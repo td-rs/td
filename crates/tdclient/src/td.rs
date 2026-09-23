@@ -529,23 +529,31 @@ impl crate::message_content::MessageContentContext for Td {
     fn merge_animations(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
         {}
     }
-    fn merge_audios(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
-        {}
+    fn merge_audios(&mut self, new_file_id: FileId, old_file_id: FileId) {
+        self.audios_manager.merge_audios(new_file_id, old_file_id);
     }
-    fn merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
-        {}
+    fn merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId) {
+        // the manager record merge + the FileManager merge
+        // (DocumentsManager.cpp:643-659)
+        self.documents_manager
+            .merge_document_records(new_file_id, old_file_id);
+        if let Err(error) = self.file_manager.lock().merge(new_file_id, old_file_id) {
+            tdutils::log_error!("{}", error.message());
+        }
     }
     fn merge_stickers(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
         {}
     }
-    fn merge_videos(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
-        {}
+    fn merge_videos(&mut self, new_file_id: FileId, old_file_id: FileId) {
+        self.videos_manager.merge_videos(new_file_id, old_file_id);
     }
-    fn merge_video_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
-        {}
+    fn merge_video_notes(&mut self, new_file_id: FileId, old_file_id: FileId) {
+        self.video_notes_manager
+            .merge_video_notes(new_file_id, old_file_id);
     }
-    fn merge_voice_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
-        {}
+    fn merge_voice_notes(&mut self, new_file_id: FileId, old_file_id: FileId) {
+        self.voice_notes_manager
+            .merge_voice_notes(new_file_id, old_file_id);
     }
     fn merge_files(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
         {}
@@ -597,20 +605,20 @@ impl crate::message_content::MessageContentContext for Td {
     fn create_animation(
         &mut self,
         _file_id: FileId,
-        _thumbnail: PhotoSize,
+        _thumbnail: crate::photo::PhotoSize,
         _has_stickers: bool,
         _sticker_file_ids: Vec<FileId>,
         _file_name: String,
         _mime_type: String,
         _duration: i32,
-        _dimensions: Dimensions,
+        _dimensions: crate::photo::Dimensions,
     ) {
         {}
     }
     fn create_audio(
         &mut self,
         _file_id: FileId,
-        _thumbnail: PhotoSize,
+        _thumbnail: crate::photo::PhotoSize,
         _file_name: String,
         _mime_type: String,
         _duration: i32,
@@ -622,25 +630,30 @@ impl crate::message_content::MessageContentContext for Td {
     fn create_document(
         &mut self,
         _file_id: FileId,
-        _thumbnail: PhotoSize,
+        _thumbnail: crate::photo::PhotoSize,
         _file_name: String,
         _mime_type: String,
     ) {
         {}
     }
-    fn create_sticker(&mut self, _file_id: FileId, _thumbnail: PhotoSize, _dimensions: Dimensions) {
+    fn create_sticker(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: crate::photo::PhotoSize,
+        _dimensions: Dimensions,
+    ) {
         {}
     }
     fn create_video(
         &mut self,
         _file_id: FileId,
-        _thumbnail: PhotoSize,
+        _thumbnail: crate::photo::PhotoSize,
         _has_stickers: bool,
         _sticker_file_ids: Vec<FileId>,
         _file_name: String,
         _mime_type: String,
         _duration: i32,
-        _dimensions: Dimensions,
+        _dimensions: crate::photo::Dimensions,
         _supports_streaming: bool,
     ) {
         {}
@@ -648,9 +661,9 @@ impl crate::message_content::MessageContentContext for Td {
     fn create_video_note(
         &mut self,
         _file_id: FileId,
-        _thumbnail: PhotoSize,
+        _thumbnail: crate::photo::PhotoSize,
         _duration: i32,
-        _dimensions: Dimensions,
+        _dimensions: crate::photo::Dimensions,
     ) {
         {}
     }
@@ -666,7 +679,7 @@ impl crate::message_content::MessageContentContext for Td {
     fn create_photo_input(
         &mut self,
         _file_id: FileId,
-        _thumbnail: PhotoSize,
+        _thumbnail: crate::photo::PhotoSize,
         _width: i32,
         _height: i32,
         _sticker_file_ids: Vec<FileId>,
@@ -903,20 +916,21 @@ impl crate::message_content::MessageContentContext for Td {
     fn delete_animation_thumbnail(&mut self, _file_id: FileId) {
         {}
     }
-    fn delete_audio_thumbnail(&mut self, _file_id: FileId) {
-        {}
+    fn delete_audio_thumbnail(&mut self, file_id: FileId) {
+        self.audios_manager.delete_audio_thumbnail(file_id);
     }
-    fn delete_document_thumbnail(&mut self, _file_id: FileId) {
-        {}
+    fn delete_document_thumbnail(&mut self, file_id: FileId) {
+        self.documents_manager.delete_document_thumbnail(file_id);
     }
     fn delete_sticker_thumbnail(&mut self, _file_id: FileId) {
         {}
     }
-    fn delete_video_thumbnail(&mut self, _file_id: FileId) {
-        {}
+    fn delete_video_thumbnail(&mut self, file_id: FileId) {
+        self.videos_manager.delete_video_thumbnail(file_id);
     }
-    fn delete_video_note_thumbnail(&mut self, _file_id: FileId) {
-        {}
+    fn delete_video_note_thumbnail(&mut self, file_id: FileId) {
+        self.video_notes_manager
+            .delete_video_note_thumbnail(file_id);
     }
     fn cancel_upload(&mut self, _file_upload_id: FileUploadId) {
         {}
@@ -926,21 +940,66 @@ impl crate::message_content::MessageContentContext for Td {
     }
     fn get_live_photo_video_file_id(
         &mut self,
-        _video: Option<telegram_api::Document>,
-        _owner_dialog_id: DialogId,
-        _is_self_destructing: bool,
+        video: Option<telegram_api::Document>,
+        owner_dialog_id: DialogId,
+        is_self_destructing: bool,
     ) -> FileId {
-        FileId::default()
+        // `VideosManager::get_live_photo_video_file_id`
+        // (VideosManager.cpp:439-453): the document intake of the live
+        // photo's video half
+        let Some(document) = video else {
+            tdutils::log_error!("Receive empty live photo video");
+            return FileId::default();
+        };
+        let telegram_api::Document::document(document) = document else {
+            tdutils::log_error!("Receive empty live photo video");
+            return FileId::default();
+        };
+        let (mut env, documents) = self.documents_env();
+        let parsed = documents.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            owner_dialog_id,
+            is_self_destructing,
+            true,
+            crate::document::DocumentType::Video,
+            crate::documents_manager::Subtype::Other,
+        );
+        if parsed.is_empty() || parsed.type_ != crate::document::DocumentType::Video {
+            tdutils::log_error!("Receive invalid live photo video");
+            return FileId::default();
+        }
+        parsed.file_id
     }
     fn on_get_document(
         &mut self,
-        _document: telegram_api::Document,
-        _owner_dialog_id: DialogId,
-        _is_self_destructing: bool,
+        document: telegram_api::Document,
+        owner_dialog_id: DialogId,
+        is_self_destructing: bool,
         _is_send_priority: bool,
-        _doc_type: Option<DocumentType>,
+        doc_type: Option<DocumentType>,
     ) -> ParsedDocument {
-        ParsedDocument::default()
+        // `DocumentsManager::on_get_document`
+        // (MessageContent.cpp:9864-9900, 10021, Game.cpp:47) — the
+        // parsed `Document` collapses to the `(file_id, type)` pair
+        let telegram_api::Document::document(document) = document else {
+            tdutils::log_error!("Receive empty document");
+            return ParsedDocument::default();
+        };
+        let (mut env, documents) = self.documents_env();
+        let parsed = documents.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            owner_dialog_id,
+            is_self_destructing,
+            false,
+            doc_type.unwrap_or(crate::document::DocumentType::General),
+            crate::documents_manager::Subtype::Other,
+        );
+        ParsedDocument {
+            file_id: parsed.file_id,
+            r#type: parsed.type_,
+        }
     }
     fn get_web_document_photo(
         &mut self,
@@ -983,23 +1042,26 @@ impl crate::message_content::MessageContentContext for Td {
     fn dup_animation(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
         FileId::default()
     }
-    fn dup_audio(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
-        FileId::default()
+    fn dup_audio(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId {
+        self.audios_manager.dup_audio(new_file_id, old_file_id)
     }
-    fn dup_document(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
-        FileId::default()
+    fn dup_document(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId {
+        self.documents_manager
+            .dup_document(new_file_id, old_file_id)
     }
     fn dup_sticker(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
         FileId::default()
     }
-    fn dup_video(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
-        FileId::default()
+    fn dup_video(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId {
+        self.videos_manager.dup_video(new_file_id, old_file_id)
     }
-    fn dup_video_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
-        FileId::default()
+    fn dup_video_note(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId {
+        self.video_notes_manager
+            .dup_video_note(new_file_id, old_file_id)
     }
-    fn dup_voice_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
-        FileId::default()
+    fn dup_voice_note(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId {
+        self.voice_notes_manager
+            .dup_voice_note(new_file_id, old_file_id)
     }
     fn dup_poll(&mut self, _dialog_id: DialogId, _poll_id: PollId) -> PollId {
         PollId::default()
@@ -1101,20 +1163,30 @@ impl crate::message_content::MessageContentContext for Td {
     fn get_animation_object(&self, _file_id: FileId) -> td_api::Animation {
         td_api::Animation::default()
     }
-    fn get_audio_object(&self, _file_id: FileId) -> td_api::Audio {
-        td_api::Audio::default()
+    fn get_audio_object(&self, file_id: FileId) -> td_api::Audio {
+        self.audios_manager
+            .get_audio_object(self, file_id)
+            .unwrap_or_default()
     }
-    fn get_document_object(&self, _file_id: FileId) -> td_api::Document {
-        td_api::Document::default()
+    fn get_document_object(&self, file_id: FileId) -> td_api::Document {
+        self.documents_manager
+            .get_document_object(self, file_id, crate::photo::PhotoFormat::Jpeg)
+            .unwrap_or_default()
     }
-    fn get_video_object(&self, _file_id: FileId) -> td_api::Video {
-        td_api::Video::default()
+    fn get_video_object(&self, file_id: FileId) -> td_api::Video {
+        self.videos_manager
+            .get_video_object(self, file_id)
+            .unwrap_or_default()
     }
-    fn get_video_note_object(&self, _file_id: FileId) -> td_api::VideoNote {
-        td_api::VideoNote::default()
+    fn get_video_note_object(&self, file_id: FileId) -> td_api::VideoNote {
+        self.video_notes_manager
+            .get_video_note_object(self, file_id)
+            .unwrap_or_default()
     }
-    fn get_voice_note_object(&self, _file_id: FileId) -> td_api::VoiceNote {
-        td_api::VoiceNote::default()
+    fn get_voice_note_object(&self, file_id: FileId) -> td_api::VoiceNote {
+        self.voice_notes_manager
+            .get_voice_note_object(self, file_id)
+            .unwrap_or_default()
     }
     fn get_sticker_object(&self, _file_id: FileId) -> Option<td_api::Sticker> {
         None
@@ -1144,17 +1216,19 @@ impl crate::message_content::MessageContentContext for Td {
     }
     fn get_alternative_video_object(
         &self,
-        _file_id: FileId,
-        _hls_file_ids: &[FileId],
+        file_id: FileId,
+        hls_file_ids: &[FileId],
     ) -> Option<td_api::AlternativeVideo> {
-        None
+        self.videos_manager
+            .get_alternative_video_object(self, file_id, hls_file_ids)
     }
     fn get_video_storyboard_object(
         &self,
-        _file_id: FileId,
-        _storyboard_map_file_ids: &[FileId],
+        file_id: FileId,
+        storyboard_map_file_ids: &[FileId],
     ) -> Option<td_api::VideoStoryboard> {
-        None
+        self.documents_manager
+            .get_video_storyboard_object(self, file_id, storyboard_map_file_ids)
     }
     fn get_link_preview_object(
         &self,
@@ -1244,17 +1318,17 @@ impl crate::message_content::MessageContentContext for Td {
     fn get_animation_duration(&self, _file_id: FileId) -> i32 {
         0
     }
-    fn get_audio_duration(&self, _file_id: FileId) -> i32 {
-        0
+    fn get_audio_duration(&self, file_id: FileId) -> i32 {
+        self.audios_manager.get_audio_duration(file_id)
     }
-    fn get_video_duration(&self, _file_id: FileId) -> i32 {
-        0
+    fn get_video_duration(&self, file_id: FileId) -> i32 {
+        self.videos_manager.get_video_duration(file_id)
     }
-    fn get_video_note_duration(&self, _file_id: FileId) -> i32 {
-        0
+    fn get_video_note_duration(&self, file_id: FileId) -> i32 {
+        self.video_notes_manager.get_video_note_duration(file_id)
     }
-    fn get_voice_note_duration(&self, _file_id: FileId) -> i32 {
-        0
+    fn get_voice_note_duration(&self, file_id: FileId) -> i32 {
+        self.voice_notes_manager.get_voice_note_duration(file_id)
     }
     fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
         0
@@ -1295,8 +1369,8 @@ impl crate::message_content::MessageContentContext for Td {
     ) -> Result<(), Status> {
         unreachable!("send-path seam reached on the receive flip")
     }
-    fn get_video_mime_type(&self, _file_id: FileId) -> String {
-        String::new()
+    fn get_video_mime_type(&self, file_id: FileId) -> String {
+        self.videos_manager.get_video_mime_type(file_id).to_owned()
     }
     fn get_poll_file_ids(&self, _poll_id: PollId) -> Vec<FileId> {
         Vec::new()
@@ -1310,14 +1384,14 @@ impl crate::message_content::MessageContentContext for Td {
     fn get_animation_search_text(&self, _file_id: FileId) -> String {
         String::new()
     }
-    fn get_audio_search_text(&self, _file_id: FileId) -> String {
-        String::new()
+    fn get_audio_search_text(&self, file_id: FileId) -> String {
+        self.audios_manager.get_audio_search_text(file_id)
     }
-    fn get_document_search_text(&self, _file_id: FileId) -> String {
-        String::new()
+    fn get_document_search_text(&self, file_id: FileId) -> String {
+        self.documents_manager.get_document_search_text(file_id)
     }
-    fn get_video_search_text(&self, _file_id: FileId) -> String {
-        String::new()
+    fn get_video_search_text(&self, file_id: FileId) -> String {
+        self.videos_manager.get_video_search_text(file_id)
     }
     fn get_poll_search_text(&self, _poll_id: PollId) -> String {
         String::new()
@@ -2125,6 +2199,19 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) animations_updates: Vec<td_api::Update>,
+    /// `Td::audios_manager_` (Td.cpp:1160, M.28) — the media-metadata
+    /// audio plane.
+    pub(crate) audios_manager: crate::audios_manager::AudiosManager,
+    /// `Td::documents_manager_` (Td.cpp:1160, M.28) — the media-metadata
+    /// document plane (the GeneralDocument records + the intake).
+    pub(crate) documents_manager: crate::documents_manager::DocumentsManager,
+    /// `Td::videos_manager_` (Td.cpp:1160, M.28) — the media-metadata
+    /// video plane.
+    pub(crate) videos_manager: crate::videos_manager::VideosManager,
+    /// `Td::voice_notes_manager_` (Td.cpp:1160, M.28).
+    pub(crate) voice_notes_manager: crate::voice_notes_manager::VoiceNotesManager,
+    /// `Td::video_notes_manager_` (Td.cpp:1160, M.28).
+    pub(crate) video_notes_manager: crate::video_notes_manager::VideoNotesManager,
     /// `Td::poll_manager_` (Td.cpp:1263-1265, M.19).
     pub(crate) poll_manager: crate::poll_manager::PollManager,
     /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
@@ -2498,6 +2585,11 @@ impl Td {
             language_pack_updates: Vec::new(),
             animations_manager: crate::animations_manager::AnimationsManager::new(),
             animations_updates: Vec::new(),
+            audios_manager: crate::audios_manager::AudiosManager::new(),
+            documents_manager: crate::documents_manager::DocumentsManager::new(),
+            videos_manager: crate::videos_manager::VideosManager::new(),
+            voice_notes_manager: crate::voice_notes_manager::VoiceNotesManager::new(),
+            video_notes_manager: crate::video_notes_manager::VideoNotesManager::new(),
             poll_manager: crate::poll_manager::PollManager::new(),
             poll_updates: Vec::new(),
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
@@ -4913,6 +5005,18 @@ impl Td {
 
             file_manager,
 
+            file_load_manager,
+
+            documents_manager,
+
+            videos_manager,
+
+            audios_manager,
+
+            voice_notes_manager,
+
+            video_notes_manager,
+
             notification_updates,
             ..
         } = self;
@@ -4931,6 +5035,18 @@ impl Td {
             chat_manager,
 
             file_manager: file_manager.clone(),
+
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
+
+            documents: documents_manager,
+
+            videos: videos_manager,
+
+            audios: audios_manager,
+
+            voice_notes: voice_notes_manager,
+
+            video_notes: video_notes_manager,
 
             updates: notification_updates,
         };
@@ -6724,6 +6840,440 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
             "Send SaveGifQuery(file_id = {}, unsave = {unsave}) — [blocked: net]",
             file_id.get()
         );
+    }
+}
+
+// ── the media-metadata manager environments (M.28) ──
+//
+// The five C++ media-metadata managers read `td_->file_manager_` (and,
+// for the document intake, `td_->file_load_manager_` and the sibling
+// records). The env traits are implemented directly on `Td` for the
+// shared-context reads; the mutable document intake rides
+// [`TdDocumentsEnv`], the field-split form the `create_*` dispatch
+// needs.
+
+/// The field-split [`crate::documents_manager::DocumentsManagerEnv`]
+/// of the `on_get_document` intake: the document manager itself plus
+/// the disjoint sibling records its `create_*` tails build.
+pub(crate) struct TdDocumentsEnv<'a> {
+    pub(crate) auth_is_bot: bool,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
+    pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
+    pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
+    pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
+    pub(crate) video_notes: &'a mut crate::video_notes_manager::VideoNotesManager,
+}
+
+impl crate::photo::DialogPhotoStoreEnv for TdDocumentsEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::documents_manager::DocumentsManagerEnv for TdDocumentsEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn file_load_manager(
+        &self,
+    ) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>> {
+        std::sync::Arc::clone(&self.file_load_manager)
+    }
+
+    fn create_animation(
+        &mut self,
+        _file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _animated_thumbnail: crate::photo::AnimationSize,
+        _has_stickers: bool,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: crate::photo::Dimensions,
+        _replace: bool,
+    ) {
+        // the C++ routes this to `animations_manager_->create_animation`
+        // (with the empty sticker-file-ids vector); the animation record
+        // dispatch rides the M.20 env construction at the message-content
+        // intake flip
+        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+    }
+
+    fn create_sticker(
+        &mut self,
+        _file_id: FileId,
+        _premium_animation_file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _dimensions: crate::photo::Dimensions,
+        _sticker: Option<telegram_api::documentAttributeSticker>,
+        _custom_emoji: Option<telegram_api::documentAttributeCustomEmoji>,
+        _sticker_format: crate::documents_manager::StickerFormat,
+    ) {
+        // the C++ routes this to `stickers_manager_->create_sticker`;
+        // the sticker record rides the M.15 stickers integration
+        tdutils::log_info!("create_sticker — [blocked: M.15 record dispatch]");
+    }
+
+    fn create_audio(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        title: String,
+        performer: String,
+        date: i32,
+        replace: bool,
+    ) {
+        self.audios.create_audio(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            file_name,
+            mime_type,
+            duration,
+            title,
+            performer,
+            date,
+            replace,
+        );
+    }
+
+    fn create_video(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        precise_duration: f64,
+        dimensions: crate::photo::Dimensions,
+        supports_streaming: bool,
+        is_animation: bool,
+        preload_prefix_size: i32,
+        start_ts: f64,
+        codec: String,
+        replace: bool,
+    ) {
+        self.videos.create_video(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            sticker_file_ids,
+            file_name,
+            mime_type,
+            duration,
+            precise_duration,
+            dimensions,
+            supports_streaming,
+            is_animation,
+            preload_prefix_size,
+            start_ts,
+            codec,
+            replace,
+        );
+    }
+
+    fn create_video_note(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.video_notes.create_video_note(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            duration,
+            dimensions,
+            waveform,
+            replace,
+        );
+    }
+
+    fn create_voice_note(
+        &mut self,
+        file_id: FileId,
+        mime_type: String,
+        duration: i32,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.voice_notes
+            .create_voice_note(file_id, mime_type, duration, waveform, replace);
+    }
+}
+
+impl crate::documents_manager::DocumentsManagerEnv for Td {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn file_load_manager(
+        &self,
+    ) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>> {
+        std::sync::Arc::clone(&self.file_load_manager)
+    }
+
+    fn create_animation(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
+    ) {
+        // the C++ DocumentsManager dispatch passes the empty
+        // sticker-file-ids vector (DocumentsManager.cpp:552-554)
+        let mut env = TdAnimationsEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            updates: &mut self.animations_updates,
+        };
+        self.animations_manager.create_animation(
+            &mut env,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
+    }
+
+    fn create_sticker(
+        &mut self,
+        _file_id: FileId,
+        _premium_animation_file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _dimensions: crate::photo::Dimensions,
+        _sticker: Option<telegram_api::documentAttributeSticker>,
+        _custom_emoji: Option<telegram_api::documentAttributeCustomEmoji>,
+        _sticker_format: crate::documents_manager::StickerFormat,
+    ) {
+        // the C++ routes this to `stickers_manager_->create_sticker`;
+        // the sticker record rides the M.15 stickers integration
+        tdutils::log_info!("create_sticker — [blocked: M.15 record dispatch]");
+    }
+
+    fn create_audio(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        title: String,
+        performer: String,
+        date: i32,
+        replace: bool,
+    ) {
+        self.audios_manager.create_audio(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            file_name,
+            mime_type,
+            duration,
+            title,
+            performer,
+            date,
+            replace,
+        );
+    }
+
+    fn create_video(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        precise_duration: f64,
+        dimensions: crate::photo::Dimensions,
+        supports_streaming: bool,
+        is_animation: bool,
+        preload_prefix_size: i32,
+        start_ts: f64,
+        codec: String,
+        replace: bool,
+    ) {
+        self.videos_manager.create_video(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            sticker_file_ids,
+            file_name,
+            mime_type,
+            duration,
+            precise_duration,
+            dimensions,
+            supports_streaming,
+            is_animation,
+            preload_prefix_size,
+            start_ts,
+            codec,
+            replace,
+        );
+    }
+
+    fn create_video_note(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.video_notes_manager.create_video_note(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            duration,
+            dimensions,
+            waveform,
+            replace,
+        );
+    }
+
+    fn create_voice_note(
+        &mut self,
+        file_id: FileId,
+        mime_type: String,
+        duration: i32,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.voice_notes_manager
+            .create_voice_note(file_id, mime_type, duration, waveform, replace);
+    }
+}
+
+impl Td {
+    /// The field-split document-intake env (`TdDocumentsEnv`) off the
+    /// Td fields — the disjoint siblings the intake's `create_*` tails
+    /// build.
+    pub(crate) fn documents_env(
+        &mut self,
+    ) -> (
+        TdDocumentsEnv<'_>,
+        &mut crate::documents_manager::DocumentsManager,
+    ) {
+        (
+            TdDocumentsEnv {
+                auth_is_bot: self.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&self.file_manager),
+                file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+                audios: &mut self.audios_manager,
+                videos: &mut self.videos_manager,
+                voice_notes: &mut self.voice_notes_manager,
+                video_notes: &mut self.video_notes_manager,
+            },
+            &mut self.documents_manager,
+        )
+    }
+}
+
+impl crate::photo::DialogPhotoStoreEnv for Td {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::videos_manager::VideosManagerEnv for Td {
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn documents(&self) -> &crate::documents_manager::DocumentsManager {
+        &self.documents_manager
+    }
+}
+
+impl crate::audios_manager::AudiosManagerEnv for Td {
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+}
+
+impl crate::voice_notes_manager::VoiceNotesManagerEnv for Td {
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+}
+
+impl crate::video_notes_manager::VideoNotesManagerEnv for Td {
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn get_option_integer(&mut self, name: &str, default_value: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_integer(name, default_value)
+            })
     }
 }
 
@@ -10983,6 +11533,12 @@ pub(crate) struct StoryEnv<'a> {
     pub user_manager: &'a mut UserManager,
     pub chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
+    pub documents: &'a mut crate::documents_manager::DocumentsManager,
+    pub videos: &'a mut crate::videos_manager::VideosManager,
+    pub audios: &'a mut crate::audios_manager::AudiosManager,
+    pub voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
+    pub video_notes: &'a mut crate::video_notes_manager::VideoNotesManager,
     pub updates: &'a mut Vec<td_api::Update>,
 }
 
@@ -10999,6 +11555,29 @@ impl<'a> StoryEnv<'a> {
                 .expect("story requests run with the initialized option manager"),
             auth_is_bot: self.auth_is_bot,
         }
+    }
+}
+
+impl crate::photo::DialogPhotoStoreEnv for StoryEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::videos_manager::VideosManagerEnv for StoryEnv<'_> {
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn documents(&self) -> &crate::documents_manager::DocumentsManager {
+        self.documents
     }
 }
 
@@ -11310,11 +11889,100 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
     }
 
     fn videos_get_video_duration(&mut self, file_id: crate::files::FileId) -> i32 {
-        // `VideosManager::get_video_duration` reads the video record —
-        // [blocked: VideosManager]; the interim answer is the C++ "not a
-        // video" -1
-        let _ = file_id;
-        -1
+        self.videos.get_video_duration(file_id)
+    }
+
+    fn on_get_story_document(
+        &mut self,
+        document: telegram_api::document,
+        owner_dialog_id: DialogId,
+    ) -> Option<FileId> {
+        // `DocumentsManager::on_get_document(..., Type::Video, Subtype::Story)`
+        // (StoryContent.cpp:257-266)
+        let documents = &mut *self.documents;
+        let mut env = TdDocumentsEnv {
+            auth_is_bot: self.auth_is_bot,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            audios: &mut *self.audios,
+            videos: &mut *self.videos,
+            voice_notes: &mut *self.voice_notes,
+            video_notes: &mut *self.video_notes,
+        };
+        let parsed = documents.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            owner_dialog_id,
+            false,
+            false,
+            crate::document::DocumentType::Video,
+            crate::documents_manager::Subtype::Story,
+        );
+        if parsed.is_empty() || parsed.type_ != crate::document::DocumentType::Video {
+            tdutils::log_error!("Receive a story with an invalid document");
+            return None;
+        }
+        Some(parsed.file_id)
+    }
+
+    fn get_story_document_file_ids(&mut self, file_id: FileId) -> Option<Vec<FileId>> {
+        if !file_id.is_valid() {
+            return None;
+        }
+        // the `Document { Type::Video, file_id }.append_file_ids` arm
+        // (Document.cpp:44-55)
+        let mut file_ids = vec![file_id];
+        let thumbnail = self.videos.get_video_thumbnail_file_id(file_id);
+        if thumbnail.is_valid() {
+            file_ids.push(thumbnail);
+        }
+        let animated = self.videos.get_video_animated_thumbnail_file_id(file_id);
+        if animated.is_valid() {
+            file_ids.push(animated);
+        }
+        Some(file_ids)
+    }
+
+    fn videos_get_story_video_object(&mut self, file_id: FileId) -> Option<td_api::StoryVideo> {
+        self.videos.get_story_video_object(self, file_id)
+    }
+
+    fn videos_get_video_object(&mut self, file_id: FileId) -> Option<td_api::Video> {
+        self.videos.get_video_object(self, file_id)
+    }
+
+    fn videos_create_story_video(
+        &mut self,
+        file_id: FileId,
+        duration_seconds: i32,
+        duration: f64,
+        dimensions: crate::photo::Dimensions,
+        is_animation: bool,
+        cover_frame_timestamp: f64,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+    ) {
+        // `VideosManager::create_video` of the story upload
+        // (StoryContent.cpp:337-342)
+        self.videos.create_video(
+            file_id,
+            String::new(),
+            crate::photo::PhotoSize::default(),
+            crate::photo::AnimationSize::default(),
+            has_stickers,
+            sticker_file_ids,
+            "story.mp4".to_owned(),
+            "video/mp4".to_owned(),
+            duration_seconds,
+            duration,
+            dimensions,
+            true,
+            is_animation,
+            0,
+            cover_frame_timestamp,
+            String::new(),
+            false,
+        );
     }
 
     fn story_db(&mut self) -> Option<&mut crate::story_db::StoryDb> {
@@ -11544,7 +12212,13 @@ pub(crate) fn web_pages_env_split(
         auth_manager,
         user_manager,
         file_manager,
+        file_load_manager,
         file_reference_manager,
+        documents_manager,
+        audios_manager,
+        videos_manager,
+        voice_notes_manager,
+        video_notes_manager,
         web_pages_manager,
         web_pages_timeouts,
         ..
@@ -11556,7 +12230,13 @@ pub(crate) fn web_pages_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             file_manager: std::sync::Arc::clone(file_manager),
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
             file_reference_manager,
+            documents: documents_manager,
+            audios: audios_manager,
+            videos: videos_manager,
+            voice_notes: voice_notes_manager,
+            video_notes: video_notes_manager,
             web_pages_timeouts,
         },
         web_pages_manager,
@@ -11572,7 +12252,13 @@ pub(crate) struct TdWebPagesEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) documents: &'a mut crate::documents_manager::DocumentsManager,
+    pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
+    pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
+    pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
+    pub(crate) video_notes: &'a mut crate::video_notes_manager::VideoNotesManager,
     pub(crate) web_pages_timeouts: &'a mut std::collections::HashMap<i64, f64>,
 }
 
@@ -11589,9 +12275,157 @@ impl crate::photo::PhotoStoreEnv for TdWebPagesEnv<'_> {
     }
 }
 
+impl crate::documents_manager::DocumentsManagerEnv for TdWebPagesEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn file_load_manager(
+        &self,
+    ) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>> {
+        std::sync::Arc::clone(&self.file_load_manager)
+    }
+
+    fn create_animation(
+        &mut self,
+        _file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _animated_thumbnail: crate::photo::AnimationSize,
+        _has_stickers: bool,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: crate::photo::Dimensions,
+        _replace: bool,
+    ) {
+        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+    }
+
+    fn create_sticker(
+        &mut self,
+        _file_id: FileId,
+        _premium_animation_file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _dimensions: crate::photo::Dimensions,
+        _sticker: Option<telegram_api::documentAttributeSticker>,
+        _custom_emoji: Option<telegram_api::documentAttributeCustomEmoji>,
+        _sticker_format: crate::documents_manager::StickerFormat,
+    ) {
+        tdutils::log_info!("create_sticker — [blocked: M.15 record dispatch]");
+    }
+
+    fn create_audio(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        title: String,
+        performer: String,
+        date: i32,
+        replace: bool,
+    ) {
+        self.audios.create_audio(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            file_name,
+            mime_type,
+            duration,
+            title,
+            performer,
+            date,
+            replace,
+        );
+    }
+
+    fn create_video(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        precise_duration: f64,
+        dimensions: crate::photo::Dimensions,
+        supports_streaming: bool,
+        is_animation: bool,
+        preload_prefix_size: i32,
+        start_ts: f64,
+        codec: String,
+        replace: bool,
+    ) {
+        self.videos.create_video(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            sticker_file_ids,
+            file_name,
+            mime_type,
+            duration,
+            precise_duration,
+            dimensions,
+            supports_streaming,
+            is_animation,
+            preload_prefix_size,
+            start_ts,
+            codec,
+            replace,
+        );
+    }
+
+    fn create_video_note(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.video_notes.create_video_note(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            duration,
+            dimensions,
+            waveform,
+            replace,
+        );
+    }
+
+    fn create_voice_note(
+        &mut self,
+        file_id: FileId,
+        mime_type: String,
+        duration: i32,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.voice_notes
+            .create_voice_note(file_id, mime_type, duration, waveform, replace);
+    }
+}
+
 impl crate::webpage::WebPageBlockEnv for TdWebPagesEnv<'_> {
-    fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
-        None // [blocked: M.28 DocumentsManager object]
+    fn get_document_object(&self, file_id: FileId) -> Option<td_api::Document> {
+        self.documents
+            .get_document_object(self, file_id, crate::photo::PhotoFormat::Jpeg)
     }
 
     fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
@@ -11888,14 +12722,37 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
 
     fn on_get_document(
         &mut self,
-        _document: Box<telegram_api::Document>,
-        _owner_dialog_id: crate::dialog_id::DialogId,
+        document: Box<telegram_api::Document>,
+        owner_dialog_id: crate::dialog_id::DialogId,
     ) -> Option<crate::document::Document> {
-        None // [blocked: M.28]
+        let telegram_api::Document::document(document) = *document else {
+            tdutils::log_error!("Receive empty web-page document");
+            return None;
+        };
+        let documents = &mut *self.documents;
+        let mut env = TdDocumentsEnv {
+            auth_is_bot: self.auth_is_bot,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            audios: &mut *self.audios,
+            videos: &mut *self.videos,
+            voice_notes: &mut *self.voice_notes,
+            video_notes: &mut *self.video_notes,
+        };
+        let parsed = documents.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            owner_dialog_id,
+            false,
+            false,
+            crate::document::DocumentType::General,
+            crate::documents_manager::Subtype::Other,
+        );
+        Some(parsed)
     }
 
-    fn get_document_mime_type(&self, _file_id: FileId) -> String {
-        String::new() // [blocked: M.28]
+    fn get_document_mime_type(&self, file_id: FileId) -> String {
+        self.documents.get_document_mime_type(file_id).to_owned()
     }
 
     fn get_message_link_media_timestamp(&self, _url: &str) -> i32 {

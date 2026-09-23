@@ -2191,6 +2191,40 @@ impl FullRemoteFileLocation {
         }
     }
 
+    /// `FullRemoteFileLocation::as_input_document` (FileLocation.h:473-477).
+    pub fn as_input_document(&self) -> telegram_api::inputDocument {
+        assert!(self.is_common());
+        assert!(self.is_document());
+        let common = self.common();
+        telegram_api::inputDocument {
+            id: common.id,
+            access_hash: common.access_hash,
+            file_reference: self.file_reference.as_bytes().to_vec(),
+        }
+    }
+
+    /// `FullRemoteFileLocation::as_input_photo` (FileLocation.h:481-484).
+    pub fn as_input_photo(&self) -> telegram_api::inputPhoto {
+        assert!(self.is_photo());
+        let photo = self.photo();
+        telegram_api::inputPhoto {
+            id: photo.id,
+            access_hash: photo.access_hash,
+            file_reference: self.file_reference.as_bytes().to_vec(),
+        }
+    }
+
+    /// `FullRemoteFileLocation::as_input_encrypted_file`
+    /// (FileLocation.h:486-489).
+    pub fn as_input_encrypted_file(&self) -> telegram_api::inputEncryptedFile {
+        assert!(self.is_encrypted_secret());
+        let common = self.common();
+        telegram_api::inputEncryptedFile {
+            id: common.id,
+            access_hash: common.access_hash,
+        }
+    }
+
     /// `FullRemoteFileLocation::as_input_web_file_location`
     /// (FileLocation.h:381-384).
     pub fn as_input_web_file_location(
@@ -6587,6 +6621,60 @@ impl FileManager {
                 is_uploading_completed,
                 uploaded_size: remote_size,
             }),
+        }
+    }
+
+    /// `FileManager::get_input_documents` (FileManager.cpp:4402-4413) —
+    /// the sticker-file-id conversion the uploaded-document media builds.
+    pub fn get_input_documents(&self, file_ids: &[FileId]) -> Vec<telegram_api::InputDocument> {
+        file_ids
+            .iter()
+            .map(|file_id| {
+                let file_view = self
+                    .get_file_view(*file_id)
+                    .expect("FileManager::get_input_documents: empty file view");
+                let full_remote_location = file_view
+                    .get_full_remote_location()
+                    .expect("FileManager::get_input_documents: no full remote location");
+                assert!(!full_remote_location.is_web());
+                telegram_api::InputDocument::inputDocument(full_remote_location.as_input_document())
+            })
+            .collect()
+    }
+
+    /// `FileManager::extract_file_reference(const InputMedia *)`
+    /// (FileManager.cpp:4542-4570) — the file reference an already-built
+    /// input media carries, empty unless the media wraps a common
+    /// document (or the story-document upload form).
+    pub fn extract_input_media_file_reference(input_media: &telegram_api::InputMedia) -> String {
+        const INVALID_FILE_REFERENCE: &[u8] = b"#";
+        let reference = |input_document: Option<&telegram_api::InputDocument>| match input_document
+        {
+            Some(telegram_api::InputDocument::inputDocument(document)) => {
+                if document.file_reference == INVALID_FILE_REFERENCE {
+                    String::new()
+                } else {
+                    // the wire field is `bytes`; the module-wide
+                    // file-reference representation is the String
+                    // (FullRemoteFileLocation docs)
+                    String::from_utf8_lossy(&document.file_reference).into_owned()
+                }
+            }
+            _ => String::new(),
+        };
+        match input_media {
+            telegram_api::InputMedia::inputMediaDocument(media) => reference(media.id.as_ref()),
+            telegram_api::InputMedia::inputMediaUploadedDocument(media) => {
+                // only the story-document upload form carries the
+                // reference (FileManager.cpp:4560-4567)
+                match media.file.as_ref() {
+                    Some(telegram_api::InputFile::inputFileStoryDocument(story)) => {
+                        reference(story.id.as_ref())
+                    }
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
         }
     }
 

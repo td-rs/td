@@ -14,6 +14,9 @@
 //! (`PhotoSize.cpp:38-189`, `Photo.cpp:57-115`,
 //! `StickerPhotoSize.cpp:95-128`).
 
+use crate::chat_manager::DcId;
+use crate::files::{FileLocationSource, FileManager, FullRemoteFileLocation, PhotoSizeSource};
+use crate::message_id::DialogId;
 use crate::store_parse::{self, Parser};
 use crate::td_api;
 use crate::user_manager::FileId;
@@ -438,7 +441,7 @@ pub fn photo_append_file_ids(photo: &Photo, file_ids: &mut Vec<FileId>) {
 /// The `Variant<PhotoSize, string>` result of `get_photo_size`
 /// (PhotoSize.cpp:38): a classified size, or the packed minithumbnail
 /// string of a `photoStrippedSize`.
-enum PhotoSizeOrMinithumbnail {
+pub enum PhotoSizeOrMinithumbnail {
     Size(PhotoSize),
     Minithumbnail(String),
 }
@@ -1200,6 +1203,349 @@ pub fn parse_dialog_photo(
     }
     dialog_photo.is_personal = is_personal;
     Ok(dialog_photo)
+}
+
+// ==== M.28 media-metadata additions: the FileManager-integrated size intake =====
+
+/// `get_thumbnail_format_object` (PhotoSize.cpp:82-99) — the PhotoFormat →
+/// td_api thumbnail-format table; the C++ `default: UNREACHABLE()` is the
+/// enum's exhaustiveness.
+pub fn get_thumbnail_format_object(format: PhotoFormat) -> td_api::ThumbnailFormat {
+    match format {
+        PhotoFormat::Jpeg => {
+            td_api::ThumbnailFormat::thumbnailFormatJpeg(td_api::thumbnailFormatJpeg)
+        }
+        PhotoFormat::Png => td_api::ThumbnailFormat::thumbnailFormatPng(td_api::thumbnailFormatPng),
+        PhotoFormat::Webp => {
+            td_api::ThumbnailFormat::thumbnailFormatWebp(td_api::thumbnailFormatWebp)
+        }
+        PhotoFormat::Gif => td_api::ThumbnailFormat::thumbnailFormatGif(td_api::thumbnailFormatGif),
+        PhotoFormat::Tgs => td_api::ThumbnailFormat::thumbnailFormatTgs(td_api::thumbnailFormatTgs),
+        PhotoFormat::Mpeg4 => {
+            td_api::ThumbnailFormat::thumbnailFormatMpeg4(td_api::thumbnailFormatMpeg4)
+        }
+        PhotoFormat::Webm => {
+            td_api::ThumbnailFormat::thumbnailFormatWebm(td_api::thumbnailFormatWebm)
+        }
+    }
+}
+
+/// `get_thumbnail_object` (PhotoSize.cpp:483-495): the td_api thumbnail
+/// over a classified photo size; `'g'`-typed sizes render as GIF under
+/// the JPEG default. Divergence until the Files step: the C++ carries
+/// `file_manager->get_file_object(photo_size.file_id)` — the placeholder
+/// carries the forced-empty `file` payload (module docs).
+pub fn get_thumbnail_object(
+    photo_size: &PhotoSize,
+    format: PhotoFormat,
+) -> Option<td_api::Thumbnail> {
+    if !photo_size.file_id.is_valid() {
+        return None;
+    }
+
+    let format = if format == PhotoFormat::Jpeg && photo_size.size_type == b'g' as i32 {
+        PhotoFormat::Gif
+    } else {
+        format
+    };
+
+    Some(td_api::Thumbnail {
+        format: Some(get_thumbnail_format_object(format)),
+        width: photo_size.dimensions.width as i32,
+        height: photo_size.dimensions.height as i32,
+        file: Some(td_api::File::default()),
+    })
+}
+
+/// `get_thumbnail_object(file_manager, photo_size, animated_photo_size)`
+/// (PhotoSize.cpp:497-503): the animated size wins with the MPEG4
+/// format, the static size answers JPEG.
+pub fn get_thumbnail_object_with_animation(
+    photo_size: &PhotoSize,
+    animated_photo_size: &PhotoSize,
+) -> Option<td_api::Thumbnail> {
+    if animated_photo_size.file_id.is_valid() {
+        return get_thumbnail_object(animated_photo_size, PhotoFormat::Mpeg4);
+    }
+    get_thumbnail_object(photo_size, PhotoFormat::Jpeg)
+}
+
+/// The `operator<<(StringBuilder, PhotoFormat)` short names
+/// (PhotoSize.cpp:101-121) — the suggested-file-name suffix.
+fn photo_format_short_name(format: PhotoFormat) -> &'static str {
+    match format {
+        PhotoFormat::Jpeg => "jpg",
+        PhotoFormat::Png => "png",
+        PhotoFormat::Webp => "webp",
+        PhotoFormat::Gif => "gif",
+        PhotoFormat::Tgs => "tgs",
+        PhotoFormat::Mpeg4 => "mp4",
+        PhotoFormat::Webm => "webm",
+    }
+}
+
+/// `register_photo_size` (PhotoSize.cpp:126-137) — the remote
+/// registration of a classified photo size. The M.9.5 Files-plane
+/// resolution: the size gets its real FileManager `FileId` here.
+#[allow(clippy::too_many_arguments)]
+pub fn register_photo_size(
+    file_manager: &mut FileManager,
+    source: PhotoSizeSource,
+    id: i64,
+    access_hash: i64,
+    file_reference: String,
+    owner_dialog_id: DialogId,
+    file_size: i32,
+    dc_id: DcId,
+    format: PhotoFormat,
+) -> FileId {
+    let suggested_name = format!(
+        "{}.{}",
+        source.get_unique_name(id),
+        photo_format_short_name(format)
+    );
+    let file_location_source =
+        if owner_dialog_id.get_type() == crate::message_id::DialogType::SecretChat {
+            FileLocationSource::FromUser
+        } else {
+            FileLocationSource::FromServer
+        };
+    file_manager.register_remote(
+        FullRemoteFileLocation::from_photo(source, id, access_hash, dc_id, file_reference),
+        file_location_source,
+        owner_dialog_id,
+        file_size as i64,
+        0,
+        suggested_name,
+    )
+}
+
+/// `get_photo_size` (PhotoSize.cpp:38-190) — the full FileManager-
+/// integrated form the media-metadata intakes use: the classification
+/// walk of [`get_photo_size`] plus the format guards, the sticker-set
+/// thumbnail type fixes, the thumbnail-source retyping, the size clamp
+/// and the content/registration tail. The minithumbnail half carries the
+/// module-wide lossy-String convention.
+#[allow(clippy::too_many_arguments)]
+pub fn get_photo_size_registered(
+    file_manager: &mut FileManager,
+    file_load_manager: &mut crate::files::FileLoadManager,
+    source: PhotoSizeSource,
+    id: i64,
+    access_hash: i64,
+    file_reference: String,
+    dc_id: DcId,
+    owner_dialog_id: DialogId,
+    size_ptr: telegram_api::PhotoSize,
+    format: PhotoFormat,
+) -> PhotoSizeOrMinithumbnail {
+    let mut res = PhotoSize::default();
+    let mut format = format;
+    let type_str: String;
+    let mut content: Vec<u8> = Vec::new();
+    match size_ptr {
+        telegram_api::PhotoSize::photoSizeEmpty(_) => return PhotoSizeOrMinithumbnail::Size(res),
+        telegram_api::PhotoSize::photoSize(size) => {
+            type_str = size.r#type;
+            res.dimensions = get_dimensions(size.w, size.h, "photoSize");
+            res.size = size.size;
+        }
+        telegram_api::PhotoSize::photoCachedSize(size) => {
+            type_str = size.r#type;
+            res.dimensions = get_dimensions(size.w, size.h, "photoCachedSize");
+            res.size = size.bytes.len() as i32;
+            content = size.bytes;
+        }
+        telegram_api::PhotoSize::photoStrippedSize(size) => {
+            if format != PhotoFormat::Jpeg {
+                tdutils::log_error!(
+                    "Receive unexpected JPEG minithumbnail in photo {id} of format {format:?}"
+                );
+                return PhotoSizeOrMinithumbnail::Size(res);
+            }
+            // The packed bytes are binary; the module-wide minithumbnail
+            // representation is the lossy String (module docs)
+            return PhotoSizeOrMinithumbnail::Minithumbnail(
+                String::from_utf8_lossy(&size.bytes).into_owned(),
+            );
+        }
+        telegram_api::PhotoSize::photoSizeProgressive(mut size) => {
+            if size.sizes.is_empty() {
+                tdutils::log_error!("Receive photo {id} with empty progressive size");
+                return PhotoSizeOrMinithumbnail::Size(res);
+            }
+            size.sizes.sort_unstable();
+            type_str = size.r#type;
+            res.dimensions = get_dimensions(size.w, size.h, "photoSizeProgressive");
+            res.size = *size.sizes.last().unwrap();
+            size.sizes.pop();
+            res.progressive_sizes = size.sizes;
+        }
+        telegram_api::PhotoSize::photoPathSize(size) => {
+            if format != PhotoFormat::Tgs
+                && format != PhotoFormat::Webp
+                && format != PhotoFormat::Webm
+            {
+                tdutils::log_error!(
+                    "Receive unexpected SVG minithumbnail in photo {id} of format {format:?}"
+                );
+                return PhotoSizeOrMinithumbnail::Size(res);
+            }
+            return PhotoSizeOrMinithumbnail::Minithumbnail(
+                String::from_utf8_lossy(&size.bytes).into_owned(),
+            );
+        }
+    }
+
+    if type_str.len() != 1 {
+        tdutils::log_error!("Wrong photoSize \"{type_str}\"");
+        res.size_type = 0;
+    } else {
+        let mut int_type = type_str.as_bytes()[0] as i32;
+        if int_type >= 128 {
+            tdutils::log_error!("Wrong photoSize \"{int_type}\"");
+            int_type = 0;
+        }
+        res.size_type = int_type;
+    }
+    if format == PhotoFormat::Tgs {
+        if res.size_type == b's' as i32 {
+            format = PhotoFormat::Webp;
+        } else if res.size_type == b'v' as i32 {
+            format = PhotoFormat::Webm;
+        } else if res.size_type != b'a' as i32 {
+            tdutils::log_error!("Receive sticker set thumbnail of type {}", res.size_type);
+            format = PhotoFormat::Webp;
+        }
+    }
+    let mut source = source;
+    if let PhotoSizeSource::Thumbnail { thumbnail_type, .. } = &mut source {
+        *thumbnail_type = crate::files::PhotoSizeType::new(res.size_type);
+    }
+    if res.size < 0 || res.size > 1_000_000_000 {
+        tdutils::log_error!("Receive photo of size {}", res.size);
+        res.size = 0;
+    }
+
+    res.file_id = register_photo_size(
+        file_manager,
+        source,
+        id,
+        access_hash,
+        file_reference,
+        owner_dialog_id,
+        res.size,
+        dc_id,
+        format,
+    );
+    if !content.is_empty() {
+        file_manager.set_content(res.file_id, content, file_load_manager);
+    }
+    PhotoSizeOrMinithumbnail::Size(res)
+}
+
+/// `get_animation_size(Td *, ...)` (PhotoSize.cpp:275-303) — the
+/// FileManager-integrated form: the placeholder's classification plus the
+/// thumbnail-source retyping and the `register_photo_size` tail.
+#[allow(clippy::too_many_arguments)]
+pub fn get_animation_size_registered(
+    file_manager: &mut FileManager,
+    source: PhotoSizeSource,
+    id: i64,
+    access_hash: i64,
+    file_reference: String,
+    dc_id: DcId,
+    owner_dialog_id: DialogId,
+    size: telegram_api::videoSize,
+) -> AnimationSize {
+    let mut result = AnimationSize {
+        photo_size: PhotoSize::default(),
+        main_frame_timestamp: size.video_start_ts,
+    };
+    if size.r#type != "p" && size.r#type != "u" && size.r#type != "v" {
+        tdutils::log_error!("Unsupported videoSize \"{}\"", size.r#type);
+    }
+    // An empty type string reads the terminating zero, exactly like the
+    // C++ `size->type_[0]` on an empty std::string.
+    let mut type_ = size.r#type.as_bytes().first().copied().unwrap_or(0) as i32;
+    if type_ >= 128 {
+        tdutils::log_error!("Wrong videoSize \"{type_}\"");
+        type_ = 0;
+    }
+    result.photo_size.size_type = type_;
+    result.photo_size.dimensions = get_dimensions(size.w, size.h, "get_animation_size");
+    result.photo_size.size = size.size;
+
+    let mut source = source;
+    if let PhotoSizeSource::Thumbnail { thumbnail_type, .. } = &mut source {
+        *thumbnail_type = crate::files::PhotoSizeType::new(result.photo_size.size_type);
+    }
+    if result.photo_size.size < 0 || result.photo_size.size > 1_000_000_000 {
+        tdutils::log_error!("Receive animation of size {}", result.photo_size.size);
+        result.photo_size.size = 0;
+    }
+
+    result.photo_size.file_id = register_photo_size(
+        file_manager,
+        source,
+        id,
+        access_hash,
+        file_reference,
+        owner_dialog_id,
+        result.photo_size.size,
+        dc_id,
+        PhotoFormat::Mpeg4,
+    );
+    result
+}
+
+/// `get_secret_thumbnail_photo_size` (PhotoSize.cpp:139-156) — the
+/// encrypted-chat thumbnail: a random negative photo id registered as an
+/// encrypted thumbnail, the bytes parked in the FileManager content. The
+/// C++ `FileManager::set_content` reaches its `FileLoadManager` through
+/// the manager itself; the Rust `FileManager` takes it per call.
+pub fn get_secret_thumbnail_photo_size(
+    file_manager: &mut FileManager,
+    file_load_manager: &mut crate::files::FileLoadManager,
+    bytes: Vec<u8>,
+    owner_dialog_id: DialogId,
+    width: i32,
+    height: i32,
+) -> PhotoSize {
+    if bytes.is_empty() {
+        return PhotoSize::default();
+    }
+    let size_type = b't' as i32;
+    let dimensions = get_dimensions(width, height, "");
+    let size = bytes.len() as i32;
+
+    // generate some random remote location to save
+    let dc_id = DcId::invalid();
+    let photo_id = -(tdutils::random::secure_int64() & i64::MAX);
+
+    let file_id = file_manager.register_remote(
+        FullRemoteFileLocation::from_photo(
+            PhotoSizeSource::thumbnail(crate::files::FileType::EncryptedThumbnail, b't' as i32),
+            photo_id,
+            0,
+            dc_id,
+            String::new(),
+        ),
+        FileLocationSource::FromServer,
+        owner_dialog_id,
+        size as i64,
+        0,
+        format!("{}.jpg", photo_id as u64),
+    );
+    file_manager.set_content(file_id, bytes, file_load_manager);
+
+    PhotoSize {
+        size_type,
+        size,
+        dimensions,
+        file_id,
+        progressive_sizes: Vec::new(),
+    }
 }
 
 #[cfg(test)]

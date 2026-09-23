@@ -1192,9 +1192,16 @@ pub trait StoryManagerEnv {
         None
     }
 
-    /// `VideosManager::get_story_video_object` — [blocked: VideosManager];
-    /// `None` for the invalid file id.
+    /// `VideosManager::get_story_video_object` — flipped with M.28.
     fn videos_get_story_video_object(&mut self, file_id: FileId) -> Option<td_api::StoryVideo> {
+        let _ = file_id;
+        None
+    }
+
+    /// `VideosManager::get_video_object` (VideosManager.cpp:249-283) —
+    /// the full video object of the album icon; `None` for the invalid
+    /// file id.
+    fn videos_get_video_object(&mut self, file_id: FileId) -> Option<td_api::Video> {
         let _ = file_id;
         None
     }
@@ -6491,7 +6498,7 @@ impl StoryManager {
                 album.get_story_album_id(),
             );
             self.register_story_album(env, album_full_id, &album);
-            album_objects.push(album.get_story_album_object());
+            album_objects.push(album.get_story_album_object(env));
         }
         let result = td_api::StoryAlbums {
             albums: album_objects,
