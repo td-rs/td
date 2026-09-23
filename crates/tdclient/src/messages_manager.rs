@@ -22653,7 +22653,7 @@ pub fn replay_send_message_log_event(
         ctx.content_context_mut(),
         dialog_id,
         content,
-        crate::message_content::MessageContentDupType::Send,
+        crate::message_content_dup_type::MessageContentDupType::Send,
         false,
         crate::message_content::MessageCopyOptions::default(),
     );
