@@ -73,6 +73,9 @@ pub struct ConfigActions {
     /// `LinkManager::update_autologin_token` (ConfigManager.cpp:1196) —
     /// the token for the fan-out, `Some` when `process_config` ran.
     pub autologin_token: Option<String>,
+    /// `LinkManager::update_autologin_domains` (ConfigManager.cpp:2047) —
+    /// the three domain lists for the fan-out, applied per app config.
+    pub autologin_domains: Option<(Vec<String>, Vec<String>, Vec<String>)>,
     /// The manager fan-outs of `process_app_config` (M.3.9.2) — the C++
     /// `send_closure`s the Td applies to its
     /// [`crate::manager_option_states::ManagerOptionStates`], in the
@@ -95,6 +98,7 @@ impl ConfigActions {
             .connection_creator_dc_options
             .or(self.connection_creator_dc_options.take());
         self.autologin_token = other.autologin_token.or(self.autologin_token.take());
+        self.autologin_domains = other.autologin_domains.or(self.autologin_domains.take());
         self.manager_updates.extend(other.manager_updates);
         self.refresh_premium_options |= other.refresh_premium_options;
     }
@@ -1950,6 +1954,9 @@ impl ConfigManager {
         let mut dice_emoji_index: HashMap<String, usize> = HashMap::new();
         let mut dice_emoji_success_value: HashMap<String, String> = HashMap::new();
         let mut emoji_sounds: Vec<String> = Vec::new();
+        let mut autologin_domains: Vec<String> = Vec::new();
+        let mut url_auth_domains: Vec<String> = Vec::new();
+        let mut whitelisted_domains: Vec<String> = Vec::new();
         let mut animation_search_emojis = String::new();
         let mut animated_emoji_zoom = 0.0;
         let mut premium_features: Vec<String> = Vec::new();
@@ -2228,9 +2235,20 @@ impl ConfigManager {
                         continue;
                     }
                     "autologin_domains" | "url_auth_domains" | "whitelisted_domains" => {
-                        // LinkManager::update_autologin_domains — lands with
-                        // the LinkManager; the arrays are not stored.
-                        tdutils::log_debug!("Skip {key} until the LinkManager lands");
+                        // LinkManager::update_autologin_domains's three
+                        // arrays (ConfigManager.cpp:1703-1731).
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
+                            for domain in &array.value {
+                                let domain = get_json_value_string(domain, key);
+                                match key {
+                                    "autologin_domains" => autologin_domains.push(domain),
+                                    "url_auth_domains" => url_auth_domains.push(domain),
+                                    _ => whitelisted_domains.push(domain),
+                                }
+                            }
+                        } else {
+                            tdutils::log_error!("Receive unexpected {key} {value:?}");
+                        }
                         continue;
                     }
                     "round_video_encoding" => {
@@ -2606,10 +2624,12 @@ impl ConfigManager {
             telegram_api::jsonObject { value: new_values },
         ));
 
-        // The C++ fan-outs: LinkManager::update_autologin_domains stays
-        // skipped until the LinkManager (see the key handlers above);
+        // The C++ fan-outs: LinkManager::update_autologin_domains
+        // (ConfigManager.cpp:2047) is carried for the Td's LinkManager;
         // the three M.3.9.2 fan-outs (ConfigManager.cpp:2050-2059) are
         // carried for the Td's manager states.
+        actions.autologin_domains =
+            Some((autologin_domains, url_auth_domains, whitelisted_domains));
         actions
             .manager_updates
             .push(ManagerUpdate::TrialParameters {

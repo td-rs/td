@@ -1132,7 +1132,7 @@ mod tests {
     use super::*;
 
     use super::*;
-    use crate::chat_manager::MessageId;
+    use crate::messages_manager::MessageId;
     use crate::dialog_id::{DialogId, MessageFullId};
     use crate::files::FileId;
     use tdutils::promise::{Promise, PromiseInterface};
@@ -1468,8 +1468,10 @@ mod tests {
         let mut manager = TranscriptionManager::default();
 
         // Unauthorized: dropped, like the C++ guard.
+        env.authorized = false;
         manager.on_update_trial_parameters(&mut env, 10, 300, 2000);
         assert!(env.updates.is_empty());
+        env.authorized = true;
 
         // First application: the negatives clamp at zero, the left tries
         // carry (and clamp), the pmc write lands, the update is carried and
@@ -1549,12 +1551,13 @@ mod tests {
         );
         assert!(manager.message_file_ids.contains_key(&full_id(1, 1 << 21)));
 
-        // A second message over the same file joins the set.
+        // A second message over the same file joins the set (a clean
+        // server id — bit 4 is the scheduled mark, not a counter).
         manager.register_voice(
             &env,
             FileId::new(3, 0),
             TranscriptionKind::VoiceNote,
-            full_id(1, (1 << 21) + 4),
+            full_id(1, 3 << 21),
             "test",
         );
         assert_eq!(
@@ -1629,7 +1632,7 @@ mod tests {
                 .map(|ids| ids.len()),
             Some(1)
         );
-        manager.unregister_voice(&env, FileId::new(3, 0), full_id(1, (1 << 21) + 4), "test");
+        manager.unregister_voice(&env, FileId::new(3, 0), full_id(1, 3 << 21), "test");
         assert!(manager.voice_messages.is_empty());
         assert!(manager.message_file_ids.is_empty());
 
@@ -1877,9 +1880,24 @@ mod tests {
     #[test]
     fn test_on_transcribed_audio_trial_table() {
         // The `flags.1` pair lands the trial numbers, clamped through
-        // update_left_tries at the standing weekly number.
+        // update_left_tries at the standing weekly number. The answer
+        // flows through the final-transcription path first, so the info
+        // must carry a pending query (the C++
+        // CHECK(!speech_recognition_queries_.empty()) precondition): the
+        // recognize step parks it.
         let mut env = TestTranscriptionEnv::new();
         let mut manager = TranscriptionManager::default();
+        env.messages.push(full_id(1, 1 << 21));
+        env.register_info(3, TranscriptionInfo::default());
+        manager.register_voice(
+            &env,
+            FileId::new(3, 0),
+            TranscriptionKind::VoiceNote,
+            full_id(1, 1 << 21),
+            "test",
+        );
+        let (_, promise) = FlagPromise::<()>::create();
+        manager.recognize_speech(&mut env, full_id(1, 1 << 21), promise);
         manager.on_update_trial_parameters(&mut env, 10, 300, 0);
         // Restart the counter so the carried tries are 10.
         env.unix_time += 1;
@@ -1893,7 +1911,7 @@ mod tests {
             tdutils::status::Result::Ok(telegram_api::messages_TranscribedAudio {
                 flags: 1 << 1,
                 pending: false,
-                transcription_id: 0,
+                transcription_id: 7,
                 text: String::new(),
                 trial_remains_num: 7,
                 trial_remains_until_date: 5555,
