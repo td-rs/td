@@ -59,7 +59,50 @@ fn normalize(stderr: &str) -> Vec<String> {
         }
         out.push(s);
     }
-    out
+    // The eager-Td startup plane (the Track J eager `td_create_client_id`
+    // fix) races the command processing, and the auto-config answers'
+    // `system_version` follows the host — filter those blocks out instead
+    // of baking the racy transcript into the goldens. The S81 bindings
+    // smoke covers the startup update itself.
+    let mut filtered: Vec<String> = Vec::new();
+    let mut pending_header: Option<String> = None;
+    let mut skip_lines = 0usize;
+    let mut in_failed_send = false;
+    for line in &out {
+        if in_failed_send {
+            // inside a `Failed to send: ...` request dump; the block ends
+            // at the bare `}` that closes the request object
+            if line == "}" {
+                in_failed_send = false;
+            }
+            continue;
+        }
+        if line.contains("Failed to send: ") {
+            in_failed_send = true;
+            continue;
+        }
+        if skip_lines > 0 {
+            skip_lines -= 1;
+            continue;
+        }
+        if let Some(header) = pending_header.take() {
+            if line.contains("authorizationStateWaitTdlibParameters")
+                || line.contains("authorizationStateClosing")
+            {
+                // the whole 4-line update block (header, state line, the
+                // two closers) is racy — drop it
+                skip_lines = 2;
+                continue;
+            }
+            filtered.push(header);
+        }
+        if line.contains("updateAuthorizationState {") {
+            pending_header = Some(line.clone());
+            continue;
+        }
+        filtered.push(line.clone());
+    }
+    filtered
 }
 
 struct Session {
@@ -150,6 +193,10 @@ const UNKNOWN_HELLO: &str =
 /// `Ready to stop`).
 const CREATING_TD: &str =
     "[ 2][t 1][ts][cli.rs][!CliClient]\tCreating new Td ClientActor1 with generation 1";
+
+/// The CLI answers the startup state with the auto-config requests; after
+/// `q` tore the client down (or the pipe closed), the sends fail — the
+
 const QUIT_TAIL: &[&str] = &[
     "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
     "[ 2][t 1][ts][cli.rs][!CliClient]\tupdateAuthorizationState {",
