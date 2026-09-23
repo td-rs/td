@@ -9,6 +9,7 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod channel_recommendation_manager;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
@@ -52,6 +53,7 @@ pub mod store_parse;
 pub mod synchronous_requests;
 pub mod td;
 pub mod time_zone_manager;
+pub mod top_dialog_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;

@@ -558,6 +558,19 @@ pub fn search_strings_by_prefix(
     )
 }
 
+/// `get_vector_hash` (misc.cpp:301-311) — the top-peer id fold behind the
+/// `contacts_getTopPeers` hash argument (M.27).
+pub fn get_vector_hash(numbers: &[u64]) -> i64 {
+    let mut acc: u64 = 0;
+    for number in numbers {
+        acc ^= acc >> 21;
+        acc ^= acc << 35;
+        acc ^= acc >> 4;
+        acc = acc.wrapping_add(*number);
+    }
+    acc as i64
+}
+
 #[cfg(test)]
 mod search_strings_by_prefix_tests {
     use super::search_strings_by_prefix;

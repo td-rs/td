@@ -692,6 +692,91 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             search_contacts_request(td, id, query, request.limit);
         }
+        // --- the top-dialog + recommendation set (M.27): Requests.cpp:3230-3243,
+        // 3182-3212. The managers validate; the net query tails park the promises
+        // unanswered offline, exactly like the C++ request without a network ---
+        Function::getTopChats(request) => {
+            // Requests.cpp:3230-3235
+            if !check_is_user(td, id) {
+                return;
+            }
+            let category =
+                crate::top_dialog_manager::get_top_dialog_category_from_td_api(&request.category);
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(td);
+            top_dialog_manager.get_top_dialogs(&mut env, category, request.limit, promise);
+        }
+        Function::removeTopChat(request) => {
+            // Requests.cpp:3237-3242
+            if !check_is_user(td, id) {
+                return;
+            }
+            let category =
+                crate::top_dialog_manager::get_top_dialog_category_from_td_api(&request.category);
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(td);
+            top_dialog_manager.remove_dialog(
+                &mut env,
+                category,
+                DialogId::new(request.chat_id),
+                promise,
+            );
+        }
+        Function::getRecommendedChats(_request) => {
+            // Requests.cpp:3182-3186
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.get_recommended_channels(&mut env, promise);
+        }
+        Function::getChatSimilarChats(request) => {
+            // Requests.cpp:3188-3192
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.get_channel_recommendations(
+                &mut env,
+                DialogId::new(request.chat_id),
+                false,
+                Some(promise),
+                None,
+            );
+        }
+        Function::getChatSimilarChatCount(request) => {
+            // Requests.cpp:3194-3199 — the CREATE_COUNT_REQUEST_PROMISE band
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<i32, _>(id, |count| Object::count(td_api::Count { count }));
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.get_channel_recommendations(
+                &mut env,
+                DialogId::new(request.chat_id),
+                request.return_local,
+                None,
+                Some(promise),
+            );
+        }
+        Function::openChatSimilarChat(request) => {
+            // Requests.cpp:3201-3207
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.open_channel_recommended_channel(
+                &mut env,
+                DialogId::new(request.chat_id),
+                DialogId::new(request.opened_chat_id),
+                promise,
+            );
+        }
+
         Function::addContact(request) => {
             // Requests.cpp:6611-6620 + `get_contact` (Contact.cpp:142-156):
             // the importedContact variant has no vcard and carries the
@@ -2180,9 +2265,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            116,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 888, "interim count");
     }
 }

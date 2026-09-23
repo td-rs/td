@@ -326,8 +326,8 @@ getChatRevenueStatistics	interim
 getChatRevenueTransactions	interim
 getChatRevenueWithdrawalUrl	interim
 getChatScheduledMessages	interim
-getChatSimilarChatCount	interim
-getChatSimilarChats	interim
+getChatSimilarChatCount	dispatched
+getChatSimilarChats	dispatched
 getChatSparseMessagePositions	interim
 getChatSponsoredMessages	interim
 getChatStatistics	interim
@@ -496,7 +496,7 @@ getRecentStickers	interim
 getRecentlyOpenedChats	dispatched
 getRecentlyVisitedTMeUrls	interim
 getRecommendedChatFolders	interim
-getRecommendedChats	interim
+getRecommendedChats	dispatched
 getRecoveryEmailAddress	interim
 getRemoteFile	dispatched
 getRepliedMessage	interim
@@ -553,7 +553,7 @@ getThemedChatEmojiStatuses	interim
 getThemedEmojiStatuses	interim
 getTimeZones	interim
 getTonTransactions	interim
-getTopChats	interim
+getTopChats	dispatched
 getTrendingStickerSets	interim
 getUpgradedGift	interim
 getUpgradedGiftEmojiStatuses	interim
@@ -609,7 +609,7 @@ logOut	interim
 markChecklistTasksAsDone	interim
 openBotSimilarBot	interim
 openChat	interim
-openChatSimilarChat	interim
+openChatSimilarChat	dispatched
 openGiftAuction	interim
 openMessageContent	interim
 openSponsoredChat	interim
@@ -674,7 +674,7 @@ removeSearchedForTag	interim
 removeStickerFromSet	interim
 removeStoryAlbumStories	interim
 removeTextCompositionStyle	interim
-removeTopChat	interim
+removeTopChat	dispatched
 removeWebBrowserSettingsException	interim
 reorderActiveUsernames	dispatched
 reorderBotActiveUsernames	interim
