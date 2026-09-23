@@ -168,8 +168,8 @@ deleteChatReplyMarkup	interim
 deleteChatWelcomeMessage	interim
 deleteCommands	dispatched
 deleteDefaultBackground	interim
-deleteDirectMessagesChatTopicHistory	interim
-deleteDirectMessagesChatTopicMessagesByDate	interim
+deleteDirectMessagesChatTopicHistory	dispatched
+deleteDirectMessagesChatTopicMessagesByDate	dispatched
 deleteEphemeralMessage	dispatched
 deleteFile	interim
 deleteForumTopic	dispatched
@@ -187,8 +187,8 @@ deleteQuickReplyShortcut	dispatched
 deleteQuickReplyShortcutMessages	dispatched
 deleteRevokedChatInviteLink	interim
 deleteSavedCredentials	dispatched
-deleteSavedMessagesTopicHistory	interim
-deleteSavedMessagesTopicMessagesByDate	interim
+deleteSavedMessagesTopicHistory	dispatched
+deleteSavedMessagesTopicMessagesByDate	dispatched
 deleteSavedOrderInfo	dispatched
 deleteStickerSet	interim
 deleteStory	dispatched
@@ -360,10 +360,10 @@ getDefaultChatPhotoCustomEmojiStickers	interim
 getDefaultEmojiStatuses	interim
 getDefaultMessageAutoDeleteTime	interim
 getDefaultProfilePhotoCustomEmojiStickers	interim
-getDirectMessagesChatTopic	interim
-getDirectMessagesChatTopicHistory	interim
-getDirectMessagesChatTopicMessageByDate	interim
-getDirectMessagesChatTopicRevenue	interim
+getDirectMessagesChatTopic	dispatched
+getDirectMessagesChatTopicHistory	dispatched
+getDirectMessagesChatTopicMessageByDate	dispatched
+getDirectMessagesChatTopicRevenue	dispatched
 getDisallowedChatEmojiStatuses	interim
 getEmojiCategories	interim
 getEmojiReaction	dispatched
@@ -436,7 +436,7 @@ getMe	dispatched
 getMenuButton	dispatched
 getMessage	interim
 getMessageAddedReactions	interim
-getMessageAuthor	interim
+getMessageAuthor	dispatched
 getMessageAvailableReactions	interim
 getMessageEffect	dispatched
 getMessageEmbeddingCode	dispatched
@@ -502,8 +502,8 @@ getRemoteFile	dispatched
 getRepliedMessage	interim
 getSavedAnimations	dispatched
 getSavedMessagesTags	dispatched
-getSavedMessagesTopicHistory	interim
-getSavedMessagesTopicMessageByDate	interim
+getSavedMessagesTopicHistory	dispatched
+getSavedMessagesTopicMessageByDate	dispatched
 getSavedNotificationSound	interim
 getSavedNotificationSounds	interim
 getSavedOrderInfo	dispatched
@@ -600,11 +600,11 @@ loadActiveStories	dispatched
 loadChatWelcomeMessages	interim
 loadChats	interim
 loadCommunityFullInfo	interim
-loadDirectMessagesChatTopics	interim
+loadDirectMessagesChatTopics	dispatched
 loadGroupCallParticipants	dispatched
 loadQuickReplyShortcutMessages	interim
 loadQuickReplyShortcuts	interim
-loadSavedMessagesTopics	interim
+loadSavedMessagesTopics	dispatched
 logOut	interim
 markChecklistTasksAsDone	dispatched
 openBotSimilarBot	dispatched
@@ -633,7 +633,7 @@ rateSpeechRecognition	dispatched
 readAllChatMentions	dispatched
 readAllChatPollVotes	interim
 readAllChatReactions	interim
-readAllDirectMessagesChatTopicReactions	interim
+readAllDirectMessagesChatTopicReactions	dispatched
 readAllForumTopicMentions	dispatched
 readAllForumTopicPollVotes	interim
 readAllForumTopicReactions	interim
@@ -854,7 +854,7 @@ setDefaultChannelAdministratorRights	dispatched
 setDefaultGroupAdministratorRights	dispatched
 setDefaultMessageAutoDeleteTime	interim
 setDefaultReactionType	dispatched
-setDirectMessagesChatTopicIsMarkedAsUnread	interim
+setDirectMessagesChatTopicIsMarkedAsUnread	dispatched
 setEmojiStatus	dispatched
 setFileGenerationProgress	dispatched
 setForumTopicNotificationSettings	dispatched
@@ -891,7 +891,7 @@ setPersonalChat	interim
 setPinnedChats	interim
 setPinnedForumTopics	dispatched
 setPinnedGifts	dispatched
-setPinnedSavedMessagesTopics	interim
+setPinnedSavedMessagesTopics	dispatched
 setPollAnswer	dispatched
 setProfileAccentColor	interim
 setProfileAudioPosition	dispatched
@@ -968,7 +968,7 @@ toggleChatIsMarkedAsUnread	interim
 toggleChatIsPinned	interim
 toggleChatIsTranslatable	interim
 toggleChatViewAsTopics	interim
-toggleDirectMessagesChatTopicCanSendUnpaidMessages	interim
+toggleDirectMessagesChatTopicCanSendUnpaidMessages	dispatched
 toggleDownloadIsPaused	dispatched
 toggleForumTopicIsClosed	dispatched
 toggleForumTopicIsPinned	dispatched
@@ -981,7 +981,7 @@ toggleGroupCallParticipantIsHandRaised	dispatched
 toggleGroupCallParticipantIsMuted	dispatched
 toggleGroupCallScreenSharingIsPaused	dispatched
 toggleHasSponsoredMessagesEnabled	dispatched
-toggleSavedMessagesTopicIsPinned	interim
+toggleSavedMessagesTopicIsPinned	dispatched
 toggleSessionCanAcceptCalls	dispatched
 toggleSessionCanAcceptSecretChats	dispatched
 toggleStoryIsPostedToChatPage	dispatched
@@ -1007,7 +1007,7 @@ translateMessageText	interim
 translateRichMessage	dispatched
 translateText	dispatched
 unpinAllChatMessages	interim
-unpinAllDirectMessagesChatTopicMessages	interim
+unpinAllDirectMessagesChatTopicMessages	dispatched
 unpinAllForumTopicMessages	interim
 unpinChatMessage	interim
 upgradeBasicGroupChatToSupergroupChat	dispatched

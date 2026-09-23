@@ -125,6 +125,7 @@ pub mod requested_dialog_type;
 pub mod requests;
 pub mod restriction_reason;
 pub mod rich_button_style;
+pub mod saved_messages_manager;
 pub mod secret_chat;
 pub mod secret_chats_manager;
 pub mod secure_manager;
