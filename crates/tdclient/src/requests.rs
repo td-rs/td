@@ -970,6 +970,92 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             search_contacts_request(td, id, query, request.limit);
         }
+        // --- the top-dialog + recommendation set (M.27): Requests.cpp:3230-3243,
+        // 3182-3212. The managers validate; the net query tails park the promises
+        // unanswered offline, exactly like the C++ request without a network ---
+        Function::getTopChats(request) => {
+            // Requests.cpp:3230-3235
+            if !check_is_user(td, id) {
+                return;
+            }
+            let category = crate::top_dialog_manager::get_top_dialog_category_from_td_api(
+                request.category.as_ref(),
+            );
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(td);
+            top_dialog_manager.get_top_dialogs(&mut env, category, request.limit, promise);
+        }
+        Function::removeTopChat(request) => {
+            // Requests.cpp:3237-3242
+            if !check_is_user(td, id) {
+                return;
+            }
+            let category = crate::top_dialog_manager::get_top_dialog_category_from_td_api(
+                request.category.as_ref(),
+            );
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(td);
+            top_dialog_manager.remove_dialog(
+                &mut env,
+                category,
+                MmDialogId::new(request.chat_id),
+                promise,
+            );
+        }
+        Function::getRecommendedChats(_request) => {
+            // Requests.cpp:3182-3186
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.get_recommended_channels(&mut env, promise);
+        }
+        Function::getChatSimilarChats(request) => {
+            // Requests.cpp:3188-3192
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.get_channel_recommendations(
+                &mut env,
+                MmDialogId::new(request.chat_id),
+                false,
+                Some(promise),
+                None,
+            );
+        }
+        Function::getChatSimilarChatCount(request) => {
+            // Requests.cpp:3194-3199 — the CREATE_COUNT_REQUEST_PROMISE band
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<i32, _>(id, |count| Object::count(td_api::Count { count }));
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.get_channel_recommendations(
+                &mut env,
+                MmDialogId::new(request.chat_id),
+                request.return_local,
+                None,
+                Some(promise),
+            );
+        }
+        Function::openChatSimilarChat(request) => {
+            // Requests.cpp:3201-3207
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
+            recommendation_manager.open_channel_recommended_channel(
+                &mut env,
+                MmDialogId::new(request.chat_id),
+                MmDialogId::new(request.opened_chat_id),
+                promise,
+            );
+        }
         // --- the inline set (M.21): Requests.cpp:4342-4386, 4917-4941,
         // 8195-8233, 4737-4740. The managers validate; the net query tails park
         // the promises unanswered offline, exactly like the C++ request without
@@ -4040,7 +4126,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
-        // Everything else waits for its manager step.
         _ => run_forum_topic_requests(td, id, function),
     }
 }
@@ -4276,7 +4361,6 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
             promise.set_value(());
         }
 
-        // Everything else waits for its manager step.
         // Everything else waits for its manager step.
         _ => run_story_requests(td, id, function),
     }
@@ -5240,7 +5324,6 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
-        // Everything else waits for its manager step.
         // Everything else waits for its manager step.
         // Everything else waits for its manager step; the M.42 star gift
         // group follows in its own frame (see the frame note above).
@@ -9743,35 +9826,34 @@ mod request_census_tests {
         // The scheme size from the S07 differential dump.
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
-        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
-        // merge: the m11 pins + M.13/M.13S's seven real dispatches
-        // (removeNotification, removeNotificationGroup, registerDevice and
-        // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder) + M.12.10's eighteen file-plane
-        // dispatches (getFile/getRemoteFile, the download/upload/
-        // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms) + M.20's three saved-animations arms
-        // (getSavedAnimations, addSavedAnimation, removeSavedAnimation).
-        // Fix per flip.
-        // The flip-state ledger — re-derived from the fixture at the wave-3
-        // integration (the per-track flip histories compose) + M.23's ten
-        // LinkManager dispatches (getDeepLinkInfo, getExternalLink,
-        // getExternalLinkInfo, getRecentlyVisitedTMeUrls, the two login-url
-        // arms and the four oauth arms) + M.20's three saved-animations
-        // arms (getSavedAnimations, addSavedAnimation,
-        // removeSavedAnimation) + M.24's nine language-pack
-        // dispatches (getLocalizationTargetInfo, getLanguagePackInfo,
+        // The flip-state ledger — re-derived from the fixture at each
+        // integration (the per-track flip histories compose): the m11 pins +
+        // M.13/M.13S's seven real dispatches (removeNotification,
+        // removeNotificationGroup, registerDevice and the four
+        // notification-settings arms; processPushNotification stays the 500
+        // placeholder) + M.12.10's eighteen file-plane dispatches
+        // (getFile/getRemoteFile, the download/upload/generation arms, the
+        // DownloadManager list plane and the four storage-statistics arms) +
+        // M.23's ten LinkManager dispatches (getDeepLinkInfo,
+        // getExternalLink, getExternalLinkInfo, getRecentlyVisitedTMeUrls,
+        // the two login-url arms and the four oauth arms) + M.20's three
+        // saved-animations arms (getSavedAnimations, addSavedAnimation,
+        // removeSavedAnimation) + M.24's nine language-pack dispatches
+        // (getLocalizationTargetInfo, getLanguagePackInfo,
         // getLanguagePackStrings, synchronizeLanguagePack,
         // addCustomServerLanguagePack, setCustomLanguagePack,
         // editCustomLanguagePackInfo, setCustomLanguagePackString,
         // deleteLanguagePack) and getLanguagePackString moving to the
-        // synchronous set. Fix per flip.
+        // synchronous set + M.27's six top-dialog/recommendation dispatches
+        // (getTopChats, removeTopChat, getRecommendedChats,
+        // getChatSimilarChats, getChatSimilarChatCount,
+        // openChatSimilarChat). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            479,
+            485,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 523, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 517, "interim count");
     }
 }

@@ -12466,7 +12466,7 @@ impl ChatManager {
     /// `get_input_channel` (ChatManager.cpp:2744-2769). The
     /// `inputChannelFromMessage` branch needs `get_simple_input_peer`
     /// (M.5.33) — unreachable until `channel_messages_` is fed (M.5.43).
-    fn get_input_channel(
+    pub(crate) fn get_input_channel(
         &self,
         env: &UserEnv,
         channel_id: ChannelId,
