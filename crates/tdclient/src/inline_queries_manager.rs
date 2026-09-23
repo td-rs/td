@@ -19,9 +19,9 @@
 //! - `process_input_message_text` — ported here (the function is
 //!   self-contained over the landed MessageEntity plane); it lifts to the
 //!   M.9 InputMessageText module at that integration.
-//! - `get_input_reply_markup` — `[blocked: M.22]` (ReplyMarkup track); a
-//!   non-null markup collapses to "no markup" in the built payloads
-//!   (which never send offline).
+//! - `get_input_reply_markup` / `get_input_keyboard_button` — the M.22
+//!   reply-markup plane (landed: `reply_markup.rs`/`keyboard_button.rs`);
+//!   the intakes ride the env ([`InlineQueriesManagerEnv::get_input_reply_markup`]).
 //! - `RichMessage`/`InputInvoice` conversions — `[blocked: M.17]` /
 //!   Wave-3 payments; both park the request at the seam (`Ok(None)`).
 //! - `create_inline_message_content` — `[blocked: M.9]`: the real record
@@ -766,20 +766,23 @@ pub trait InlineQueriesManagerEnv {
         promise: Promise<td_api::InlineMessageId>,
     );
 
-    // -- the unlanded-plane seams
+    // -- the M.22 reply-markup plane intakes
     /// `KeyboardButton::get_keyboard_button(button, true)` +
-    /// `get_input_keyboard_button` — `[blocked: M.22]`; `None` parks the
-    /// caller's request.
+    /// `get_input_keyboard_button` (KeyboardButton.{h,cpp}) — the M.22
+    /// plane; validation errors reach the caller's promise (the C++
+    /// TRY_RESULT_PROMISE band at InlineQueriesManager.cpp:814).
     fn get_input_keyboard_button(
         &mut self,
         button: &td_api::KeyboardButton,
-    ) -> Option<telegram_api::KeyboardButton>;
-    /// `get_inline_reply_markup` + `get_input_reply_markup` —
-    /// `[blocked: M.22]`; a non-null markup collapses to no markup (the
-    /// C++ validation error texts for the record plane land with M.22).
+    ) -> Result<telegram_api::KeyboardButton, Status>;
+    /// `get_inline_reply_markup` (ReplyMarkup.cpp:319-322) composed with
+    /// the null-safe `get_input_reply_markup` (ReplyMarkup.cpp:495-502) —
+    /// the M.22 plane.
     fn get_input_reply_markup(
         &mut self,
         reply_markup: Option<td_api::ReplyMarkup>,
+        is_bot: bool,
+        switch_inline_buttons_allowed: bool,
     ) -> Result<Option<telegram_api::ReplyMarkup>, Status>;
     /// `RichMessage::get_rich_message` + `get_input_rich_message` —
     /// `[blocked: M.17]`; `Ok(None)` parks the caller's request.
@@ -1338,9 +1341,9 @@ impl InlineQueriesManager {
     }
 
     /// `save_prepared_keyboard_button` (InlineQueriesManager.cpp:811-819).
-    /// The `KeyboardButton::get_keyboard_button` record plane is
-    /// `[blocked: M.22]` — the request parks at the seam with the C++
-    /// input-user validation already applied.
+    /// The button intake rides the M.22 plane
+    /// ([`InlineQueriesManagerEnv::get_input_keyboard_button`]); the
+    /// validation errors take the C++ TRY_RESULT_PROMISE band.
     pub fn save_prepared_keyboard_button(
         &mut self,
         env: &mut impl InlineQueriesManagerEnv,
@@ -1360,16 +1363,14 @@ impl InlineQueriesManager {
             return;
         };
         match env.get_input_keyboard_button(&button) {
-            Some(input_button) => {
+            Ok(input_button) => {
                 let query = telegram_api::bots_requestWebViewButton {
                     user_id: Some(input_user),
                     button: Some(input_button),
                 };
                 env.send_save_prepared_keyboard_button_query(query, promise);
             }
-            None => {
-                // the promise lands in the [blocked: M.22] seam
-            }
+            Err(status) => promise.set_error(status),
         }
     }
 
@@ -2615,7 +2616,8 @@ impl InlineQueriesManager {
         let Some(input_message_content) = input_message_content else {
             return Err(Status::error(400, "Inline message must be non-empty"));
         };
-        let input_reply_markup = env.get_input_reply_markup(reply_markup_ptr)?;
+        let is_bot = env.auth_is_bot();
+        let input_reply_markup = env.get_input_reply_markup(reply_markup_ptr, is_bot, true)?;
 
         match input_message_content.as_ref() {
             td_api::InputMessageContent::inputMessageText(_) => {
@@ -2954,7 +2956,8 @@ impl InlineQueriesManager {
                 )?;
             }
             td_api::InputInlineQueryResult::inputInlineQueryResultGame(game) => {
-                let input_reply_markup = env.get_input_reply_markup(game.reply_markup)?;
+                let input_reply_markup =
+                    env.get_input_reply_markup(game.reply_markup, true, true)?;
                 let mut flags = 0;
                 if input_reply_markup.is_some() {
                     flags |= MASK_REPLY_MARKUP;
