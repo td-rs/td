@@ -62,6 +62,7 @@ pub mod dh_cache;
 pub mod dialog_db;
 pub mod dialog_id;
 pub mod dialog_filter_manager;
+pub mod dialog_invite_link_manager;
 pub mod dialog_manager;
 pub mod dialog_participant_filter;
 pub mod dialog_participant_manager;

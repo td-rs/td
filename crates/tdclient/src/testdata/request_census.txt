@@ -77,7 +77,7 @@ checkAuthenticationPremiumPurchase	interim
 checkAuthenticationWebToken	interim
 checkBotUsername	dispatched
 checkChatFolderInviteLink	dispatched
-checkChatInviteLink	interim
+checkChatInviteLink	dispatched
 checkChatUsername	dispatched
 checkCreatedPublicChatsLimit	interim
 checkEmailAddressVerificationCode	interim
@@ -124,8 +124,8 @@ createBusinessChatLink	dispatched
 createCall	dispatched
 createChatFolder	dispatched
 createChatFolderInviteLink	dispatched
-createChatInviteLink	interim
-createChatSubscriptionInviteLink	interim
+createChatInviteLink	dispatched
+createChatSubscriptionInviteLink	dispatched
 createCommunity	dispatched
 createForumTopic	dispatched
 createGiftCollection	dispatched
@@ -151,7 +151,7 @@ deleteAccount	interim
 deleteAllCallMessages	dispatched
 deleteAllChatWelcomeMessages	interim
 deleteAllRecentMessageReactionsFromSender	dispatched
-deleteAllRevokedChatInviteLinks	interim
+deleteAllRevokedChatInviteLinks	dispatched
 deleteBotMediaPreviews	dispatched
 deleteBusinessChatLink	dispatched
 deleteBusinessConnectedBot	dispatched
@@ -185,7 +185,7 @@ deletePollOption	dispatched
 deleteProfilePhoto	interim
 deleteQuickReplyShortcut	dispatched
 deleteQuickReplyShortcutMessages	dispatched
-deleteRevokedChatInviteLink	interim
+deleteRevokedChatInviteLink	dispatched
 deleteSavedCredentials	dispatched
 deleteSavedMessagesTopicHistory	dispatched
 deleteSavedMessagesTopicMessagesByDate	dispatched
@@ -215,8 +215,8 @@ editBusinessStory	dispatched
 editCallbackQueryMessage	dispatched
 editChatFolder	dispatched
 editChatFolderInviteLink	dispatched
-editChatInviteLink	interim
-editChatSubscriptionInviteLink	interim
+editChatInviteLink	dispatched
+editChatSubscriptionInviteLink	dispatched
 editChatWelcomeMessage	interim
 editCustomLanguagePackInfo	dispatched
 editEphemeralMessage	dispatched
@@ -307,10 +307,10 @@ getChatFolderDefaultIconName	sync
 getChatFolderInviteLinks	dispatched
 getChatFolderNewChats	dispatched
 getChatHistory	dispatched
-getChatInviteLink	interim
-getChatInviteLinkCounts	interim
-getChatInviteLinkMembers	interim
-getChatInviteLinks	interim
+getChatInviteLink	dispatched
+getChatInviteLinkCounts	dispatched
+getChatInviteLinkMembers	dispatched
+getChatInviteLinks	dispatched
 getChatJoinRequests	dispatched
 getChatListsToAddChat	interim
 getChatMember	dispatched
@@ -588,7 +588,7 @@ inviteVideoChatParticipants	dispatched
 isLoginEmailAddressRequired	dispatched
 isProfileAudio	dispatched
 joinChat	dispatched
-joinChatByInviteLink	interim
+joinChatByInviteLink	dispatched
 joinGroupCall	dispatched
 joinLiveStory	dispatched
 joinVideoChat	dispatched
@@ -688,7 +688,7 @@ reorderStoryAlbumStories	dispatched
 reorderStoryAlbums	dispatched
 reorderSupergroupActiveUsernames	dispatched
 replaceLiveStoryRtmpUrl	dispatched
-replacePrimaryChatInviteLink	interim
+replacePrimaryChatInviteLink	dispatched
 replaceStickerInSet	interim
 replaceVideoChatRtmpUrl	dispatched
 reportAuthenticationCodeMissing	interim
@@ -717,7 +717,7 @@ resetInstalledBackgrounds	interim
 resetNetworkStatistics	interim
 resetPassword	interim
 reuseStarSubscription	interim
-revokeChatInviteLink	interim
+revokeChatInviteLink	dispatched
 revokeGroupCallInviteLink	dispatched
 saveApplicationLogEvent	interim
 savePreparedInlineMessage	dispatched

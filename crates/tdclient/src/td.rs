@@ -2311,6 +2311,9 @@ pub struct Td {
     /// `Td::dialog_filter_manager_` (Td.cpp).
     pub(crate) dialog_filter_manager:
         crate::dialog_filter_manager::DialogFilterManager,
+    /// `Td::dialog_invite_link_manager_` (Td.cpp).
+    pub(crate) dialog_invite_link_manager:
+        crate::dialog_invite_link_manager::DialogInviteLinkManager,
     /// `Td::channel_recommendation_manager_` (Td.cpp:1278, M.27).
     pub(crate) channel_recommendation_manager:
         crate::channel_recommendation_manager::ChannelRecommendationManager,
@@ -2675,6 +2678,8 @@ impl Td {
                 crate::saved_messages_manager::SavedMessagesManager::new(),
             dialog_filter_manager:
                 crate::dialog_filter_manager::DialogFilterManager::new(),
+            dialog_invite_link_manager:
+                crate::dialog_invite_link_manager::DialogInviteLinkManager::new(),
             channel_recommendation_manager:
                 crate::channel_recommendation_manager::ChannelRecommendationManager::new(),
             web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
@@ -15393,6 +15398,195 @@ impl crate::dialog_filter_manager::DialogFilterManagerEnv for TdDialogFilterEnv<
     ) {
     }
     fn send_get_recommended_dialog_filters(&mut self) {}
+}
+
+pub(crate) fn dialog_invite_link_env_split(
+    td: &mut Td,
+) -> (
+    TdDialogInviteLinkEnv<'_>,
+    &mut crate::dialog_invite_link_manager::DialogInviteLinkManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        dialog_invite_link_manager,
+        ..
+    } = td;
+    (
+        TdDialogInviteLinkEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        dialog_invite_link_manager,
+    )
+}
+
+pub(crate) struct TdDialogInviteLinkEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::dialog_invite_link_manager::DialogInviteLinkManagerEnv for TdDialogInviteLinkEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn my_user_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        let has = match dialog_id.get_type() {
+            crate::chat_manager::DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            crate::chat_manager::DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            crate::chat_manager::DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            crate::chat_manager::DialogType::SecretChat
+            | crate::chat_manager::DialogType::None => false,
+        };
+        if has {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_chat_is_active(&mut self, chat_id: crate::chat_manager::ChatId) -> bool {
+        self.chat_manager.get_chat_is_active(chat_id)
+    }
+
+    fn get_chat_status(
+        &mut self,
+        chat_id: crate::chat_manager::ChatId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_chat_status(chat_id)
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn is_channel_megagroup(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_megagroup)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return Err(tdutils::status::Status::error(500, "Client is closing"));
+        };
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn send_check_dialog_invite_link(&mut self, _invite_link: String) {}
+    fn send_import_dialog_invite_link(&mut self, _invite_link: String) {}
+    fn send_export_dialog_invite_link(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _title: String,
+        _expire_date: i32,
+        _usage_limit: i32,
+        _creates_join_request: bool,
+        _subscription_pricing: crate::chat_manager::StarSubscriptionPricing,
+        _is_permanent: bool,
+    ) {
+    }
+    fn send_edit_dialog_invite_link(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _invite_link: String,
+        _title: String,
+        _expire_date: i32,
+        _usage_limit: i32,
+        _creates_join_request: bool,
+        _is_subscription: bool,
+    ) {
+    }
+    fn send_get_dialog_invite_link(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _invite_link: String,
+    ) {
+    }
+    fn send_get_dialog_invite_link_counts(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+    ) {
+    }
+    fn send_get_dialog_invite_links(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _input_user: tdmtproto::telegram_api::InputUser,
+        _is_revoked: bool,
+        _offset_date: i32,
+        _offset_invite_link: String,
+        _limit: i32,
+    ) {
+    }
+    fn send_get_dialog_invite_link_users(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _invite_link: String,
+        _subscription_expired: bool,
+        _offset_date: i32,
+        _offset_user_id: UserId,
+        _limit: i32,
+    ) {
+    }
+    fn send_revoke_dialog_invite_link(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _invite_link: String,
+    ) {
+    }
+    fn send_delete_revoked_dialog_invite_link(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _invite_link: String,
+    ) {
+    }
+    fn send_delete_all_revoked_dialog_invite_links(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _input_user: tdmtproto::telegram_api::InputUser,
+    ) {
+    }
 }
 
 #[cfg(test)]

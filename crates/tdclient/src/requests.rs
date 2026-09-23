@@ -12161,6 +12161,244 @@ fn run_dialog_filter_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
+        _ => run_dialog_invite_link_requests(td, id, function),
+    }
+}
+
+fn run_dialog_invite_link_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::replacePrimaryChatInviteLink(request) => {
+            let promise = td.deferred_promise(id, Object::chatInviteLink);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.export_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                String::new(),
+                0,
+                0,
+                false,
+                crate::chat_manager::StarSubscriptionPricing::default(),
+                false,
+                true,
+                promise,
+            );
+        }
+        Function::createChatInviteLink(request) => {
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLink);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.export_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                name,
+                request.expiration_date,
+                request.member_limit,
+                request.creates_join_request,
+                crate::chat_manager::StarSubscriptionPricing::default(),
+                false,
+                false,
+                promise,
+            );
+        }
+        Function::createChatSubscriptionInviteLink(request) => {
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let pricing = crate::chat_manager::StarSubscriptionPricing::from_td_api(
+                request.subscription_pricing,
+            );
+            let promise = td.deferred_promise(id, Object::chatInviteLink);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.export_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                name,
+                0,
+                0,
+                false,
+                pricing,
+                true,
+                false,
+                promise,
+            );
+        }
+        Function::editChatInviteLink(request) => {
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLink);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.edit_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                name,
+                request.expiration_date,
+                request.member_limit,
+                request.creates_join_request,
+                false,
+                promise,
+            );
+        }
+        Function::editChatSubscriptionInviteLink(request) => {
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLink);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.edit_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                name,
+                0,
+                0,
+                false,
+                true,
+                promise,
+            );
+        }
+        Function::getChatInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLink);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.get_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                promise,
+            );
+        }
+        Function::getChatInviteLinkCounts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chatInviteLinkCounts);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.get_dialog_invite_link_counts(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                promise,
+            );
+        }
+        Function::getChatInviteLinks(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset_invite_link) =
+                crate::misc::clean_input_string(&request.offset_invite_link)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLinks);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.get_dialog_invite_links(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.creator_user_id),
+                request.is_revoked,
+                request.offset_date,
+                offset_invite_link,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getChatInviteLinkMembers(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLinkMembers);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.get_dialog_invite_link_users(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                request.only_with_expired_subscription,
+                request.offset_member,
+                request.limit,
+                promise,
+            );
+        }
+        Function::revokeChatInviteLink(request) => {
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLinks);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.revoke_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                promise,
+            );
+        }
+        Function::deleteRevokedChatInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.delete_revoked_dialog_invite_link(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                promise,
+            );
+        }
+        Function::deleteAllRevokedChatInviteLinks(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.delete_all_revoked_dialog_invite_links(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.creator_user_id),
+                promise,
+            );
+        }
+        Function::checkChatInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatInviteLinkInfo);
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.check_dialog_invite_link(&mut env, invite_link, promise);
+        }
+        Function::joinChatByInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |v: td_api::ChatJoinResult| v.into());
+            let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
+            manager.import_dialog_invite_link(&mut env, invite_link, promise);
+        }
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -12970,12 +13208,13 @@ mod request_census_tests {
         // SavedMessagesManager arms (the 11 directMessagesChatTopic arms,
         // the 7 savedMessagesTopic arms and getMessageAuthor). The M.filter
         // slice flipped 17 DialogFilterManager arms and getChatFolderDefaultIconName (sync).
+        // The M.invite slice flipped 14 DialogInviteLinkManager arms.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            641,
+            655,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 360, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 346, "interim count");
     }
 }
