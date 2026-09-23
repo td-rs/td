@@ -51,7 +51,9 @@ use tdutils::status::Status;
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::{ChannelId, ChatId, DcId, MessageId, RestrictedRights};
+use crate::chat_manager::{
+    ChannelId, ChannelType, ChatId, ChatManager, DcId, MessageId, RestrictedRights,
+};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -89,7 +91,7 @@ use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
 use crate::user_manager::SecretChatId;
-use crate::user_manager::{UserEnv, UserId, UserManager};
+use crate::user_manager::{AccessRights, UserEnv, UserId, UserManager};
 use crate::web_browser_manager::WebBrowserManager;
 
 use crate::call_manager::CallManager;
@@ -11294,7 +11296,6 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
     }
 }
 
-#[cfg(test)]
 /// Field-split the `Td` for the inline manager calls.
 pub(crate) fn inline_env_split(
     td: &mut Td,
@@ -11422,7 +11423,7 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         let Some(options) = self.options.as_mut() else {
             return user_id.get();
         };
-        let mut env = make_user_env(&mut self.global, options, self.auth_is_bot);
+        let mut env = make_user_env(self.global, options, self.auth_is_bot);
         self.user_manager
             .get_user_id_object(&mut env, user_id, source)
     }
@@ -11434,7 +11435,7 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         let Some(options) = self.options.as_mut() else {
             return Err(tdutils::status::Status::error(400, "User not found"));
         };
-        let env = make_user_env(&mut self.global, options, self.auth_is_bot);
+        let env = make_user_env(self.global, options, self.auth_is_bot);
         self.user_manager.get_input_user(&env, user_id)
     }
 
@@ -11442,7 +11443,7 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         let Some(options) = self.options.as_mut() else {
             return;
         };
-        let mut env = make_user_env(&mut self.global, options, self.auth_is_bot);
+        let mut env = make_user_env(self.global, options, self.auth_is_bot);
         self.user_manager.on_get_users(&mut env, users, source);
     }
 
@@ -11454,7 +11455,7 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
             crate::dialog_id::DialogType::User => {
                 let user_id = dialog_id.get_user_id();
                 let options = self.options.as_mut()?;
-                let env = make_user_env(&mut self.global, options, self.auth_is_bot);
+                let env = make_user_env(self.global, options, self.auth_is_bot);
                 self.user_manager
                     .get_input_peer_user(&env, user_id, AccessRights::Read)
             }
@@ -11512,7 +11513,7 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         // the C++ `user_manager == nullptr` band.
         crate::message_entity::get_formatted_text_of_input::<()>(
             None,
-            dialog_id,
+            crate::message_content::to_message_entity_dialog_id(dialog_id),
             text,
             is_bot,
             allow_empty,
@@ -11521,6 +11522,8 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
             None,
             always_parse_markdown,
             session_count,
+            None,
+            false,
         )
     }
 
@@ -11727,7 +11730,7 @@ impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> 
     }
 }
 
-
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config_manager::StoredDcOptions;
