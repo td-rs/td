@@ -4,12 +4,17 @@ use crate::store_parse::{Parser, store_flags, store_string};
 use crate::td_api;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tdmtproto::telegram_api;
 
 /// The `Td *td` slice of the collapsed VideosManager.
 pub trait VideosManagerEnv: DialogPhotoStoreEnv {
     /// The `td_->file_manager_` handle — `get_file_object` and the file
     /// views ride it (locked per call).
     fn file_manager(&self) -> Arc<parking_lot::Mutex<FileManager>>;
+
+    /// The `td_->documents_manager_` handle of the alternative-video
+    /// name check (the storyboard/HLS map documents).
+    fn documents(&self) -> &crate::documents_manager::DocumentsManager;
 }
 
 /// `VideosManager::Video` (VideosManager.h:80-111).
@@ -184,6 +189,327 @@ impl VideosManager {
         })
     }
 
+    /// `VideosManager::get_story_video_object` (VideosManager.cpp:87-99).
+    pub fn get_story_video_object(
+        &self,
+        env: &impl VideosManagerEnv,
+        file_id: FileId,
+    ) -> Option<td_api::StoryVideo> {
+        if !file_id.is_valid() {
+            return None;
+        }
+        let video = self.get_video(file_id)?;
+        let thumbnail = photo::get_thumbnail_object_with_animation(
+            &video.thumbnail,
+            &video.animated_thumbnail.photo_size,
+        );
+        Some(td_api::StoryVideo {
+            duration: video.precise_duration,
+            width: i32::from(video.dimensions.width),
+            height: i32::from(video.dimensions.height),
+            has_stickers: video.has_stickers,
+            is_animation: video.is_animation,
+            minithumbnail: Some(photo::get_minithumbnail_object(
+                video.minithumbnail.as_bytes(),
+            )),
+            thumbnail,
+            preload_prefix_size: video.preload_prefix_size,
+            cover_frame_timestamp: video.start_ts,
+            video: Some(env.file_manager().lock().get_file_object(file_id)),
+        })
+    }
+
+    /// `VideosManager::get_alternative_video_object`
+    /// (VideosManager.cpp:101-119) — the HLS alternative whose map
+    /// document is registered under the `mtproto:<document_id>` name.
+    pub fn get_alternative_video_object(
+        &self,
+        env: &impl VideosManagerEnv,
+        file_id: FileId,
+        hls_file_ids: &[FileId],
+    ) -> Option<td_api::AlternativeVideo> {
+        let video = self.get_video(file_id)?;
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        let full_remote_location = file_view.get_full_remote_location()?;
+        assert!(full_remote_location.is_document());
+        let document_id = full_remote_location.get_id();
+        drop(file_manager);
+        let name = format!("mtproto:{document_id}");
+        for &hls_file_id in hls_file_ids {
+            if env.documents().get_document_file_name(hls_file_id) == name {
+                let file_manager = env.file_manager();
+                let file_manager = file_manager.lock();
+                return Some(td_api::AlternativeVideo {
+                    id: document_id,
+                    width: i32::from(video.dimensions.width),
+                    height: i32::from(video.dimensions.height),
+                    codec: video.codec.clone(),
+                    hls_file: Some(file_manager.get_file_object(hls_file_id)),
+                    video: Some(file_manager.get_file_object(file_id)),
+                });
+            }
+        }
+        None
+    }
+
+    /// `VideosManager::get_input_media` (VideosManager.cpp:272-381).
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_input_media(
+        &self,
+        env: &impl VideosManagerEnv,
+        file_id: FileId,
+        input_file: Option<telegram_api::InputFile>,
+        input_thumbnail: Option<telegram_api::InputFile>,
+        cover: &crate::photo::Photo,
+        start_timestamp: i32,
+        ttl: i32,
+        has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        if !file_id.is_valid() {
+            return None;
+        }
+        // the C++ video-cover probe: the photo's any file id, decrypted
+        // main document location only
+        let mut input_cover: Option<telegram_api::InputPhoto> = None;
+        if !cover.is_empty() {
+            let cover_file_id = photo::get_photo_any_file_id(cover);
+            if cover_file_id.is_valid() {
+                let file_manager = env.file_manager();
+                let file_manager = file_manager.lock();
+                if let Some(cover_file_view) = file_manager.get_file_view(cover_file_id)
+                    && !cover_file_view.is_encrypted()
+                    && let Some(main_remote_location) = cover_file_view.get_main_remote_location()
+                    && !main_remote_location.is_web()
+                {
+                    input_cover = Some(as_input_photo(main_remote_location));
+                }
+            }
+        }
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        let main_remote_location = file_view.get_main_remote_location();
+        if let Some(main_remote_location) = main_remote_location
+            && !main_remote_location.is_web()
+            && input_file.is_none()
+        {
+            let mut flags = 0;
+            const INPUT_MEDIA_DOCUMENT_TTL_SECONDS_MASK: i32 = 1;
+            const INPUT_MEDIA_DOCUMENT_VIDEO_TIMESTAMP_MASK: i32 = 16;
+            const INPUT_MEDIA_DOCUMENT_VIDEO_COVER_MASK: i32 = 8;
+            if ttl != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_TTL_SECONDS_MASK;
+            }
+            if start_timestamp != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_VIDEO_TIMESTAMP_MASK;
+            }
+            if input_cover.is_some() {
+                flags |= INPUT_MEDIA_DOCUMENT_VIDEO_COVER_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaDocument(
+                telegram_api::inputMediaDocument {
+                    flags,
+                    spoiler: has_spoiler,
+                    id: Some(as_input_document(main_remote_location)),
+                    video_cover: input_cover,
+                    video_timestamp: start_timestamp,
+                    ttl_seconds: ttl,
+                    query: String::new(),
+                },
+            ));
+        }
+        if let Some(url) = file_view.get_url() {
+            let mut flags = 0;
+            const INPUT_MEDIA_DOCUMENT_EXTERNAL_TTL_SECONDS_MASK: i32 = 1;
+            const INPUT_MEDIA_DOCUMENT_EXTERNAL_VIDEO_TIMESTAMP_MASK: i32 = 8;
+            const INPUT_MEDIA_DOCUMENT_EXTERNAL_VIDEO_COVER_MASK: i32 = 4;
+            if ttl != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_EXTERNAL_TTL_SECONDS_MASK;
+            }
+            if start_timestamp != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_EXTERNAL_VIDEO_TIMESTAMP_MASK;
+            }
+            if input_cover.is_some() {
+                flags |= INPUT_MEDIA_DOCUMENT_EXTERNAL_VIDEO_COVER_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaDocumentExternal(
+                telegram_api::inputMediaDocumentExternal {
+                    flags,
+                    spoiler: has_spoiler,
+                    url: url.to_owned(),
+                    ttl_seconds: ttl,
+                    video_cover: input_cover,
+                    video_timestamp: start_timestamp,
+                },
+            ));
+        }
+
+        if let Some(input_file) = input_file {
+            let video = self.get_video(file_id)?;
+            let mut attributes: Vec<telegram_api::DocumentAttribute> = Vec::new();
+            {
+                let mut attribute_flags = 0;
+                const ATTRIBUTE_VIDEO_VIDEO_START_TS_MASK: i32 = 16;
+                if video.start_ts > 0.0 {
+                    attribute_flags |= ATTRIBUTE_VIDEO_VIDEO_START_TS_MASK;
+                }
+                attributes.push(telegram_api::DocumentAttribute::documentAttributeVideo(
+                    telegram_api::documentAttributeVideo {
+                        flags: attribute_flags,
+                        round_message: false,
+                        supports_streaming: video.supports_streaming,
+                        nosound: video.is_animation,
+                        duration: video.precise_duration,
+                        w: i32::from(video.dimensions.width),
+                        h: i32::from(video.dimensions.height),
+                        preload_prefix_size: 0,
+                        video_start_ts: video.start_ts,
+                        video_codec: String::new(),
+                    },
+                ));
+            }
+            if !video.file_name.is_empty() {
+                attributes.push(telegram_api::DocumentAttribute::documentAttributeFilename(
+                    telegram_api::documentAttributeFilename {
+                        file_name: video.file_name.clone(),
+                    },
+                ));
+            }
+            let mut flags = 0;
+            const UPLOADED_STICKERS_MASK: i32 = 1;
+            const UPLOADED_TTL_SECONDS_MASK: i32 = 2;
+            const UPLOADED_THUMB_MASK: i32 = 4;
+            const UPLOADED_VIDEO_TIMESTAMP_MASK: i32 = 128;
+            const UPLOADED_VIDEO_COVER_MASK: i32 = 64;
+            let added_stickers = if video.has_stickers {
+                flags |= UPLOADED_STICKERS_MASK;
+                get_input_documents(&file_manager, &video.sticker_file_ids)
+            } else {
+                Vec::new()
+            };
+            let mut mime_type = video.mime_type.clone();
+            if !mime_type.starts_with("video/") || ttl > 0 {
+                mime_type = "video/mp4".to_owned();
+            }
+            if ttl != 0 {
+                flags |= UPLOADED_TTL_SECONDS_MASK;
+            }
+            if input_thumbnail.is_some() {
+                flags |= UPLOADED_THUMB_MASK;
+            }
+            if start_timestamp != 0 {
+                flags |= UPLOADED_VIDEO_TIMESTAMP_MASK;
+            }
+            if input_cover.is_some() {
+                flags |= UPLOADED_VIDEO_COVER_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaUploadedDocument(
+                telegram_api::inputMediaUploadedDocument {
+                    flags,
+                    nosound_video: true,
+                    force_file: false,
+                    spoiler: has_spoiler,
+                    file: Some(input_file),
+                    thumb: input_thumbnail,
+                    mime_type,
+                    attributes,
+                    stickers: added_stickers,
+                    video_cover: input_cover,
+                    video_timestamp: start_timestamp,
+                    ttl_seconds: ttl,
+                },
+            ));
+        }
+        None
+    }
+
+    /// `VideosManager::get_story_document_input_media`
+    /// (VideosManager.cpp:380-423) — the story-video re-upload of an
+    /// already-main-document video.
+    pub fn get_story_document_input_media(
+        &self,
+        env: &impl VideosManagerEnv,
+        file_id: FileId,
+        main_frame_timestamp: f64,
+    ) -> Option<telegram_api::InputMedia> {
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        let main_remote_location = file_view.get_main_remote_location()?;
+        if main_remote_location.is_web() {
+            return None;
+        }
+        let video = self.get_video(file_id)?;
+
+        let mut attributes: Vec<telegram_api::DocumentAttribute> = Vec::new();
+        let mut attribute_flags = 0;
+        const ATTRIBUTE_VIDEO_VIDEO_START_TS_MASK: i32 = 16;
+        if main_frame_timestamp > 0.0 {
+            attribute_flags |= ATTRIBUTE_VIDEO_VIDEO_START_TS_MASK;
+        }
+        attributes.push(telegram_api::DocumentAttribute::documentAttributeVideo(
+            telegram_api::documentAttributeVideo {
+                flags: attribute_flags,
+                round_message: false,
+                supports_streaming: video.supports_streaming,
+                nosound: video.is_animation,
+                duration: video.precise_duration,
+                w: i32::from(video.dimensions.width),
+                h: i32::from(video.dimensions.height),
+                preload_prefix_size: 0,
+                video_start_ts: main_frame_timestamp,
+                video_codec: String::new(),
+            },
+        ));
+        if !video.file_name.is_empty() {
+            attributes.push(telegram_api::DocumentAttribute::documentAttributeFilename(
+                telegram_api::documentAttributeFilename {
+                    file_name: video.file_name.clone(),
+                },
+            ));
+        }
+        let mut flags = 0;
+        const UPLOADED_STICKERS_MASK: i32 = 1;
+        let added_stickers = if video.has_stickers {
+            flags |= UPLOADED_STICKERS_MASK;
+            get_input_documents(&file_manager, &video.sticker_file_ids)
+        } else {
+            Vec::new()
+        };
+        let mut mime_type = video.mime_type.clone();
+        if !mime_type.starts_with("video/") {
+            mime_type = "video/mp4".to_owned();
+        }
+        Some(telegram_api::InputMedia::inputMediaUploadedDocument(
+            telegram_api::inputMediaUploadedDocument {
+                flags,
+                nosound_video: true,
+                force_file: false,
+                spoiler: false,
+                file: Some(telegram_api::InputFile::inputFileStoryDocument(
+                    telegram_api::inputFileStoryDocument {
+                        id: Some(as_input_document(main_remote_location)),
+                    },
+                )),
+                thumb: None,
+                mime_type,
+                attributes,
+                stickers: added_stickers,
+                video_cover: None,
+                video_timestamp: 0,
+                ttl_seconds: 0,
+            },
+        ))
+    }
+
     /// `VideosManager::store_video` (VideosManager.hpp:22-62).
     pub fn store_video(&self, env: &mut impl VideosManagerEnv, file_id: FileId, out: &mut Vec<u8>) {
         let video = self.get_video(file_id).expect("video not found");
@@ -313,6 +639,50 @@ impl VideosManager {
     }
 }
 
+/// `FullRemoteFileLocation::as_input_document` (FileLocation.h) — the
+/// animations_manager local copy; the caller validated `is_document`.
+fn as_input_document(
+    location: &crate::files::FullRemoteFileLocation,
+) -> telegram_api::InputDocument {
+    debug_assert!(location.is_document());
+    telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+        id: location.get_id(),
+        access_hash: location.get_access_hash(),
+        file_reference: location.get_file_reference().as_bytes().to_vec(),
+    })
+}
+
+/// `FullRemoteFileLocation::as_input_photo` (FileLocation.h) — the
+/// video-cover probe; the caller validated `is_photo`.
+fn as_input_photo(location: &crate::files::FullRemoteFileLocation) -> telegram_api::InputPhoto {
+    debug_assert!(location.is_photo());
+    telegram_api::InputPhoto::inputPhoto(telegram_api::inputPhoto {
+        id: location.get_id(),
+        access_hash: location.get_access_hash(),
+        file_reference: location.get_file_reference().as_bytes().to_vec(),
+    })
+}
+
+/// `FileManager::get_input_documents` over the full-remote-location
+/// probes; the C++ CHECKs every location.
+fn get_input_documents(
+    file_manager: &FileManager,
+    file_ids: &[FileId],
+) -> Vec<telegram_api::InputDocument> {
+    file_ids
+        .iter()
+        .map(|file_id| {
+            let file_view = file_manager
+                .get_file_view(*file_id)
+                .expect("get_input_documents: missing file view");
+            let full_remote_location = file_view
+                .get_full_remote_location()
+                .expect("get_input_documents: no full remote location");
+            as_input_document(full_remote_location)
+        })
+        .collect()
+}
+
 /// `store(Dimensions)` / `parse(Dimensions)` — the photo module's pair
 /// (PhotoSize.hpp).
 fn store_dimensions(out: &mut Vec<u8>, dimensions: &Dimensions) {
@@ -353,6 +723,7 @@ mod tests {
 
     struct TestEnv {
         files: Arc<parking_lot::Mutex<FileManager>>,
+        documents: crate::documents_manager::DocumentsManager,
     }
 
     impl crate::photo::DialogPhotoStoreEnv for TestEnv {
@@ -368,6 +739,10 @@ mod tests {
     impl VideosManagerEnv for TestEnv {
         fn file_manager(&self) -> Arc<parking_lot::Mutex<FileManager>> {
             Arc::clone(&self.files)
+        }
+
+        fn documents(&self) -> &crate::documents_manager::DocumentsManager {
+            &self.documents
         }
     }
 
@@ -395,6 +770,7 @@ mod tests {
     fn env() -> TestEnv {
         TestEnv {
             files: Arc::new(parking_lot::Mutex::new(FileManager::new())),
+            documents: crate::documents_manager::DocumentsManager::new(),
         }
     }
 

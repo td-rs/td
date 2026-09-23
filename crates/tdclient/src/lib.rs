@@ -146,15 +146,15 @@ pub mod top_dialog_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+pub mod video_notes_manager;
+pub mod videos_manager;
+pub mod voice_notes_manager;
 pub mod web_app;
 pub mod web_app_manager;
 pub mod web_browser_manager;
 pub mod web_browser_settings;
 pub mod web_pages_manager;
 pub mod webpage;
-pub mod video_notes_manager;
-pub mod videos_manager;
-pub mod voice_notes_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

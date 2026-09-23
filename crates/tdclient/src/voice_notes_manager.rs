@@ -3,6 +3,7 @@ use crate::store_parse::{Parser, store_flags, store_string};
 use crate::td_api;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tdmtproto::telegram_api;
 
 /// The `Td *td` slice of the collapsed VoiceNotesManager.
 pub trait VoiceNotesManagerEnv: crate::photo::DialogPhotoStoreEnv {
@@ -92,6 +93,120 @@ impl VoiceNotesManager {
         })
     }
 
+    /// `VoiceNotesManager::dup_voice_note` (VoiceNotesManager.cpp:99-112).
+    /// The TranscriptionInfo copy rides the M.25 transcription seam.
+    pub fn dup_voice_note(&mut self, new_id: FileId, old_id: FileId) -> FileId {
+        if let Some(mut note) = self.voice_notes.get(&old_id).cloned() {
+            note.file_id = new_id;
+            self.voice_notes.entry(new_id).or_insert(note);
+            new_id
+        } else {
+            FileId::default()
+        }
+    }
+
+    /// `VoiceNotesManager::get_input_media` (VoiceNotesManager.cpp:168-218).
+    pub fn get_input_media(
+        &self,
+        env: &impl VoiceNotesManagerEnv,
+        file_id: FileId,
+        input_file: Option<telegram_api::InputFile>,
+        ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        if let Some(main_remote_location) = file_view.get_main_remote_location()
+            && !main_remote_location.is_web()
+            && input_file.is_none()
+        {
+            let mut flags = 0;
+            const INPUT_MEDIA_DOCUMENT_TTL_SECONDS_MASK: i32 = 1;
+            if ttl != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_TTL_SECONDS_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaDocument(
+                telegram_api::inputMediaDocument {
+                    flags,
+                    spoiler: false,
+                    id: Some(as_input_document(main_remote_location)),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: ttl,
+                    query: String::new(),
+                },
+            ));
+        }
+        if let Some(url) = file_view.get_url() {
+            let mut flags = 0;
+            const INPUT_MEDIA_DOCUMENT_EXTERNAL_TTL_SECONDS_MASK: i32 = 1;
+            if ttl != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_EXTERNAL_TTL_SECONDS_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaDocumentExternal(
+                telegram_api::inputMediaDocumentExternal {
+                    flags,
+                    spoiler: false,
+                    url: url.to_owned(),
+                    ttl_seconds: ttl,
+                    video_cover: None,
+                    video_timestamp: 0,
+                },
+            ));
+        }
+
+        if let Some(input_file) = input_file {
+            let voice_note = self.get_voice_note(file_id)?;
+            let mut attributes: Vec<telegram_api::DocumentAttribute> = Vec::new();
+            {
+                let mut flags = 0;
+                const ATTRIBUTE_AUDIO_WAVEFORM_MASK: i32 = 4;
+                if !voice_note.waveform.is_empty() {
+                    flags |= ATTRIBUTE_AUDIO_WAVEFORM_MASK;
+                }
+                attributes.push(telegram_api::DocumentAttribute::documentAttributeAudio(
+                    telegram_api::documentAttributeAudio {
+                        flags,
+                        voice: true,
+                        duration: voice_note.duration,
+                        title: String::new(),
+                        performer: String::new(),
+                        waveform: voice_note.waveform.as_bytes().to_vec(),
+                    },
+                ));
+            }
+            let mut mime_type = voice_note.mime_type.clone();
+            if mime_type != "audio/ogg" && mime_type != "audio/mpeg" && mime_type != "audio/mp4" {
+                mime_type = "audio/ogg".to_owned();
+            }
+            let mut flags = 0;
+            const UPLOADED_TTL_SECONDS_MASK: i32 = 2;
+            if ttl != 0 {
+                flags |= UPLOADED_TTL_SECONDS_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaUploadedDocument(
+                telegram_api::inputMediaUploadedDocument {
+                    flags,
+                    nosound_video: true,
+                    force_file: false,
+                    spoiler: false,
+                    file: Some(input_file),
+                    thumb: None,
+                    mime_type,
+                    attributes,
+                    stickers: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: ttl,
+                },
+            ));
+        }
+        None
+    }
+
     /// `VoiceNotesManager::store_voice_note`
     /// (VoiceNotesManager.hpp:20-43).
     pub fn store_voice_note(
@@ -161,6 +276,19 @@ impl VoiceNotesManager {
         );
         Ok(file_id)
     }
+}
+
+/// `FullRemoteFileLocation::as_input_document` (FileLocation.h) — the
+/// animations_manager local copy; the caller validated `is_document`.
+fn as_input_document(
+    location: &crate::files::FullRemoteFileLocation,
+) -> telegram_api::InputDocument {
+    debug_assert!(location.is_document());
+    telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+        id: location.get_id(),
+        access_hash: location.get_access_hash(),
+        file_reference: location.get_file_reference().as_bytes().to_vec(),
+    })
 }
 
 #[cfg(test)]

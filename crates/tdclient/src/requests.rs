@@ -4389,6 +4389,12 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             user_manager,
             chat_manager,
             file_manager,
+            file_load_manager,
+            documents_manager,
+            videos_manager,
+            audios_manager,
+            voice_notes_manager,
+            video_notes_manager,
             notification_updates,
             ..
         } = td;
@@ -4400,6 +4406,12 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             user_manager,
             chat_manager,
             file_manager: file_manager.clone(),
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
+            documents: documents_manager,
+            videos: videos_manager,
+            audios: audios_manager,
+            voice_notes: voice_notes_manager,
+            video_notes: video_notes_manager,
             updates: notification_updates,
         };
         run(&mut env, story_manager);

@@ -15,11 +15,8 @@
 //! `StickerPhotoSize.cpp:95-128`).
 
 use crate::chat_manager::DcId;
+use crate::files::{FileLocationSource, FileManager, FullRemoteFileLocation, PhotoSizeSource};
 use crate::message_id::DialogId;
-use crate::files::{
-    FileLoadManager, FileLocationSource, FileManager, FileType, FullRemoteFileLocation,
-    PhotoSizeSource,
-};
 use crate::store_parse::{self, Parser};
 use crate::td_api;
 use crate::user_manager::FileId;
@@ -1207,7 +1204,6 @@ pub fn parse_dialog_photo(
     dialog_photo.is_personal = is_personal;
     Ok(dialog_photo)
 }
-
 
 // ==== M.28 media-metadata additions: the FileManager-integrated size intake =====
 

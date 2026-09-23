@@ -104,13 +104,14 @@ impl StoryAlbum {
         file_ids
     }
 
-    /// `StoryAlbum::get_story_album_object` (StoryAlbum.cpp:63-67).
-    pub fn get_story_album_object(&self) -> td_api::StoryAlbum {
+    /// `StoryAlbum::get_story_album_object` (StoryAlbum.cpp:63-67) —
+    /// the video icon is the full video object of the icon video.
+    pub fn get_story_album_object(&self, env: &mut impl StoryManagerEnv) -> td_api::StoryAlbum {
         td_api::StoryAlbum {
             id: self.album_id.get(),
             name: self.title.clone(),
             photo_icon: get_story_photo_object(&self.icon_photo),
-            video_icon: None, // the Video object rides the [blocked: VideosManager] seam
+            video_icon: env.videos_get_video_object(self.icon_video_file_id),
         }
     }
 }

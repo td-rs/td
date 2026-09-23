@@ -4,6 +4,7 @@ use crate::store_parse::{Parser, store_flags, store_string};
 use crate::td_api;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tdmtproto::telegram_api;
 
 /// The `Td *td` slice of the collapsed AudiosManager.
 pub trait AudiosManagerEnv: DialogPhotoStoreEnv {
@@ -185,6 +186,126 @@ impl AudiosManager {
         }
     }
 
+    /// `AudiosManager::get_input_media` (AudiosManager.cpp:256-300).
+    pub fn get_input_media(
+        &self,
+        env: &impl AudiosManagerEnv,
+        file_id: FileId,
+        input_file: Option<telegram_api::InputFile>,
+        input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        if let Some(main_remote_location) = file_view.get_main_remote_location()
+            && !main_remote_location.is_web()
+            && input_file.is_none()
+        {
+            return Some(telegram_api::InputMedia::inputMediaDocument(
+                telegram_api::inputMediaDocument {
+                    flags: 0,
+                    spoiler: false,
+                    id: Some(as_input_document(main_remote_location)),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 0,
+                    query: String::new(),
+                },
+            ));
+        }
+        if let Some(url) = file_view.get_url() {
+            return Some(telegram_api::InputMedia::inputMediaDocumentExternal(
+                telegram_api::inputMediaDocumentExternal {
+                    flags: 0,
+                    spoiler: false,
+                    url: url.to_owned(),
+                    ttl_seconds: 0,
+                    video_cover: None,
+                    video_timestamp: 0,
+                },
+            ));
+        }
+
+        if let Some(input_file) = input_file {
+            let audio = self.get_audio(file_id)?;
+            let mut attributes: Vec<telegram_api::DocumentAttribute> = Vec::new();
+            // the pinned scheme: TITLE_MASK = 1, PERFORMER_MASK = 2
+            const TITLE_MASK: i32 = 1;
+            const PERFORMER_MASK: i32 = 2;
+            attributes.push(telegram_api::DocumentAttribute::documentAttributeAudio(
+                telegram_api::documentAttributeAudio {
+                    flags: TITLE_MASK | PERFORMER_MASK,
+                    voice: false,
+                    duration: audio.duration,
+                    title: audio.title.clone(),
+                    performer: audio.performer.clone(),
+                    waveform: Vec::new(),
+                },
+            ));
+            if !audio.file_name.is_empty() {
+                attributes.push(telegram_api::DocumentAttribute::documentAttributeFilename(
+                    telegram_api::documentAttributeFilename {
+                        file_name: audio.file_name.clone(),
+                    },
+                ));
+            }
+            let mut mime_type = audio.mime_type.clone();
+            if !mime_type.starts_with("audio/") {
+                mime_type = "audio/mpeg".to_owned();
+            }
+            let mut flags = 0;
+            const UPLOADED_THUMB_MASK: i32 = 4;
+            if input_thumbnail.is_some() {
+                flags |= UPLOADED_THUMB_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaUploadedDocument(
+                telegram_api::inputMediaUploadedDocument {
+                    flags,
+                    nosound_video: false,
+                    force_file: false,
+                    spoiler: false,
+                    file: Some(input_file),
+                    thumb: input_thumbnail,
+                    mime_type,
+                    attributes,
+                    stickers: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 0,
+                },
+            ));
+        }
+        None
+    }
+
+    /// `AudiosManager::get_audio_thumbnail_file_id`
+    /// (AudiosManager.cpp:170-174).
+    pub fn get_audio_thumbnail_file_id(&self, file_id: FileId) -> FileId {
+        self.get_audio(file_id)
+            .map_or(FileId::default(), |audio| audio.thumbnail.file_id)
+    }
+
+    /// `AudiosManager::dup_audio` (AudiosManager.cpp:133-143).
+    pub fn dup_audio(&mut self, new_id: FileId, old_id: FileId) -> FileId {
+        if let Some(mut audio) = self.audios.get(&old_id).cloned() {
+            audio.file_id = new_id;
+            self.audios.entry(new_id).or_insert(audio);
+            new_id
+        } else {
+            FileId::default()
+        }
+    }
+
+    /// `AudiosManager::get_audio_search_text` (AudiosManager.cpp:164-168).
+    pub fn get_audio_search_text(&self, file_id: FileId) -> String {
+        self.get_audio(file_id).map_or_else(String::new, |audio| {
+            format!("{} {} {}", audio.file_name, audio.title, audio.performer)
+        })
+    }
+
     /// `AudiosManager::store_audio` (AudiosManager.hpp:22-74).
     pub fn store_audio(&self, env: &mut impl AudiosManagerEnv, file_id: FileId, out: &mut Vec<u8>) {
         let audio = self.get_audio(file_id).expect("audio not found");
@@ -333,6 +454,19 @@ impl AudiosManager {
         );
         Ok(file_id)
     }
+}
+
+/// `FullRemoteFileLocation::as_input_document` (FileLocation.h) — the
+/// animations_manager local copy; the caller validated `is_document`.
+fn as_input_document(
+    location: &crate::files::FullRemoteFileLocation,
+) -> telegram_api::InputDocument {
+    debug_assert!(location.is_document());
+    telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+        id: location.get_id(),
+        access_hash: location.get_access_hash(),
+        file_reference: location.get_file_reference().as_bytes().to_vec(),
+    })
 }
 
 #[cfg(test)]

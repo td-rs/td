@@ -1273,14 +1273,24 @@ impl DocumentsManager {
         assert!(old_id.is_valid() && new_id.is_valid());
         assert!(new_id != old_id);
 
+        self.merge_document_records(new_id, old_id);
+        if let Err(error) = env.file_manager().lock().merge(new_id, old_id) {
+            tdutils::log_error!("{}", error.message());
+        }
+    }
+
+    /// The record half of `merge_documents`
+    /// (DocumentsManager.cpp:643-653) — the field-split form the Td-side
+    /// flip calls; the FileManager merge rides the caller's handle.
+    pub fn merge_document_records(&mut self, new_id: FileId, old_id: FileId) {
+        assert!(old_id.is_valid() && new_id.is_valid());
+        assert!(new_id != old_id);
+
         tdutils::log_info!("Merge documents {} and {}", new_id.get(), old_id.get());
         assert!(self.get_document(old_id).is_some());
 
         if self.get_document(new_id).is_none() {
             self.dup_document(new_id, old_id);
-        }
-        if let Err(error) = env.file_manager().lock().merge(new_id, old_id) {
-            tdutils::log_error!("{}", error.message());
         }
     }
 
@@ -1303,6 +1313,84 @@ impl DocumentsManager {
             i += 1;
         }
         result
+    }
+
+    /// `DocumentsManager::get_input_media` (DocumentsManager.cpp:689-730).
+    pub fn get_input_media(
+        &self,
+        env: &impl DocumentsManagerEnv,
+        file_id: FileId,
+        input_file: Option<telegram_api::InputFile>,
+        input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        if let Some(main_remote_location) = file_view.get_main_remote_location()
+            && !main_remote_location.is_web()
+            && input_file.is_none()
+        {
+            return Some(telegram_api::InputMedia::inputMediaDocument(
+                telegram_api::inputMediaDocument {
+                    flags: 0,
+                    spoiler: false,
+                    id: Some(as_input_document(main_remote_location)),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 0,
+                    query: String::new(),
+                },
+            ));
+        }
+        if let Some(url) = file_view.get_url() {
+            return Some(telegram_api::InputMedia::inputMediaDocumentExternal(
+                telegram_api::inputMediaDocumentExternal {
+                    flags: 0,
+                    spoiler: false,
+                    url: url.to_owned(),
+                    ttl_seconds: 0,
+                    video_cover: None,
+                    video_timestamp: 0,
+                },
+            ));
+        }
+
+        if let Some(input_file) = input_file {
+            let document = self.get_document(file_id)?;
+            let mut attributes: Vec<telegram_api::DocumentAttribute> = Vec::new();
+            if !document.file_name.is_empty() {
+                attributes.push(telegram_api::DocumentAttribute::documentAttributeFilename(
+                    telegram_api::documentAttributeFilename {
+                        file_name: document.file_name.clone(),
+                    },
+                ));
+            }
+            let mut flags = 0;
+            const UPLOADED_THUMB_MASK: i32 = 4;
+            if input_thumbnail.is_some() {
+                flags |= UPLOADED_THUMB_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaUploadedDocument(
+                telegram_api::inputMediaUploadedDocument {
+                    flags,
+                    nosound_video: false,
+                    force_file: file_view.get_type() == FileType::DocumentAsFile,
+                    spoiler: false,
+                    file: Some(input_file),
+                    thumb: input_thumbnail,
+                    mime_type: document.mime_type.clone(),
+                    attributes,
+                    stickers: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 0,
+                },
+            ));
+        }
+        None
     }
 
     /// `DocumentsManager::store_document` (DocumentsManager.hpp:20-51) —
@@ -1434,6 +1522,19 @@ impl DocumentsManager {
 /// a UTF-8 character (not a continuation byte).
 fn is_utf8_character_first_code_unit(first_byte: u8) -> bool {
     first_byte & 0xC0 != 0x80
+}
+
+/// `FullRemoteFileLocation::as_input_document` (FileLocation.h) — the
+/// animations_manager local copy; the caller validated `is_document`.
+fn as_input_document(
+    location: &crate::files::FullRemoteFileLocation,
+) -> telegram_api::InputDocument {
+    debug_assert!(location.is_document());
+    telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+        id: location.get_id(),
+        access_hash: location.get_access_hash(),
+        file_reference: location.get_file_reference().as_bytes().to_vec(),
+    })
 }
 
 #[cfg(test)]

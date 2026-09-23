@@ -4,10 +4,15 @@ use crate::store_parse::{Parser, store_flags, store_string};
 use crate::td_api;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tdmtproto::telegram_api;
 
 /// The `Td *td` slice of the collapsed VideoNotesManager.
 pub trait VideoNotesManagerEnv: DialogPhotoStoreEnv {
     fn file_manager(&self) -> Arc<parking_lot::Mutex<FileManager>>;
+
+    /// The `td_->option_manager_->get_option_integer` read of the
+    /// round-video suggested length.
+    fn get_option_integer(&mut self, name: &str, default_value: i64) -> i64;
 }
 
 /// `VideoNotesManager::VideoNote` (VideoNotesManager.h:68-79).
@@ -117,6 +122,136 @@ impl VideoNotesManager {
         })
     }
 
+    /// `VideoNotesManager::get_video_note_thumbnail_file_id`
+    /// (VideoNotesManager.cpp:103-107).
+    pub fn get_video_note_thumbnail_file_id(&self, file_id: FileId) -> FileId {
+        self.get_video_note(file_id)
+            .map_or(FileId::default(), |note| note.thumbnail.file_id)
+    }
+
+    /// `VideoNotesManager::dup_video_note` (VideoNotesManager.cpp:115-130).
+    /// The TranscriptionInfo copy rides the M.25 transcription seam.
+    pub fn dup_video_note(&mut self, new_id: FileId, old_id: FileId) -> FileId {
+        if let Some(mut note) = self.video_notes.get(&old_id).cloned() {
+            note.file_id = new_id;
+            self.video_notes.entry(new_id).or_insert(note);
+            new_id
+        } else {
+            FileId::default()
+        }
+    }
+
+    /// `VideoNotesManager::get_input_media`
+    /// (VideoNotesManager.cpp:199-248).
+    pub fn get_input_media(
+        &self,
+        env: &mut impl VideoNotesManagerEnv,
+        file_id: FileId,
+        input_file: Option<telegram_api::InputFile>,
+        input_thumbnail: Option<telegram_api::InputFile>,
+        ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        let file_manager = env.file_manager();
+        let file_manager = file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        if let Some(main_remote_location) = file_view.get_main_remote_location()
+            && !main_remote_location.is_web()
+            && input_file.is_none()
+        {
+            let mut flags = 0;
+            const INPUT_MEDIA_DOCUMENT_TTL_SECONDS_MASK: i32 = 1;
+            if ttl != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_TTL_SECONDS_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaDocument(
+                telegram_api::inputMediaDocument {
+                    flags,
+                    spoiler: false,
+                    id: Some(as_input_document(main_remote_location)),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: ttl,
+                    query: String::new(),
+                },
+            ));
+        }
+        if let Some(url) = file_view.get_url() {
+            let mut flags = 0;
+            const INPUT_MEDIA_DOCUMENT_EXTERNAL_TTL_SECONDS_MASK: i32 = 1;
+            if ttl != 0 {
+                flags |= INPUT_MEDIA_DOCUMENT_EXTERNAL_TTL_SECONDS_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaDocumentExternal(
+                telegram_api::inputMediaDocumentExternal {
+                    flags,
+                    spoiler: false,
+                    url: url.to_owned(),
+                    ttl_seconds: ttl,
+                    video_cover: None,
+                    video_timestamp: 0,
+                },
+            ));
+        }
+
+        if let Some(input_file) = input_file {
+            let video_note = self.get_video_note(file_id)?;
+            let mut attributes: Vec<telegram_api::DocumentAttribute> = Vec::new();
+            let suggested_video_note_length =
+                env.get_option_integer("suggested_video_note_length", 384);
+            attributes.push(telegram_api::DocumentAttribute::documentAttributeVideo(
+                telegram_api::documentAttributeVideo {
+                    flags: 0,
+                    round_message: true,
+                    supports_streaming: false,
+                    nosound: false,
+                    duration: video_note.duration as f64,
+                    w: if video_note.dimensions.width != 0 {
+                        i32::from(video_note.dimensions.width)
+                    } else {
+                        suggested_video_note_length as i32
+                    },
+                    h: if video_note.dimensions.height != 0 {
+                        i32::from(video_note.dimensions.height)
+                    } else {
+                        suggested_video_note_length as i32
+                    },
+                    preload_prefix_size: 0,
+                    video_start_ts: 0.0,
+                    video_codec: String::new(),
+                },
+            ));
+            let mut flags = 0;
+            const UPLOADED_TTL_SECONDS_MASK: i32 = 2;
+            const UPLOADED_THUMB_MASK: i32 = 4;
+            if ttl != 0 {
+                flags |= UPLOADED_TTL_SECONDS_MASK;
+            }
+            if input_thumbnail.is_some() {
+                flags |= UPLOADED_THUMB_MASK;
+            }
+            return Some(telegram_api::InputMedia::inputMediaUploadedDocument(
+                telegram_api::inputMediaUploadedDocument {
+                    flags,
+                    nosound_video: true,
+                    force_file: false,
+                    spoiler: false,
+                    file: Some(input_file),
+                    thumb: input_thumbnail,
+                    mime_type: "video/mp4".to_owned(),
+                    attributes,
+                    stickers: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: ttl,
+                },
+            ));
+        }
+        None
+    }
+
     /// `VideoNotesManager::store_video_note`
     /// (VideoNotesManager.hpp:21-53). The `is_transcribed` flag plane is
     /// written `false` — the TranscriptionInfo record rides the M.25
@@ -217,6 +352,19 @@ impl VideoNotesManager {
     }
 }
 
+/// `FullRemoteFileLocation::as_input_document` (FileLocation.h) — the
+/// animations_manager local copy; the caller validated `is_document`.
+fn as_input_document(
+    location: &crate::files::FullRemoteFileLocation,
+) -> telegram_api::InputDocument {
+    debug_assert!(location.is_document());
+    telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+        id: location.get_id(),
+        access_hash: location.get_access_hash(),
+        file_reference: location.get_file_reference().as_bytes().to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +388,10 @@ mod tests {
     impl VideoNotesManagerEnv for TestEnv {
         fn file_manager(&self) -> Arc<parking_lot::Mutex<FileManager>> {
             Arc::clone(&self.files)
+        }
+
+        fn get_option_integer(&mut self, _name: &str, default_value: i64) -> i64 {
+            default_value
         }
     }
 

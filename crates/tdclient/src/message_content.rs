@@ -13922,21 +13922,10 @@ pub struct MessageCopyOptions {
     pub new_caption: FormattedText,
 }
 
-/// The C++ `Document::Type` (Document.h:30-41) — the receive-path subset
-/// `get_document_message_content` and the game-animation arm need; the
-/// full value class lands with the M.12 DocumentsManager.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DocumentType {
-    #[default]
-    Unknown,
-    Animation,
-    Audio,
-    General,
-    Sticker,
-    Video,
-    VideoNote,
-    VoiceNote,
-}
+/// The C++ `Document::Type` (Document.h:30-41) — the canonical value
+/// class the M.28 media-metadata reconcile re-exports here
+/// (crate::document::DocumentType).
+pub use crate::document::DocumentType;
 
 /// The seam-shaped `DocumentsManager::on_get_document` result — the C++
 /// `Document` value class collapses to its `(file_id, type)` pair until
