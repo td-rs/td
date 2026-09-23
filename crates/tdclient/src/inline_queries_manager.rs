@@ -1,12 +1,13 @@
 //! Port of `td/telegram/InlineQueriesManager.{h,cpp}` (M.21) plus the
-//! model pieces that only serve this manager: `TargetDialogTypes.{h,cpp}`,
-//! `WebAppOpenParameters.{h,cpp}` (the theme-parameter JSON half is the
-//! Wave-3 ThemeManager seam) and the `Venue` record slice
+//! model pieces that only serve this manager: `WebAppOpenParameters.{h,cpp}`
+//! (the theme-parameter JSON half is the Wave-3 ThemeManager seam) and the
+//! `Venue` record slice
 //! (`Venue.{h,cpp}`; the record lifts to its own module at the M.9
 //! message-content integration). The `Location.cpp` input processors
 //! (`process_input_message_location`/`process_live_location`) live with
 //! the `Location` record in `chat_manager.rs` — see this module's re-use
-//! below.
+//! below. `TargetDialogTypes.{h,cpp}` rides the canonical
+//! `target_dialog_types.rs` module (M.22 unification).
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`InlineQueriesManagerEnv`] trait carries the `G()`/option/pmc/
@@ -18,9 +19,9 @@
 //! - `process_input_message_text` — ported here (the function is
 //!   self-contained over the landed MessageEntity plane); it lifts to the
 //!   M.9 InputMessageText module at that integration.
-//! - `get_input_reply_markup` — `[blocked: M.22]` (ReplyMarkup track); a
-//!   non-null markup collapses to "no markup" in the built payloads
-//!   (which never send offline).
+//! - `get_input_reply_markup` / `get_input_keyboard_button` — the M.22
+//!   reply-markup plane (landed: `reply_markup.rs`/`keyboard_button.rs`);
+//!   the intakes ride the env ([`InlineQueriesManagerEnv::get_input_reply_markup`]).
 //! - `RichMessage`/`InputInvoice` conversions — `[blocked: M.17]` /
 //!   Wave-3 payments; both park the request at the seam (`Ok(None)`).
 //! - `create_inline_message_content` — `[blocked: M.9]`: the real record
@@ -55,6 +56,7 @@ use crate::files::FileId;
 use crate::link_manager;
 use crate::message_entity::{FormattedText, get_first_url};
 use crate::misc::{add_to_top, clean_input_string, is_base64url_characters, to_integer_i64};
+use crate::target_dialog_types::TargetDialogTypes;
 use crate::td_api;
 use crate::user_manager::{BotData, UserId};
 use std::collections::HashMap;
@@ -73,142 +75,6 @@ pub(crate) const INLINE_QUERY_DELAY_MS: i64 = 400;
 /// `MAX_INLINE_QUERY_RESULT_COUNT` (InlineQueriesManager.h:114) — the
 /// server-side limit.
 pub(crate) const MAX_INLINE_QUERY_RESULT_COUNT: usize = 50;
-
-// ---------------------------------------------------------------------------
-// TargetDialogTypes.{h,cpp}
-// ---------------------------------------------------------------------------
-
-/// `td::TargetDialogTypes` (TargetDialogTypes.h:20-56).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TargetDialogTypes {
-    mask: i64,
-}
-
-impl TargetDialogTypes {
-    const USERS_MASK: i64 = 1;
-    const BOTS_MASK: i64 = 2;
-    const CHATS_MASK: i64 = 4;
-    const BROADCASTS_MASK: i64 = 8;
-    const FULL_MASK: i64 =
-        Self::USERS_MASK | Self::BOTS_MASK | Self::CHATS_MASK | Self::BROADCASTS_MASK;
-
-    /// `TargetDialogTypes(int64 mask)`.
-    pub fn from_mask(mask: i64) -> TargetDialogTypes {
-        TargetDialogTypes { mask }
-    }
-
-    /// `TargetDialogTypes(const vector<object_ptr<InlineQueryPeerType>> &)`
-    /// (TargetDialogTypes.cpp:15-35).
-    pub fn from_wire(types: &[telegram_api::InlineQueryPeerType]) -> TargetDialogTypes {
-        let mut result = TargetDialogTypes::default();
-        for peer_type in types {
-            match peer_type {
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypePM(_) => {
-                    result.mask |= Self::USERS_MASK;
-                }
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBotPM(_) => {
-                    result.mask |= Self::BOTS_MASK;
-                }
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeChat(_)
-                | telegram_api::InlineQueryPeerType::inlineQueryPeerTypeMegagroup(_) => {
-                    result.mask |= Self::CHATS_MASK;
-                }
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBroadcast(_) => {
-                    result.mask |= Self::BROADCASTS_MASK;
-                }
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeSameBotPM(_) => {
-                    result.mask |= Self::USERS_MASK;
-                }
-            }
-        }
-        result
-    }
-
-    /// `get_target_dialog_types` (TargetDialogTypes.cpp:37-57).
-    pub fn from_td_api(
-        types: Option<&td_api::TargetChatTypes>,
-    ) -> Result<TargetDialogTypes, Status> {
-        let mut mask = 0i64;
-        if let Some(types) = types {
-            if types.allow_user_chats {
-                mask |= Self::USERS_MASK;
-            }
-            if types.allow_bot_chats {
-                mask |= Self::BOTS_MASK;
-            }
-            if types.allow_group_chats {
-                mask |= Self::CHATS_MASK;
-            }
-            if types.allow_channel_chats {
-                mask |= Self::BROADCASTS_MASK;
-            }
-        }
-        if mask == 0 {
-            return Err(Status::error(400, "At least one chat type must be allowed"));
-        }
-        Ok(TargetDialogTypes { mask })
-    }
-
-    /// `get_mask` (TargetDialogTypes.h:44-46).
-    pub fn get_mask(self) -> i64 {
-        self.mask
-    }
-
-    /// `get_full_mask` (TargetDialogTypes.h:48-50).
-    pub fn get_full_mask(self) -> i64 {
-        if self.mask == 0 {
-            Self::FULL_MASK
-        } else {
-            self.mask
-        }
-    }
-
-    /// `get_input_peer_types` (TargetDialogTypes.cpp:59-80).
-    pub fn get_input_peer_types(self) -> Vec<telegram_api::InlineQueryPeerType> {
-        let mut peer_types = Vec::new();
-        if self.mask == Self::FULL_MASK {
-            return peer_types;
-        }
-        if (self.mask & Self::USERS_MASK) != 0 {
-            peer_types.push(telegram_api::InlineQueryPeerType::inlineQueryPeerTypePM(
-                telegram_api::inlineQueryPeerTypePM {},
-            ));
-        }
-        if (self.mask & Self::BOTS_MASK) != 0 {
-            peer_types.push(telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBotPM(
-                telegram_api::inlineQueryPeerTypeBotPM {},
-            ));
-        }
-        if (self.mask & Self::CHATS_MASK) != 0 {
-            peer_types.push(telegram_api::InlineQueryPeerType::inlineQueryPeerTypeChat(
-                telegram_api::inlineQueryPeerTypeChat {},
-            ));
-            peer_types.push(
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeMegagroup(
-                    telegram_api::inlineQueryPeerTypeMegagroup {},
-                ),
-            );
-        }
-        if (self.mask & Self::BROADCASTS_MASK) != 0 {
-            peer_types.push(
-                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBroadcast(
-                    telegram_api::inlineQueryPeerTypeBroadcast {},
-                ),
-            );
-        }
-        peer_types
-    }
-
-    /// `get_target_chat_types_object` (TargetDialogTypes.cpp:82-94).
-    pub fn get_target_chat_types_object(self) -> Option<td_api::TargetChatTypes> {
-        Some(td_api::TargetChatTypes {
-            allow_user_chats: (self.mask & Self::USERS_MASK) != 0,
-            allow_bot_chats: (self.mask & Self::BOTS_MASK) != 0,
-            allow_group_chats: (self.mask & Self::CHATS_MASK) != 0,
-            allow_channel_chats: (self.mask & Self::BROADCASTS_MASK) != 0,
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // WebAppOpenParameters.{h,cpp}
@@ -900,20 +766,23 @@ pub trait InlineQueriesManagerEnv {
         promise: Promise<td_api::InlineMessageId>,
     );
 
-    // -- the unlanded-plane seams
+    // -- the M.22 reply-markup plane intakes
     /// `KeyboardButton::get_keyboard_button(button, true)` +
-    /// `get_input_keyboard_button` — `[blocked: M.22]`; `None` parks the
-    /// caller's request.
+    /// `get_input_keyboard_button` (KeyboardButton.{h,cpp}) — the M.22
+    /// plane; validation errors reach the caller's promise (the C++
+    /// TRY_RESULT_PROMISE band at InlineQueriesManager.cpp:814).
     fn get_input_keyboard_button(
         &mut self,
         button: &td_api::KeyboardButton,
-    ) -> Option<telegram_api::KeyboardButton>;
-    /// `get_inline_reply_markup` + `get_input_reply_markup` —
-    /// `[blocked: M.22]`; a non-null markup collapses to no markup (the
-    /// C++ validation error texts for the record plane land with M.22).
+    ) -> Result<telegram_api::KeyboardButton, Status>;
+    /// `get_inline_reply_markup` (ReplyMarkup.cpp:319-322) composed with
+    /// the null-safe `get_input_reply_markup` (ReplyMarkup.cpp:495-502) —
+    /// the M.22 plane.
     fn get_input_reply_markup(
         &mut self,
         reply_markup: Option<td_api::ReplyMarkup>,
+        is_bot: bool,
+        switch_inline_buttons_allowed: bool,
     ) -> Result<Option<telegram_api::ReplyMarkup>, Status>;
     /// `RichMessage::get_rich_message` + `get_input_rich_message` —
     /// `[blocked: M.17]`; `Ok(None)` parks the caller's request.
@@ -1398,7 +1267,7 @@ impl InlineQueriesManager {
                     return;
                 }
             };
-        let types = match TargetDialogTypes::from_td_api(chat_types.as_ref()) {
+        let types = match TargetDialogTypes::get_target_dialog_types(chat_types.as_ref()) {
             Ok(types) => types,
             Err(status) => {
                 promise.set_error(status);
@@ -1472,9 +1341,9 @@ impl InlineQueriesManager {
     }
 
     /// `save_prepared_keyboard_button` (InlineQueriesManager.cpp:811-819).
-    /// The `KeyboardButton::get_keyboard_button` record plane is
-    /// `[blocked: M.22]` — the request parks at the seam with the C++
-    /// input-user validation already applied.
+    /// The button intake rides the M.22 plane
+    /// ([`InlineQueriesManagerEnv::get_input_keyboard_button`]); the
+    /// validation errors take the C++ TRY_RESULT_PROMISE band.
     pub fn save_prepared_keyboard_button(
         &mut self,
         env: &mut impl InlineQueriesManagerEnv,
@@ -1494,16 +1363,14 @@ impl InlineQueriesManager {
             return;
         };
         match env.get_input_keyboard_button(&button) {
-            Some(input_button) => {
+            Ok(input_button) => {
                 let query = telegram_api::bots_requestWebViewButton {
                     user_id: Some(input_user),
                     button: Some(input_button),
                 };
                 env.send_save_prepared_keyboard_button_query(query, promise);
             }
-            None => {
-                // the promise lands in the [blocked: M.22] seam
-            }
+            Err(status) => promise.set_error(status),
         }
     }
 
@@ -1936,8 +1803,10 @@ impl InlineQueriesManager {
         Some(td_api::PreparedInlineMessage {
             inline_query_id: results.inline_query_id,
             result: Some(result),
-            chat_types: TargetDialogTypes::from_mask(entry.target_dialog_types_mask)
-                .get_target_chat_types_object(),
+            chat_types: Some(
+                TargetDialogTypes::from_mask(entry.target_dialog_types_mask)
+                    .get_target_chat_types_object(),
+            ),
         })
     }
 
@@ -2437,7 +2306,7 @@ impl InlineQueriesManager {
         });
         entry.cache_expire_time = tdutils::time::now() + f64::from(prepared_message.cache_time);
         entry.target_dialog_types_mask =
-            TargetDialogTypes::from_wire(&prepared_message.peer_types).get_mask();
+            TargetDialogTypes::from_telegram(&prepared_message.peer_types).get_mask();
         let object = self.get_prepared_inline_message_object(query_hash);
         promise.set_value(object);
     }
@@ -2747,7 +2616,8 @@ impl InlineQueriesManager {
         let Some(input_message_content) = input_message_content else {
             return Err(Status::error(400, "Inline message must be non-empty"));
         };
-        let input_reply_markup = env.get_input_reply_markup(reply_markup_ptr)?;
+        let is_bot = env.auth_is_bot();
+        let input_reply_markup = env.get_input_reply_markup(reply_markup_ptr, is_bot, true)?;
 
         match input_message_content.as_ref() {
             td_api::InputMessageContent::inputMessageText(_) => {
@@ -3086,7 +2956,8 @@ impl InlineQueriesManager {
                 )?;
             }
             td_api::InputInlineQueryResult::inputInlineQueryResultGame(game) => {
-                let input_reply_markup = env.get_input_reply_markup(game.reply_markup)?;
+                let input_reply_markup =
+                    env.get_input_reply_markup(game.reply_markup, true, true)?;
                 let mut flags = 0;
                 if input_reply_markup.is_some() {
                     flags |= MASK_REPLY_MARKUP;

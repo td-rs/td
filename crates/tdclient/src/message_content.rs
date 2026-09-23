@@ -111,6 +111,7 @@ use crate::birthdate::Birthdate;
 use crate::chat_manager::{ChannelId, ChannelType, ChatId, MessageId, RestrictedRights};
 use crate::contact::Contact;
 use crate::emoji_status::CustomEmojiId;
+use crate::message_content_dup_type::MessageContentDupType;
 use crate::message_entity::{
     FormattedText, MessageEntity, Type, UserManagerLike, find_entities, remove_empty_entities,
 };
@@ -13907,23 +13908,9 @@ pub fn delete_message_content_thumbnail(
 // MessageContent.cpp:9778-10145) + `dup_message_content` (10146-10451) with
 // the wire constructors they need.
 // ---------------------------------------------------------------------------
-
-/// `td::MessageContentDupType` (MessageContentDupType.h:18-26).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MessageContentDupType {
-    /// normal message sending
-    Send,
-    /// message sending via bot
-    SendViaBot,
-    /// quick reply sending
-    SendQuickReply,
-    /// server-side message forward
-    Forward,
-    /// local message copy
-    Copy,
-    /// server-side message copy
-    ServerCopy,
-}
+//
+// `MessageContentDupType` rides the canonical `message_content_dup_type.rs`
+// module (M.22 unification; this is the adoption the module doc names).
 
 /// `td::MessageCopyOptions` (MessageCopyOptions.h:26-34) — the
 /// `dup_message_content` subset. The send-path fields (`input_reply_to`,

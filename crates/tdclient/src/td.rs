@@ -5605,10 +5605,9 @@ impl Td {
                     // `send_update_message_edited` (MessagesManager.cpp:
                     // 5985-6014's emission half)
                     let edit_date = crate::messages_manager::get_message_shown_edit_date(m);
-                    let reply_markup = m
-                        .reply_markup
-                        .as_ref()
-                        .and_then(|reply_markup| reply_markup.get_reply_markup_object(self));
+                    let reply_markup = m.reply_markup.as_ref().and_then(|reply_markup| {
+                        crate::messages_manager::get_message_reply_markup_object(self, reply_markup)
+                    });
                     self.send_update(Object::updateMessageEdited(td_api::updateMessageEdited {
                         chat_id: dialog_id.get(),
                         message_id: message_id.get(),
@@ -11749,16 +11748,39 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
 
     fn get_input_keyboard_button(
         &mut self,
-        _button: &td_api::KeyboardButton,
-    ) -> Option<telegram_api::KeyboardButton> {
-        None // [blocked: M.22]
+        button: &td_api::KeyboardButton,
+    ) -> Result<telegram_api::KeyboardButton, tdutils::status::Status> {
+        // `KeyboardButton::get_keyboard_button(std::move(button), true)`
+        // (InlineQueriesManager.cpp:814; KeyboardButton.cpp:82) — request
+        // buttons are the point of savePreparedKeyboardButton; the wire
+        // form is the record's `get_input_keyboard_button`
+        // (KeyboardButton.cpp:181).
+        let record = crate::keyboard_button::KeyboardButton::from_td_api(
+            button.clone(),
+            true,
+            self.is_test_dc(),
+        )?;
+        Ok(record.get_input_keyboard_button())
     }
 
     fn get_input_reply_markup(
         &mut self,
-        _reply_markup: Option<td_api::ReplyMarkup>,
+        reply_markup: Option<td_api::ReplyMarkup>,
+        is_bot: bool,
+        switch_inline_buttons_allowed: bool,
     ) -> Result<Option<telegram_api::ReplyMarkup>, tdutils::status::Status> {
-        Ok(None) // [blocked: M.22]: a non-null markup collapses to none
+        // `get_inline_reply_markup` (ReplyMarkup.cpp:319-322) + the
+        // null-safe free `get_input_reply_markup` (ReplyMarkup.cpp:495-502).
+        let markup = crate::reply_markup::get_inline_reply_markup(
+            reply_markup,
+            is_bot,
+            switch_inline_buttons_allowed,
+            self.is_test_dc(),
+        )?;
+        let Some(markup) = markup else {
+            return Ok(None);
+        };
+        Ok(crate::reply_markup::get_input_reply_markup(&markup))
     }
 
     fn get_input_rich_message(
