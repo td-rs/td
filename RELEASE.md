@@ -59,9 +59,13 @@ A release is parity-clean when **all** of the following are green:
 - [ ] cargo-deny advisories clean (or every exception explicitly signed
       off — see the open `rsa` RUSTSEC-2023-0071 decision)
 
-Current status (2026-09-15): **13 / 1,022 (1.3%)** — Track I has not
-started; the number is the release-blocking metric, not a quality one
-(the implemented subset is oracle-verified).
+Current status (2026-09-23, Track J audit): **633 / 1,022 (61.9%)** —
+`td-api-parity` counts `Function::<name>` handler references across the
+crate sources; the request census pins the same tree at
+20 sync / 558 dispatched / 444 interim of 1,022 arms
+(`crates/tdclient/src/testdata/request_census.txt`). The number is the
+release-blocking metric, not a quality one (the implemented subset is
+oracle-verified).
 
 ## 4. Changelog + version
 
@@ -72,9 +76,43 @@ started; the number is the release-blocking metric, not a quality one
   milestones (S76 walking skeleton → 0.1.0 tag with the first release
   artifacts; S81 bindings validation → 0.2.0; S84 first full-parity
   release → 1.0.0-candidate).
+- **2026-09-23 changelog-parity audit (S84)**, against the pinned upstream
+  `d1085f9cebc5a62379991ae1652673954f229c1f` (tdlib 1.8.67):
+  - `conformance/scheme_parity/check.sh` — the five schemes match the S03
+    sha256 pin (local drift green; the upstream drift check runs at import
+    time per §1 with a td checkout).
+  - The tdjson surface reports `version = "1.8.67"` byte-identical to the
+    C++ (`td_execute getOption version`, asserted by the
+    `execute_get_option_round_trip` test and the S81 python run).
+  - The S81 binding matrix (`conformance/bindings/README.md`), the S83
+    symbol audit (`conformance/verify_symbols.sh`: 14 required, 14
+    exported, 0 extra) and the request census above are the
+    release-candidate evidence set; `conformance/requests_gate/verify.sh`
+    green on the same tree.
+  - Known divergences live in `conformance/bindings/README.md` (close
+    latency after a pre-auth config fetch; the mixed legacy+manager
+    teardown fatal) and `bench/README.md`.
 
 ## 5. Artifacts
 
-Packaging (tdjson cdylib + headers per platform, wasm) is S82 — its
-`release.yml` workflow exists and activates on `v*` tags once S81's
-bindings validation passes.
+S82 packaging is **activated for Linux** as of 2026-09-23. The release
+artifact set matches a tdlib install: the `tdjson` cdylib plus the C
+headers it ships.
+
+- `libtdjson.so` — `cargo build --release -p tdjson` (the `release.yml`
+  glob picks it up on `v*` tags; CI remains gated on the billing fix).
+- `include/td/telegram/td_json_client.h`, `include/td/telegram/td_log.h` —
+  vendored byte-identical from the pinned upstream commit under
+  `crates/tdjson/include/` (`tdjson_export.h` is a CMake-generated C++
+  visibility header with no consumer outside td's own build and is
+  deliberately not shipped).
+- Verified as a drop-in: the S81 python example runs against exactly this
+  staged pair (`conformance/bindings/python_smoke.py`), and
+  `conformance/verify_symbols.sh` pins the export surface.
+- **wasm (example/web) status**: the `wasm32` CI job stays advisory. The
+  workspace does not yet check clean for `wasm32-unknown-unknown`:
+  `getrandom 0.2.17` fails with "the wasm*-unknown-unknown targets are not
+  supported by default, you may need to enable the `js` feature". S82's
+  remaining wasm work: a target-scoped `getrandom` `js`-feature wiring,
+  then an emscripten (`wasm32-unknown-emscripten`) cdylib build feeding
+  the `tdweb` packaging scripts.

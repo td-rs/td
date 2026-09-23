@@ -1,0 +1,14 @@
+[package]
+name = "gen_mtproto_seeds"
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+publish = false
+
+# Standalone S78 helper (not a fuzz target): emits valid-format MTProto
+# packets for fuzz/corpus/mtproto_packet so the fuzzer opens past the
+# fixed-key envelope gate instead of burning hundreds of millions of execs
+# at zero coverage (see fuzz/audit-2026-09-23.md).
+[dependencies]
+tdmtproto = { path = "../../crates/tdmtproto" }
+tdutils = { path = "../../crates/tdutils" }

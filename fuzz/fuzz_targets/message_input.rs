@@ -1,5 +1,6 @@
-//! Fuzz target: the M.10.21 td_api input plane — `ReplyMarkup::from_td_api`
-//! over arbitrary markup trees built by JSON deserialization, with the five
+//! Fuzz target: the M.10.21 td_api input plane —
+//! `get_reply_markup_from_td_api` (ReplyMarkup.cpp:201-317) over arbitrary
+//! markup trees built by JSON deserialization, with the five
 //! gate bools (is_bot / only_inline_keyboard / request_buttons_allowed /
 //! switch_inline_buttons_allowed / allow_personal) taken from the leading
 //! flag byte (bit 5 selects the null-markup arm). The keyboard/inline
@@ -35,12 +36,13 @@ fuzz_target!(|data: &[u8]| {
         }
     };
 
-    let _ = tdclient::messages_manager::ReplyMarkup::from_td_api(
+    let _ = tdclient::reply_markup::get_reply_markup_from_td_api(
         markup,
         is_bot,
         only_inline_keyboard,
         request_buttons_allowed,
         switch_inline_buttons_allowed,
         allow_personal,
+        false, // is_test_dc
     );
 });
