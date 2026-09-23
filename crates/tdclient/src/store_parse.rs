@@ -152,6 +152,14 @@ pub fn store_i32_vec(out: &mut Vec<u8>, values: &[i32]) {
     }
 }
 
+/// `td::store(vector<int64>)`.
+pub fn store_i64_vec(out: &mut Vec<u8>, values: &[i64]) {
+    store_i32(out, values.len() as i32);
+    for value in values {
+        store_i64(out, *value);
+    }
+}
+
 /// `BEGIN_STORE_FLAGS`/`STORE_FLAG`/`END_STORE_FLAGS` — one little-endian
 /// `uint32` per flag block; the C++ CHECKs `bit_offset < 31`.
 pub fn store_flags<const N: usize>(out: &mut Vec<u8>, flags: [bool; N]) {

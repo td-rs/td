@@ -95,7 +95,7 @@ clearAllDraftMessages	interim
 clearAutosaveSettingsExceptions	dispatched
 clearImportedContacts	dispatched
 clearRecentEmojiStatuses	interim
-clearRecentReactions	interim
+clearRecentReactions	dispatched
 clearRecentStickers	interim
 clearRecentlyFoundChats	dispatched
 clearSearchedForTags	interim
@@ -366,7 +366,7 @@ getDirectMessagesChatTopicMessageByDate	interim
 getDirectMessagesChatTopicRevenue	interim
 getDisallowedChatEmojiStatuses	interim
 getEmojiCategories	interim
-getEmojiReaction	interim
+getEmojiReaction	dispatched
 getEmojiSuggestionsUrl	interim
 getExternalLink	dispatched
 getExternalLinkInfo	dispatched
@@ -438,7 +438,7 @@ getMessage	interim
 getMessageAddedReactions	interim
 getMessageAuthor	interim
 getMessageAvailableReactions	interim
-getMessageEffect	interim
+getMessageEffect	dispatched
 getMessageEmbeddingCode	dispatched
 getMessageFileType	dispatched
 getMessageImportConfirmationText	dispatched
@@ -501,7 +501,7 @@ getRecoveryEmailAddress	interim
 getRemoteFile	dispatched
 getRepliedMessage	interim
 getSavedAnimations	dispatched
-getSavedMessagesTags	interim
+getSavedMessagesTags	dispatched
 getSavedMessagesTopicHistory	interim
 getSavedMessagesTopicMessageByDate	interim
 getSavedNotificationSound	interim
@@ -531,7 +531,7 @@ getStorageStatistics	dispatched
 getStorageStatisticsFast	dispatched
 getStory	dispatched
 getStoryAlbumStories	dispatched
-getStoryAvailableReactions	interim
+getStoryAvailableReactions	dispatched
 getStoryInteractions	dispatched
 getStoryNotificationSettingsExceptions	interim
 getStoryPublicForwards	dispatched
@@ -853,7 +853,7 @@ setDefaultBackground	interim
 setDefaultChannelAdministratorRights	dispatched
 setDefaultGroupAdministratorRights	dispatched
 setDefaultMessageAutoDeleteTime	interim
-setDefaultReactionType	interim
+setDefaultReactionType	dispatched
 setDirectMessagesChatTopicIsMarkedAsUnread	interim
 setEmojiStatus	dispatched
 setFileGenerationProgress	dispatched
@@ -900,7 +900,7 @@ setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	interim
 setRecoveryEmailAddress	interim
-setSavedMessagesTagLabel	interim
+setSavedMessagesTagLabel	dispatched
 setScopeNotificationSettings	dispatched
 setStickerEmojis	interim
 setStickerKeywords	interim
