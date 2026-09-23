@@ -94,6 +94,11 @@ pub struct WriterOpts {
     /// Emit the td_api JSON methods (`to_json*`/`from_json*`, S12) — td_api
     /// only; the other schemes have no JSON surface.
     pub json: bool,
+    /// Emit the C++ `to_string` debug surface (`store_debug` +
+    /// `to_debug_string`, M.14.2) — td_api only: the CLI prints responses
+    /// through td's `TlStorerToString` format, so the port needs the same
+    /// dynamic `to_string(const BaseObject&)` surface the C++ CLI reads.
+    pub tostring: bool,
     /// Also compile the sample synthesizers outside `cfg(test)`, behind this
     /// cargo feature of the including crate — the S15 replay oracle bins
     /// build with it (`conformance-samples`).
@@ -119,6 +124,9 @@ pub fn write_rust(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) -> String {
     out.push_str(SUPPORT_MODULE);
     if opts.json {
         out.push_str(JSON_SUPPORT_MODULE);
+    }
+    if opts.tostring {
+        out.push_str(TOSTRING_SUPPORT_MODULE);
     }
 
     let mut emitted_names = BTreeSet::new();
@@ -418,6 +426,10 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
                 emit_roundtrip_test(out, p, f, opts.umbrella, false, &name, opts.json);
             }
         }
+    }
+
+    if opts.tostring {
+        emit_tostring_golden_test(out);
     }
 
     // ---- malformed-input seeds ------------------------------------------
@@ -829,6 +841,9 @@ fn emit_struct(
     if opts.json {
         emit_struct_json(out, p, m, opts, c, fields);
     }
+    if opts.tostring {
+        emit_struct_tostring(out, p, m, c, fields);
+    }
     out.push_str("}\n\n");
 }
 
@@ -1019,8 +1034,28 @@ fn emit_object_umbrella(out: &mut String, p: &TlProgram, m: &SchemeModel, opts: 
         "                id => Result::Err(format!(\"Unknown constructor 0x{:08x}\", id as u32)),\n\
          \x20           },\n            \
          other => Result::Err(format!(\"Expected String or Integer, but receive {}\", other.type_name())),\n        \
-         }\n    }\n}\n\n",
+         }\n    }\n",
     );
+    if opts.tostring {
+        // td's `to_string(const BaseObject&)`: the virtual `store` dispatch.
+        out.push_str(
+            "\n    /// td's `to_string(const BaseObject&)` for the dynamic object.\n    \
+             pub fn to_debug_string(&self) -> String {\n        \
+             let mut out = String::new();\n        \
+             let mut storer = TlStorerToString { out: &mut out, shift: 0 };\n        \
+             self.store_debug(&mut storer, \"\");\n        \
+             out\n    }\n\n    \
+             pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {\n        \
+             match self {\n",
+        );
+        for (variant, _, _) in &variants {
+            out.push_str(&format!(
+                "            Self::{variant}(v) => v.store_debug(s, field_name),\n"
+            ));
+        }
+        out.push_str("        }\n    }\n");
+    }
+    out.push_str("}\n\n");
     // `Update::try_from_object` — the update-typed view C++ carries through
     // `td_api::updates` and `Td::send_update` (`object_ptr<Update>`); the
     // rewrap is variant-for-variant over the `Update` type's constructors.
@@ -1474,6 +1509,9 @@ fn emit_enum(
     out.push_str("        }\n    }\n");
     if opts.json {
         emit_enum_json(out, p, ctors);
+    }
+    if opts.tostring {
+        emit_enum_tostring(out, p, ctors);
     }
     out.push_str("}\n\n");
     // Manual Default: the breaking (min-rank) ctor — derived Default would
@@ -2756,3 +2794,466 @@ pub mod tl_json {
 }
 
 "#;
+
+/// Emits the M.14.2 debug-print methods for one constructor struct: td's
+/// generated `Class::store(TlStorerToString&, const char*)` (storer_type 1)
+/// plus the `to_string(const BaseObject&)` wrapper. The C++ CLI transcript
+/// (the M.14.7 oracle) is built from these strings, so every formatting
+/// quirk of `TlStorerToString` is load-bearing.
+fn emit_struct_tostring(
+    out: &mut String,
+    p: &TlProgram,
+    m: &SchemeModel,
+    c: usize,
+    fields: &[Field],
+) {
+    out.push_str(
+        "\n    /// td's generated `Class::store(TlStorerToString&, const char*)`\n    \
+         /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).\n    \
+         pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {\n",
+    );
+    out.push_str(&format!(
+        "        s.store_class_begin(field_name, \"{}\");\n",
+        pretty_class_name(&p.ctors[c].id)
+    ));
+    ToStringStoreWriter {
+        m,
+        depth: 2,
+        var_counter: 0,
+    }
+    .emit_fields(out, fields);
+    out.push_str("        s.store_class_end();\n    }\n");
+    out.push_str(
+        "\n    /// td's `to_string(const BaseObject&)` for this constructor.\n    \
+         pub fn to_debug_string(&self) -> String {\n        \
+         let mut out = String::new();\n        \
+         let mut storer = TlStorerToString { out: &mut out, shift: 0 };\n        \
+         self.store_debug(&mut storer, \"\");\n        \
+         out\n    }\n",
+    );
+}
+
+/// Emits the debug-print dispatch for one enum (and the `Function`
+/// umbrella): forwards to the variant struct's `store_debug`, like the C++
+/// virtual `store` through the base class.
+fn emit_enum_tostring(out: &mut String, p: &TlProgram, ctors: &[usize]) {
+    out.push_str(
+        "\n    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {\n        \
+         match self {\n",
+    );
+    for &c in ctors {
+        let variant = capitalize(&p.ctors[c].id);
+        out.push_str(&format!(
+            "            Self::{variant}(v) => v.store_debug(s, field_name),\n"
+        ));
+    }
+    out.push_str("        }\n    }\n");
+    out.push_str(
+        "\n    /// td's `to_string(const BaseObject&)` for this type.\n    \
+         pub fn to_debug_string(&self) -> String {\n        \
+         let mut out = String::new();\n        \
+         let mut storer = TlStorerToString { out: &mut out, shift: 0 };\n        \
+         self.store_debug(&mut storer, \"\");\n        \
+         out\n    }\n",
+    );
+}
+
+/// `TD_TL_writer_cpp::get_pretty_class_name`: underscores become dots
+/// outside mtproto (td_api ctor names carry none; the transform is kept for
+/// fidelity).
+fn pretty_class_name(id: &str) -> String {
+    id.replace('_', ".")
+}
+
+/// Emits the `store_debug` field statements. Differences from the binary
+/// [`StoreWriter`] are the C++ generator's own (`gen_field_store` at
+/// storer_type 1): conditionals gate on the *raw* flags word (the
+/// `var0 = flags | bools` capture exists only for the wire), `?true` bools
+/// print as their own `name = true` lines, null class pointers print `null`
+/// (never default-materialized), and vectors carry no constructor id.
+struct ToStringStoreWriter<'a> {
+    m: &'a SchemeModel,
+    depth: usize,
+    var_counter: usize,
+}
+
+impl ToStringStoreWriter<'_> {
+    fn indent(&self) -> String {
+        " ".repeat(self.depth * 4)
+    }
+
+    fn emit_fields(&mut self, out: &mut String, fields: &[Field]) {
+        for f in fields {
+            // td's `get_pretty_field_name`: the TL name minus trailing
+            // underscores (the C++ member suffix); vector internals pass "".
+            let pretty = f.name.trim_end_matches('_');
+            let expr = format!("self.{}", field_ident(&f.name));
+            if let FieldType::Conditional {
+                flags_field,
+                bit,
+                inner,
+            } = &f.ty
+            {
+                let flags = format!("self.{}", field_ident(&fields[*flags_field].name));
+                let mask = bit_mask(*bit);
+                if **inner == FieldType::Prim(Prim::True) {
+                    out.push_str(&format!(
+                        "{}if {flags} & {mask} != 0 {{ s.store_field_bool(\"{pretty}\", true); }}\n",
+                        self.indent()
+                    ));
+                    continue;
+                }
+                out.push_str(&format!("{}if {flags} & {mask} != 0 {{\n", self.indent()));
+                self.depth += 1;
+                self.emit_value(out, pretty, &expr, inner);
+                self.depth -= 1;
+                out.push_str(&format!("{}}}\n", self.indent()));
+            } else {
+                self.emit_value(out, pretty, &expr, &f.ty);
+            }
+        }
+    }
+
+    /// The borrow form of a place expression for `&`/`match` positions:
+    /// deref places (vector items) reborrow through the deref (`&*v`, the
+    /// clippy-accepted form the binary writer uses).
+    fn borrow(expr: &str) -> String {
+        if expr.starts_with('*') {
+            format!("&*{expr}")
+        } else {
+            format!("&{expr}")
+        }
+    }
+
+    /// The borrow form for the string/bytes arguments: an owned place takes
+    /// `&`, while a loop item (`*__v0`) is already a shared reference one
+    /// level out — pass the variable bare and let deref coercion produce the
+    /// `&str`/`&[u8]` (the `&**v` form trips clippy's `explicit_auto_deref`).
+    fn borrow_str(expr: &str) -> String {
+        if expr.starts_with('*') {
+            expr.trim_start_matches('*').to_owned()
+        } else {
+            format!("&{expr}")
+        }
+    }
+
+    /// The borrow form for an `Option` match scrutinee: the place is an
+    /// `Option<T>` (vector items arrive as `*__v0` derefs), so one deref
+    /// level — `&*__v0` is `&Option<T>`, where the prim arm's [`Self::borrow`]
+    /// would peel into the `Option` itself.
+    fn borrow_option(expr: &str) -> String {
+        if expr.starts_with('*') {
+            format!("&*{}", expr.trim_start_matches('*'))
+        } else {
+            format!("&{expr}")
+        }
+    }
+
+    /// Emits the statement printing `expr` (a place expression) as `ty`.
+    fn emit_value(&mut self, out: &mut String, name: &str, expr: &str, ty: &FieldType) {
+        let ind = self.indent();
+        let place = |e: &str| {
+            if e.starts_with('*') {
+                format!("({e})")
+            } else {
+                e.to_owned()
+            }
+        };
+        match ty {
+            FieldType::Prim(prim) => {
+                // A bare place expression: no parens — unary deref binds
+                // tighter than `as`, so `*__v0 as i64` parses correctly, and
+                // the parenthesized form trips `unused_parens` in the
+                // generated module.
+                let p = expr;
+                match prim {
+                    Prim::Nat | Prim::Int32 => out.push_str(&format!(
+                        "{ind}s.store_field_int(\"{name}\", {p} as i64);\n"
+                    )),
+                    Prim::Int53 | Prim::Int64 => {
+                        out.push_str(&format!("{ind}s.store_field_int(\"{name}\", {p});\n"))
+                    }
+                    Prim::Double => {
+                        out.push_str(&format!("{ind}s.store_field_double(\"{name}\", {p});\n"))
+                    }
+                    Prim::Bool => {
+                        out.push_str(&format!("{ind}s.store_field_bool(\"{name}\", {p});\n"))
+                    }
+                    Prim::String => out.push_str(&format!(
+                        "{ind}s.store_field_str(\"{name}\", {});\n",
+                        Self::borrow_str(expr)
+                    )),
+                    Prim::Bytes => out.push_str(&format!(
+                        "{ind}s.store_bytes_field(\"{name}\", {});\n",
+                        Self::borrow_str(expr)
+                    )),
+                    Prim::True => unreachable!("?true is folded into its flags gate"),
+                }
+            }
+            FieldType::Vector { inner, .. } => {
+                let n = self.var_counter;
+                self.var_counter += 1;
+                let var = format!("__v{n}");
+                out.push_str(&format!(
+                    "{ind}s.store_vector_begin(\"{name}\", {}.len());\n",
+                    place(expr)
+                ));
+                out.push_str(&format!("{ind}for {var} in {} {{\n", Self::borrow(expr)));
+                self.depth += 1;
+                match inner.as_ref() {
+                    // Vector elements are plain values in this model (the
+                    // S76 non-nullable `object_ptr` collapse) — no null arm.
+                    FieldType::Boxed(_) | FieldType::Bare(_) | FieldType::Function => {
+                        out.push_str(&format!("{ind}    {var}.store_debug(s, \"\");\n"));
+                    }
+                    t => self.emit_value(out, "", &format!("*{var}"), t),
+                }
+                self.depth -= 1;
+                out.push_str(&format!("{ind}}}\n"));
+                // The vector's closing brace is `store_class_end`, exactly
+                // as the C++ generates (`} s.store_class_end(); }`).
+                out.push_str(&format!("{ind}s.store_class_end();\n"));
+            }
+            FieldType::FixedArray { len, inner } => {
+                // The fixed word types (int128/int256/int512) print as raw
+                // bytes (`store_field(Slice, const UInt128&)` → `{ AB CD }`).
+                assert!(
+                    matches!(
+                        inner.as_ref(),
+                        FieldType::Prim(Prim::Nat | Prim::Int32 | Prim::Int53 | Prim::Int64)
+                    ),
+                    "fixed word arrays hold ints"
+                );
+                let n = self.var_counter;
+                self.var_counter += 1;
+                out.push_str(&format!(
+                    "{ind}let __bytes{n}: Vec<u8> = {}.iter().flat_map(|w| w.to_le_bytes()).collect();\n",
+                    place(expr)
+                ));
+                out.push_str(&format!(
+                    "{ind}s.store_field_binary(\"{name}\", &__bytes{n}); // {len}*word\n"
+                ));
+            }
+            FieldType::Boxed(t) | FieldType::Bare(t) => {
+                debug_assert!(
+                    !self.m.is_word_type[*t],
+                    "word types are printed as primitives"
+                );
+                let n = self.var_counter;
+                self.var_counter += 1;
+                out.push_str(&format!("{ind}match {} {{\n", Self::borrow_option(expr)));
+                out.push_str(&format!(
+                    "{ind}    Some(__m{n}) => __m{n}.store_debug(s, \"{name}\"),\n"
+                ));
+                out.push_str(&format!("{ind}    None => s.store_null(\"{name}\"),\n"));
+                out.push_str(&format!("{ind}}}\n"));
+            }
+            FieldType::Function => {
+                // `Option<Box<Function>>`: the same null-or-recurse shape.
+                let n = self.var_counter;
+                self.var_counter += 1;
+                out.push_str(&format!("{ind}match {} {{\n", Self::borrow_option(expr)));
+                out.push_str(&format!(
+                    "{ind}    Some(__m{n}) => __m{n}.store_debug(s, \"{name}\"),\n"
+                ));
+                out.push_str(&format!("{ind}    None => s.store_null(\"{name}\"),\n"));
+                out.push_str(&format!("{ind}}}\n"));
+            }
+            FieldType::Conditional { .. } => unreachable!("conditionals are handled per-field"),
+        }
+    }
+}
+
+const TOSTRING_SUPPORT_MODULE: &str = r#"/// td's `TlStorerToString` (tdutils/td/utils/TlStorerToString.h): the
+/// `field = value` storer behind C++ `to_string(const BaseObject&)`.
+/// The formatting quirks are load-bearing (the CLI transcript oracle diffs
+/// on them): strings are raw bytes in quotes (no escaping), bools print
+/// `true`/`false`, doubles are 6-decimal fixed (`FixedDouble(x, 6)`; the
+/// C++ `nan`/`inf` spellings differ and never occur in practice), bytes are
+/// uppercase-hex capped at 64 with an `...` marker, and every line is
+/// `\n`-terminated with a 2-space shift per nesting level.
+pub struct TlStorerToString<'a> {
+    out: &'a mut String,
+    shift: usize,
+}
+
+impl TlStorerToString<'_> {
+    fn field_begin(&mut self, name: &str) {
+        for _ in 0..self.shift {
+            self.out.push(' ');
+        }
+        if !name.is_empty() {
+            self.out.push_str(name);
+            self.out.push_str(" = ");
+        }
+    }
+
+    fn field_end(&mut self) {
+        self.out.push('\n');
+    }
+
+    /// `store_class_begin`: `name = ClassName {` + shift 2.
+    pub fn store_class_begin(&mut self, field_name: &str, class_name: &str) {
+        self.field_begin(field_name);
+        self.out.push_str(class_name);
+        self.out.push_str(" {\n");
+        self.shift += 2;
+    }
+
+    /// `store_class_end`: unshift, close the brace.
+    pub fn store_class_end(&mut self) {
+        debug_assert!(self.shift >= 2);
+        self.shift -= 2;
+        for _ in 0..self.shift {
+            self.out.push(' ');
+        }
+        self.out.push_str("}\n");
+    }
+
+    /// `store_vector_begin`: `name = vector[N] {` + shift 2 (the closing
+    /// brace comes from `store_class_end`, exactly as the C++ generates).
+    pub fn store_vector_begin(&mut self, field_name: &str, size: usize) {
+        self.field_begin(field_name);
+        self.out.push_str(&format!("vector[{size}] {{\n"));
+        self.shift += 2;
+    }
+
+    /// `store_field(Slice, const string&)`: the value in quotes, raw bytes
+    /// (the C++ `sb_ << value` never escapes).
+    pub fn store_field_str(&mut self, name: &str, value: &str) {
+        self.field_begin(name);
+        self.out.push('"');
+        self.out.push_str(value);
+        self.out.push('"');
+        self.field_end();
+    }
+
+    /// The `Bool` arm (`sb_ << bool` prints `true`/`false`).
+    pub fn store_field_bool(&mut self, name: &str, value: bool) {
+        self.field_begin(name);
+        self.out.push_str(if value { "true" } else { "false" });
+        self.field_end();
+    }
+
+    /// The integer arm: plain decimal.
+    pub fn store_field_int(&mut self, name: &str, value: i64) {
+        self.field_begin(name);
+        self.out.push_str(&value.to_string());
+        self.field_end();
+    }
+
+    /// The `Double` arm: `FixedDouble(x, 6)` — `std::stringstream` with
+    /// `std::ios_base::fixed` in the classic locale.
+    pub fn store_field_double(&mut self, name: &str, value: f64) {
+        self.field_begin(name);
+        self.out.push_str(&format!("{value:.6}"));
+        self.field_end();
+    }
+
+    /// `store_bytes_field`: `bytes [N] { hex... }`, the first 64 bytes
+    /// uppercase-hex (each byte followed by a space), `...` when truncated.
+    pub fn store_bytes_field(&mut self, name: &str, value: &[u8]) {
+        self.field_begin(name);
+        self.out.push_str(&format!("bytes [{}] {{ ", value.len()));
+        let len = value.len().min(64);
+        self.hex_bytes(&value[..len]);
+        if len < value.len() {
+            self.out.push_str("...");
+        }
+        self.out.push('}');
+        self.field_end();
+    }
+
+    /// `store_field(Slice, const UInt128/256/512&)`: the whole word as raw
+    /// bytes — `{ AB CD ... }`, no size, no cap.
+    pub fn store_field_binary(&mut self, name: &str, value: &[u8]) {
+        self.field_begin(name);
+        self.out.push_str("{ ");
+        self.hex_bytes(value);
+        self.out.push('}');
+        self.field_end();
+    }
+
+    fn hex_bytes(&mut self, value: &[u8]) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for &b in value {
+            self.out.push(HEX[(b >> 4) as usize] as char);
+            self.out.push(HEX[(b & 15) as usize] as char);
+            self.out.push(' ');
+        }
+    }
+
+    /// `store_object_field` on a null `object_ptr`: the bare word `null`
+    /// (no quotes — the C++ `Slice("null")` overload wins over the quoted
+    /// `string` one).
+    pub fn store_null(&mut self, name: &str) {
+        self.field_begin(name);
+        self.out.push_str("null");
+        self.field_end();
+    }
+}
+"#;
+
+/// Emits the hand-pinned `TlStorerToString` format goldens (td_api only):
+/// every quirk of the C++ debug print, computed by hand from the C++
+/// generator sources (tl_writer_cpp.cpp + TlStorerToString.h).
+fn emit_tostring_golden_test(out: &mut String) {
+    out.push_str(
+        r#"#[cfg(test)]
+#[test]
+fn to_debug_string_matches_the_cpp_tl_storer_to_string_format() {
+    // error { code = 400, message = "Wrong" }
+    let e = Error { code: 400, message: "Wrong".to_owned() };
+    assert_eq!(e.to_debug_string(), "error {\n  code = 400\n  message = \"Wrong\"\n}\n");
+
+    // Strings print RAW — no escaping (the C++ `sb_ << value` in quotes).
+    let e = Error { code: 0, message: "a\nb".to_owned() };
+    assert_eq!(e.to_debug_string(), "error {\n  code = 0\n  message = \"a\nb\"\n}\n");
+
+    // Bools print true/false (`sb_ << bool`).
+    let b = optionValueBoolean { value: true };
+    assert_eq!(b.to_debug_string(), "optionValueBoolean {\n  value = true\n}\n");
+
+    // Doubles print 6-decimal fixed (`FixedDouble(x, 6)`).
+    let l = Location { latitude: 1.5, longitude: -0.25, horizontal_accuracy: 0.0 };
+    assert_eq!(
+        l.to_debug_string(),
+        "location {\n  latitude = 1.500000\n  longitude = -0.250000\n  horizontal_accuracy = 0.000000\n}\n"
+    );
+
+    // Vectors: `vector[N] {`, nested objects with null pointers, the empty
+    // inner class on one shifted line.
+    let t = TextEntities {
+        entities: vec![
+            TextEntity { offset: 0, length: 4, r#type: None },
+            TextEntity {
+                offset: 5,
+                length: 9,
+                r#type: Some(TextEntityType::textEntityTypeUrl(textEntityTypeUrl)),
+            },
+        ],
+    };
+    assert_eq!(
+        t.to_debug_string(),
+        "textEntities {\n  entities = vector[2] {\n    textEntity {\n      offset = 0\n      length = 4\n      type = null\n    }\n    textEntity {\n      offset = 5\n      length = 9\n      type = textEntityTypeUrl {\n      }\n    }\n  }\n}\n"
+    );
+
+    // Bytes: uppercase hex, capped at 64 with an `...` marker.
+    let t = TestBytes { value: vec![0xab; 70] };
+    let mut expected = String::from("testBytes {\n  value = bytes [70] { ");
+    for _ in 0..64 {
+        expected.push_str("AB ");
+    }
+    expected.push_str("...}\n}\n");
+    assert_eq!(t.to_debug_string(), expected);
+
+    // The dynamic surfaces (`to_string(const BaseObject&)`, both umbrellas).
+    assert_eq!(
+        Object::error(e).to_debug_string(),
+        "error {\n  code = 0\n  message = \"a\nb\"\n}\n"
+    );
+    assert_eq!(Function::getMe(getMe).to_debug_string(), "getMe {\n}\n");
+}
+"#,
+    );
+}

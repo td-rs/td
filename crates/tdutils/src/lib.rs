@@ -3,6 +3,7 @@
 pub mod bignum;
 pub mod buffer;
 pub mod byte_flow;
+pub mod combined_log;
 pub mod crc32;
 pub mod crypto;
 pub mod ed25519;

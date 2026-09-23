@@ -1,0 +1,20 @@
+[package]
+name = "tdcli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `td/telegram/cli.cpp` — the test/dogfooding CLI (`tg_cli` binary). Dev tool,
+# excluded from the release surface (D6): it never ships in the tdjson parity
+# audit (S83).
+[[bin]]
+name = "td_cli"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+tdclient = { path = "../tdclient" }
+tdnet = { path = "../tdnet" }
+tdutils = { path = "../tdutils" }
+libc = "0.2"
