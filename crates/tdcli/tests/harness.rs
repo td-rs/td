@@ -194,9 +194,6 @@ const UNKNOWN_HELLO: &str =
 const CREATING_TD: &str =
     "[ 2][t 1][ts][cli.rs][!CliClient]\tCreating new Td ClientActor1 with generation 1";
 
-/// The CLI answers the startup state with the auto-config requests; after
-/// `q` tore the client down (or the pipe closed), the sends fail — the
-
 const QUIT_TAIL: &[&str] = &[
     "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
     "[ 2][t 1][ts][cli.rs][!CliClient]\tupdateAuthorizationState {",
