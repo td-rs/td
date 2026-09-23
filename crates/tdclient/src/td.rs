@@ -51,8 +51,7 @@ use tdutils::status::Status;
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::{ChannelId, ChannelType, DcId};
-use crate::chat_manager::{ChannelId, ChatId, DcId, MessageId, RestrictedRights};
+use crate::chat_manager::{ChannelType, ChannelId, ChatId, DcId, MessageId, RestrictedRights};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -66,8 +65,6 @@ use crate::config_recoverer::{
 };
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
-use crate::convert::{self, MessageSpec};
-use crate::dialog_id::DialogType;
 use crate::contact::Contact;
 use crate::convert;
 use crate::dialog_manager::DialogManager;
@@ -91,7 +88,6 @@ use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
-use crate::user_manager::AccessRights;
 use crate::user_manager::SecretChatId;
 use crate::user_manager::{UserEnv, UserId, UserManager};
 use crate::web_browser_manager::WebBrowserManager;
@@ -2034,6 +2030,13 @@ pub struct Td {
     /// `Td::message_query_manager_` (`Td.cpp:1245`, M.18) — the collapsed
     /// MessageQueryManager; created with Td like the C++ `init_managers`.
     pub(crate) message_query_manager: crate::message_query_manager::MessageQueryManager,
+    /// `Td::inline_message_manager_` (Td.cpp:1234, M.21).
+    pub(crate) inline_message_manager: crate::inline_message_manager::InlineMessageManager,
+    /// `Td::inline_queries_manager_` (Td.cpp:1237, M.21).
+    pub(crate) inline_queries_manager: crate::inline_queries_manager::InlineQueriesManager,
+    /// The inline managers' `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) inline_updates: Vec<td_api::Update>,
     /// The message-query manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -2090,6 +2093,14 @@ pub struct Td {
     pub(crate) community_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::animations_manager_` (`Td.cpp:1160`, M.20) — the constructor
+    /// and start_up halves run in [`Td::init_animations_manager`] where
+    /// the option manager exists.
+    pub(crate) animations_manager: crate::animations_manager::AnimationsManager,
+    /// The animations manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) animations_updates: Vec<td_api::Update>,
     /// `Td::poll_manager_` (Td.cpp:1263-1265, M.19).
     pub(crate) poll_manager: crate::poll_manager::PollManager,
     /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
@@ -2124,13 +2135,6 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
-    /// `Td::inline_message_manager_` (Td.cpp:1234, M.21).
-    pub(crate) inline_message_manager: crate::inline_message_manager::InlineMessageManager,
-    /// `Td::inline_queries_manager_` (Td.cpp:1237, M.21).
-    pub(crate) inline_queries_manager: crate::inline_queries_manager::InlineQueriesManager,
-    /// The inline managers' `send_update` outbox — drained by
-    /// [`Td::flush_user_updates`].
-    pub(crate) inline_updates: Vec<td_api::Update>,
     /// `Td::web_pages_manager_` (Td.cpp:1270, M.17).
     pub(crate) web_pages_manager: crate::web_pages_manager::WebPagesManager,
     /// The web-pages pending timeout deadlines (the collapsed
@@ -2421,6 +2425,9 @@ impl Td {
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
             message_query_manager: crate::message_query_manager::MessageQueryManager::new(),
+            inline_message_manager: crate::inline_message_manager::InlineMessageManager::new(),
+            inline_queries_manager: crate::inline_queries_manager::InlineQueriesManager::new(),
+            inline_updates: Vec::new(),
             message_query_updates: Vec::new(),
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
@@ -2445,6 +2452,8 @@ impl Td {
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            animations_manager: crate::animations_manager::AnimationsManager::new(),
+            animations_updates: Vec::new(),
             poll_manager: crate::poll_manager::PollManager::new(),
             poll_updates: Vec::new(),
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
@@ -2459,9 +2468,6 @@ impl Td {
             call_updates: Vec::new(),
             call_dh_config: None,
             notification_updates: Vec::new(),
-            inline_message_manager: crate::inline_message_manager::InlineMessageManager::new(),
-            inline_queries_manager: crate::inline_queries_manager::InlineQueriesManager::new(),
-            inline_updates: Vec::new(),
             web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
             web_pages_timeouts: std::collections::HashMap::new(),
             attach_menu_manager: crate::attach_menu_manager::AttachMenuManager::new(),
@@ -2661,6 +2667,11 @@ impl Td {
         // the pmc token load runs at Td start, auth-independently; the
         // sync loop is the [blocked: net] seam.
         self.load_device_token_states();
+
+        // `AnimationsManager::AnimationsManager` + `start_up`
+        // (Td.cpp:1160, the init_managers block) — the constructor erases
+        // the legacy limit key and loads the saved `ans` record (M.20).
+        self.init_animations_manager();
 
         // `Td::process_binlog_events` (Td.cpp:1034) — the on-server
         // notification settings log events replay into the settings
@@ -3590,6 +3601,27 @@ impl Td {
     /// queued by the manager's option writes go out before the answers,
     /// like the C++ `send_update` calls during the handlers.
     pub(crate) fn apply_config_actions(&mut self, actions: ConfigActions) {
+        // The `OptionManager::option_changed` animations fan-outs
+        // (OptionManager.cpp:603-608, 734-736): the search-parameter and
+        // saved-animations-limit options are config-applied only, and the
+        // manager re-reads + dedupes them per call, so the unconditional
+        // per-apply fire is observationally the C++ changed-only path.
+        {
+            let mut env = TdAnimationsEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                file_manager: Arc::clone(&self.file_manager),
+                file_reference_manager: &mut self.file_reference_manager,
+                updates: &mut self.animations_updates,
+            };
+            self.animations_manager
+                .on_update_animation_search_emojis(&mut env);
+            self.animations_manager
+                .on_update_animation_search_provider(&mut env);
+            self.animations_manager
+                .on_update_saved_animations_limit(&mut env);
+        }
         if actions.refresh_premium_options
             && let Some(option_manager) = self.option_manager.as_mut()
         {
@@ -4581,6 +4613,26 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let animations_updates = std::mem::take(&mut self.animations_updates);
+        for update in animations_updates {
+            self.send_update(update.into());
+        }
+    }
+
+    /// `AnimationsManager::AnimationsManager`
+    /// (AnimationsManager.cpp:127-147) plus the `start_up` halves — the
+    /// collapsed actor start reads the options and the `ans` pmc record
+    /// (M.20).
+    fn init_animations_manager(&mut self) {
+        let mut env = TdAnimationsEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            file_manager: Arc::clone(&self.file_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            updates: &mut self.animations_updates,
+        };
+        self.animations_manager.init(&mut env);
         let inline_updates = std::mem::take(&mut self.inline_updates);
         for update in inline_updates {
             self.send_update(update.into());
@@ -6356,13 +6408,154 @@ impl FileManagerWorker for TdFileWorker {
     }
 }
 
-// ── the LinkManager environment (M.23) ──
+// ── the AnimationsManager environment (M.20) ──
 //
-// The C++ LinkManager reads `G()` (options, close flag, the binlog pmc)
-// and sends its queries from the collapsed actor's `create_handler`s;
-// the env carries the same surfaces and the `[blocked: net]` query
-// seams. The dialog-manager half of `bot_start_autostart`
-// (LinkManager.cpp:641-646) stays behind the trait default.
+// The C++ AnimationsManager reads `G()` (options, close flag, the binlog
+// + sqlite pmcs, the FileManager) and sends its queries from the
+// collapsed actor's `create_handler`s; the env carries the same surfaces
+// and the `[blocked: net]` query seams.
+
+/// The per-call [`crate::animations_manager::AnimationsManagerEnv`] over
+/// the Td fields — built per call with the field-split borrows, never
+/// held across calls.
+pub(crate) struct TdAnimationsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::photo::DialogPhotoStoreEnv for TdAnimationsEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn use_sqlite_pmc(&self) -> bool {
+        self.global.use_sqlite_pmc()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        // The C++ sqlite pmc `get` is async; the collapsed line inlines
+        // the callback (the common kv plays the pmc role on this line).
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn create_saved_animations_file_source(&mut self) -> crate::files::FileSourceId {
+        self.file_reference_manager
+            .intern(crate::files::FileSource::SavedAnimations)
+    }
+
+    fn change_files_source(
+        &mut self,
+        file_source_id: crate::files::FileSourceId,
+        old_file_ids: &[FileId],
+        new_file_ids: &[FileId],
+        _source: &str,
+    ) {
+        // `FileManager::change_files_source` over the main-file-id sets.
+        let file_manager = self.file_manager.lock();
+        let main_file_ids = |file_manager: &crate::files::FileManager,
+                             file_ids: &[FileId]|
+         -> std::collections::HashSet<FileId> {
+            file_ids
+                .iter()
+                .map(|file_id| {
+                    file_manager
+                        .get_file_view(*file_id)
+                        .map(|view| view.get_main_file_id())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let old_main = main_file_ids(&file_manager, old_file_ids);
+        let mut new_main = main_file_ids(&file_manager, new_file_ids);
+        for file_id in old_main {
+            if !new_main.remove(&file_id) {
+                self.file_reference_manager
+                    .remove_file_source(file_id, file_source_id);
+            }
+        }
+        for file_id in new_main {
+            self.file_reference_manager
+                .add_file_source(file_id, file_source_id);
+        }
+    }
+
+    fn on_get_document_animation(&mut self, _document: telegram_api::document) -> Option<FileId> {
+        // `td_->documents_manager_->on_get_document` — the
+        // [blocked: M.28] intake seam; answers None until the document
+        // plane lands, which the caller handles like the C++
+        // non-animation case.
+        None
+    }
+
+    fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64) {
+        tdutils::log_info!(
+            "Send GetSavedGifsQuery(is_repair = {is_repair}, hash = {hash}) — [blocked: net]"
+        );
+    }
+
+    fn send_save_gif_query_net(
+        &mut self,
+        file_id: FileId,
+        unsave: bool,
+        _input_document: telegram_api::InputDocument,
+        _promise: Promise<()>,
+    ) {
+        tdutils::log_info!(
+            "Send SaveGifQuery(file_id = {}, unsave = {unsave}) — [blocked: net]",
+            file_id.get()
+        );
+    }
+}
 
 /// The `&self` option slice for the `LinkManager` statics
 /// (`get_instant_view_link*`, LinkManager.h:115-119) — they read
@@ -7061,12 +7254,6 @@ impl Actor for Td {
             self.notification_settings_manager.tick_timeouts(&mut env);
             self.device_token_manager.tick_timeouts(&mut env);
         }
-        // The InlineQueriesManager timeout sweep (M.21): the C++
-        // `on_pending_inline_query_timeout_callback` collapses into
-        // `tick_timeouts`.
-        {
-            let (mut env, inline_queries_manager, _) = inline_env_split(self);
-            inline_queries_manager.tick_timeouts(&mut env);
         // The WebPagesManager pending-page timeouts (M.17): the
         // collapsed MultiTimeout fires each due id once.
         {
@@ -7082,6 +7269,13 @@ impl Actor for Td {
                 let (mut env, web_pages_manager) = web_pages_env_split(self);
                 web_pages_manager.on_pending_web_page_timeout(&mut env, web_page_id);
             }
+        }
+        // The InlineQueriesManager timeout sweep (M.21): the C++
+        // `on_pending_inline_query_timeout_callback` collapses into
+        // `tick_timeouts`.
+        {
+            let (mut env, inline_queries_manager, _) = inline_env_split(self);
+            inline_queries_manager.tick_timeouts(&mut env);
         }
         // The MessageQueryManager timeout families (M.18): the C++
         // `send_message_view_metrics_timeout_callback` and the reload
@@ -11101,6 +11295,439 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
 }
 
 #[cfg(test)]
+/// Field-split the `Td` for the inline manager calls.
+pub(crate) fn inline_env_split(
+    td: &mut Td,
+) -> (
+    TdInlineEnv<'_>,
+    &mut crate::inline_queries_manager::InlineQueriesManager,
+    &mut crate::inline_message_manager::InlineMessageManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        inline_queries_manager,
+        inline_message_manager,
+        inline_updates,
+        ..
+    } = td;
+    (
+        TdInlineEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            updates: inline_updates,
+        },
+        inline_queries_manager,
+        inline_message_manager,
+    )
+}
+
+/// The `G()`/manager slice of the collapsed InlineQueriesManager +
+/// InlineMessageManager pair (M.21).
+pub(crate) struct TdInlineEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults on the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut ChatManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+/// Build the UserEnv from the env's fields (the field-level borrows
+/// must be written inline at each call site; a `&mut self` helper would
+/// pin the whole struct).
+fn make_user_env<'a>(
+    global: &'a mut Global,
+    options: &'a mut OptionManager,
+    auth_is_bot: bool,
+) -> UserEnv<'a> {
+    UserEnv {
+        global,
+        options,
+        auth_is_bot,
+    }
+}
+
+impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_chat_info_database(&self) -> bool {
+        self.global.use_chat_info_database()
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn binlog_pmc_get(&mut self, key: &str) -> String {
+        self.global.binlog_pmc().get(key)
+    }
+
+    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_bot_data(
+        &self,
+        user_id: crate::user_manager::UserId,
+    ) -> Result<crate::user_manager::BotData, tdutils::status::Status> {
+        self.user_manager.get_bot_data(user_id)
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn have_user_force(&self, user_id: crate::user_manager::UserId) -> bool {
+        // The forced fetch is the M.4 seam; the in-memory band answers.
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_user_first_username(&self, user_id: crate::user_manager::UserId) -> String {
+        self.user_manager
+            .get_user_first_username_of(user_id)
+            .to_owned()
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let Some(options) = self.options.as_mut() else {
+            return user_id.get();
+        };
+        let mut env = make_user_env(&mut self.global, options, self.auth_is_bot);
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> Result<telegram_api::InputUser, tdutils::status::Status> {
+        let Some(options) = self.options.as_mut() else {
+            return Err(tdutils::status::Status::error(400, "User not found"));
+        };
+        let env = make_user_env(&mut self.global, options, self.auth_is_bot);
+        self.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let Some(options) = self.options.as_mut() else {
+            return;
+        };
+        let mut env = make_user_env(&mut self.global, options, self.auth_is_bot);
+        self.user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                let options = self.options.as_mut()?;
+                let env = make_user_env(&mut self.global, options, self.auth_is_bot);
+                self.user_manager
+                    .get_input_peer_user(&env, user_id, AccessRights::Read)
+            }
+            crate::dialog_id::DialogType::Chat
+            | crate::dialog_id::DialogType::Channel
+            | crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    fn get_channel_type(&self, channel_id: ChannelId) -> ChannelType {
+        self.chat_manager.get_channel_type_by_id(channel_id)
+    }
+
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+        self.chat_manager.get_channel_type_by_id(channel_id) == ChannelType::Broadcast
+    }
+
+    fn resolve_weather_dialog(
+        &mut self,
+        _username: &str,
+        _location: crate::chat_manager::Location,
+        _promise: Promise<td_api::CurrentWeather>,
+    ) {
+        // [blocked: net]: the resolve never sends; the promise parks.
+    }
+
+    fn can_add_web_page_previews(&self, _dialog_id: crate::dialog_id::DialogId) -> bool {
+        false // the M.5 band
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn parse_formatted_text(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        text: Option<td_api::FormattedText>,
+        is_bot: bool,
+        allow_empty: bool,
+        skip_media_timestamps: bool,
+        skip_trim: bool,
+    ) -> Result<crate::message_entity::FormattedText, tdutils::status::Status> {
+        let (always_parse_markdown, session_count) = match self.options.as_ref() {
+            Some(options) => (
+                options.get_option_boolean("always_parse_markdown", false),
+                options.get_option_integer("session_count", -1) as i32,
+            ),
+            None => (false, 0),
+        };
+        // The real user-manager form rides the M.8 line; the null form is
+        // the C++ `user_manager == nullptr` band.
+        crate::message_entity::get_formatted_text_of_input::<()>(
+            None,
+            dialog_id,
+            text,
+            is_bot,
+            allow_empty,
+            skip_media_timestamps,
+            skip_trim,
+            None,
+            always_parse_markdown,
+            session_count,
+        )
+    }
+
+    fn get_input_message_entities(
+        &mut self,
+        entities: &[crate::message_entity::MessageEntity],
+        source: &str,
+    ) -> Vec<telegram_api::MessageEntity> {
+        crate::message_entity::get_input_message_entities::<()>(None, entities, source)
+    }
+
+    fn send_get_inline_bot_results_query(
+        &mut self,
+        _query: telegram_api::messages_getInlineBotResults,
+        _dialog_id: crate::dialog_id::DialogId,
+        _bot_user_id: crate::user_manager::UserId,
+        _query_hash: u64,
+        _promise: Promise<Option<td_api::InlineQueryResults>>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_set_inline_bot_results_query(
+        &mut self,
+        _query: telegram_api::messages_setInlineBotResults,
+        _promise: Promise<()>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_set_bot_guest_chat_result_query(
+        &mut self,
+        _query_id: i64,
+        _result: telegram_api::InputBotInlineResult,
+        _promise: Promise<td_api::InlineMessageId>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_save_prepared_inline_message_query(
+        &mut self,
+        _query: telegram_api::messages_savePreparedInlineMessage,
+        _promise: Promise<td_api::PreparedInlineMessageId>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_get_prepared_inline_message_query(
+        &mut self,
+        _query: telegram_api::messages_getPreparedInlineMessage,
+        _bot_user_id: crate::user_manager::UserId,
+        _query_hash: u64,
+        _promise: Promise<Option<td_api::PreparedInlineMessage>>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_save_prepared_keyboard_button_query(
+        &mut self,
+        _query: telegram_api::bots_requestWebViewButton,
+        _promise: Promise<String>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_get_requested_web_view_button_query(
+        &mut self,
+        _query: telegram_api::bots_getRequestedWebViewButton,
+        _bot_user_id: crate::user_manager::UserId,
+        _prepared_button_id: String,
+        _promise: Promise<td_api::KeyboardButton>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_request_simple_web_view_query(
+        &mut self,
+        _query: telegram_api::messages_requestSimpleWebView,
+        _promise: Promise<td_api::WebAppUrl>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_send_web_view_data_query(
+        &mut self,
+        _query: telegram_api::messages_sendWebViewData,
+        _promise: Promise<()>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_send_web_view_result_message_query(
+        &mut self,
+        _query: telegram_api::messages_sendWebViewResultMessage,
+        _promise: Promise<td_api::InlineMessageId>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn get_input_keyboard_button(
+        &mut self,
+        _button: &td_api::KeyboardButton,
+    ) -> Option<telegram_api::KeyboardButton> {
+        None // [blocked: M.22]
+    }
+
+    fn get_input_reply_markup(
+        &mut self,
+        _reply_markup: Option<td_api::ReplyMarkup>,
+    ) -> Result<Option<telegram_api::ReplyMarkup>, tdutils::status::Status> {
+        Ok(None) // [blocked: M.22]: a non-null markup collapses to none
+    }
+
+    fn get_input_rich_message(
+        &mut self,
+        _message: &td_api::inputMessageRichMessage,
+    ) -> Result<Option<telegram_api::InputRichMessage>, tdutils::status::Status> {
+        Ok(None) // [blocked: M.17]
+    }
+
+    fn get_input_bot_inline_message_media_invoice(
+        &mut self,
+        _invoice: &td_api::inputMessageInvoice,
+        _reply_markup: Option<telegram_api::ReplyMarkup>,
+    ) -> Result<Option<telegram_api::InputBotInlineMessage>, tdutils::status::Status> {
+        Ok(None) // [blocked: Wave-3 payments]
+    }
+
+    fn create_inline_message_content(
+        &mut self,
+        _file_id: FileId,
+        _inline_message: Option<telegram_api::BotInlineMessage>,
+        _allowed_media_content_id: i32,
+    ) -> Option<crate::inline_queries_manager::InlineMessageContent> {
+        None // [blocked: M.9]
+    }
+
+    fn register_thumbnail(
+        &mut self,
+        _web_document: telegram_api::WebDocument,
+    ) -> Option<td_api::Thumbnail> {
+        None // [blocked: Files]
+    }
+
+    fn get_web_document_temp_photo_size(
+        &mut self,
+        _web_document: telegram_api::WebDocument,
+    ) -> Option<crate::photo::PhotoSize> {
+        None // [blocked: Files]
+    }
+
+    fn get_web_document_thumbnail_photo_size(
+        &mut self,
+        _web_document: telegram_api::WebDocument,
+    ) -> Option<crate::photo::PhotoSize> {
+        None // [blocked: Files]
+    }
+
+    fn get_theme_parameters_json_string(&self, _theme: &td_api::ThemeParameters) -> Option<String> {
+        None // [blocked: Wave-3 ThemeManager]
+    }
+
+    fn on_dialog_used(
+        &mut self,
+        _category: crate::inline_queries_manager::TopDialogCategory,
+        _dialog_id: crate::dialog_id::DialogId,
+        _unix_time: i32,
+    ) {
+        // [blocked: M.27]
+    }
+}
+
+impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> {
+    fn send_edit_inline_message_query(
+        &mut self,
+        _query: telegram_api::messages_editInlineBotMessage,
+        _promise: Promise<()>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_set_inline_game_score_query(
+        &mut self,
+        _query: telegram_api::messages_setInlineGameScore,
+        _promise: Promise<()>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_get_inline_game_high_scores_query(
+        &mut self,
+        _query: telegram_api::messages_getInlineGameHighScores,
+        _promise: Promise<td_api::GameHighScores>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn get_input_media_for_edit(
+        &mut self,
+        _input_message_content: Box<td_api::InputMessageContent>,
+    ) -> Result<Option<crate::inline_message_manager::MediaEditPiece>, tdutils::status::Status>
+    {
+        Ok(None) // [blocked: M.9/M.10]
+    }
+}
+
+
 mod tests {
     use super::*;
     use crate::config_manager::StoredDcOptions;
@@ -13114,437 +13741,5 @@ mod tests {
             );
             assert!(matches!(responses_of(callback, 3)[0], Object::ok(_)));
         });
-    }
-}
-
-/// Field-split the `Td` for the inline manager calls.
-pub(crate) fn inline_env_split(
-    td: &mut Td,
-) -> (
-    TdInlineEnv<'_>,
-    &mut crate::inline_queries_manager::InlineQueriesManager,
-    &mut crate::inline_message_manager::InlineMessageManager,
-) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        inline_queries_manager,
-        inline_message_manager,
-        inline_updates,
-        ..
-    } = td;
-    (
-        TdInlineEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-            updates: inline_updates,
-        },
-        inline_queries_manager,
-        inline_message_manager,
-    )
-}
-
-/// The `G()`/manager slice of the collapsed InlineQueriesManager +
-/// InlineMessageManager pair (M.21).
-pub(crate) struct TdInlineEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    /// `None` once the option manager is torn down; the getters answer
-    /// their defaults on the destroy path.
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) auth_is_bot: bool,
-    pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) chat_manager: &'a mut ChatManager,
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
-}
-
-/// Build the UserEnv from the env's fields (the field-level borrows
-/// must be written inline at each call site; a `&mut self` helper would
-/// pin the whole struct).
-fn make_user_env<'a>(
-    global: &'a mut Global,
-    options: &'a mut OptionManager,
-    auth_is_bot: bool,
-) -> UserEnv<'a> {
-    UserEnv {
-        global,
-        options,
-        auth_is_bot,
-    }
-}
-
-impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> {
-    fn auth_is_bot(&self) -> bool {
-        self.auth_is_bot
-    }
-
-    fn close_flag(&self) -> bool {
-        self.global.close_flag()
-    }
-
-    fn use_chat_info_database(&self) -> bool {
-        self.global.use_chat_info_database()
-    }
-
-    fn is_test_dc(&self) -> bool {
-        self.global.is_test_dc()
-    }
-
-    fn unix_time(&self) -> i32 {
-        self.global.unix_time()
-    }
-
-    fn get_option_string(&self, name: &str, default_value: &str) -> String {
-        self.options.as_ref().map_or_else(
-            || default_value.to_owned(),
-            |options| options.get_option_string(name, default_value),
-        )
-    }
-
-    fn binlog_pmc_get(&mut self, key: &str) -> String {
-        self.global.binlog_pmc().get(key)
-    }
-
-    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
-        self.global.binlog_pmc().set(key, value);
-    }
-
-    fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
-    }
-
-    fn get_bot_data(
-        &self,
-        user_id: crate::user_manager::UserId,
-    ) -> Result<crate::user_manager::BotData, tdutils::status::Status> {
-        self.user_manager.get_bot_data(user_id)
-    }
-
-    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
-        self.user_manager.have_min_user(user_id)
-    }
-
-    fn have_user_force(&self, user_id: crate::user_manager::UserId) -> bool {
-        // The forced fetch is the M.4 seam; the in-memory band answers.
-        self.user_manager.have_min_user(user_id)
-    }
-
-    fn get_user_first_username(&self, user_id: crate::user_manager::UserId) -> String {
-        self.user_manager
-            .get_user_first_username_of(user_id)
-            .to_owned()
-    }
-
-    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
-        let Some(options) = self.options.as_mut() else {
-            return user_id.get();
-        };
-        let mut env = make_user_env(&mut self.global, options, self.auth_is_bot);
-        self.user_manager
-            .get_user_id_object(&mut env, user_id, source)
-    }
-
-    fn get_input_user(
-        &mut self,
-        user_id: crate::user_manager::UserId,
-    ) -> Result<telegram_api::InputUser, tdutils::status::Status> {
-        let Some(options) = self.options.as_mut() else {
-            return Err(tdutils::status::Status::error(400, "User not found"));
-        };
-        let env = make_user_env(&mut self.global, options, self.auth_is_bot);
-        self.user_manager.get_input_user(&env, user_id)
-    }
-
-    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
-        let Some(options) = self.options.as_mut() else {
-            return;
-        };
-        let mut env = make_user_env(&mut self.global, options, self.auth_is_bot);
-        self.user_manager.on_get_users(&mut env, users, source);
-    }
-
-    fn get_input_peer(
-        &mut self,
-        dialog_id: crate::dialog_id::DialogId,
-    ) -> Option<telegram_api::InputPeer> {
-        match dialog_id.get_type() {
-            crate::dialog_id::DialogType::User => {
-                let user_id = dialog_id.get_user_id();
-                let options = self.options.as_mut()?;
-                let env = make_user_env(&mut self.global, options, self.auth_is_bot);
-                self.user_manager
-                    .get_input_peer_user(&env, user_id, AccessRights::Read)
-            }
-            crate::dialog_id::DialogType::Chat
-            | crate::dialog_id::DialogType::Channel
-            | crate::dialog_id::DialogType::SecretChat => None,
-            crate::dialog_id::DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
-                telegram_api::inputPeerEmpty {},
-            )),
-        }
-    }
-
-    fn get_channel_type(&self, channel_id: ChannelId) -> ChannelType {
-        self.chat_manager.get_channel_type_by_id(channel_id)
-    }
-
-    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
-        self.chat_manager.get_channel_type_by_id(channel_id) == ChannelType::Broadcast
-    }
-
-    fn resolve_weather_dialog(
-        &mut self,
-        _username: &str,
-        _location: crate::chat_manager::Location,
-        _promise: Promise<td_api::CurrentWeather>,
-    ) {
-        // [blocked: net]: the resolve never sends; the promise parks.
-    }
-
-    fn can_add_web_page_previews(&self, _dialog_id: crate::dialog_id::DialogId) -> bool {
-        false // the M.5 band
-    }
-
-    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
-        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
-    }
-
-    fn parse_formatted_text(
-        &mut self,
-        dialog_id: crate::dialog_id::DialogId,
-        text: Option<td_api::FormattedText>,
-        is_bot: bool,
-        allow_empty: bool,
-        skip_media_timestamps: bool,
-        skip_trim: bool,
-    ) -> Result<crate::message_entity::FormattedText, tdutils::status::Status> {
-        let (always_parse_markdown, session_count) = match self.options.as_ref() {
-            Some(options) => (
-                options.get_option_boolean("always_parse_markdown", false),
-                options.get_option_integer("session_count", -1) as i32,
-            ),
-            None => (false, 0),
-        };
-        // The real user-manager form rides the M.8 line; the null form is
-        // the C++ `user_manager == nullptr` band.
-        crate::message_entity::get_formatted_text_of_input::<()>(
-            None,
-            dialog_id,
-            text,
-            is_bot,
-            allow_empty,
-            skip_media_timestamps,
-            skip_trim,
-            None,
-            always_parse_markdown,
-            session_count,
-        )
-    }
-
-    fn get_input_message_entities(
-        &mut self,
-        entities: &[crate::message_entity::MessageEntity],
-        source: &str,
-    ) -> Vec<telegram_api::MessageEntity> {
-        crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_get_inline_bot_results_query(
-        &mut self,
-        _query: telegram_api::messages_getInlineBotResults,
-        _dialog_id: crate::dialog_id::DialogId,
-        _bot_user_id: crate::user_manager::UserId,
-        _query_hash: u64,
-        _promise: Promise<Option<td_api::InlineQueryResults>>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_set_inline_bot_results_query(
-        &mut self,
-        _query: telegram_api::messages_setInlineBotResults,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_set_bot_guest_chat_result_query(
-        &mut self,
-        _query_id: i64,
-        _result: telegram_api::InputBotInlineResult,
-        _promise: Promise<td_api::InlineMessageId>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_save_prepared_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_savePreparedInlineMessage,
-        _promise: Promise<td_api::PreparedInlineMessageId>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_prepared_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_getPreparedInlineMessage,
-        _bot_user_id: crate::user_manager::UserId,
-        _query_hash: u64,
-        _promise: Promise<Option<td_api::PreparedInlineMessage>>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_save_prepared_keyboard_button_query(
-        &mut self,
-        _query: telegram_api::bots_requestWebViewButton,
-        _promise: Promise<String>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_requested_web_view_button_query(
-        &mut self,
-        _query: telegram_api::bots_getRequestedWebViewButton,
-        _bot_user_id: crate::user_manager::UserId,
-        _prepared_button_id: String,
-        _promise: Promise<td_api::KeyboardButton>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_request_simple_web_view_query(
-        &mut self,
-        _query: telegram_api::messages_requestSimpleWebView,
-        _promise: Promise<td_api::WebAppUrl>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_send_web_view_data_query(
-        &mut self,
-        _query: telegram_api::messages_sendWebViewData,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_send_web_view_result_message_query(
-        &mut self,
-        _query: telegram_api::messages_sendWebViewResultMessage,
-        _promise: Promise<td_api::InlineMessageId>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn get_input_keyboard_button(
-        &mut self,
-        _button: &td_api::KeyboardButton,
-    ) -> Option<telegram_api::KeyboardButton> {
-        None // [blocked: M.22]
-    }
-
-    fn get_input_reply_markup(
-        &mut self,
-        _reply_markup: Option<td_api::ReplyMarkup>,
-    ) -> Result<Option<telegram_api::ReplyMarkup>, tdutils::status::Status> {
-        Ok(None) // [blocked: M.22]: a non-null markup collapses to none
-    }
-
-    fn get_input_rich_message(
-        &mut self,
-        _message: &td_api::inputMessageRichMessage,
-    ) -> Result<Option<telegram_api::InputRichMessage>, tdutils::status::Status> {
-        Ok(None) // [blocked: M.17]
-    }
-
-    fn get_input_bot_inline_message_media_invoice(
-        &mut self,
-        _invoice: &td_api::inputMessageInvoice,
-        _reply_markup: Option<telegram_api::ReplyMarkup>,
-    ) -> Result<Option<telegram_api::InputBotInlineMessage>, tdutils::status::Status> {
-        Ok(None) // [blocked: Wave-3 payments]
-    }
-
-    fn create_inline_message_content(
-        &mut self,
-        _file_id: FileId,
-        _inline_message: Option<telegram_api::BotInlineMessage>,
-        _allowed_media_content_id: i32,
-    ) -> Option<crate::inline_queries_manager::InlineMessageContent> {
-        None // [blocked: M.9]
-    }
-
-    fn register_thumbnail(
-        &mut self,
-        _web_document: telegram_api::WebDocument,
-    ) -> Option<td_api::Thumbnail> {
-        None // [blocked: Files]
-    }
-
-    fn get_web_document_temp_photo_size(
-        &mut self,
-        _web_document: telegram_api::WebDocument,
-    ) -> Option<crate::photo::PhotoSize> {
-        None // [blocked: Files]
-    }
-
-    fn get_web_document_thumbnail_photo_size(
-        &mut self,
-        _web_document: telegram_api::WebDocument,
-    ) -> Option<crate::photo::PhotoSize> {
-        None // [blocked: Files]
-    }
-
-    fn get_theme_parameters_json_string(&self, _theme: &td_api::ThemeParameters) -> Option<String> {
-        None // [blocked: Wave-3 ThemeManager]
-    }
-
-    fn on_dialog_used(
-        &mut self,
-        _category: crate::inline_queries_manager::TopDialogCategory,
-        _dialog_id: crate::dialog_id::DialogId,
-        _unix_time: i32,
-    ) {
-        // [blocked: M.27]
-    }
-}
-
-impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> {
-    fn send_edit_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_editInlineBotMessage,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_set_inline_game_score_query(
-        &mut self,
-        _query: telegram_api::messages_setInlineGameScore,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_inline_game_high_scores_query(
-        &mut self,
-        _query: telegram_api::messages_getInlineGameHighScores,
-        _promise: Promise<td_api::GameHighScores>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn get_input_media_for_edit(
-        &mut self,
-        _input_message_content: Box<td_api::InputMessageContent>,
-    ) -> Result<Option<crate::inline_message_manager::MediaEditPiece>, tdutils::status::Status>
-    {
-        Ok(None) // [blocked: M.9/M.10]
     }
 }

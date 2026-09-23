@@ -950,7 +950,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             inline_queries_manager.send_inline_query(
                 &mut env,
                 crate::user_manager::UserId::new(request.bot_user_id),
-                DialogId::new(request.chat_id),
+                crate::messages_manager::DialogId::new(request.chat_id),
                 user_location,
                 &query,
                 &offset,
@@ -1044,6 +1044,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 crate::inline_queries_manager::location_from_td_api(request.location.as_ref());
             let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
             inline_queries_manager.get_weather(&mut env, user_location, promise);
+        }
+
         // --- the web-page set (M.17): Requests.cpp:5032-5042. The managers
         // validate; the net query tails park the promises unanswered offline,
         // exactly like the C++ request without a network ---
@@ -9504,11 +9506,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            123,
-            454,
+            467,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 881, "interim count");
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 549, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 536, "interim count");
     }
 }

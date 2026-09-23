@@ -33,7 +33,7 @@ const MAX_RAW_DC_ID: i32 = 1000;
 
 /// `DcId::is_valid` (net/DcId.h:31-33).
 fn is_valid_dc_id(dc_id: i32) -> bool {
-    1 <= dc_id && dc_id <= MAX_RAW_DC_ID
+    (1..=MAX_RAW_DC_ID).contains(&dc_id)
 }
 
 /// `get_inline_message_dc_id` (InlineMessageManager.cpp:36-48).
@@ -217,7 +217,7 @@ impl InlineMessageManager {
         inline_message_id: &str,
         reply_markup: Option<td_api::ReplyMarkup>,
         input_message_content: Option<Box<td_api::InputMessageContent>>,
-        promise: Promise<()>,
+        mut promise: Promise<()>,
     ) {
         let is_bot = env.auth_is_bot();
         debug_assert!(is_bot, "edit_inline_message_text is bot-only");
@@ -552,6 +552,7 @@ impl InlineMessageManager {
     }
 
     /// `set_inline_game_score` (InlineMessageManager.cpp:341-350).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_inline_game_score(
         &mut self,
         env: &mut impl InlineMessageManagerEnv,

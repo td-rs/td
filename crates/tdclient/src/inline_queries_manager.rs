@@ -116,6 +116,9 @@ impl TargetDialogTypes {
                 telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBroadcast(_) => {
                     result.mask |= Self::BROADCASTS_MASK;
                 }
+                telegram_api::InlineQueryPeerType::inlineQueryPeerTypeSameBotPM(_) => {
+                    result.mask |= Self::USERS_MASK;
+                }
             }
         }
         result
@@ -486,13 +489,13 @@ pub(crate) fn process_live_location(
     let period = live_location.live_period;
     if !for_edit
         && period != i32::MAX
-        && (period < MIN_LIVE_LOCATION_PERIOD || period > MAX_LIVE_LOCATION_PERIOD)
+        && (!(MIN_LIVE_LOCATION_PERIOD..=MAX_LIVE_LOCATION_PERIOD).contains(&period))
     {
         return Err(Status::error(400, "Wrong live location period specified"));
     }
 
     let heading = live_location.heading;
-    if heading != 0 && (heading < MIN_LIVE_LOCATION_HEADING || heading > MAX_LIVE_LOCATION_HEADING)
+    if heading != 0 && (!(MIN_LIVE_LOCATION_HEADING..=MAX_LIVE_LOCATION_HEADING).contains(&heading))
     {
         return Err(Status::error(400, "Wrong live location heading specified"));
     }
@@ -645,7 +648,7 @@ pub(crate) fn process_input_message_text(
         for_draft,
         for_draft,
     )?;
-    let mut web_page_url = web_page_url;
+
     if !disable_web_page_preview
         && web_page_url.is_empty()
         && dialog_id.get_type() == DialogType::SecretChat
@@ -728,6 +731,9 @@ const MASK_REPLY_MARKUP: i32 = 1 << 2;
 /// `inputBotInlineMessageMediaAuto/Text::ENTITIES_MASK` (flags.1).
 const MASK_ENTITIES: i32 = 1 << 1;
 /// `inputBotInlineMessageMediaAuto/Text::INVERT_MEDIA_MASK` (flags.3).
+/// The web-app result ride-along flags; consumed by the M.31 web-app
+/// result plane ([blocked: Wave 3] seam here).
+#[allow(dead_code)]
 const MASK_INVERT_MEDIA: i32 = 1 << 3;
 /// `inputBotInlineMessageMediaWebPage` force flags (flags.4/flags.5) and
 /// the optional flag (flags.6) are built from the record fields.
@@ -1221,6 +1227,7 @@ impl InlineQueriesManager {
     /// `answer_inline_query` (InlineQueriesManager.cpp:696-760). The
     /// `CHECK(td_->auth_manager_->is_bot())` is the request layer's
     /// CHECK_IS_BOT gate.
+    #[allow(clippy::too_many_arguments)]
     pub fn answer_inline_query(
         &mut self,
         env: &mut impl InlineQueriesManagerEnv,
@@ -1354,7 +1361,7 @@ impl InlineQueriesManager {
         env: &mut impl InlineQueriesManagerEnv,
         guest_query_id: i64,
         input_result: Option<td_api::InputInlineQueryResult>,
-        promise: Promise<td_api::InlineMessageId>,
+        mut promise: Promise<td_api::InlineMessageId>,
     ) {
         match self.get_input_bot_inline_result(env, input_result, &mut false, &mut false) {
             Ok(Some(result)) => {
@@ -1506,7 +1513,7 @@ impl InlineQueriesManager {
         env: &mut impl InlineQueriesManagerEnv,
         bot_user_id: UserId,
         prepared_button_id: &str,
-        promise: Promise<td_api::KeyboardButton>,
+        mut promise: Promise<td_api::KeyboardButton>,
     ) {
         let input_user = match env.get_input_user(bot_user_id) {
             Ok(input_user) => input_user,
@@ -1675,7 +1682,7 @@ impl InlineQueriesManager {
         env: &mut impl InlineQueriesManagerEnv,
         web_view_query_id: &str,
         input_result: Option<td_api::InputInlineQueryResult>,
-        promise: Promise<td_api::InlineMessageId>,
+        mut promise: Promise<td_api::InlineMessageId>,
     ) {
         debug_assert!(env.auth_is_bot(), "answer_web_view_query is bot-only");
 
@@ -1768,10 +1775,6 @@ impl InlineQueriesManager {
             | Some(telegram_api::InputPeer::inputPeerChannelFromMessage(_)) => {
                 let channel_type = env.get_channel_type(dialog_id.get_channel_id()) as i32;
                 5 + channel_type
-            }
-            Some(_) => {
-                debug_assert!(false, "unreachable input peer kind");
-                -1
             }
         };
 
@@ -1983,6 +1986,9 @@ impl InlineQueriesManager {
     }
 
     /// `get_web_document_url` (InlineQueriesManager.cpp:1816-1843).
+    /// The thumbnail url form; consumed by the web-document thumbnail
+    /// plane ([blocked: Wave 3] seam here).
+    #[allow(dead_code)]
     fn get_web_document_url(web_document: Option<&telegram_api::WebDocument>) -> String {
         let Some(web_document) = web_document else {
             return String::new();
@@ -2251,11 +2257,11 @@ impl InlineQueriesManager {
                         return None;
                     }
                     let mut sizes = Vec::new();
-                    if let Some(thumbnail) = thumbnail {
-                        if thumbnail.size_type != b'v' as i32 && thumbnail.size_type != b'g' as i32
-                        {
-                            sizes.push(thumbnail);
-                        }
+                    if let Some(thumbnail) = thumbnail
+                        && thumbnail.size_type != b'v' as i32
+                        && thumbnail.size_type != b'g' as i32
+                    {
+                        sizes.push(thumbnail);
                     }
                     sizes.push(photo_size);
                     let photo = td_api::Photo {
@@ -2581,6 +2587,7 @@ impl InlineQueriesManager {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// `on_new_inline_query` (InlineQueriesManager.cpp:2449-2487).
     pub fn on_new_inline_query(
         &mut self,
@@ -2713,7 +2720,7 @@ impl InlineQueriesManager {
         &mut self,
         env: &mut impl InlineQueriesManagerEnv,
         bot_user_id: UserId,
-        promise: Promise<()>,
+        mut promise: Promise<()>,
     ) {
         if let Some(position) = self
             .recently_used_bot_user_ids
@@ -2910,8 +2917,11 @@ impl InlineQueriesManager {
             return Err(Status::error(400, "Inline query result must be non-empty"));
         };
 
+        #[allow(unused_assignments)]
         let mut id = String::new();
+        #[allow(unused_assignments)]
         let mut url = String::new();
+        #[allow(unused_assignments)]
         let mut result_type = String::new();
         let mut title = String::new();
         let mut description = String::new();
@@ -3469,7 +3479,7 @@ fn extract_input_invert_media(content: &td_api::InputMessageContent) -> bool {
         td_api::InputMessageContent::inputMessageAnimation(content) => {
             content.show_caption_above_media
         }
-        td_api::InputMessageContent::inputMessageDocument(content) => false,
+        td_api::InputMessageContent::inputMessageDocument(_content) => false,
         td_api::InputMessageContent::inputMessagePhoto(content) => content.show_caption_above_media,
         td_api::InputMessageContent::inputMessageVideo(content) => content.show_caption_above_media,
         _ => false,
@@ -3477,7 +3487,8 @@ fn extract_input_invert_media(content: &td_api::InputMessageContent) -> bool {
 }
 
 /// `on_get_weather` (InlineQueriesManager.cpp:1320-1333) — the weather
-/// fold over the single-article result.
+/// fold over the single-article result; the feed tail is [blocked: net].
+#[allow(dead_code)]
 pub(crate) fn on_get_weather(
     results: td_api::InlineQueryResults,
 ) -> Result<td_api::CurrentWeather, Status> {
