@@ -1039,6 +1039,12 @@ impl AuthManager {
             AuthNetResult::Authorization {
                 user_id: Some(_), ..
             } => {
+                // `CheckAuthenticationBotTokenQuery::on_ok` sets
+                // `is_bot_ = true` (AuthManager.cpp:1504) — the live
+                // bot session's whole request surface gates on it (the
+                // 2026-09-23 live recording round caught the missing
+                // set: every CHECK_IS_USER arm ran its user path).
+                self.is_bot = true;
                 self.state = State::Ok;
                 self.update_state(State::Ok);
                 Ok(())
