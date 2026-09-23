@@ -2383,6 +2383,27 @@ impl DialogListId {
         DialogFilterId((self.0 - Self::FILTER_ID_SHIFT) as i32)
     }
 
+    /// `DialogListId(td_api::object_ptr<td_api::ChatList>)`
+    /// (DialogListId.cpp:21-49): the null list is the main folder; a filter
+    /// list with an invalid filter id falls back to the main folder.
+    pub fn from_chat_list(chat_list: Option<&td_api::ChatList>) -> DialogListId {
+        let Some(chat_list) = chat_list else {
+            return DialogListId::from_folder(FolderId::main());
+        };
+        match chat_list {
+            td_api::ChatList::chatListArchive(_) => DialogListId::from_folder(FolderId::archive()),
+            td_api::ChatList::chatListMain(_) => DialogListId::from_folder(FolderId::main()),
+            td_api::ChatList::chatListFolder(folder) => {
+                let filter_id = DialogFilterId::new(folder.chat_folder_id);
+                if filter_id.is_valid() {
+                    DialogListId::from_filter(filter_id)
+                } else {
+                    DialogListId::from_folder(FolderId::main())
+                }
+            }
+        }
+    }
+
     /// `DialogListId::get_chat_list_object` (DialogListId.cpp:46-59).
     pub fn get_chat_list_object(self) -> td_api::ChatList {
         if self.is_folder() {

@@ -32,7 +32,7 @@
 
 use crate::call_id::{CallId, InputCallId};
 use crate::call_protocol::CallProtocol;
-use crate::chat_manager::{ChannelId, DialogId};
+use crate::chat_manager::{ChannelId, DialogId, StickerSetId};
 use crate::community_id::CommunityId;
 use crate::contact::Contact;
 use crate::message_id::{MessageFullId, MessageId};
@@ -48,6 +48,7 @@ use crate::star_gift_manager::{
 };
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
+use crate::td::AttachMenuEnv;
 use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
@@ -1188,6 +1189,441 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 request.message_file,
                 request.attached_files,
                 promise,
+            );
+        }
+
+        // --- the M.10.22 flip wave: the manager arms whose receivers landed
+        // with the M.7/M.12/M.18/M.20/M.21/M.24/M.25 tracks; every arm
+        // anchors its C++ overload. The net query tails park the promises
+        // unanswered offline, exactly like the C++ request without a
+        // network ---
+        Function::testGetDifference(_) => {
+            // `Requests.cpp:60-65` — the test entry answers ok right after
+            // the difference pump starts; the query senders stay the
+            // [blocked: net] seams.
+            let mut env = crate::td::TdUpdatesEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("option manager exists after init"),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                my_id: td.user_manager.get_my_id().get(),
+                can_ignore_background_updates: td.can_ignore_background_updates,
+            };
+            td.updates_manager
+                .get_difference(&mut env, "testGetDifference");
+            td.send_result(id, ok_object());
+        }
+        Function::answerWebAppQuery(request) => {
+            // `Requests.cpp:1202-1208`.
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(web_app_query_id) = clean_or_utf8_error(td, id, &request.web_app_query_id)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::InlineMessageId, _>(id, Object::inlineMessageId);
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.answer_web_view_query(
+                &mut env,
+                &web_app_query_id,
+                request.result,
+                promise,
+            );
+        }
+        Function::sendWebAppData(request) => {
+            // `Requests.cpp:1226-1235` — the ok promise parks behind the
+            // send query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(button_text) = clean_or_utf8_error(td, id, &request.button_text) else {
+                return;
+            };
+            let Some(data) = clean_or_utf8_error(td, id, &request.data) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.send_web_view_data(
+                &mut env,
+                UserId::new(request.bot_user_id),
+                &button_text,
+                &data,
+                promise,
+            );
+        }
+        Function::getWebAppUrl(request) => {
+            // `Requests.cpp:1242-1252`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::WebAppUrl, _>(id, Object::webAppUrl);
+            let parameters = crate::inline_queries_manager::WebAppOpenParameters::from_td_api(
+                request.parameters,
+            );
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_simple_web_view_url(
+                &mut env,
+                UserId::new(request.bot_user_id),
+                &url,
+                parameters,
+                promise,
+            );
+        }
+        Function::getPreparedKeyboardButton(request) => {
+            // `Requests.cpp:1290-1296`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(prepared_button_id) = clean_or_utf8_error(td, id, &request.prepared_button_id)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::KeyboardButton, _>(id, Object::keyboardButton);
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_prepared_keyboard_button(
+                &mut env,
+                UserId::new(request.bot_user_id),
+                &prepared_button_id,
+                promise,
+            );
+        }
+        Function::savePreparedKeyboardButton(request) => {
+            // `Requests.cpp:1297-1303` — the text answer parks behind the
+            // save query ([blocked: net]).
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.save_prepared_keyboard_button(
+                &mut env,
+                UserId::new(request.user_id),
+                request.button,
+                promise,
+            );
+        }
+        Function::getAttachmentMenuBot(request) => {
+            // `Requests.cpp:1101-1105` — the bot-data read answers the
+            // manager object; the reload query tail parks at the
+            // [blocked: net] seam. (The M.40 flip predated the arms — the
+            // dispatcher audit caught the gap.)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::AttachmentMenuBot, _>(id, Object::attachmentMenuBot);
+            let mut env = AttachMenuEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                file_manager: td.file_manager.clone(),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.attach_menu_updates,
+            };
+            td.attach_menu_manager
+                .get_attach_menu_bot_request(&mut env, UserId::new(request.bot_user_id), promise);
+        }
+        Function::toggleBotIsAddedToAttachmentMenu(request) => {
+            // `Requests.cpp:1107-1113` — the ok answer parks behind the
+            // toggle query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = AttachMenuEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                file_manager: td.file_manager.clone(),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.attach_menu_updates,
+            };
+            td.attach_menu_manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(request.bot_user_id),
+                request.is_added,
+                request.allow_write_access,
+                promise,
+            );
+        }
+        Function::getMessageImportConfirmationText(request) => {
+            // `Requests.cpp:2949-2954` — the text answer parks behind the
+            // import-confirmation query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
+            let dialog_id = crate::messages_manager::DialogId::new(request.chat_id);
+            let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
+            message_import_manager
+                .get_message_import_confirmation_text(&mut env, dialog_id, promise);
+        }
+        Function::getMessageFileType(request) => {
+            // `Requests.cpp:2956-2962`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(message_file_head) = clean_or_utf8_error(td, id, &request.message_file_head)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::MessageFileType, _>(
+                    id,
+                    |file_type| match file_type {
+                        td_api::MessageFileType::messageFileTypePrivate(file_type) => {
+                            Object::messageFileTypePrivate(file_type)
+                        }
+                        td_api::MessageFileType::messageFileTypeGroup(file_type) => {
+                            Object::messageFileTypeGroup(file_type)
+                        }
+                        td_api::MessageFileType::messageFileTypeUnknown(file_type) => {
+                            Object::messageFileTypeUnknown(file_type)
+                        }
+                    },
+                );
+            let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
+            message_import_manager.get_message_file_type(&mut env, &message_file_head, promise);
+        }
+        Function::getStatisticalGraph(request) => {
+            // `Requests.cpp:1586-1593` — the token read answers the stored
+            // graphs; the query tail parks at the [blocked: net] seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(token) = clean_or_utf8_error(td, id, &request.token) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::StatisticalGraph, _>(id, |graph| match graph {
+                    td_api::StatisticalGraph::statisticalGraphData(graph) => {
+                        Object::statisticalGraphData(graph)
+                    }
+                    td_api::StatisticalGraph::statisticalGraphAsync(graph) => {
+                        Object::statisticalGraphAsync(graph)
+                    }
+                    td_api::StatisticalGraph::statisticalGraphError(graph) => {
+                        Object::statisticalGraphError(graph)
+                    }
+                });
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.load_statistics_graph(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &token,
+                request.x,
+                promise,
+            );
+        }
+        Function::isLoginEmailAddressRequired(_) => {
+            // `Requests.cpp:1893-1898` — the ok answer parks behind the
+            // promo-data query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.suggested_action_manager
+                .is_login_email_address_required(&mut env, promise);
+        }
+        Function::getAvailableChatBoostSlots(_) => {
+            // `Requests.cpp:3511-3515` — the slot list parks behind the
+            // load query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::ChatBoostSlots, _>(id, Object::chatBoostSlots);
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            td.boost_manager.get_boost_slots(&mut env, promise);
+        }
+        Function::getChatBoostFeatures(request) => {
+            // `Requests.cpp:3517-3521` — the local feature-table builder
+            // answers synchronously.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            let features = td
+                .boost_manager
+                .get_chat_boost_features_object(&mut env, !request.is_channel);
+            td.send_result(id, Object::chatBoostFeatures(features));
+        }
+        Function::getChatBoostLevelFeatures(request) => {
+            // `Requests.cpp:3523-3529`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            let features = td.boost_manager.get_chat_boost_level_features_object(
+                &mut env,
+                !request.is_channel,
+                request.level,
+            );
+            td.send_result(id, Object::chatBoostLevelFeatures(features));
+        }
+        Function::getChatAvailablePaidMessageReactionSenders(request) => {
+            // `Requests.cpp:3343-3347` — the sender-list load parks at the
+            // [blocked: net] query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::MessageSenders, _>(id, Object::messageSenders);
+            let mut env = MessageQueryEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                can_ignore_background_updates: td.can_ignore_background_updates,
+                updates: &mut td.message_query_updates,
+                user_manager: &mut td.user_manager,
+                updates_manager: &mut td.updates_manager,
+            };
+            td.message_query_manager.get_paid_message_reaction_senders(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+        }
+        Function::getMessageViewers(request) => {
+            // `Requests.cpp:2233-2238` — the participant-list query parks
+            // at the [blocked: net] seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::MessageViewers, _>(id, Object::messageViewers);
+            let message_full_id = crate::dialog_id::MessageFullId::new(
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
+            );
+            let mut env = MessageQueryEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                can_ignore_background_updates: td.can_ignore_background_updates,
+                updates: &mut td.message_query_updates,
+                user_manager: &mut td.user_manager,
+                updates_manager: &mut td.updates_manager,
+            };
+            td.message_query_manager
+                .get_message_viewers(&mut env, message_full_id, promise);
+        }
+        Function::getStakeDiceState(_) => {
+            // `Requests.cpp:3088-3093` — the state parks behind the emoji
+            // game query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::StakeDiceState, _>(id, Object::stakeDiceState);
+            let mut env = MessageQueryEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                can_ignore_background_updates: td.can_ignore_background_updates,
+                updates: &mut td.message_query_updates,
+                user_manager: &mut td.user_manager,
+                updates_manager: &mut td.updates_manager,
+            };
+            td.message_query_manager
+                .get_emoji_game_info(&mut env, promise);
+        }
+        Function::sendMessageViewMetrics(request) => {
+            // `Requests.cpp:2920-2931` — the ok promise parks behind the
+            // metrics query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = MessageQueryEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                can_ignore_background_updates: td.can_ignore_background_updates,
+                updates: &mut td.message_query_updates,
+                user_manager: &mut td.user_manager,
+                updates_manager: &mut td.updates_manager,
+            };
+            td.message_query_manager.send_message_view_metrics(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
+                request.time_in_view_ms,
+                request.active_time_in_view_ms,
+                request.height_to_viewport_ratio_per_mille,
+                request.seen_range_ratio_per_mille,
+                promise,
+            );
+        }
+        Function::getTimeZones(_) => {
+            // `Requests.cpp:3099-3102` — the local list answer.
+            let mut global = std::mem::take(&mut td.global);
+            let time_zones = td.time_zone_manager.get_time_zones(&mut global);
+            td.global = global;
+            td.send_result(id, Object::timeZones(time_zones));
+        }
+        Function::getFileDownloadedPrefixSize(request) => {
+            // `Requests.cpp:3076-3087` — the local file-view read.
+            if request.offset < 0 {
+                return td.send_error_impl(id, 400, "Parameter offset must be non-negative");
+            }
+            // the file-view read borrows the file-manager lock, so the
+            // prefix size is computed inside the lock scope
+            let downloaded_prefix = {
+                let file_manager = td.file_manager.lock();
+                file_manager
+                    .get_file_view(crate::files::FileId::new(request.file_id, 0))
+                    .map(|view| view.downloaded_prefix(request.offset))
+            };
+            let Some(size) = downloaded_prefix else {
+                return td.send_error_impl(id, 400, "Unknown file ID");
+            };
+            td.send_result(
+                id,
+                Object::fileDownloadedPrefixSize(td_api::FileDownloadedPrefixSize { size }),
             );
         }
 
@@ -2904,6 +3340,328 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_request(id, td, recorded);
         }
 
+        Function::reportSupergroupAntiSpamFalsePositive(request) => {
+            // `Requests.cpp:2147-2152` — CHECK_IS_USER; the ok promise
+            // settles synchronously (the query tail is the net seam).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.report_channel_anti_spam_false_positive(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                crate::chat_manager::MessageId::new(request.message_id),
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::reportSupergroupSpam(request) => {
+            // `Requests.cpp:2154-2159`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let message_ids: Vec<crate::chat_manager::MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| crate::chat_manager::MessageId::new(message_id))
+                .collect();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.report_channel_spam(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                &message_ids,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupIsBroadcastGroup(request) => {
+            // `Requests.cpp:2160-2166` — the gigagroup conversion gate.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.convert_channel_to_gigagroup(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupHasAggressiveAntiSpamEnabled(request) => {
+            // `Requests.cpp:2174-2180`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_has_aggressive_anti_spam_enabled(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.has_aggressive_anti_spam_enabled,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupHasHiddenMembers(request) => {
+            // `Requests.cpp:2181-2187`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_has_hidden_participants(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.has_hidden_members,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupHasAutomaticTranslation(request) => {
+            // `Requests.cpp:2188-2194`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_has_automatic_translation(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.has_automatic_translation,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupCanHaveSponsoredMessages(request) => {
+            // `Requests.cpp:2195-2201`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_can_have_sponsored_messages(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.can_have_sponsored_messages,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupIsAllHistoryAvailable(request) => {
+            // `Requests.cpp:2202-2209`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_is_all_history_available(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.is_all_history_available,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupJoinByRequest(request) => {
+            // `Requests.cpp:2210-2216`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_join_request(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.join_by_request,
+                UserId::new(request.guard_bot_user_id),
+                request.apply_to_invite_links,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupJoinToSendMessages(request) => {
+            // `Requests.cpp:2217-2223`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_join_to_send(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.join_to_send_messages,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupSignMessages(request) => {
+            // `Requests.cpp:2224-2230`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_sign_messages(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.sign_messages,
+                request.show_message_sender,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setSupergroupMainProfileTab(request) => {
+            // `Requests.cpp:2231-2236`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let main_profile_tab = request.main_profile_tab.clone().unwrap();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_main_profile_tab(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                main_profile_tab,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setSupergroupUnrestrictBoostCount(request) => {
+            // `Requests.cpp:2237-2242`.
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_unrestrict_boost_count(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.unrestrict_boost_count,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setSupergroupCustomEmojiStickerSet(request) => {
+            // `Requests.cpp:2243-2248`.
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_emoji_sticker_set(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                StickerSetId::new(request.custom_emoji_sticker_set_id),
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setSupergroupStickerSet(request) => {
+            // `Requests.cpp:2249-2254`.
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_sticker_set(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                StickerSetId::new(request.sticker_set_id),
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::reorderSupergroupActiveUsernames(request) => {
+            // `Requests.cpp:2259-2264` — CLEAN_INPUT_STRING on every
+            // username first.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let usernames: Vec<String> = request
+                .usernames
+                .into_iter()
+                .map(|username| crate::misc::clean_input_string(&username).unwrap_or_default())
+                .collect();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.reorder_channel_usernames(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                usernames,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::disableAllSupergroupUsernames(request) => {
+            // `Requests.cpp:2265-2270`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.disable_all_channel_usernames(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatDirectMessagesGroup(request) => {
+            // `Requests.cpp:3427-3432`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_monoforum_group(
+                user_manager,
+                &mut env,
+                DialogId::new(request.chat_id),
+                request.is_enabled,
+                request.paid_message_star_count,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatDiscussionGroup(request) => {
+            // `Requests.cpp:3434-3440`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_discussion_group(
+                user_manager,
+                &mut env,
+                DialogId::new(request.chat_id),
+                DialogId::new(request.discussion_chat_id),
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatPaidMessageStarCount(request) => {
+            // `Requests.cpp:3768-3774`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_send_paid_message_star_count(
+                user_manager,
+                &mut env,
+                DialogId::new(request.chat_id),
+                request.paid_message_star_count,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+
         // --- web browser settings (Requests.cpp:3154-3180, 3603-3608) ---
         Function::getLinkWebBrowserType(request) => {
             // `Requests.cpp:3603-3608` — the classification is local, no
@@ -3330,6 +4088,87 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         // --- messages, write family part 1 (Requests.cpp:3529-3548, :4139) ---
+        Function::deleteChatHistory(request) => {
+            // `Requests.cpp:2997-3003` — CHECK_IS_USER; the local delete
+            // core over the durable spine, the server tail rides the net
+            // seam (as deleteMessages).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::delete_dialog_history(
+                ctx,
+                &mut manager,
+                dialog_id,
+                request.remove_from_chat_list,
+                request.revoke,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(_) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getChats(request) => {
+            // `Requests.cpp:2653-2657` — the chat-list task answers the
+            // loaded window synchronously; the load-needed Pending parks
+            // (the db/net legs are the seams), the same caller-retry
+            // contract as getChatHistory's empty window.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_list_id =
+                crate::messages_manager::DialogListId::from_chat_list(request.chat_list.as_ref());
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the state alias is used strictly sequentially inside
+            // the callee.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::get_dialogs_from_list(
+                state,
+                &mut manager,
+                dialog_list_id,
+                request.limit,
+            );
+            td.messages_manager = manager;
+            match result {
+                crate::messages_manager::GetDialogsFromListResult::Chats(chats) => {
+                    td.send_result(id, Object::chats(chats))
+                }
+                crate::messages_manager::GetDialogsFromListResult::Pending(_) => {
+                    // the load legs are the net/db seams; the request
+                    // stays unanswered like the C++ promise without a
+                    // network
+                }
+                crate::messages_manager::GetDialogsFromListResult::Error(code, message) => {
+                    td.send_error_impl(id, code, &message)
+                }
+            }
+        }
+        Function::setChatEmojiStatus(request) => {
+            // `Requests.cpp:3722-3728`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let emoji_status = crate::emoji_status::EmojiStatus::get_emoji_status_from_td_api(
+                request.emoji_status.as_ref(),
+                td.global.unix_time(),
+            );
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            crate::dialog_manager::set_dialog_emoji_status(
+                td,
+                MmDialogId::new(request.chat_id),
+                emoji_status.as_ref(),
+                promise,
+            );
+        }
         Function::openChat(request) => {
             // Requests.cpp:3529-3532 — CHECK_IS_USER; the ok-promise
             // answers the local open.
@@ -3394,6 +4233,94 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             match result {
                 Ok(()) => td.send_result(id, ok_object()),
                 Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::readAllChatMentions(request) => {
+            // `Requests.cpp:3606-3611`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let time = crate::user_manager::TimeCtx::from_global(&td.global);
+            // SAFETY: the ctx/state pair aliases one Td and is used
+            // strictly sequentially inside the callee.
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let result = crate::messages_manager::read_all_dialog_mentions(
+                &td.global,
+                &mut manager,
+                ctx,
+                state,
+                &time,
+                dialog_id,
+                crate::messages_manager::ForumTopicId::default(),
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::readAllForumTopicMentions(request) => {
+            // `Requests.cpp:3614-3619`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            if request.forum_topic_id == 0 {
+                return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let time = crate::user_manager::TimeCtx::from_global(&td.global);
+            // SAFETY: as readAllChatMentions above.
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let result = crate::messages_manager::read_all_dialog_mentions(
+                &td.global,
+                &mut manager,
+                ctx,
+                state,
+                &time,
+                dialog_id,
+                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::readChatList(request) => {
+            // `Requests.cpp:3621-3625`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_list_id =
+                crate::messages_manager::DialogListId::from_chat_list(request.chat_list.as_ref());
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as readAllChatMentions above.
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let result = crate::messages_manager::read_all_dialogs_from_list(
+                ctx,
+                state,
+                &mut manager,
+                dialog_list_id,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err((code, message)) => td.send_error_impl(id, code, &message),
             }
         }
         Function::deleteMessages(request) => {
@@ -9323,6 +10250,181 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
             });
         }
 
+        Function::createTextCompositionStyle(request) => {
+            // `Requests.cpp:2263-2270`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let Some(prompt) = clean_or_utf8_error(td, id, &request.prompt) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::TextCompositionStyle, _>(
+                id,
+                Object::textCompositionStyle,
+            );
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.create_tone(
+                &mut env,
+                title,
+                request.custom_emoji_id,
+                prompt,
+                request.show_creator,
+                promise,
+            );
+        }
+        Function::editTextCompositionStyle(request) => {
+            // `Requests.cpp:2272-2280`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let Some(prompt) = clean_or_utf8_error(td, id, &request.prompt) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::TextCompositionStyle, _>(
+                id,
+                Object::textCompositionStyle,
+            );
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.update_tone(
+                &mut env,
+                name,
+                title,
+                request.custom_emoji_id,
+                prompt,
+                request.show_creator,
+                promise,
+            );
+        }
+        Function::deleteTextCompositionStyle(request) => {
+            // `Requests.cpp:2281-2285`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.delete_tone(&mut env, name, promise);
+        }
+        Function::searchTextCompositionStyle(request) => {
+            // `Requests.cpp:2286-2292` — the tone read parks at the
+            // [blocked: net] query seam like the C++ request.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::TextCompositionStyle, _>(
+                id,
+                Object::textCompositionStyle,
+            );
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.search_tone(&mut env, name, promise);
+        }
+        Function::getTextCompositionStyleExample(request) => {
+            // `Requests.cpp:2293-2296`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::TextCompositionStyleExample, _>(
+                id,
+                Object::textCompositionStyleExample,
+            );
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.get_tone_example(
+                &mut env,
+                name,
+                request.example_number,
+                promise,
+            );
+        }
+        Function::addTextCompositionStyle(request) => {
+            // `Requests.cpp:2297-2300`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.add_tone(&mut env, name, promise);
+        }
+        Function::removeTextCompositionStyle(request) => {
+            // `Requests.cpp:2301-2304`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.remove_tone(&mut env, name, promise);
+        }
         Function::recognizeSpeech(request) => {
             // `Requests.cpp:2933-2938`: CHECK_IS_USER, then the
             // transcription manager. The message probe is the
@@ -10365,9 +11467,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            506,
+            558,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 496, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 444, "interim count");
     }
 }

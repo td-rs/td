@@ -6,6 +6,7 @@
 //! StickersManager/ premium steps.
 
 use crate::store_parse::{self, Parser};
+use crate::td_api;
 use tdmtproto::telegram_api;
 
 /// `td::CustomEmojiId` — the emoji/document identifier wrapper (the port
@@ -76,6 +77,48 @@ impl EmojiStatus {
     /// constructor and structurally-empty statuses collapse into `None`.
     pub fn get_emoji_status(emoji_status: telegram_api::EmojiStatus) -> Option<EmojiStatus> {
         let result = EmojiStatus::from_telegram(emoji_status);
+        if result.is_empty() {
+            return None;
+        }
+        Some(result)
+    }
+
+    /// `EmojiStatus::EmojiStatus(td_api::object_ptr<td_api::emojiStatus>)`
+    /// and `get_emoji_status(td_api::...)` (EmojiStatus.cpp:26-64): the
+    /// null and structurally-empty statuses collapse into `None`; an
+    /// already expired `expiration_date` empties the status (the C++ ctor
+    /// reads `G()->unix_time()` — the port threads the clock in).
+    pub fn get_emoji_status_from_td_api(
+        emoji_status: Option<&td_api::EmojiStatus>,
+        unix_time: i32,
+    ) -> Option<EmojiStatus> {
+        let emoji_status = emoji_status?;
+        let mut result = EmojiStatus::default();
+        if emoji_status.expiration_date != 0 {
+            if emoji_status.expiration_date <= unix_time {
+                return None;
+            }
+            result.until_date = emoji_status.expiration_date;
+        }
+        match emoji_status.r#type.as_ref() {
+            Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(type_)) => {
+                result.custom_emoji_id = CustomEmojiId::new(type_.custom_emoji_id);
+            }
+            Some(td_api::EmojiStatusType::emojiStatusTypeUpgradedGift(type_)) => {
+                result.collectible_id = type_.upgraded_gift_id;
+                result.title = type_.gift_title.clone();
+                result.slug = type_.gift_name.clone();
+                result.model_custom_emoji_id = CustomEmojiId::new(type_.model_custom_emoji_id);
+                result.pattern_custom_emoji_id = CustomEmojiId::new(type_.symbol_custom_emoji_id);
+                if let Some(colors) = type_.backdrop_colors.as_ref() {
+                    result.center_color = colors.center_color;
+                    result.edge_color = colors.edge_color;
+                    result.pattern_color = colors.symbol_color;
+                    result.text_color = colors.text_color;
+                }
+            }
+            None => {}
+        }
         if result.is_empty() {
             return None;
         }
