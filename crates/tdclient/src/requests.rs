@@ -47,6 +47,7 @@ use crate::star_gift_manager::{
     StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
 };
 use crate::suggested_action::SuggestedAction;
+use crate::dialog_participant_manager::DialogParticipantManagerEnv;
 use crate::td::AccountEnv;
 use crate::td::AttachMenuEnv;
 use crate::td::AutosaveEnv;
@@ -251,6 +252,14 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     &mut chat_updates,
                 );
                 updates.extend(chat_updates);
+            }
+
+            // DialogParticipantManager::get_current_state (the M.dp
+            // slice; the online-member-count updates after the chat block
+            // per the C++ order)
+            {
+                let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+                manager.get_current_state(&mut env, &mut updates);
             }
 
             // NotificationSettingsManager::get_current_state
@@ -1667,6 +1676,301 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
             let (mut env, recommendation_manager) = crate::td::recommendation_env_split(td);
             recommendation_manager.get_recommended_channels(&mut env, promise);
+        }
+        Function::joinChat(request) => {
+            // Requests.cpp:6154-6159
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |v: td_api::ChatJoinResult| v.into());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.join_dialog(&mut env, crate::chat_manager::DialogId::new(request.chat_id), promise);
+        }
+        Function::leaveChat(request) => {
+            // Requests.cpp:6160-6177: the creator-of-channel early-ok and the
+            // creator-status rewrite happen at the dispatcher
+            let dialog_id = crate::chat_manager::DialogId::new(request.chat_id);
+            let mut new_status = td_api::ChatMemberStatus::chatMemberStatusLeft(td_api::chatMemberStatusLeft {});
+            if dialog_id.get_type() == crate::chat_manager::DialogType::Channel && {
+                let (mut env, _) = crate::td::dialog_participant_env_split(td);
+                env.have_dialog_force(dialog_id, "leaveChat")
+            } {
+                let (mut env, _) = crate::td::dialog_participant_env_split(td);
+                let status = env.get_channel_status(dialog_id.get_channel_id());
+                if status.is_creator() {
+                    if !status.is_member() {
+                        return td.send_result(id, ok_object());
+                    }
+                    new_status = td_api::ChatMemberStatus::chatMemberStatusCreator(
+                        td_api::chatMemberStatusCreator {
+                            is_anonymous: status.is_anonymous(),
+                            is_member: false,
+                        },
+                    );
+                }
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            let my_dialog_id = env.my_dialog_id();
+            manager.set_dialog_participant_status(&mut env, dialog_id, my_dialog_id, new_status, promise);
+        }
+        Function::addChatMember(request) => {
+            // Requests.cpp:6178-6184
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.add_dialog_participant(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.user_id),
+                request.forward_limit,
+                promise,
+            );
+        }
+        Function::addChatMembers(request) => {
+            // Requests.cpp:6185-6191
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.add_dialog_participants(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                request.user_ids.iter().map(|&user_id| crate::user_manager::UserId::new(user_id)).collect(),
+                promise,
+            );
+        }
+        Function::setChatMemberStatus(request) => {
+            // Requests.cpp:6192-6199
+            let participant_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.member_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => {
+                        crate::chat_manager::DialogId::new(dialog_id.get())
+                    }
+                    tdutils::status::Result::Err(status) => return send_error_status(td, id, status),
+                }
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.set_dialog_participant_status(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                participant_dialog_id,
+                request.status.expect("the status is a required field"),
+                promise,
+            );
+        }
+        Function::setChatMemberTag(request) => {
+            // Requests.cpp:6200-6206
+            let Some(tag) = clean_or_utf8_error(td, id, &request.tag) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.set_dialog_participant_rank(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.user_id),
+                tag,
+                promise,
+            );
+        }
+        Function::banChatMember(request) => {
+            // Requests.cpp:6207-6215
+            let participant_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.member_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => {
+                        crate::chat_manager::DialogId::new(dialog_id.get())
+                    }
+                    tdutils::status::Result::Err(status) => return send_error_status(td, id, status),
+                }
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.ban_dialog_participant(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                participant_dialog_id,
+                request.banned_until_date,
+                request.revoke_messages,
+                promise,
+            );
+        }
+        Function::canTransferOwnership(_) => {
+            // Requests.cpp:6216-6229: the query error maps through the
+            // manager's table; the query itself parks [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |v: crate::dialog_participant_manager::CanTransferOwnershipResult| {
+                    crate::dialog_participant_manager::DialogParticipantManager::get_can_transfer_ownership_result_object(v).into()
+                });
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.can_transfer_ownership(&mut env);
+            drop(promise);
+        }
+        Function::transferChatOwnership(request) => {
+            // Requests.cpp:6230-6237
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.transfer_dialog_ownership(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.user_id),
+                &password,
+                promise,
+            );
+        }
+        Function::getChatOwnerAfterLeaving(request) => {
+            // Requests.cpp:6238-6243
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |v: td_api::User| Object::user(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.get_future_creator_after_leave(&mut env, crate::chat_manager::DialogId::new(request.chat_id), promise);
+        }
+        Function::getChatMember(request) => {
+            // Requests.cpp:6244-6251
+            let participant_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.member_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => {
+                        crate::chat_manager::DialogId::new(dialog_id.get())
+                    }
+                    tdutils::status::Result::Err(status) => return send_error_status(td, id, status),
+                }
+            };
+            let promise = td.deferred_promise(id, |v: td_api::ChatMember| Object::chatMember(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.get_dialog_participant(&mut env, crate::chat_manager::DialogId::new(request.chat_id), participant_dialog_id, promise);
+        }
+        Function::searchChatMembers(request) => {
+            // Requests.cpp:6252-6268
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let dialog_id = crate::chat_manager::DialogId::new(request.chat_id);
+            let filter = crate::dialog_participant_filter::DialogParticipantFilter::from_td_api(
+                dialog_id,
+                request.filter.as_ref(),
+            );
+            let promise = td.deferred_promise(id, |v: td_api::ChatMembers| Object::chatMembers(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.search_dialog_participants(&mut env, dialog_id, &query, request.limit, &filter, promise);
+        }
+        Function::getChatAdministrators(request) => {
+            // Requests.cpp:6269-6274
+            let promise = td.deferred_promise(id, |v: td_api::ChatAdministrators| Object::chatAdministrators(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.get_dialog_administrators(&mut env, crate::chat_manager::DialogId::new(request.chat_id), promise);
+        }
+        Function::getChatJoinRequests(request) => {
+            // Requests.cpp:6346-6355
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = clean_or_utf8_error(td, id, &request.invite_link) else {
+                return;
+            };
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |v: td_api::ChatJoinRequests| Object::chatJoinRequests(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.get_dialog_join_requests(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                query,
+                request.offset_request,
+                request.limit,
+                promise,
+            );
+        }
+        Function::processChatJoinRequest(request) => {
+            // Requests.cpp:6356-6361
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.process_dialog_join_request(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.user_id),
+                request.approve,
+                promise,
+            );
+        }
+        Function::processChatJoinRequests(request) => {
+            // Requests.cpp:6362-6370
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = clean_or_utf8_error(td, id, &request.invite_link) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.process_dialog_join_requests(&mut env, crate::chat_manager::DialogId::new(request.chat_id), invite_link, request.approve, promise);
+        }
+        Function::getSupergroupMembers(request) => {
+            // Requests.cpp:7393-7411
+            let channel_id = crate::chat_manager::ChannelId::new(request.supergroup_id);
+            let filter = crate::dialog_participant_filter::ChannelParticipantFilter::from_td_api(
+                crate::chat_manager::DialogId::from_channel_id(channel_id),
+                request.filter.as_ref(),
+            );
+            let promise = td.deferred_promise(id, |v: td_api::ChatMembers| Object::chatMembers(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.get_channel_participants(&mut env, channel_id, &filter, request.offset, request.limit, promise);
+        }
+        Function::getGuardBotWebAppUrl(request) => {
+            // Requests.cpp:8300-8306
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |v: td_api::WebAppUrl| Object::webAppUrl(v));
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.get_chat_join_web_view_url(&mut env, request.query_id, promise);
+        }
+        Function::answerChatJoinRequestQuery(request) => {
+            // Requests.cpp:8348-8354
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_participant_env_split(td);
+            manager.set_join_chat_result(&mut env, request.query_id, request.result.expect("the result is a required field"), url);
+            drop(promise);
         }
         Function::getChatSimilarChats(request) => {
             // Requests.cpp:3188-3192
@@ -11463,13 +11767,21 @@ mod request_census_tests {
         // (translateText, composeTextWithAi, fixTextWithAi,
         // createRichMessageWithAi and the rich trio — the query tails
         // park at the [blocked: net]/[blocked: RichMessage] seams like
-        // the C++ offline). Fix per flip.
+        // the C++ offline). Fix per flip. The M.dp slice flipped the
+        // nineteen DialogParticipantManager arms (joinChat, leaveChat,
+        // addChatMember(s), setChatMemberStatus, setChatMemberTag,
+        // banChatMember, canTransferOwnership, transferChatOwnership,
+        // getChatOwnerAfterLeaving, getChatMember, searchChatMembers,
+        // getChatAdministrators, getChatJoinRequests,
+        // processChatJoinRequest(s), getSupergroupMembers,
+        // getGuardBotWebAppUrl, answerChatJoinRequestQuery) over the
+        // collapsed dialog_participant_manager plane.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            558,
+            577,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 444, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 425, "interim count");
     }
 }

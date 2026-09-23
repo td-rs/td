@@ -2299,6 +2299,9 @@ pub struct Td {
     pub(crate) sponsored_updates: Vec<td_api::Update>,
     /// `Td::top_dialog_manager_` (Td.cpp:1276, M.27).
     pub(crate) top_dialog_manager: crate::top_dialog_manager::TopDialogManager,
+    /// `Td::dialog_participant_manager_` (Td.cpp, the M.dp slice).
+    pub(crate) dialog_participant_manager:
+        crate::dialog_participant_manager::DialogParticipantManager,
     /// `Td::channel_recommendation_manager_` (Td.cpp:1278, M.27).
     pub(crate) channel_recommendation_manager:
         crate::channel_recommendation_manager::ChannelRecommendationManager,
@@ -2652,6 +2655,8 @@ impl Td {
             message_import_manager: crate::message_import_manager::MessageImportManager::new(),
             sponsored_updates: Vec::new(),
             top_dialog_manager: crate::top_dialog_manager::TopDialogManager::new(),
+            dialog_participant_manager:
+                crate::dialog_participant_manager::DialogParticipantManager::new(),
             channel_recommendation_manager:
                 crate::channel_recommendation_manager::ChannelRecommendationManager::new(),
             web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
@@ -8107,6 +8112,25 @@ impl Actor for Td {
         {
             let (mut env, top_dialog_manager) = top_dialog_env_split(self);
             top_dialog_manager.tick_timeouts(&mut env);
+        }
+        // The DialogParticipantManager online-member-count timeout (the
+        // M.dp slice): the expired deadlines fire the cache-expiry refresh.
+        {
+            let now = tdutils::time::now();
+            let expired: Vec<i64> = self
+                .dialog_participant_manager
+                .online_member_count_deadlines
+                .iter()
+                .filter(|(_, deadline)| **deadline <= now)
+                .map(|(&dialog_id, _)| dialog_id)
+                .collect();
+            for dialog_id in expired {
+                self.dialog_participant_manager
+                    .online_member_count_deadlines
+                    .remove(&dialog_id);
+                let (mut env, manager) = dialog_participant_env_split(self);
+                manager.on_online_member_count_timeout(&mut env, crate::chat_manager::DialogId::new(dialog_id));
+            }
         }
         // The WebPagesManager pending-page timeouts (M.17): the
         // collapsed MultiTimeout fires each due id once.
@@ -14212,6 +14236,427 @@ impl crate::channel_recommendation_manager::ChannelRecommendationManagerEnv for 
 
     fn save_app_log(&mut self, _ref_channel_id: i64, _open_channel_id: i64, _promise: Promise<()>) {
         // [blocked: net]
+    }
+}
+
+/// A promise interface that discards its result — the parked continuation
+/// of a fire-and-forget reload tail (the C++ `Auto()` promise).
+struct DiscardPromise;
+impl<T: Send + 'static> tdutils::promise::PromiseInterface<T> for DiscardPromise {
+    fn set_value(&mut self, _value: T) {}
+    fn set_error(&mut self, _error: tdutils::status::Status) {}
+}
+
+pub(crate) fn dialog_participant_env_split(
+    td: &mut Td,
+) -> (
+    TdDialogParticipantEnv<'_>,
+    &mut crate::dialog_participant_manager::DialogParticipantManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        dialog_participant_manager,
+        ..
+    } = td;
+    (
+        TdDialogParticipantEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        dialog_participant_manager,
+    )
+}
+
+/// The `G()`/manager slice of the collapsed DialogParticipantManager (the
+/// M.dp slice).
+pub(crate) struct TdDialogParticipantEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults on the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::dialog_participant_filter::DialogParticipantFilterEnv for TdDialogParticipantEnv<'_> {
+    fn is_user_contact(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_contact_of(user_id, false)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_bot_of(user_id)
+    }
+}
+
+impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialogParticipantEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn use_chat_info_database(&self) -> bool {
+        self.global.use_chat_info_database()
+    }
+
+    fn my_user_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn my_dialog_id(&self) -> crate::chat_manager::DialogId {
+        crate::chat_manager::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::chat_manager::DialogId, _source: &str) -> bool {
+        // the M.6 dialog-manager stand-in shape
+        match dialog_id.get_type() {
+            crate::chat_manager::DialogType::User => self.user_manager.have_accessible_user(dialog_id.get_user_id()),
+            crate::chat_manager::DialogType::Channel => self.chat_manager.get_channel(dialog_id.get_channel_id()).is_some(),
+            crate::chat_manager::DialogType::Chat => self.chat_manager.get_chat(dialog_id.get_chat_id()).is_some(),
+            crate::chat_manager::DialogType::SecretChat | crate::chat_manager::DialogType::None => false,
+        }
+    }
+
+    fn have_dialog_info(&mut self, dialog_id: crate::chat_manager::DialogId) -> bool {
+        self.have_dialog_force(dialog_id, "have_dialog_info")
+    }
+
+    fn check_dialog_access_read(&mut self, dialog_id: crate::chat_manager::DialogId, _source: &str) -> Result<(), tdutils::status::Status> {
+        // the M.6 check_dialog_access stand-in (AccessRights::Read)
+        if self.have_dialog_force(dialog_id, "check_dialog_access") {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn check_dialog_access_write(&mut self, dialog_id: crate::chat_manager::DialogId, source: &str) -> Result<(), tdutils::status::Status> {
+        self.check_dialog_access_read(dialog_id, source)
+    }
+
+    fn is_monoforum_channel(&mut self, dialog_id: crate::chat_manager::DialogId) -> bool {
+        // the monoforum plane is not ported; no channel is monoforum
+        let _ = dialog_id;
+        false
+    }
+
+    fn get_dialog_status(&mut self, dialog_id: crate::chat_manager::DialogId) -> crate::chat_manager::DialogParticipantStatus {
+        // the C++ dialog_manager_->get_dialog_status routes per type
+        match dialog_id.get_type() {
+            crate::chat_manager::DialogType::Chat => self.chat_manager.get_chat_status(dialog_id.get_chat_id()),
+            crate::chat_manager::DialogType::Channel => self.chat_manager.get_channel_status(dialog_id.get_channel_id()),
+            // a private-chat "status" is a plain member
+            _ => crate::chat_manager::DialogParticipantStatus::member(0, String::new()),
+        }
+    }
+
+    fn is_dialog_opened(&self, _dialog_id: crate::chat_manager::DialogId) -> bool {
+        // the M.6/M.10 dialog-opened plane stand-in
+        false
+    }
+
+    fn get_dialog_search_text(&self, _dialog_id: crate::chat_manager::DialogId) -> String {
+        // the M.6 search-text plane stand-in
+        String::new()
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::chat_manager::DialogId, _source: &str) -> i64 {
+        // the C++ routes the encoded dialog id through get_chat_id_object
+        dialog_id.get()
+    }
+
+    fn have_input_peer_know(&mut self, dialog_id: crate::chat_manager::DialogId) -> bool {
+        self.have_dialog_force(dialog_id, "get_input_peer")
+    }
+
+    fn get_chat_is_active(&mut self, chat_id: ChatId) -> bool {
+        self.chat_manager.get_chat_is_active(chat_id)
+    }
+
+    fn get_chat_status(&mut self, chat_id: ChatId) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_chat_status(chat_id)
+    }
+
+    fn get_channel_status(&mut self, channel_id: ChannelId) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn get_channel_permissions(&mut self, channel_id: ChannelId) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager
+            .get_channel_permissions_id(self.global, channel_id)
+    }
+
+    fn is_broadcast_channel(&mut self, channel_id: ChannelId) -> bool {
+        self.chat_manager.get_channel_type_by_id(channel_id) == crate::chat_manager::ChannelType::Broadcast
+    }
+
+
+
+
+
+
+    fn get_chat_participants(&mut self, chat_id: ChatId) -> Option<Vec<crate::chat_manager::DialogParticipant>> {
+        self.chat_manager
+            .get_chat_participants(chat_id)
+            .cloned()
+    }
+
+    fn get_chat_member_object(
+        &mut self,
+        participant: &crate::chat_manager::DialogParticipant,
+        source: &str,
+    ) -> td_api::ChatMember {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self.options.as_deref_mut().expect("the option manager outlives the env"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .get_chat_member_object(self.user_manager, &mut env, participant, source)
+    }
+
+    fn load_chat_full(&mut self, chat_id: ChatId) {
+        // the reload tail answers the fire-and-forget continuation only;
+        // the manager re-reads its state on the next request
+        let promise = tdutils::promise::Promise::from_interface(DiscardPromise);
+        let mut env = UserEnv {
+            global: self.global,
+            options: self.options.as_deref_mut().expect("the option manager outlives the env"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .load_chat_full(self.user_manager, &mut env, chat_id, false, promise, "reload_dialog_administrators");
+    }
+
+    fn on_update_channel_bot_user_ids(&mut self, _channel_id: ChannelId, _bot_user_ids: Vec<UserId>) {
+        // the M.5 channel bot-list plane stand-in
+    }
+
+    fn on_update_channel_participant_count(&mut self, _channel_id: ChannelId, _count: i32) {
+        // the M.5 channel participant-count plane stand-in
+    }
+
+    fn on_update_channel_administrator_count(&mut self, channel_id: ChannelId, count: i32) {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self.options.as_deref_mut().expect("the option manager outlives the env"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .on_update_channel_administrator_count(self.user_manager, &mut env, channel_id, count);
+    }
+
+    fn have_user_force(&mut self, user_id: UserId, _source: &str) -> bool {
+        self.user_manager.have_accessible_user(user_id)
+    }
+
+    fn is_user_deleted(&mut self, user_id: UserId) -> bool {
+        self.user_manager.is_user_deleted_of(user_id)
+    }
+
+    fn have_min_user(&mut self, user_id: UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_user_was_online(&mut self, user_id: UserId, unix_time: i32) -> i32 {
+        self.user_manager.get_user_was_online_of(user_id, unix_time)
+    }
+
+    fn get_secret_chat_user_id(&mut self, dialog_id: crate::chat_manager::DialogId) -> UserId {
+        self.user_manager
+            .get_secret_chat_user_id(dialog_id.get_secret_chat_id())
+    }
+
+    fn chat_administrator_object(
+        &mut self,
+        administrator: &crate::chat_manager::DialogAdministrator,
+    ) -> td_api::ChatAdministrator {
+        // `DialogAdministrator::get_chat_administrator_object(user_manager)`
+        let mut env = UserEnv {
+            global: self.global,
+            options: self.options.as_deref_mut().expect("the option manager outlives the env"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        let user_id = self
+            .user_manager
+            .get_user_id_object(&mut env, administrator.get_user_id(), "chatAdministrator");
+        td_api::ChatAdministrator {
+            user_id,
+            custom_title: administrator.get_rank().to_owned(),
+            is_owner: administrator.is_creator(),
+            can_be_edited: administrator.can_be_edited(),
+        }
+    }
+
+    fn have_dialog(&mut self, dialog_id: crate::chat_manager::DialogId) -> bool {
+        self.have_dialog_force(dialog_id, "have_dialog")
+    }
+
+    fn status_update_restrictions(&mut self, status: &mut crate::chat_manager::DialogParticipantStatus) {
+        // `status.update_restrictions(G())` — the env carries the Global
+        let global = &mut *self.global;
+        status.update_restrictions(global);
+    }
+
+    fn on_view_dialog_active_stories(&mut self, _dialog_ids: Vec<crate::chat_manager::DialogId>) {
+        // the M.47 story-view intake stand-in
+    }
+
+    fn chat_members_object(
+        &mut self,
+        total_count: i32,
+        participants: Vec<crate::chat_manager::DialogParticipant>,
+        source: &str,
+    ) -> td_api::ChatMembers {
+        let members = participants
+            .iter()
+            .map(|participant| self.get_chat_member_object(participant, source))
+            .collect();
+        td_api::ChatMembers {
+            total_count,
+            members,
+        }
+    }
+
+    fn send_null_user(&mut self, _promise: tdutils::promise::Promise<td_api::User>) {
+        // the C++ `promise.set_value(nullptr user)` answers JSON null
+        // (ClientJson.cpp:94-95); the Rust response plane has no null
+        // object yet — the promise parks. Recorded divergence for the
+        // S84 audit.
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn sqlite_pmc_erase(&mut self, key: &[u8]) {
+        self.global.td_db().common_kv().erase(key);
+    }
+
+    fn set_online_member_count_timeout(&mut self, dialog_id: crate::chat_manager::DialogId, timeout: f64) {
+        // the MultiTimeout set/cancel is folded into the deadline map the
+        // Td tick scans; the sync-config re-arm mirrors the C++ re-arm
+        // the deadline map the Td tick scans is the timeout store; the
+        // actor re-arm rides the shared alarm slot it already polls
+    }
+
+    fn set_channel_participant_cache_timeout(&mut self, _channel_id: ChannelId, _timeout: f64) {
+        // the cache expiry is bookkeeping-only in the collapsed manager
+    }
+
+    fn send_update_chat_online_member_count(&mut self, _dialog_id: crate::chat_manager::DialogId, _online_member_count: i32) {
+        // the updateChatOnlineMemberCount out machine rides the updates
+        // outbox [blocked: M.7 outbox fan-in]
+    }
+
+    fn get_channel_administrators_query(&mut self, _channel_id: ChannelId, _hash: i64) {
+        // GetChannelAdministratorsQuery [blocked: net]
+    }
+
+    fn get_channel_participants_query(
+        &mut self,
+        _channel_id: ChannelId,
+        _filter: &crate::dialog_participant_filter::ChannelParticipantFilter,
+        _offset: i32,
+        _limit: i32,
+    ) {
+        // GetChannelParticipantsQuery [blocked: net]
+    }
+
+    fn get_channel_participant_query(&mut self, _channel_id: ChannelId, _participant_dialog_id: crate::chat_manager::DialogId) {
+        // GetChannelParticipantQuery [blocked: net]
+    }
+
+    fn get_chat_join_requests_query(
+        &mut self,
+        _dialog_id: crate::chat_manager::DialogId,
+        _invite_link: String,
+        _query: String,
+        _offset_date: i32,
+        _offset_user_id: UserId,
+        _limit: i32,
+    ) {
+        // GetChatJoinRequestsQuery [blocked: net]
+    }
+
+    fn hide_chat_join_request_query(&mut self, _dialog_id: crate::chat_manager::DialogId, _user_id: UserId, _approve: bool) {
+        // HideChatJoinRequestQuery [blocked: net]
+    }
+
+    fn hide_all_chat_join_requests_query(&mut self, _dialog_id: crate::chat_manager::DialogId, _invite_link: String, _approve: bool) {
+        // HideAllChatJoinRequestsQuery [blocked: net]
+    }
+
+    fn can_edit_chat_creator_query(&mut self) {
+        // CanEditChatCreatorQuery [blocked: net]
+    }
+
+    fn get_future_chat_creator_query(&mut self, _dialog_id: crate::chat_manager::DialogId) {
+        // GetFutureChatCreatorAfterLeaveQuery [blocked: net]
+    }
+
+    fn transfer_chat_ownership_seam(&mut self, _dialog_id: crate::chat_manager::DialogId, _user_id: UserId) {
+        // get_input_check_password_srp + EditChatCreatorQuery [blocked: net]
+    }
+
+    fn edit_chat_participant_rank_query(&mut self, _dialog_id: crate::chat_manager::DialogId, _user_id: UserId, _rank: String) {
+        // EditChatParticipantRankQuery [blocked: net]
+    }
+
+    fn request_chat_join_web_view_query(&mut self, _query_id: i64) {
+        // RequestChatJoinWebViewQuery [blocked: net]
+    }
+
+    fn set_join_chat_results_query(&mut self, _query_id: i64, _result: td_api::ChatJoinRequestResult, _url: String) {
+        // SetJoinChatResultsQuery [blocked: net]
+    }
+
+    fn join_or_add_chat_member_query(&mut self, _chat_id: ChatId, _user_id: UserId) {
+        // messages.addChatUser / the invite acceptance [blocked: net]
+    }
+
+    fn join_channel_query(&mut self, _channel_id: ChannelId) {
+        // channels.joinChannel [blocked: net]
+    }
+
+    fn invite_to_channel_query(&mut self, _channel_id: ChannelId, _user_id: UserId) {
+        // channels.inviteToChannel [blocked: net]
+    }
+
+    fn edit_channel_participant_query(
+        &mut self,
+        _channel_id: ChannelId,
+        _participant_dialog_id: crate::chat_manager::DialogId,
+        _new_status: crate::chat_manager::DialogParticipantStatus,
+    ) {
+        // channels.editCreator/editAdmin/editBanned [blocked: net]
+    }
+
+    fn edit_chat_participant_query(
+        &mut self,
+        _chat_id: ChatId,
+        _user_id: UserId,
+        _new_status: crate::chat_manager::DialogParticipantStatus,
+    ) {
+        // messages.deleteChatUser/editChatAdmin [blocked: net]
     }
 }
 

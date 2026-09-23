@@ -61,6 +61,8 @@ pub mod dh_cache;
 pub mod dialog_db;
 pub mod dialog_id;
 pub mod dialog_manager;
+pub mod dialog_participant_filter;
+pub mod dialog_participant_manager;
 pub mod document;
 pub mod documents_manager;
 pub mod emoji_status;
