@@ -15,11 +15,19 @@
 //! `StickerPhotoSize.cpp:95-128`).
 
 use crate::store_parse::{self, Parser};
+use crate::td_api;
+use crate::user_manager::FileId;
 use base64::Engine as _;
 use tdmtproto::telegram_api;
 
-use crate::td_api;
-use crate::user_manager::FileId;
+/// The `storer.context()->td()` slice the FileId-carrying db records read —
+/// the FileManager FileId codec (`FileManager::store_file`/`parse_file`,
+/// the M.40 icon-plane encoding). Shared by the DialogPhoto and the
+/// animation/pm records.
+pub trait DialogPhotoStoreEnv {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn parse_file_id(&mut self, parser: &mut Parser<'_>) -> Result<FileId, &'static str>;
+}
 
 /// `td::Dimensions` (Dimensions.h:14) with `get_dimensions`
 /// (Dimensions.cpp:23-31): a dimension outside `0..=u16::MAX` clamps to
@@ -77,6 +85,100 @@ pub struct PhotoSize {
 pub struct AnimationSize {
     pub photo_size: PhotoSize,
     pub main_frame_timestamp: f64,
+}
+
+/// `td::PhotoFormat` (PhotoFormat.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhotoFormat {
+    Jpeg,
+    Png,
+    Webp,
+    Gif,
+    Tgs,
+    Mpeg4,
+    Webm,
+}
+
+impl Dimensions {
+    /// `store(Dimensions, StorerT)` (Dimensions.hpp:14-17) — the packed
+    /// `(width << 16) | height` uint32.
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_parse::store_u32(out, ((self.width as u32) << 16) | self.height as u32);
+    }
+
+    /// `parse(Dimensions &, ParserT)` (Dimensions.hpp:19-25).
+    pub fn parse_from(parser: &mut Parser<'_>) -> Result<Dimensions, &'static str> {
+        let width_height = parser.u32_()?;
+        Ok(Dimensions {
+            width: (width_height >> 16) as u16,
+            height: (width_height & 0xFFFF) as u16,
+        })
+    }
+}
+
+impl PhotoSize {
+    /// `store(const PhotoSize &, StorerT)` (PhotoSize.hpp:17-25). The
+    /// `file_id` rides the FileManager codec (`store_file`), the
+    /// `DialogPhotoStoreEnv` framing the FileId-consuming records use.
+    pub fn store(&self, env: &mut impl DialogPhotoStoreEnv, out: &mut Vec<u8>) {
+        store_parse::store_i32(out, self.size_type);
+        self.dimensions.store(out);
+        store_parse::store_i32(out, self.size);
+        env.store_file_id(self.file_id, out);
+        store_parse::store_i32_vec(out, &self.progressive_sizes);
+    }
+
+    /// `parse(PhotoSize &, ParserT)` (PhotoSize.hpp:27-40) — the
+    /// progressive-sizes tail is version-gated
+    /// (`Version::AddPhotoProgressiveSizes`).
+    pub fn parse_from(
+        env: &mut impl DialogPhotoStoreEnv,
+        parser: &mut Parser<'_>,
+    ) -> Result<PhotoSize, &'static str> {
+        let mut result = PhotoSize {
+            size_type: parser.i32_()?,
+            ..PhotoSize::default()
+        };
+        if !(0..128).contains(&result.size_type) {
+            return Err("Wrong photo size type");
+        }
+        result.dimensions = Dimensions::parse_from(parser)?;
+        result.size = parser.i32_()?;
+        result.file_id = env.parse_file_id(parser)?;
+        if parser.version() >= crate::store_parse::version::ADD_PHOTO_PROGRESSIVE_SIZES {
+            result.progressive_sizes = parser.i32_vec()?;
+        } else {
+            result.progressive_sizes.clear();
+        }
+        Ok(result)
+    }
+}
+
+impl AnimationSize {
+    /// `store(const AnimationSize &, StorerT)` (PhotoSize.hpp:42-46).
+    pub fn store(&self, env: &mut impl DialogPhotoStoreEnv, out: &mut Vec<u8>) {
+        self.photo_size.store(env, out);
+        store_parse::store_f64(out, self.main_frame_timestamp);
+    }
+
+    /// `parse(AnimationSize &, ParserT)` (PhotoSize.hpp:48-58) — the
+    /// frame timestamp is version-gated
+    /// (`Version::AddDialogPhotoHasAnimation`).
+    pub fn parse_from(
+        env: &mut impl DialogPhotoStoreEnv,
+        parser: &mut Parser<'_>,
+    ) -> Result<AnimationSize, &'static str> {
+        let mut result = AnimationSize {
+            photo_size: PhotoSize::parse_from(env, parser)?,
+            ..AnimationSize::default()
+        };
+        if parser.version() >= crate::store_parse::version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+            result.main_frame_timestamp = parser.f64_()?;
+        } else {
+            result.main_frame_timestamp = 0.0;
+        }
+        Ok(result)
+    }
 }
 
 /// `StickerPhotoSize::Type` (StickerPhotoSize.h).

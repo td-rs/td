@@ -59,6 +59,7 @@ use crate::td::PremiumTdEnv;
 use crate::td::QuickReplyEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
+use crate::td::TdAnimationsEnv;
 use crate::td::TdLinkEnv;
 use crate::td::ThemeEnv;
 use crate::td::WebBrowserEnv;
@@ -277,6 +278,21 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 };
                 td.notification_manager
                     .get_current_state(&env, &mut updates);
+            }
+
+            // AnimationsManager::get_current_state (Requests.cpp:2213) —
+            // the saved-animations + search-parameters updates; the
+            // manager's own is_bot gate applies.
+            if !td.auth_manager.is_bot() {
+                let env = TdAnimationsEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_bot: false,
+                    file_manager: std::sync::Arc::clone(&td.file_manager),
+                    file_reference_manager: &mut td.file_reference_manager,
+                    updates: &mut Vec::new(),
+                };
+                td.animations_manager.get_current_state(&env, &mut updates);
             }
 
             // MessageQueryManager::get_current_state
@@ -1560,6 +1576,71 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             // passport / the missing setter halves (M.4.12 deferred them
             // with their types)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // --- the AnimationsManager arm set (M.20): Requests.cpp:1793-1830.
+        // The saved-animations ring answers offline; the GetSavedGifsQuery/
+        // SaveGifQuery tails are the [blocked: net] env seams and park the
+        // promises exactly like the C++ request without a network ---
+        Function::getSavedAnimations(_) => {
+            // Requests.cpp:1793-1802; the two-step RequestActor collapses
+            // into the manager's promise (it answers the Animations
+            // object once the ring is loaded)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Animations, _>(id, Object::animations);
+            let mut env = TdAnimationsEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.animations_updates,
+            };
+            td.animations_manager
+                .get_saved_animations(&mut env, promise);
+        }
+        Function::addSavedAnimation(request) => {
+            // Requests.cpp:1806-1812; the input file resolves locally,
+            // messages.saveGif parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = TdAnimationsEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.animations_updates,
+            };
+            td.animations_manager.add_saved_animation(
+                &mut env,
+                request.animation.as_ref(),
+                promise,
+            );
+        }
+        Function::removeSavedAnimation(request) => {
+            // Requests.cpp:1814-1820; messages.saveGif unsave parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = TdAnimationsEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.animations_updates,
+            };
+            td.animations_manager.remove_saved_animation(
+                &mut env,
+                request.animation.as_ref(),
+                promise,
+            );
         }
 
         // --- the LinkManager arm set (M.23): Requests.cpp:3592-3642 +
@@ -9406,11 +9487,23 @@ mod request_census_tests {
         // The scheme size from the S07 differential dump.
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
+        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
+        // merge: the m11 pins + M.13/M.13S's seven real dispatches
+        // (removeNotification, removeNotificationGroup, registerDevice and
+        // the four notification-settings arms; processPushNotification
+        // stays the 500 placeholder) + M.12.10's eighteen file-plane
+        // dispatches (getFile/getRemoteFile, the download/upload/
+        // generation arms, the DownloadManager list plane and the four
+        // storage-statistics arms) + M.20's three saved-animations arms
+        // (getSavedAnimations, addSavedAnimation, removeSavedAnimation).
+        // Fix per flip.
         // The flip-state ledger — re-derived from the fixture at the wave-3
         // integration (the per-track flip histories compose) + M.23's ten
         // LinkManager dispatches (getDeepLinkInfo, getExternalLink,
         // getExternalLinkInfo, getRecentlyVisitedTMeUrls, the two login-url
-        // arms and the four oauth arms) + M.24's nine language-pack
+        // arms and the four oauth arms) + M.20's three saved-animations
+        // arms (getSavedAnimations, addSavedAnimation,
+        // removeSavedAnimation) + M.24's nine language-pack
         // dispatches (getLocalizationTargetInfo, getLanguagePackInfo,
         // getLanguagePackStrings, synchronizeLanguagePack,
         // addCustomServerLanguagePack, setCustomLanguagePack,
@@ -9420,9 +9513,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            463,
+            466,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 539, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 536, "interim count");
     }
 }
