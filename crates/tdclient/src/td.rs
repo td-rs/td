@@ -2046,6 +2046,13 @@ pub struct Td {
     /// The transcription manager's `send_update` outbox — drained by
     /// [`Td::flush_user_updates`].
     pub(crate) transcription_updates: Vec<td_api::Update>,
+    /// `Td::translation_manager_` (`Td.cpp:1316`, M.25) — the
+    /// AI-compose/translation query manager; created with Td like the
+    /// C++ `init_managers`.
+    pub(crate) translation_manager: crate::translation_manager::TranslationManager,
+    /// The translation manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) translation_updates: Vec<td_api::Update>,
     /// `Td::account_manager_` (`make_unique` at `Td.cpp:1231`, the
     /// `init_managers` block).
     pub(crate) account_manager: AccountManager,
@@ -2423,6 +2430,8 @@ impl Td {
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             transcription_manager: crate::transcription_manager::TranscriptionManager::default(),
             transcription_updates: Vec::new(),
+            translation_manager: crate::translation_manager::TranslationManager::default(),
+            translation_updates: Vec::new(),
             account_manager: AccountManager::new(),
             terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager::new(),
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
@@ -2940,6 +2949,25 @@ impl Td {
                 updates: &mut self.transcription_updates,
             };
             self.transcription_manager.init(&mut env);
+        }
+
+        // `make_unique<TranslationManager>` + the constructor
+        // `ai_compose_tones` restore (Td.cpp:1316,
+        // TranslationManager.cpp:573-592) — the M.25 partner manager;
+        // the read runs right after the transcription manager's, in the
+        // C++ creation order (:1313 → :1316). The gate is inside
+        // (start_up guards is_authorized && !is_bot); the empty-cache
+        // reload is the [blocked: net] tail.
+        {
+            let mut env = TranslationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.translation_updates,
+                users: &mut self.user_manager,
+            };
+            self.translation_manager.init(&mut env);
         }
 
         // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
@@ -4672,6 +4700,10 @@ impl Td {
         for update in transcription_updates {
             self.send_update(update.into());
         }
+        let translation_updates = std::mem::take(&mut self.translation_updates);
+        for update in translation_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -4788,6 +4820,24 @@ impl Td {
             updates: &mut self.web_browser_updates,
         };
         self.web_browser_manager.on_authorization_success(&mut env);
+    }
+
+    /// `TranslationManager::on_authorization_success`
+    /// (TranslationManager.cpp:598-603, called from AuthManager.cpp:1554)
+    /// — the live auth-success moment; runs before the web-browser
+    /// manager's, in the C++ AuthData order. The binlog-restore paths
+    /// don't call this (the C++ fires it only from on_get_authorization;
+    /// the constructor restore already sent the styles update).
+    fn on_translation_authorization_success(&mut self) {
+        let mut env = TranslationEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.translation_updates,
+            users: &mut self.user_manager,
+        };
+        self.translation_manager.on_authorization_success(&mut env);
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -5247,6 +5297,7 @@ impl Td {
         // C++ fires it after every manager init above — the notification
         // and web browser managers are the ones on this tree
         self.init_notification_manager();
+        self.on_translation_authorization_success();
         self.on_web_browser_authorization_success();
         self.init_theme_manager();
         self.init_story_manager();
@@ -7727,6 +7778,275 @@ impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'
         tdutils::log_info!(
             "Rate transcribed audio {message_full_id:?} id {transcription_id} good {is_good} — [blocked: net]"
         );
+    }
+}
+
+/// The [`crate::translation_manager::TranslationManagerEnv`] over the `Td`
+/// fields — built per call (the `NotificationEnv` convention), never held
+/// across calls. The user plane rides the same split-`UserEnv` borrow as
+/// the bot arms (`bot_user_split`), because the manager's entity scan
+/// also needs the [`crate::message_entity::UserManagerLike`] surface.
+pub(crate) struct TranslationEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) users: &'a mut UserManager,
+}
+
+impl TranslationEnv<'_> {
+    /// The disjoint `UserEnv` + manager borrow (the `bot_user_split`
+    /// convention in requests.rs).
+    fn user_env_split(&mut self) -> (UserEnv<'_>, &mut UserManager) {
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("translation calls run with the initialized option manager");
+        let env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        (env, &mut *self.users)
+    }
+}
+
+impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let (mut env, user_manager) = self.user_env_split();
+        user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_user_id_object(&mut self, user_id: i64, source: &str) -> i64 {
+        let (mut env, users) = self.user_env_split();
+        users.get_user_id_object(&mut env, UserId::new(user_id), source)
+    }
+
+    /// `Dependencies::add` × N + `Dependencies::resolve_force` —
+    /// [blocked: the Dependencies owner]; like the
+    /// `BotRecommendationManagerEnv` default, the collapse trusts the
+    /// synchronous user cache (the tones answer re-intakes the authors
+    /// through `on_get_users` once the net step lands).
+    fn resolve_user_dependencies(&mut self, user_ids: &[i64], source: &str) -> bool {
+        let _ = (user_ids, source);
+        true
+    }
+
+    fn get_me(&mut self) {
+        let (mut env, users) = self.user_env_split();
+        users.get_me(&mut env);
+    }
+
+    /// `TranslateTextQuery::send` — [blocked: net]; the promise drops,
+    /// which keeps the C++ request unanswered offline.
+    fn send_translate_text_query(
+        &mut self,
+        texts: Vec<FormattedText>,
+        to_language_code: String,
+        tone: String,
+        skip_bot_commands: bool,
+        max_media_timestamp: i32,
+        _promise: tdutils::promise::Promise<td_api::FormattedText>,
+    ) {
+        let _ = (
+            texts,
+            to_language_code,
+            tone,
+            skip_bot_commands,
+            max_media_timestamp,
+        );
+        tdutils::log_info!("Translate text — [blocked: net]");
+    }
+
+    /// `ComposeMessageWithAiQuery::send` — [blocked: net].
+    fn send_compose_message_with_ai_query(
+        &mut self,
+        text: FormattedText,
+        translate_to_language_code: String,
+        input_tone: Option<telegram_api::InputAiComposeTone>,
+        emojify: bool,
+        _promise: tdutils::promise::Promise<td_api::FormattedText>,
+    ) {
+        let _ = (text, translate_to_language_code, input_tone, emojify);
+        tdutils::log_info!("Compose message with AI — [blocked: net]");
+    }
+
+    /// `ProofreadMessageWithAiQuery::send` — [blocked: net].
+    fn send_proofread_message_with_ai_query(
+        &mut self,
+        text: FormattedText,
+        _promise: tdutils::promise::Promise<td_api::FixedText>,
+    ) {
+        let _ = text;
+        tdutils::log_info!("Proofread message with AI — [blocked: net]");
+    }
+
+    /// `GetAiComposeTonesQuery::send` — [blocked: net].
+    fn send_get_ai_compose_tones_query(
+        &mut self,
+        hash: i64,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = hash;
+        tdutils::log_info!("Get AI-compose tones hash {hash} — [blocked: net]");
+    }
+
+    /// `CreateToneQuery::send` — [blocked: net].
+    fn send_create_tone_query(
+        &mut self,
+        title: String,
+        custom_emoji_id: i64,
+        prompt: String,
+        show_creator: bool,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+    ) {
+        let _ = (title, custom_emoji_id, prompt, show_creator);
+        tdutils::log_info!("Create AI-compose tone — [blocked: net]");
+    }
+
+    /// `UpdateToneQuery::send` — [blocked: net].
+    fn send_update_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        title: String,
+        custom_emoji_id: i64,
+        prompt: String,
+        show_creator: bool,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+    ) {
+        let _ = (input_tone, title, custom_emoji_id, prompt, show_creator);
+        tdutils::log_info!("Update AI-compose tone — [blocked: net]");
+    }
+
+    /// `DeleteToneQuery::send` — [blocked: net].
+    fn send_delete_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = input_tone;
+        tdutils::log_info!("Delete AI-compose tone — [blocked: net]");
+    }
+
+    /// `GetToneQuery::send` — [blocked: net].
+    fn send_get_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+    ) {
+        let _ = input_tone;
+        tdutils::log_info!("Get AI-compose tone — [blocked: net]");
+    }
+
+    /// `GetToneExampleQuery::send` — [blocked: net].
+    fn send_get_tone_example_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        num: i32,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyleExample>,
+    ) {
+        let _ = (input_tone, num);
+        tdutils::log_info!("Get AI-compose tone example — [blocked: net]");
+    }
+
+    /// `SaveToneQuery::send` — [blocked: net].
+    fn send_save_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        unsave: bool,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (input_tone, unsave);
+        tdutils::log_info!("Save AI-compose tone — [blocked: net]");
+    }
+
+    /// `TranslateRichMessageQuery::send` — [blocked: net] over the
+    /// [blocked: RichMessage] value plane; the promise drops unanswered.
+    fn send_translate_rich_message_query(
+        &mut self,
+        message: td_api::InputRichMessage,
+        to_language_code: String,
+        tone: String,
+        _promise: tdutils::promise::Promise<td_api::RichMessage>,
+    ) {
+        let _ = (message, to_language_code, tone);
+        tdutils::log_info!("Translate rich message — [blocked: RichMessage]");
+    }
+
+    /// `do_compose_rich_message_with_ai` +
+    /// `ComposeRichMessageWithAiQuery::send` — [blocked: net] over the
+    /// [blocked: RichMessage] value plane; the promise drops unanswered.
+    fn send_compose_rich_message_with_ai_query(
+        &mut self,
+        has_message: bool,
+        message: Option<td_api::InputRichMessage>,
+        translate_to_language_code: String,
+        input_tone: Option<telegram_api::InputAiComposeTone>,
+        emojify: bool,
+        proofread: bool,
+        _promise: tdutils::promise::Promise<td_api::RichMessage>,
+    ) {
+        let _ = (
+            has_message,
+            message,
+            translate_to_language_code,
+            input_tone,
+            emojify,
+            proofread,
+        );
+        tdutils::log_info!("Compose rich message with AI — [blocked: RichMessage]");
+    }
+}
+
+impl crate::message_entity::UserManagerLike for TranslationEnv<'_> {
+    fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, users) = self.user_env_split();
+        users.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        let (env, users) = self.user_env_split();
+        users.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.users.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
+        let (env, users) = self.user_env_split();
+        users.get_input_user_force(&env, user_id)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.users.is_user_bot_of(user_id)
     }
 }
 

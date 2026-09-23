@@ -60,6 +60,7 @@ use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::TdLinkEnv;
 use crate::td::ThemeEnv;
+use crate::td::TranslationEnv;
 use crate::td::WebBrowserEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
@@ -326,6 +327,22 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 };
                 td.message_query_manager
                     .get_current_state(&env, &mut updates);
+            }
+
+            // TranslationManager::get_current_state (Requests.cpp:2257 —
+            // right after the message-query block, before web browser; the
+            // manager's own authorized/non-bot gate applies)
+            {
+                let mut env = TranslationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.translation_updates,
+                    users: &mut td.user_manager,
+                };
+                td.translation_manager
+                    .get_current_state(&mut env, &mut updates);
             }
 
             // WebBrowserManager::get_current_state (Requests.cpp:2259; the
@@ -8571,6 +8588,209 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
+        Function::translateText(request) => {
+            // `Requests.cpp:2847-2853`: CHECK_IS_USER, clean the two
+            // strings, then the translation manager. The query tail is
+            // the [blocked: net] seam — the promise parks unanswered
+            // offline.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(to_language_code) = clean_or_utf8_error(td, id, &request.to_language_code)
+            else {
+                return;
+            };
+            let Some(tone) = clean_or_utf8_error(td, id, &request.tone) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.translate_text(
+                &mut env,
+                request.text,
+                to_language_code,
+                tone,
+                promise,
+            );
+        }
+        Function::translateRichMessage(request) => {
+            // `Requests.cpp:2855-2861`: CHECK_IS_USER, clean, then the
+            // manager; the rich intake parks at the [blocked:
+            // RichMessage] seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(to_language_code) = clean_or_utf8_error(td, id, &request.to_language_code)
+            else {
+                return;
+            };
+            let Some(tone) = clean_or_utf8_error(td, id, &request.tone) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.translate_rich_message(
+                &mut env,
+                request.message.map(|message| *message),
+                to_language_code,
+                tone,
+                promise,
+            );
+        }
+        Function::composeTextWithAi(request) => {
+            // `Requests.cpp:2892-2898`: CHECK_IS_USER, clean, then the
+            // manager's tone lookup + the [blocked: net] seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(translate_to_language_code) =
+                clean_or_utf8_error(td, id, &request.translate_to_language_code)
+            else {
+                return;
+            };
+            let Some(style_name) = clean_or_utf8_error(td, id, &request.style_name) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.compose_message_with_ai(
+                &mut env,
+                request.text,
+                translate_to_language_code,
+                style_name,
+                request.add_emojis,
+                promise,
+            );
+        }
+        Function::composeRichMessageWithAi(request) => {
+            // `Requests.cpp:2900-2910`: CHECK_IS_USER, the three strings,
+            // then the manager's rich compose ([blocked: RichMessage]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(translate_to_language_code) =
+                clean_or_utf8_error(td, id, &request.translate_to_language_code)
+            else {
+                return;
+            };
+            let Some(style_name) = clean_or_utf8_error(td, id, &request.style_name) else {
+                return;
+            };
+            let Some(custom_prompt) = clean_or_utf8_error(td, id, &request.custom_prompt) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.compose_rich_message_with_ai(
+                &mut env,
+                request.message.map(|message| *message),
+                translate_to_language_code,
+                style_name,
+                custom_prompt,
+                request.add_emojis,
+                promise,
+            );
+        }
+        Function::createRichMessageWithAi(request) => {
+            // `Requests.cpp:2912-2919`: CHECK_IS_USER, clean the two
+            // strings, then the manager's rich create
+            // ([blocked: RichMessage]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_code) = clean_or_utf8_error(td, id, &request.language_code) else {
+                return;
+            };
+            let Some(prompt) = clean_or_utf8_error(td, id, &request.prompt) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.create_rich_message_with_ai(
+                &mut env,
+                prompt,
+                language_code,
+                request.add_emojis,
+                promise,
+            );
+        }
+        Function::fixTextWithAi(request) => {
+            // `Requests.cpp:2921-2925`: CHECK_IS_USER, then the manager's
+            // proofread intake (no strings to clean; the query tail is
+            // the [blocked: net] seam).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::FixedText, _>(id, Object::fixedText);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager
+                .proofread_message_with_ai(&mut env, request.text, promise);
+        }
+        Function::fixRichMessageWithAi(request) => {
+            // `Requests.cpp:2927-2931`: CHECK_IS_USER, then the manager's
+            // rich proofread ([blocked: RichMessage]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+            let mut env = TranslationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.translation_updates,
+                users: &mut td.user_manager,
+            };
+            td.translation_manager.proofread_rich_message_with_ai(
+                &mut env,
+                request.message.map(|message| *message),
+                promise,
+            );
+        }
 
         // Everything else waits for its manager step.
         _ => {
@@ -9314,14 +9534,17 @@ mod request_census_tests {
         // getExternalLinkInfo, getRecentlyVisitedTMeUrls, the two login-url
         // arms and the four oauth arms) + M.25's two transcription
         // dispatches (recognizeSpeech, rateSpeechRecognition — the
-        // [blocked: M.10] probe seam answers the C++ not-found band). Fix
-        // per flip.
+        // [blocked: M.10] probe seam answers the C++ not-found band) and
+        // seven translation dispatches (translateText, composeTextWithAi,
+        // fixTextWithAi, createRichMessageWithAi and the rich trio — the
+        // query tails park at the [blocked: net]/[blocked: RichMessage]
+        // seams like the C++ offline). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            456,
+            463,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 547, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 540, "interim count");
     }
 }

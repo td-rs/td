@@ -129,6 +129,7 @@ pub mod terms_of_service_manager;
 pub mod theme_manager;
 pub mod time_zone_manager;
 pub mod transcription_manager;
+pub mod translation_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;

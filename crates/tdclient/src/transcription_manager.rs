@@ -1131,10 +1131,9 @@ fn get_retry_after(error_code: i32, error_message: &str) -> i32 {
 mod tests {
     use super::*;
 
-    use super::*;
-    use crate::messages_manager::MessageId;
     use crate::dialog_id::{DialogId, MessageFullId};
     use crate::files::FileId;
+    use crate::messages_manager::MessageId;
     use tdutils::promise::{Promise, PromiseInterface};
 
     /// A [`PromiseInterface`] that flips flags instead of answering requests —
