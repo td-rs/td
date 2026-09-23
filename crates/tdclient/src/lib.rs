@@ -70,6 +70,8 @@ pub mod game_manager;
 pub mod global;
 pub mod group_call_manager;
 pub mod inline_keyboard_button;
+pub mod inline_message_manager;
+pub mod inline_queries_manager;
 pub mod join_chat_bot_result;
 pub mod keyboard_button;
 pub mod keyboard_button_style;

@@ -41,8 +41,8 @@ allowUnpaidMessagesFromUser	interim
 answerCallbackQuery	dispatched
 answerChatJoinRequestQuery	interim
 answerCustomQuery	dispatched
-answerGuestQuery	interim
-answerInlineQuery	interim
+answerGuestQuery	dispatched
+answerInlineQuery	dispatched
 answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
 answerWebAppQuery	interim
@@ -222,11 +222,11 @@ editCustomLanguagePackInfo	dispatched
 editEphemeralMessage	interim
 editEphemeralMessageCaption	interim
 editForumTopic	dispatched
-editInlineMessageCaption	interim
-editInlineMessageLiveLocation	interim
-editInlineMessageMedia	interim
-editInlineMessageReplyMarkup	interim
-editInlineMessageText	interim
+editInlineMessageCaption	dispatched
+editInlineMessageLiveLocation	dispatched
+editInlineMessageMedia	dispatched
+editInlineMessageReplyMarkup	dispatched
+editInlineMessageText	dispatched
 editMessageCaption	interim
 editMessageChecklist	interim
 editMessageLiveLocation	interim
@@ -349,7 +349,7 @@ getCountryCode	interim
 getCountryFlagEmoji	interim
 getCreatedPublicChats	interim
 getCurrentState	dispatched
-getCurrentWeather	interim
+getCurrentWeather	dispatched
 getCustomEmojiReactionAnimations	interim
 getCustomEmojiStickers	interim
 getDatabaseStatistics	dispatched
@@ -401,8 +401,8 @@ getGroupsInCommon	interim
 getGuardBotWebAppUrl	interim
 getImportedContactCount	dispatched
 getInactiveSupergroupChats	interim
-getInlineGameHighScores	interim
-getInlineQueryResults	interim
+getInlineGameHighScores	dispatched
+getInlineQueryResults	dispatched
 getInstalledBackgrounds	interim
 getInstalledStickerSets	interim
 getInternalLink	interim
@@ -482,7 +482,7 @@ getPremiumLimit	dispatched
 getPremiumState	dispatched
 getPremiumStickerExamples	interim
 getPremiumStickers	interim
-getPreparedInlineMessage	interim
+getPreparedInlineMessage	dispatched
 getPreparedKeyboardButton	interim
 getProxies	interim
 getPublicPostSearchLimits	interim
@@ -720,7 +720,7 @@ reuseStarSubscription	interim
 revokeChatInviteLink	interim
 revokeGroupCallInviteLink	dispatched
 saveApplicationLogEvent	interim
-savePreparedInlineMessage	interim
+savePreparedInlineMessage	dispatched
 savePreparedKeyboardButton	interim
 searchAffiliatePrograms	dispatched
 searchBackground	interim
@@ -866,7 +866,7 @@ setGroupCallPaidMessageStarCount	dispatched
 setGroupCallParticipantIsSpeaking	dispatched
 setGroupCallParticipantVolumeLevel	dispatched
 setInactiveSessionTtl	interim
-setInlineGameScore	interim
+setInlineGameScore	dispatched
 setLiveStoryMessageSender	dispatched
 setLogStream	sync
 setLogTagVerbosityLevel	sync
