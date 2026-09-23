@@ -238,7 +238,8 @@ impl InlineMessageManager {
             return;
         }
 
-        let new_reply_markup = match env.get_input_reply_markup(reply_markup) {
+        let is_bot = env.auth_is_bot();
+        let new_reply_markup = match env.get_input_reply_markup(reply_markup, is_bot, true) {
             Ok(reply_markup) => reply_markup,
             Err(status) => {
                 promise.set_error(status);
@@ -321,7 +322,8 @@ impl InlineMessageManager {
             "edit_inline_message_live_location is bot-only"
         );
 
-        let new_reply_markup = match env.get_input_reply_markup(reply_markup) {
+        let is_bot = env.auth_is_bot();
+        let new_reply_markup = match env.get_input_reply_markup(reply_markup, is_bot, true) {
             Ok(reply_markup) => reply_markup,
             Err(status) => {
                 promise.set_error(status);
@@ -414,7 +416,8 @@ impl InlineMessageManager {
             return;
         }
 
-        let new_reply_markup = match env.get_input_reply_markup(reply_markup) {
+        let is_bot = env.auth_is_bot();
+        let new_reply_markup = match env.get_input_reply_markup(reply_markup, is_bot, true) {
             Ok(reply_markup) => reply_markup,
             Err(status) => {
                 promise.set_error(status);
@@ -480,7 +483,8 @@ impl InlineMessageManager {
                 return;
             }
         };
-        let new_reply_markup = match env.get_input_reply_markup(reply_markup) {
+        let is_bot = env.auth_is_bot();
+        let new_reply_markup = match env.get_input_reply_markup(reply_markup, is_bot, true) {
             Ok(reply_markup) => reply_markup,
             Err(status) => {
                 promise.set_error(status);
@@ -522,7 +526,8 @@ impl InlineMessageManager {
             "edit_inline_message_reply_markup is bot-only"
         );
 
-        let new_reply_markup = match env.get_input_reply_markup(reply_markup) {
+        let is_bot = env.auth_is_bot();
+        let new_reply_markup = match env.get_input_reply_markup(reply_markup, is_bot, true) {
             Ok(reply_markup) => reply_markup,
             Err(status) => {
                 promise.set_error(status);

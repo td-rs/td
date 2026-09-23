@@ -30,16 +30,14 @@ use crate::dialog_id::DialogId;
 use crate::emoji_status::CustomEmojiId;
 use crate::files::FileId;
 use crate::formatted_date::FormattedDate;
-use crate::inline_keyboard_button::{
-    InlineKeyboardButton, RichButtonStyle, UserInputEnv, get_inline_keyboard_button_from_td_api,
-    get_inline_keyboard_button_from_telegram, get_inline_keyboard_button_object,
-    get_input_keyboard_inline_button,
-};
+use crate::inline_keyboard_button::{InlineKeyboardButton, InlineKeyboardButtonEnv};
+use crate::message_content_dup_type::MessageContentDupType;
 use crate::peer_color::AccentColorId;
 use crate::photo::{
     DialogPhoto, Photo, PhotoStoreEnv, get_dimensions, parse_dimensions, parse_photo,
     store_dimensions, store_photo,
 };
+use crate::rich_button_style::RichButtonStyle;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string, version};
 use crate::td_api;
 use crate::user_manager::UserId;
@@ -130,7 +128,7 @@ pub struct WebPageBlockObjectContext<'a> {
     /// anchor -> whether the anchor has text (the C++ `const RichText *`).
     pub anchors: std::collections::HashMap<String, bool>,
     /// The `UserManager *` of the object builders (the InlineButton type).
-    pub user_manager: &'a mut dyn UserInputEnv,
+    pub user_manager: &'a mut dyn InlineKeyboardButtonEnv,
 }
 
 /// `GetInputPageBlockContext` (WebPageBlock.h:35-41).
@@ -143,7 +141,7 @@ pub struct GetInputPageBlockContext<'a> {
     /// `InputContext::media_` — `[blocked: M.9]`, the RichMessageMedia
     /// vector; the position walks one step per media block.
     pub media_pos: usize,
-    pub user_manager: &'a mut dyn UserInputEnv,
+    pub user_manager: &'a mut dyn InlineKeyboardButtonEnv,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,44 +184,22 @@ impl std::fmt::Display for WebPageId {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MessageContentDupType (MessageContentDupType.h) — the shared enum the
-// clone plane reads; the message-content consumers (M.9/M.10) reuse it.
-// ---------------------------------------------------------------------------
-
-/// `td::MessageContentDupType` (MessageContentDupType.h:9) — append only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MessageContentDupType {
-    /// normal message sending
-    #[default]
-    Send,
-    /// message sending via bot
-    SendViaBot,
-    /// quick reply sending
-    SendQuickReply,
-    /// server-side message forward
-    Forward,
-    /// local message copy
-    Copy,
-    /// server-side message copy
-    ServerCopy,
-}
-
-/// The `CloneWebPageBlockContext` (WebPageBlock.h:43-48) — the `Td *`
-/// collapse keeps the four fields the clone plane reads.
+/// The `CloneWebPageBlockContext` (WebPageBlock.h:43-48) — the clone
+/// plane reads the dialog (the secret-chat check), the dup type and the
+/// via-bot flag.
 #[derive(Clone, Copy, Debug)]
 pub struct CloneWebPageBlockContext {
     /// `dialog_id_.get_type() == DialogType::SecretChat`.
-    pub is_secret_chat: bool,
+    pub dialog_id: DialogId,
     pub dup_type: MessageContentDupType,
     pub is_via_bot: bool,
 }
 
 impl CloneWebPageBlockContext {
     /// The C++ field defaults: `dup_type = Send`, `is_via_bot = false`.
-    pub fn new(is_secret_chat: bool) -> Self {
+    pub fn new(dialog_id: DialogId) -> Self {
         CloneWebPageBlockContext {
-            is_secret_chat,
+            dialog_id,
             dup_type: MessageContentDupType::Send,
             is_via_bot: false,
         }
@@ -430,18 +406,12 @@ impl RichText {
                     ..RichText::default()
                 };
             }
-            result.button = Some(button.clone_for_dup(
-                context.is_secret_chat,
-                matches!(
-                    context.dup_type,
-                    MessageContentDupType::Send
-                        | MessageContentDupType::SendViaBot
-                        | MessageContentDupType::SendQuickReply
-                ),
-                is_forward,
+            result.button = Some(button.clone_button(
+                context.dialog_id,
+                context.dup_type,
+                context.is_via_bot,
                 // is_rich_message: the RichText clone is always a rich message
                 true,
-                context.is_via_bot,
             ));
         }
         result
@@ -594,7 +564,7 @@ impl RichText {
                     flags |= 1 << 0;
                 }
                 let button = self.button.as_ref().expect("the C++ CHECKs the button");
-                let input_button = get_input_keyboard_inline_button(context.user_manager, button);
+                let input_button = button.get_input_keyboard_inline_button(context.user_manager);
                 telegram_api::RichText::textButton(telegram_api::textButton {
                     flags,
                     text: Some(Box::new(self.texts[0].get_input_rich_text(context))),
@@ -844,12 +814,13 @@ impl RichText {
             }
             RichTextType::Button => {
                 let button = self.button.as_ref().expect("the C++ CHECKs the button");
-                let button_type = get_inline_keyboard_button_object(context.user_manager, button);
+                let button_object =
+                    button.get_inline_keyboard_button_object(Some(&*context.user_manager));
                 td_api::RichText::richTextButton(td_api::richTextButton {
                     button: Some(Box::new(td_api::InlineButton {
                         text: self.texts[0].get_rich_text_object(context, false),
                         style: self.button_style.get_button_style_object(),
-                        r#type: Some(button_type),
+                        r#type: button_object.r#type,
                     })),
                 })
             }
@@ -1130,7 +1101,7 @@ pub fn get_rich_text_from_telegram(
                 text: "1".to_owned(),
                 r#type: rich_text.r#type,
             };
-            result.button = Some(get_inline_keyboard_button_from_telegram(keyboard_button));
+            result.button = Some(InlineKeyboardButton::from_telegram(keyboard_button));
         }
     }
     result
@@ -1340,7 +1311,7 @@ pub fn get_rich_text_from_td_api(
                 return Err(Status::error(400, "Button must be non-empty"));
             };
             let t = get_rich_text_from_td_api(env, button.text.clone())?;
-            let inline_button = get_inline_keyboard_button_from_td_api(
+            let inline_button = InlineKeyboardButton::from_td_api(
                 td_api::InlineKeyboardButton {
                     text: "1".to_owned(),
                     icon_custom_emoji_id: 0,
@@ -1348,7 +1319,7 @@ pub fn get_rich_text_from_td_api(
                     r#type: button.r#type.clone(),
                 },
                 true,
-                &InlineEnvAdapter { env },
+                false,
             )?;
             result.r#type = RichTextType::Button;
             result.texts.push(t);
@@ -1413,20 +1384,6 @@ pub fn get_rich_text_from_td_api(
         }
     }
     Ok(result)
-}
-
-/// The [`InlineKeyboardButtonEnv`] adapter over the [`WebPageBlockEnv`]
-/// (the rich-text intake never exercises the test-dc gate; the C++
-/// default `check_link(url, false, false)` applies).
-struct InlineEnvAdapter<'a> {
-    env: &'a mut dyn WebPageBlockEnv,
-}
-
-impl crate::inline_keyboard_button::InlineKeyboardButtonEnv for InlineEnvAdapter<'_> {
-    fn is_test_dc(&self) -> bool {
-        let _ = self.env;
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2186,7 +2143,7 @@ impl WebPageBlockRowButton {
             return Err(Status::error(400, "Button must be non-empty"));
         };
         result.text = get_rich_text_from_td_api(env, button.text)?;
-        result.button = get_inline_keyboard_button_from_td_api(
+        result.button = InlineKeyboardButton::from_td_api(
             td_api::InlineKeyboardButton {
                 text: "1".to_owned(),
                 icon_custom_emoji_id: 0,
@@ -2194,7 +2151,7 @@ impl WebPageBlockRowButton {
                 r#type: button.r#type,
             },
             true,
-            &InlineEnvAdapter { env },
+            false,
         )?;
         result.style = RichButtonStyle::from_td_api(button.style);
         Ok(result)
@@ -2220,17 +2177,11 @@ impl WebPageBlockButtonRow {
                 .map(|button| {
                     let mut result = WebPageBlockRowButton {
                         style: button.style,
-                        button: button.button.clone_for_dup(
-                            context.is_secret_chat,
-                            matches!(
-                                context.dup_type,
-                                MessageContentDupType::Send
-                                    | MessageContentDupType::SendViaBot
-                                    | MessageContentDupType::SendQuickReply
-                            ),
-                            context.dup_type == MessageContentDupType::Forward,
-                            true,
+                        button: button.button.clone_button(
+                            context.dialog_id,
+                            context.dup_type,
                             context.is_via_bot,
+                            true,
                         ),
                         ..button.clone()
                     };
@@ -3350,7 +3301,7 @@ pub fn append_user_ids(page_block: &WebPageBlock, user_ids: &mut Vec<UserId>) {
             user_ids.push(text.user_id);
         }
         if let Some(button) = &text.button {
-            let user_id = button.user_id();
+            let user_id = button.user_id;
             if user_id.is_valid() {
                 user_ids.push(user_id);
             }
@@ -3448,7 +3399,7 @@ fn get_page_blocks_object_vec(
 pub fn get_page_blocks_object(
     page_blocks: &[WebPageBlock],
     env: &mut dyn WebPageBlockEnv,
-    user_manager: &mut dyn UserInputEnv,
+    user_manager: &mut dyn InlineKeyboardButtonEnv,
     base_url: &str,
     real_url: &str,
     skip_bot_commands: bool,
@@ -4438,14 +4389,13 @@ impl WebPageBlock {
                         .buttons
                         .iter()
                         .map(|button| {
-                            let button_type = get_inline_keyboard_button_object(
-                                context.user_manager,
-                                &button.button,
-                            );
+                            let button_object = button
+                                .button
+                                .get_inline_keyboard_button_object(Some(&*context.user_manager));
                             Box::new(td_api::InlineButton {
                                 text: button.text.get_rich_text_object(context, false),
                                 style: button.style.get_button_style_object(),
-                                r#type: Some(button_type),
+                                r#type: button_object.r#type,
                             })
                         })
                         .collect(),
@@ -4885,10 +4835,9 @@ impl WebPageBlock {
                                 // pageButton::STYLE_MASK
                                 button_flags |= 1 << 0;
                             }
-                            let input_button = get_input_keyboard_inline_button(
-                                context.user_manager,
-                                &button.button,
-                            );
+                            let input_button = button
+                                .button
+                                .get_input_keyboard_inline_button(context.user_manager);
                             telegram_api::PageButton {
                                 flags: button_flags,
                                 text: Some(Box::new(button.text.get_input_rich_text(context))),
@@ -5473,7 +5422,7 @@ pub fn get_web_page_block(
                             text: "1".to_owned(),
                             r#type: button.r#type,
                         };
-                        result.button = get_inline_keyboard_button_from_telegram(keyboard_button);
+                        result.button = InlineKeyboardButton::from_telegram(keyboard_button);
                         result
                     })
                     .collect(),
@@ -5853,15 +5802,15 @@ mod tests {
     use crate::emoji_status::CustomEmojiId;
     use crate::files::FileId;
     use crate::formatted_date::FormattedDate;
-    use crate::inline_keyboard_button::{
-        InlineKeyboardButton, InlineKeyboardButtonType, KeyboardButtonStyle, RichButtonStyle,
-        TargetDialogTypes, get_inline_keyboard_button_from_td_api,
-    };
+    use crate::inline_keyboard_button::{InlineKeyboardButton, InlineKeyboardButtonType};
+    use crate::keyboard_button_style::KeyboardButtonStyle;
     use crate::photo::{
         DialogPhoto, Dimensions, Photo, PhotoSize, parse_dialog_photo, parse_dimensions,
         parse_photo, store_dialog_photo, store_dimensions, store_photo,
     };
+    use crate::rich_button_style::RichButtonStyle;
     use crate::store_parse::{Parser, version};
+    use crate::target_dialog_types::TargetDialogTypes;
     use crate::td_api;
     use crate::user_manager::UserId;
 
@@ -6670,18 +6619,16 @@ mod tests {
         }
     }
 
-    /// The minimal `UserInputEnv` for the object builders.
+    /// The minimal [`InlineKeyboardButtonEnv`] for the object builders.
     struct TestUserManager;
 
     impl crate::inline_keyboard_button::InlineKeyboardButtonEnv for TestUserManager {
         fn is_test_dc(&self) -> bool {
             false
         }
-    }
 
-    impl crate::inline_keyboard_button::UserInputEnv for TestUserManager {
         fn get_input_user(
-            &mut self,
+            &self,
             _user_id: UserId,
         ) -> std::result::Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status>
         {
@@ -6694,7 +6641,7 @@ mod tests {
             false
         }
 
-        fn get_user_id_object(&mut self, user_id: UserId, _source: &str) -> i64 {
+        fn get_user_id_object(&self, user_id: UserId, _source: &str) -> i64 {
             user_id.get()
         }
     }
@@ -6823,7 +6770,7 @@ mod tests {
 
     #[test]
     fn get_inline_keyboard_button_from_td_api_url() {
-        let button = get_inline_keyboard_button_from_td_api(
+        let button = InlineKeyboardButton::from_td_api(
             td_api::InlineKeyboardButton {
                 text: "go".to_owned(),
                 icon_custom_emoji_id: 0,
@@ -6837,7 +6784,7 @@ mod tests {
                 ),
             },
             true,
-            &TestUserManager,
+            false,
         )
         .unwrap();
         assert_eq!(button.type_, InlineKeyboardButtonType::Url);
