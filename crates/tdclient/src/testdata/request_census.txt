@@ -100,9 +100,9 @@ clearRecentStickers	interim
 clearRecentlyFoundChats	dispatched
 clearSearchedForTags	interim
 clickAnimatedEmojiMessage	interim
-clickChatSponsoredMessage	interim
+clickChatSponsoredMessage	dispatched
 clickPremiumSubscriptionButton	dispatched
-clickVideoMessageAdvertisement	interim
+clickVideoMessageAdvertisement	dispatched
 close	dispatched
 closeChat	dispatched
 closeGiftAuction	dispatched
@@ -329,7 +329,7 @@ getChatScheduledMessages	interim
 getChatSimilarChatCount	dispatched
 getChatSimilarChats	dispatched
 getChatSparseMessagePositions	interim
-getChatSponsoredMessages	interim
+getChatSponsoredMessages	dispatched
 getChatStatistics	dispatched
 getChatStoryAlbums	dispatched
 getChatStoryInteractions	dispatched
@@ -508,7 +508,7 @@ getSavedNotificationSound	interim
 getSavedNotificationSounds	interim
 getSavedOrderInfo	dispatched
 getScopeNotificationSettings	dispatched
-getSearchSponsoredChats	interim
+getSearchSponsoredChats	dispatched
 getSearchedForTags	interim
 getSecretChat	dispatched
 getStakeDiceState	interim
@@ -572,7 +572,7 @@ getUserSupportInfo	interim
 getVideoChatAvailableParticipants	dispatched
 getVideoChatInviteLink	dispatched
 getVideoChatRtmpUrl	dispatched
-getVideoMessageAdvertisements	interim
+getVideoMessageAdvertisements	dispatched
 getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	interim
@@ -581,7 +581,7 @@ giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	dispatched
 importContacts	dispatched
-importMessages	interim
+importMessages	dispatched
 increaseGiftAuctionBid	dispatched
 inviteGroupCallParticipant	dispatched
 inviteVideoChatParticipants	dispatched
@@ -612,7 +612,7 @@ openChat	dispatched
 openChatSimilarChat	dispatched
 openGiftAuction	dispatched
 openMessageContent	interim
-openSponsoredChat	interim
+openSponsoredChat	dispatched
 openStory	dispatched
 openWebApp	dispatched
 optimizeStorage	dispatched
@@ -694,14 +694,14 @@ replaceVideoChatRtmpUrl	dispatched
 reportAuthenticationCodeMissing	interim
 reportChat	dispatched
 reportChatPhoto	interim
-reportChatSponsoredMessage	interim
+reportChatSponsoredMessage	dispatched
 reportMessageReactions	interim
 reportPhoneNumberCodeMissing	interim
-reportSponsoredChat	interim
+reportSponsoredChat	dispatched
 reportStory	dispatched
 reportSupergroupAntiSpamFalsePositive	interim
 reportSupergroupSpam	interim
-reportVideoMessageAdvertisement	interim
+reportVideoMessageAdvertisement	dispatched
 requestAuthenticationPasswordRecovery	interim
 requestPasswordRecovery	interim
 requestQrCodeAuthentication	interim
@@ -1016,7 +1016,7 @@ uploadStickerFile	interim
 validateOrderInfo	dispatched
 viewMessages	dispatched
 viewPremiumFeature	dispatched
-viewSponsoredChat	interim
+viewSponsoredChat	dispatched
 viewTrendingStickerSets	interim
-viewVideoMessageAdvertisement	interim
+viewVideoMessageAdvertisement	dispatched
 writeGeneratedFilePart	dispatched
