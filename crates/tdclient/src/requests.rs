@@ -40,12 +40,12 @@ use crate::message_id::{MessageFullId, MessageId};
 use crate::messages_manager::DialogId as MmDialogId;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
-    get_notification_settings_scope, get_scope_notification_settings_object,
-    ReactionNotificationSettings,
+    ReactionNotificationSettings, get_notification_settings_scope,
+    get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::star_gift_manager::{
-    get_message_sender_dialog_id, StarGiftCollectionId, StarGiftId, StarGiftResalePrice,
+    StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
 };
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
@@ -1739,6 +1739,581 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 request.seen_range_ratio_per_mille,
                 promise,
             );
+        }
+        Function::searchStickers(request) => {
+            // Requests.cpp:7443-7465 — the legacy emoji rewrites, then
+            // the search bands (the cache-miss load parks [blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(emojis) = clean_or_utf8_error(td, id, &request.emojis) else {
+                return;
+            };
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let mut input_language_codes = Vec::with_capacity(request.input_language_codes.len());
+            for language_code in &request.input_language_codes {
+                let Some(language_code) = clean_or_utf8_error(td, id, language_code) else {
+                    return;
+                };
+                input_language_codes.push(language_code);
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let sticker_type =
+                crate::stickers_manager::get_sticker_type(request.sticker_type.as_ref());
+            let mut emojis = emojis;
+            if sticker_type == crate::stickers_manager::StickerType::Regular && query.is_empty() {
+                // legacy
+                if emojis == "\u{2b50}\u{2b50}" {
+                    emojis = "\u{2b50}".to_owned();
+                } else if emojis == "\u{1f4d2}\u{2b50}" {
+                    emojis = "\u{1f4d2}".to_owned();
+                } else if emojis == "\u{1f44b}\u{2b50}" {
+                    emojis = "\u{1f44b}".to_owned();
+                }
+            }
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_stickers(
+                &mut env,
+                sticker_type,
+                emojis,
+                query,
+                input_language_codes,
+                request.offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getGreetingStickers(_) => {
+            // Requests.cpp:7467-7472 — the greeting search parks at the
+            // found-stickers load ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_stickers(
+                &mut env,
+                crate::stickers_manager::StickerType::Regular,
+                "\u{1f44b}\u{2b50}".to_owned(),
+                String::new(),
+                Vec::new(),
+                0,
+                100,
+                promise,
+            );
+        }
+        Function::getPremiumStickerExamples(_) => {
+            // Requests.cpp:9016-9021 — the examples search parks at the
+            // found-stickers load ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_stickers(
+                &mut env,
+                crate::stickers_manager::StickerType::Regular,
+                "\u{2b50}\u{2b50}".to_owned(),
+                String::new(),
+                Vec::new(),
+                0,
+                100,
+                promise,
+            );
+        }
+        Function::getAnimatedEmoji(request) => {
+            // Requests.cpp:7731-7736 — the special-set load parks
+            // ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(emoji) = clean_or_utf8_error(td, id, &request.emoji) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::AnimatedEmoji, _>(id, Object::animatedEmoji);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_animated_emoji(&mut env, emoji, false, promise);
+        }
+        Function::getCustomEmojiStickers(request) => {
+            // Requests.cpp:7745-7749 — the dedupe/limit bands, then the
+            // unknown-id load parks ([blocked: net]).
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_custom_emoji_stickers(
+                &mut env,
+                crate::stickers_manager::CustomEmojiId::get_custom_emoji_ids(
+                    &request.custom_emoji_ids,
+                ),
+                true,
+                promise,
+            );
+        }
+        Function::getDefaultChatPhotoCustomEmojiStickers(_) => {
+            // Requests.cpp:7751-7755 — the default-list load parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_default_custom_emoji_stickers(
+                &mut env,
+                crate::stickers_manager::StickerListType::DialogPhoto,
+                false,
+                promise,
+            );
+        }
+        Function::getDefaultProfilePhotoCustomEmojiStickers(_) => {
+            // Requests.cpp:7757-7762 — the default-list load parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_default_custom_emoji_stickers(
+                &mut env,
+                crate::stickers_manager::StickerListType::UserProfilePhoto,
+                false,
+                promise,
+            );
+        }
+        Function::getDefaultBackgroundCustomEmojiStickers(_) => {
+            // Requests.cpp:7764-7769 — the default-list load parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_default_custom_emoji_stickers(
+                &mut env,
+                crate::stickers_manager::StickerListType::Background,
+                false,
+                promise,
+            );
+        }
+        Function::getDisallowedChatEmojiStatuses(_) => {
+            // Requests.cpp:7770-7775 — the disallowed list load parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_sticker_list_emoji_statuses(
+                &mut env,
+                crate::stickers_manager::StickerListType::DisallowedChannelEmojiStatus,
+                false,
+                promise,
+            );
+        }
+        Function::getEmojiCategories(request) => {
+            // Requests.cpp:7725-7729 — the emoji-group load parks
+            // ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::EmojiCategories, _>(id, Object::emojiCategories);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_emoji_groups(
+                &mut env,
+                crate::stickers_manager::get_emoji_group_type(request.r#type.as_ref()),
+                promise,
+            );
+        }
+        Function::getCustomEmojiReactionAnimations(_) => {
+            // Requests.cpp:3913-3917 — the generic-animations set load
+            // parks ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_custom_emoji_reaction_generic_animations(&mut env, false, promise);
+        }
+        Function::getForumTopicDefaultIcons(_) => {
+            // Requests.cpp:4827-4831 — the topic-icons set load parks.
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_default_topic_icons(&mut env, false, promise);
+        }
+        Function::getThemedEmojiStatuses(_) => {
+            // Requests.cpp:6815-6819 — the default-statuses set load
+            // parks ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_default_emoji_statuses(&mut env, false, promise);
+        }
+        Function::getPremiumStickers(request) => {
+            // Requests.cpp:7474-7478 — the limit bands, then the
+            // composite load parks ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_premium_stickers(&mut env, request.limit, promise);
+        }
+        Function::getPremiumInfoSticker(request) => {
+            // Requests.cpp:9011-9015 — the premium-gift set load parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Sticker, _>(id, Object::sticker);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.load_premium_gift_sticker(&mut env, request.month_count, 0, promise);
+        }
+        Function::getOwnedStickerSets(request) => {
+            // Requests.cpp:7660-7664 — the limit band, then the
+            // my-stickers query parks ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StickerSets, _>(id, Object::stickerSets);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_created_sticker_sets(
+                &mut env,
+                crate::stickers_manager::StickerSetId::new(request.offset_sticker_set_id),
+                request.limit,
+                promise,
+            );
+        }
+        Function::getStickerSetName(request) => {
+            // Requests.cpp:7506-7509 — the Great Minds special case
+            // answers locally, unknown sets 400.
+            let promise =
+                td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_sticker_set_name(
+                &mut env,
+                crate::stickers_manager::StickerSetId::new(request.set_id),
+                promise,
+            );
+        }
+        Function::getSuggestedStickerSetName(request) => {
+            // Requests.cpp:7552-7556 — the title strip is local; the
+            // suggestion query parks ([blocked: net]).
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_suggested_sticker_set_name(&mut env, title, promise);
+        }
+        Function::checkStickerSetName(request) => {
+            // Requests.cpp:7558-7570 — the empty band answers Invalid;
+            // the short-name check parks ([blocked: net]).
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td
+                .deferred_promise::<crate::stickers_manager::CheckStickerSetNameResult, _>(
+                    id,
+                    |result| {
+                        use crate::stickers_manager::CheckStickerSetNameResult as R;
+                        match result {
+                            R::Ok => Object::checkStickerSetNameResultOk(
+                                td_api::checkStickerSetNameResultOk {},
+                            ),
+                            R::Invalid => Object::checkStickerSetNameResultNameInvalid(
+                                td_api::checkStickerSetNameResultNameInvalid {},
+                            ),
+                            R::Occupied => Object::checkStickerSetNameResultNameOccupied(
+                                td_api::checkStickerSetNameResultNameOccupied {},
+                            ),
+                        }
+                    },
+                );
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.check_sticker_set_name(&mut env, name, promise);
+        }
+        Function::createNewStickerSet(request) => {
+            // Requests.cpp:7572-7581 — the validation prefix is local;
+            // the pending-set upload parks ([blocked: Files]).
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let Some(source) = clean_or_utf8_error(td, id, &request.source) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::StickerSet, _>(id, Object::stickerSet);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.create_new_sticker_set(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                title,
+                name,
+                crate::stickers_manager::get_sticker_type(request.sticker_type.as_ref()),
+                request.needs_repainting,
+                request.stickers,
+                source,
+                promise,
+            );
+        }
+        Function::addStickerToSet(request) => {
+            // Requests.cpp:7583-7589 — the name/user bands; the set
+            // reload parks ([blocked: net]).
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.add_sticker_to_set(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                name,
+                request.sticker,
+                None,
+                promise,
+            );
+        }
+        Function::replaceStickerInSet(request) => {
+            // Requests.cpp:7590-7599 — the old-sticker null band is
+            // local; the rest rides the add_to_set reload.
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            if request.old_sticker.is_none() {
+                return td.send_error_impl(id, 400, "Old sticker must be non-empty");
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.add_sticker_to_set(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                name,
+                request.new_sticker,
+                request.old_sticker,
+                promise,
+            );
+        }
+        Function::setStickerSetThumbnail(request) => {
+            // Requests.cpp:7601-7607 — the name/user bands; the set
+            // reload parks ([blocked: net]).
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_sticker_set_thumbnail(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                name,
+                request.thumbnail,
+                crate::stickers_manager::get_sticker_format(request.format.as_ref()),
+                promise,
+            );
+        }
+        Function::setCustomEmojiStickerSetThumbnail(request) => {
+            // Requests.cpp:7609-7614 — the name band; the set reload
+            // parks ([blocked: net]).
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_custom_emoji_sticker_set_thumbnail(
+                &mut env,
+                name,
+                crate::stickers_manager::CustomEmojiId::new(request.custom_emoji_id),
+                promise,
+            );
+        }
+        Function::setStickerSetTitle(request) => {
+            // Requests.cpp:7616-7622 — the name/title bands; the query
+            // parks ([blocked: net]).
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_sticker_set_title(&mut env, name, title, promise);
+        }
+        Function::deleteStickerSet(request) => {
+            // Requests.cpp:7624-7628 — the name band; the query parks
+            // ([blocked: net]).
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.delete_sticker_set(&mut env, name, promise);
+        }
+        Function::setStickerPositionInSet(request) => {
+            // Requests.cpp:7630-7633 — the position band; the query
+            // parks ([blocked: net]).
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_sticker_position_in_set(
+                &mut env,
+                request.sticker.as_ref(),
+                request.position,
+                promise,
+            );
+        }
+        Function::setStickerEmojis(request) => {
+            // Requests.cpp:7640-7644 — the file probe; the query parks
+            // ([blocked: net]).
+            let Some(emojis) = clean_or_utf8_error(td, id, &request.emojis) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_sticker_emojis(
+                &mut env,
+                request.sticker.as_ref(),
+                emojis,
+                promise,
+            );
+        }
+        Function::setStickerKeywords(request) => {
+            // Requests.cpp:7646-7652 — the file probe; the query parks
+            // ([blocked: net]).
+            let mut keywords = Vec::with_capacity(request.keywords.len());
+            for keyword in &request.keywords {
+                let Some(keyword) = clean_or_utf8_error(td, id, keyword) else {
+                    return;
+                };
+                keywords.push(keyword);
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_sticker_keywords(
+                &mut env,
+                request.sticker.as_ref(),
+                keywords,
+                promise,
+            );
+        }
+        Function::setStickerMaskPosition(request) => {
+            // Requests.cpp:7654-7658 — the file probe; the query parks
+            // ([blocked: net]).
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.set_sticker_mask_position(
+                &mut env,
+                request.sticker.as_ref(),
+                request.mask_position,
+                promise,
+            );
+        }
+        Function::removeStickerFromSet(request) => {
+            // Requests.cpp:7635-7638 — the file probe; the query parks
+            // ([blocked: net]).
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.remove_sticker_from_set(&mut env, request.sticker.as_ref(), promise);
+        }
+        Function::reorderInstalledStickerSets(request) => {
+            // Requests.cpp:7538-7544 — the local order table answers
+            // (the not-loaded band is the 400).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.reorder_installed_sticker_sets(
+                &mut env,
+                crate::stickers_manager::get_sticker_type(request.sticker_type.as_ref()),
+                crate::stickers_manager::StickerSetId::get_sticker_set_ids(
+                    &request.sticker_set_ids,
+                ),
+                promise,
+            );
+        }
+        Function::uploadStickerFile(request) => {
+            // Requests.cpp:7546-7550 — the prepare bands are local; the
+            // upload parks ([blocked: Files]).
+            let promise = td.deferred_promise::<td_api::File, _>(id, Object::file);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.upload_sticker_file(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                crate::stickers_manager::get_sticker_format(request.sticker_format.as_ref()),
+                request.sticker.as_ref(),
+                promise,
+            );
+        }
+        Function::viewTrendingStickerSets(request) => {
+            // Requests.cpp:7532-7536 — the local view marks are no-ops
+            // over the empty cache; the delayed server read parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.view_featured_sticker_sets(
+                &mut env,
+                &crate::stickers_manager::StickerSetId::get_sticker_set_ids(
+                    &request.sticker_set_ids,
+                ),
+            );
+            td.send_result(id, ok_object());
+        }
+        Function::getStickerOutline(request) => {
+            // Requests.cpp:7415-7420 — the C++ answers JSON null over an
+            // unknown sticker (the recorded null-response divergence):
+            // the promise parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Outline, _>(id, Object::outline);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_sticker_outline_object(
+                &mut env,
+                crate::files::FileId::new(request.sticker_file_id, 0),
+                request.for_animated_emoji,
+                request.for_clicked_animated_emoji_message,
+                promise,
+            );
+        }
+        Function::getStickerOutlineSvgPath(request) => {
+            // Requests.cpp:7422-7427 — the unknown-sticker band answers
+            // the empty path locally.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_sticker_outline_svg_path(
+                &mut env,
+                crate::files::FileId::new(request.sticker_file_id, 0),
+                request.for_animated_emoji,
+                request.for_clicked_animated_emoji_message,
+                promise,
+            );
+        }
+        Function::getEmojiSuggestionsUrl(request) => {
+            // Requests.cpp:7738-7742 — the URL query parks
+            // ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_code) = clean_or_utf8_error(td, id, &request.language_code) else {
+                return;
+            };
+            let promise = td.deferred_promise::<String, _>(id, |url: String| {
+                Object::httpUrl(td_api::HttpUrl { url })
+            });
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_emoji_suggestions_url(&mut env, language_code, promise);
         }
         Function::searchMessages(request) => {
             // Requests.cpp:3702-3714 — the global search; the empty
@@ -12970,12 +13545,31 @@ mod request_census_tests {
         // SavedMessagesManager arms (the 11 directMessagesChatTopic arms,
         // the 7 savedMessagesTopic arms and getMessageAuthor). The M.filter
         // slice flipped 17 DialogFilterManager arms and getChatFolderDefaultIconName (sync).
+        // The M.st slice flipped the thirty-eight StickersManager arms
+        // (searchStickers, getGreetingStickers, getPremiumStickerExamples,
+        // getAnimatedEmoji, getCustomEmojiStickers, the three
+        // default-custom-emoji arms, getDisallowedChatEmojiStatuses,
+        // getEmojiCategories, getCustomEmojiReactionAnimations,
+        // getForumTopicDefaultIcons, getThemedEmojiStatuses,
+        // getThemedChatEmojiStatuses, getPremiumStickers,
+        // getPremiumInfoSticker, getOwnedStickerSets, getStickerSetName,
+        // getSuggestedStickerSetName, checkStickerSetName,
+        // createNewStickerSet, addStickerToSet, replaceStickerInSet,
+        // setStickerSetThumbnail, setCustomEmojiStickerSetThumbnail,
+        // setStickerSetTitle, deleteStickerSet, setStickerPositionInSet,
+        // setStickerEmojis, setStickerKeywords, setStickerMaskPosition,
+        // removeStickerFromSet, reorderInstalledStickerSets,
+        // uploadStickerFile, viewTrendingStickerSets, getStickerOutline,
+        // getStickerOutlineSvgPath, getEmojiSuggestionsUrl) over the
+        // collapsed stickers_manager plane (the validation/cache bands
+        // exact; every set load and query tail parks at the
+        // [blocked: net]/[blocked: Files] seams).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            641,
+            679,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 360, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 322, "interim count");
     }
 }

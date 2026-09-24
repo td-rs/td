@@ -2146,6 +2146,9 @@ pub struct Td {
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
+    /// `Td::stickers_manager_` (`Td.cpp:1220`) — the collapsed
+    /// StickersManager (the M.st request plane).
+    pub(crate) stickers_manager: crate::stickers_manager::StickersManager,
     /// `Td::message_query_manager_` (`Td.cpp:1245`, M.18) — the collapsed
     /// MessageQueryManager; created with Td like the C++ `init_managers`.
     pub(crate) message_query_manager: crate::message_query_manager::MessageQueryManager,
@@ -2306,11 +2309,9 @@ pub struct Td {
     pub(crate) dialog_participant_manager:
         crate::dialog_participant_manager::DialogParticipantManager,
     /// `Td::saved_messages_manager_` (Td.cpp).
-    pub(crate) saved_messages_manager:
-        crate::saved_messages_manager::SavedMessagesManager,
+    pub(crate) saved_messages_manager: crate::saved_messages_manager::SavedMessagesManager,
     /// `Td::dialog_filter_manager_` (Td.cpp).
-    pub(crate) dialog_filter_manager:
-        crate::dialog_filter_manager::DialogFilterManager,
+    pub(crate) dialog_filter_manager: crate::dialog_filter_manager::DialogFilterManager,
     /// `Td::channel_recommendation_manager_` (Td.cpp:1278, M.27).
     pub(crate) channel_recommendation_manager:
         crate::channel_recommendation_manager::ChannelRecommendationManager,
@@ -2606,6 +2607,7 @@ impl Td {
             web_app_manager: crate::web_app_manager::WebAppManager::new(),
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
+            stickers_manager: crate::stickers_manager::StickersManager::new(),
             message_query_manager: crate::message_query_manager::MessageQueryManager::new(),
             inline_message_manager: crate::inline_message_manager::InlineMessageManager::new(),
             inline_queries_manager: crate::inline_queries_manager::InlineQueriesManager::new(),
@@ -2671,10 +2673,8 @@ impl Td {
             top_dialog_manager: crate::top_dialog_manager::TopDialogManager::new(),
             dialog_participant_manager:
                 crate::dialog_participant_manager::DialogParticipantManager::new(),
-            saved_messages_manager:
-                crate::saved_messages_manager::SavedMessagesManager::new(),
-            dialog_filter_manager:
-                crate::dialog_filter_manager::DialogFilterManager::new(),
+            saved_messages_manager: crate::saved_messages_manager::SavedMessagesManager::new(),
+            dialog_filter_manager: crate::dialog_filter_manager::DialogFilterManager::new(),
             channel_recommendation_manager:
                 crate::channel_recommendation_manager::ChannelRecommendationManager::new(),
             web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
@@ -14595,6 +14595,153 @@ pub(crate) fn dialog_participant_env_split(
     )
 }
 
+/// The `G()`/manager slice of the collapsed StickersManager (the M.st
+/// request plane). The file reads go through the shared FileManager
+/// registry behind the mutex (the `MessageQueryEnv` convention).
+pub(crate) struct TdStickersEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+}
+
+impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_boolean(name, default_value)
+        })
+    }
+
+    fn get_my_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let user_env = UserEnv {
+            global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        match self.user_manager.get_input_user(&user_env, user_id) {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(error) => tdutils::status::Result::Err(error),
+        }
+    }
+
+    fn file_get_input_file_id(
+        &mut self,
+        file_type: crate::files::FileType,
+        input_file: Option<&td_api::InputFile>,
+        expect_thumbnail: bool,
+    ) -> tdutils::status::Result<crate::files::FileId> {
+        let mut file_manager = self.file_manager.lock();
+        // the C++ passes (file_type, input_file, DialogId(),
+        // expect_empty=expect_thumbnail, is_encrypted=false) with the
+        // hash/secure/reuse defaults off
+        match file_manager.get_input_file_id(
+            file_type,
+            input_file,
+            crate::dialog_id::DialogId::default(),
+            expect_thumbnail,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(file_id) => tdutils::status::Result::Ok(file_id),
+            Err(error) => tdutils::status::Result::Err(error),
+        }
+    }
+
+    fn file_get_view(
+        &mut self,
+        file_id: crate::files::FileId,
+    ) -> crate::stickers_manager::StickerFileView {
+        use crate::stickers_manager::StickerFileView;
+        let file_manager = self.file_manager.lock();
+        let Some(file_view) = file_manager.get_file_view(file_id) else {
+            return StickerFileView::default();
+        };
+        let main_remote_document_id = file_view
+            .get_main_remote_location()
+            .filter(|location| location.is_document() && !location.is_web())
+            .map(|location| location.get_id());
+        StickerFileView {
+            is_encrypted: file_view.is_encrypted(),
+            main_remote_document_id,
+            has_url: file_view.has_url(),
+            has_full_local_location: file_view.has_full_local_location(),
+            expected_size: file_view.expected_size(false),
+            full_remote_document_id: file_view
+                .get_full_remote_location()
+                .filter(|location| location.is_document())
+                .map(|location| location.get_id()),
+        }
+    }
+
+    fn file_get_file_object(&mut self, file_id: crate::files::FileId) -> Option<td_api::File> {
+        let file_manager = self.file_manager.lock();
+        Some(file_manager.get_file_object(file_id))
+    }
+}
+
+/// The field-split over [`Td`] for the StickersManager request arms (the
+/// M.st slice): the [`TdStickersEnv`] plus the manager itself.
+pub(crate) fn stickers_env_split(
+    td: &mut Td,
+) -> (
+    TdStickersEnv<'_>,
+    &mut crate::stickers_manager::StickersManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        file_manager,
+        stickers_manager,
+        ..
+    } = td;
+    (
+        TdStickersEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+        },
+        stickers_manager,
+    )
+}
+
 /// The field-split over [`Td`] for the MessageQueryManager request arms
 /// (the M.mp slice): the [`MessageQueryEnv`] plus the manager itself.
 pub(crate) fn message_query_env_split(
@@ -15174,16 +15321,15 @@ impl crate::saved_messages_manager::SavedMessagesManagerEnv for TdSavedMessagesE
         match dialog_id.get_type() {
             crate::dialog_id::DialogType::Channel => {
                 let channel_id = dialog_id.get_channel_id();
-                self.chat_manager.get_channel_status(channel_id).is_administrator()
+                self.chat_manager
+                    .get_channel_status(channel_id)
+                    .is_administrator()
             }
             _ => false,
         }
     }
     fn is_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
-        match dialog_id.get_type() {
-            crate::dialog_id::DialogType::Channel => true,
-            _ => false,
-        }
+        matches!(dialog_id.get_type(), crate::dialog_id::DialogType::Channel)
     }
     fn have_input_peer(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
         dialog_id.is_valid()
@@ -15191,21 +15337,27 @@ impl crate::saved_messages_manager::SavedMessagesManagerEnv for TdSavedMessagesE
     fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> i64 {
         dialog_id.get()
     }
-    fn get_message_sender_object(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> td_api::MessageSender {
+    fn get_message_sender_object(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> td_api::MessageSender {
         match dialog_id.get_type() {
             crate::dialog_id::DialogType::User => {
                 td_api::MessageSender::messageSenderUser(td_api::messageSenderUser {
                     user_id: dialog_id.get_user_id().get(),
                 })
             }
-            _ => {
-                td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
-                    chat_id: dialog_id.get(),
-                })
-            }
+            _ => td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
+                chat_id: dialog_id.get(),
+            }),
         }
     }
-    fn have_message_force(&mut self, _full_id: crate::message_id::MessageFullId, _source: &str) -> bool {
+    fn have_message_force(
+        &mut self,
+        _full_id: crate::message_id::MessageFullId,
+        _source: &str,
+    ) -> bool {
         true
     }
     fn get_pinned_saved_messages_topic_limit(&self) -> i32 {
@@ -15216,14 +15368,58 @@ impl crate::saved_messages_manager::SavedMessagesManagerEnv for TdSavedMessagesE
     }
     fn send_get_saved_dialogs(&mut self, _dialog_id: crate::dialog_id::DialogId, _limit: i32) {}
     fn send_get_pinned_saved_dialogs(&mut self, _limit: i32) {}
-    fn send_toggle_saved_dialog_pin(&mut self, _topic_id: crate::messages_manager::SavedMessagesTopicId, _is_pinned: bool) {}
-    fn send_reorder_pinned_saved_dialogs(&mut self, _topic_ids: Vec<crate::messages_manager::SavedMessagesTopicId>) {}
-    fn send_delete_saved_history(&mut self, _dialog_id: crate::dialog_id::DialogId, _topic_id: crate::messages_manager::SavedMessagesTopicId) {}
-    fn send_delete_saved_messages_by_date(&mut self, _dialog_id: crate::dialog_id::DialogId, _topic_id: crate::messages_manager::SavedMessagesTopicId, _min_date: i32, _max_date: i32) {}
-    fn send_get_saved_message_by_date(&mut self, _dialog_id: crate::dialog_id::DialogId, _topic_id: crate::messages_manager::SavedMessagesTopicId, _date: i32) {}
-    fn send_get_monoforum_paid_message_revenue(&mut self, _dialog_id: crate::dialog_id::DialogId, _user_id: UserId) {}
-    fn send_toggle_monoforum_nopaid_messages_exception(&mut self, _dialog_id: crate::dialog_id::DialogId, _user_id: UserId, _can_send_unpaid: bool, _refund_payments: bool) {}
-    fn send_get_message_author(&mut self, _channel_id: crate::chat_manager::ChannelId, _message_id: crate::message_id::MessageId) {}
+    fn send_toggle_saved_dialog_pin(
+        &mut self,
+        _topic_id: crate::messages_manager::SavedMessagesTopicId,
+        _is_pinned: bool,
+    ) {
+    }
+    fn send_reorder_pinned_saved_dialogs(
+        &mut self,
+        _topic_ids: Vec<crate::messages_manager::SavedMessagesTopicId>,
+    ) {
+    }
+    fn send_delete_saved_history(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _topic_id: crate::messages_manager::SavedMessagesTopicId,
+    ) {
+    }
+    fn send_delete_saved_messages_by_date(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _topic_id: crate::messages_manager::SavedMessagesTopicId,
+        _min_date: i32,
+        _max_date: i32,
+    ) {
+    }
+    fn send_get_saved_message_by_date(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _topic_id: crate::messages_manager::SavedMessagesTopicId,
+        _date: i32,
+    ) {
+    }
+    fn send_get_monoforum_paid_message_revenue(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _user_id: UserId,
+    ) {
+    }
+    fn send_toggle_monoforum_nopaid_messages_exception(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _user_id: UserId,
+        _can_send_unpaid: bool,
+        _refund_payments: bool,
+    ) {
+    }
+    fn send_get_message_author(
+        &mut self,
+        _channel_id: crate::chat_manager::ChannelId,
+        _message_id: crate::message_id::MessageId,
+    ) {
+    }
 }
 
 pub(crate) fn dialog_filter_env_split(
@@ -15281,7 +15477,7 @@ impl crate::dialog_filter_manager::DialogFilterManagerEnv for TdDialogFilterEnv<
     fn is_premium(&self) -> bool {
         self.options
             .as_ref()
-            .map_or(false, |o| o.get_option_boolean("is_premium", false))
+            .is_some_and(|o| o.get_option_boolean("is_premium", false))
     }
     fn get_option_integer(&self, name: &str, default: i64) -> i64 {
         self.options

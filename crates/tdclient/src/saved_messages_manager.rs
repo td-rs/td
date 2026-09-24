@@ -405,6 +405,7 @@ impl SavedMessagesManager {
     }
 
     /// `getDirectMessagesChatTopicHistory` (Requests.cpp:3280-3287)
+    #[allow(clippy::too_many_arguments)]
     pub fn get_monoforum_topic_history(
         &mut self,
         env: &mut dyn SavedMessagesManagerEnv,
@@ -451,6 +452,7 @@ impl SavedMessagesManager {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_topic_history_impl(
         &mut self,
         env: &mut dyn SavedMessagesManagerEnv,
@@ -725,11 +727,11 @@ impl SavedMessagesManager {
         }
         let old_pinned_ids = self.topic_list.pinned_topic_ids.clone();
         for old_pinned in old_pinned_ids {
-            if !topic_ids.contains(&old_pinned) {
-                if let Some(topic) = self.topic_list.get_topic_mut(old_pinned) {
-                    topic.pinned_order = 0;
-                    topic.is_changed = true;
-                }
+            if !topic_ids.contains(&old_pinned)
+                && let Some(topic) = self.topic_list.get_topic_mut(old_pinned)
+            {
+                topic.pinned_order = 0;
+                topic.is_changed = true;
             }
         }
         self.topic_list.pinned_topic_ids.clear();

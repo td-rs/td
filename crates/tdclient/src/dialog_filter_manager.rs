@@ -122,10 +122,11 @@ impl DialogFilter {
 
     /// `DialogFilter::get_default_icon_name` (DialogFilter.cpp:402-438).
     pub fn get_default_icon_name(filter: &td_api::ChatFolder) -> String {
-        if let Some(ref icon) = filter.icon {
-            if !icon.name.is_empty() && !Self::get_emoji_by_icon_name(&icon.name).is_empty() {
-                return icon.name.clone();
-            }
+        if let Some(ref icon) = filter.icon
+            && !icon.name.is_empty()
+            && !Self::get_emoji_by_icon_name(&icon.name).is_empty()
+        {
+            return icon.name.clone();
         }
 
         if !filter.pinned_chat_ids.is_empty()
