@@ -12,19 +12,54 @@
 //!   rebuild;
 //! - the `start_up` pmc replay (cpp:1099-1106);
 //! - `get_default_dc_options` (cpp:1220-1280), the non-emscripten table.
+//! - the proxy registry (`net/Proxy.{h,cpp}` + cpp:117-478): `add_proxy`,
+//!   `enable_proxy`/`disable_proxy`/`remove_proxy`/`get_proxies`, the
+//!   `init_proxies` pmc restore and the `ping_proxy` validation bands —
+//!   the glue slice (the resolve/connect tails are the `[blocked: net]`
+//!   seams, the M.31 park convention).
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use tddb::binlog_key_value::BinlogKeyValue;
+use tdmtproto::proxy_secret::ProxySecret;
 use tdutils::hash::hash_int64;
+use tdutils::promise::Promise;
+use tdutils::utf8::check_utf8;
 
 use crate::config_manager::{DC_OPTION_IPV6, StoredDcOption, StoredDcOptions};
+use crate::store_parse::{Parser, store_i32, store_string};
+use crate::td_api;
 
 /// The merged option list — the `dc_options_set_` stand-in (see the
 /// module docs).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ConnectionCreator {
     dc_options: Vec<StoredDcOption>,
+    /// `proxies_` (cpp:76) — the registry, ordered by id like the C++
+    /// `std::map`; the string is each proxy's comment.
+    proxies: BTreeMap<i32, (Proxy, String)>,
+    /// `active_proxy_id_` — `0` is the no-proxy default.
+    active_proxy_id: i32,
+    /// `max_proxy_id_` — the C++ in-class `= 2` default (`start_up`
+    /// re-pins it).
+    max_proxy_id: i32,
+    /// `proxy_last_used_date_` / `proxy_last_used_saved_date_`.
+    proxy_last_used_date: BTreeMap<i32, i32>,
+    proxy_last_used_saved_date: BTreeMap<i32, i32>,
+}
+
+impl Default for ConnectionCreator {
+    fn default() -> Self {
+        Self {
+            dc_options: Vec::new(),
+            proxies: BTreeMap::new(),
+            active_proxy_id: 0,
+            max_proxy_id: 2,
+            proxy_last_used_date: BTreeMap::new(),
+            proxy_last_used_saved_date: BTreeMap::new(),
+        }
+    }
 }
 
 impl ConnectionCreator {
@@ -85,6 +120,744 @@ impl ConnectionCreator {
     #[allow(dead_code)] // the net step's DcOptionsSet reads land; tests pin it now
     pub(crate) fn dc_options(&self) -> &[StoredDcOption] {
         &self.dc_options
+    }
+
+    /// The `start_up` proxy half (cpp:1111-1119 + `init_proxies`
+    /// cpp:1131-1190): the gate skips the restore only when the store
+    /// proves proxies were never added. The Rust keeps it out of
+    /// [`Self::new`] because the restore writes the `enabled_proxy_id`
+    /// option through the env, and the env needs the `Td` — the caller
+    /// runs it right after construction, in the C++ `start_up` order.
+    pub(crate) fn restore_proxies(&mut self, env: &mut impl ConnectionCreatorEnv) {
+        if env.binlog_pmc_get(b"proxy_max_id") != "2"
+            || !env
+                .binlog_pmc_get(get_proxy_database_key(1).as_bytes())
+                .is_empty()
+        {
+            // don't need to init proxies if they have never been added
+            self.init_proxies(env);
+        } else {
+            self.max_proxy_id = 2;
+        }
+    }
+
+    /// `ConnectionCreator::init_proxies` (cpp:1131-1190) — the
+    /// `prefix_get("proxy")` restore. The Rust pmc returns full keys, so
+    /// the `"proxy"` prefix is stripped here instead of by the C++
+    /// `prefix_get` semantics.
+    fn init_proxies(&mut self, env: &mut impl ConnectionCreatorEnv) {
+        let mut comments: BTreeMap<i32, String> = BTreeMap::new();
+        let mut erased_keys: Vec<String> = Vec::new();
+        for (key, value) in env.binlog_pmc_prefix_get("proxy") {
+            let suffix = key.strip_prefix("proxy").unwrap_or(&key).to_owned();
+            match suffix.as_str() {
+                "_max_id" => {
+                    self.max_proxy_id = suffix_parse(&suffix, &value);
+                }
+                "_active_id" => {
+                    let proxy_id = suffix_parse(&suffix, &value);
+                    self.set_active_proxy_id(env, proxy_id, true);
+                }
+                _ if suffix.starts_with("_used") => {
+                    let proxy_id: i32 = suffix[5..].parse().unwrap_or(0);
+                    let last_used: i32 = String::from_utf8_lossy(&value).parse().unwrap_or(0);
+                    if proxy_id > 0 {
+                        self.proxy_last_used_date.insert(proxy_id, last_used);
+                        self.proxy_last_used_saved_date.insert(proxy_id, last_used);
+                    }
+                }
+                _ if suffix.starts_with("_comment") => {
+                    let proxy_id: i32 = suffix[8..].parse().unwrap_or(0);
+                    if proxy_id > 0 {
+                        comments.insert(proxy_id, String::from_utf8_lossy(&value).into_owned());
+                    }
+                }
+                _ => {
+                    let proxy_id: i32 = if suffix.is_empty() {
+                        1
+                    } else {
+                        suffix.parse().unwrap_or(0)
+                    };
+                    if proxy_id <= 0 || self.proxies.contains_key(&proxy_id) {
+                        continue;
+                    }
+                    let mut proxy = Proxy::default();
+                    if let Err(error) = proxy.parse(&value) {
+                        tdutils::log_error!("Can't parse proxy {proxy_id}: {error}");
+                        continue;
+                    }
+                    if proxy.type_ == ProxyType::None {
+                        // `LOG_IF(ERROR, proxy_id != 1)` + the erase walk
+                        // (cpp:1179-1189): an empty stored record is dropped.
+                        if proxy_id != 1 {
+                            tdutils::log_error!("Have empty proxy {proxy_id}");
+                        }
+                        erased_keys.push(get_proxy_database_key(proxy_id));
+                        erased_keys.push(get_proxy_comment_database_key(proxy_id));
+                        erased_keys.push(get_proxy_used_database_key(proxy_id));
+                        self.proxies.remove(&proxy_id);
+                        if self.active_proxy_id == proxy_id {
+                            self.set_active_proxy_id(env, 0, false);
+                        }
+                    } else {
+                        self.proxies.insert(proxy_id, (proxy, String::new()));
+                    }
+                }
+            }
+        }
+        for key in erased_keys {
+            env.binlog_pmc_erase(&key);
+        }
+        for (proxy_id, comment) in comments {
+            // The C++ `proxies_[proxy_id].second` operator[] default-inserts
+            // a missing entry — mirrored with the same fallback.
+            let entry = self.proxies.entry(proxy_id).or_default();
+            set_proxy_comment(env, proxy_id, &mut entry.1, comment);
+        }
+    }
+
+    /// `ConnectionCreator::add_proxy` (cpp:158-212) — the edit-dedup
+    /// ladder and the id allocation. `old_proxy_id < 0` adds; the
+    /// TD_EMSCRIPTEN/WATCH_OS unsupported-platform band is compiled out
+    /// on this line like in the C++.
+    pub(crate) fn add_proxy(
+        &mut self,
+        env: &mut impl ConnectionCreatorEnv,
+        old_proxy_id: i32,
+        proxy: Option<&td_api::Proxy>,
+        enable: bool,
+        comment: String,
+    ) -> Result<td_api::AddedProxy, String> {
+        let new_proxy = Proxy::create_proxy(proxy)?;
+        let mut enable = enable;
+        if old_proxy_id >= 0 {
+            let Some((old_proxy, old_comment)) = self.proxies.get_mut(&old_proxy_id) else {
+                return Err("Proxy not found".to_string());
+            };
+            if *old_proxy == new_proxy {
+                set_proxy_comment(env, old_proxy_id, old_comment, comment);
+                if enable {
+                    self.enable_proxy_impl(env, old_proxy_id);
+                }
+                return Ok(self.get_added_proxy_object(old_proxy_id));
+            }
+            if old_proxy_id == self.active_proxy_id {
+                enable = true;
+                self.disable_proxy_impl(env);
+            }
+
+            self.proxies.remove(&old_proxy_id);
+            env.binlog_pmc_erase(&get_proxy_comment_database_key(old_proxy_id));
+            env.binlog_pmc_erase(&get_proxy_used_database_key(old_proxy_id));
+            self.proxy_last_used_date.remove(&old_proxy_id);
+            self.proxy_last_used_saved_date.remove(&old_proxy_id);
+        }
+
+        let proxy_id = {
+            let mut found = None;
+            for (id, (proxy, _)) in &self.proxies {
+                if *proxy == new_proxy {
+                    found = Some(*id);
+                    break;
+                }
+            }
+            match found {
+                Some(proxy_id) => proxy_id,
+                None => {
+                    let mut proxy_id = old_proxy_id;
+                    if proxy_id < 0 {
+                        debug_assert!(self.max_proxy_id >= 2);
+                        proxy_id = self.max_proxy_id;
+                        self.max_proxy_id += 1;
+                        env.binlog_pmc_set_raw(
+                            b"proxy_max_id",
+                            self.max_proxy_id.to_string().as_bytes(),
+                        );
+                    }
+                    env.binlog_pmc_set_raw(
+                        get_proxy_database_key(proxy_id).as_bytes(),
+                        &new_proxy.store(),
+                    );
+                    let is_inserted = self
+                        .proxies
+                        .insert(proxy_id, (new_proxy, String::new()))
+                        .is_none();
+                    debug_assert!(is_inserted);
+                    proxy_id
+                }
+            }
+        };
+        let comment_stored = self.proxies.get_mut(&proxy_id).expect("proxy inserted");
+        set_proxy_comment(env, proxy_id, &mut comment_stored.1, comment);
+        if enable {
+            self.enable_proxy_impl(env, proxy_id);
+        }
+        Ok(self.get_added_proxy_object(proxy_id))
+    }
+
+    /// `ConnectionCreator::enable_proxy` (cpp:214-221).
+    pub(crate) fn enable_proxy(
+        &mut self,
+        env: &mut impl ConnectionCreatorEnv,
+        proxy_id: i32,
+    ) -> Result<(), String> {
+        if !self.proxies.contains_key(&proxy_id) {
+            return Err("Unknown proxy identifier".to_string());
+        }
+
+        self.enable_proxy_impl(env, proxy_id);
+        Ok(())
+    }
+
+    /// `ConnectionCreator::disable_proxy` (cpp:223-227).
+    pub(crate) fn disable_proxy(&mut self, env: &mut impl ConnectionCreatorEnv) {
+        self.save_proxy_last_used_date(env, 0);
+        self.disable_proxy_impl(env);
+    }
+
+    /// `ConnectionCreator::remove_proxy` (cpp:229-244).
+    pub(crate) fn remove_proxy(
+        &mut self,
+        env: &mut impl ConnectionCreatorEnv,
+        proxy_id: i32,
+    ) -> Result<(), String> {
+        if !self.proxies.contains_key(&proxy_id) {
+            return Err("Unknown proxy identifier".to_string());
+        }
+
+        if proxy_id == self.active_proxy_id {
+            self.disable_proxy_impl(env);
+        }
+
+        self.proxies.remove(&proxy_id);
+
+        env.binlog_pmc_erase(&get_proxy_database_key(proxy_id));
+        env.binlog_pmc_erase(&get_proxy_comment_database_key(proxy_id));
+        env.binlog_pmc_erase(&get_proxy_used_database_key(proxy_id));
+        Ok(())
+    }
+
+    /// `ConnectionCreator::get_proxies` (cpp:246-254) — the registry
+    /// order (the C++ `std::map` iterates by ascending id).
+    pub(crate) fn get_proxies(&self) -> td_api::AddedProxies {
+        td_api::AddedProxies {
+            proxies: self
+                .proxies
+                .keys()
+                .copied()
+                .map(|proxy_id| self.get_added_proxy_object(proxy_id))
+                .collect(),
+        }
+    }
+
+    /// `ConnectionCreator::ping_proxy` (cpp:278-334) — the given-proxy
+    /// path only: the C++ null-input path pings the main DC through the
+    /// `DcOptionsSet` connection list, and the flattened td_api model
+    /// makes `request.proxy` non-nullable, so that band is inexpressible
+    /// here. The validation bands are exact; the resolve/connect tail is
+    /// the `[blocked: net]` seam — the promise rides the seam and resolves
+    /// with the C++ LambdaPromise drop ("Lost promise") until the net
+    /// step's ping machinery answers it.
+    pub(crate) fn ping_proxy(
+        &mut self,
+        env: &mut impl ConnectionCreatorEnv,
+        input_proxy: Option<&td_api::Proxy>,
+        promise: Promise<f64>,
+    ) -> Result<(), String> {
+        let proxy = Proxy::create_proxy(input_proxy)?;
+        let _prefer_ipv6 = env.get_option_boolean("prefer_ipv6", false);
+        env.ping_via_net(&proxy, promise);
+        Ok(())
+    }
+
+    /// `ConnectionCreator::enable_proxy_impl` (cpp:403-418).
+    fn enable_proxy_impl(&mut self, env: &mut impl ConnectionCreatorEnv, proxy_id: i32) {
+        debug_assert!(self.proxies.contains_key(&proxy_id));
+        if proxy_id == self.active_proxy_id {
+            return;
+        }
+
+        let active_is_mtproto = self
+            .proxies
+            .get(&self.active_proxy_id)
+            .is_some_and(|(proxy, _)| proxy.type_ == ProxyType::Mtproto);
+        let new_is_mtproto = self.proxies[&proxy_id].0.type_ == ProxyType::Mtproto;
+        if (self.active_proxy_id != 0 && active_is_mtproto) || new_is_mtproto {
+            env.update_mtproto_header(Some(&self.proxies[&proxy_id].0));
+        }
+        self.save_proxy_last_used_date(env, 0);
+
+        self.set_active_proxy_id(env, proxy_id, false);
+
+        self.on_proxy_changed(env, false);
+    }
+
+    /// `ConnectionCreator::disable_proxy_impl` (cpp:420-435).
+    fn disable_proxy_impl(&mut self, env: &mut impl ConnectionCreatorEnv) {
+        if self.active_proxy_id == 0 {
+            env.remove_sponsored_dialog();
+            env.reload_promo_data();
+            return;
+        }
+        debug_assert!(self.proxies.contains_key(&self.active_proxy_id));
+
+        if self.proxies[&self.active_proxy_id].0.type_ == ProxyType::Mtproto {
+            env.update_mtproto_header(None);
+        }
+
+        self.set_active_proxy_id(env, 0, false);
+
+        self.on_proxy_changed(env, false);
+    }
+
+    /// `ConnectionCreator::on_proxy_changed` (cpp:437-458) — the state
+    /// flag and the resolve/children resets are the net step's consumers
+    /// (the `[blocked: net]` seams); the promo fan-outs and the flag
+    /// itself are real.
+    fn on_proxy_changed(&mut self, env: &mut impl ConnectionCreatorEnv, from_db: bool) {
+        let use_proxy = self.active_proxy_id != 0
+            && self
+                .proxies
+                .get(&self.active_proxy_id)
+                .is_some_and(|(proxy, _)| {
+                    proxy.type_ != ProxyType::Mtproto && proxy.type_ != ProxyType::HttpCaching
+                });
+        env.on_proxy_state(use_proxy);
+
+        if !from_db {
+            // the children `send_closure` resets — the net step's
+            // per-client session drop
+        }
+
+        // `VLOG(connections) << "Drop proxy IP address"` + the resolve
+        // state reset — the resolve loop is the net step.
+        if self.active_proxy_id == 0 || !from_db {
+            env.remove_sponsored_dialog();
+        }
+        env.reload_promo_data();
+
+        // `loop()` — the net step's link loop.
+    }
+
+    /// `ConnectionCreator::set_active_proxy_id` (cpp:386-401) — the
+    /// option write happens on every path; the pmc write and the config
+    /// refetch only off the binlog.
+    fn set_active_proxy_id(
+        &mut self,
+        env: &mut impl ConnectionCreatorEnv,
+        proxy_id: i32,
+        from_binlog: bool,
+    ) {
+        self.active_proxy_id = proxy_id;
+        if proxy_id == 0 {
+            env.set_option_empty("enabled_proxy_id");
+        } else {
+            env.set_option_integer("enabled_proxy_id", i64::from(proxy_id));
+        }
+        if !from_binlog {
+            if proxy_id == 0 {
+                env.binlog_pmc_erase("proxy_active_id");
+                env.request_config(false);
+            } else {
+                env.binlog_pmc_set_raw(b"proxy_active_id", proxy_id.to_string().as_bytes());
+            }
+        }
+    }
+
+    /// `ConnectionCreator::save_proxy_last_used_date` (cpp:481-496).
+    fn save_proxy_last_used_date(&mut self, env: &mut impl ConnectionCreatorEnv, delay: i32) {
+        if self.active_proxy_id == 0 {
+            return;
+        }
+
+        debug_assert!(delay >= 0);
+        let date = self
+            .proxy_last_used_date
+            .entry(self.active_proxy_id)
+            .or_default();
+        if *date
+            <= *self
+                .proxy_last_used_saved_date
+                .entry(self.active_proxy_id)
+                .or_default()
+                + delay
+        {
+            return;
+        }
+
+        let saved = *date;
+        *self
+            .proxy_last_used_saved_date
+            .get_mut(&self.active_proxy_id)
+            .unwrap() = saved;
+        env.binlog_pmc_set_raw(
+            get_proxy_used_database_key(self.active_proxy_id).as_bytes(),
+            saved.to_string().as_bytes(),
+        );
+    }
+
+    /// `ConnectionCreator::get_added_proxy_object` (cpp:498-505).
+    fn get_added_proxy_object(&self, proxy_id: i32) -> td_api::AddedProxy {
+        let (proxy, comment) = &self.proxies[&proxy_id];
+        let last_used_date = self
+            .proxy_last_used_date
+            .get(&proxy_id)
+            .copied()
+            .unwrap_or(0);
+        td_api::AddedProxy {
+            id: proxy_id,
+            last_used_date,
+            is_enabled: proxy_id == self.active_proxy_id,
+            comment: comment.clone(),
+            proxy: Some(proxy.get_proxy_object()),
+        }
+    }
+}
+
+/// The `init_proxies` integer-read helper: the C++
+/// `to_integer_safe`/`to_integer` pair — the `_max_id`/`_active_id`
+/// values are trusted (they were written by this code), the id suffixes
+/// parse with a 0 fallback the caller filters.
+fn suffix_parse(_suffix: &str, value: &[u8]) -> i32 {
+    String::from_utf8_lossy(value).parse().unwrap_or(0)
+}
+
+/// [`ConnectionCreator`] seams over the `Td` fields — the env
+/// convention ([`crate::background_manager::BackgroundManagerEnv`]).
+pub(crate) trait ConnectionCreatorEnv {
+    /// `G()->td_db()->get_binlog_pmc()->get` — the decimal-string view.
+    fn binlog_pmc_get(&mut self, key: &[u8]) -> String;
+
+    /// `G()->td_db()->get_binlog_pmc()->set` (the decimal-string form).
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]);
+
+    /// `G()->td_db()->get_binlog_pmc()->erase`.
+    fn binlog_pmc_erase(&mut self, key: &str);
+
+    /// `G()->td_db()->get_binlog_pmc()->prefix_get`.
+    fn binlog_pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)>;
+
+    /// `G()->get_option_boolean`.
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool;
+
+    /// `G()->set_option_integer` / `set_option_empty` — the
+    /// `enabled_proxy_id` writes.
+    fn set_option_integer(&mut self, name: &str, value: i64);
+
+    fn set_option_empty(&mut self, name: &str);
+
+    /// `send_closure(G()->config_manager(), &ConfigManager::request_config,
+    /// false)` — the config refetch after the proxy went away.
+    fn request_config(&mut self, reopen_sessions: bool);
+
+    /// `PromoDataManager::remove_sponsored_dialog`.
+    fn remove_sponsored_dialog(&mut self);
+
+    /// `PromoDataManager::reload_promo_data`.
+    fn reload_promo_data(&mut self);
+
+    /// `ConnectionCreator::update_mtproto_header` — the net step's
+    /// session/mtproto-header rebuild; `None` is the C++ `Proxy()`.
+    fn update_mtproto_header(&mut self, proxy: Option<&Proxy>);
+
+    /// `StateManager::on_proxy` — the collapsed state world's flag sink.
+    fn on_proxy_state(&mut self, use_proxy: bool);
+
+    /// `GetHostByNameActor::run` + `ping_proxy_resolved` — the
+    /// `[blocked: net]` resolve/connect seam; the promise resolves with
+    /// the C++ LambdaPromise drop until the net step answers it.
+    fn ping_via_net(&mut self, proxy: &Proxy, promise: Promise<f64>);
+
+    /// `ProxyChecker::test_proxy` — the `[blocked: net]` handshake seam.
+    fn test_proxy_via_net(&mut self, proxy: &Proxy, dc_id: i32, timeout: f64, promise: Promise<()>);
+}
+
+/// `ConnectionCreator::set_proxy_comment` (cpp:143-156).
+fn set_proxy_comment(
+    env: &mut impl ConnectionCreatorEnv,
+    proxy_id: i32,
+    comment: &mut String,
+    new_comment: String,
+) {
+    if comment == &new_comment {
+        return;
+    }
+    *comment = new_comment;
+    debug_assert!(proxy_id > 0);
+    if comment.is_empty() {
+        env.binlog_pmc_erase(&get_proxy_comment_database_key(proxy_id));
+    } else {
+        env.binlog_pmc_set_raw(
+            get_proxy_comment_database_key(proxy_id).as_bytes(),
+            comment.as_bytes(),
+        );
+    }
+}
+
+/// `ConnectionCreator::get_proxy_database_key` (cpp:460-468) — proxy 1
+/// keeps the bare `"proxy"` key (the C++ store compat).
+fn get_proxy_database_key(proxy_id: i32) -> String {
+    debug_assert!(proxy_id > 0);
+    if proxy_id == 1 {
+        return "proxy".to_string();
+    }
+    format!("proxy{proxy_id}")
+}
+
+/// `ConnectionCreator::get_proxy_comment_database_key` (cpp:470-472).
+fn get_proxy_comment_database_key(proxy_id: i32) -> String {
+    debug_assert!(proxy_id > 0);
+    format!("proxy_comment{proxy_id}")
+}
+
+/// `ConnectionCreator::get_proxy_used_database_key` (cpp:474-478).
+fn get_proxy_used_database_key(proxy_id: i32) -> String {
+    debug_assert!(proxy_id > 0);
+    format!("proxy_used{proxy_id}")
+}
+
+/// `Proxy::Type` (net/Proxy.h:96-99) — the i32 discriminants are the
+/// stored form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ProxyType {
+    #[default]
+    None = 0,
+    Socks5 = 1,
+    Mtproto = 2,
+    HttpTcp = 3,
+    HttpCaching = 4,
+}
+
+/// `Proxy` (net/Proxy.h) — the td_api-level proxy record with the exact
+/// tl_helpers store/parse (the `log_event_store` bytes).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Proxy {
+    pub type_: ProxyType,
+    pub server: String,
+    pub port: i32,
+    pub user: String,
+    pub password: String,
+    pub secret: ProxySecret,
+}
+
+impl Proxy {
+    /// `Proxy::create_proxy(const td_api::proxy *)` (Proxy.cpp:50-56) —
+    /// the null-proxy band; the flattened td_api makes the caller's
+    /// `request.proxy` non-nullable, so only `None` input (the C++ null
+    /// pointer at the `ProxyType` level is likewise flattened away)
+    /// reaches this. Kept for the option-taking arms.
+    pub(crate) fn create_proxy(proxy: Option<&td_api::Proxy>) -> Result<Proxy, String> {
+        let Some(proxy) = proxy else {
+            return Err("Proxy must be non-empty".to_string());
+        };
+        Self::create_proxy_parts(&proxy.server, proxy.port, proxy.r#type.as_ref())
+    }
+
+    /// `Proxy::create_proxy(string, int, const td_api::ProxyType *)`
+    /// (Proxy.cpp:12-48) — the exact 400 ladder.
+    pub(crate) fn create_proxy_parts(
+        server: &str,
+        port: i32,
+        proxy_type: Option<&td_api::ProxyType>,
+    ) -> Result<Proxy, String> {
+        let Some(proxy_type) = proxy_type else {
+            return Err("Proxy type must be non-empty".to_string());
+        };
+        if server.is_empty() {
+            return Err("Server name must be non-empty".to_string());
+        }
+        if server.len() > 255 {
+            return Err("Server name is too long".to_string());
+        }
+        if !check_utf8(server.as_bytes()) {
+            return Err("Server name must be encoded in UTF-8".to_string());
+        }
+        if port <= 0 || port > 65535 {
+            return Err("Wrong port number".to_string());
+        }
+
+        match proxy_type {
+            td_api::ProxyType::proxyTypeSocks5(type_) => Ok(Self {
+                type_: ProxyType::Socks5,
+                server: server.to_string(),
+                port,
+                user: type_.username.clone(),
+                password: type_.password.clone(),
+                secret: ProxySecret::default(),
+            }),
+            td_api::ProxyType::proxyTypeHttp(type_) => {
+                let proxy_type = if type_.http_only {
+                    ProxyType::HttpCaching
+                } else {
+                    ProxyType::HttpTcp
+                };
+                Ok(Self {
+                    type_: proxy_type,
+                    server: server.to_string(),
+                    port,
+                    user: type_.username.clone(),
+                    password: type_.password.clone(),
+                    secret: ProxySecret::default(),
+                })
+            }
+            td_api::ProxyType::proxyTypeMtproto(type_) => {
+                let secret = match ProxySecret::from_link(type_.secret.as_bytes(), false) {
+                    tdutils::status::Result::Ok(secret) => secret,
+                    tdutils::status::Result::Err(status) => {
+                        return Err(status.message().to_string());
+                    }
+                };
+                Ok(Self {
+                    type_: ProxyType::Mtproto,
+                    server: server.to_string(),
+                    port,
+                    user: String::new(),
+                    password: String::new(),
+                    secret,
+                })
+            }
+        }
+    }
+
+    /// `Proxy::get_proxy_object` (Proxy.cpp:58-78).
+    pub(crate) fn get_proxy_object(&self) -> td_api::Proxy {
+        let r#type = match self.type_ {
+            ProxyType::Socks5 => td_api::ProxyType::proxyTypeSocks5(td_api::proxyTypeSocks5 {
+                username: self.user.clone(),
+                password: self.password.clone(),
+            }),
+            ProxyType::HttpTcp => td_api::ProxyType::proxyTypeHttp(td_api::proxyTypeHttp {
+                username: self.user.clone(),
+                password: self.password.clone(),
+                http_only: false,
+            }),
+            ProxyType::HttpCaching => td_api::ProxyType::proxyTypeHttp(td_api::proxyTypeHttp {
+                username: self.user.clone(),
+                password: self.password.clone(),
+                http_only: true,
+            }),
+            ProxyType::Mtproto => td_api::ProxyType::proxyTypeMtproto(td_api::proxyTypeMtproto {
+                secret: String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned(),
+            }),
+            ProxyType::None => unreachable!("the C++ UNREACHABLE default"),
+        };
+        td_api::Proxy {
+            server: self.server.clone(),
+            port: self.port,
+            r#type: Some(r#type),
+        }
+    }
+
+    /// `Proxy::store` (Proxy.h:131-149) — the tl_helpers bytes: the
+    /// `Type` int32, then the socks/http or mtproto field groups.
+    pub(crate) fn store(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        store_i32(&mut out, self.type_ as i32);
+        match self.type_ {
+            ProxyType::Socks5 | ProxyType::HttpTcp | ProxyType::HttpCaching => {
+                store_string(&mut out, &self.server);
+                store_i32(&mut out, self.port);
+                store_string(&mut out, &self.user);
+                store_string(&mut out, &self.password);
+            }
+            ProxyType::Mtproto => {
+                store_string(&mut out, &self.server);
+                store_i32(&mut out, self.port);
+                store_string(
+                    &mut out,
+                    &String::from_utf8_lossy(&self.secret.get_encoded_secret()),
+                );
+            }
+            ProxyType::None => {}
+        }
+        out
+    }
+
+    /// `Proxy::parse` (Proxy.h:151-171) — the mtproto secret re-parses
+    /// with `truncate_if_needed = true` like the C++.
+    pub(crate) fn parse(&mut self, data: &[u8]) -> Result<(), String> {
+        let mut parser = Parser::new(data);
+        self.type_ = Self::parse_type(parser.i32_().map_err(|e| e.to_string())?)?;
+        match self.type_ {
+            ProxyType::Socks5 | ProxyType::HttpTcp | ProxyType::HttpCaching => {
+                self.server = parser.string().map_err(|e| e.to_string())?;
+                self.port = parser.i32_().map_err(|e| e.to_string())?;
+                self.user = parser.string().map_err(|e| e.to_string())?;
+                self.password = parser.string().map_err(|e| e.to_string())?;
+            }
+            ProxyType::Mtproto => {
+                self.server = parser.string().map_err(|e| e.to_string())?;
+                self.port = parser.i32_().map_err(|e| e.to_string())?;
+                let encoded = parser.string().map_err(|e| e.to_string())?;
+                self.secret = match ProxySecret::from_link(encoded.as_bytes(), true) {
+                    tdutils::status::Result::Ok(secret) => secret,
+                    tdutils::status::Result::Err(status) => {
+                        return Err(status.message().to_string());
+                    }
+                };
+            }
+            ProxyType::None => {}
+        }
+        Ok(())
+    }
+
+    /// The `Type` int32 back-reference (the C++ parse reads the enum
+    /// value straight; unknown values are the C++ `CHECK` failure — the
+    /// Rust answers a parse error instead of aborting the process).
+    fn parse_type(value: i32) -> Result<ProxyType, String> {
+        match value {
+            0 => Ok(ProxyType::None),
+            1 => Ok(ProxyType::Socks5),
+            2 => Ok(ProxyType::Mtproto),
+            3 => Ok(ProxyType::HttpTcp),
+            4 => Ok(ProxyType::HttpCaching),
+            _ => Err(format!("Unknown proxy type {value}")),
+        }
+    }
+}
+
+/// `NetType` (net/NetType.h:17) — the i8 discriminants are the C++ enum
+/// values (`Size`/`Unknown` included for completeness).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)] // Size/Unknown ride the C++ enum; the arms use the rest
+pub(crate) enum NetType {
+    #[default]
+    Other = 0,
+    WiFi = 1,
+    Mobile = 2,
+    MobileRoaming = 3,
+    Size = 4,
+    None = 5,
+    Unknown = 6,
+}
+
+/// `get_net_type` (net/NetType.h:19-39) — the C++ null input answers
+/// `NetType::Other`.
+pub(crate) fn get_net_type(net_type: Option<&td_api::NetworkType>) -> NetType {
+    let Some(net_type) = net_type else {
+        return NetType::Other;
+    };
+    match net_type {
+        td_api::NetworkType::networkTypeOther(_) => NetType::Other,
+        td_api::NetworkType::networkTypeWiFi(_) => NetType::WiFi,
+        td_api::NetworkType::networkTypeMobile(_) => NetType::Mobile,
+        td_api::NetworkType::networkTypeMobileRoaming(_) => NetType::MobileRoaming,
+        td_api::NetworkType::networkTypeNone(_) => NetType::None,
+    }
+}
+
+/// `get_network_type_object` (net/NetType.h:41-56) — the stats/
+/// auto-download consumers land with their slices.
+#[allow(dead_code)]
+pub(crate) fn get_network_type_object(net_type: NetType) -> td_api::NetworkType {
+    match net_type {
+        NetType::Other => td_api::NetworkType::networkTypeOther(td_api::networkTypeOther {}),
+        NetType::WiFi => td_api::NetworkType::networkTypeWiFi(td_api::networkTypeWiFi {}),
+        NetType::Mobile => td_api::NetworkType::networkTypeMobile(td_api::networkTypeMobile {}),
+        NetType::MobileRoaming => {
+            td_api::NetworkType::networkTypeMobileRoaming(td_api::networkTypeMobileRoaming {})
+        }
+        _ => unreachable!("the C++ UNREACHABLE default"),
     }
 }
 
@@ -549,5 +1322,465 @@ mod tests {
         let stored = StoredDcOptions::parse(&pmc.get_raw(b"dc_options")).unwrap();
         assert_eq!(stored.options[0].secret(), b"16-byte--secret");
         assert!(stored.options[0].is_obfuscated_tcp_only());
+    }
+
+    /// The proxy env over a real `BinlogKeyValue` — the option writes
+    /// ride a map, the promo/state/mtproto seams count their calls, and
+    /// the net seams drop the promises (the production `ConnectionEnv`
+    /// behavior).
+    struct TestProxyEnv {
+        pmc: TestPmc,
+        options: std::collections::BTreeMap<String, String>,
+        promo_reloads: usize,
+        sponsored_removals: usize,
+        proxy_states: Vec<bool>,
+        mtproto_updates: Vec<Option<ProxyType>>,
+    }
+
+    impl TestProxyEnv {
+        fn new(name: &str) -> TestProxyEnv {
+            TestProxyEnv {
+                pmc: TestPmc::new(name),
+                options: std::collections::BTreeMap::new(),
+                promo_reloads: 0,
+                sponsored_removals: 0,
+                proxy_states: Vec::new(),
+                mtproto_updates: Vec::new(),
+            }
+        }
+
+        fn proxy(server: &str, port: i32) -> td_api::Proxy {
+            td_api::Proxy {
+                server: server.to_string(),
+                port,
+                r#type: Some(td_api::ProxyType::proxyTypeSocks5(
+                    td_api::proxyTypeSocks5 {
+                        username: "user".to_string(),
+                        password: "pass".to_string(),
+                    },
+                )),
+            }
+        }
+    }
+
+    impl ConnectionCreatorEnv for TestProxyEnv {
+        fn binlog_pmc_get(&mut self, key: &[u8]) -> String {
+            self.pmc.get(&String::from_utf8_lossy(key))
+        }
+
+        fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+            self.pmc.set_raw(key, value);
+        }
+
+        fn binlog_pmc_erase(&mut self, key: &str) {
+            self.pmc.erase(key);
+        }
+
+        fn binlog_pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+            self.pmc.prefix_get(prefix)
+        }
+
+        fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+            match self.options.get(name).map(String::as_str) {
+                None | Some("") => default_value,
+                Some("Btrue") => true,
+                Some("Bfalse") => false,
+                Some(value) => panic!("non-boolean option {name} = {value}"),
+            }
+        }
+
+        fn set_option_integer(&mut self, name: &str, value: i64) {
+            self.options.insert(name.to_string(), format!("I{value}"));
+        }
+
+        fn set_option_empty(&mut self, name: &str) {
+            self.options.insert(name.to_string(), String::new());
+        }
+
+        fn request_config(&mut self, _reopen_sessions: bool) {}
+
+        fn remove_sponsored_dialog(&mut self) {
+            self.sponsored_removals += 1;
+        }
+
+        fn reload_promo_data(&mut self) {
+            self.promo_reloads += 1;
+        }
+
+        fn update_mtproto_header(&mut self, proxy: Option<&Proxy>) {
+            self.mtproto_updates.push(proxy.map(|proxy| proxy.type_));
+        }
+
+        fn on_proxy_state(&mut self, use_proxy: bool) {
+            self.proxy_states.push(use_proxy);
+        }
+
+        fn ping_via_net(&mut self, _proxy: &Proxy, promise: Promise<f64>) {
+            drop(promise);
+        }
+
+        fn test_proxy_via_net(
+            &mut self,
+            _proxy: &Proxy,
+            _dc_id: i32,
+            _timeout: f64,
+            promise: Promise<()>,
+        ) {
+            drop(promise);
+        }
+    }
+
+    fn socks5(server: &str, port: i32) -> Proxy {
+        Proxy {
+            type_: ProxyType::Socks5,
+            server: server.to_string(),
+            port,
+            user: "user".to_string(),
+            password: "pass".to_string(),
+            secret: ProxySecret::default(),
+        }
+    }
+
+    /// The `create_proxy` 400 ladder (Proxy.cpp:12-48), each band in
+    /// order, plus the http_only split and the mtproto secret parse.
+    #[test]
+    fn create_proxy_ladder_matches_the_cpp_errors() {
+        let proxy = TestProxyEnv::proxy("proxy.example", 1080);
+        let typed = |r#type| td_api::Proxy {
+            r#type: Some(r#type),
+            ..TestProxyEnv::proxy("proxy.example", 1080)
+        };
+
+        assert_eq!(
+            Proxy::create_proxy(None).unwrap_err(),
+            "Proxy must be non-empty"
+        );
+        assert_eq!(
+            Proxy::create_proxy_parts("", 1080, proxy.r#type.as_ref()).unwrap_err(),
+            "Server name must be non-empty"
+        );
+        let long_server = "x".repeat(256);
+        assert_eq!(
+            Proxy::create_proxy_parts(&long_server, 1080, proxy.r#type.as_ref()).unwrap_err(),
+            "Server name is too long"
+        );
+        // The utf8 band (Proxy.cpp:26-28) is dead code here — a Rust
+        // `&str` cannot carry the invalid bytes it checks for; the
+        // C++-reachable callers (testProxy skips the clean) keep it.
+        assert_eq!(
+            Proxy::create_proxy_parts("s", 0, proxy.r#type.as_ref()).unwrap_err(),
+            "Wrong port number"
+        );
+        assert_eq!(
+            Proxy::create_proxy_parts("s", 65536, proxy.r#type.as_ref()).unwrap_err(),
+            "Wrong port number"
+        );
+        assert_eq!(
+            Proxy::create_proxy_parts("s", 1080, None).unwrap_err(),
+            "Proxy type must be non-empty"
+        );
+
+        let created = Proxy::create_proxy(Some(&proxy)).unwrap();
+        assert_eq!(created, socks5("proxy.example", 1080));
+
+        let http = typed(td_api::ProxyType::proxyTypeHttp(td_api::proxyTypeHttp {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            http_only: false,
+        }));
+        assert_eq!(
+            Proxy::create_proxy(Some(&http)).unwrap().type_,
+            ProxyType::HttpTcp
+        );
+        let caching = typed(td_api::ProxyType::proxyTypeHttp(td_api::proxyTypeHttp {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            http_only: true,
+        }));
+        assert_eq!(
+            Proxy::create_proxy(Some(&caching)).unwrap().type_,
+            ProxyType::HttpCaching
+        );
+
+        let mtproto = typed(td_api::ProxyType::proxyTypeMtproto(
+            td_api::proxyTypeMtproto {
+                secret: "00112233445566778899aabbccddeeff".to_string(),
+            },
+        ));
+        let created = Proxy::create_proxy(Some(&mtproto)).unwrap();
+        assert_eq!(created.type_, ProxyType::Mtproto);
+        assert_eq!(
+            created.secret.get_encoded_secret(),
+            b"00112233445566778899aabbccddeeff".to_vec()
+        );
+        let bad_secret = typed(td_api::ProxyType::proxyTypeMtproto(
+            td_api::proxyTypeMtproto {
+                secret: "zz-not-a-secret".to_string(),
+            },
+        ));
+        assert!(Proxy::create_proxy(Some(&bad_secret)).is_err());
+    }
+
+    /// The tl_helpers store bytes pinned by hand: the `Type` int32, then
+    /// the socks5 field group (`store(string)` = int32 length + bytes).
+    #[test]
+    fn proxy_store_parse_round_trip_is_byte_exact() {
+        let proxy = socks5("s", 1080);
+        assert_eq!(
+            proxy.store(),
+            vec![
+                1, 0, 0, 0, // Type::Socks5
+                1, b's', 0, 0, // "s"
+                56, 4, 0, 0, // 1080
+                4, b'u', b's', b'e', b'r', 0, 0, 0, // "user"
+                4, b'p', b'a', b's', b's', 0, 0, 0, // "pass"
+            ]
+        );
+        let mut parsed = Proxy::default();
+        parsed.parse(&proxy.store()).unwrap();
+        assert_eq!(parsed, proxy);
+
+        let mtproto = Proxy {
+            type_: ProxyType::Mtproto,
+            server: "m".to_string(),
+            port: 443,
+            user: String::new(),
+            password: String::new(),
+            secret: ProxySecret::from_link(b"00112233445566778899aabbccddeeff", false).unwrap(),
+        };
+        assert_eq!(
+            mtproto.store(),
+            vec![
+                2, 0, 0, 0, // Type::Mtproto
+                1, b'm', 0, 0, // "m"
+                187, 1, 0, 0, // 443
+                32, b'0', b'0', b'1', b'1', b'2', b'2', b'3', b'3', b'4', b'4', b'5', b'5', b'6',
+                b'6', b'7', b'7', b'8', b'8', b'9', b'9', b'a', b'a', b'b', b'b', b'c', b'c', b'd',
+                b'd', b'e', b'e', b'f', b'f', 0, 0, 0, // the encoded secret
+            ]
+        );
+        let mut parsed = Proxy::default();
+        parsed.parse(&mtproto.store()).unwrap();
+        assert_eq!(parsed, mtproto);
+    }
+
+    /// The `add_proxy` decision table: the allocate/dedup/edit-same/
+    /// edit-different walks, the error bands, and the enable fan-outs.
+    #[test]
+    fn add_proxy_registry_decisions_match_the_cpp() {
+        let mut env = TestProxyEnv::new("add-proxy-decisions");
+        let mut creator = ConnectionCreator::default();
+
+        // A fresh add allocates id 2 — id 1 stays reserved for the legacy
+        // bare "proxy" record — stores it under "proxy2", answers disabled.
+        let added = creator
+            .add_proxy(
+                &mut env,
+                -1,
+                Some(&TestProxyEnv::proxy("a", 1080)),
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(added.id, 2);
+        assert!(!added.is_enabled);
+        assert_eq!(added.last_used_date, 0);
+        assert!(!env.pmc.get("proxy2").is_empty());
+        assert!(!env.options.contains_key("enabled_proxy_id"));
+
+        // Re-adding the same proxy dedups onto id 2; the comment updates.
+        let deduped = creator
+            .add_proxy(
+                &mut env,
+                -1,
+                Some(&TestProxyEnv::proxy("a", 1080)),
+                false,
+                "main".to_string(),
+            )
+            .unwrap();
+        assert_eq!(deduped.id, 2);
+        assert_eq!(deduped.comment, "main");
+        assert_eq!(env.pmc.get("proxy_comment2"), "main");
+
+        // The second proxy gets id 3 and pins proxy_max_id past it.
+        let second = creator
+            .add_proxy(
+                &mut env,
+                -1,
+                Some(&TestProxyEnv::proxy("b", 1080)),
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(second.id, 3);
+        assert_eq!(env.pmc.get("proxy_max_id"), "4");
+
+        // The error bands.
+        assert_eq!(
+            creator
+                .add_proxy(
+                    &mut env,
+                    7,
+                    Some(&TestProxyEnv::proxy("a", 1080)),
+                    false,
+                    String::new()
+                )
+                .unwrap_err(),
+            "Proxy not found"
+        );
+        assert_eq!(
+            creator.enable_proxy(&mut env, 9).unwrap_err(),
+            "Unknown proxy identifier"
+        );
+        assert_eq!(
+            creator.remove_proxy(&mut env, 9).unwrap_err(),
+            "Unknown proxy identifier"
+        );
+
+        // Enabling proxy 3: the option, the state flag, no mtproto header
+        // hop for socks5.
+        creator.enable_proxy(&mut env, 3).unwrap();
+        assert_eq!(
+            env.options.get("enabled_proxy_id").map(String::as_str),
+            Some("I3")
+        );
+        assert_eq!(env.proxy_states, vec![true]);
+        assert!(env.mtproto_updates.is_empty());
+        assert!(creator.get_proxies().proxies[1].is_enabled);
+
+        // Editing the active proxy onto a different server keeps it
+        // enabled (the C++ `enable = true` mutation) and reuses the id.
+        let edited = creator
+            .add_proxy(
+                &mut env,
+                3,
+                Some(&TestProxyEnv::proxy("c", 1080)),
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(edited.id, 3);
+        assert!(edited.is_enabled);
+        assert_eq!(env.pmc.get("proxy_comment2"), "main");
+        assert_eq!(env.pmc.get("proxy_comment3"), "");
+
+        // Disabling: the option clears, the sponsored dialogs drop, the
+        // promo reloads.
+        creator.disable_proxy(&mut env);
+        assert_eq!(
+            env.options.get("enabled_proxy_id").map(String::as_str),
+            Some("")
+        );
+        assert!(env.sponsored_removals >= 1);
+        assert!(env.promo_reloads >= 1);
+
+        // Removing the active-proxy record erases the pmc keys.
+        creator.enable_proxy(&mut env, 2).unwrap();
+        creator.remove_proxy(&mut env, 2).unwrap();
+        assert!(env.pmc.get("proxy2").is_empty());
+        assert!(env.pmc.get("proxy_comment2").is_empty());
+        assert!(env.pmc.get("proxy_used2").is_empty());
+        assert_eq!(creator.get_proxies().proxies.len(), 1);
+    }
+
+    /// The `init_proxies` restore (cpp:1131-1190): registry, comments,
+    /// active id and the never-added gate, over a reopen of the same pmc.
+    #[test]
+    fn restore_proxies_round_trips_through_the_pmc() {
+        let mut env = TestProxyEnv::new("restore-proxies");
+        let mut creator = ConnectionCreator::default();
+        creator
+            .add_proxy(
+                &mut env,
+                -1,
+                Some(&TestProxyEnv::proxy("a", 1080)),
+                true,
+                "note".to_string(),
+            )
+            .unwrap();
+        creator
+            .add_proxy(
+                &mut env,
+                -1,
+                Some(&TestProxyEnv::proxy("b", 8080)),
+                false,
+                String::new(),
+            )
+            .unwrap();
+        drop(creator);
+
+        // A fresh creator restores both records, the comment and the
+        // active id (and re-applies the option through the env).
+        let mut restored = ConnectionCreator::default();
+        restored.restore_proxies(&mut env);
+        let proxies = restored.get_proxies();
+        assert_eq!(proxies.proxies.len(), 2);
+        assert_eq!(proxies.proxies[0].proxy.as_ref().unwrap().server, "a");
+        assert_eq!(proxies.proxies[0].comment, "note");
+        assert!(proxies.proxies[0].is_enabled);
+        assert!(!proxies.proxies[1].is_enabled);
+        assert_eq!(
+            env.options.get("enabled_proxy_id").map(String::as_str),
+            Some("I2")
+        );
+
+        // The next allocation continues past the restored max.
+        let third = restored
+            .add_proxy(
+                &mut env,
+                -1,
+                Some(&TestProxyEnv::proxy("c", 1080)),
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(third.id, 4);
+
+        // The never-added gate: an empty store pins max_proxy_id = 2 and
+        // allocates from 1.
+        let mut fresh = TestProxyEnv::new("restore-proxies-fresh");
+        let mut fresh_creator = ConnectionCreator::default();
+        fresh_creator.restore_proxies(&mut fresh);
+        let added = fresh_creator
+            .add_proxy(
+                &mut fresh,
+                -1,
+                Some(&TestProxyEnv::proxy("x", 1080)),
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(added.id, 2);
+    }
+
+    /// The `NetType` mapping table (net/NetType.h:19-39).
+    #[test]
+    fn net_type_mapping_matches_the_cpp() {
+        let cases = [
+            (
+                &td_api::NetworkType::networkTypeOther(td_api::networkTypeOther {}),
+                NetType::Other,
+            ),
+            (
+                &td_api::NetworkType::networkTypeWiFi(td_api::networkTypeWiFi {}),
+                NetType::WiFi,
+            ),
+            (
+                &td_api::NetworkType::networkTypeMobile(td_api::networkTypeMobile {}),
+                NetType::Mobile,
+            ),
+            (
+                &td_api::NetworkType::networkTypeMobileRoaming(td_api::networkTypeMobileRoaming {}),
+                NetType::MobileRoaming,
+            ),
+            (
+                &td_api::NetworkType::networkTypeNone(td_api::networkTypeNone {}),
+                NetType::None,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(get_net_type(Some(input)), expected);
+        }
+        assert_eq!(get_net_type(None), NetType::Other);
     }
 }

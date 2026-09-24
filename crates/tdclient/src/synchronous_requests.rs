@@ -96,10 +96,11 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::searchStringsByPrefix(_)
             | Function::getLanguagePackString(_)
             | Function::getChatFolderDefaultIconName(_)
+            | Function::getPushReceiverId(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
     // Not ported yet (need their managers): searchQuote,
     // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
-    // getPhoneNumberInfoSync, getPushReceiverId.
+    // getPhoneNumberInfoSync.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -212,6 +213,17 @@ pub fn run_request(function: Function) -> Object {
             let icon_name =
                 crate::dialog_filter_manager::DialogFilter::get_default_icon_name(&folder);
             Object::chatFolderIcon(td_api::ChatFolderIcon { name: icon_name })
+        }
+        Function::getPushReceiverId(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:288-303)
+            // — the NotificationManager payload walk; the VLOG(notifications)
+            // error log rides the result arm.
+            match crate::notification_manager::get_push_receiver_id(&request.payload) {
+                Ok(receiver_id) => {
+                    Object::pushReceiverId(td_api::PushReceiverId { id: receiver_id })
+                }
+                Err((code, message)) => make_error(code, &message),
+            }
         }
         Function::getJsonValue(request) => match get_json_value(&request.json) {
             Result::Ok(value) => json_value_object(value),

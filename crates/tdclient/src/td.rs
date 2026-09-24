@@ -75,7 +75,7 @@ use crate::config_recoverer::{
     RecovererNetType, SimpleConfigResult, load_dc_options_update,
 };
 use crate::config_result;
-use crate::connection_creator::ConnectionCreator;
+use crate::connection_creator::{ConnectionCreator, NetType};
 use crate::contact::Contact;
 use crate::convert;
 use crate::dc_auth_manager::{DcAuthManager, DcCompletedQueue};
@@ -2106,6 +2106,10 @@ pub struct Td {
     /// dc-options consumer slice; the connection machinery (the
     /// `DcOptionsSet` orderings, the link loop) is the net step.
     pub(crate) connection_creator: Option<ConnectionCreator>,
+    /// The collapsed `StateManager::network_type_` (StateManager.cpp) —
+    /// the flag `setNetworkType` feeds; the state manager's consumers
+    /// (the recoverer's network callbacks) are the net-step seams.
+    pub(crate) network_type: NetType,
     /// The C++ `Td::config_manager_` — created by `init_options_and_network`; its
     /// expire timer rides the Td's actor timeout slot and its queries
     /// dispatch through the client-side dispatcher (M.3.8.1).
@@ -2668,6 +2672,7 @@ impl Td {
             header_options: HeaderOptions::default(),
             option_manager: None,
             connection_creator: None,
+            network_type: NetType::Other,
             config_manager: None,
             net_query_dispatcher: None,
             net_router: None,
@@ -3038,8 +3043,15 @@ impl Td {
         // which persists the empty list and re-adds the defaults. The
         // actor machinery around it is the net step.
         let is_test_dc = self.global.is_test_dc();
-        self.connection_creator =
-            Some(ConnectionCreator::new(self.global.binlog_pmc(), is_test_dc));
+        let mut connection_creator = ConnectionCreator::new(self.global.binlog_pmc(), is_test_dc);
+        // The `start_up` proxy restore (ConnectionCreator.cpp:1111-1119)
+        // — the `enabled_proxy_id` option write needs the option manager,
+        // so it runs through the env here, in the C++ `start_up` order.
+        {
+            let mut env = ConnectionEnv { td: &mut *self };
+            connection_creator.restore_proxies(&mut env);
+        }
+        self.connection_creator = Some(connection_creator);
 
         // VLOG "Create ConfigManager" (Td.cpp:1070-1072).
         {
@@ -10920,6 +10932,100 @@ impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
         parser: &mut crate::store_parse::Parser,
     ) -> Result<FileId, &'static str> {
         self.file_manager.lock().parse_file(parser)
+    }
+}
+
+/// The [`crate::connection_creator::ConnectionCreatorEnv`] over the whole
+/// `Td` — the request arms take the manager out of `Td` and hand the
+/// remainder to the env (the [`BackgroundEnv`] convention).
+pub(crate) struct ConnectionEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::connection_creator::ConnectionCreatorEnv for ConnectionEnv<'_> {
+    fn binlog_pmc_get(&mut self, key: &[u8]) -> String {
+        String::from_utf8_lossy(&self.td.global.binlog_pmc().get_raw(key)).into_owned()
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.td.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.td.global.binlog_pmc().erase(key);
+    }
+
+    fn binlog_pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.td.global.binlog_pmc().prefix_get(prefix)
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_boolean(name, default_value)
+            })
+    }
+
+    fn set_option_integer(&mut self, name: &str, value: i64) {
+        if let Some(options) = self.td.option_manager.as_mut() {
+            options.set_option_integer(name, value);
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.td.option_manager.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn request_config(&mut self, _reopen_sessions: bool) {
+        // `send_closure(G()->config_manager(), &ConfigManager::request_config,
+        // false)` — the config refetch cycle after the proxy went away. The
+        // collapsed config machinery fetches through its own paths; the
+        // proxy-aware refetch closes with the net step.
+    }
+
+    fn remove_sponsored_dialog(&mut self) {
+        let (mut promo_env, promo_data_manager) = promo_env_split(self.td);
+        promo_data_manager.remove_sponsored_dialog(&mut promo_env);
+    }
+
+    fn reload_promo_data(&mut self) {
+        let (mut promo_env, promo_data_manager) = promo_env_split(self.td);
+        promo_data_manager.reload_promo_data(&mut promo_env);
+    }
+
+    fn update_mtproto_header(&mut self, _proxy: Option<&crate::connection_creator::Proxy>) {
+        // `ConnectionCreator::update_mtproto_header` — the net step's
+        // session/mtproto-header rebuild (`[blocked: net]`).
+    }
+
+    fn on_proxy_state(&mut self, _use_proxy: bool) {
+        // `StateManager::on_proxy` — the state flag's consumers (the
+        // recoverer's reconnect cycle) are the net-step seams; the flag
+        // itself rides the collapsed state world.
+    }
+
+    fn ping_via_net(&mut self, _proxy: &crate::connection_creator::Proxy, promise: Promise<f64>) {
+        // `GetHostByNameActor::run` + `ping_proxy_resolved` — the
+        // `[blocked: net]` resolve/connect seam. Dropping the promise
+        // answers with the C++ LambdaPromise drop ("Lost promise") until
+        // the net step's ping machinery completes it.
+        drop(promise);
+    }
+
+    fn test_proxy_via_net(
+        &mut self,
+        _proxy: &crate::connection_creator::Proxy,
+        _dc_id: i32,
+        _timeout: f64,
+        promise: Promise<()>,
+    ) {
+        // `ProxyChecker::test_proxy` — the `[blocked: net]` handshake
+        // seam; the promise resolves with the C++ LambdaPromise drop.
+        drop(promise);
     }
 }
 

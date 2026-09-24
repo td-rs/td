@@ -18,13 +18,13 @@ addLocalMessage	dispatched
 addLogMessage	sync
 addLoginPasskey	dispatched
 addMessageReaction	dispatched
-addNetworkStatistics	interim
+addNetworkStatistics	dispatched
 addOffer	interim
 addPendingLiveStoryReaction	dispatched
 addPendingPaidMessageReaction	dispatched
 addPollOption	dispatched
 addProfileAudio	interim
-addProxy	interim
+addProxy	dispatched
 addQuickReplyShortcutInlineQueryResultMessage	dispatched
 addQuickReplyShortcutMessage	dispatched
 addQuickReplyShortcutMessageAlbum	dispatched
@@ -196,7 +196,7 @@ deleteStoryAlbum	dispatched
 deleteTextCompositionStyle	dispatched
 destroy	dispatched
 disableAllSupergroupUsernames	dispatched
-disableProxy	interim
+disableProxy	dispatched
 discardCall	dispatched
 disconnectAffiliateProgram	dispatched
 disconnectAllWebsites	dispatched
@@ -234,14 +234,14 @@ editMessageMedia	dispatched
 editMessageReplyMarkup	dispatched
 editMessageSchedulingState	dispatched
 editMessageText	dispatched
-editProxy	interim
+editProxy	dispatched
 editQuickReplyMessage	dispatched
 editStarSubscription	dispatched
 editStory	dispatched
 editStoryCover	dispatched
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
-enableProxy	interim
+enableProxy	dispatched
 encryptGroupCallData	dispatched
 endGroupCall	dispatched
 endGroupCallRecording	dispatched
@@ -453,7 +453,7 @@ getMessageThread	dispatched
 getMessageThreadHistory	dispatched
 getMessageViewers	dispatched
 getMessages	dispatched
-getNetworkStatistics	interim
+getNetworkStatistics	dispatched
 getNewChatPrivacySettings	interim
 getOauthLinkInfo	dispatched
 getOption	dispatched
@@ -484,9 +484,9 @@ getPremiumStickerExamples	dispatched
 getPremiumStickers	dispatched
 getPreparedInlineMessage	dispatched
 getPreparedKeyboardButton	dispatched
-getProxies	interim
+getProxies	dispatched
 getPublicPostSearchLimits	dispatched
-getPushReceiverId	interim
+getPushReceiverId	sync
 getReadDatePrivacySettings	interim
 getReceivedGift	dispatched
 getReceivedGifts	dispatched
@@ -619,7 +619,7 @@ optimizeStorage	dispatched
 parseMarkdown	sync
 parseTextEntities	sync
 pinChatMessage	dispatched
-pingProxy	interim
+pingProxy	dispatched
 placeGiftAuctionBid	dispatched
 postStory	dispatched
 preliminaryUploadFile	dispatched
@@ -664,7 +664,7 @@ removeNotificationGroup	dispatched
 removePendingLiveStoryReactions	dispatched
 removePendingPaidMessageReactions	dispatched
 removeProfileAudio	dispatched
-removeProxy	interim
+removeProxy	dispatched
 removeRecentHashtag	interim
 removeRecentSticker	interim
 removeRecentlyFoundChat	dispatched
@@ -714,7 +714,7 @@ resendRecoveryEmailAddressCode	dispatched
 resetAllNotificationSettings	dispatched
 resetAuthenticationEmailAddress	dispatched
 resetInstalledBackgrounds	dispatched
-resetNetworkStatistics	interim
+resetNetworkStatistics	dispatched
 resetPassword	dispatched
 reuseStarSubscription	dispatched
 revokeChatInviteLink	dispatched
@@ -880,7 +880,7 @@ setMessageReactions	dispatched
 setMessageSenderBlockList	dispatched
 setMessageSenderBotVerification	dispatched
 setName	dispatched
-setNetworkType	interim
+setNetworkType	dispatched
 setNewChatPrivacySettings	interim
 setOption	dispatched
 setPaidMessageReactionType	dispatched
@@ -951,7 +951,7 @@ testCallVectorString	dispatched
 testCallVectorStringObject	dispatched
 testGetDifference	dispatched
 testNetwork	interim
-testProxy	interim
+testProxy	dispatched
 testReturnError	sync
 testSquareInt	dispatched
 testUseUpdate	dispatched

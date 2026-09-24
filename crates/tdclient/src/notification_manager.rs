@@ -4334,10 +4334,138 @@ fn parse_pmc_i32(value: &str, key: &str) -> i32 {
     }
 }
 
+/// `NotificationManager::get_push_receiver_id` (NotificationManager.cpp) —
+/// the sync `getPushReceiverId` payload walk: `"{}"` is id 0, the payload
+/// must be a JSON object, the optional `"data"` sub-object replaces it,
+/// and the receiver id comes from the `"p"` encrypted blob (the first
+/// base64url 12 chars reinterpreted as the little-endian i64) or the
+/// `"user_id"` field.
+pub(crate) fn get_push_receiver_id(payload: &str) -> Result<i64, (i32, String)> {
+    use tdutils::json::{JsonValue, JsonValueType, json_decode};
+
+    if payload == "{}" {
+        return Ok(0);
+    }
+
+    let json_value = match json_decode(payload) {
+        tdutils::status::Result::Ok(value) => value,
+        tdutils::status::Result::Err(status) => {
+            return Err((400, status.message().to_string()));
+        }
+    };
+    if json_value.ty() != JsonValueType::Object {
+        return Err((400, "Expected JSON object".to_string()));
+    }
+
+    let mut data = match json_value {
+        JsonValue::Object(object) => object,
+        _ => unreachable!("the Object check above"),
+    };
+    if data.has_field("data") {
+        let data_data = match data.extract_required_field("data", JsonValueType::Object) {
+            tdutils::status::Result::Ok(value) => value,
+            tdutils::status::Result::Err(status) => {
+                return Err((400, status.message().to_string()));
+            }
+        };
+        data = match data_data {
+            JsonValue::Object(object) => object,
+            _ => unreachable!("extract_required_field checked the type"),
+        };
+    }
+
+    if data.has_field("p") {
+        let encrypted_data = match data.get_required_string_field("p") {
+            tdutils::status::Result::Ok(value) => value,
+            tdutils::status::Result::Err(status) => {
+                return Err((400, status.message().to_string()));
+            }
+        };
+        if encrypted_data.len() < 12 {
+            return Err((400, "Encrypted payload is too small".to_string()));
+        }
+        let decoded = match base64_decode_url(&encrypted_data[..12]) {
+            Some(decoded) => decoded,
+            None => return Err((400, "Failed to base64url-decode payload".to_string())),
+        };
+        debug_assert_eq!(decoded.len(), 9);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&decoded[..8]);
+        return Ok(i64::from_le_bytes(bytes));
+    }
+    if data.has_field("user_id") {
+        let user_id = match data.get_required_long_field("user_id") {
+            tdutils::status::Result::Ok(value) => value,
+            tdutils::status::Result::Err(status) => {
+                return Err((400, status.message().to_string()));
+            }
+        };
+        if user_id <= 0 {
+            return Err((400, format!("Receive wrong user_id {user_id}")));
+        }
+        return Ok(user_id);
+    }
+
+    Ok(0)
+}
+
+/// `td::base64url_decode` (base64.cpp) — the URL-safe alphabet subset the
+/// push payload walks (12 chars → 9 bytes; any other length is an error
+/// here because the caller pins the 12-char window).
+fn base64_decode_url(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(input.as_bytes())
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tdutils::promise::PromiseCreator;
+
+    /// `NotificationManager::get_push_receiver_id` — the "{}"/user_id/"p"
+    /// walks and the 400 bands (the sync getPushReceiverId arm).
+    #[test]
+    fn push_receiver_id_walks_the_payload_like_the_cpp() {
+        use crate::notification_manager::get_push_receiver_id;
+
+        assert_eq!(get_push_receiver_id("{}"), Ok(0));
+
+        // The "data" sub-object replaces the top-level payload.
+        assert_eq!(
+            get_push_receiver_id(r#"{"data":{"user_id":42},"user_id":7}"#),
+            Ok(42)
+        );
+        assert_eq!(get_push_receiver_id(r#"{"user_id":42}"#), Ok(42));
+
+        // A "p" payload: 12 base64url chars decode to 9 bytes, the first
+        // 8 little-endian bytes are the id. "AQAAAAAAAAAA" is
+        // 01 00 00 00 00 00 00 00 00 — id 1.
+        assert_eq!(get_push_receiver_id(r#"{"p":"AQAAAAAAAAAA"}"#), Ok(1));
+
+        assert_eq!(
+            get_push_receiver_id("not json"),
+            Err((400, "Token starts with 'n' -- null expected".to_string()))
+        );
+        assert_eq!(
+            get_push_receiver_id(r#"[1,2]"#),
+            Err((400, "Expected JSON object".to_string()))
+        );
+        assert_eq!(
+            get_push_receiver_id(r#"{"data":3}"#),
+            Err((400, "Field \"data\" must be of type Object".to_string()))
+        );
+        assert_eq!(
+            get_push_receiver_id(r#"{"p":"short"}"#),
+            Err((400, "Encrypted payload is too small".to_string()))
+        );
+        assert_eq!(
+            get_push_receiver_id(r#"{"user_id":0}"#),
+            Err((400, "Receive wrong user_id 0".to_string()))
+        );
+        assert_eq!(get_push_receiver_id(r#"{"c":"x"}"#), Ok(0));
+    }
 
     struct TestEnv {
         disabled: bool,
