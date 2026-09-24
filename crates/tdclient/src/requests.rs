@@ -351,11 +351,16 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     .get_current_state(&env, &mut updates);
             }
 
+            // StarManager::get_current_state (Requests.cpp:2251 — after
+            // the terms-of-service block, before the group-call block;
+            // the owned star/ton updates ride their inited flags)
+            td.star_manager.get_current_state(&mut updates);
+
             // MessageQueryManager::get_current_state
             // (Requests.cpp:2255 — after the star/group-call blocks; the
-            // managers in between are pending). The manager's own is_bot
-            // gate applies; the emoji-game update carries the 60-second
-            // freshness window.
+            // group-call manager in between is pending). The manager's
+            // own is_bot gate applies; the emoji-game update carries the
+            // 60-second freshness window.
             if !td.auth_manager.is_bot() {
                 let (env, mq_manager) = crate::td::message_query_env_split(td);
                 mq_manager.get_current_state(&env, &mut updates);
@@ -12974,6 +12979,279 @@ fn run_dialog_invite_link_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
             manager.import_dialog_invite_link(&mut env, invite_link, promise);
         }
+        _ => run_star_requests(td, id, function),
+    }
+}
+
+/// The StarManager request dispatcher (the M.star slice; the C++
+/// `Requests::on_request` overloads that route into
+/// `td_->star_manager_`).
+#[allow(clippy::too_many_lines)]
+fn run_star_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::getStarPaymentOptions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::starPaymentOptions);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_payment_options(&mut env, promise);
+        }
+        Function::getStarGiftPaymentOptions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::starPaymentOptions);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_gift_payment_options(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                promise,
+            );
+        }
+        Function::getStarGiveawayPaymentOptions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::starGiveawayPaymentOptions);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_giveaway_payment_options(&mut env, promise);
+        }
+        Function::getStarTransactions(request) => {
+            let Some(subscription_id) = clean_or_utf8_error(td, id, &request.subscription_id)
+            else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            // the C++ manager probes the sender off its `td_`
+            // (StarManager.cpp:1597); the collapsed probe rides the bot
+            // env (MessageSender.cpp:173-215)
+            let dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.owner_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise(id, Object::starTransactions);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_transactions(
+                &mut env,
+                dialog_id,
+                subscription_id,
+                offset,
+                request.limit,
+                request.direction,
+                promise,
+            );
+        }
+        Function::getTonTransactions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, Object::tonTransactions);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_ton_transactions(
+                &mut env,
+                offset,
+                request.limit,
+                request.direction,
+                promise,
+            );
+        }
+        Function::getStarSubscriptions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, Object::starSubscriptions);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_subscriptions(&mut env, request.only_expiring, offset, promise);
+        }
+        Function::editStarSubscription(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(subscription_id) = clean_or_utf8_error(td, id, &request.subscription_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.edit_star_subscription(&mut env, subscription_id, request.is_canceled, promise);
+        }
+        Function::editUserStarSubscription(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(telegram_payment_charge_id) =
+                clean_or_utf8_error(td, id, &request.telegram_payment_charge_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.edit_user_star_subscription(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                telegram_payment_charge_id,
+                request.is_canceled,
+                promise,
+            );
+        }
+        Function::reuseStarSubscription(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(subscription_id) = clean_or_utf8_error(td, id, &request.subscription_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.reuse_star_subscription(&mut env, subscription_id, promise);
+        }
+        Function::refundStarPayment(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(telegram_payment_charge_id) =
+                clean_or_utf8_error(td, id, &request.telegram_payment_charge_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.refund_star_payment(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                telegram_payment_charge_id,
+                promise,
+            );
+        }
+        Function::getStarRevenueStatistics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            // the C++ manager probes the sender off its `td_`
+            // (StarManager.cpp:1679)
+            let dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.owner_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise(id, Object::starRevenueStatistics);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_revenue_statistics(&mut env, dialog_id, request.is_dark, promise);
+        }
+        Function::getStarWithdrawalUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            // the C++ manager probes the sender off its `td_`
+            // (StarManager.cpp:1712)
+            let dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.owner_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_withdrawal_url(
+                &mut env,
+                dialog_id,
+                request.star_count,
+                request.password,
+                promise,
+            );
+        }
+        Function::getStarAdAccountUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            // the C++ manager probes the sender off its `td_`
+            // (StarManager.cpp:1729)
+            let dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.owner_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_star_ad_account_url(&mut env, dialog_id, promise);
+        }
+        Function::getGramRevenueStatistics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::gramRevenueStatistics);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_ton_revenue_statistics(&mut env, request.is_dark, promise);
+        }
+        Function::getGramWithdrawalUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_ton_withdrawal_url(&mut env, request.password, promise);
+        }
+        Function::getPaidMessageRevenue(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::starCount);
+            let (mut env, manager) = crate::td::star_env_split(td);
+            manager.get_paid_message_revenue(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                promise,
+            );
+        }
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -13806,9 +14084,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            693,
+            709,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 308, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 292, "interim count");
     }
 }

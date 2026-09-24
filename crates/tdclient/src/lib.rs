@@ -135,6 +135,7 @@ pub mod secure_storage;
 pub mod secure_value;
 pub mod sponsored_message_manager;
 pub mod star_gift_manager;
+pub mod star_manager;
 pub mod statistics_manager;
 pub mod stickers_manager;
 pub mod store_parse;

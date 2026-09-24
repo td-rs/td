@@ -2199,6 +2199,9 @@ pub struct Td {
     pub(crate) secure_manager: crate::secure_manager::SecureManager,
     /// `Td::star_gift_manager_` (Td.cpp:1286, the `Td::Td` manager block).
     pub(crate) star_gift_manager: crate::star_gift_manager::StarGiftManager,
+    /// `Td::star_manager_` (Td.cpp:1287, the `Td::Td` manager block; the
+    /// M.star slice).
+    pub(crate) star_manager: crate::star_manager::StarManager,
     /// `Td::theme_manager_` (`Td.cpp:1304`, the init managers block; the
     /// M.41 Wave-3 slice).
     pub(crate) theme_manager: crate::theme_manager::ThemeManager,
@@ -2303,6 +2306,9 @@ pub struct Td {
     /// The sponsored/promo managers' `send_update` outbox — drained by
     /// [`Td::flush_user_updates`].
     pub(crate) sponsored_updates: Vec<td_api::Update>,
+    /// The StarManager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`] (the M.star slice).
+    pub(crate) star_updates: Vec<td_api::Update>,
     /// `Td::top_dialog_manager_` (Td.cpp:1276, M.27).
     pub(crate) top_dialog_manager: crate::top_dialog_manager::TopDialogManager,
     /// `Td::dialog_participant_manager_` (Td.cpp, the M.dp slice).
@@ -2631,8 +2637,10 @@ impl Td {
             forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
+            star_manager: crate::star_manager::StarManager::new(),
             theme_manager: crate::theme_manager::ThemeManager::new(),
             theme_updates: Vec::new(),
+            star_updates: Vec::new(),
             autosave_manager: crate::autosave_manager::AutosaveManager::new(),
             autosave_updates: Vec::new(),
             boost_manager: BoostManager::new(),
@@ -3466,6 +3474,15 @@ impl Td {
             };
             self.account_manager.start_up(&mut env);
             self.suggested_action_manager.start_up(&mut env);
+        }
+
+        // `StarManager::start_up` (StarManager.cpp:1402, the actor
+        // start) — the owned star/ton pmc load; the initial
+        // updateOwnedStarCount/updateOwnedGramCount ride the star
+        // updates outbox.
+        {
+            let (mut env, manager) = crate::td::star_env_split(self);
+            manager.start_up(&mut env);
         }
 
         // `make_unique<PeopleNearbyManager>` (Td.cpp:1258, the
@@ -4900,6 +4917,10 @@ impl Td {
         }
         let reaction_updates = std::mem::take(&mut self.reaction_updates);
         for update in reaction_updates {
+            self.send_update(update.into());
+        }
+        let star_updates = std::mem::take(&mut self.star_updates);
+        for update in star_updates {
             self.send_update(update.into());
         }
     }
@@ -15779,6 +15800,124 @@ impl crate::dialog_invite_link_manager::DialogInviteLinkManagerEnv for TdDialogI
         _dialog_id: crate::chat_manager::DialogId,
         _input_user: tdmtproto::telegram_api::InputUser,
     ) {
+    }
+}
+
+pub(crate) fn star_env_split(
+    td: &mut Td,
+) -> (TdStarEnv<'_>, &mut crate::star_manager::StarManager) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        star_manager,
+        star_updates,
+        ..
+    } = td;
+    (
+        TdStarEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            updates: star_updates,
+        },
+        star_manager,
+    )
+}
+
+/// The `G()`/`td_` slice [`crate::star_manager::StarManager`] reads
+/// through (the M.star env split; the StickersManager/PasswordManager
+/// halves keep their trait defaults — the C++ chains collapse at the
+/// seams, see the star_manager module header).
+pub(crate) struct TdStarEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults like the other envs.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The `Td::send_update` outbox, drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::star_manager::StarManagerEnv for TdStarEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.global.close_flag() {
+            Status::error(500, "Request aborted")
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    fn my_user_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_bot_data(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<crate::user_manager::BotData> {
+        match self.user_manager.get_bot_data(user_id) {
+            Ok(bot_data) => tdutils::status::Result::Ok(bot_data),
+            Err(status) => tdutils::status::Result::from_status(status),
+        }
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<tdmtproto::telegram_api::InputUser> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                500,
+                "Client is closing",
+            ));
+        };
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id).into()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
     }
 }
 
