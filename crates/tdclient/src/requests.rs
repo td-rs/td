@@ -1007,9 +1007,8 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.check_authentication_bot_token(id, request.token);
         }
         Function::logOut(_) => {
-            // `AuthManager::log_out` — the local guards need the sender for
-            // the query part; both arrive with the net step.
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            // `AuthManager::log_out` over the dispatcher (auth-net slice).
+            td.log_out(id);
         }
 
         // -- the walking-skeleton messaging set (S76): getMe stays the
@@ -15853,9 +15852,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            876,
+            877,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 125, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 124, "interim count");
     }
 }

@@ -1558,7 +1558,10 @@ fn is_custom_language_code(language_code: &str) -> bool {
 /// The header's language fields (MtprotoHeader.cpp:56-67): an empty pack
 /// or a custom (`X`-prefixed) code clears both fields; an empty code with
 /// a real pack becomes "en".
-fn recovery_language_fields(language_pack: &str, language_code: &str) -> (String, String) {
+pub(crate) fn recovery_language_fields(
+    language_pack: &str,
+    language_code: &str,
+) -> (String, String) {
     if language_pack.is_empty() || is_custom_language_code(language_code) {
         (String::new(), String::new())
     } else if language_code.is_empty() {
@@ -1658,7 +1661,7 @@ pub fn gen_recovery_header(options: &RecoveryHeaderOptions) -> Result<Vec<u8>, S
 
     let mut out = Vec::new();
     telegram_api::invokeWithLayer {
-        layer: RECOVERY_MTPROTO_LAYER,
+        layer: MTPROTO_LAYER,
         query: Some(Box::new(telegram_api::Function::initConnection(
             telegram_api::initConnection {
                 flags,
@@ -1776,7 +1779,7 @@ impl SessionConnectionCallback for FullConfigCallback {
 }
 
 /// `MTPROTO_LAYER` (Version.h:13) — the layer the pinned scheme carries.
-const RECOVERY_MTPROTO_LAYER: i32 = 229;
+pub(crate) const MTPROTO_LAYER: i32 = 229;
 
 /// The `GetConfigActor::set_timeout_in(10)` budget (ConfigManager.cpp:466)
 /// — the whole mini-session, handshake included, fails with

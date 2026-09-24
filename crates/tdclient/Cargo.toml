@@ -16,7 +16,7 @@ tdnet = { path = "../tdnet" }
 tracing = "0.1"
 tdmtproto = { path = "../tdmtproto" }
 tdutils = { path = "../tdutils" }
-tokio = { version = "1", features = ["rt", "sync", "net", "time", "macros"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [build-dependencies]
 tl-codegen = { path = "../tl-codegen" }
