@@ -1350,9 +1350,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             return;
         }
         let old_pts = self.get_pts();
-        if pts > old_pts || (0 < pts && pts < old_pts - 1_000_009) {
+        if pts > old_pts || (0 < pts && pts < old_pts.wrapping_sub(1_000_009)) {
             // PTS can only go up or drop cardinally
-            if pts < old_pts - 1_000_009 {
+            if pts < old_pts.wrapping_sub(1_000_009) {
                 tdutils::log_warning!("PTS decreases from {} to {} from {}", old_pts, pts, source);
             } else {
                 tdutils::log_info!("Update PTS from {} to {} from {}", old_pts, pts, source);
@@ -2506,16 +2506,16 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             qts,
             old_qts
         );
-        if qts < old_qts - 1_000_009 {
+        if qts < old_qts.wrapping_sub(1_000_009) {
             tdutils::log_warning!(
                 "Restore QTS after QTS overflow from {} to {} by {}",
                 old_qts,
                 qts,
                 update.name()
             );
-            self.add_qts(env, qts - 1);
-            debug_assert_eq!(self.get_qts(), qts - 1);
-            old_qts = qts - 1;
+            self.add_qts(env, qts.wrapping_sub(1));
+            debug_assert_eq!(self.get_qts(), qts.wrapping_sub(1));
+            old_qts = qts.wrapping_sub(1);
             self.last_confirmed_qts = self.get_qts();
         }
 
@@ -2525,7 +2525,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             return;
         }
 
-        if self.running_get_difference || (qts - 1 > old_qts && old_qts > 0) {
+        if self.running_get_difference || (qts.wrapping_sub(1) > old_qts && old_qts > 0) {
             tdutils::log_info!("Postpone update with QTS = {}", qts);
             if !self.running_get_difference && self.pending_qts_updates.is_empty() {
                 let now = env.now();
@@ -2739,8 +2739,8 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         }
 
         let old_pts = self.get_pts();
-        if new_pts < old_pts - 99 && source != AFTER_GET_DIFFERENCE_SOURCE {
-            let need_restore_pts = new_pts < old_pts - 19_999;
+        if new_pts < old_pts.wrapping_sub(99) && source != AFTER_GET_DIFFERENCE_SOURCE {
+            let need_restore_pts = new_pts < old_pts.wrapping_sub(19_999);
             let now = env.now();
             if old_pts == 2_100_000_000
                 && new_pts < 1_100_000_000
@@ -2809,7 +2809,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             return;
         }
 
-        if old_pts > new_pts - pts_count {
+        if old_pts > new_pts.wrapping_sub(pts_count) {
             tdutils::log_warning!(
                 "Have old_pts (= {}) + pts_count (= {}) > new_pts (= {}). Update from {} = {}",
                 old_pts,
@@ -2824,12 +2824,16 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             return;
         }
 
-        self.accumulated_pts_count += pts_count;
+        self.accumulated_pts_count = self.accumulated_pts_count.wrapping_add(pts_count);
         if new_pts > self.accumulated_pts {
             self.accumulated_pts = new_pts;
         }
 
-        if old_pts > self.accumulated_pts - self.accumulated_pts_count {
+        if old_pts
+            > self
+                .accumulated_pts
+                .wrapping_sub(self.accumulated_pts_count)
+        {
             tdutils::log_warning!(
                 "Have old_pts (= {}) + accumulated_pts_count (= {}) > accumulated_pts (= {}). new_pts = {}, pts_count = {}. Update from {} = {}",
                 old_pts,
@@ -2851,7 +2855,10 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         }
 
         if self.pending_pts_updates.is_empty()
-            && old_pts == self.accumulated_pts - self.accumulated_pts_count
+            && old_pts
+                == self
+                    .accumulated_pts
+                    .wrapping_sub(self.accumulated_pts_count)
             && !self.pts_gap_timeout.has_timeout()
         {
             if pts_count > 0 {
