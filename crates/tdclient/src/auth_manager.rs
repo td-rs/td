@@ -1058,8 +1058,8 @@ impl AuthManager {
 
     /// `AuthManager::request_qr_code_authentication` (cpp:483-512).
     pub fn request_qr_code_authentication(&mut self, other_user_ids: &[i64]) -> Result<(), String> {
-        if self.state != State::WaitPhoneNumber {
-            if !matches!(
+        if self.state != State::WaitPhoneNumber
+            && !matches!(
                 self.state,
                 State::WaitPremiumPurchase
                     | State::WaitEmailAddress
@@ -1067,9 +1067,9 @@ impl AuthManager {
                     | State::WaitCode
                     | State::WaitPassword
                     | State::WaitRegistration
-            ) {
-                return Err("Call to requestQrCodeAuthentication unexpected".to_string());
-            }
+            )
+        {
+            return Err("Call to requestQrCodeAuthentication unexpected".to_string());
         }
         if self.is_bot {
             return Err("Cannot request QR code authentication after bot token was entered. You must log out first".to_string());
@@ -1093,8 +1093,9 @@ impl AuthManager {
         _signature: &[u8],
         _user_handle: &[u8],
     ) -> Result<(), String> {
-        if self.state != State::WaitPhoneNumber && self.state != State::WaitQrCodeConfirmation {
-            if !matches!(
+        if self.state != State::WaitPhoneNumber
+            && self.state != State::WaitQrCodeConfirmation
+            && !matches!(
                 self.state,
                 State::WaitPremiumPurchase
                     | State::WaitEmailAddress
@@ -1102,9 +1103,9 @@ impl AuthManager {
                     | State::WaitCode
                     | State::WaitPassword
                     | State::WaitRegistration
-            ) {
-                return Err("Call to checkAuthenticationPasskey unexpected".to_string());
-            }
+            )
+        {
+            return Err("Call to checkAuthenticationPasskey unexpected".to_string());
         }
         if self.is_bot {
             return Err("Cannot request passkey authentication after bot token was entered. You must log out first".to_string());
