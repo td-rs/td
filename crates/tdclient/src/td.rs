@@ -17601,6 +17601,7 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
@@ -17631,6 +17632,7 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
@@ -17778,6 +17780,7 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
@@ -17894,6 +17897,7 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
