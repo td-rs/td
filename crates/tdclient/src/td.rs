@@ -15925,6 +15925,219 @@ impl crate::star_manager::StarManagerEnv for TdStarEnv<'_> {
     }
 }
 
+// ---- the available-reactions request plane (the M.react slice) ----
+
+/// The disjoint `DialogAvailableReactionsEnv` + manager borrow for the
+/// `setChatAvailableReactions` arm.
+pub(crate) struct TdDialogAvailableReactionsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+pub(crate) fn dialog_available_reactions_env_split(
+    td: &mut Td,
+) -> (
+    TdDialogAvailableReactionsEnv<'_>,
+    &mut crate::messages_manager::MessagesManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        messages_manager,
+        ..
+    } = td;
+    (
+        TdDialogAvailableReactionsEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        messages_manager,
+    )
+}
+
+impl crate::chat_reactions::ChatReactionsEnv for TdDialogAvailableReactionsEnv<'_> {
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options
+            .as_deref()
+            .map(|options| options.get_option_integer(name, default_value))
+            .unwrap_or(default_value)
+    }
+}
+
+impl crate::messages_manager::DialogAvailableReactionsEnv for TdDialogAvailableReactionsEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn is_broadcast_channel(&mut self, dialog_id: crate::messages_manager::DialogId) -> bool {
+        match dialog_id.get_type() {
+            crate::messages_manager::DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some_and(|c| !c.is_megagroup),
+            _ => false,
+        }
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        _allow_secret_chats: bool,
+        _access_rights: crate::user_manager::AccessRights,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        // the collapsed-world existence band; the full rights check is
+        // the M.6 dialog integration
+        let has = match dialog_id.get_type() {
+            crate::messages_manager::DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            crate::messages_manager::DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            crate::messages_manager::DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            crate::messages_manager::DialogType::SecretChat
+            | crate::messages_manager::DialogType::None => false,
+        };
+        if has {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_chat_permissions(
+        &mut self,
+        chat_id: crate::chat_manager::ChatId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_chat_permissions_id(chat_id)
+    }
+
+    fn is_appointed_chat_administrator(&mut self, chat_id: crate::chat_manager::ChatId) -> bool {
+        self.chat_manager.is_appointed_chat_administrator(chat_id)
+    }
+
+    fn get_channel_permissions(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager
+            .get_channel_permissions_id(self.global, channel_id)
+    }
+}
+
+/// The disjoint `MessageReactionQueryEnv` + manager borrow for the
+/// `getMessageAddedReactions`/`reportMessageReactions` arms.
+pub(crate) struct TdMessageReactionQueryEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+pub(crate) fn message_reactions_query_env_split(
+    td: &mut Td,
+) -> (
+    TdMessageReactionQueryEnv<'_>,
+    &mut crate::messages_manager::MessagesManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        messages_manager,
+        ..
+    } = td;
+    (
+        TdMessageReactionQueryEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        messages_manager,
+    )
+}
+
+impl crate::message_reaction::MessageReactionQueryEnv for TdMessageReactionQueryEnv<'_> {
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _allow_secret_chats: bool,
+        _access_rights: crate::user_manager::AccessRights,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        // the collapsed-world existence band; the full rights check is
+        // the M.6 dialog integration
+        let has = match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            crate::dialog_id::DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => false,
+        };
+        if has {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let Some(options) = self.options.as_deref_mut() else {
+                    return false;
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .have_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            crate::dialog_id::DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

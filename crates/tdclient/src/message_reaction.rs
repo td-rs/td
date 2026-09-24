@@ -1220,6 +1220,166 @@ pub fn get_chosen_tags(message_reactions: Option<&MessageReactions>) -> Vec<Reac
     }
 }
 
+// ---- the message-reaction request plane (the M.react slice;
+// Requests.cpp:4006-4012 and 7858-7865) ----
+
+/// The `Td *td` slice of the message-reaction request free functions
+/// (MessageReaction.cpp:1140-1192). The access checks answer the
+/// collapsed-world bands (the M.6 dialog integration owns the full
+/// rights/restrictions family); the net queries are the seams.
+pub trait MessageReactionQueryEnv {
+    /// `td_->dialog_manager_->check_dialog_access(dialog_id, false,
+    /// AccessRights::Read, source)`.
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> Result<(), tdutils::status::Status>;
+
+    /// `td_->dialog_manager_->have_input_peer(dialog_id, false,
+    /// access_rights)` — the chooser existence probe; the C++
+    /// `from_group_chat` input is always false here.
+    fn have_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool;
+
+    // -- the net query seams ([blocked: net]); each one drops the
+    // -- promise, which keeps the C++ request unanswered offline
+    /// `GetMessageReactionsListQuery` (MessageReaction.cpp:69-99).
+    fn send_get_message_reactions_list(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+        reaction_type: ReactionType,
+        offset: String,
+        limit: i32,
+        promise: tdutils::promise::Promise<td_api::AddedReactions>,
+    ) {
+        let _ = (dialog_id, message_id, reaction_type, offset, limit, promise);
+    }
+    /// `ReportReactionQuery` (MessageReaction.cpp:101-113).
+    fn send_report_message_reaction(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+        chooser_dialog_id: DialogId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (dialog_id, message_id, chooser_dialog_id, promise);
+    }
+}
+
+/// `td_api::make_object<td_api::addedReactions>(0, Auto(), string())`.
+fn empty_added_reactions() -> td_api::AddedReactions {
+    td_api::AddedReactions {
+        total_count: 0,
+        reactions: Vec::new(),
+        next_offset: String::new(),
+    }
+}
+
+/// `get_message_added_reactions` (MessageReaction.cpp:1140-1164).
+pub fn get_message_added_reactions(
+    env: &mut impl MessageReactionQueryEnv,
+    manager: &crate::messages_manager::MessagesManager,
+    message_full_id: crate::messages_manager::MessageFullId,
+    reaction_type: ReactionType,
+    offset: String,
+    mut limit: i32,
+    mut promise: tdutils::promise::Promise<td_api::AddedReactions>,
+) {
+    if !crate::messages_manager::have_message_force_full(
+        manager,
+        message_full_id,
+        "get_message_added_reactions",
+    ) {
+        return promise.set_error(tdutils::status::Status::error(400, "Message not found"));
+    }
+    if reaction_type.is_paid_reaction() {
+        return promise.set_error(tdutils::status::Status::error(
+            400,
+            "Can't use the method for paid reaction",
+        ));
+    }
+
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    if dialog_id.get_type() == crate::dialog_id::DialogType::SecretChat || !message_id.is_server() {
+        return promise.set_value(empty_added_reactions());
+    }
+
+    if limit <= 0 {
+        return promise.set_error(tdutils::status::Status::error(
+            400,
+            "Parameter limit must be positive",
+        ));
+    }
+    const MAX_GET_ADDED_REACTIONS: i32 = 100; // server-side limit
+    limit = limit.min(MAX_GET_ADDED_REACTIONS);
+
+    env.send_get_message_reactions_list(
+        dialog_id,
+        message_id,
+        reaction_type,
+        offset,
+        limit,
+        promise,
+    );
+}
+
+/// `report_message_reactions` (MessageReaction.cpp:1166-1190).
+pub fn report_message_reactions(
+    env: &mut impl MessageReactionQueryEnv,
+    manager: &crate::messages_manager::MessagesManager,
+    message_full_id: crate::messages_manager::MessageFullId,
+    chooser_dialog_id: DialogId,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    if let Err(status) = env.check_dialog_access(
+        dialog_id,
+        false,
+        crate::user_manager::AccessRights::Read,
+        "report_message_reactions",
+    ) {
+        return promise.set_error(status);
+    }
+
+    if !crate::messages_manager::have_message_force_full(
+        manager,
+        message_full_id,
+        "report_message_reactions",
+    ) {
+        return promise.set_error(tdutils::status::Status::error(400, "Message not found"));
+    }
+    if message_id.is_valid_scheduled() {
+        return promise.set_error(tdutils::status::Status::error(
+            400,
+            "Can't report reactions on scheduled messages",
+        ));
+    }
+    if !message_id.is_server() {
+        return promise.set_error(tdutils::status::Status::error(
+            400,
+            "Message reactions can't be reported",
+        ));
+    }
+
+    if !env.have_input_peer(chooser_dialog_id, crate::user_manager::AccessRights::Know) {
+        return promise.set_error(tdutils::status::Status::error(
+            400,
+            "Reaction sender not found",
+        ));
+    }
+
+    env.send_report_message_reaction(dialog_id, message_id, chooser_dialog_id, promise);
+}
+
 #[cfg(test)]
 mod message_reaction_tests {
     use super::*;
@@ -1576,5 +1736,340 @@ mod message_reaction_tests {
         list.insert(emoji("👍"), vec![DialogId::new(-7), DialogId::new(-8)]);
         assert!(reactions.are_consistent_with_list(&emoji("👍"), list.clone(), 2));
         assert!(!reactions.are_consistent_with_list(&emoji("👍"), list, 3));
+    }
+
+    /// the recording env of the request-plane ladders
+    struct QueryEnv {
+        access_ok: bool,
+        peers: Vec<DialogId>,
+        lists: Vec<(DialogId, i64, String, i32)>,
+        reports: Vec<(DialogId, i64, DialogId)>,
+        dropped: Vec<&'static str>,
+    }
+
+    impl Default for QueryEnv {
+        fn default() -> QueryEnv {
+            QueryEnv {
+                access_ok: true,
+                peers: Vec::new(),
+                lists: Vec::new(),
+                reports: Vec::new(),
+                dropped: Vec::new(),
+            }
+        }
+    }
+
+    impl MessageReactionQueryEnv for QueryEnv {
+        fn check_dialog_access(
+            &mut self,
+            _dialog_id: DialogId,
+            _allow_secret_chats: bool,
+            _access_rights: crate::user_manager::AccessRights,
+            _source: &str,
+        ) -> Result<(), tdutils::status::Status> {
+            if self.access_ok {
+                Ok(())
+            } else {
+                Err(tdutils::status::Status::error(400, "Chat not found"))
+            }
+        }
+
+        fn have_input_peer(
+            &mut self,
+            dialog_id: DialogId,
+            _access_rights: crate::user_manager::AccessRights,
+        ) -> bool {
+            self.peers.contains(&dialog_id)
+        }
+
+        fn send_get_message_reactions_list(
+            &mut self,
+            dialog_id: DialogId,
+            message_id: crate::messages_manager::MessageId,
+            reaction_type: ReactionType,
+            _offset: String,
+            limit: i32,
+            _promise: tdutils::promise::Promise<td_api::AddedReactions>,
+        ) {
+            self.dropped.push("list");
+            self.lists.push((
+                dialog_id,
+                message_id.get(),
+                reaction_type.get_string().to_owned(),
+                limit,
+            ));
+        }
+
+        fn send_report_message_reaction(
+            &mut self,
+            dialog_id: DialogId,
+            message_id: crate::messages_manager::MessageId,
+            chooser_dialog_id: DialogId,
+            _promise: tdutils::promise::Promise<()>,
+        ) {
+            self.dropped.push("report");
+            self.reports
+                .push((dialog_id, message_id.get(), chooser_dialog_id));
+        }
+    }
+
+    fn manager_with_server_message() -> crate::messages_manager::MessagesManager {
+        let mut manager = crate::messages_manager::MessagesManager::default();
+        let dialog_id =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(2000));
+        let mut d = Box::new(crate::messages_manager::Dialog::default());
+        d.dialog_id = dialog_id;
+        let mut m = Box::new(crate::messages_manager::Message::default());
+        m.message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(400),
+        );
+        d.messages.insert(m.message_id, m);
+        // a local message of the same dialog (the non-server empty band)
+        let mut local = Box::new(crate::messages_manager::Message::default());
+        local.message_id = crate::messages_manager::MessageId::new(2); // TYPE_LOCAL
+        d.messages.insert(local.message_id, local);
+        manager.dialogs.insert(dialog_id, d);
+        manager
+    }
+
+    fn server_full_id() -> crate::messages_manager::MessageFullId {
+        crate::messages_manager::MessageFullId::new(
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(2000)),
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(400),
+            ),
+        )
+    }
+
+    fn user_dialog_id() -> DialogId {
+        crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(2000))
+    }
+
+    /// the shared resolution cell: `Err(message)` for promise errors
+    type CaughtAdded =
+        std::sync::Arc<std::sync::Mutex<Option<Result<td_api::AddedReactions, String>>>>;
+
+    fn caught_added_promise(
+        cell: CaughtAdded,
+    ) -> tdutils::promise::Promise<td_api::AddedReactions> {
+        tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<td_api::AddedReactions>| match result {
+                tdutils::status::Result::Ok(value) => {
+                    *cell.lock().unwrap() = Some(Ok(value));
+                }
+                tdutils::status::Result::Err(status) => {
+                    *cell.lock().unwrap() = Some(Err(status.message().to_owned()));
+                }
+            },
+        )
+    }
+
+    fn expect_error(cell: &CaughtAdded, expected: &str) {
+        match cell.lock().unwrap().as_ref() {
+            Some(Err(message)) => assert_eq!(message, expected),
+            Some(Ok(_)) => panic!("expected the {expected:?} error, got a value"),
+            None => panic!("expected the {expected:?} error, the promise is unresolved"),
+        }
+    }
+
+    /// `get_message_added_reactions` (MessageReaction.cpp:1140-1164): the
+    /// not-found and paid bands, the local empty resolution and
+    /// the limit validation with the server-side clamp.
+    #[test]
+    fn added_reactions_ladder_follows_the_cpp() {
+        let manager = manager_with_server_message();
+
+        // an unknown message errors before anything else
+        let unknown = crate::messages_manager::MessageFullId::new(
+            user_dialog_id(),
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(401),
+            ),
+        );
+        let cell: CaughtAdded = std::sync::Arc::default();
+        let mut env = QueryEnv::default();
+        get_message_added_reactions(
+            &mut env,
+            &manager,
+            unknown,
+            emoji("👍"),
+            String::new(),
+            10,
+            caught_added_promise(cell.clone()),
+        );
+        expect_error(&cell, "Message not found");
+        assert!(env.dropped.is_empty());
+
+        // the paid reaction type is rejected outright
+        let cell: CaughtAdded = std::sync::Arc::default();
+        let mut env = QueryEnv::default();
+        get_message_added_reactions(
+            &mut env,
+            &manager,
+            server_full_id(),
+            emoji("$"),
+            String::new(),
+            10,
+            caught_added_promise(cell.clone()),
+        );
+        expect_error(&cell, "Can't use the method for paid reaction");
+        assert!(env.dropped.is_empty());
+
+        // a local message resolves the synchronous empty value without
+        // the net query
+        let local_full_id = crate::messages_manager::MessageFullId::new(
+            user_dialog_id(),
+            crate::messages_manager::MessageId::new(2), // TYPE_LOCAL
+        );
+        let cell: CaughtAdded = std::sync::Arc::default();
+        let mut env = QueryEnv::default();
+        get_message_added_reactions(
+            &mut env,
+            &manager,
+            local_full_id,
+            emoji("👍"),
+            String::new(),
+            10,
+            caught_added_promise(cell.clone()),
+        );
+        let value = cell.lock().unwrap().take().unwrap().ok().unwrap();
+        assert_eq!(value.total_count, 0);
+        assert!(value.reactions.is_empty());
+        assert!(value.next_offset.is_empty());
+        assert!(env.dropped.is_empty());
+
+        // the limit must be positive; the clamp caps at the server limit
+        let cell: CaughtAdded = std::sync::Arc::default();
+        let mut env = QueryEnv::default();
+        get_message_added_reactions(
+            &mut env,
+            &manager,
+            server_full_id(),
+            emoji("👍"),
+            String::new(),
+            0,
+            caught_added_promise(cell.clone()),
+        );
+        expect_error(&cell, "Parameter limit must be positive");
+
+        let mut env = QueryEnv::default();
+        get_message_added_reactions(
+            &mut env,
+            &manager,
+            server_full_id(),
+            emoji("👍"),
+            "offset".to_owned(),
+            150,
+            tdutils::promise::Promise::default(),
+        );
+        assert_eq!(env.dropped, vec!["list"]);
+        assert_eq!(env.lists.len(), 1);
+        assert_eq!(env.lists[0].0, user_dialog_id());
+        assert_eq!(
+            env.lists[0].1,
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(400)
+            )
+            .get()
+        );
+        assert_eq!(env.lists[0].2, "👍");
+        assert_eq!(env.lists[0].3, 100);
+    }
+
+    /// `report_message_reactions` (MessageReaction.cpp:1166-1190): the
+    /// access/message/scheduled/chooser ladder, then the query.
+    #[test]
+    fn report_reactions_ladder_follows_the_cpp() {
+        let manager = manager_with_server_message();
+        let chooser = crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(7));
+        let unknown_chooser =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(9));
+
+        // the access gate fires first
+        let cell: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>> =
+            std::sync::Arc::default();
+        let promise_cell = cell.clone();
+        let mut env = QueryEnv {
+            access_ok: false,
+            ..QueryEnv::default()
+        };
+        report_message_reactions(
+            &mut env,
+            &manager,
+            server_full_id(),
+            chooser,
+            tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<()>| match result {
+                    tdutils::status::Result::Ok(()) => {
+                        *promise_cell.lock().unwrap() = Some(Ok(()));
+                    }
+                    tdutils::status::Result::Err(status) => {
+                        *promise_cell.lock().unwrap() = Some(Err(status.message().to_owned()));
+                    }
+                },
+            ),
+        );
+        match cell.lock().unwrap().as_ref() {
+            Some(Err(message)) => assert_eq!(message, "Chat not found"),
+            _ => panic!("expected the access error"),
+        }
+        assert!(env.dropped.is_empty());
+        assert!(env.reports.is_empty());
+
+        // the scheduled id is rejected without the query
+        let mut env = QueryEnv::default();
+        let scheduled_full_id = crate::messages_manager::MessageFullId::new(
+            user_dialog_id(),
+            crate::messages_manager::MessageId::from_scheduled(
+                crate::messages_manager::ScheduledServerMessageId::new(1),
+                0,
+                false,
+            ),
+        );
+        report_message_reactions(
+            &mut env,
+            &manager,
+            scheduled_full_id,
+            chooser,
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.dropped.is_empty());
+        assert!(env.reports.is_empty());
+
+        // an unknown chooser errors with the C++ band
+        let mut env = QueryEnv::default();
+        report_message_reactions(
+            &mut env,
+            &manager,
+            server_full_id(),
+            unknown_chooser,
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.dropped.is_empty());
+        assert!(env.reports.is_empty());
+
+        // the happy path parks the promise in the report query
+        let mut env = QueryEnv {
+            peers: vec![chooser],
+            ..QueryEnv::default()
+        };
+        report_message_reactions(
+            &mut env,
+            &manager,
+            server_full_id(),
+            chooser,
+            tdutils::promise::Promise::default(),
+        );
+        assert_eq!(env.dropped, vec!["report"]);
+        assert_eq!(env.reports.len(), 1);
+        assert_eq!(env.reports[0].0, user_dialog_id());
+        assert_eq!(
+            env.reports[0].1,
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(400)
+            )
+            .get()
+        );
+        assert_eq!(env.reports[0].2, chooser);
     }
 }

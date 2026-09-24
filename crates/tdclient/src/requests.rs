@@ -14342,14 +14342,29 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
         Function::getMessageAddedReactions(request) => {
+            // Requests.cpp:4006-4012 — the M.react slice routes the query
+            // through `get_message_added_reactions`; the list query tail
+            // stays [blocked: net]
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(_offset) = clean_or_utf8_error(td, id, &request.offset) else {
-                return;
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
-            let _promise =
-                td.deferred_promise::<td_api::AddedReactions, _>(id, Object::addedReactions);
+            let promise = td.deferred_promise(id, Object::addedReactions);
+            let (mut env, manager) = crate::td::message_reactions_query_env_split(td);
+            crate::message_reaction::get_message_added_reactions(
+                &mut env,
+                manager,
+                crate::messages_manager::MessageFullId::new(
+                    crate::messages_manager::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type),
+                offset,
+                request.limit,
+                promise,
+            );
         }
         Function::getMessageAvailableReactions(_) => {
             if !check_is_user(td, id) {
@@ -14358,11 +14373,39 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let _promise = td
                 .deferred_promise::<td_api::AvailableReactions, _>(id, Object::availableReactions);
         }
-        Function::reportMessageReactions(_) => {
+        Function::reportMessageReactions(request) => {
+            // Requests.cpp:7858-7865 — the M.react slice validates the
+            // ladder in `report_message_reactions`; the report query tail
+            // stays [blocked: net]
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let sender_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.sender_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut env, manager) = crate::td::message_reactions_query_env_split(td);
+            crate::message_reaction::report_message_reactions(
+                &mut env,
+                manager,
+                crate::messages_manager::MessageFullId::new(
+                    crate::messages_manager::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                sender_dialog_id,
+                promise,
+            );
         }
         Function::addPendingPaidMessageReaction(_) => {
             if !check_is_user(td, id) {
@@ -14388,8 +14431,20 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
-        Function::setChatAvailableReactions(_) => {
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        Function::setChatAvailableReactions(request) => {
+            // Requests.cpp:6082-6087 — the M.react slice runs the full
+            // `set_dialog_available_reactions` ladder: the access and
+            // rights checks, the local dialog mutation with the
+            // generation bump, then the server ack ([blocked: net])
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_available_reactions_env_split(td);
+            crate::messages_manager::set_dialog_available_reactions(
+                manager,
+                &mut env,
+                crate::messages_manager::DialogId::new(request.chat_id),
+                request.available_reactions,
+                promise,
+            );
         }
 
         // --- QuickReplyManager (6) ---
@@ -14609,10 +14664,10 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             }
             let dialog_id = MmDialogId::new(request.chat_id);
             let message_id = MessageId::new(request.message_id);
-            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
-                if d.reply_markup_message_id == message_id {
-                    d.reply_markup_message_id = MessageId::new(0);
-                }
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id)
+                && d.reply_markup_message_id == message_id
+            {
+                d.reply_markup_message_id = MessageId::new(0);
             }
             td.send_result(id, ok_object());
         }
@@ -15789,6 +15844,12 @@ mod request_census_tests {
         // reorderBotActiveUsernames, setBotProfilePhoto,
         // toggleBotCanManageEmojiStatus, toggleBotUsernameIsActive (871 + 5 = 876
         // dispatched / 125 interim).
+        // The M.react ReactionManager-remainder slice deepened three of
+        // those ReactionManager arms (setChatAvailableReactions,
+        // reportMessageReactions, getMessageAddedReactions) from the
+        // parked placeholders to the real C++ ladders — the counts do not
+        // move (the arms were already dispatched); the other ten reaction
+        // arms belong to the M.mmreq MessagesManager request plane.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),

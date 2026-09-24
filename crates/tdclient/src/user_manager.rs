@@ -7332,11 +7332,11 @@ impl UserManager {
             return;
         }
         let mut changed = false;
-        if let Some(user_full) = self.users_full.get_mut(&bot_user_id.get()) {
-            if user_full.can_manage_emoji_status != can_manage_emoji_status {
-                user_full.can_manage_emoji_status = can_manage_emoji_status;
-                changed = true;
-            }
+        if let Some(user_full) = self.users_full.get_mut(&bot_user_id.get())
+            && user_full.can_manage_emoji_status != can_manage_emoji_status
+        {
+            user_full.can_manage_emoji_status = can_manage_emoji_status;
+            changed = true;
         }
         if changed {
             self.update_user_full(
