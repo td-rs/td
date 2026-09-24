@@ -8296,6 +8296,48 @@ impl UserManager {
         tdutils::log_info!("Send messages.unsaveMusic — [blocked: net]");
     }
 
+    /// `UserManager::set_main_profile_tab` (UserManager.cpp:6688-6721).
+    /// The `get_profile_tab(main_profile_tab, ChannelType::Unknown)` null
+    /// gate answers here (the variant map is 1:1 and `is_allowed_profile_tab`
+    /// is unrestricted for `ChannelType::Unknown`); the
+    /// SetMainProfileTabQuery send + the ack-gated `on_set_main_profile_tab`
+    /// user_full write are [blocked: net] — the ProfileTab subsystem.
+    pub fn set_main_profile_tab(
+        &mut self,
+        main_profile_tab: Option<td_api::ProfileTab>,
+        mut promise: Promise<()>,
+    ) {
+        if main_profile_tab.is_none() {
+            return promise.set_error(Status::error(400, "Profile tab must be non-empty"));
+        }
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Send users.setMainProfileTab — [blocked: net]");
+    }
+
+    /// `UserManager::add_new_saved_music` (UserManager.cpp:7178-7212).
+    /// The null/title/performer gates answer here; the
+    /// `get_input_file_id(FileType::Audio, ...)` resolution, the
+    /// encrypted/web gates, the remote-location fast path
+    /// (`add_saved_music`) and the `create_audio`/`upload_saved_music`
+    /// tail are the FileManager/AudiosManager seams (they join the
+    /// FileManager env half of the M.4 tail).
+    pub fn add_new_saved_music(
+        &mut self,
+        input_audio: Option<td_api::InputAudio>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(input_audio) = input_audio else {
+            return promise.set_error(Status::error(400, "Audio must be non-empty"));
+        };
+        if crate::misc::clean_input_string(&input_audio.title).is_none()
+            || crate::misc::clean_input_string(&input_audio.performer).is_none()
+        {
+            return promise.set_error(Status::error(400, "Strings must be encoded in UTF-8"));
+        }
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("upload_saved_music — [blocked: net]");
+    }
+
     /// `UserManager::on_remove_saved_music` (UserManager.cpp:7380-7420).
     /// The `reload_user_full` fallback (cpp:7415) rides the net step —
     /// the promise completes there (M.4.16).

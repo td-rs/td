@@ -26,7 +26,9 @@ use crate::files::{FileId, FileSourceId};
 use crate::inline_keyboard_button::InlineKeyboardButtonEnv;
 use crate::message_content::{
     BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
-    can_be_secret_message_content,
+    can_be_secret_message_content, can_message_content_have_media_timestamp,
+    get_message_content_poll_can_view_stats, get_message_content_poll_option_properties,
+    remove_message_content_poll_has_unread_votes,
 };
 use crate::message_db::MessageDbAsyncInterface;
 use crate::message_entity::FormattedText;
@@ -18190,6 +18192,325 @@ pub fn read_all_dialog_mentions(
     // `MessageQueryManager::read_all_dialog_mentions_on_server(dialog_id, 0,
     // promise)` — [blocked: net]
     tracing::info!("read_all_dialog_mentions_on_server seam: dialog {dialog_id:?}");
+    Result::Ok(())
+}
+
+/// `MessagesManager::read_all_local_dialog_poll_votes`
+/// (MessagesManager.cpp:9261-9293) — the in-memory half of the
+/// readAllChatPollVotes/readAllForumTopicPollVotes handlers. The
+/// per-message unread-poll-vote flags and the dialog counter clear here;
+/// the counter's update send (`send_update_chat_unread_poll_vote_count`),
+/// the `on_unread_poll_vote_removed` notification/update legs, and the
+/// `on_topic_poll_vote_count_changed` topic-count leg are the M.10.7-family
+/// update-send seams (they complete with the dialog-update machinery).
+pub fn read_all_local_dialog_poll_votes(
+    ctx: &dyn MessageObjectContext,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+) {
+    // `td_->auth_manager_->is_bot()` — the dispatcher's CHECK_IS_USER gate
+    // answers bots before the manager call; the C++ double-checks here.
+    if ctx.is_bot() {
+        return;
+    }
+    let (message_ids, unread_poll_vote_count) = {
+        let Some(d) = manager.get_dialog(dialog_id) else {
+            return;
+        };
+        let reactions_ctx = MessageObjectReactionsContext::new(ctx);
+        let message_ids = find_dialog_messages(d, |m| {
+            has_unread_poll_votes(&reactions_ctx, m)
+                && (!forum_topic_id.is_valid()
+                    || (m.is_topic_message
+                        && ForumTopicId::from_top_thread_message_id(m.top_thread_message_id)
+                            == forum_topic_id))
+        });
+        (message_ids, d.unread_poll_vote_count)
+    };
+    if forum_topic_id.is_valid() {
+        // `on_topic_poll_vote_count_changed(dialog_id, forum_topic_id, 0,
+        // false)` — the forum-topic count leg is the ForumTopicManager
+        // receive seam.
+        tracing::info!(
+            "on_topic_poll_vote_count_changed seam: dialog {dialog_id:?} topic {}",
+            forum_topic_id.get()
+        );
+    } else if unread_poll_vote_count != 0 {
+        // `set_dialog_unread_poll_vote_count(d, 0)` — the counter
+        // reset; the update send (`send_update_chat_unread_poll_vote_count`
+        // / `on_dialog_updated`) is the update-send seam above.
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.unread_poll_vote_count = 0;
+        on_dialog_updated(manager, dialog_id, "read_all_local_dialog_poll_votes");
+    }
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx);
+    for message_id in message_ids {
+        let m = get_message_in_dialog(manager.get_dialog(dialog_id).unwrap(), message_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "get_message CHECK failed for {} in read_all_local_dialog_poll_votes",
+                    DisplayMessageId(message_id)
+                )
+            });
+        assert!(has_unread_poll_votes(&reactions_ctx, m));
+        assert_eq!(m.message_id, message_id);
+        assert!(m.message_id.is_valid());
+        // `remove_message_notification_id(d, m, true, false)` + the
+        // `on_unread_poll_vote_removed(d, m, nullptr)` update legs are the
+        // seams above; the content flag itself lives in the poll manager.
+        remove_message_content_poll_has_unread_votes(
+            ctx.content_context(),
+            m.content.as_ref().expect("poll content has unread votes"),
+        );
+    }
+}
+
+/// `MessagesManager::can_get_media_timestamp_link`
+/// (MessagesManager.cpp:15568-15607).
+pub fn can_get_media_timestamp_link(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+) -> Result<(), Status> {
+    let Some(m) = m else {
+        return Result::Err(Status::error(400, "Message not found"));
+    };
+    if is_ephemeral_message(m) || m.ephemeral_message.is_some() {
+        return Result::Err(Status::error(400, "Message is ephemeral"));
+    }
+    let message_links_unavailable = Status::error(
+        400,
+        "Message links are available only for messages in supergroups and channel chats",
+    );
+    let direct_messages_unavailable = Status::error(
+        400,
+        "Message links aren't available for messages in channel direct messages chats",
+    );
+    if dialog_id.get_type() != DialogType::Channel {
+        let imported = m
+            .forward_info
+            .as_ref()
+            .is_none_or(|forward_info| forward_info.is_imported());
+        if m.content
+            .as_ref()
+            .is_none_or(|content| !can_message_content_have_media_timestamp(content))
+            || imported
+        {
+            return Result::Err(message_links_unavailable);
+        }
+        let origin_message_full_id = m
+            .forward_info
+            .as_ref()
+            .expect("forward info checked above")
+            .get_origin_message_full_id();
+        let origin_message_id = origin_message_full_id.get_message_id();
+        if !origin_message_id.is_server() {
+            return Result::Err(message_links_unavailable);
+        }
+        if ctx.is_monoforum_channel_dialog(origin_message_full_id.get_dialog_id()) {
+            return Result::Err(direct_messages_unavailable);
+        }
+        return Result::Ok(());
+    }
+    if ctx.is_monoforum_channel_dialog(dialog_id) {
+        return Result::Err(direct_messages_unavailable);
+    }
+    if m.message_id.is_yet_unsent() {
+        return Result::Err(Status::error(400, "Message is not sent yet"));
+    }
+    if m.message_id.is_scheduled() {
+        return Result::Err(Status::error(400, "Message is scheduled"));
+    }
+    if !m.message_id.is_server() {
+        return Result::Err(Status::error(400, "Message is local"));
+    }
+    Result::Ok(())
+}
+
+/// `MessagesManager::get_poll_option_properties`
+/// (MessagesManager.cpp:15499-15516) — the request wrapper: the dialog
+/// access gate, the message/content checks, the flag table, then the
+/// `get_message_content_poll_option_properties` delegate (ported in
+/// message_content.rs).
+pub fn get_poll_option_properties_request(
+    ctx: &dyn SendMessageContext,
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    option_id: &str,
+    mut promise: tdutils::promise::Promise<td_api::PollOptionProperties>,
+) {
+    // `check_dialog_access(dialog_id, true, AccessRights::Read,
+    // "get_poll_option_properties")` — the in-memory gate; the db-load and
+    // rights halves are the dialog-db / dialog-manager seams.
+    if manager.get_dialog(dialog_id).is_none() {
+        if !dialog_id.is_valid() {
+            promise.set_error(Status::error(400, "Invalid chat identifier specified"));
+        } else {
+            promise.set_error(Status::error(400, "Chat not found"));
+        }
+        return;
+    }
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        unreachable!("checked above");
+    };
+    let Some(m) = get_message_in_dialog(d, message_id) else {
+        promise.set_error(Status::error(400, "Poll not found"));
+        return;
+    };
+    if m.ephemeral_message.is_some() || !matches!(m.content, Some(MessageContent::Poll(_))) {
+        promise.set_error(Status::error(400, "Poll not found"));
+        return;
+    }
+    let content = m.content.as_ref().expect("poll content checked above");
+    let can_be_forwarded = can_forward_message(ctx, dialog_id, Some(m), false);
+    let can_be_replied = can_reply_to_message(ctx, d, message_id, Some(m));
+    let can_be_replied_in_another_chat =
+        can_reply_to_message_in_another_dialog(ctx, dialog_id, Some(m), can_be_forwarded);
+    let can_get_media_timestamp_links =
+        can_get_media_timestamp_link(ctx, dialog_id, Some(m)).is_ok();
+    let can_get_link = can_get_media_timestamp_links && dialog_id.get_type() == DialogType::Channel;
+    get_message_content_poll_option_properties(
+        ctx.content_context(),
+        content,
+        option_id,
+        dialog_id,
+        crate::message_content::to_chat_manager_message_id(message_id),
+        can_be_replied,
+        can_be_replied_in_another_chat,
+        can_get_link,
+        is_message_forward(m),
+        m.is_outgoing || dialog_id == ctx.get_my_dialog_id(),
+        promise,
+    );
+}
+
+/// `MessagesManager::have_message_force(MessageFullId, source)`
+/// (MessagesManager.cpp:13829-13840) — the request-gate form; the db-load
+/// leg is the dialog-db receive seam.
+pub fn have_message_request(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> bool {
+    manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| get_message_in_dialog(d, message_id).is_some())
+}
+
+/// `MessagesManager::get_message_force(DialogId, MessageId, source)` —
+/// the request-gate read; the db-load leg is the dialog-db receive seam.
+pub fn get_message_for_request(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> Option<&Message> {
+    manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message_in_dialog(d, message_id))
+}
+
+/// `MessagesManager::read_all_dialog_poll_votes`
+/// (MessagesManager.cpp:9301-9324) — the readAllChatPollVotes/
+/// readAllForumTopicPollVotes wrapper: the access gate, the topic gate,
+/// the local unread-vote clear, then the
+/// `read_all_dialog_poll_votes_on_server` net tail (the dispatcher answers
+/// nothing on `Ok` — the C++ ok waits for the server ack).
+pub fn read_all_dialog_poll_votes_request(
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+) -> Result<(), Status> {
+    // `check_dialog_access(dialog_id, true, AccessRights::Read,
+    // "read_all_dialog_poll_votes")` — the in-memory gate; the db-load leg
+    // is the dialog-db receive seam.
+    if manager.get_dialog(dialog_id).is_none() {
+        if !dialog_id.is_valid() {
+            return Result::Err(Status::error(400, "Invalid chat identifier specified"));
+        }
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    if !state.have_input_peer(dialog_id, true) {
+        return Result::Err(Status::error(400, "Can't access the chat"));
+    }
+    can_use_forum_topic_id(manager, dialog_id, forum_topic_id)?;
+    read_all_local_dialog_poll_votes(ctx, manager, dialog_id, forum_topic_id);
+    // `read_all_dialog_poll_votes_on_server` — [blocked: net]
+    tracing::info!(
+        "read_all_dialog_poll_votes_on_server seam: dialog {dialog_id:?} topic {}",
+        forum_topic_id.get()
+    );
+    Result::Ok(())
+}
+
+/// `MessagesManager::can_get_message_poll_vote_statistics`
+/// (MessagesManager.cpp:8379-8393) — the getPollVoteStatistics gate.
+pub fn can_get_message_poll_vote_statistics(
+    ctx: &dyn SendMessageContext,
+    manager: &MessagesManager,
+    state: &dyn ReadStateContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> bool {
+    if ctx.is_bot() {
+        return false;
+    }
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return false;
+    };
+    let Some(m) = get_message_in_dialog(d, message_id) else {
+        return false;
+    };
+    if !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || !matches!(m.content, Some(MessageContent::Poll(_)))
+        || !state.have_input_peer(dialog_id, false)
+    {
+        return false;
+    }
+    get_message_content_poll_can_view_stats(
+        ctx.content_context(),
+        m.content.as_ref().expect("poll content checked above"),
+    )
+}
+
+/// `MessagesManager::get_forum_topic_history` (MessagesManager.cpp:18177-18193)
+/// — the request wrapper: the dialog/topic gates answer here; the
+/// `is_forum` check rides the forum-topic manager seam (the env answers ok)
+/// and the `get_message_thread_history` read is the M.10 thread-history
+/// seam (the dispatcher answers the getChatMessageByDate db-seam retry
+/// error on `Ok`).
+pub fn get_forum_topic_history_request(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+    from_message_id: MessageId,
+    offset: i32,
+    limit: i32,
+) -> Result<(), Status> {
+    let _ = (from_message_id, offset, limit);
+    if manager.get_dialog(dialog_id).is_none() {
+        // `get_dialog_force(dialog_id, "get_forum_topic_history")` — the
+        // db-load leg is the dialog-db receive seam
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    // `dialog_manager_->have_input_peer(dialog_id, true, AccessRights::Read)`
+    // — the rights half is the dialog-manager seam
+    if !forum_topic_id.is_valid() {
+        return Result::Err(Status::error(
+            400,
+            "Invalid forum topic identifier specified",
+        ));
+    }
+    // `forum_topic_manager_->is_forum(dialog_id, true)` — the forum check
+    // rides the forum-topic manager seam (the default env answers ok).
+    tracing::info!(
+        "get_message_thread_history seam: dialog {dialog_id:?} topic {}",
+        forum_topic_id.get()
+    );
     Result::Ok(())
 }
 

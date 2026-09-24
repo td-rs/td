@@ -14942,6 +14942,308 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        // --- the Misc arm group (2026-09-24): the TD-local glue +
+        // pure-server query remainder, in Requests.cpp function order.
+        // The validation halves answer byte-parity offline; the net/db
+        // tails stay [blocked: net] / seam per arm ---
+        Function::getPollOptionProperties(request) => {
+            // Requests.cpp:2666-2670 → MessagesManager.cpp:15499-15516
+            // (no CHECK_IS_USER in the C++)
+            let promise = td.deferred_promise::<td_api::PollOptionProperties, _>(
+                id,
+                Object::pollOptionProperties,
+            );
+            let manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+            crate::messages_manager::get_poll_option_properties_request(
+                ctx,
+                &manager,
+                MmDialogId::new(request.chat_id),
+                MessageId::new(request.message_id),
+                &request.poll_option_id,
+                promise,
+            );
+            td.messages_manager = manager;
+        }
+        Function::getGroupsInCommon(request) => {
+            // Requests.cpp:3453-3456 → GetGroupsInCommonRequest
+            // (Requests.cpp:496-515): the common-dialog read is the
+            // CommonDialogManager seam — the request stays unanswered
+            // exactly like the C++ actor without a network.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _ = (request.offset_chat_id, request.limit);
+        }
+        Function::readAllChatPollVotes(request) => {
+            // Requests.cpp:4200-4204 → MessagesManager.cpp:9301-9324: the
+            // ok waits for the server ack, so the `Ok` arm answers nothing
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let result = crate::messages_manager::read_all_dialog_poll_votes_request(
+                ctx,
+                state,
+                &mut manager,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::default(),
+            );
+            td.messages_manager = manager;
+            if let Err(status) = result {
+                td.send_error_impl(id, status.code(), status.message());
+            }
+        }
+        Function::readAllForumTopicPollVotes(request) => {
+            // Requests.cpp:4206-4213: the topic-id zero gate answers in the
+            // dispatcher before the manager call
+            if !check_is_user(td, id) {
+                return;
+            }
+            if request.forum_topic_id == 0 {
+                return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
+            }
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let result = crate::messages_manager::read_all_dialog_poll_votes_request(
+                ctx,
+                state,
+                &mut manager,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+            );
+            td.messages_manager = manager;
+            if let Err(status) = result {
+                td.send_error_impl(id, status.code(), status.message());
+            }
+        }
+        Function::loadQuickReplyShortcuts(_) => {
+            // Requests.cpp:4604-4607 → QuickReplyManager.cpp:1126-1137:
+            // the loaded fast path joins the intake port; the reload parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            td.quick_reply_manager.get_quick_reply_shortcuts(promise);
+        }
+        Function::getForumTopicHistory(request) => {
+            // Requests.cpp:4854-4858 → MessagesManager.cpp:18177-18193:
+            // the gates answer here; the thread-history read follows the
+            // getChatMessageByDate db-seam caller-retry contract
+            if !check_is_user(td, id) {
+                return;
+            }
+            let manager = std::mem::take(&mut td.messages_manager);
+            let result = crate::messages_manager::get_forum_topic_history_request(
+                &manager,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+                MessageId::new(request.from_message_id),
+                request.offset,
+                request.limit,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => {
+                    // the thread-history read parks on the db seam
+                    // ([blocked: net])
+                    td.send_error_impl(id, 500, "The message history is not loaded yet");
+                }
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getStoryNotificationSettingsExceptions(_) => {
+            // Requests.cpp:5918-5922: the GetStoryNotifySettingsExceptionsQuery
+            // is [blocked: net] — the request stays unanswered like the C++
+            // actor without a network
+            if !check_is_user(td, id) {
+                return;
+            }
+        }
+        Function::approveSuggestedPost(request) => {
+            // Requests.cpp:6370-6374 → MessagesManager.cpp:25405-25417
+            // (no CHECK_IS_USER in the C++)
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            let manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let result = match crate::messages_manager::get_message_for_request(
+                &manager, dialog_id, message_id,
+            ) {
+                None => Err(Status::error(400, "Message not found")),
+                Some(m) => {
+                    if !crate::messages_manager::can_approve_message(ctx, dialog_id, m) {
+                        Err(Status::error(400, "Message can't be used in the method"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            td.messages_manager = manager;
+            match result {
+                // `toggle_suggested_post_approval` — [blocked: net]
+                Ok(()) => {}
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::declineSuggestedPost(request) => {
+            // Requests.cpp:6376-6381 → MessagesManager.cpp:25405-25417
+            let Some(_comment) = clean_or_utf8_error(td, id, &request.comment) else {
+                return;
+            };
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            let manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let result = match crate::messages_manager::get_message_for_request(
+                &manager, dialog_id, message_id,
+            ) {
+                None => Err(Status::error(400, "Message not found")),
+                Some(m) => {
+                    if !crate::messages_manager::can_decline_message(ctx, dialog_id, m) {
+                        Err(Status::error(400, "Message can't be used in the method"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            td.messages_manager = manager;
+            match result {
+                // `toggle_suggested_post_approval` — [blocked: net]
+                Ok(()) => {}
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::setMainProfileTab(request) => {
+            // Requests.cpp:6791-6795 → UserManager.cpp:6688-6721: the
+            // null gate answers here; the SetMainProfileTabQuery send and
+            // the ack-gated user_full write are [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            td.user_manager
+                .set_main_profile_tab(request.main_profile_tab, promise);
+        }
+        Function::addProfileAudio(request) => {
+            // Requests.cpp:7143-7146 → UserManager.cpp:7178-7212: the
+            // input gates answer here; the get_input_file_id resolution,
+            // the encrypted/web gates and the create_audio/upload tail are
+            // the FileManager/AudiosManager seams
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            td.user_manager.add_new_saved_music(request.audio, promise);
+        }
+        Function::getSavedNotificationSound(_request) => {
+            // Requests.cpp:7792-7795 → GetSavedNotificationSoundRequest
+            // (Requests.cpp:1835-1850): the saved-ringtones load is the
+            // NotificationSettingsManager receive seam — the request stays
+            // unanswered like the C++ actor without a network
+            if !check_is_user(td, id) {
+                return;
+            }
+        }
+        Function::getSavedNotificationSounds(_) => {
+            // Requests.cpp:7797-7800 → GetSavedNotificationSoundsRequest
+            // (Requests.cpp:1853-1866): the saved-ringtones load is the
+            // NotificationSettingsManager receive seam
+            if !check_is_user(td, id) {
+                return;
+            }
+        }
+        Function::addSavedNotificationSound(_request) => {
+            // Requests.cpp:7802-7805 → NotificationSettingsManager.cpp:1030:
+            // the close gate + the FileManager ringtone input-id path and
+            // the size/duration checks are the FileManager/AudiosManager
+            // seams; the account.saveRingtone tail is [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+        }
+        Function::removeSavedNotificationSound(_request) => {
+            // Requests.cpp:7808-7811 → RemoveSavedNotificationSoundRequest
+            // (Requests.cpp:1869-1883): the saved-ringtones pmc plane is
+            // the NotificationSettingsManager receive seam
+            if !check_is_user(td, id) {
+                return;
+            }
+        }
+        Function::getPollVoteStatistics(request) => {
+            // Requests.cpp:8116-8119 → StatisticsManager.cpp:888-898: the
+            // messages-manager gates answer here; the GetPollStatsQuery
+            // parks in the statistics manager
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::PollVoteStatistics, _>(id, Object::pollVoteStatistics);
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            let manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let result = if !crate::messages_manager::have_message_request(
+                &manager, dialog_id, message_id,
+            ) {
+                Err(Status::error(400, "Message not found"))
+            } else if !crate::messages_manager::can_get_message_poll_vote_statistics(
+                ctx, &manager, state, dialog_id, message_id,
+            ) {
+                Err(Status::error(400, "Poll statistics are inaccessible"))
+            } else {
+                Ok(())
+            };
+            td.messages_manager = manager;
+            if let Err(status) = result {
+                td.send_error_impl(id, status.code(), status.message());
+                return;
+            }
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_poll_statistics(
+                &mut env,
+                MessageFullId::new(dialog_id, message_id),
+                request.is_dark,
+                promise,
+            );
+        }
+        Function::canPurchaseFromStore(_request) => {
+            // Requests.cpp:9202-9205 → Premium.cpp:1444-1446: the
+            // CanPurchasePremiumQuery send (with the store purpose) is the
+            // seam; the promise parks in the premium manager
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.can_purchase_premium(&mut env, promise);
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -15789,12 +16091,20 @@ mod request_census_tests {
         // reorderBotActiveUsernames, setBotProfilePhoto,
         // toggleBotCanManageEmojiStatus, toggleBotUsernameIsActive (871 + 5 = 876
         // dispatched / 125 interim).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
+        // The Misc slice flipped 18 arms: checkQuickReplyShortcutName (sync),
+        // getPollOptionProperties, getGroupsInCommon, readAllChatPollVotes,
+        // readAllForumTopicPollVotes, loadQuickReplyShortcuts,
+        // getForumTopicHistory, getStoryNotificationSettingsExceptions,
+        // approveSuggestedPost, declineSuggestedPost, setMainProfileTab,
+        // addProfileAudio, the four saved-notification-sound arms,
+        // getPollVoteStatistics, canPurchaseFromStore (876 + 17 = 893
+        // dispatched / 125 - 18 = 107 interim; sync 21 + 1 = 22).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 22, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            876,
+            893,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 125, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 107, "interim count");
     }
 }

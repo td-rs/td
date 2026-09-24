@@ -96,9 +96,10 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::searchStringsByPrefix(_)
             | Function::getLanguagePackString(_)
             | Function::getChatFolderDefaultIconName(_)
+            | Function::checkQuickReplyShortcutName(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
     // Not ported yet (need their managers): searchQuote,
-    // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
+    // getCountryFlagEmoji, cleanFileName,
     // getPhoneNumberInfoSync, getPushReceiverId.
 }
 
@@ -212,6 +213,16 @@ pub fn run_request(function: Function) -> Object {
             let icon_name =
                 crate::dialog_filter_manager::DialogFilter::get_default_icon_name(&folder);
             Object::chatFolderIcon(td_api::ChatFolderIcon { name: icon_name })
+        }
+        // `SynchronousRequests::do_request(checkQuickReplyShortcutName)`
+        // (SynchronousRequests.cpp:248-255) — the pure
+        // `QuickReplyManager::check_shortcut_name` static; the error code
+        // is the sync-handler 200, not the status's own code.
+        Function::checkQuickReplyShortcutName(request) => {
+            match crate::quick_reply_manager::check_shortcut_name(&request.name) {
+                Ok(()) => Object::ok(td_api::Ok),
+                Err(status) => make_error(200, status.message()),
+            }
         }
         Function::getJsonValue(request) => match get_json_value(&request.json) {
             Result::Ok(value) => json_value_object(value),
