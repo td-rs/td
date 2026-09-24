@@ -5,13 +5,13 @@
 //! (`request_set_`), the `send_result`/`send_error` semantics and the
 //! close/destroy machine.
 //!
-//! S76 adds the walking-skeleton live path: the [`NetBridge`](crate::net)
-//! session (spawned by `init`, updates flowing back through `OnNetUpdate`),
-//! the authorization requests over the bridge (phone → code → 2FA → Ready,
-//! or the persisted-state resume), `getMe`, the Saved-Messages text
-//! `sendMessage` (the temporary-message flow) and the update receive path
-//! (`updateUser`/`updateNewChat`/`updateChatReadInbox`/`updateNewMessage`/
-//! `updateChatLastMessage`).
+//! The net step replaces the S76 walking-skeleton bridge with the C++
+//! actor-shaped stack: the queries dispatch through the client-side
+//! `NetQueryDispatcher`, whose `SessionSink`/`DcInitSink` are the
+//! `NetRouter` pools (`session_multi_proxy.rs`, the `SessionMultiProxy`
+//! port), the auth queries ride the same dispatcher with the
+//! `DcAuthManager` gating DC init, and updates flow back through the
+//! shared `NetEventQueue` (drained by the actor pump).
 //!
 //! Divergences (each arrives with its Wave-1 step):
 //! - the database opens synchronously in the actor; the C++ hops to a
@@ -27,9 +27,9 @@
 //!   the Td's own actor timeout slot; the ConfigRecoverer rides with it —
 //!   created at the manager's `start_up`, its dispatched fetches parked
 //!   until their executors, its wakeup sharing the same timeout slot.
-//! - the S76 bridge is one dedicated thread with a blocking query API (the
-//!   C++ runs the net stack as actors; the observable JSON behavior is
-//!   identical for the single-client skeleton).
+//! - the session drivers are plain threads over the shared `NetShared`
+//!   (the C++ runs the net stack as actors; the observable JSON behavior
+//!   is identical for the single-client skeleton).
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -44,19 +44,28 @@ use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
-use tdnet::net_query::{NetQuery, NetQueryDispatcher};
+use tdnet::net_query::{
+    AuthFlag, DcId, GzipFlag, NetQuery, NetQueryCallback, NetQueryDispatcher, NetQueryType,
+};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
-use crate::auth_manager::{AuthManager, AuthQuerySender};
+use crate::auth_data_shared::{
+    AuthDataShared, AuthDataSnapshot, NetEvent, NetEventQueue, QueueWaker, load_auth_key_from_pmc,
+    load_salts_from_pmc, save_auth_key_to_pmc, save_salts_to_pmc,
+};
+use crate::auth_dispatch::{
+    AuthAnswer, AuthPendingKind, build_auth_net_function, build_check_password_function,
+    parse_auth_answer,
+};
+use crate::auth_manager::AuthManager;
 use crate::chat_manager::{
-    ChannelId, ChannelType, ChatId, ChatManager, DcId, MessageId, RestrictedRights,
+    ChannelId, ChannelType, ChatId, ChatManager, DcId as ChatDcId, MessageId, RestrictedRights,
 };
 use crate::config_dispatch::{
-    CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
-    build_config_net_query,
+    CompletedNetQueries, ConfigQueryCallback, TdConfigSink, build_config_net_query,
 };
 use crate::config_manager::{
     ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
@@ -69,6 +78,7 @@ use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
 use crate::contact::Contact;
 use crate::convert;
+use crate::dc_auth_manager::{DcAuthManager, DcCompletedQueue};
 use crate::dialog_manager::DialogManager;
 use crate::emoji_status::CustomEmojiId;
 use crate::global::Global;
@@ -80,12 +90,13 @@ use crate::messages_manager::{
     DialogId, EphemeralMessageFullId, FileUploadId, MessageFullId, QuickReplyMessageFullId,
     QuickReplyShortcutId, StoryFullId, StoryId,
 };
-use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
+use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
 use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
+use crate::session_multi_proxy::{NetRouter, NetShared, PublicRsaKeySharedMain, RouterSink};
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
@@ -2033,6 +2044,35 @@ impl crate::messages_manager::DialogReactionsContext for Td {
     }
 }
 
+/// The walking-skeleton + auth in-flight net kinds: a dispatched query's
+/// token maps back to one of these on the answer drain (the C++ delivers
+/// through the query's promise; the skeleton parks the pair instead).
+enum PendingNetKind {
+    Auth(AuthPendingKind),
+    GetMe,
+    GetState,
+}
+
+/// The dispatcher callback for the parked queries: files the completed
+/// `NetQuery` under its token and nudges the `Td` actor (the C++
+/// callback's `send_closure(Td, &Td::on_result)`); the nudge drains the
+/// parked answers through `dispatch_completed_walking`.
+struct NetDispatchCallback {
+    token: u64,
+    completed: Arc<Mutex<Vec<(u64, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl NetQueryCallback for NetDispatchCallback {
+    fn on_result(&mut self, query: NetQuery) {
+        self.completed.lock().push((self.token, query));
+        if let Some(shared) = &self.shared {
+            shared.wake_td();
+        }
+    }
+}
+
 /// The full Td actor: the request entry point and the manager orchestrator.
 pub struct Td {
     callback: Option<Box<dyn TdCallback>>,
@@ -2072,12 +2112,36 @@ pub struct Td {
     pub(crate) config_manager: Option<ConfigManager>,
     /// The client-side `NetQueryDispatcher` (`Td.cpp:914-919`), created in
     /// `init`; the ConfigManager queries and the `pingProxy` main-DC read
-    /// go through it.
-    pub(crate) net_query_dispatcher: Option<NetQueryDispatcher>,
-    /// Queries that passed the dispatcher's DC-init gate, parked with
-    /// their resolved DC by `TdSessionSink` until the Track-G session step
-    /// routes them to real sessions.
-    pub(crate) sent_net_queries: SentNetQueries,
+    /// go through it, and the pool router delivers everything to the
+    /// per-DC session drivers.
+    pub(crate) net_query_dispatcher: Option<Arc<NetQueryDispatcher>>,
+    /// The dispatcher's sink trio — the pool router (`SessionSink` +
+    /// `DcInitSink`), kept out for the close-time pool shutdown and the
+    /// option-mirror sync.
+    pub(crate) net_router: Option<Arc<NetRouter>>,
+    /// The shared driver context (the C++ `G()` session surface).
+    pub(crate) net_shared: Option<Arc<NetShared>>,
+    /// The per-raw-DC shared auth data (`auth<raw>`/`salt<raw>` pmc
+    /// images), built at `init` and shared with the pools and the
+    /// `DcAuthManager`.
+    pub(crate) auth_data_registry: HashMap<i32, Arc<AuthDataShared>>,
+    /// The net-inert test double of the dispatcher's session sink: the
+    /// queries park here instead of driving the live pools (the M.3.8.1
+    /// stand-in shape). Production runs never touch it.
+    #[cfg(test)]
+    pub(crate) sent_net_queries: Arc<Mutex<Vec<(DcId, NetQuery)>>>,
+    /// The net-inert mode switch: a net-inert test Td dispatches through
+    /// the parking sink and a refusing DC-init stand-in — the exact
+    /// M.3.8.1 dispatcher semantics — instead of the net step's pool
+    /// router, so the config-flow tests stay hermetic.
+    #[cfg(test)]
+    pub(crate) inert_net: bool,
+    /// The C++ `Td::dc_auth_manager_` (`DcAuthManager.cpp` — the
+    /// export/import loop), inline on the actor; `None` until `init`
+    /// builds the driver context.
+    pub(crate) dc_auth_manager: Option<DcAuthManager>,
+    /// The dc-auth export/import completions parked by their callbacks.
+    pub(crate) dc_completed_queries: DcCompletedQueue,
     /// Completed ConfigManager queries — `(token, NetQuery)` parked by
     /// `ConfigQueryCallback` (token 0 = the callback-less `TdSink`
     /// stand-in); M.3.8.2 routes them into `on_config_query_result`.
@@ -2397,10 +2461,13 @@ pub struct Td {
     /// promise completions push here and the actor drains at the end of the
     /// turn (the `flush_deferred_results` send_closure hop).
     deferred_results: DeferredResults,
-    /// The S76 network bridge (spawned by `init`; updates flow back through
-    /// `OnNetUpdate`). Idle until the first query, so offline tests stay
-    /// offline.
-    bridge: Option<NetBridge>,
+    /// The parked auth + walking-skeleton net requests: dispatch token →
+    /// (request_id, kind).
+    pending_net: HashMap<u64, (u64, PendingNetKind)>,
+    /// The callback-parked answers: token → the raw query.
+    net_completed: Arc<Mutex<Vec<(u64, NetQuery)>>>,
+    /// The net dispatch token allocator.
+    net_dispatch_token: u64,
     /// The authorized self id (from `auth.authorization`).
     my_id: i64,
     /// The self access hash — `inputPeerUser` for the Saved Messages peer
@@ -2596,8 +2663,16 @@ impl Td {
             connection_creator: None,
             config_manager: None,
             net_query_dispatcher: None,
-            sent_net_queries: Arc::new(std::sync::Mutex::new(Vec::new())),
-            completed_config_queries: Arc::new(std::sync::Mutex::new(Vec::new())),
+            net_router: None,
+            net_shared: None,
+            auth_data_registry: HashMap::new(),
+            #[cfg(test)]
+            sent_net_queries: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            inert_net: false,
+            dc_auth_manager: None,
+            dc_completed_queries: DcCompletedQueue::new(),
+            completed_config_queries: Arc::new(Mutex::new(Vec::new())),
             config_recoverer: None,
             pending_recoverer_fetches: Vec::new(),
             recoverer_wakeup_at: 0.0,
@@ -2711,7 +2786,9 @@ impl Td {
             messages_manager: crate::messages_manager::MessagesManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
-            bridge: None,
+            pending_net: HashMap::new(),
+            net_completed: Arc::new(Mutex::new(Vec::new())),
+            net_dispatch_token: 1,
             my_id: 0,
             my_access_hash: 0,
             users: HashMap::new(),
@@ -2743,6 +2820,7 @@ impl Td {
         // immediately in the C++ (send_closure from the manager); the
         // collapse queues them. The deferred promise completions answer
         // through the same end-of-turn hop.
+        self.drain_net_events();
         self.flush_user_updates();
         self.flush_deferred_results();
     }
@@ -2917,39 +2995,6 @@ impl Td {
                 .on_binlog_events(&mut env, notification_settings_events);
         }
 
-        // The S76 bridge thread (updates flow back through OnNetUpdate).
-        // Idle until the first query, so the offline tests stay offline.
-        // Spawned only under an actor scheduler (the live runs); the
-        // direct-call tests drive `Td::init` without one, and both
-        // `actor_id_of` and `instance_ptr` need the scheduler TLS.
-        if Scheduler::in_scheduler_context() {
-            let actor_id = self.actor_id_of::<Td>();
-            let config = BridgeConfig {
-                api_id: parameters.api_id,
-                api_hash: parameters.api_hash.clone(),
-                use_test_dc: parameters.use_test_dc,
-                database_directory: parameters.database_directory.clone(),
-                device_model: self.header_options.device_model.clone(),
-                system_version: self.header_options.system_version.clone(),
-                application_version: self.header_options.application_version.clone(),
-                system_language_code: self.header_options.system_language_code.clone(),
-            };
-            self.bridge = Some(NetBridge::spawn(
-                config,
-                actor_id,
-                Scheduler::instance_ptr(),
-            ));
-        }
-
-        // A persisted walking-skeleton session resumes straight to Ready
-        // (the C++ AuthManager ctor reading the binlog "auth" key — zero
-        // network); the self user is re-queried over the bridge.
-        let resumed_user = if NetBridge::has_persisted_state(&parameters.database_directory) {
-            self.query_users_me()
-        } else {
-            None
-        };
-
         // init_options_and_network, the M.1 + ConfigManager subset: the
         // OptionManager over the db config pmc, then the ConfigManager
         // (StateManager/OnlineManager arrive with their steps; the
@@ -2964,11 +3009,6 @@ impl Td {
             let unix_time = self.global.unix_time();
             let mut option_manager = OptionManager::new(is_test_dc);
             option_manager.attach_pmc(config_pmc, unix_time);
-            if let Some(user) = &resumed_user {
-                // `UserManager::set_my_id` — the C++ config pmc persists it
-                // and the option storm on reopen carries it.
-                option_manager.set_option_integer("my_id", user.id);
-            }
             self.option_manager = Some(option_manager);
         }
         // The option storm starts with unix_time (the C++ ctor broadcasts
@@ -3032,19 +3072,135 @@ impl Td {
             header_options.is_emulator = option_manager.get_option_boolean("is_emulator", false);
         }
 
-        // VLOG "Create NetQueryDispatcher" (Td.cpp:914-919): the
-        // client-side dispatcher over the session/td sinks — the
-        // ConfigManager queries dispatch through it below; the pending
-        // pingProxy requests complete once their main-DC reads go through
-        // it.
-        self.net_query_dispatcher = Some(NetQueryDispatcher::new(
-            Box::new(TdSessionSink {
-                sent: self.sent_net_queries.clone(),
-            }),
+        // VLOG "Create NetQueryDispatcher" (Td.cpp:914-919) + the net
+        // step's session wiring: the per-DC shared auth data (the
+        // `auth<raw>`/`salt<raw>` pmc images), the driver context, the
+        // pool router and the DcAuthManager — the C++ lazy
+        // `wait_dc_init` body, hoisted to init where the pmc lives.
+        let net_events = NetEventQueue::new();
+        let server_time_difference = self.global.get_server_time_difference();
+        {
+            let mut registry = HashMap::new();
+            let binlog_pmc = self.global.binlog_pmc();
+            // The internal DCs are 1..=5 (DcId.h) — the C++ creates the
+            // shared auth data per DC on demand; the pmc images read the
+            // same keys.
+            for raw in 1..=5i32 {
+                let dc_id = DcId::internal(raw);
+                let snapshot = AuthDataSnapshot {
+                    auth_key: load_auth_key_from_pmc(binlog_pmc, dc_id),
+                    future_salts: load_salts_from_pmc(binlog_pmc, dc_id),
+                    server_time_difference,
+                };
+                registry.insert(
+                    raw,
+                    AuthDataShared::new(dc_id, snapshot, net_events.clone()),
+                );
+            }
+            self.auth_data_registry = registry;
+        }
+        let scheduler = if Scheduler::in_scheduler_context() {
+            Some(Scheduler::instance_ptr())
+        } else {
+            None
+        };
+        let td_actor_id = if Scheduler::in_scheduler_context() {
+            Some(self.actor_id_of::<Td>())
+        } else {
+            None
+        };
+        // The queue's pushes wake the actor (the C++
+        // `send_closure_later(G()->td(), ...)` hop); inert without the
+        // scheduler context (the direct-call tests pump manually).
+        net_events.set_waker(QueueWaker::new(scheduler, td_actor_id.clone()));
+        // The constructor's binlog restore (NetQueryDispatcher.cpp:373-376
+        // + DcAuthManager.cpp:30-42): the pmc `"main_dc_id"`, defaulting
+        // to 1.
+        let main_dc_raw = {
+            let stored = self.global.binlog_pmc().get("main_dc_id");
+            let parsed: i32 = stored.trim().parse().unwrap_or(0);
+            if parsed != 0 && DcId::is_valid_raw(parsed) {
+                parsed
+            } else {
+                1
+            }
+        };
+        let is_test_dc = self.global.is_test_dc();
+        let shared = Arc::new(NetShared {
+            td: td_actor_id,
+            scheduler,
+            events: net_events,
+            header: Mutex::new(gen_default_header(&self.header_options)),
+            dc_options: Mutex::new(
+                self.connection_creator
+                    .as_ref()
+                    .map(|creator| creator.dc_options().to_vec())
+                    .unwrap_or_default(),
+            ),
+            is_test_dc,
+            main_dc_id: Arc::new(std::sync::atomic::AtomicI32::new(main_dc_raw)),
+            public_rsa_key: Arc::new(PublicRsaKeySharedMain::create(is_test_dc)),
+        });
+        let (session_count, is_premium) = {
+            let option_manager = self
+                .option_manager
+                .as_ref()
+                .expect("option manager just set");
+            (
+                option_manager.get_option_integer("session_count", 1) as i32,
+                option_manager.get_option_boolean("is_premium", false),
+            )
+        };
+        let router = Arc::new(NetRouter::new(
+            shared.clone(),
+            self.auth_data_registry.clone(),
+            session_count,
+            is_premium,
+        ));
+        // The net-inert tests keep the M.3.8.1 dispatcher semantics: the
+        // queries park in `sent_net_queries` and every DC-init is
+        // refused — nothing reaches the network. Production (and the
+        // net-step tests) route through the pool router.
+        #[cfg(test)]
+        let (session_sink, dc_init_sink): (
+            Box<dyn tdnet::net_query::SessionSink>,
+            Box<dyn tdnet::net_query::DcInitSink>,
+        ) = if self.inert_net {
+            (
+                Box::new(crate::config_dispatch::TdSessionSink {
+                    sent: self.sent_net_queries.clone(),
+                }),
+                Box::new(InertDcInit),
+            )
+        } else {
+            (
+                Box::new(RouterSink(router.clone())),
+                Box::new(RouterSink(router.clone())),
+            )
+        };
+        #[cfg(not(test))]
+        let (session_sink, dc_init_sink) = (
+            Box::new(RouterSink(router.clone())) as Box<dyn tdnet::net_query::SessionSink>,
+            Box::new(RouterSink(router.clone())) as Box<dyn tdnet::net_query::DcInitSink>,
+        );
+        let dispatcher = NetQueryDispatcher::new(
+            session_sink,
             Box::new(TdConfigSink {
                 completed: self.completed_config_queries.clone(),
             }),
-        ));
+            dc_init_sink,
+        );
+        if main_dc_raw != 1 {
+            dispatcher.load_main_dc_id(main_dc_raw);
+        }
+        self.net_query_dispatcher = Some(Arc::new(dispatcher));
+        self.net_router = Some(router);
+        self.net_shared = Some(shared.clone());
+        let mut dc_auth_manager = DcAuthManager::new(shared, self.dc_completed_queries.clone());
+        if main_dc_raw != 1 {
+            dc_auth_manager.update_main_dc(DcId::internal(main_dc_raw));
+        }
+        self.dc_auth_manager = Some(dc_auth_manager);
 
         // VLOG "Create AuthManager" (Td.cpp:923-926) + the constructor pmc
         // restore (AuthManager.cpp:337-366).
@@ -3052,21 +3208,16 @@ impl Td {
             .set_api_credentials(parameters.api_id, parameters.api_hash.clone());
         self.password_manager
             .set_api_credentials(parameters.api_id, parameters.api_hash.clone());
-        if let Some(user) = resumed_user {
-            // The walking-skeleton resume: Ready + the cached self user (the
-            // C++ emits Ready from the binlog restore and reads the user
-            // from the UserManager cache — no updateUser broadcast).
-            self.auth_manager.set_state_ok();
-            self.apply_self_user(&user, false);
-            self.init_notification_manager();
-            self.init_attach_menu_manager();
-            self.init_terms_of_service_manager();
-            self.on_web_browser_authorization_success();
-        } else {
+        {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
             match auth_str.as_str() {
                 "ok" => {
+                    // AuthManager.cpp:355 — the restore path checks the
+                    // authorization on the sessions.
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.check_authorization_is_ok();
+                    }
                     let is_bot = binlog_pmc.get("auth_is_bot") == "true";
                     // `UserManager::load_my_id()` + the my_id option
                     // (AuthManager.cpp:342-348); the fallback
@@ -3096,6 +3247,13 @@ impl Td {
                     tracing::warn!("Continue to destroy auth keys");
                     self.auth_manager
                         .restore_from_pmc("destroy", false, String::new());
+                    // AuthManager.cpp:373-377 + `start_up`: the continued
+                    // destroy runs `destroy_auth_keys` — the DcAuthManager
+                    // flag half (the promise→`Td::destroy` half is the
+                    // close machine's).
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.destroy();
+                    }
                 }
                 _ => {
                     // `if (!load_state()) update_state(State::WaitPhoneNumber)`
@@ -3299,10 +3457,10 @@ impl Td {
             .set_context(Box::new(TdFilePlane(Arc::clone(&self.file_shared))));
         let dlds_records = self.global.binlog_pmc().prefix_get("dlds");
         self.file_shared.lock().dlds_preload(dlds_records);
-        // the live nets install (T.9): the bridge handle + the shared
+        // the live nets install (T.9): the dispatcher + the shared
         // snapshot fill the factory cell, and the file-name counters
         // preload from the pmc (FileLoaderUtils.cpp:85-92, 116-122)
-        let bridge_handle = self.bridge.as_ref().map(NetBridge::handle);
+        let live_dispatcher = self.net_query_dispatcher.clone();
         let tmp_file_id = self
             .global
             .binlog_pmc()
@@ -3318,9 +3476,9 @@ impl Td {
         self.file_shared
             .lock()
             .preload_file_name_counters(tmp_file_id, perm_file_id);
-        if let Some(bridge_handle) = bridge_handle {
+        if let Some(live_dispatcher) = live_dispatcher {
             let live_factory = TdFileLoadNetFactory::new();
-            live_factory.install(bridge_handle, Arc::clone(&self.file_shared));
+            live_factory.install(live_dispatcher, Arc::clone(&self.file_shared));
             self.file_load_manager
                 .lock()
                 .set_factory(Box::new(live_factory));
@@ -3692,15 +3850,17 @@ impl Td {
         if let Some(dispatcher) = self.net_query_dispatcher.take() {
             dispatcher.stop();
         }
-        for (_, mut net_query) in std::mem::take(&mut *self.sent_net_queries.lock().unwrap()) {
-            net_query.set_error(config_result::request_aborted_error());
-            if let Some(mut callback) = net_query.move_callback() {
-                callback.on_result(net_query);
-            }
+        // The pool shutdown: every session driver fails its in-flight
+        // queries with "Request aborted" (the C++ per-DC
+        // SessionMultiProxy resets in `stop`, NetQueryDispatcher.cpp:290-295).
+        if let Some(router) = self.net_router.take() {
+            router.close();
         }
+        self.net_shared = None;
+        self.dc_auth_manager = None;
+        self.auth_data_registry.clear();
         self.drain_config_net_query_completions();
-        self.sent_net_queries.lock().unwrap().clear();
-        self.completed_config_queries.lock().unwrap().clear();
+        self.completed_config_queries.lock().clear();
 
         // The files cluster's hangup half (the C++ resets the manager
         // actors in `Td::clear`, Td.cpp:707-712): the stored planes drop
@@ -3872,6 +4032,11 @@ impl Td {
             return;
         };
         connection_creator.on_dc_options(options, seed, is_test_dc, self.global.binlog_pmc());
+        // The session drivers read the same merged option list (the
+        // C++ ConnectionCreator hands connections out directly).
+        if let Some(shared) = self.net_shared.as_ref() {
+            *shared.dc_options.lock() = connection_creator.dc_options().to_vec();
+        }
     }
 
     /// Complete the requests a ConfigManager call produced and hold its
@@ -4377,8 +4542,290 @@ impl Td {
         };
         let is_bot = self.auth_manager.is_bot();
         let (net_query, token) = build_config_net_query(&query, dispatcher.next_query_id(), is_bot);
-        let callback = ConfigQueryCallback::new(token, self.completed_config_queries.clone());
+        let callback = ConfigQueryCallback::with_wake(
+            token,
+            self.completed_config_queries.clone(),
+            self.net_shared.clone(),
+        );
         dispatcher.dispatch_with_callback(net_query, Box::new(callback));
+    }
+
+    pub(crate) fn drain_net_events(&mut self) {
+        let Some(shared) = self.net_shared.as_ref() else {
+            return;
+        };
+        for event in shared.events.take() {
+            match event {
+                NetEvent::UpdatePacket(packet) => {
+                    // The walking-skeleton intake (the M.7 engine consumes
+                    // these once it lands; the skeleton converts them).
+                    self.on_net_update(packet);
+                }
+                NetEvent::ServerTimeDifference {
+                    raw_dc_id,
+                    diff,
+                    force,
+                } => {
+                    if let Some(options) = self.option_manager.as_mut() {
+                        self.global
+                            .update_server_time_difference(diff, force, options);
+                    }
+                    if let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id) {
+                        shared_auth.set_server_time_difference(diff);
+                    }
+                }
+                NetEvent::PersistAuthKey { raw_dc_id } => {
+                    if let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id) {
+                        let auth_key = shared_auth.get_auth_key();
+                        save_auth_key_to_pmc(
+                            self.global.binlog_pmc(),
+                            DcId::internal(raw_dc_id),
+                            &auth_key,
+                        );
+                    }
+                }
+                NetEvent::PersistSalts { raw_dc_id } => {
+                    if let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id) {
+                        let salts = shared_auth.get_future_salts();
+                        save_salts_to_pmc(
+                            self.global.binlog_pmc(),
+                            DcId::internal(raw_dc_id),
+                            &salts,
+                        );
+                    }
+                }
+                NetEvent::PersistMainDc(raw_dc_id) => {
+                    self.global
+                        .binlog_pmc()
+                        .set("main_dc_id", &raw_dc_id.to_string());
+                }
+                NetEvent::MainDcChanged(raw_dc_id) => {
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.update_main_dc(DcId::internal(raw_dc_id));
+                    }
+                }
+                NetEvent::DcAdded { raw_dc_id } => {
+                    let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id).cloned() else {
+                        continue;
+                    };
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.add_dc(shared_auth);
+                    }
+                }
+                NetEvent::AuthKeyChanged { raw_dc_id } => {
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.update_auth_key_state(raw_dc_id);
+                    }
+                }
+                NetEvent::SignInMainDc { raw_dc_id } => {
+                    // Session.cpp:902-904 — the sign-in answers set the
+                    // main DC (the dispatcher dedups).
+                    if let Some(dispatcher) = self.net_query_dispatcher.as_ref() {
+                        dispatcher.set_main_dc_id(raw_dc_id);
+                    }
+                }
+                NetEvent::Unauthorized { message } => {
+                    // Session.cpp:963-967's `G()->log_out(message)` — the
+                    // auth-side destroy keys (AuthManager.cpp:1452-1466).
+                    self.auth_manager.destroy_auth_keys_impl();
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.destroy();
+                    }
+                    tracing::warn!("Log out: {message}");
+                }
+                NetEvent::QueryResult(query) => {
+                    self.completed_config_queries.lock().push((0, query));
+                }
+            }
+        }
+        // The dc-auth completions, then the loop (the C++ `loop` runs
+        // after every state touch).
+        let Some(dispatcher) = self.net_query_dispatcher.as_ref() else {
+            return;
+        };
+        let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() else {
+            return;
+        };
+        for (raw_dc_id, query) in dc_auth_manager.take_completed() {
+            dc_auth_manager.on_result(raw_dc_id, query);
+        }
+        dc_auth_manager.loop_(dispatcher, || dispatcher.next_query_id());
+        // The callback-parked completions (each callback nudged us here):
+        // the M.3.8.2 config token dispatch, then the auth +
+        // walking-skeleton answers.
+        self.drain_config_net_query_completions();
+        self.dispatch_completed_walking();
+    }
+
+    /// Drain the callback-parked auth + walking-skeleton answers (the
+    /// driver threads park them; the actor pump routes them here).
+    pub(crate) fn dispatch_completed_walking(&mut self) {
+        let completed = std::mem::take(&mut *self.net_completed.lock());
+        for (token, query) in completed {
+            let Some((request_id, kind)) = self.pending_net.remove(&token) else {
+                continue;
+            };
+            self.on_walking_answer(request_id, kind, query);
+        }
+    }
+
+    /// Route one walking-skeleton answer by kind.
+    fn on_walking_answer(&mut self, request_id: u64, kind: PendingNetKind, query: NetQuery) {
+        let answer: Option<&[u8]> = if query.is_error() {
+            None
+        } else {
+            Some(query.ok())
+        };
+        let error_message: Option<String> = if query.is_error() {
+            Some(query.error().message().to_string())
+        } else {
+            None
+        };
+        let error: Option<&str> = if query.is_error() {
+            Some(query.error().message())
+        } else {
+            None
+        };
+        match kind {
+            PendingNetKind::Auth(kind) => self.on_auth_answer(request_id, kind, answer, error),
+            PendingNetKind::GetMe => {
+                let Some(data) = answer else {
+                    let message =
+                        error_message.unwrap_or_else(|| "the answer is missing".to_string());
+                    return self.send_error_impl(request_id, 500, &message);
+                };
+                match parse_vector_user(data).and_then(|mut users| users.pop()) {
+                    Some(user) => {
+                        self.apply_self_user(&user, false);
+                        if let Some(user) = self.users.get(&self.my_id).cloned() {
+                            self.send_result(request_id, Object::user(user));
+                        } else {
+                            self.send_error_impl(request_id, 500, "Failed to get self user");
+                        }
+                    }
+                    None => self.send_error_impl(
+                        request_id,
+                        500,
+                        "Failed to get information about the user",
+                    ),
+                }
+            }
+            PendingNetKind::GetState => {
+                if let Some(data) = answer
+                    && let Ok(m) = telegram_api::updates_State::parse(data)
+                {
+                    // The M.7 engine: `updates.getState` replays through
+                    // on_get_updates_state (the C++ get_difference chain);
+                    // the S72 set_pts/set_qts/set_seq calls are superseded.
+                    let global = &mut self.global;
+                    let options = self
+                        .option_manager
+                        .as_mut()
+                        .expect("option manager exists after init");
+                    let mut env = TdUpdatesEnv {
+                        global,
+                        options,
+                        auth_is_authorized: self.auth_manager.is_authorized(),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                        my_id: self.user_manager.get_my_id().get(),
+                        can_ignore_background_updates: self.can_ignore_background_updates,
+                    };
+                    self.updates_manager
+                        .on_get_updates_state(&mut env, m, "updates.getState");
+                }
+            }
+        }
+    }
+
+    /// Route one auth answer (the two-step `CheckPassword` re-dispatches
+    /// inside).
+    fn on_auth_answer(
+        &mut self,
+        request_id: u64,
+        kind: AuthPendingKind,
+        answer: Option<&[u8]>,
+        error: Option<&str>,
+    ) {
+        // The sign-in `SESSION_PASSWORD_NEEDED` turn: the C++ fetches the
+        // password state (`account.getPassword`) and answers WaitPassword.
+        if matches!(kind, AuthPendingKind::SignIn) && error == Some("SESSION_PASSWORD_NEEDED") {
+            let function =
+                telegram_api::Function::account_getPassword(telegram_api::account_getPassword);
+            let token = self.park_net(
+                request_id,
+                PendingNetKind::Auth(AuthPendingKind::GetPassword),
+            );
+            return self.dispatch_walking_query(token, function, AuthFlag::On);
+        }
+        match parse_auth_answer(&kind, answer, error) {
+            tdutils::status::Result::Ok(AuthAnswer::SentCode(result)) => {
+                match self.auth_manager.on_sent_code_result(result) {
+                    Ok(()) => {
+                        self.flush_auth_updates();
+                        self.send_result(request_id, ok_object());
+                    }
+                    Err(message) => self.send_error_impl(request_id, 400, &message),
+                }
+            }
+            tdutils::status::Result::Ok(AuthAnswer::Authorization { user_id, user }) => {
+                let result = crate::auth_manager::AuthNetResult::Authorization {
+                    user_id,
+                    terms_of_service: None,
+                };
+                let applied = match kind {
+                    AuthPendingKind::SignIn => self.auth_manager.on_authorization_result(result),
+                    AuthPendingKind::BotToken => self.auth_manager.on_bot_token_result(result),
+                    _ => unreachable!("authorization from an unexpected auth step"),
+                };
+                match applied {
+                    Ok(()) => {
+                        if self.auth_manager.is_authorized() {
+                            self.complete_authorization(request_id, user.as_ref());
+                        } else {
+                            // WaitRegistration — updates then ok.
+                            self.flush_auth_updates();
+                            self.send_result(request_id, ok_object());
+                        }
+                    }
+                    Err(message) => self.send_error_impl(request_id, 400, &message),
+                }
+            }
+            tdutils::status::Result::Ok(AuthAnswer::PasswordSrp { srp }) => {
+                let function = build_check_password_function(srp);
+                let token = self.park_net(
+                    request_id,
+                    PendingNetKind::Auth(AuthPendingKind::CheckPasswordStep2),
+                );
+                self.dispatch_walking_query(token, function, AuthFlag::On);
+            }
+            tdutils::status::Result::Ok(AuthAnswer::PasswordOk { user }) => {
+                match self
+                    .auth_manager
+                    .on_password_result(crate::auth_manager::AuthNetResult::PasswordOk)
+                {
+                    Ok(()) => self.complete_authorization(request_id, user.as_ref()),
+                    Err(message) => self.send_error_impl(request_id, 400, &message),
+                }
+            }
+            tdutils::status::Result::Ok(AuthAnswer::PasswordState {
+                wait_password_state,
+            }) => {
+                self.auth_manager.on_password_needed(wait_password_state);
+                self.flush_auth_updates();
+                self.send_result(request_id, ok_object());
+            }
+            tdutils::status::Result::Ok(AuthAnswer::LoggedOut) => {
+                self.auth_manager.on_logged_out();
+                if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                    dc_auth_manager.destroy();
+                }
+                self.flush_auth_updates();
+                self.send_result(request_id, ok_object());
+            }
+            tdutils::status::Result::Err(status) => {
+                self.send_error_impl(request_id, 400, status.message())
+            }
+        }
     }
 
     /// `G()->unix_time()` — the server-time-corrected wall clock; the value
@@ -4487,7 +4934,7 @@ impl Td {
     /// the dispatcher-stop aborts, the actor flow once the callback
     /// delivery is wired there.
     pub(crate) fn drain_config_net_query_completions(&mut self) {
-        let completions = std::mem::take(&mut *self.completed_config_queries.lock().unwrap());
+        let completions = std::mem::take(&mut *self.completed_config_queries.lock());
         for (token, net_query) in completions {
             self.on_config_net_query_result(token, net_query);
         }
@@ -5426,11 +5873,74 @@ impl Td {
     }
 
     // --------------------------------------------------------------------
-    // The S76 walking-skeleton live paths.
+    // The walking-skeleton live paths (the auth-net slice + the messaging
+    // queries over the NetQueryDispatcher).
     // --------------------------------------------------------------------
 
+    /// The `api_id`/`api_hash` pair for the auth queries.
+    fn auth_params(&self) -> (i32, String) {
+        let parameters = self.parameters.as_ref().expect("parameters");
+        (parameters.api_id, parameters.api_hash.clone())
+    }
+
+    /// Allocate a dispatch token and park the request.
+    fn park_net(&mut self, request_id: u64, kind: PendingNetKind) -> u64 {
+        let token = self.net_dispatch_token;
+        self.net_dispatch_token += 1;
+        self.pending_net.insert(token, (request_id, kind));
+        token
+    }
+
+    /// Serialize + dispatch one walking-skeleton query (the session
+    /// prepends the shared `MtprotoHeader`).
+    fn dispatch_walking_query(
+        &mut self,
+        token: u64,
+        function: telegram_api::Function,
+        auth_flag: AuthFlag,
+    ) {
+        let mut bytes = Vec::new();
+        function.store(&mut bytes);
+        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let dispatcher = self
+            .net_query_dispatcher
+            .as_ref()
+            .expect("the net dispatcher exists");
+        let net_query = NetQuery::new(
+            token,
+            DcId::main(),
+            NetQueryType::Common,
+            auth_flag,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        let callback = NetDispatchCallback {
+            token,
+            completed: self.net_completed.clone(),
+            shared: self.net_shared.clone(),
+        };
+        dispatcher.dispatch_with_callback(net_query, Box::new(callback));
+    }
+
+    /// Dispatch a prepared `AuthNetQuery` and park the request.
+    fn dispatch_auth(
+        &mut self,
+        request_id: u64,
+        kind: AuthPendingKind,
+        query: &crate::auth_manager::AuthNetQuery,
+    ) {
+        let (api_id, api_hash) = self.auth_params();
+        let function = build_auth_net_function(query, api_id, &api_hash);
+        let token = self.park_net(request_id, PendingNetKind::Auth(kind));
+        self.dispatch_walking_query(token, function, AuthFlag::Off);
+    }
+
     /// `setAuthenticationPhoneNumber` (Requests.cpp:1786-1794): the clean
-    /// check, then `AuthManager::set_phone_number` over the bridge.
+    /// check, then `AuthManager::set_phone_number` over the dispatcher —
+    /// the request parks until the `auth.sendCode` answer applies.
     pub(crate) fn set_authentication_phone_number(&mut self, request_id: u64, phone: String) {
         let phone = match crate::misc::clean_input_string(&phone) {
             Some(phone) => phone,
@@ -5438,21 +5948,9 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        let bridge = self.bridge.as_ref().expect("bridge").handle();
-        let params = self.parameters.as_ref().expect("parameters");
-        let mut sender = AuthSender::new(
-            &bridge,
-            params.api_id,
-            params.api_hash.clone(),
-            String::new(),
-        );
-        match self
-            .auth_manager
-            .set_authentication_phone_number(&phone, &mut sender)
-        {
-            Ok(()) => {
-                self.flush_auth_updates();
-                self.send_result(request_id, ok_object());
+        match self.auth_manager.prepare_authentication_phone_number(phone) {
+            Ok(query) => {
+                self.dispatch_auth(request_id, AuthPendingKind::SendCode, &query);
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
@@ -5465,9 +5963,15 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        self.check_code_or_password(request_id, |sender, auth| {
-            auth.check_authentication_bot_token(&token, sender)
-        });
+        match self
+            .auth_manager
+            .prepare_check_authentication_bot_token(token)
+        {
+            Ok(query) => {
+                self.dispatch_auth(request_id, AuthPendingKind::BotToken, &query);
+            }
+            Err(message) => self.send_error_impl(request_id, 400, &message),
+        }
     }
 
     pub(crate) fn check_authentication_code(&mut self, request_id: u64, code: String) {
@@ -5477,9 +5981,28 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        self.check_code_or_password(request_id, |sender, auth| {
-            auth.check_authentication_code(&code, sender)
-        });
+        match self.auth_manager.prepare_check_authentication_code(code) {
+            Ok(query) => {
+                self.dispatch_auth(request_id, AuthPendingKind::SignIn, &query);
+            }
+            Err(message) => self.send_error_impl(request_id, 400, &message),
+        }
+    }
+
+    /// `logOut` (Requests.cpp:1795-1805 + `AuthManager::log_out` over the
+    /// dispatcher).
+    pub(crate) fn log_out(&mut self, request_id: u64) {
+        match self.auth_manager.prepare_log_out() {
+            Ok(Some(query)) => {
+                self.dispatch_auth(request_id, AuthPendingKind::LogOut, &query);
+            }
+            Ok(None) => {
+                // The destroy path without a network round-trip.
+                self.flush_auth_updates();
+                self.send_result(request_id, ok_object());
+            }
+            Err(message) => self.send_error_impl(request_id, 400, &message),
+        }
     }
 
     pub(crate) fn check_authentication_password(&mut self, request_id: u64, password: String) {
@@ -5489,51 +6012,16 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        self.check_code_or_password(request_id, |sender, auth| {
-            auth.check_authentication_password(&password, sender)
-        });
-    }
-
-    /// `checkAuthenticationCode` / `checkAuthenticationPassword` — the
-    /// shared completion: the authorization updates BEFORE the ok, the
-    /// success sequence of `AuthManager::on_get_authorization`
-    /// (authorization_date, my_id, updateUser(self), Ready).
-    fn check_code_or_password(
-        &mut self,
-        request_id: u64,
-        run: impl FnOnce(&mut dyn AuthQuerySender, &mut AuthManager) -> Result<(), String>,
-    ) {
-        let bridge = self.bridge.as_ref().expect("bridge").handle();
-        let params = self.parameters.as_ref().expect("parameters");
-        let mut sender = AuthSender::new(
-            &bridge,
-            params.api_id,
-            params.api_hash.clone(),
-            String::new(),
-        );
-        // The password for the SRP step rides the checkAuthenticationPassword
-        // request; check_authentication_password carries it through the
-        // query (the sender re-fetches account.getPassword for fresh salts).
-        let result = {
-            let mut auth = std::mem::take(&mut self.auth_manager);
-            let outcome = run(&mut sender, &mut auth);
-            self.auth_manager = auth;
-            outcome
-        };
-        match result {
-            Ok(()) => {
-                if self.auth_manager.is_authorized() {
-                    // The ConfigManager's `help.getConfig` step: the
-                    // config-derived options come from the live reply. A
-                    // failed fetch skips them, as in the C++ client when
-                    // the config has not arrived yet.
-                    let config = sender.get_config().ok();
-                    self.complete_authorization(request_id, &sender, config.as_ref());
-                } else {
-                    // WaitRegistration / WaitPassword — updates then ok.
-                    self.flush_auth_updates();
-                    self.send_result(request_id, ok_object());
-                }
+        match self
+            .auth_manager
+            .prepare_check_authentication_password(password.clone())
+        {
+            Ok(query) => {
+                self.dispatch_auth(
+                    request_id,
+                    AuthPendingKind::CheckPassword { password },
+                    &query,
+                );
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
@@ -5544,12 +6032,7 @@ impl Td {
     /// options, authorization_date, my_id, the self user, Ready — then the
     /// ok, `connectionStateUpdating`, the default reaction type and
     /// `connectionStateReady`.
-    fn complete_authorization(
-        &mut self,
-        request_id: u64,
-        sender: &AuthSender<'_>,
-        config: Option<&telegram_api::Config>,
-    ) {
+    fn complete_authorization(&mut self, request_id: u64, user: Option<&telegram_api::user>) {
         self.send_update(Object::updateOption(td_api::updateOption {
             name: "unix_time".to_string(),
             value: Some(td_api::OptionValue::optionValueInteger(
@@ -5559,43 +6042,9 @@ impl Td {
             )),
         }));
 
-        // The ConfigManager-applied options: the `help.getConfig`-derived
-        // subset in the C++ `process_config` emission order the recorder
-        // pins; the search-bot options are app-config sourced.
-        if let Some(option_manager) = self.option_manager.as_mut() {
-            if let Some(config) = config {
-                option_manager.set_option_boolean("test_mode", config.test_mode);
-                option_manager.set_option_integer(
-                    "forwarded_message_count_max",
-                    config.forwarded_count_max as i64,
-                );
-                option_manager
-                    .set_option_integer("basic_group_size_max", config.chat_size_max as i64);
-                option_manager
-                    .set_option_integer("supergroup_size_max", config.megagroup_size_max as i64);
-                option_manager.set_option_boolean("expect_blocking", config.blocked_mode);
-                if !config.me_url_prefix.is_empty() {
-                    let mut url = config.me_url_prefix.clone();
-                    if !url.ends_with('/') {
-                        url.push('/');
-                    }
-                    option_manager.set_option_string("t_me_url", &url);
-                }
-                option_manager.set_option_integer(
-                    "call_connect_timeout_ms",
-                    config.call_connect_timeout_ms as i64,
-                );
-                option_manager.set_option_integer(
-                    "call_packet_timeout_ms",
-                    config.call_packet_timeout_ms as i64,
-                );
-            }
-            option_manager.set_option_string("animation_search_bot_username", "contextbot");
-            option_manager.set_option_string("venue_search_bot_username", "foursquarebot");
-            option_manager.set_option_string("photo_search_bot_username", "imagebot");
-        }
-        self.flush_option_updates();
-
+        // The config-derived options arrive from the ConfigManager's own
+        // `help.getConfig` fetch (dispatched at init — the M.3.8 wiring);
+        // the recorder pins their position, the manager their order.
         self.send_update(Object::updateOption(td_api::updateOption {
             name: "authorization_date".to_string(),
             value: Some(td_api::OptionValue::optionValueInteger(
@@ -5604,7 +6053,7 @@ impl Td {
                 },
             )),
         }));
-        if let Some(user) = sender.last_user() {
+        if let Some(user) = user {
             self.apply_self_user(user, true);
         }
         self.flush_auth_updates();
@@ -5635,35 +6084,11 @@ impl Td {
         ));
 
         // The post-Ready position: `updates.getState` seeds the pts (the
-        // C++ get_difference chain; the skeleton keeps the position).
-        if let Some(owner) = self.bridge.as_ref() {
-            let bridge = owner.handle();
-            let state = telegram_api::Function::updates_getState(telegram_api::updates_getState);
-            if let QueryAnswer::Ok(data) = bridge.query(state)
-                && let Ok(m) = telegram_api::updates_State::parse(&data)
-            {
-                // The M.7 engine: `updates.getState` replays through
-                // on_get_updates_state (the C++ get_difference chain);
-                // the S72 set_pts/set_qts/set_seq calls are superseded.
-                let global = &mut self.global;
-                let options = self
-                    .option_manager
-                    .as_mut()
-                    .expect("option manager exists after init");
-                let mut env = TdUpdatesEnv {
-                    global,
-                    options,
-                    auth_is_authorized: self.auth_manager.is_authorized(),
-                    auth_is_bot: self.auth_manager.is_bot(),
-                    my_id: self.user_manager.get_my_id().get(),
-                    can_ignore_background_updates: self.can_ignore_background_updates,
-                };
-                self.updates_manager
-                    .on_get_updates_state(&mut env, m, "updates.getState");
-            }
-            bridge.mark_authorized();
-            bridge.persist();
-        }
+        // C++ get_difference chain; the skeleton parks the query — the
+        // answer replays through the M.7 engine on the drain side).
+        let function = telegram_api::Function::updates_getState(telegram_api::updates_getState);
+        let token = self.park_net(0, PendingNetKind::GetState);
+        self.dispatch_walking_query(token, function, AuthFlag::On);
 
         // the live `on_get_authorization` init (AuthManager.cpp:1545); the
         // C++ fires it after every manager init above — the notification
@@ -5697,22 +6122,9 @@ impl Td {
         }
     }
 
-    /// One `users.getUsers[inputUserSelf]` round-trip (the wire `getMe`).
-    fn query_users_me(&mut self) -> Option<telegram_api::user> {
-        let bridge = self.bridge.as_ref()?.handle();
-        let query = telegram_api::Function::users_getUsers(telegram_api::users_getUsers {
-            id: vec![telegram_api::InputUser::inputUserSelf(
-                telegram_api::inputUserSelf,
-            )],
-        });
-        match bridge.query(query) {
-            QueryAnswer::Ok(data) => parse_vector_user(&data).and_then(|mut users| users.pop()),
-            _ => None,
-        }
-    }
-
     /// `getMe` (Requests.cpp): the cached self user, the UserManager store
-    /// (the M.4 surface), or one `users.getUsers` round-trip over the bridge.
+    /// (the M.4 surface), or one `users.getUsers` round-trip over the
+    /// dispatcher.
     pub(crate) fn get_me(&mut self, request_id: u64) {
         if !self.auth_manager.is_authorized() {
             return self.send_error_impl(request_id, 401, "Unauthorized");
@@ -5721,8 +6133,8 @@ impl Td {
             return self.send_result(request_id, Object::user(user));
         }
         // The UserManager store answers first when it has the self user
-        // (the M.4 surface — also the offline unit-test path); the live
-        // bridge round-trip fires only on a cache miss.
+        // (the M.4 surface — also the offline unit-test path); the
+        // dispatcher round-trip fires only on a cache miss.
         {
             let mut env = UserEnv {
                 global: &mut self.global,
@@ -5746,19 +6158,13 @@ impl Td {
                 return self.send_result(request_id, Object::user(user));
             }
         }
-        match self.query_users_me() {
-            Some(user) => {
-                self.apply_self_user(&user, false);
-                if let Some(user) = self.users.get(&self.my_id).cloned() {
-                    self.send_result(request_id, Object::user(user));
-                } else {
-                    self.send_error_impl(request_id, 500, "Failed to get self user");
-                }
-            }
-            None => {
-                self.send_error_impl(request_id, 500, "Failed to get information about the user")
-            }
-        }
+        let function = telegram_api::Function::users_getUsers(telegram_api::users_getUsers {
+            id: vec![telegram_api::InputUser::inputUserSelf(
+                telegram_api::inputUserSelf,
+            )],
+        });
+        let token = self.park_net(request_id, PendingNetKind::GetMe);
+        self.dispatch_walking_query(token, function, AuthFlag::On);
     }
 
     /// Creates the private chat for a peer when first needed and emits
@@ -6139,12 +6545,8 @@ impl Td {
         );
     }
 
-    /// `Td` close: dropping the callback sends the close notification; the
-    /// bridge thread stops (persisting the auth state).
+    /// `Td` close: dropping the callback sends the close notification.
     fn close(&mut self) {
-        if let Some(bridge) = self.bridge.take() {
-            bridge.shutdown();
-        }
         drop(self.callback.take());
     }
 }
@@ -7707,35 +8109,54 @@ fn storage_env_fields<'a>(
 /// the file-name counters refresh per drive).
 #[derive(Default)]
 pub(crate) struct LiveNetCell {
-    bridge: Option<crate::net::BridgeHandle>,
+    dispatcher: Option<Arc<NetQueryDispatcher>>,
     shared: Option<Arc<parking_lot::Mutex<TdFileShared>>>,
 }
 
 impl LiveNetCell {
     fn install(
         &mut self,
-        bridge: crate::net::BridgeHandle,
+        dispatcher: Arc<NetQueryDispatcher>,
         shared: Arc<parking_lot::Mutex<TdFileShared>>,
     ) {
-        self.bridge = Some(bridge);
+        self.dispatcher = Some(dispatcher);
         self.shared = Some(shared);
     }
 
-    /// The bridge handle clone (the cell keeps the canonical one).
-    fn bridge(&self) -> Option<crate::net::BridgeHandle> {
-        self.bridge.clone()
+    /// The dispatcher clone (the cell keeps the canonical one).
+    fn dispatcher(&self) -> Option<Arc<NetQueryDispatcher>> {
+        self.dispatcher.clone()
     }
 
-    /// One query through the bridge as a `Status` result (the C++
-    /// NetQuery error surfaces: the RPC error code/message).
+    /// One query through the pool dispatcher as a `Status` result (the
+    /// C++ NetQuery error surfaces: the RPC error code/message). The
+    /// driver thread blocks on the callback channel — the session pool
+    /// answers from its own slot.
     fn query(&self, function: telegram_api::Function) -> Result<Vec<u8>, Status> {
-        match self
-            .bridge()
-            .ok_or_else(|| Status::error(400, "Not connected"))?
-            .query(function)
-        {
-            crate::net::QueryAnswer::Ok(data) => Ok(data),
-            crate::net::QueryAnswer::Err(code, message) => Err(Status::error(code, &message)),
+        let dispatcher = self
+            .dispatcher()
+            .ok_or_else(|| Status::error(400, "Not connected"))?;
+        let mut bytes = Vec::new();
+        function.store(&mut bytes);
+        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let mut net_query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        net_query.set_callback(Box::new(LiveChannelCallback { sender }));
+        dispatcher.dispatch(net_query);
+        match receiver.recv() {
+            Ok(Ok(data)) => Ok(data),
+            Ok(Err(status)) => Err(status),
+            Err(_) => Err(Status::error_message("the answer is missing")),
         }
     }
 
@@ -7750,6 +8171,22 @@ impl LiveNetCell {
     /// The per-drive files dirs.
     fn io_dirs(&self) -> Result<(String, String), Status> {
         self.with_shared(|shared| (shared.files_dir(), shared.secure_files_dir()))
+    }
+}
+
+/// The blocking channel completion for the live file nets (the C++ answers
+/// through the query's promise; the driver threads park on this channel).
+struct LiveChannelCallback {
+    sender: std::sync::mpsc::Sender<Result<Vec<u8>, Status>>,
+}
+
+impl NetQueryCallback for LiveChannelCallback {
+    fn on_result(&mut self, mut query: NetQuery) {
+        let _ = self.sender.send(if query.is_error() {
+            Err(Status::error(query.error().code(), query.error().message()))
+        } else {
+            Ok(query.move_as_ok())
+        });
     }
 }
 
@@ -7931,13 +8368,13 @@ impl FileDownloaderNet for LiveDownloadNet {
             .with_shared(|shared| shared.create_from_temp(file_type, path, name))?
     }
 
-    fn webfile_dc_id(&mut self) -> DcId {
+    fn webfile_dc_id(&mut self) -> ChatDcId {
         self.cell
             .lock()
             .with_shared(|shared| {
                 let id =
                     shared.option_integer("webfile_dc_id", if shared.is_test_dc() { 2 } else { 4 });
-                DcId::internal(id as i32)
+                ChatDcId::internal(id as i32)
             })
             .unwrap_or_default()
     }
@@ -8052,13 +8489,13 @@ impl TdFileLoadNetFactory {
         }
     }
 
-    /// Fills the cell once the session exists (Td `init`).
+    /// Fills the cell once the dispatcher exists (Td `init`).
     pub(crate) fn install(
         &self,
-        bridge: crate::net::BridgeHandle,
+        dispatcher: Arc<NetQueryDispatcher>,
         shared: Arc<parking_lot::Mutex<TdFileShared>>,
     ) {
-        self.cell.lock().install(bridge, shared);
+        self.cell.lock().install(dispatcher, shared);
     }
 }
 
@@ -8121,10 +8558,11 @@ actor_messages! {
         /// `ConfigRecoverer::on_full_config`; the M.3.7.4 executor is the
         /// production sender.
         RecovererFullConfigResult { result: Result<telegram_api::Config, Status>, } => on_recoverer_full_config_result(result),
-        /// A raw update packet from the net bridge (the `Updates`
-        /// umbrella) — forwarded from the bridge thread over the captured
-        /// `SchedulerPtr`.
-        OnNetUpdate { data: Vec<u8>, } => on_net_update(data),
+        /// A driver-thread nudge: the session drivers and the shared
+        /// auth data queue their events into `net_shared.events`; this
+        /// wakes the actor to drain them (the C++
+        /// `send_closure_later(G()->td(), ...)`.
+        DrainNetEvents => drain_net_events(),
     }
 }
 
@@ -8293,6 +8731,11 @@ impl Actor for Td {
             };
             self.updates_manager.tick_timeouts(&mut env);
         }
+        // The driver events (salts persists, key changes, updates) pump
+        // through the same slot when no DrainNetEvents nudge beat it.
+        self.drain_net_events();
+        // The callback-parked auth + walking-skeleton answers.
+        self.dispatch_completed_walking();
         self.flush_deferred_results();
     }
 
@@ -9920,6 +10363,21 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
     );
 }
 
+/// The net-inert DC-init stand-in: refuses every init (the M.3.8.1
+/// dispatcher semantics — each query completes with the C++ "No such dc"
+/// gate error) without materializing any session machinery.
+#[cfg(test)]
+struct InertDcInit;
+
+#[cfg(test)]
+impl tdnet::net_query::DcInitSink for InertDcInit {
+    fn init_dc(&mut self, _dc_id: DcId) -> bool {
+        false
+    }
+
+    fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+}
+
 /// The account-plane env over the `Td` fields (AccountManager,
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
 /// the field-split borrows (the `NotificationEnv` convention).
@@ -10381,10 +10839,10 @@ impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
         } else {
             FileType::Document
         };
-        let dc_id = if DcId::is_valid_raw(document.dc_id) {
-            DcId::internal(document.dc_id)
+        let dc_id = if ChatDcId::is_valid_raw(document.dc_id) {
+            ChatDcId::internal(document.dc_id)
         } else {
-            DcId::invalid()
+            ChatDcId::invalid()
         };
         let location = crate::files::FullRemoteFileLocation::from_document(
             file_type,
@@ -11116,7 +11574,7 @@ impl crate::secure_value::SecureValueEnv for SecureEnv<'_> {
         &mut self,
         id: i64,
         access_hash: i64,
-        dc_id: DcId,
+        dc_id: ChatDcId,
         size: i64,
         remote_name: String,
     ) -> FileId {
@@ -11140,7 +11598,7 @@ impl crate::secure_value::SecureValueEnv for SecureEnv<'_> {
         &mut self,
         id: i64,
         access_hash: i64,
-        dc_id: DcId,
+        dc_id: ChatDcId,
         expected_size: i64,
         suggested_path: String,
     ) -> FileId {
@@ -17151,9 +17609,9 @@ mod tests {
         // The start-up GetConfig went through the dispatcher; without a
         // session-inited DC the slice's DC gate completes it with the C++
         // "No such dc" error through the token-8 callback.
-        assert!(td.sent_net_queries.lock().unwrap().is_empty());
+        assert!(td.sent_net_queries.lock().is_empty());
         {
-            let completed = td.completed_config_queries.lock().unwrap();
+            let completed = td.completed_config_queries.lock();
             assert_eq!(completed.len(), 1);
             assert_eq!(completed[0].0, 8);
             assert_eq!(completed[0].1.error().message(), "No such dc DcId{1}");
@@ -17230,7 +17688,7 @@ mod tests {
         );
         net_query.set_ok(answer);
         {
-            let mut completions = td.completed_config_queries.lock().unwrap();
+            let mut completions = td.completed_config_queries.lock();
             completions.clear();
             completions.push((token, net_query));
         }
@@ -17238,9 +17696,9 @@ mod tests {
         // The ok config triggers the C++ follow-up app-config reload
         // (process_config → reload_app_config) — a fresh GetAppConfig
         // dispatch parks its own DC-gate completion.
-        assert_eq!(td.completed_config_queries.lock().unwrap().len(), 1);
+        assert_eq!(td.completed_config_queries.lock().len(), 1);
         td.drain_config_net_query_completions();
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
 
         // The M.3.9.1 fan-outs (ConfigManager.cpp:1191/1196): the
         // DcOptions ctor dropped the invalid dc id, the ConnectionCreator
@@ -17359,7 +17817,7 @@ mod tests {
         );
         net_query.set_ok(answer);
         {
-            let mut completions = td.completed_config_queries.lock().unwrap();
+            let mut completions = td.completed_config_queries.lock();
             completions.clear();
             completions.push((token, net_query));
         }
@@ -17370,12 +17828,12 @@ mod tests {
         // fresh GetAppConfig dispatch parks its own DC-gate completion
         // with the token-1 callback.
         {
-            let completions = td.completed_config_queries.lock().unwrap();
+            let completions = td.completed_config_queries.lock();
             assert_eq!(completions.len(), 1);
             assert_eq!(completions[0].0, 1, "the app-config reload token");
         }
         td.drain_config_net_query_completions();
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
         assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
         let responses = callback.responses.lock();
         assert!(responses.iter().any(|(id, object)| {
@@ -17451,17 +17909,17 @@ mod tests {
         let (mut net_query, token) = build_config_net_query(&query, 1, false);
         net_query.set_error(crate::config_result::request_aborted_error());
         {
-            let mut completions = td.completed_config_queries.lock().unwrap();
+            let mut completions = td.completed_config_queries.lock();
             completions.clear();
             completions.push((token, net_query));
         }
         td.drain_config_net_query_completions();
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
         assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
 
         td.close_impl(false);
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
-        assert!(td.sent_net_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
+        assert!(td.sent_net_queries.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
