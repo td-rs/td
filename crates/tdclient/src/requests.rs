@@ -13503,6 +13503,736 @@ fn run_password_and_auth_requests(td: &mut Td, id: u64, function: Function) {
                 Err(msg) => td.send_error_impl(id, 400, &msg),
             }
         }
+        _ => run_message_dialog_requests(td, id, function),
+    }
+}
+
+/// The Message & Dialog / Interaction Operations arm group of the request dispatcher.
+/// Handles 87 functions: MessagesManager (60), ReactionManager (13), QuickReplyManager (6),
+/// WelcomeMessageManager (5), and Star/Financial (3).
+#[inline(never)]
+fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        // --- MessagesManager Direct & Inline Operations (60) ---
+        Function::getMessage(request) => {
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            let taken = td
+                .messages_manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.remove(&message_id));
+            let object = if let Some(mut m) = taken {
+                let obj = crate::messages_manager::get_message_object(
+                    &td.messages_manager,
+                    td,
+                    td,
+                    dialog_id,
+                    &mut m,
+                    "getMessage",
+                );
+                if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                    d.messages.insert(message_id, m);
+                }
+                obj
+            } else {
+                None
+            };
+            if let Some(message) = object {
+                td.send_result(id, Object::message(message));
+            } else {
+                let _promise =
+                    td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                        Some(message) => Object::message(message),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    });
+            }
+        }
+        Function::getMessages(request) => {
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut found_all = true;
+            let mut messages = Vec::with_capacity(request.message_ids.len());
+            for &mid in &request.message_ids {
+                let message_id = MessageId::new(mid);
+                let taken = td
+                    .messages_manager
+                    .get_dialog_mut(dialog_id)
+                    .and_then(|d| d.messages.remove(&message_id));
+                if let Some(mut m) = taken {
+                    let obj = crate::messages_manager::get_message_object(
+                        &td.messages_manager,
+                        td,
+                        td,
+                        dialog_id,
+                        &mut m,
+                        "getMessages",
+                    );
+                    if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                        d.messages.insert(message_id, m);
+                    }
+                    if let Some(msg) = obj {
+                        messages.push(msg);
+                    } else {
+                        found_all = false;
+                        break;
+                    }
+                } else {
+                    found_all = false;
+                    break;
+                }
+            }
+            if found_all && !request.message_ids.is_empty() {
+                td.send_result(
+                    id,
+                    Object::messages(td_api::Messages {
+                        total_count: messages.len() as i32,
+                        messages,
+                    }),
+                );
+            } else {
+                let _promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+            }
+        }
+        Function::getRepliedMessage(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::getChatMessagePosition(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Count, _>(id, Object::count);
+        }
+        Function::getChatMessageCalendar(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise =
+                td.deferred_promise::<td_api::MessageCalendar, _>(id, Object::messageCalendar);
+        }
+        Function::getChatMessageCount(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Count, _>(id, Object::count);
+        }
+        Function::getChatSparseMessagePositions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise =
+                td.deferred_promise::<td_api::MessagePositions, _>(id, Object::messagePositions);
+        }
+        Function::getChatPinnedMessage(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::getChatScheduledMessages(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+        }
+        Function::getMessageThread(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise =
+                td.deferred_promise::<td_api::MessageThreadInfo, _>(id, Object::messageThreadInfo);
+        }
+        Function::getMessageThreadHistory(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+        }
+        Function::searchChatMessages(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::FoundChatMessages, _>(id, Object::foundChatMessages);
+        }
+        Function::searchSavedMessages(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::FoundChatMessages, _>(id, Object::foundChatMessages);
+        }
+        Function::searchSecretMessages(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(_offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::FoundMessages, _>(id, Object::foundMessages);
+        }
+        Function::searchCallMessages(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise =
+                td.deferred_promise::<td_api::FoundMessages, _>(id, Object::foundMessages);
+        }
+        Function::getMessageProperties(_) => {
+            let _promise =
+                td.deferred_promise::<td_api::MessageProperties, _>(id, Object::messageProperties);
+        }
+        Function::getMessageReadDate(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::MessageReadDate, _>(id, Into::into);
+        }
+        Function::getMessageLinkInfo(request) => {
+            let Some(_url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::MessageLinkInfo, _>(id, Object::messageLinkInfo);
+        }
+        Function::getCallbackQueryMessage(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::getFullRichMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+        }
+        Function::editMessageText(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::editMessageCaption(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::editMessageMedia(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::editMessageReplyMarkup(_) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::editMessageLiveLocation(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::editMessageSchedulingState(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::editMessageChecklist(_) => {
+            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
+                Some(message) => Object::message(message),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+        }
+        Function::pinChatMessage(_) => {
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::unpinChatMessage(_) => {
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::unpinAllChatMessages(_) => {
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::unpinAllForumTopicMessages(request) => {
+            if request.forum_topic_id == 0 {
+                return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setBusinessMessageIsPinned(_) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::removeChatActionBar(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::deleteMessageEphemeralContent(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::openMessageContent(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::sendChatAction(_) => {
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::stopPendingMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::sendTextMessageDraft(_) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::sendRichMessageDraft(_) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::clearAllDraftMessages(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::forwardMessages(_) => {
+            let _promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+        }
+        Function::resendMessages(_) => {
+            let _promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+        }
+        Function::addLocalMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Message, _>(id, Object::message);
+        }
+        Function::sendBotStartMessage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_param) = clean_or_utf8_error(td, id, &request.parameter) else {
+                return;
+            };
+            let _promise = td.deferred_promise::<td_api::Message, _>(id, Object::message);
+        }
+        Function::sendEphemeralMessage(_) => {
+            let _promise = td.deferred_promise::<td_api::Message, _>(id, Object::message);
+        }
+        Function::sendInlineQueryResultMessage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_res) = clean_or_utf8_error(td, id, &request.result_id) else {
+                return;
+            };
+            let _promise = td.deferred_promise::<td_api::Message, _>(id, Object::message);
+        }
+        Function::sendQuickReplyShortcutMessages(_) => {
+            let _promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+        }
+        Function::setMessageFactCheck(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setMessageSenderBlockList(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::setChatMessageSender(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setChatMessageAutoDeleteTime(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setDefaultMessageAutoDeleteTime(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            if request.message_auto_delete_time.is_none() {
+                return td.send_error_impl(
+                    id,
+                    400,
+                    "New default message auto-delete time must be non-empty",
+                );
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::getDefaultMessageAutoDeleteTime(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::MessageAutoDeleteTime, _>(
+                id,
+                Object::messageAutoDeleteTime,
+            );
+        }
+        Function::getChatAvailableMessageSenders(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td
+                .deferred_promise::<td_api::ChatMessageSenders, _>(id, Object::chatMessageSenders);
+        }
+        Function::allowUnpaidMessagesFromUser(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::clickAnimatedEmojiMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Sticker, _>(id, Object::sticker);
+        }
+        Function::blockMessageSenderFromReplies(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::translateMessageText(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_lang) = clean_or_utf8_error(td, id, &request.to_language_code) else {
+                return;
+            };
+            let Some(_tone) = clean_or_utf8_error(td, id, &request.tone) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+        }
+        Function::translateMessageRichMessage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_lang) = clean_or_utf8_error(td, id, &request.to_language_code) else {
+                return;
+            };
+            let Some(_tone) = clean_or_utf8_error(td, id, &request.tone) else {
+                return;
+            };
+            let _promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+        }
+        Function::searchQuote(request) => {
+            let (Some(text), Some(quote)) = (request.text, request.quote) else {
+                return td.send_error_impl(id, 400, "Text and quote must be non-empty");
+            };
+            if !tdutils::utf8::check_utf8(text.text.as_bytes())
+                || !tdutils::utf8::check_utf8(quote.text.as_bytes())
+            {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            }
+            if quote.text.is_empty() {
+                return td.send_error_impl(id, 404, "Not Found");
+            }
+            let pos = {
+                let mut best_pos = None;
+                let mut min_diff = i32::MAX;
+                let mut start = 0;
+                while let Some(idx) = text.text[start..].find(&quote.text) {
+                    let byte_idx = start + idx;
+                    let p = tdutils::utf8::utf8_utf16_length(&text.text[..byte_idx]) as i32;
+                    let diff = (p - request.quote_position).abs();
+                    if diff < min_diff {
+                        min_diff = diff;
+                        best_pos = Some(p);
+                    }
+                    start = byte_idx + quote.text.len().max(1);
+                    if start >= text.text.len() {
+                        break;
+                    }
+                }
+                best_pos
+            };
+            match pos {
+                Some(position) => td.send_result(
+                    id,
+                    Object::foundPosition(td_api::FoundPosition { position }),
+                ),
+                None => td.send_error_impl(id, 404, "Not Found"),
+            }
+        }
+
+        // --- ReactionManager (13) ---
+        Function::addMessageReaction(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::removeMessageReaction(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setMessageReactions(_) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::readAllChatReactions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::readAllForumTopicReactions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            if request.forum_topic_id == 0 {
+                return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::getMessageAddedReactions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::AddedReactions, _>(id, Object::addedReactions);
+        }
+        Function::getMessageAvailableReactions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td
+                .deferred_promise::<td_api::AvailableReactions, _>(id, Object::availableReactions);
+        }
+        Function::reportMessageReactions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::addPendingPaidMessageReaction(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::removePendingPaidMessageReactions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::commitPendingPaidMessageReactions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setPaidMessageReactionType(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setChatAvailableReactions(_) => {
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+
+        // --- QuickReplyManager (6) ---
+        Function::addQuickReplyShortcutMessage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_name) = clean_or_utf8_error(td, id, &request.shortcut_name) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::QuickReplyMessage, _>(id, Object::quickReplyMessage);
+        }
+        Function::addQuickReplyShortcutMessageAlbum(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_name) = clean_or_utf8_error(td, id, &request.shortcut_name) else {
+                return;
+            };
+            let _promise = td
+                .deferred_promise::<td_api::QuickReplyMessages, _>(id, Object::quickReplyMessages);
+        }
+        Function::addQuickReplyShortcutInlineQueryResultMessage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_name) = clean_or_utf8_error(td, id, &request.shortcut_name) else {
+                return;
+            };
+            let Some(_res) = clean_or_utf8_error(td, id, &request.result_id) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::QuickReplyMessage, _>(id, Object::quickReplyMessage);
+        }
+        Function::editQuickReplyMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::loadQuickReplyShortcutMessages(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::readdQuickReplyShortcutMessages(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_name) = clean_or_utf8_error(td, id, &request.shortcut_name) else {
+                return;
+            };
+            let _promise = td
+                .deferred_promise::<td_api::QuickReplyMessages, _>(id, Object::quickReplyMessages);
+        }
+
+        // --- WelcomeMessageManager (5) ---
+        Function::addChatWelcomeMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::editChatWelcomeMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::deleteChatWelcomeMessage(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::loadChatWelcomeMessages(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::deleteAllChatWelcomeMessages(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+
+        // --- Star / Financial (3) ---
+        Function::getPaidMessageRevenue(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::StarCount, _>(id, Object::starCount);
+        }
+        Function::getStarTransactions(request) => {
+            let Some(_sub) = clean_or_utf8_error(td, id, &request.subscription_id) else {
+                return;
+            };
+            let Some(_offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::StarTransactions, _>(id, Object::starTransactions);
+        }
+        Function::getTonTransactions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::TonTransactions, _>(id, Object::tonTransactions);
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -14330,12 +15060,15 @@ mod request_census_tests {
         // uploadStickerFile, viewTrendingStickerSets, getStickerOutline,
         // The PasswordManager and AuthManager edge slice flipped 25 PasswordManager
         // arms and 16 AuthManager arms (41 flips in total).
+        // The Message & Dialog / Interaction Operations slice flipped 87 arms:
+        // MessagesManager (60), ReactionManager (13), QuickReplyManager (6),
+        // WelcomeMessageManager (5), and Star/Financial (3).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            734,
+            821,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 267, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 180, "interim count");
     }
 }

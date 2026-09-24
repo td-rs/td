@@ -17866,4 +17866,158 @@ mod tests {
         assert!(!resp25.is_empty());
         assert!(matches!(resp25[0], Object::passkeys(_)));
     }
+
+    #[test]
+    fn message_dialog_requests_dispatch() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(message_dialog_requests_dispatch_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn message_dialog_requests_dispatch_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("message-dialog-test");
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+        td.auth_manager.force_authorized_for_test();
+
+        // 1. searchQuote: valid substring search
+        td.request(
+            201,
+            Function::searchQuote(td_api::searchQuote {
+                text: Some(td_api::FormattedText {
+                    text: "Hello world, this is a test message for quoting!".to_string(),
+                    entities: Vec::new(),
+                }),
+                quote: Some(td_api::FormattedText {
+                    text: "this is a test".to_string(),
+                    entities: Vec::new(),
+                }),
+                quote_position: 0,
+            }),
+        );
+        let resp201 = responses_of(&callback, 201);
+        assert!(!resp201.is_empty());
+        match &resp201[0] {
+            Object::foundPosition(p) => assert_eq!(p.position, 13),
+            other => panic!("expected foundPosition, got {other:?}"),
+        }
+
+        // 2. searchQuote: not found
+        td.request(
+            202,
+            Function::searchQuote(td_api::searchQuote {
+                text: Some(td_api::FormattedText {
+                    text: "Hello world".to_string(),
+                    entities: Vec::new(),
+                }),
+                quote: Some(td_api::FormattedText {
+                    text: "absent substring".to_string(),
+                    entities: Vec::new(),
+                }),
+                quote_position: 0,
+            }),
+        );
+        let err202 = error_of(&callback, 202);
+        assert_eq!(err202.code, 404);
+        assert_eq!(err202.message, "Not Found");
+
+        // 3. searchQuote: missing text or quote
+        td.request(
+            203,
+            Function::searchQuote(td_api::searchQuote {
+                text: None,
+                quote: None,
+                quote_position: 0,
+            }),
+        );
+        let err203 = error_of(&callback, 203);
+        assert_eq!(err203.code, 400);
+        assert_eq!(err203.message, "Text and quote must be non-empty");
+
+        // 4. unpinAllForumTopicMessages: topic_id == 0 error
+        td.request(
+            204,
+            Function::unpinAllForumTopicMessages(td_api::unpinAllForumTopicMessages {
+                chat_id: 1,
+                forum_topic_id: 0,
+            }),
+        );
+        let err204 = error_of(&callback, 204);
+        assert_eq!(err204.code, 400);
+        assert_eq!(err204.message, "Invalid forum topic identifier specified");
+
+        // 5. readAllForumTopicReactions: topic_id == 0 error
+        td.request(
+            205,
+            Function::readAllForumTopicReactions(td_api::readAllForumTopicReactions {
+                chat_id: 1,
+                forum_topic_id: 0,
+            }),
+        );
+        let err205 = error_of(&callback, 205);
+        assert_eq!(err205.code, 400);
+        assert_eq!(err205.message, "Invalid forum topic identifier specified");
+
+        // 6. setDefaultMessageAutoDeleteTime: None error
+        td.request(
+            206,
+            Function::setDefaultMessageAutoDeleteTime(td_api::setDefaultMessageAutoDeleteTime {
+                message_auto_delete_time: None,
+            }),
+        );
+        let err206 = error_of(&callback, 206);
+        assert_eq!(err206.code, 400);
+        assert_eq!(
+            err206.message,
+            "New default message auto-delete time must be non-empty"
+        );
+
+        // 7. openMessageContent: returns ok
+        td.request(
+            207,
+            Function::openMessageContent(td_api::openMessageContent {
+                chat_id: 1,
+                message_id: 100,
+            }),
+        );
+        let resp207 = responses_of(&callback, 207);
+        assert!(!resp207.is_empty());
+        assert!(matches!(resp207[0], Object::ok(_)));
+
+        // 8. setMessageSenderBlockList: returns ok
+        td.request(
+            208,
+            Function::setMessageSenderBlockList(td_api::setMessageSenderBlockList {
+                sender_id: None,
+                block_list: None,
+            }),
+        );
+        let resp208 = responses_of(&callback, 208);
+        assert!(!resp208.is_empty());
+        assert!(matches!(resp208[0], Object::ok(_)));
+
+        // 9. editMessageReplyMarkup: non-bot gets 400
+        td.request(
+            209,
+            Function::editMessageReplyMarkup(td_api::editMessageReplyMarkup {
+                chat_id: 1,
+                message_id: 100,
+                reply_markup: None,
+            }),
+        );
+        let err209 = error_of(&callback, 209);
+        assert_eq!(err209.code, 400);
+        assert_eq!(err209.message, "Only bots can use the method");
+    }
 }
