@@ -15661,8 +15661,9 @@ impl crate::dialog_invite_link_manager::DialogInviteLinkManagerEnv for TdDialogI
                 .chat_manager
                 .get_chat(dialog_id.get_chat_id())
                 .is_some(),
-            crate::chat_manager::DialogType::SecretChat
-            | crate::chat_manager::DialogType::None => false,
+            crate::chat_manager::DialogType::SecretChat | crate::chat_manager::DialogType::None => {
+                false
+            }
         };
         if has {
             Ok(())
@@ -15740,11 +15741,7 @@ impl crate::dialog_invite_link_manager::DialogInviteLinkManagerEnv for TdDialogI
         _invite_link: String,
     ) {
     }
-    fn send_get_dialog_invite_link_counts(
-        &mut self,
-        _dialog_id: crate::chat_manager::DialogId,
-    ) {
-    }
+    fn send_get_dialog_invite_link_counts(&mut self, _dialog_id: crate::chat_manager::DialogId) {}
     fn send_get_dialog_invite_links(
         &mut self,
         _dialog_id: crate::chat_manager::DialogId,
