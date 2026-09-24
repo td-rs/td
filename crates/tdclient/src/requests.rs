@@ -14511,6 +14511,344 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 td.deferred_promise::<td_api::TonTransactions, _>(id, Object::tonTransactions);
         }
 
+        _ => run_chat_and_group_requests(td, id, function),
+    }
+}
+
+/// The Chat & Group Management arm group of the request dispatcher.
+/// Handles 37 functions: chat creation, chat loading/getting, supergroup/basic group inspection,
+/// chat settings/properties toggling, and public/discussion/personal chat queries.
+#[inline(never)]
+fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
+    fn chat_optional_to_object(value: Option<td_api::Chat>) -> Object {
+        match value {
+            Some(chat) => Object::chat(chat),
+            None => Object::error(td_api::Error {
+                code: 404,
+                message: "Not Found".to_owned(),
+            }),
+        }
+    }
+
+    match function {
+        Function::addChatToList(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::checkCreatedPublicChatsLimit(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::createBasicGroupChat(request) => {
+            let dialog_id =
+                MmDialogId::from_chat_id(crate::chat_manager::ChatId::new(request.basic_group_id));
+            if let Some(chat) = td.chats.get(&dialog_id.get()).cloned() {
+                td.send_result(id, Object::chat(chat));
+            } else {
+                let _promise =
+                    td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+            }
+        }
+        Function::createNewBasicGroupChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+        }
+        Function::createNewSupergroupChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let Some(_description) = clean_or_utf8_error(td, id, &request.description) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+        }
+        Function::createPrivateChat(request) => {
+            td.ensure_chat(request.user_id);
+            if let Some(chat) = td.chats.get(&request.user_id).cloned() {
+                td.send_result(id, Object::chat(chat));
+            } else {
+                let _promise =
+                    td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+            }
+        }
+        Function::createSecretChat(request) => {
+            let dialog_id = MmDialogId::from_secret_chat_id(
+                crate::user_manager::SecretChatId::new(request.secret_chat_id),
+            );
+            if let Some(chat) = td.chats.get(&dialog_id.get()).cloned() {
+                td.send_result(id, Object::chat(chat));
+            } else {
+                let _promise =
+                    td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+            }
+        }
+        Function::createSupergroupChat(request) => {
+            let dialog_id = MmDialogId::from_channel_id(ChannelId::new(request.supergroup_id));
+            if let Some(chat) = td.chats.get(&dialog_id.get()).cloned() {
+                td.send_result(id, Object::chat(chat));
+            } else {
+                let _promise =
+                    td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+            }
+        }
+        Function::deleteChatReplyMarkup(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                if d.reply_markup_message_id == message_id {
+                    d.reply_markup_message_id = MessageId::new(0);
+                }
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::getArchiveChatListSettings(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::ArchiveChatListSettings, _>(
+                id,
+                Object::archiveChatListSettings,
+            );
+        }
+        Function::getBasicGroup(request) => {
+            if let Some(basic_group) = td
+                .chat_manager
+                .get_basic_group_object(crate::chat_manager::ChatId::new(request.basic_group_id))
+            {
+                td.send_result(id, Object::basicGroup(basic_group));
+            } else {
+                let _promise = td.deferred_promise::<td_api::BasicGroup, _>(id, Object::basicGroup);
+            }
+        }
+        Function::getBasicGroupFullInfo(_) => {
+            let _promise = td
+                .deferred_promise::<td_api::BasicGroupFullInfo, _>(id, Object::basicGroupFullInfo);
+        }
+        Function::getChat(request) => {
+            if let Some(chat) = td.chats.get(&request.chat_id).cloned() {
+                td.send_result(id, Object::chat(chat));
+            } else {
+                td.ensure_chat(request.chat_id);
+                if let Some(chat) = td.chats.get(&request.chat_id).cloned() {
+                    td.send_result(id, Object::chat(chat));
+                } else {
+                    let _promise =
+                        td.deferred_promise::<Option<td_api::Chat>, _>(id, chat_optional_to_object);
+                }
+            }
+        }
+        Function::getChatBoostLinkInfo(request) => {
+            let Some(_url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let _promise =
+                td.deferred_promise::<td_api::ChatBoostLinkInfo, _>(id, Object::chatBoostLinkInfo);
+        }
+        Function::getChatEventLog(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let _promise = td.deferred_promise::<td_api::ChatEvents, _>(id, Object::chatEvents);
+        }
+        Function::getChatFolderChatCount(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Count, _>(id, Object::count);
+        }
+        Function::getChatListsToAddChat(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            td.send_result(
+                id,
+                Object::chatLists(td_api::ChatLists {
+                    chat_lists: Vec::new(),
+                }),
+            );
+        }
+        Function::getChatNotificationSettingsExceptions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+        }
+        Function::getCreatedPublicChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+        }
+        Function::getInactiveSupergroupChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+        }
+        Function::getSuitableDiscussionChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+        }
+        Function::getSuitablePersonalChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+        }
+        Function::getSupergroup(request) => {
+            if let Some(supergroup) = td
+                .chat_manager
+                .get_supergroup_object(ChannelId::new(request.supergroup_id))
+            {
+                td.send_result(id, Object::supergroup(supergroup));
+            } else {
+                let _promise = td.deferred_promise::<td_api::Supergroup, _>(id, Object::supergroup);
+            }
+        }
+        Function::getSupergroupFullInfo(_) => {
+            let _promise = td
+                .deferred_promise::<td_api::SupergroupFullInfo, _>(id, Object::supergroupFullInfo);
+        }
+        Function::loadChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::loadCommunityFullInfo(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::reportChatPhoto(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_text) = clean_or_utf8_error(td, id, &request.text) else {
+                return;
+            };
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setArchiveChatListSettings(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setChatClientData(request) => {
+            let dialog_id = MmDialogId::new(request.chat_id);
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                d.client_data = request.client_data;
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::setChatNotificationSettings(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setPersonalChat(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::setPinnedChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::toggleChatDefaultDisableNotification(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                d.notification_settings.silent_send_message = request.default_disable_notification;
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::toggleChatIsMarkedAsUnread(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                d.is_marked_as_unread = request.is_marked_as_unread;
+                td.send_update(Object::updateChatIsMarkedAsUnread(
+                    td_api::updateChatIsMarkedAsUnread {
+                        chat_id: request.chat_id,
+                        is_marked_as_unread: request.is_marked_as_unread,
+                    },
+                ));
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::toggleChatIsPinned(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        }
+        Function::toggleChatIsTranslatable(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                d.is_translatable = request.is_translatable;
+                td.send_update(Object::updateChatIsTranslatable(
+                    td_api::updateChatIsTranslatable {
+                        chat_id: request.chat_id,
+                        is_translatable: request.is_translatable,
+                    },
+                ));
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::toggleChatViewAsTopics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                d.view_as_messages = !request.view_as_topics;
+                d.is_view_as_messages_inited = true;
+                td.send_update(Object::updateChatViewAsTopics(
+                    td_api::updateChatViewAsTopics {
+                        chat_id: request.chat_id,
+                        view_as_topics: request.view_as_topics,
+                    },
+                ));
+            }
+            td.send_result(id, ok_object());
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -15351,12 +15689,15 @@ mod request_census_tests {
         // in the chain order. The merged pin: 693 + 41 (password/auth) + 87
         // (interaction) + 16 (star) - 3 (star overlap, counted once) = 834
         // dispatched / 167 interim.
+        // The Chat & Group Management slice flipped 37 arms: chat creation,
+        // inspection, properties toggling, and queries (834 + 37 = 871
+        // dispatched / 130 interim).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            834,
+            871,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 167, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 130, "interim count");
     }
 }

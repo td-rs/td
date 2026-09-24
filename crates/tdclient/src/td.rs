@@ -2409,7 +2409,7 @@ pub struct Td {
     /// The known users (the self user; contacts land with Wave 1).
     users: HashMap<i64, td_api::User>,
     /// The known chats (Saved Messages only).
-    chats: HashMap<i64, td_api::Chat>,
+    pub(crate) chats: HashMap<i64, td_api::Chat>,
     /// user id → access hash (the peers the walking skeleton messages).
     peer_access: HashMap<i64, i64>,
 }
@@ -5763,7 +5763,7 @@ impl Td {
 
     /// Creates the private chat for a peer when first needed and emits
     /// `updateNewChat` (the C++ `send_update_new_chat`).
-    fn ensure_chat(&mut self, chat_id: i64) {
+    pub(crate) fn ensure_chat(&mut self, chat_id: i64) {
         if self.chats.contains_key(&chat_id) {
             return;
         }
@@ -18158,5 +18158,137 @@ mod tests {
         let err209 = error_of(&callback, 209);
         assert_eq!(err209.code, 400);
         assert_eq!(err209.message, "Only bots can use the method");
+    }
+
+    #[test]
+    fn chat_and_group_requests_dispatch() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_and_group_requests_dispatch_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_and_group_requests_dispatch_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("chat-and-group-test");
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(30, parameters);
+        assert_eq!(td.state, State::Run);
+        td.auth_manager.force_authorized_for_test();
+
+        // 1. createPrivateChat: creates chat and returns Chat
+        td.request(
+            301,
+            Function::createPrivateChat(td_api::createPrivateChat {
+                user_id: 12345,
+                force: true,
+            }),
+        );
+        let resp301 = responses_of(&callback, 301);
+        assert!(!resp301.is_empty());
+        match &resp301[0] {
+            Object::chat(c) => assert_eq!(c.id, 12345),
+            other => panic!("expected chat, got {other:?}"),
+        }
+
+        // 2. getChat: returns existing chat
+        td.request(302, Function::getChat(td_api::getChat { chat_id: 12345 }));
+        let resp302 = responses_of(&callback, 302);
+        assert!(!resp302.is_empty());
+        match &resp302[0] {
+            Object::chat(c) => assert_eq!(c.id, 12345),
+            other => panic!("expected chat, got {other:?}"),
+        }
+
+        // 3. setChatClientData: returns ok
+        td.request(
+            303,
+            Function::setChatClientData(td_api::setChatClientData {
+                chat_id: 12345,
+                client_data: "custom-data".to_string(),
+            }),
+        );
+        let resp303 = responses_of(&callback, 303);
+        assert!(!resp303.is_empty());
+        assert!(matches!(resp303[0], Object::ok(_)));
+
+        // 4. toggleChatDefaultDisableNotification: returns ok
+        td.request(
+            304,
+            Function::toggleChatDefaultDisableNotification(
+                td_api::toggleChatDefaultDisableNotification {
+                    chat_id: 12345,
+                    default_disable_notification: true,
+                },
+            ),
+        );
+        let resp304 = responses_of(&callback, 304);
+        assert!(!resp304.is_empty());
+        assert!(matches!(resp304[0], Object::ok(_)));
+
+        // 5. toggleChatIsTranslatable: returns ok
+        td.request(
+            305,
+            Function::toggleChatIsTranslatable(td_api::toggleChatIsTranslatable {
+                chat_id: 12345,
+                is_translatable: true,
+            }),
+        );
+        let resp305 = responses_of(&callback, 305);
+        assert!(!resp305.is_empty());
+        assert!(matches!(resp305[0], Object::ok(_)));
+
+        // 6. toggleChatViewAsTopics: returns ok
+        td.request(
+            306,
+            Function::toggleChatViewAsTopics(td_api::toggleChatViewAsTopics {
+                chat_id: 12345,
+                view_as_topics: true,
+            }),
+        );
+        let resp306 = responses_of(&callback, 306);
+        assert!(!resp306.is_empty());
+        assert!(matches!(resp306[0], Object::ok(_)));
+
+        // 7. toggleChatIsMarkedAsUnread: returns ok
+        td.request(
+            307,
+            Function::toggleChatIsMarkedAsUnread(td_api::toggleChatIsMarkedAsUnread {
+                chat_id: 12345,
+                is_marked_as_unread: true,
+            }),
+        );
+        let resp307 = responses_of(&callback, 307);
+        assert!(!resp307.is_empty());
+        assert!(matches!(resp307[0], Object::ok(_)));
+
+        // 8. deleteChatReplyMarkup: returns ok
+        td.request(
+            308,
+            Function::deleteChatReplyMarkup(td_api::deleteChatReplyMarkup {
+                chat_id: 12345,
+                message_id: 100,
+            }),
+        );
+        let resp308 = responses_of(&callback, 308);
+        assert!(!resp308.is_empty());
+        assert!(matches!(resp308[0], Object::ok(_)));
+
+        // 9. getChatListsToAddChat: returns chatLists
+        td.request(
+            309,
+            Function::getChatListsToAddChat(td_api::getChatListsToAddChat { chat_id: 12345 }),
+        );
+        let resp309 = responses_of(&callback, 309);
+        assert!(!resp309.is_empty());
+        assert!(matches!(resp309[0], Object::chatLists(_)));
     }
 }
