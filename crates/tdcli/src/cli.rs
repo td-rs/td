@@ -1884,20 +1884,18 @@ impl CliClient {
         // cli.cpp:1902-1916 — the three send-timing lambdas.
         // Lambda 1: on sendMessage reply carrying a message object, move the
         // SendMessageInfo from the query map to the message map.
-        if id != 0 {
-            if let Some(info) = self
+        if id != 0
+            && let Some(info) = self
                 .query_id_to_send_message_info
                 .lock()
                 .unwrap()
                 .remove(&id)
-            {
-                if let Some(Object::message(ref msg)) = result {
-                    self.message_id_to_send_message_info
-                        .lock()
-                        .unwrap()
-                        .insert(msg.id, info);
-                }
-            }
+            && let Some(Object::message(ref msg)) = result
+        {
+            self.message_id_to_send_message_info
+                .lock()
+                .unwrap()
+                .insert(msg.id, info);
         }
         // Lambda 2: on updateMessageSendAcknowledged, stamp quick_ack_time.
         if let Some(Object::updateMessageSendAcknowledged(ref upd)) = result {
@@ -1951,47 +1949,42 @@ impl CliClient {
             }
             // cli.cpp:1990-2003 — on an incoming business message while
             // use_test_dc is set, echo "Welcome!" back over the connection.
-            Object::updateNewBusinessMessage(update) => {
-                if !update
+            Object::updateNewBusinessMessage(update)
+                if update
                     .message
                     .as_ref()
-                    .map_or(true, |m| m.message.as_ref().map_or(true, |m| m.is_outgoing))
-                    && self.use_test_dc.load(Ordering::SeqCst)
-                {
-                    let conn_id = update.connection_id.clone();
-                    let old = std::mem::replace(
-                        &mut *self.business_connection_id.lock().unwrap(),
-                        conn_id,
+                    .is_some_and(|m| m.message.as_ref().is_some_and(|m| !m.is_outgoing))
+                    && self.use_test_dc.load(Ordering::SeqCst) =>
+            {
+                let conn_id = update.connection_id.clone();
+                let old =
+                    std::mem::replace(&mut *self.business_connection_id.lock().unwrap(), conn_id);
+                self.on_cmd("gbc".to_owned());
+                if let Some(msg) = update.message.as_ref().and_then(|m| m.message.as_ref()) {
+                    self.send_message(
+                        msg.chat_id,
+                        td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                            text: Some(td_api::FormattedText {
+                                text: "Welcome!".to_owned(),
+                                entities: vec![],
+                            }),
+                            link_preview_options: self.get_link_preview_options(),
+                            clear_draft: true,
+                        }),
                     );
-                    self.on_cmd("gbc".to_owned());
-                    if let Some(msg) = update.message.as_ref().and_then(|m| m.message.as_ref()) {
-                        self.send_message(
-                            msg.chat_id,
-                            td_api::InputMessageContent::inputMessageText(
-                                td_api::inputMessageText {
-                                    text: Some(td_api::FormattedText {
-                                        text: "Welcome!".to_owned(),
-                                        entities: vec![],
-                                    }),
-                                    link_preview_options: self.get_link_preview_options(),
-                                    clear_draft: true,
-                                },
-                            ),
-                        );
-                    }
-                    *self.business_connection_id.lock().unwrap() = old;
                 }
+                *self.business_connection_id.lock().unwrap() = old;
             }
             // cli.cpp:2005-2009 — auto-answer pre-checkout queries on test_dc.
-            Object::updateNewPreCheckoutQuery(update) => {
-                if self.use_test_dc.load(Ordering::SeqCst) {
-                    self.send_request(Function::answerPreCheckoutQuery(
-                        td_api::answerPreCheckoutQuery {
-                            pre_checkout_query_id: update.id,
-                            error_message: String::new(),
-                        },
-                    ));
-                }
+            Object::updateNewPreCheckoutQuery(update)
+                if self.use_test_dc.load(Ordering::SeqCst) =>
+            {
+                self.send_request(Function::answerPreCheckoutQuery(
+                    td_api::answerPreCheckoutQuery {
+                        pre_checkout_query_id: update.id,
+                        error_message: String::new(),
+                    },
+                ));
             }
             Object::updateConnectionState(_) => {
                 tdutils::log_warning!("{}", result_str);
