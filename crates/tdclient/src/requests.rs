@@ -4050,8 +4050,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::deleteProfilePhoto(_)
         | Function::setUserPersonalProfilePhoto(_)
-        | Function::suggestUserProfilePhoto(_)
-        | Function::setBotProfilePhoto(_) => {
+        | Function::suggestUserProfilePhoto(_) => {
             // the photo-set family: the non-null input path rides
             // FileManager (`set_profile_photo_impl`, the Files slice) and
             // the null-input halves are net actors
@@ -4068,7 +4067,6 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         | Function::setPersonalChat(_)
         | Function::createNewSecretChat(_)
         | Function::suggestUserBirthdate(_)
-        | Function::toggleBotCanManageEmojiStatus(_)
         | Function::setProfileAccentColor(_)
         | Function::setUpgradedGiftColors(_)
         | Function::getSupportUser(_)
@@ -14849,6 +14847,101 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             td.send_result(id, ok_object());
         }
 
+        _ => run_bot_and_web_app_requests(td, id, function),
+    }
+}
+
+/// The Bot & WebApp Operations arm group of the request dispatcher.
+/// Handles 5 functions: getRecentInlineBots, reorderBotActiveUsernames,
+/// setBotProfilePhoto, toggleBotCanManageEmojiStatus, toggleBotUsernameIsActive.
+#[inline(never)]
+fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::getRecentInlineBots(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<Vec<crate::user_manager::UserId>, _>(
+                id,
+                |bot_ids: Vec<crate::user_manager::UserId>| {
+                    Object::users(td_api::Users {
+                        total_count: bot_ids.len() as i32,
+                        user_ids: bot_ids.into_iter().map(|u| u.get()).collect(),
+                    })
+                },
+            );
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_recent_inline_bots(&mut env, promise);
+        }
+        Function::reorderBotActiveUsernames(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut cleaned_usernames = Vec::with_capacity(request.usernames.len());
+            for username in &request.usernames {
+                let Some(cleaned) = clean_or_utf8_error(td, id, username) else {
+                    return;
+                };
+                cleaned_usernames.push(cleaned);
+            }
+            let bot_user_id = crate::user_manager::UserId::new(request.bot_user_id);
+            let mut env = user_env!(td);
+            match td.user_manager.reorder_bot_usernames_local(
+                &mut env,
+                bot_user_id,
+                &cleaned_usernames,
+            ) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::setBotProfilePhoto(request) => {
+            let is_bot = td.auth_manager.is_bot();
+            let bot_user_id = crate::user_manager::UserId::new(request.bot_user_id);
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = user_env!(td);
+            td.user_manager.set_bot_profile_photo(
+                &mut env,
+                is_bot,
+                bot_user_id,
+                request.photo.as_ref(),
+                promise,
+            );
+        }
+        Function::toggleBotCanManageEmojiStatus(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let bot_user_id = crate::user_manager::UserId::new(request.bot_user_id);
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = user_env!(td);
+            td.user_manager.toggle_user_can_manage_emoji_status(
+                &mut env,
+                bot_user_id,
+                request.can_manage_emoji_status,
+                promise,
+            );
+        }
+        Function::toggleBotUsernameIsActive(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let bot_user_id = crate::user_manager::UserId::new(request.bot_user_id);
+            let mut env = user_env!(td);
+            match td.user_manager.toggle_bot_username_is_active_local(
+                &mut env,
+                bot_user_id,
+                &username,
+                request.is_active,
+            ) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -15692,12 +15785,16 @@ mod request_census_tests {
         // The Chat & Group Management slice flipped 37 arms: chat creation,
         // inspection, properties toggling, and queries (834 + 37 = 871
         // dispatched / 130 interim).
+        // The Bot & WebApp Operations slice flipped 5 arms: getRecentInlineBots,
+        // reorderBotActiveUsernames, setBotProfilePhoto,
+        // toggleBotCanManageEmojiStatus, toggleBotUsernameIsActive (871 + 5 = 876
+        // dispatched / 125 interim).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            871,
+            876,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 130, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 125, "interim count");
     }
 }

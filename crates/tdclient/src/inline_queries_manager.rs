@@ -972,8 +972,7 @@ impl InlineQueriesManager {
             return;
         }
         if self.recently_used_bots_loaded < 2 {
-            let promise = Promise::default();
-            self.load_recently_used_bots(env, promise);
+            self.load_recently_used_bots(env);
         }
     }
 
@@ -2317,7 +2316,8 @@ impl InlineQueriesManager {
         env: &mut impl InlineQueriesManagerEnv,
         promise: Promise<Vec<UserId>>,
     ) {
-        if !self.load_recently_used_bots(env, promise) {
+        self.pending_recent_inline_bots.push(promise);
+        if !self.load_recently_used_bots(env) {
             // the promise parks behind the resolution
             return;
         }
@@ -2356,11 +2356,7 @@ impl InlineQueriesManager {
     /// `load_recently_used_bots` (InlineQueriesManager.cpp:2387-2447) —
     /// returns true when the bots are ready (the C++ then resolves the
     /// request promise in get_recent_inline_bots; here the caller does).
-    fn load_recently_used_bots(
-        &mut self,
-        env: &mut impl InlineQueriesManagerEnv,
-        promise: Promise<Vec<UserId>>,
-    ) -> bool {
+    fn load_recently_used_bots(&mut self, env: &mut impl InlineQueriesManagerEnv) -> bool {
         if self.recently_used_bots_loaded >= 2 {
             return true;
         }
@@ -2399,8 +2395,6 @@ impl InlineQueriesManager {
             return true;
         }
 
-        // the promise parks behind the resolution (the multipromise add)
-        self.pending_recent_inline_bots.push(promise);
         if self.recently_used_bots_loaded == 0 {
             self.recently_used_bots_loaded = 1;
             if !env.use_chat_info_database() {

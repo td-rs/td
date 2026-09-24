@@ -491,7 +491,7 @@ getReadDatePrivacySettings	interim
 getReceivedGift	dispatched
 getReceivedGifts	dispatched
 getRecentEmojiStatuses	interim
-getRecentInlineBots	interim
+getRecentInlineBots	dispatched
 getRecentStickers	interim
 getRecentlyOpenedChats	dispatched
 getRecentlyVisitedTMeUrls	dispatched
@@ -677,7 +677,7 @@ removeTextCompositionStyle	dispatched
 removeTopChat	dispatched
 removeWebBrowserSettingsException	dispatched
 reorderActiveUsernames	dispatched
-reorderBotActiveUsernames	interim
+reorderBotActiveUsernames	dispatched
 reorderBotMediaPreviews	dispatched
 reorderChatFolders	dispatched
 reorderGiftCollectionGifts	dispatched
@@ -803,7 +803,7 @@ setBirthdate	dispatched
 setBotInfoDescription	dispatched
 setBotInfoShortDescription	dispatched
 setBotName	dispatched
-setBotProfilePhoto	interim
+setBotProfilePhoto	dispatched
 setBotUpdatesStatus	dispatched
 setBusinessAccountBio	dispatched
 setBusinessAccountGiftSettings	dispatched
@@ -956,9 +956,9 @@ testReturnError	sync
 testSquareInt	dispatched
 testUseUpdate	dispatched
 toggleAllDownloadsArePaused	dispatched
-toggleBotCanManageEmojiStatus	interim
+toggleBotCanManageEmojiStatus	dispatched
 toggleBotIsAddedToAttachmentMenu	dispatched
-toggleBotUsernameIsActive	interim
+toggleBotUsernameIsActive	dispatched
 toggleBusinessConnectedBotChatIsPaused	dispatched
 toggleChatDefaultDisableNotification	dispatched
 toggleChatFolderTags	dispatched

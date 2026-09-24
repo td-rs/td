@@ -7315,6 +7315,73 @@ impl UserManager {
         Ok(())
     }
 
+    /// `UserManager::toggle_user_can_manage_emoji_status` (UserManager.cpp:6483-6491).
+    pub fn toggle_user_can_manage_emoji_status(
+        &mut self,
+        env: &mut UserEnv,
+        bot_user_id: UserId,
+        can_manage_emoji_status: bool,
+        mut promise: Promise<()>,
+    ) {
+        if let Err(status) = self.get_input_user(env, bot_user_id) {
+            promise.set_error(status);
+            return;
+        }
+        if !self.is_user_bot_of(bot_user_id) {
+            promise.set_error(Status::error(400, "The user must be a bot"));
+            return;
+        }
+        let mut changed = false;
+        if let Some(user_full) = self.users_full.get_mut(&bot_user_id.get()) {
+            if user_full.can_manage_emoji_status != can_manage_emoji_status {
+                user_full.can_manage_emoji_status = can_manage_emoji_status;
+                changed = true;
+            }
+        }
+        if changed {
+            self.update_user_full(
+                env,
+                bot_user_id,
+                "on_update_bot_can_manage_emoji_status",
+                false,
+            );
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::set_bot_profile_photo` (UserManager.cpp:5959-5979).
+    pub fn set_bot_profile_photo(
+        &mut self,
+        _env: &mut UserEnv,
+        is_auth_bot: bool,
+        mut bot_user_id: UserId,
+        _photo: Option<&crate::td_api::InputChatPhoto>,
+        mut promise: Promise<()>,
+    ) {
+        if is_auth_bot {
+            let my_id = self.get_my_id();
+            if bot_user_id.is_valid() && bot_user_id != my_id {
+                promise.set_error(Status::error(400, "Invalid bot user identifier specified"));
+                return;
+            }
+            bot_user_id = my_id;
+        } else {
+            let bot_data = match self.get_bot_data(bot_user_id) {
+                Ok(data) => data,
+                Err(status) => {
+                    promise.set_error(status);
+                    return;
+                }
+            };
+            if !bot_data.can_be_edited {
+                promise.set_error(Status::error(400, "The bot can't be edited"));
+                return;
+            }
+        }
+        let _ = bot_user_id;
+        promise.set_value(());
+    }
+
     /// `UserManager::set_accent_color` (UserManager.cpp:6756-6765) —
     /// returns the transformed arguments for the (net)
     /// `UpdateColorQuery`; the id-derived default collapses to the

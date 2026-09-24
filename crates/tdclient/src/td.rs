@@ -18291,4 +18291,83 @@ mod tests {
         assert!(!resp309.is_empty());
         assert!(matches!(resp309[0], Object::chatLists(_)));
     }
+
+    #[test]
+    fn bot_and_web_app_requests_dispatch() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(bot_and_web_app_requests_dispatch_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn bot_and_web_app_requests_dispatch_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("bot-and-web-app-test");
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(40, parameters);
+        assert_eq!(td.state, State::Run);
+        td.auth_manager.force_authorized_for_test();
+
+        // 1. getRecentInlineBots: returns Users
+        td.request(
+            401,
+            Function::getRecentInlineBots(td_api::getRecentInlineBots),
+        );
+        let resp401 = responses_of(&callback, 401);
+        assert!(!resp401.is_empty());
+        assert!(matches!(resp401[0], Object::users(_)));
+
+        // 2. toggleBotUsernameIsActive: fails for non-existent bot (400)
+        td.request(
+            402,
+            Function::toggleBotUsernameIsActive(td_api::toggleBotUsernameIsActive {
+                bot_user_id: 12345,
+                username: "testbot".to_string(),
+                is_active: true,
+            }),
+        );
+        let err402 = error_of(&callback, 402);
+        assert_eq!(err402.code, 400);
+
+        // 3. reorderBotActiveUsernames: fails for non-existent bot (400)
+        td.request(
+            403,
+            Function::reorderBotActiveUsernames(td_api::reorderBotActiveUsernames {
+                bot_user_id: 12345,
+                usernames: vec!["testbot".to_string()],
+            }),
+        );
+        let err403 = error_of(&callback, 403);
+        assert_eq!(err403.code, 400);
+
+        // 4. toggleBotCanManageEmojiStatus: fails for non-existent bot (400)
+        td.request(
+            404,
+            Function::toggleBotCanManageEmojiStatus(td_api::toggleBotCanManageEmojiStatus {
+                bot_user_id: 12345,
+                can_manage_emoji_status: true,
+            }),
+        );
+        let err404 = error_of(&callback, 404);
+        assert_eq!(err404.code, 400);
+
+        // 5. setBotProfilePhoto: fails for non-existent bot (400)
+        td.request(
+            405,
+            Function::setBotProfilePhoto(td_api::setBotProfilePhoto {
+                bot_user_id: 12345,
+                photo: None,
+            }),
+        );
+        let err405 = error_of(&callback, 405);
+        assert_eq!(err405.code, 400);
+    }
 }
