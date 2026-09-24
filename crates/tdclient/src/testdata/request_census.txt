@@ -605,7 +605,7 @@ loadGroupCallParticipants	dispatched
 loadQuickReplyShortcutMessages	dispatched
 loadQuickReplyShortcuts	interim
 loadSavedMessagesTopics	dispatched
-logOut	interim
+logOut	dispatched
 markChecklistTasksAsDone	dispatched
 openBotSimilarBot	dispatched
 openChat	dispatched
