@@ -59,6 +59,7 @@ pub trait DialogInviteLinkManagerEnv {
     // Net query seams [blocked: net]
     fn send_check_dialog_invite_link(&mut self, invite_link: String);
     fn send_import_dialog_invite_link(&mut self, invite_link: String);
+    #[allow(clippy::too_many_arguments)]
     fn send_export_dialog_invite_link(
         &mut self,
         dialog_id: DialogId,
@@ -69,6 +70,7 @@ pub trait DialogInviteLinkManagerEnv {
         subscription_pricing: StarSubscriptionPricing,
         is_permanent: bool,
     );
+    #[allow(clippy::too_many_arguments)]
     fn send_edit_dialog_invite_link(
         &mut self,
         dialog_id: DialogId,
@@ -145,6 +147,7 @@ impl DialogInviteLinkManager {
     }
 
     /// `can_manage_dialog_invite_links` (DialogInviteLinkManager.cpp:918-953).
+    #[allow(clippy::too_many_arguments)]
     pub fn can_manage_dialog_invite_links(
         &mut self,
         env: &mut impl DialogInviteLinkManagerEnv,
@@ -198,6 +201,7 @@ impl DialogInviteLinkManager {
     }
 
     /// `export_dialog_invite_link` (DialogInviteLinkManager.cpp:970-1010).
+    #[allow(clippy::too_many_arguments)]
     pub fn export_dialog_invite_link(
         &mut self,
         env: &mut impl DialogInviteLinkManagerEnv,
@@ -266,6 +270,7 @@ impl DialogInviteLinkManager {
     }
 
     /// `edit_dialog_invite_link` (DialogInviteLinkManager.cpp:1012-1028).
+    #[allow(clippy::too_many_arguments)]
     pub fn edit_dialog_invite_link(
         &mut self,
         env: &mut impl DialogInviteLinkManagerEnv,
@@ -354,6 +359,7 @@ impl DialogInviteLinkManager {
     }
 
     /// `get_dialog_invite_link_counts` (DialogInviteLinkManager.cpp:1041-1046).
+    #[allow(clippy::too_many_arguments)]
     pub fn get_dialog_invite_link_counts(
         &mut self,
         env: &mut impl DialogInviteLinkManagerEnv,
@@ -370,6 +376,7 @@ impl DialogInviteLinkManager {
     }
 
     /// `get_dialog_invite_links` (DialogInviteLinkManager.cpp:1048-1061).
+    #[allow(clippy::too_many_arguments)]
     pub fn get_dialog_invite_links(
         &mut self,
         env: &mut impl DialogInviteLinkManagerEnv,
@@ -407,6 +414,7 @@ impl DialogInviteLinkManager {
     }
 
     /// `get_dialog_invite_link_users` (DialogInviteLinkManager.cpp:1063-1086).
+    #[allow(clippy::too_many_arguments)]
     pub fn get_dialog_invite_link_users(
         &mut self,
         env: &mut impl DialogInviteLinkManagerEnv,
