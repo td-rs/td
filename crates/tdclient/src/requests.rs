@@ -3947,10 +3947,25 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
 
         // --- the remaining photo-set handlers (the Files slice) and the
         // deferred subsystems — each arm is the flip point for its step ---
-        Function::setProfilePhoto(_) => {
-            // the upload path — the Files slice (M.4.12's stub keeps the
-            // C++ error surface)
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        Function::setProfilePhoto(request) => {
+            // Requests.cpp:7116-7119 → UserManager.cpp:5996-6002: the
+            // non-bot UserpicSetup suggested-action dismissal is the
+            // Payments-style seam; the validation bands answer in
+            // `set_profile_photo_impl`, the upload flow is
+            // [blocked: net/Files]
+            if !td.auth_manager.is_bot() {
+                tdutils::log_info!(
+                    "dismiss_suggested_action(USERPIC_SETUP) — [blocked: SuggestedActionManager]"
+                );
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let env = user_env!(td);
+            td.user_manager.set_profile_photo(
+                &env,
+                request.photo.as_ref(),
+                request.is_public,
+                promise,
+            );
         }
         Function::getUserProfilePhotos(request) => {
             // Requests.cpp:7125-7130: no CHECK gate; the cache window
@@ -4061,32 +4076,241 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-        Function::deleteProfilePhoto(_)
-        | Function::setUserPersonalProfilePhoto(_)
-        | Function::suggestUserProfilePhoto(_) => {
-            // the photo-set family: the non-null input path rides
-            // FileManager (`set_profile_photo_impl`, the Files slice) and
-            // the null-input halves are net actors
-            // (DeleteContactProfilePhotoQuery/UpdateProfilePhotoQuery)
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        Function::deleteProfilePhoto(request) => {
+            // Requests.cpp:7121-7124 → UserManager.cpp:6395-6426: the
+            // cache bands answer here; the user_full reload, the reset
+            // query and the delete query are [blocked: net]
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = user_env!(td);
+            td.user_manager
+                .delete_profile_photo(&mut env, request.profile_photo_id, promise);
         }
-        Function::addProfileAudio(_) => {
-            // the input-audio path needs FileManager's get_input_file_id
-            // (the Files slice)
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        Function::setUserPersonalProfilePhoto(request) => {
+            // Requests.cpp:6681-6685 → UserManager.cpp:6071-6097: the
+            // contact/self/bot ladder answers here; the delete query and
+            // the upload flow are [blocked: net/Files]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let env = user_env!(td);
+            td.user_manager.set_user_profile_photo(
+                &env,
+                UserId::new(request.user_id),
+                request.photo.as_ref(),
+                false,
+                promise,
+            );
         }
-        Function::setUserNote(_)
-        | Function::setMainProfileTab(_)
-        | Function::setPersonalChat(_)
-        | Function::createNewSecretChat(_)
-        | Function::suggestUserBirthdate(_)
-        | Function::setProfileAccentColor(_)
-        | Function::setUpgradedGiftColors(_)
-        | Function::getSupportUser(_)
-        | Function::setPassportElementErrors(_) => {
-            // MessageEntity / UserFull ProfileTab / DialogManager /
-            // passport / the missing setter halves (M.4.12 deferred them
-            // with their types)
+        Function::suggestUserProfilePhoto(request) => {
+            // Requests.cpp:6693-6697: the suggest twin
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let env = user_env!(td);
+            td.user_manager.set_user_profile_photo(
+                &env,
+                UserId::new(request.user_id),
+                request.photo.as_ref(),
+                true,
+                promise,
+            );
+        }
+        Function::addProfileAudio(request) => {
+            // Requests.cpp:7143-7146 → UserManager.cpp:7178-7212: the
+            // input gates answer here; the get_input_file_id resolution,
+            // the encrypted/web gates and the create_audio/upload tail are
+            // the FileManager/AudiosManager seams
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.user_manager.add_new_saved_music(request.audio, promise);
+        }
+        Function::setUserNote(request) => {
+            // Requests.cpp:6687-6691 → UserManager.cpp:6440-6466: the
+            // contact/self gates and the formatted-text normalization
+            // answer here; the UpdateContactNoteQuery is [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let env = user_env!(td);
+            td.user_manager.set_user_note(
+                &env,
+                UserId::new(request.user_id),
+                request.note,
+                promise,
+            );
+        }
+        Function::setMainProfileTab(request) => {
+            // Requests.cpp:6791-6795 → UserManager.cpp:6688-6701: the
+            // null gate and the Unknown-channel tab allow-list answer
+            // here; the SetMainProfileTabQuery send and the ack-gated
+            // user_full write are [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.user_manager
+                .set_main_profile_tab(request.main_profile_tab, promise);
+        }
+        Function::suggestUserBirthdate(request) => {
+            // Requests.cpp:6699-6703 → UserManager.cpp:6471-6480: the
+            // self/bot gates answer here; the SuggestUserBirthdayQuery is
+            // [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let env = user_env!(td);
+            td.user_manager.suggest_user_birthdate(
+                &env,
+                UserId::new(request.user_id),
+                request.birthdate.unwrap_or_default(),
+                promise,
+            );
+        }
+        Function::setProfileAccentColor(_request) => {
+            // Requests.cpp:7176-7180 → UserManager.cpp:6644-6648: no
+            // validation; the UpdateColorQuery carries the promise
+            // ([blocked: net]) and `on_update_accent_color_success` is
+            // its ack intake
+            if !check_is_user(td, id) {
+                return;
+            }
+            tdutils::log_info!("Send account.updateColor (profile) — [blocked: net]");
+        }
+        Function::setUpgradedGiftColors(_request) => {
+            // Requests.cpp:7169-7173 → UserManager.cpp:6640-6642: no
+            // validation; the UpdateColorCollectibleQuery is
+            // [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            tdutils::log_info!("Send account.updateColorCollectible — [blocked: net]");
+        }
+        Function::getSupportUser(_) => {
+            // Requests.cpp:8893-8896 → UserManager.cpp:6798-6815: the
+            // cached id answers here; the GetSupportUserQuery is
+            // [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::User, _>(id, Object::user);
+            let env = user_env!(td);
+            td.user_manager.get_support_user(&env, promise);
+        }
+        Function::getDefaultEmojiStatuses(_) => {
+            // Requests.cpp:6827-6831 → EmojiStatus.cpp:571-578: the
+            // cached list answers here; the hash-revalidation query is
+            // [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let mut env = user_env!(td);
+            td.user_manager
+                .get_default_emoji_statuses(&mut env, promise);
+        }
+        Function::getDefaultChatEmojiStatuses(_) => {
+            // Requests.cpp:6833-6837 → EmojiStatus.cpp:580-588
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let mut env = user_env!(td);
+            td.user_manager
+                .get_default_channel_emoji_statuses(&mut env, promise);
+        }
+        Function::getRecentEmojiStatuses(_) => {
+            // Requests.cpp:6839-6843 → EmojiStatus.cpp:590-597
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::EmojiStatuses, _>(id, Object::emojiStatuses);
+            let mut env = user_env!(td);
+            td.user_manager.get_recent_emoji_statuses(&mut env, promise);
+        }
+        Function::getUpgradedGiftEmojiStatuses(_) => {
+            // Requests.cpp:6845-6849 → EmojiStatus.cpp:626-637
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::EmojiStatuses, _>(id, Object::emojiStatuses);
+            let mut env = user_env!(td);
+            td.user_manager
+                .get_upgraded_gift_emoji_statuses(&mut env, promise);
+        }
+        Function::clearRecentEmojiStatuses(_) => {
+            // Requests.cpp:6851-6855 → EmojiStatus.cpp:621-624: the cache
+            // clears here; the ClearRecentEmojiStatusesQuery is
+            // [blocked: net]
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = user_env!(td);
+            td.user_manager
+                .clear_recent_emoji_statuses(&mut env, promise);
+        }
+        Function::setBusinessAccountProfilePhoto(request) => {
+            // Requests.cpp:4566-4572 → UserManager.cpp:5981-5994: the bot
+            // gate, the business-connection check and the
+            // inputChatPhotoPrevious 400 answer here; the null-input
+            // delete and the upload flow are [blocked: net/Files]
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let connection_id = crate::business_connection_manager::BusinessConnectionId::new(
+                &request.business_connection_id,
+            );
+            let status = td
+                .business_connection_manager
+                .check_business_connection(&connection_id);
+            if status.is_error() {
+                return td.send_error_impl(id, status.code(), status.message());
+            }
+            match request.photo.as_ref() {
+                None => {
+                    // the DeleteBusinessProfilePhotoQuery tail ([blocked:
+                    // net]) — the request stays unanswered like the C++
+                    // actor without a network
+                    tdutils::log_info!(
+                        "Send businessConnection.deleteProfilePhoto — [blocked: net]"
+                    );
+                }
+                Some(td_api::InputChatPhoto::inputChatPhotoPrevious(_)) => {
+                    td.send_error_impl(id, 400, "Unsupported");
+                }
+                Some(input_photo) => {
+                    let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+                    let user_id = td
+                        .business_connection_manager
+                        .get_business_connection_user_id(&connection_id);
+                    let env = user_env!(td);
+                    td.user_manager.set_profile_photo_impl(
+                        &env,
+                        user_id,
+                        Some(input_photo),
+                        request.is_public,
+                        false,
+                        promise,
+                    );
+                }
+            }
+        }
+        Function::setPassportElementErrors(_) => {
+            // the passport plane (the Wave-3 SecureManager slice)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
@@ -16048,12 +16272,22 @@ mod request_census_tests {
         // resetInstalledBackgrounds, setChatBackground, deleteChatBackground
         // (877 + 9 = 886 dispatched / 115 interim; the net-step landing
         // moved the baseline to 877/124 before this slice).
+        // The M.4 tails slice flipped 17 arms: the UserManager setters
+        // (setProfilePhoto, setUserPersonalProfilePhoto,
+        // suggestUserProfilePhoto, deleteProfilePhoto, setUserNote,
+        // setMainProfileTab, suggestUserBirthdate, setProfileAccentColor,
+        // setUpgradedGiftColors, setBusinessAccountProfilePhoto,
+        // addProfileAudio, getSupportUser), the EmojiStatus query planes
+        // (getDefaultEmojiStatuses, getDefaultChatEmojiStatuses,
+        // getRecentEmojiStatuses, getUpgradedGiftEmojiStatuses,
+        // clearRecentEmojiStatuses) (886 + 17 = 903 dispatched / 98
+        // interim).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            886,
+            903,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 115, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 98, "interim count");
     }
 }
