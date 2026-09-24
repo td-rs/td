@@ -1396,6 +1396,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             // `Requests.cpp:60-65` — the test entry answers ok right after
             // the difference pump starts; the query senders stay the
             // [blocked: net] seams.
+            let net = td.updates_net();
             let mut env = crate::td::TdUpdatesEnv {
                 global: &mut td.global,
                 options: td
@@ -1406,6 +1407,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 auth_is_bot: td.auth_manager.is_bot(),
                 my_id: td.user_manager.get_my_id().get(),
                 can_ignore_background_updates: td.can_ignore_background_updates,
+                net,
             };
             td.updates_manager
                 .get_difference(&mut env, "testGetDifference");

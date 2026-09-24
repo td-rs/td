@@ -189,6 +189,9 @@ pub(crate) struct TdSink {
     /// `on_update_dialog_is_marked_as_unread` intake; the drain resolves
     /// the peer and runs `set_dialog_is_marked_as_unread`.
     pub(crate) marked_unread: Vec<tdmtproto::telegram_api::updateDialogUnreadMark>,
+    /// the `updateSentMessage` synthetic (MessagesManager.cpp:5837-5843) —
+    /// the send-ack pts path; the drain runs `on_send_message_success`.
+    pub(crate) sent_messages: Vec<(i64, i32, i32, i32)>,
 }
 
 impl UpdatesSink for TdSink {
@@ -246,6 +249,18 @@ impl UpdatesSink for TdSink {
             PendingUpdate::Wire(telegram_api::Update::updateReadChannelOutbox(update)) => {
                 self.channel_reads_outbox
                     .push((update.channel_id, update.max_id));
+            }
+            PendingUpdate::SentMessage {
+                random_id,
+                message_id,
+                date,
+                ttl_period,
+            } => {
+                // MessagesManager.cpp:5837-5843 —
+                // `on_send_message_success(random_id, message_id, date,
+                // ttl_period, FileId(), "process updateSentMessage")`.
+                self.sent_messages
+                    .push((random_id, message_id, date, ttl_period));
             }
             // `updateReadMessagesContents` (read_message_content_from_updates,
             // MessagesManager.cpp:9325) rides the TTL content-read plane,
@@ -1910,6 +1925,106 @@ impl crate::messages_manager::SendMessageContext for Td {
             )
     }
 
+    /// The `SendMessageQuery::send` wire leg (MessagesManager.cpp:1207-1249):
+    /// the write peer resolves here (the dialog-manager read), the
+    /// payload rides the params, and the answer drains through
+    /// [`Td::on_send_message_answer`].
+    fn send_text_message_query(
+        &mut self,
+        params: crate::messages_manager::TextMessageQueryParams,
+    ) {
+        // `input_peer == nullptr → on_error(400 "Have no write access to
+        // the chat")` (MessagesManager.cpp:1209-1213).
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self,
+            params.dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            tdutils::log_info!("Have no write access to the chat");
+            self.run_send_message_fail(
+                params.random_id,
+                400,
+                "Have no write access to the chat",
+            );
+            return;
+        };
+        let Some(dispatcher) = self.net_query_dispatcher.clone() else {
+            tdutils::log_debug!("Send messages.sendMessage — [net-inert]");
+            return;
+        };
+        let reply_to = params.reply_to_message_id.map(|reply_to_msg_id| {
+            // inputReplyToMessage flags.0 — the top_msg_id gate.
+            const TOP_MSG_ID_MASK: i32 = 1;
+            telegram_api::InputReplyTo::inputReplyToMessage(telegram_api::inputReplyToMessage {
+                flags: if params.top_msg_id != 0 { TOP_MSG_ID_MASK } else { 0 },
+                reply_to_msg_id,
+                top_msg_id: params.top_msg_id,
+                reply_to_peer_id: None,
+                quote_text: String::new(),
+                quote_entities: Vec::new(),
+                quote_offset: 0,
+                monoforum_peer_id: None,
+                todo_item_id: 0,
+                poll_option: Vec::new(),
+            })
+        });
+        // the `get_input_suggested_post` build stays the suggested-post
+        // slice seam (the flag bit and the post field stay unset).
+        if params.suggested_post.is_some() {
+            tdutils::log_debug!("Suggested-post send arm stays its slice seam");
+        }
+        let function = telegram_api::Function::messages_sendMessage(
+            telegram_api::messages_sendMessage {
+                flags: params.flags,
+                no_webpage: params.no_webpage,
+                silent: params.silent,
+                background: params.background,
+                clear_draft: params.clear_draft,
+                noforwards: params.noforwards,
+                update_stickersets_order: params.update_stickersets_order,
+                invert_media: params.invert_media,
+                allow_paid_floodskip: params.allow_paid_floodskip,
+                peer: Some(Box::new(peer)),
+                reply_to,
+                message: params.message,
+                random_id: params.random_id,
+                reply_markup: params.reply_markup,
+                entities: params.entities,
+                schedule_date: params.schedule_date,
+                schedule_repeat_period: params.schedule_repeat_period,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: params.effect,
+                allow_paid_stars: params.allow_paid_stars,
+                suggested_post: None,
+                rich_message: None,
+            },
+        );
+        let mut bytes = Vec::new();
+        function.store(&mut bytes);
+        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let net_query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        dispatcher.dispatch_with_callback(
+            net_query,
+            Box::new(SendMessageNetDispatchCallback {
+                random_id: params.random_id,
+                dialog_id: params.dialog_id,
+                completed: Arc::clone(&self.send_message_net_completed),
+                shared: self.net_shared.clone(),
+            }),
+        );
+    }
+
     fn ignore_default_disable_notification(&self) -> bool {
         false
     }
@@ -2051,6 +2166,107 @@ enum PendingNetKind {
     Auth(AuthPendingKind),
     GetMe,
     GetState,
+}
+
+/// The UpdatesManager in-flight query kinds (the C++
+/// `GetDifferenceQuery`/`GetUpdatesStateQuery`/`ConfirmPtsQtsQuery`/
+/// `GetPtsUpdateQuery`/`PingServerQuery` — UpdatesManager.cpp:126-271).
+/// The completions park by kind (the engine env senders are promise-less;
+/// the C++ promise lambdas route Ok/Err into `on_get_difference`/
+/// `on_failed_get_difference`/`on_get_updates_state`/
+/// `on_failed_get_updates_state`/`on_server_pong`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatesNetKind {
+    GetDifference,
+    GetUpdatesState,
+    ConfirmPtsQts,
+    /// the pts-short-gap repair (`GetPtsUpdateQuery`).
+    GetPtsUpdate,
+    /// `PingServerQuery` — the C++ class sends `updates.getState` and
+    /// feeds `on_server_pong` (UpdatesManager.cpp:152-166, 1927-1937).
+    Ping,
+}
+
+/// The cloned dispatch surface the [`TdUpdatesEnv`] senders use (the env
+/// is a field-split view over `&mut Td`, so the trio rides as owned
+/// Arcs). The C++ shape is `td_->create_handler<…>()->send(...)`: the
+/// query serializes onto the main-DC auth dispatch and the answer comes
+/// back through the callback.
+#[derive(Clone)]
+pub(crate) struct UpdatesNetHandle {
+    dispatcher: Arc<NetQueryDispatcher>,
+    completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl UpdatesNetHandle {
+    /// Serialize + dispatch one updates query (the session prepends the
+    /// shared `MtprotoHeader`; the NetQueryCreator defaults ride like the
+    /// walking-skeleton dispatch — DcId::main, the 24-hour budget).
+    fn dispatch(&self, kind: UpdatesNetKind, function: telegram_api::Function) {
+        let mut bytes = Vec::new();
+        function.store(&mut bytes);
+        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let net_query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        self.dispatcher
+            .dispatch_with_callback(net_query, Box::new(UpdatesNetDispatchCallback {
+                kind,
+                completed: Arc::clone(&self.completed),
+                shared: self.shared.clone(),
+            }));
+    }
+}
+
+/// The dispatcher callback for the updates queries: files the completed
+/// `NetQuery` under its kind and nudges the `Td` actor; the nudge drains
+/// the answers through [`Td::dispatch_completed_updates_net`].
+struct UpdatesNetDispatchCallback {
+    kind: UpdatesNetKind,
+    completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl NetQueryCallback for UpdatesNetDispatchCallback {
+    fn on_result(&mut self, query: NetQuery) {
+        self.completed.lock().push((self.kind, query));
+        if let Some(shared) = &self.shared {
+            shared.wake_td();
+        }
+    }
+}
+
+/// The dispatcher callback for the `SendMessageQuery`: files the completed
+/// `NetQuery` under the message's send identity and nudges the `Td`
+/// actor; the answer drains through [`Td::on_send_message_answer`].
+struct SendMessageNetDispatchCallback {
+    random_id: i64,
+    dialog_id: crate::messages_manager::DialogId,
+    completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl NetQueryCallback for SendMessageNetDispatchCallback {
+    fn on_result(&mut self, query: NetQuery) {
+        self.completed
+            .lock()
+            .push((self.random_id, self.dialog_id, query));
+        if let Some(shared) = &self.shared {
+            shared.wake_td();
+        }
+    }
 }
 
 /// The dispatcher callback for the parked queries: files the completed
@@ -2473,6 +2689,13 @@ pub struct Td {
     pending_net: HashMap<u64, (u64, PendingNetKind)>,
     /// The callback-parked answers: token → the raw query.
     net_completed: Arc<Mutex<Vec<(u64, NetQuery)>>>,
+    /// The callback-parked updates-engine answers (the GetDifference
+    /// family), parked by kind.
+    updates_net_completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
+    /// The callback-parked `SendMessageQuery` answers, parked by the send
+    /// identity (random_id, dialog).
+    send_message_net_completed:
+        Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
     /// The net dispatch token allocator.
     net_dispatch_token: u64,
     /// The authorized self id (from `auth.authorization`).
@@ -2510,6 +2733,10 @@ pub(crate) struct TdUpdatesEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) my_id: i64,
     pub(crate) can_ignore_background_updates: bool,
+    /// The live dispatch surface (the GetDifference-family senders);
+    /// `None` keeps the net-inert posture (the config-flow tests and the
+    /// pre-init windows log the send instead of dispatching).
+    pub(crate) net: Option<UpdatesNetHandle>,
 }
 
 impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
@@ -2567,33 +2794,104 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
         self.my_id
     }
 
-    /// The `GetDifferenceQuery` — `[blocked: net]` until the S76
-    /// bridge↔dispatcher reconciliation; the recorded intent replaces the
-    /// query send.
+    /// The `GetDifferenceQuery::send` (UpdatesManager.cpp:207-210): the
+    /// C++ promise lambda routes Ok into `on_get_difference` and Err into
+    /// `on_failed_get_difference`; both ride the completions drain.
     fn send_get_difference(&mut self, pts: i32, date: i32, qts: i32) {
-        tdutils::log_info!(
-            "Send GetDifference(pts = {pts}, date = {date}, qts = {qts}) — [blocked: net]"
-        );
+        match &self.net {
+            Some(net) => net.dispatch(
+                UpdatesNetKind::GetDifference,
+                telegram_api::Function::updates_getDifference(telegram_api::updates_getDifference {
+                    flags: 0,
+                    pts,
+                    pts_limit: 0,
+                    pts_total_limit: 0,
+                    date,
+                    qts,
+                    qts_limit: 0,
+                }),
+            ),
+            None => tdutils::log_debug!(
+                "Send GetDifference(pts = {pts}, date = {date}, qts = {qts}) — [net-inert]"
+            ),
+        }
     }
 
-    /// The `GetUpdatesStateQuery` — `[blocked: net]`.
+    /// The `GetUpdatesStateQuery::send` (UpdatesManager.cpp:136-138) —
+    /// `init_state`'s pts fetch.
     fn send_get_updates_state(&mut self) {
-        tdutils::log_info!("Send GetUpdatesState — [blocked: net]");
+        match &self.net {
+            Some(net) => net.dispatch(
+                UpdatesNetKind::GetUpdatesState,
+                telegram_api::Function::updates_getState(telegram_api::updates_getState {}),
+            ),
+            None => tdutils::log_debug!("Send GetUpdatesState — [net-inert]"),
+        }
     }
 
-    /// The `ConfirmPtsQtsQuery` — `[blocked: net]`.
+    /// The `ConfirmPtsQtsQuery::send` (UpdatesManager.cpp:219-229): the
+    /// pts/qts confirmation runs through `updates.getDifference` with both
+    /// limit masks; the answer is discarded (the C++ on_result ignores it).
     fn send_confirm_pts_qts(&mut self, pts: i32, qts: i32) {
-        tdutils::log_info!("Send ConfirmPtsQts(pts = {pts}, qts = {qts}) — [blocked: net]");
+        // updates.getDifference#19c2f763 — pts_limit is flags.1 and
+        // qts_limit is flags.2 (the codegen emits no mask constants).
+        const PTS_LIMIT_MASK: i32 = 1 << 1;
+        const QTS_LIMIT_MASK: i32 = 1 << 2;
+        let flags = PTS_LIMIT_MASK | QTS_LIMIT_MASK;
+        match &self.net {
+            Some(net) => net.dispatch(
+                UpdatesNetKind::ConfirmPtsQts,
+                telegram_api::Function::updates_getDifference(telegram_api::updates_getDifference {
+                    flags,
+                    pts,
+                    pts_limit: 1,
+                    pts_total_limit: 0,
+                    date: i32::MAX,
+                    qts,
+                    qts_limit: 1,
+                }),
+            ),
+            None => tdutils::log_debug!(
+                "Send ConfirmPtsQts(pts = {pts}, qts = {qts}) — [net-inert]"
+            ),
+        }
     }
 
-    /// The `GetPtsUpdateQuery` — `[blocked: net]`.
+    /// The `GetPtsUpdateQuery::send` (UpdatesManager.cpp:252-258) — the
+    /// pts-short-gap repair query.
     fn send_get_pts_update(&mut self, pts: i32) {
-        tdutils::log_info!("Send GetPtsUpdate(pts = {pts}) — [blocked: net]");
+        // the same flags.1|flags.2 pair as the ConfirmPtsQts send.
+        const PTS_LIMIT_MASK: i32 = 1 << 1;
+        const QTS_LIMIT_MASK: i32 = 1 << 2;
+        let flags = PTS_LIMIT_MASK | QTS_LIMIT_MASK;
+        match &self.net {
+            Some(net) => net.dispatch(
+                UpdatesNetKind::GetPtsUpdate,
+                telegram_api::Function::updates_getDifference(telegram_api::updates_getDifference {
+                    flags,
+                    pts,
+                    pts_limit: 1,
+                    pts_total_limit: 0,
+                    date: i32::MAX,
+                    qts: 0,
+                    qts_limit: 0,
+                }),
+            ),
+            None => tdutils::log_debug!("Send GetPtsUpdate(pts = {pts}) — [net-inert]"),
+        }
     }
 
-    /// The `PingServerQuery` — `[blocked: net]`.
+    /// The `PingServerQuery::send` (UpdatesManager.cpp:158-161) — the C++
+    /// class sends `updates.getState`; the answer feeds
+    /// [`UpdatesManager::on_server_pong`].
     fn send_ping_server(&mut self) {
-        tdutils::log_info!("Send PingServer — [blocked: net]");
+        match &self.net {
+            Some(net) => net.dispatch(
+                UpdatesNetKind::Ping,
+                telegram_api::Function::updates_getState(telegram_api::updates_getState {}),
+            ),
+            None => tdutils::log_debug!("Send PingServer — [net-inert]"),
+        }
     }
 
     /// `td_->online_manager_->is_online()` — the online manager lands
@@ -2797,6 +3095,8 @@ impl Td {
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             pending_net: HashMap::new(),
             net_completed: Arc::new(Mutex::new(Vec::new())),
+            updates_net_completed: Arc::new(Mutex::new(Vec::new())),
+            send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
             my_access_hash: 0,
@@ -3597,6 +3897,7 @@ impl Td {
         if !self.auth_manager.is_authorized() {
             // country_info_manager_->get_current_country_code — Wave 2.
         } else {
+            let net = self.updates_net();
             let global = &mut self.global;
             let options = self
                 .option_manager
@@ -3609,6 +3910,7 @@ impl Td {
                 auth_is_bot: self.auth_manager.is_bot(),
                 my_id: self.user_manager.get_my_id().get(),
                 can_ignore_background_updates: self.can_ignore_background_updates,
+            net,
             };
             self.updates_manager.get_difference(&mut env, "init");
         }
@@ -3772,6 +4074,7 @@ impl Td {
             // before the teardown (Td.cpp:757 resets the actor; the pmc
             // flush is the observable part).
             {
+                let net = self.updates_net();
                 let global = &mut self.global;
                 let options = self
                     .option_manager
@@ -3784,6 +4087,7 @@ impl Td {
                     auth_is_bot: self.auth_manager.is_bot(),
                     my_id: self.user_manager.get_my_id().get(),
                     can_ignore_background_updates: self.can_ignore_background_updates,
+                net,
                 };
                 self.updates_manager.timeout_expired(&mut env);
             }
@@ -4662,6 +4966,8 @@ impl Td {
     /// Drain the callback-parked auth + walking-skeleton answers (the
     /// driver threads park them; the actor pump routes them here).
     pub(crate) fn dispatch_completed_walking(&mut self) {
+        self.dispatch_completed_updates_net();
+        self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
             let Some((request_id, kind)) = self.pending_net.remove(&token) else {
@@ -4669,6 +4975,95 @@ impl Td {
             };
             self.on_walking_answer(request_id, kind, query);
         }
+    }
+
+    /// The cloned updates dispatch surface for the env builders — `None`
+    /// keeps the net-inert posture.
+    pub(crate) fn updates_net(&self) -> Option<UpdatesNetHandle> {
+        Some(UpdatesNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.updates_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// Drain the callback-parked UpdatesManager answers — the C++
+    /// promise lambdas of the five query classes (UpdatesManager.cpp:143,
+    /// 159, 202, 222, 253) rerouted through the parked kinds.
+    fn dispatch_completed_updates_net(&mut self) {
+        let completed = std::mem::take(&mut *self.updates_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_updates_net_answer(kind, query);
+        }
+    }
+
+    /// Route one UpdatesManager answer by kind. Each arm builds the env
+    /// exactly like the C++ `send_closure(G()->updates_manager(), ...)`
+    /// hop and drains the sink afterwards (the difference/state intakes
+    /// may apply updates into the collectors).
+    fn on_updates_net_answer(&mut self, kind: UpdatesNetKind, query: NetQuery) {
+        let net = self.updates_net();
+        let global = &mut self.global;
+        let Some(options) = self.option_manager.as_mut() else {
+            return;
+        };
+        let mut env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+            net,
+        };
+        match kind {
+            UpdatesNetKind::GetDifference | UpdatesNetKind::GetPtsUpdate => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.updates_manager
+                        .on_failed_get_difference(&mut env, status);
+                } else if let Ok(difference) =
+                    telegram_api::updates_Difference::parse(query.ok())
+                {
+                    self.updates_manager.on_get_difference(&mut env, difference);
+                } else {
+                    tdutils::log_error!("Failed to parse the getDifference answer");
+                }
+            }
+            UpdatesNetKind::GetUpdatesState => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.updates_manager
+                        .on_failed_get_updates_state(&mut env, status);
+                } else if let Ok(state) = telegram_api::updates_State::parse(query.ok()) {
+                    self.updates_manager
+                        .on_get_updates_state(&mut env, state, "GetUpdatesStateQuery");
+                } else {
+                    tdutils::log_error!("Failed to parse the updates.getState answer");
+                }
+            }
+            UpdatesNetKind::ConfirmPtsQts => {
+                if query.is_error() {
+                    // the C++ on_error logs unless the status is expected
+                    // (the 404/TIMEOUT class); the collapsed expected-error
+                    // table logs at debug.
+                    tdutils::log_debug!(
+                        "Failed to confirm PTS/QTS: {}",
+                        query.error().message()
+                    );
+                }
+            }
+            UpdatesNetKind::Ping => {
+                let state = if query.is_error() {
+                    None
+                } else {
+                    telegram_api::updates_State::parse(query.ok()).ok()
+                };
+                self.updates_manager.on_server_pong(&mut env, state);
+            }
+        }
+        drop(env);
+        self.drain_sink();
     }
 
     /// Route one walking-skeleton answer by kind.
@@ -4719,6 +5114,7 @@ impl Td {
                     // The M.7 engine: `updates.getState` replays through
                     // on_get_updates_state (the C++ get_difference chain);
                     // the S72 set_pts/set_qts/set_seq calls are superseded.
+                    let net = self.updates_net();
                     let global = &mut self.global;
                     let options = self
                         .option_manager
@@ -4731,11 +5127,189 @@ impl Td {
                         auth_is_bot: self.auth_manager.is_bot(),
                         my_id: self.user_manager.get_my_id().get(),
                         can_ignore_background_updates: self.can_ignore_background_updates,
+                        net,
                     };
                     self.updates_manager
                         .on_get_updates_state(&mut env, m, "updates.getState");
+                    self.drain_sink();
                 }
             }
+        }
+    }
+
+    /// The `SendMessageQuery::on_result`/`on_error` (MessagesManager.cpp:1251-1290)
+    /// over the collapsed actor shape: the short-sent arm feeds the
+    /// sent-text update + the `updateSentMessage` pts synthetic; the
+    /// updates arm runs `check_send_message_result` + the difference
+    /// pump; the error arm runs the fail ladder.
+    fn on_send_message_answer(
+        &mut self,
+        random_id: i64,
+        dialog_id: crate::messages_manager::DialogId,
+        query: NetQuery,
+    ) {
+        if query.is_error() {
+            // `SendMessageQuery::on_error`: the close+message-db check
+            // keeps the message for the restart resend (the error is
+            // dropped); the dialog-error seam is the
+            // `on_get_dialog_error` collapse; then the fail ladder.
+            let status = query.error();
+            if !(self.global.close_flag() && self.use_message_database) {
+                self.run_send_message_fail(random_id, status.code(), status.message());
+            }
+            return;
+        }
+        let updates = match telegram_api::Updates::parse(query.ok()) {
+            Ok(updates) => updates,
+            Err(_) => {
+                tdutils::log_error!("Failed to parse the sendMessage answer");
+                return;
+            }
+        };
+        if let telegram_api::Updates::updateShortSentMessage(sent_message) = updates {
+            // the updateShortSentMessage arm (MessagesManager.cpp:1263-1283):
+            // the sent-text content swap, then the pts synthetic (the
+            // channel arm rides the channel-pts machine).
+            let media = sent_message.media.map(|media| *media);
+            let mut manager = std::mem::take(&mut self.messages_manager);
+            let mut global = std::mem::take(&mut self.global);
+            // SAFETY: as on_send_message_fail above.
+            let td_ptr = std::ptr::from_mut(self);
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            crate::messages_manager::on_update_sent_text_message(
+                &mut global,
+                &mut manager,
+                ctx,
+                state,
+                random_id,
+                media,
+                sent_message.entities,
+            );
+            self.global = global;
+            self.messages_manager = manager;
+            let now = tdutils::time::now();
+            if dialog_id.get_type() == crate::messages_manager::DialogType::Channel {
+                // the C++ `add_pending_channel_update` — the channel-pts
+                // machine holds the synthetic until the channel difference
+                // plane lands (MessagesManager.cpp:1272-1276); the S76
+                // send path is the user-dialog arm.
+                tdutils::log_debug!(
+                    "Hold the sent-message synthetic for {} — [blocked: channel-pts]",
+                    dialog_id
+                );
+                return;
+            }
+            let net = self.updates_net();
+            let global = &mut self.global;
+            let options = self
+                .option_manager
+                .as_mut()
+                .expect("option manager exists after init");
+            let mut env = TdUpdatesEnv {
+                global,
+                options,
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                my_id: self.user_manager.get_my_id().get(),
+                can_ignore_background_updates: self.can_ignore_background_updates,
+                net,
+            };
+            self.updates_manager.add_pending_pts_update(
+                &mut env,
+                crate::updates_manager::PendingUpdate::SentMessage {
+                    random_id,
+                    message_id: sent_message.id,
+                    date: sent_message.date,
+                    ttl_period: sent_message.ttl_period,
+                },
+                sent_message.pts,
+                sent_message.pts_count,
+                now,
+                tdutils::promise::Promise::default(),
+                "send message actor",
+            );
+            self.drain_sink();
+            return;
+        }
+        // the full-updates arm (MessagesManager.cpp:1260-1262):
+        // check_send_message_result, then the difference pump.
+        self.check_send_message_result(random_id, dialog_id, &updates);
+        let net = self.updates_net();
+        let global = &mut self.global;
+        let options = self
+            .option_manager
+            .as_mut()
+            .expect("option manager exists after init");
+        let mut env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+            net,
+        };
+        self.updates_manager
+            .on_get_updates(&mut env, updates, tdutils::promise::Promise::default());
+        self.drain_sink();
+    }
+
+    /// `MessagesManager::on_send_message_fail` over the collapsed actor
+    /// shape — the take/put-back dance around the manager and the global.
+    fn run_send_message_fail(&mut self, random_id: i64, code: i32, message: &str) {
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        let mut global = std::mem::take(&mut self.global);
+        // SAFETY: the ctx/state views alias one Td and are used strictly
+        // sequentially inside the callee (the split_context_alias contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        crate::messages_manager::on_send_message_fail(
+            &mut global,
+            &mut manager,
+            ctx,
+            state,
+            random_id,
+            code,
+            message,
+        );
+        self.global = global;
+        self.messages_manager = manager;
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked `SendMessageQuery` answers.
+    fn dispatch_completed_send_message_net(&mut self) {
+        let completed = std::mem::take(&mut *self.send_message_net_completed.lock());
+        for (random_id, dialog_id, query) in completed {
+            self.on_send_message_answer(random_id, dialog_id, query);
+        }
+    }
+
+    /// `MessagesManager::check_send_message_result` (MessagesManager.cpp:27784-27807)
+    /// over the M.7.8 statics; the wrong-result repair legs (the channel
+    /// difference / the scheduled-messages repair) stay the recorded
+    /// seams — the log band is the observable part.
+    fn check_send_message_result(
+        &mut self,
+        random_id: i64,
+        dialog_id: crate::messages_manager::DialogId,
+        updates: &telegram_api::Updates,
+    ) {
+        let sent_messages = crate::updates_manager::get_new_messages(updates);
+        let sent_random_ids = crate::updates_manager::get_sent_messages_random_ids(updates);
+        let wrong = sent_messages.len() != 1
+            || sent_random_ids.len() != 1
+            || !sent_random_ids.contains(&random_id)
+            || crate::messages_manager::DialogId::get_message_dialog_id(sent_messages[0].0)
+                != dialog_id;
+        if wrong {
+            tdutils::log_error!(
+                "Receive wrong result for sending message with random_id {random_id} to {dialog_id}"
+            );
         }
     }
 
@@ -6225,6 +6799,7 @@ impl Td {
         let Ok(umbrella) = telegram_api::Updates::parse(&data) else {
             return;
         };
+        let net = self.updates_net();
         let Some(options) = self.option_manager.as_mut() else {
             return;
         };
@@ -6235,6 +6810,7 @@ impl Td {
             auth_is_bot: self.auth_manager.is_bot(),
             my_id: self.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.can_ignore_background_updates,
+        net,
         };
         self.updates_manager
             .on_get_updates(&mut env, umbrella, Promise::default());
@@ -6244,6 +6820,26 @@ impl Td {
     /// Converts and emits what the sink collected.
     fn drain_sink(&mut self) {
         let sink = std::mem::take(self.updates_manager.sink());
+        // the users feed the UserManager container first — the C++
+        // `process_updates_users_and_chats` tail (`td_->user_manager_->
+        // on_get_user`, UpdatesManager.cpp:1594-1600); the send path's
+        // `get_input_peer` reads the access hashes from there.
+        if !sink.users.is_empty() {
+            let mut user_manager = std::mem::take(&mut self.user_manager);
+            let options = self.option_manager.as_mut();
+            if let Some(options) = options {
+                let mut env = crate::user_manager::UserEnv {
+                    global: &mut self.global,
+                    options,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                };
+                for user in &sink.users {
+                    let user = user.clone();
+                    user_manager.on_get_user(&mut env, user, "Updates");
+                }
+            }
+            self.user_manager = user_manager;
+        }
         for user in &sink.users {
             if let telegram_api::User::user(user) = user {
                 self.peer_access.insert(user.id, user.access_hash);
@@ -6278,6 +6874,52 @@ impl Td {
         for update in &sink.marked_unread {
             self.apply_dialog_is_marked_as_unread(update);
         }
+        let sent_messages = sink.sent_messages.clone();
+        for (random_id, message_id, date, ttl_period) in sent_messages {
+            self.apply_send_message_success(random_id, message_id, date, ttl_period);
+        }
+    }
+
+    /// The receive path for the `updateSentMessage` synthetic —
+    /// `MessagesManager::on_send_message_success` (MessagesManager.cpp:27848):
+    /// the local yet-unsent message is deleted and re-added under the
+    /// server id (the `updateMessageSendSucceeded` emission rides the
+    /// ported core).
+    fn apply_send_message_success(
+        &mut self,
+        random_id: i64,
+        message_id: i32,
+        date: i32,
+        ttl_period: i32,
+    ) {
+        let new_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(message_id),
+        );
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        let mut global = std::mem::take(&mut self.global);
+        // SAFETY: the ctx/state/reactions views alias one Td and are used
+        // strictly sequentially inside the callee (the split_context_alias
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        let reactions_ctx =
+            crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
+        crate::messages_manager::on_send_message_success(
+            &mut global,
+            &mut manager,
+            ctx,
+            state,
+            &reactions_ctx,
+            random_id,
+            new_message_id,
+            date,
+            ttl_period,
+            "process updateSentMessage",
+        );
+        self.global = global;
+        self.messages_manager = manager;
     }
 
     /// The receive path for the dialog arm of `updateDialogUnreadMark` —
@@ -8748,6 +9390,7 @@ impl Actor for Td {
         // saves, the getDifference retry and the data reloaders; M.7.18).
         // Pre-init the ticks skip — the tail flush below must still run:
         // a pre-init alarm settles its parked promise through it.
+        let net = self.updates_net();
         if let Some(options) = self.option_manager.as_mut() {
             let mut env = TdUpdatesEnv {
                 global: &mut self.global,
@@ -8756,6 +9399,7 @@ impl Actor for Td {
                 auth_is_bot: self.auth_manager.is_bot(),
                 my_id: self.user_manager.get_my_id().get(),
                 can_ignore_background_updates: self.can_ignore_background_updates,
+                net,
             };
             self.updates_manager.tick_timeouts(&mut env);
         }
@@ -10017,6 +10661,9 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
             auth_is_bot: self.auth_is_bot,
             my_id: self.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.can_ignore_background_updates,
+            // the M.18 pts tails never gap into get_difference; the
+            // net-inert posture keeps the env borrow split
+            net: None,
         };
         self.updates_manager.add_pending_pts_update(
             &mut updates_env,
@@ -12999,6 +13646,7 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
     }
 
     fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
+        let net = self.td.updates_net();
         let options = self
             .td
             .option_manager
@@ -13012,6 +13660,7 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
             auth_is_bot: self.td.auth_manager.is_bot(),
             my_id: self.td.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.td.can_ignore_background_updates,
+        net,
         };
         self.td
             .updates_manager
