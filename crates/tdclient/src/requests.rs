@@ -1954,6 +1954,18 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
             stickers_manager.get_default_emoji_statuses(&mut env, false, promise);
         }
+        Function::getThemedChatEmojiStatuses(_) => {
+            // Requests.cpp:6821-6825
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_default_channel_emoji_statuses(&mut env, false, promise);
+        }
         Function::getPremiumStickers(request) => {
             // Requests.cpp:7474-7478 — the limit bands, then the
             // composite load parks ([blocked: net]).
@@ -10666,9 +10678,7 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
-        _ => {
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
-        }
+        _ => run_secret_chat_requests(td, id, function),
     }
 }
 /// Whether the function is one of the M.46 bots arm group (the cheap
@@ -12974,6 +12984,525 @@ fn run_dialog_invite_link_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, manager) = crate::td::dialog_invite_link_env_split(td);
             manager.import_dialog_invite_link(&mut env, invite_link, promise);
         }
+        _ => run_password_and_auth_requests(td, id, function),
+    }
+}
+
+/// The PasswordManager and AuthManager edge request dispatcher.
+#[allow(clippy::too_many_lines)]
+fn run_password_and_auth_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::getPasswordState(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let state = td.password_manager.get_password_state();
+            td.send_result(id, Object::passwordState(state));
+        }
+        Function::setPassword(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(old_password) = clean_or_utf8_error(td, id, &request.old_password) else {
+                return;
+            };
+            let Some(new_password) = clean_or_utf8_error(td, id, &request.new_password) else {
+                return;
+            };
+            let Some(new_hint) = clean_or_utf8_error(td, id, &request.new_hint) else {
+                return;
+            };
+            let Some(new_recovery_email_address) =
+                clean_or_utf8_error(td, id, &request.new_recovery_email_address)
+            else {
+                return;
+            };
+            match td.password_manager.set_password(
+                &old_password,
+                &new_password,
+                &new_hint,
+                request.set_recovery_email_address,
+                &new_recovery_email_address,
+            ) {
+                Ok(state) => td.send_result(id, Object::passwordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::setLoginEmailAddress(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(email) = clean_or_utf8_error(td, id, &request.new_login_email_address) else {
+                return;
+            };
+            match td.password_manager.set_login_email_address(&email) {
+                Ok(info) => td.send_result(id, Object::emailAddressAuthenticationCodeInfo(info)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::resendLoginEmailAddressCode(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td.password_manager.resend_login_email_address_code() {
+                Ok(info) => td.send_result(id, Object::emailAddressAuthenticationCodeInfo(info)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::checkLoginEmailAddressCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td
+                .password_manager
+                .check_login_email_address_code(request.code)
+            {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::setRecoveryEmailAddress(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            let Some(new_recovery_email_address) =
+                clean_or_utf8_error(td, id, &request.new_recovery_email_address)
+            else {
+                return;
+            };
+            match td
+                .password_manager
+                .set_recovery_email_address(&password, &new_recovery_email_address)
+            {
+                Ok(state) => td.send_result(id, Object::passwordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::getRecoveryEmailAddress(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            match td.password_manager.get_recovery_email_address(&password) {
+                Ok(addr) => td.send_result(id, Object::recoveryEmailAddress(addr)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::checkRecoveryEmailAddressCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(code) = clean_or_utf8_error(td, id, &request.code) else {
+                return;
+            };
+            match td.password_manager.check_recovery_email_address_code(&code) {
+                Ok(state) => td.send_result(id, Object::passwordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::resendRecoveryEmailAddressCode(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td.password_manager.resend_recovery_email_address_code() {
+                Ok(state) => td.send_result(id, Object::passwordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::cancelRecoveryEmailAddressVerification(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td
+                .password_manager
+                .cancel_recovery_email_address_verification()
+            {
+                Ok(state) => td.send_result(id, Object::passwordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::sendEmailAddressVerificationCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(email) = clean_or_utf8_error(td, id, &request.email_address) else {
+                return;
+            };
+            match td
+                .password_manager
+                .send_email_address_verification_code(&email)
+            {
+                Ok(info) => td.send_result(id, Object::emailAddressAuthenticationCodeInfo(info)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::resendEmailAddressVerificationCode(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td.password_manager.resend_email_address_verification_code() {
+                Ok(info) => td.send_result(id, Object::emailAddressAuthenticationCodeInfo(info)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::checkEmailAddressVerificationCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(code) = clean_or_utf8_error(td, id, &request.code) else {
+                return;
+            };
+            match td
+                .password_manager
+                .check_email_address_verification_code(&code)
+            {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::requestPasswordRecovery(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td.password_manager.request_password_recovery() {
+                Ok(info) => td.send_result(id, Object::emailAddressAuthenticationCodeInfo(info)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::checkPasswordRecoveryCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(code) = clean_or_utf8_error(td, id, &request.recovery_code) else {
+                return;
+            };
+            match td.password_manager.check_password_recovery_code(&code) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::recoverPassword(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(recovery_code) = clean_or_utf8_error(td, id, &request.recovery_code) else {
+                return;
+            };
+            let Some(new_password) = clean_or_utf8_error(td, id, &request.new_password) else {
+                return;
+            };
+            let Some(new_hint) = clean_or_utf8_error(td, id, &request.new_hint) else {
+                return;
+            };
+            match td
+                .password_manager
+                .recover_password(&recovery_code, &new_password, &new_hint)
+            {
+                Ok(state) => td.send_result(id, Object::passwordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::resetPassword(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td.password_manager.reset_password() {
+                Ok(res) => td.send_result(id, res.into()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::cancelPasswordReset(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match td.password_manager.cancel_password_reset() {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::getTemporaryPasswordState(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let state = td.password_manager.get_temporary_password_state();
+            td.send_result(id, Object::temporaryPasswordState(state));
+        }
+        Function::createTemporaryPassword(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            match td
+                .password_manager
+                .create_temporary_password(&password, request.valid_for)
+            {
+                Ok(state) => td.send_result(id, Object::temporaryPasswordState(state)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::getPasskeyParameters(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let text = td.password_manager.get_passkey_parameters();
+            td.send_result(id, Object::text(text));
+        }
+        Function::getAuthenticationPasskeyParameters(_) => {
+            let text = td.password_manager.get_authentication_passkey_parameters();
+            td.send_result(id, Object::text(text));
+        }
+        Function::getLoginPasskeys(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let passkeys = td.password_manager.get_login_passkeys();
+            td.send_result(id, Object::passkeys(passkeys));
+        }
+        Function::addLoginPasskey(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(client_data) = clean_or_utf8_error(td, id, &request.client_data) else {
+                return;
+            };
+            match td
+                .password_manager
+                .add_login_passkey(&client_data, request.attestation_object)
+            {
+                Ok(passkey) => td.send_result(id, Object::passkey(passkey)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::removeLoginPasskey(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(passkey_id) = clean_or_utf8_error(td, id, &request.passkey_id) else {
+                return;
+            };
+            match td.password_manager.remove_login_passkey(&passkey_id) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+
+        // --- AuthManager Edge Flows (16) ---
+        Function::resendAuthenticationCode(request) => {
+            match td
+                .auth_manager
+                .resend_authentication_code(request.reason.as_ref())
+            {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::requestQrCodeAuthentication(request) => {
+            match td
+                .auth_manager
+                .request_qr_code_authentication(&request.other_user_ids)
+            {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::sendAuthenticationFirebaseSms(request) => {
+            let Some(token) = clean_or_utf8_error(td, id, &request.token) else {
+                return;
+            };
+            match td.auth_manager.send_authentication_firebase_sms(&token) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::reportAuthenticationCodeMissing(request) => {
+            let Some(code) = clean_or_utf8_error(td, id, &request.mobile_network_code) else {
+                return;
+            };
+            match td.auth_manager.report_authentication_code_missing(&code) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::setAuthenticationEmailAddress(request) => {
+            let Some(email) = clean_or_utf8_error(td, id, &request.email_address) else {
+                return;
+            };
+            match td.auth_manager.set_authentication_email_address(&email) {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::resetAuthenticationEmailAddress(_) => {
+            match td.auth_manager.reset_authentication_email_address() {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::checkAuthenticationEmailCode(request) => {
+            match td
+                .auth_manager
+                .check_authentication_email_code(request.code.as_ref())
+            {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::setAuthenticationPremiumPurchaseTransaction(request) => {
+            match td.auth_manager.set_premium_purchase_transaction(
+                request.transaction.as_ref(),
+                request.is_restore,
+                request.premium_day_count,
+                &request.currency,
+                request.amount,
+            ) {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::checkAuthenticationPremiumPurchase(request) => {
+            let Some(currency) = clean_or_utf8_error(td, id, &request.currency) else {
+                return;
+            };
+            match td.auth_manager.check_premium_purchase(
+                request.premium_day_count,
+                &currency,
+                request.amount,
+            ) {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::checkAuthenticationPasskey(request) => {
+            let Some(credential_id) = clean_or_utf8_error(td, id, &request.credential_id) else {
+                return;
+            };
+            let Some(client_data) = clean_or_utf8_error(td, id, &request.client_data) else {
+                return;
+            };
+            match td.auth_manager.finish_passkey_login(
+                &credential_id,
+                &client_data,
+                &request.authenticator_data,
+                &request.signature,
+                &request.user_handle,
+            ) {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::checkAuthenticationWebToken(request) => {
+            let Some(token) = clean_or_utf8_error(td, id, &request.token) else {
+                return;
+            };
+            match td
+                .auth_manager
+                .import_web_token_authorization(&token, request.dc_id)
+            {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::checkAuthenticationPasswordRecoveryCode(request) => {
+            let Some(code) = clean_or_utf8_error(td, id, &request.recovery_code) else {
+                return;
+            };
+            match td
+                .auth_manager
+                .check_authentication_password_recovery_code(&code)
+            {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::requestAuthenticationPasswordRecovery(_) => {
+            match td.auth_manager.request_authentication_password_recovery() {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::recoverAuthenticationPassword(request) => {
+            let Some(code) = clean_or_utf8_error(td, id, &request.recovery_code) else {
+                return;
+            };
+            let Some(new_password) = clean_or_utf8_error(td, id, &request.new_password) else {
+                return;
+            };
+            let Some(new_hint) = clean_or_utf8_error(td, id, &request.new_hint) else {
+                return;
+            };
+            match td
+                .auth_manager
+                .recover_authentication_password(&code, &new_password, &new_hint)
+            {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::registerUser(request) => {
+            let Some(first_name) = clean_or_utf8_error(td, id, &request.first_name) else {
+                return;
+            };
+            let Some(last_name) = clean_or_utf8_error(td, id, &request.last_name) else {
+                return;
+            };
+            match td.auth_manager.register_user(
+                &first_name,
+                &last_name,
+                request.disable_notification,
+            ) {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
+        Function::deleteAccount(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(reason) = clean_or_utf8_error(td, id, &request.reason) else {
+                return;
+            };
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            match td.auth_manager.delete_account(&reason, &password) {
+                Ok(()) => {
+                    td.flush_auth_updates();
+                    td.send_result(id, ok_object());
+                }
+                Err(msg) => td.send_error_impl(id, 400, &msg),
+            }
+        }
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -13799,16 +14328,14 @@ mod request_census_tests {
         // setStickerEmojis, setStickerKeywords, setStickerMaskPosition,
         // removeStickerFromSet, reorderInstalledStickerSets,
         // uploadStickerFile, viewTrendingStickerSets, getStickerOutline,
-        // getStickerOutlineSvgPath, getEmojiSuggestionsUrl) over the
-        // collapsed stickers_manager plane (the validation/cache bands
-        // exact; every set load and query tail parks at the
-        // [blocked: net]/[blocked: Files] seams).
+        // The PasswordManager and AuthManager edge slice flipped 25 PasswordManager
+        // arms and 16 AuthManager arms (41 flips in total).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            693,
+            734,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 308, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 267, "interim count");
     }
 }

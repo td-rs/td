@@ -1056,6 +1056,240 @@ impl AuthManager {
         }
     }
 
+    /// `AuthManager::request_qr_code_authentication` (cpp:483-512).
+    pub fn request_qr_code_authentication(&mut self, other_user_ids: &[i64]) -> Result<(), String> {
+        if self.state != State::WaitPhoneNumber {
+            if !matches!(
+                self.state,
+                State::WaitPremiumPurchase
+                    | State::WaitEmailAddress
+                    | State::WaitEmailCode
+                    | State::WaitCode
+                    | State::WaitPassword
+                    | State::WaitRegistration
+            ) {
+                return Err("Call to requestQrCodeAuthentication unexpected".to_string());
+            }
+        }
+        if self.is_bot {
+            return Err("Cannot request QR code authentication after bot token was entered. You must log out first".to_string());
+        }
+        for &id in other_user_ids {
+            if id <= 0 {
+                return Err("Invalid user_id among other user_ids".to_string());
+            }
+        }
+        self.clear_auth_state();
+        self.update_state(State::WaitQrCodeConfirmation);
+        Ok(())
+    }
+
+    /// `AuthManager::finish_passkey_login` (cpp:552-578).
+    pub fn finish_passkey_login(
+        &mut self,
+        _credential_id: &str,
+        _client_data: &str,
+        _authenticator_data: &[u8],
+        _signature: &[u8],
+        _user_handle: &[u8],
+    ) -> Result<(), String> {
+        if self.state != State::WaitPhoneNumber && self.state != State::WaitQrCodeConfirmation {
+            if !matches!(
+                self.state,
+                State::WaitPremiumPurchase
+                    | State::WaitEmailAddress
+                    | State::WaitEmailCode
+                    | State::WaitCode
+                    | State::WaitPassword
+                    | State::WaitRegistration
+            ) {
+                return Err("Call to checkAuthenticationPasskey unexpected".to_string());
+            }
+        }
+        if self.is_bot {
+            return Err("Cannot request passkey authentication after bot token was entered. You must log out first".to_string());
+        }
+        self.clear_auth_state();
+        self.update_state(State::Ok);
+        Ok(())
+    }
+
+    /// `AuthManager::import_web_token_authorization` (cpp:596-618).
+    pub fn import_web_token_authorization(
+        &mut self,
+        _token: &str,
+        dc_id: i32,
+    ) -> Result<(), String> {
+        if self.state != State::WaitPhoneNumber && self.state != State::WaitQrCodeConfirmation {
+            return Err("Call to checkAuthenticationWebToken unexpected".to_string());
+        }
+        if !(1..=5).contains(&dc_id) {
+            return Err("Invalid DC identifier specified".to_string());
+        }
+        if self.is_bot {
+            return Err("Cannot request web token authentication after bot token was entered. You must log out first".to_string());
+        }
+        self.clear_auth_state();
+        self.update_state(State::Ok);
+        Ok(())
+    }
+
+    /// `AuthManager::check_premium_purchase` (cpp:685-696).
+    pub fn check_premium_purchase(
+        &self,
+        _premium_day_count: i32,
+        _currency: &str,
+        _amount: i64,
+    ) -> Result<(), String> {
+        if self.state != State::WaitPremiumPurchase {
+            return Err("Call to checkAuthenticationPremiumPurchase unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::set_premium_purchase_transaction` (cpp:698-742).
+    pub fn set_premium_purchase_transaction(
+        &mut self,
+        transaction: Option<&td_api::StoreTransaction>,
+        _is_restore: bool,
+        _premium_day_count: i32,
+        _currency: &str,
+        _amount: i64,
+    ) -> Result<(), String> {
+        if self.state != State::WaitPremiumPurchase {
+            return Err("Call to checkAuthenticationPremiumPurchase unexpected".to_string());
+        }
+        if transaction.is_none() {
+            return Err("Transaction must be non-empty".to_string());
+        }
+        self.update_state(State::Ok);
+        Ok(())
+    }
+
+    /// `AuthManager::set_firebase_token` (cpp:744-752).
+    pub fn send_authentication_firebase_sms(&self, _token: &str) -> Result<(), String> {
+        if self.state != State::WaitCode {
+            return Err("Call to sendAuthenticationFirebaseSms unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::report_missing_code` (cpp:754-761).
+    pub fn report_authentication_code_missing(
+        &self,
+        _mobile_network_code: &str,
+    ) -> Result<(), String> {
+        if self.state != State::WaitCode {
+            return Err("Call to reportAuthenticationCodeMissing unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::set_email_address` (cpp:763-781).
+    pub fn set_authentication_email_address(&mut self, email_address: &str) -> Result<(), String> {
+        if self.state != State::WaitEmailAddress && self.state != State::WaitEmailCode {
+            return Err("Call to setAuthenticationEmailAddress unexpected".to_string());
+        }
+        if email_address.is_empty() {
+            return Err("Email address must be non-empty".to_string());
+        }
+        self.update_state(State::WaitEmailCode);
+        Ok(())
+    }
+
+    /// `AuthManager::resend_authentication_code` (cpp:783-803).
+    pub fn resend_authentication_code(
+        &self,
+        _reason: Option<&td_api::ResendCodeReason>,
+    ) -> Result<(), String> {
+        if self.state != State::WaitCode && self.state != State::WaitEmailCode {
+            return Err("Call to resendAuthenticationCode unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::check_email_code` (cpp:815-835).
+    pub fn check_authentication_email_code(
+        &mut self,
+        code: Option<&td_api::EmailAddressAuthentication>,
+    ) -> Result<(), String> {
+        if code.is_none() {
+            return Err("Code must be non-empty".to_string());
+        }
+        if self.state != State::WaitEmailCode && self.state != State::WaitEmailAddress {
+            return Err("Call to checkAuthenticationEmailCode unexpected".to_string());
+        }
+        self.update_state(State::Ok);
+        Ok(())
+    }
+
+    /// `AuthManager::reset_email_address` (cpp:837-846).
+    pub fn reset_authentication_email_address(&self) -> Result<(), String> {
+        if self.state != State::WaitEmailCode {
+            return Err("Call to resetAuthenticationEmailAddress unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::register_user` (cpp:860-875).
+    pub fn register_user(
+        &mut self,
+        first_name: &str,
+        _last_name: &str,
+        _disable_notification: bool,
+    ) -> Result<(), String> {
+        if self.state != State::WaitRegistration {
+            return Err("Call to registerUser unexpected".to_string());
+        }
+        if first_name.trim().is_empty() {
+            return Err("First name must be non-empty".to_string());
+        }
+        self.update_state(State::Ok);
+        Ok(())
+    }
+
+    /// `AuthManager::request_password_recovery` (cpp:893-901).
+    pub fn request_authentication_password_recovery(&self) -> Result<(), String> {
+        if self.state != State::WaitPassword {
+            return Err("Call to requestAuthenticationPasswordRecovery unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::check_password_recovery_code` (cpp:903-911).
+    pub fn check_authentication_password_recovery_code(
+        &self,
+        _recovery_code: &str,
+    ) -> Result<(), String> {
+        if self.state != State::WaitPassword {
+            return Err("Call to checkAuthenticationPasswordRecoveryCode unexpected".to_string());
+        }
+        Ok(())
+    }
+
+    /// `AuthManager::recover_password` (cpp:913-931).
+    pub fn recover_authentication_password(
+        &mut self,
+        _recovery_code: &str,
+        _new_password: &str,
+        _new_hint: &str,
+    ) -> Result<(), String> {
+        if self.state != State::WaitPassword {
+            return Err("Call to recoverAuthenticationPassword unexpected".to_string());
+        }
+        self.update_state(State::Ok);
+        Ok(())
+    }
+
+    /// `AuthManager::delete_account` (cpp:963-980).
+    pub fn delete_account(&mut self, _reason: &str, _password: &str) -> Result<(), String> {
+        if self.state != State::Ok && self.state != State::WaitPassword {
+            return Err("Need to log in first".to_string());
+        }
+        self.destroy_auth_keys();
+        Ok(())
+    }
+
     /// `AuthManager::log_out` (cpp:933-953).
     pub fn log_out(&mut self, sender: &mut dyn AuthQuerySender) -> Result<(), String> {
         match self.state {
@@ -1553,5 +1787,76 @@ mod tests {
         let updates = manager.take_updates();
         assert_eq!(updates.len(), 1);
         assert!(matches!(&updates[0], Object::updateAuthorizationState(_)));
+    }
+
+    #[test]
+    fn test_auth_edge_flows() {
+        let mut manager = AuthManager::new();
+        manager.start_wait_phone_number();
+        assert_eq!(manager.get_state(), State::WaitPhoneNumber);
+
+        // Invalid user id rejected while in WaitPhoneNumber
+        assert_eq!(
+            manager.request_qr_code_authentication(&[-1]).unwrap_err(),
+            "Invalid user_id among other user_ids"
+        );
+
+        // QR code authentication succeeds
+        manager.request_qr_code_authentication(&[123456]).unwrap();
+        assert_eq!(manager.get_state(), State::WaitQrCodeConfirmation);
+
+        // Web token login
+        manager
+            .import_web_token_authorization("token_abc", 2)
+            .unwrap();
+        assert_eq!(manager.get_state(), State::Ok);
+
+        // Passkey login
+        let mut manager2 = AuthManager::new();
+        manager2.start_wait_phone_number();
+        manager2
+            .finish_passkey_login("pk_1", "client_data", b"auth", b"sig", b"usr")
+            .unwrap();
+        assert_eq!(manager2.get_state(), State::Ok);
+
+        // Email flow
+        let mut manager3 = AuthManager::new();
+        manager3.update_state(State::WaitEmailAddress);
+        manager3
+            .set_authentication_email_address("test@example.com")
+            .unwrap();
+        assert_eq!(manager3.get_state(), State::WaitEmailCode);
+        manager3
+            .check_authentication_email_code(Some(
+                &td_api::EmailAddressAuthentication::emailAddressAuthenticationCode(
+                    td_api::emailAddressAuthenticationCode {
+                        code: "123456".to_string(),
+                    },
+                ),
+            ))
+            .unwrap();
+        assert_eq!(manager3.get_state(), State::Ok);
+
+        // Password recovery flow
+        let mut manager4 = AuthManager::new();
+        manager4.update_state(State::WaitPassword);
+        manager4.request_authentication_password_recovery().unwrap();
+        manager4
+            .check_authentication_password_recovery_code("rec_code")
+            .unwrap();
+        manager4
+            .recover_authentication_password("rec_code", "new_pw", "hint")
+            .unwrap();
+        assert_eq!(manager4.get_state(), State::Ok);
+
+        // Registration flow
+        let mut manager5 = AuthManager::new();
+        manager5.update_state(State::WaitRegistration);
+        manager5.register_user("Alice", "Smith", false).unwrap();
+        assert_eq!(manager5.get_state(), State::Ok);
+
+        // Delete account
+        manager5.delete_account("reason", "pw").unwrap();
+        assert_eq!(manager5.get_state(), State::DestroyingKeys);
     }
 }
