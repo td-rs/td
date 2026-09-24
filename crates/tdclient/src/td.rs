@@ -2143,6 +2143,7 @@ pub struct Td {
     /// actor id also lands in `G()->set_web_app_manager` — the net step).
     pub(crate) web_app_manager: crate::web_app_manager::WebAppManager,
     pub(crate) auth_manager: AuthManager,
+    pub(crate) password_manager: crate::password_manager::PasswordManager,
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
@@ -2615,6 +2616,7 @@ impl Td {
             game_manager: crate::game_manager::GameManager::new(),
             web_app_manager: crate::web_app_manager::WebAppManager::new(),
             auth_manager: AuthManager::new(),
+            password_manager: crate::password_manager::PasswordManager::new(),
             user_manager: UserManager::new(),
             stickers_manager: crate::stickers_manager::StickersManager::new(),
             message_query_manager: crate::message_query_manager::MessageQueryManager::new(),
@@ -3047,6 +3049,8 @@ impl Td {
         // VLOG "Create AuthManager" (Td.cpp:923-926) + the constructor pmc
         // restore (AuthManager.cpp:337-366).
         self.auth_manager
+            .set_api_credentials(parameters.api_id, parameters.api_hash.clone());
+        self.password_manager
             .set_api_credentials(parameters.api_id, parameters.api_hash.clone());
         if let Some(user) = resumed_user {
             // The walking-skeleton resume: Ready + the cached self user (the
@@ -3831,7 +3835,7 @@ impl Td {
 
     /// Drain the inline AuthManager's queued `updateAuthorizationState`
     /// broadcasts (the C++ sends them straight to `Td::send_update`).
-    fn flush_auth_updates(&mut self) {
+    pub(crate) fn flush_auth_updates(&mut self) {
         for update in self.auth_manager.take_updates() {
             self.send_update(update);
         }
@@ -17935,5 +17939,70 @@ mod tests {
             );
             assert!(matches!(responses_of(callback, 3)[0], Object::ok(_)));
         });
+    }
+
+    #[test]
+    fn password_and_auth_requests_dispatch() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(password_and_auth_requests_dispatch_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn password_and_auth_requests_dispatch_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("password-auth-test");
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+
+        // Pre-auth passkey parameters
+        td.request(
+            21,
+            Function::getAuthenticationPasskeyParameters(
+                td_api::getAuthenticationPasskeyParameters,
+            ),
+        );
+        let resp21 = responses_of(&callback, 21);
+        assert!(!resp21.is_empty());
+        assert!(matches!(resp21[0], Object::text(_)));
+
+        // Now authorize the client
+        td.auth_manager.force_authorized_for_test();
+
+        // PasswordManager requests
+        td.request(
+            22,
+            Function::getPasskeyParameters(td_api::getPasskeyParameters),
+        );
+        let resp22 = responses_of(&callback, 22);
+        assert!(!resp22.is_empty());
+        assert!(matches!(resp22[0], Object::text(_)));
+
+        td.request(23, Function::getPasswordState(td_api::getPasswordState));
+        let resp23 = responses_of(&callback, 23);
+        assert!(!resp23.is_empty());
+        assert!(matches!(resp23[0], Object::passwordState(_)));
+
+        td.request(
+            24,
+            Function::getTemporaryPasswordState(td_api::getTemporaryPasswordState),
+        );
+        let resp24 = responses_of(&callback, 24);
+        assert!(!resp24.is_empty());
+        assert!(matches!(resp24[0], Object::temporaryPasswordState(_)));
+
+        td.request(25, Function::getLoginPasskeys(td_api::getLoginPasskeys));
+        let resp25 = responses_of(&callback, 25);
+        assert!(!resp25.is_empty());
+        assert!(matches!(resp25[0], Object::passkeys(_)));
     }
 }

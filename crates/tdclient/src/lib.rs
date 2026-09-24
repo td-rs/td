@@ -106,6 +106,7 @@ pub mod notification_settings;
 pub mod notification_settings_manager;
 pub mod option_manager;
 pub mod paid_reaction_type;
+pub mod password_manager;
 pub mod payments;
 pub mod peer_color;
 pub mod people_nearby_manager;
