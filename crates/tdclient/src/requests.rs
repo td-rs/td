@@ -14069,20 +14069,102 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 }),
             });
         }
-        Function::pinChatMessage(_) => {
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        Function::pinChatMessage(request) => {
+            // Requests.cpp:6127-6132 — the real pin ladder; the
+            // updateChatPinnedMessage server tail parks at the [blocked:
+            // net] seam.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::pin_dialog_message(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::business_connection_manager::BusinessConnectionId::default(),
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
+                request.disable_notification,
+                request.only_for_self,
+                false,
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
-        Function::unpinChatMessage(_) => {
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        Function::unpinChatMessage(request) => {
+            // Requests.cpp:6134-6138.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::pin_dialog_message(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::business_connection_manager::BusinessConnectionId::default(),
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
+                false,
+                false,
+                true,
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
-        Function::unpinAllChatMessages(_) => {
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+        Function::unpinAllChatMessages(request) => {
+            // Requests.cpp:6140-6143.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::unpin_all_dialog_messages(
+                &mut global,
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::default(),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
         Function::unpinAllForumTopicMessages(request) => {
+            // Requests.cpp:6145-6151.
             if request.forum_topic_id == 0 {
                 return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::unpin_all_dialog_messages(
+                &mut global,
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
         Function::setBusinessMessageIsPinned(_) => {
             if !check_is_bot(td, id) {
@@ -14308,38 +14390,132 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // --- ReactionManager (13) ---
-        Function::addMessageReaction(_) => {
+        Function::addMessageReaction(request) => {
+            // Requests.cpp:3936-3941 — the real add_message_reaction
+            // ladder; the SendReactionQuery tail parks at the [blocked:
+            // net] seam.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::add_message_reaction(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                crate::messages_manager::ReactionType::new(
+                    crate::reaction_type::ReactionType::from_td_api(request.reaction_type)
+                        .get_string()
+                        .to_owned(),
+                ),
+                request.is_big,
+                request.update_recent_reactions,
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
-        Function::removeMessageReaction(_) => {
+        Function::removeMessageReaction(request) => {
+            // Requests.cpp:3979-3983.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::remove_message_reaction(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                crate::messages_manager::ReactionType::new(
+                    crate::reaction_type::ReactionType::from_td_api(request.reaction_type)
+                        .get_string()
+                        .to_owned(),
+                ),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
         Function::setMessageReactions(_) => {
+            // Requests.cpp:4000-4004 — the arm-level free
+            // `set_message_reactions` (MessageReactions.cpp) is not ported
+            // yet; only the post-mutation fan-out landed with the mmreq
+            // reconcile, so the arm stays a parked placeholder.
             if !check_is_bot(td, id) {
                 return;
             }
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
-        Function::readAllChatReactions(_) => {
+        Function::readAllChatReactions(request) => {
+            // Requests.cpp:4184-4188.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::read_all_dialog_reactions(
+                &mut global,
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::default(),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
         Function::readAllForumTopicReactions(request) => {
+            // Requests.cpp:4190-4198.
             if !check_is_user(td, id) {
                 return;
             }
             if request.forum_topic_id == 0 {
                 return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::read_all_dialog_reactions(
+                &mut global,
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
         Function::getMessageAddedReactions(request) => {
             // Requests.cpp:4006-4012 — the M.react slice routes the query
@@ -14366,12 +14542,35 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-        Function::getMessageAvailableReactions(_) => {
+        Function::getMessageAvailableReactions(request) => {
+            // Requests.cpp:3919-3930 — the dialog/message access ladder,
+            // the sorted list built through the M.16 ReactionManager.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td
-                .deferred_promise::<td_api::AvailableReactions, _>(id, Object::availableReactions);
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::get_message_available_reactions_full(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.row_size,
+            );
+            td.global = global;
+            td.messages_manager = manager;
+            match result {
+                Ok(reactions) => td.send_result(id, Object::availableReactions(reactions)),
+                Err(status) => send_error_status(td, id, status),
+            }
         }
         Function::reportMessageReactions(request) => {
             // Requests.cpp:7858-7865 — the M.react slice validates the
@@ -14407,29 +14606,114 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-        Function::addPendingPaidMessageReaction(_) => {
+        Function::addPendingPaidMessageReaction(request) => {
+            // Requests.cpp:3947-3951 — the pending paid-reaction ladder;
+            // the SendPaidReactionQuery tail parks at the [blocked: net]
+            // seam.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::add_paid_message_reaction(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.star_count,
+                request.r#type,
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
-        Function::removePendingPaidMessageReactions(_) => {
+        Function::removePendingPaidMessageReactions(request) => {
+            // Requests.cpp:3957-3961.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::remove_paid_message_reactions(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
-        Function::commitPendingPaidMessageReactions(_) => {
+        Function::commitPendingPaidMessageReactions(request) => {
+            // Requests.cpp:3953-3956.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::commit_paid_message_reactions(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
-        Function::setPaidMessageReactionType(_) => {
+        Function::setPaidMessageReactionType(request) => {
+            // Requests.cpp:3972-3976.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            crate::messages_manager::set_paid_message_reaction_type(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.r#type,
+                promise,
+            );
+            td.global = global;
+            td.messages_manager = manager;
         }
         Function::setChatAvailableReactions(request) => {
             // Requests.cpp:6082-6087 — the M.react slice runs the full
@@ -14847,59 +15131,102 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             td.send_result(id, ok_object());
         }
         Function::toggleChatIsMarkedAsUnread(request) => {
+            // Requests.cpp:5883-5887 — the real toggle ladder with the
+            // unread-counter side effects, not the bare field write.
             if !check_is_user(td, id) {
                 return;
             }
-            let dialog_id = MmDialogId::new(request.chat_id);
-            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
-                d.is_marked_as_unread = request.is_marked_as_unread;
-                td.send_update(Object::updateChatIsMarkedAsUnread(
-                    td_api::updateChatIsMarkedAsUnread {
-                        chat_id: request.chat_id,
-                        is_marked_as_unread: request.is_marked_as_unread,
-                    },
-                ));
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::toggle_dialog_is_marked_as_unread(
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                request.is_marked_as_unread,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
             }
-            td.send_result(id, ok_object());
         }
-        Function::toggleChatIsPinned(_) => {
+        Function::toggleChatIsPinned(request) => {
+            // Requests.cpp:5871-5875.
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut global = std::mem::take(&mut td.global);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::toggle_dialog_is_pinned(
+                &mut global,
+                &mut manager,
+                ctx,
+                crate::messages_manager::DialogListId::from_chat_list(request.chat_list.as_ref()),
+                MmDialogId::new(request.chat_id),
+                request.is_pinned,
+            );
+            td.global = global;
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
         }
         Function::toggleChatIsTranslatable(request) => {
+            // Requests.cpp:5889-5893 — the real toggle ladder.
             if !check_is_user(td, id) {
                 return;
             }
-            let dialog_id = MmDialogId::new(request.chat_id);
-            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
-                d.is_translatable = request.is_translatable;
-                td.send_update(Object::updateChatIsTranslatable(
-                    td_api::updateChatIsTranslatable {
-                        chat_id: request.chat_id,
-                        is_translatable: request.is_translatable,
-                    },
-                ));
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::toggle_dialog_is_translatable(
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                request.is_translatable,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
             }
-            td.send_result(id, ok_object());
         }
         Function::toggleChatViewAsTopics(request) => {
+            // Requests.cpp:5877-5881 — toggle_dialog_view_as_messages with
+            // the inverted td_api flag.
             if !check_is_user(td, id) {
                 return;
             }
-            let dialog_id = MmDialogId::new(request.chat_id);
-            if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
-                d.view_as_messages = !request.view_as_topics;
-                d.is_view_as_messages_inited = true;
-                td.send_update(Object::updateChatViewAsTopics(
-                    td_api::updateChatViewAsTopics {
-                        chat_id: request.chat_id,
-                        view_as_topics: request.view_as_topics,
-                    },
-                ));
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(td);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::toggle_dialog_view_as_messages(
+                &mut manager,
+                ctx,
+                MmDialogId::new(request.chat_id),
+                !request.view_as_topics,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
             }
-            td.send_result(id, ok_object());
         }
 
         _ => run_bot_and_web_app_requests(td, id, function),

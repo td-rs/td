@@ -4182,6 +4182,10 @@ pub struct MessageReactions {
     pub chosen_reaction_order: Vec<ReactionType>,
     pub top_reactors: Vec<MessageReactor>,
     pub pending_paid_reactions: i32,
+    /// `pending_use_default_paid_reaction_type_` — memory-only in C++.
+    pub pending_use_default_paid_reaction_type: bool,
+    /// `pending_paid_reaction_type_` — memory-only in C++.
+    pub pending_paid_reaction_type: crate::paid_reaction_type::PaidReactionType,
     pub is_min: bool,
     pub need_polling: bool,
     pub can_get_added_reactions: bool,
@@ -4492,6 +4496,8 @@ impl MessageReactions {
             chosen_reaction_order,
             top_reactors,
             pending_paid_reactions: 0,
+            pending_use_default_paid_reaction_type: false,
+            pending_paid_reaction_type: crate::paid_reaction_type::PaidReactionType::default(),
             is_min,
             need_polling,
             can_get_added_reactions,
@@ -7096,7 +7102,7 @@ pub struct DialogScheduledMessages {
 /// identity-typed in C++ (copies deleted), so Rust gives it neither Clone
 /// nor PartialEq. Fields marked "for send_message"/"for resend_message"
 /// are the send-path scratch space (M.10.8-M.10.11).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Message {
     pub message_id: MessageId,
     pub sender_user_id: UserId,
@@ -8721,6 +8727,13 @@ pub struct MessagesManager {
     /// `being_uploaded_files_` (MessagesManager.h) — the in-flight upload
     /// registry ([blocked: M.12] for the actual upload legs).
     pub(crate) being_uploaded_files: HashMap<FileUploadId, UploadedFileInfo>,
+    /// `active_reaction_types_` (MessagesManager.h) — the active-reaction
+    /// list the config intake feeds (the M.16 `update_active_reactions`
+    /// plane); empty until that intake lands.
+    pub(crate) active_reaction_types: Vec<crate::reaction_type::ReactionType>,
+    /// `pending_reactions_` (MessagesManager.h) — the in-flight reaction
+    /// query counts, collapsed to the counter the C++ record carries.
+    pub(crate) pending_reactions: HashMap<MessageFullId, i32>,
 }
 
 /// `MessagesManager::PendingMessageGroupSend` (MessagesManager.h:3326-3332).
@@ -27415,6 +27428,2926 @@ pub fn remove_message_file_sources(
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.mmreq — the MessagesManager request plane: the 65 td_api arms that
+// route into MessagesManager (pin/unpin, the reactions intake,
+// add_local_message, resend/forward glue, the toggles/setters, the
+// count/position reads and the addChatToList folder plane). Each fn ports
+// the C++ MessagesManager.cpp request body; the cross-manager surfaces
+// ride [`MmRequestContext`], the wire tails park at the [blocked: net]
+// seams (the promise lands unanswered offline, the translation-manager
+// convention).
+// ---------------------------------------------------------------------------
+
+/// The MessagesManager request-plane context — the `Td *td_` surface the
+/// C++ request bodies read plus the server/wire tails. The `Td` impl wires
+/// the landed manager calls; the tails keep no-op default bodies so test
+/// fakes only implement the surfaces they exercise.
+pub trait MmRequestContext:
+    MessageObjectContext + crate::messages_manager::SendMessageContext + ReadStateContext
+{
+    /// `forum_topic_manager_->on_topic_reaction_count_changed(...)` — the
+    /// M.18 forum-topic counter tick.
+    fn forum_topic_on_topic_reaction_count_changed(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: ForumTopicId,
+        _count: i32,
+        _is_delta: bool,
+    ) {
+    }
+    /// `forum_topic_manager_->on_topic_poll_vote_count_changed(...)` — the
+    /// M.18 forum-topic counter tick.
+    fn forum_topic_on_topic_poll_vote_count_changed(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: ForumTopicId,
+        _count: i32,
+        _is_delta: bool,
+    ) {
+    }
+    /// `saved_messages_manager_->on_topic_reaction_count_changed(...)` —
+    /// the M.saved counter tick.
+    fn saved_messages_on_topic_reaction_count_changed(
+        &mut self,
+        _dialog_id: DialogId,
+        _saved_messages_topic_id: SavedMessagesTopicId,
+        _count: i32,
+        _is_delta: bool,
+    ) {
+    }
+
+    // -- the ReactionManager plane (the M.16 manager, driven through its
+    //    ReactionManagerEnv split)
+    /// `reaction_manager_->get_sorted_available_reactions(...)`.
+    fn reaction_manager_get_sorted_available_reactions(
+        &mut self,
+        available_reactions: crate::chat_reactions::ChatReactions,
+        active_reactions: crate::chat_reactions::ChatReactions,
+        row_size: i32,
+        is_tag: bool,
+        unavailability_reason: crate::reaction_manager::ReactionUnavailabilityReason,
+    ) -> td_api::AvailableReactions;
+    /// `reaction_manager_->add_recent_reaction(reaction_type)`.
+    fn reaction_manager_add_recent_reaction(
+        &mut self,
+        reaction_type: &crate::reaction_type::ReactionType,
+    );
+    /// `reaction_manager_->update_saved_messages_tags(topic_id, old, new)`
+    /// — the saved-messages tag plane.
+    fn reaction_manager_update_saved_messages_tags(
+        &mut self,
+        saved_messages_topic_id: SavedMessagesTopicId,
+        old_chosen_tags: Vec<crate::reaction_type::ReactionType>,
+        new_chosen_tags: Vec<crate::reaction_type::ReactionType>,
+    ) {
+        let _ = (saved_messages_topic_id, old_chosen_tags, new_chosen_tags);
+    }
+    /// `reaction_manager_->get_default_tag_reactions()`.
+    fn reaction_manager_get_default_tag_reactions(
+        &mut self,
+    ) -> Vec<crate::reaction_type::ReactionType>;
+
+    // -- the dialog-plane probes the reaction decisions read
+    /// `td_->dialog_manager_->is_group_dialog(dialog_id)`.
+    fn is_group_dialog(&self, dialog_id: DialogId) -> bool {
+        dialog_id.get_type() == DialogType::Chat
+    }
+    /// `td_->dialog_manager_->get_dialog_permissions(dialog_id)
+    /// .can_send_reactions()` — the dialog-permission plane (the M.6/M.dp
+    /// stand-in answers the unrestricted band).
+    fn get_dialog_can_send_reactions(&self, _dialog_id: DialogId) -> bool {
+        true
+    }
+    /// `td_->dialog_manager_->is_monoforum_channel(dialog_id)` — the
+    /// monoforum plane stand-in.
+    fn is_monoforum_channel(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    /// `td_->chat_manager_->get_monoforum_channel_id(channel_id)` — the
+    /// admined-monoforum reaction dialog (the monoforum plane stand-in).
+    fn monoforum_channel_dialog_id(&self, _channel_id: crate::chat_manager::ChannelId) -> DialogId {
+        DialogId::default()
+    }
+    /// `chat_manager_->get_channel_status(channel_id)`.
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus;
+
+    // -- the StarManager/ReactionManager paid-reaction ledger (the M.16
+    //    manager planes)
+    /// `star_manager_->add_pending_owned_star_count(count, is_final)` —
+    /// the pending-owned-count ledger.
+    fn add_pending_owned_star_count(&mut self, _count: i32, _is_final: bool) {}
+    /// `reaction_manager_->get_default_paid_reaction_type()`.
+    fn get_default_paid_reaction_type(&self) -> crate::paid_reaction_type::PaidReactionType {
+        crate::paid_reaction_type::PaidReactionType::default()
+    }
+
+    // -- the [blocked: net] paid-reaction tails
+    /// `MessageReactions::send_paid_message_reaction` — the
+    /// SendPaidReactionQuery tail; [blocked: net], the promise parks.
+    fn send_paid_message_reaction_on_server(
+        &mut self,
+        message_full_id: MessageFullId,
+        star_count: i32,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (message_full_id, star_count, promise);
+    }
+    /// `create_handler<TogglePaidReactionPrivacyQuery>` — [blocked: net],
+    /// the promise parks.
+    fn toggle_paid_reaction_privacy_on_server(
+        &mut self,
+        message_full_id: MessageFullId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (message_full_id, promise);
+    }
+
+    /// Upcast to the message-object view (the `get_message_object` plane).
+    fn as_message_object(&self) -> &dyn MessageObjectContext;
+    /// Upcast to the send view (the reply-markup/intake helpers).
+    fn as_send_message_context(&self) -> &dyn SendMessageContext;
+    /// Upcast to the read-state view (the M.10 helper callers).
+    fn as_read_state(&mut self) -> &mut dyn ReadStateContext;
+    /// The shared read-state view (the option-only readers).
+    fn as_read_state_shared(&self) -> &dyn ReadStateContext;
+
+    /// `td_->auth_manager_->is_bot()` — the AuthManager flag (distinct
+    /// name: the inherited MessageObjectContext/ReadStateContext probes
+    /// collide on `is_bot`).
+    fn auth_is_bot(&self) -> bool;
+    /// `td_->dialog_manager_->get_my_dialog_id()`.
+    fn my_dialog_id(&self) -> DialogId;
+    /// `td_->dialog_manager_->get_chat_id_object(dialog_id, source)` — the
+    /// update-payload chat id.
+    fn get_chat_id_object(&mut self, dialog_id: DialogId, source: &str) -> i64;
+    /// `td_->dialog_manager_->can_pin_messages(dialog_id)`.
+    fn can_pin_messages(&mut self, dialog_id: DialogId) -> Result<(), Status>;
+    /// `td_->business_connection_manager_->check_business_connection(id,
+    /// dialog_id)`.
+    fn check_business_connection(
+        &mut self,
+        business_connection_id: &crate::business_connection_manager::BusinessConnectionId,
+        dialog_id: DialogId,
+    ) -> Result<(), Status>;
+
+    /// `td_->dialog_manager_->check_dialog_access_in_memory(...)` — the
+    /// rights recheck over the loaded dialog. The dialog existence is
+    /// checked by [`check_dialog_access`] against the manager map; the
+    /// in-memory rights ladder is the M.6/M.dp stand-in.
+    fn check_dialog_access_in_memory(
+        &self,
+        _dialog_id: DialogId,
+        _allow_secret_chats: bool,
+        _access_rights: crate::user_manager::AccessRights,
+        _source: &str,
+    ) -> Result<(), Status> {
+        Ok(())
+    }
+
+    // -- the landed DialogManager server tails (DialogManager.cpp)
+    /// `dialog_manager_->toggle_dialog_is_pinned_on_server(dialog_id,
+    /// is_pinned, 0)`.
+    fn toggle_dialog_is_pinned_on_server(&mut self, _dialog_id: DialogId, _is_pinned: bool) {}
+    /// `dialog_manager_->toggle_dialog_is_marked_as_unread_on_server(...)`.
+    fn toggle_dialog_is_marked_as_unread_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _is_marked_as_unread: bool,
+    ) {
+    }
+    /// `dialog_manager_->toggle_dialog_is_translatable_on_server(...)`.
+    fn toggle_dialog_is_translatable_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _is_translatable: bool,
+    ) {
+    }
+    /// `dialog_manager_->toggle_dialog_view_as_messages_on_server(...)`.
+    fn toggle_dialog_view_as_messages_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _view_as_messages: bool,
+    ) {
+    }
+
+    // -- the [blocked: net] wire tails; the promise lands unanswered
+    //    offline (the translation-manager convention).
+    /// `create_handler<UpdateDialogPinnedMessageQuery>()->send(...)` —
+    /// [blocked: net].
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn update_dialog_pinned_message_on_server(
+        &mut self,
+        business_connection_id: &crate::business_connection_manager::BusinessConnectionId,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        is_unpin: bool,
+        disable_notification: bool,
+        only_for_self: bool,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (
+            business_connection_id,
+            dialog_id,
+            message_id,
+            is_unpin,
+            disable_notification,
+            only_for_self,
+            promise,
+        );
+    }
+    /// `message_query_manager_->unpin_all_dialog_messages_on_server` —
+    /// [blocked: net].
+    fn unpin_all_dialog_messages_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+    }
+    /// `message_query_manager_->unpin_all_topic_messages_on_server` —
+    /// [blocked: net].
+    fn unpin_all_topic_messages_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: ForumTopicId,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+    }
+    /// `message_query_manager_->read_all_dialog_reactions_on_server` —
+    /// [blocked: net].
+    fn read_all_dialog_reactions_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+    }
+    /// `message_query_manager_->read_all_topic_reactions_on_server` —
+    /// [blocked: net].
+    fn read_all_topic_reactions_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: ForumTopicId,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+    }
+    /// `message_query_manager_->read_all_dialog_poll_votes_on_server` —
+    /// [blocked: net].
+    fn read_all_dialog_poll_votes_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: ForumTopicId,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+    }
+    /// `MessagesManager::update_dialog_notification_settings_on_server` —
+    /// the M.13 notification-settings plane.
+    fn update_dialog_notification_settings_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _force: bool,
+    ) {
+    }
+
+    /// `dialog_filter_manager_->set_dialog_is_pinned(filter_id,
+    /// input_dialog_id, is_pinned)` — the M.filter plane.
+    fn filter_set_dialog_is_pinned(
+        &mut self,
+        _filter_id: DialogFilterId,
+        _dialog_id: DialogId,
+        _is_pinned: bool,
+    ) -> Result<(), Status> {
+        Err(Status::error(400, "Chat list not found"))
+    }
+}
+
+/// `MessagesManager::check_dialog_access` (MessagesManager.cpp:34390-34402)
+/// — the dialog-existence gate. The `get_dialog_force` db-load leg is the
+/// recorded dialog-db seam (the M.10 request-plane convention): an
+/// unresolved id answers the C++ not-found band.
+pub fn check_dialog_access(
+    manager: &MessagesManager,
+    ctx: &impl MmRequestContext,
+    dialog_id: DialogId,
+    allow_secret_chats: bool,
+    access_rights: crate::user_manager::AccessRights,
+    source: &str,
+) -> Result<(), Status> {
+    if manager.get_dialog(dialog_id).is_none() {
+        if !dialog_id.is_valid() {
+            return Err(Status::error(400, "Invalid chat identifier specified"));
+        }
+        return Err(Status::error(400, "Chat not found"));
+    }
+    ctx.check_dialog_access_in_memory(dialog_id, allow_secret_chats, access_rights, source)
+}
+
+/// `MessagesManager::get_message` (MessagesManager.h:2825) — the in-memory
+/// probe.
+pub fn get_message(d: &Dialog, message_id: MessageId) -> Option<&Message> {
+    get_message_in_dialog(d, message_id)
+}
+
+/// `MessagesManager::get_message_force(Dialog *, MessageId, const char *)`
+/// (MessagesManager.cpp:30644-30670) — the ensure form: loads the message
+/// into the dialog (in-memory probe → message-db sync load →
+/// `add_message_to_dialog` from_database) and answers whether it is
+/// available. The dialog itself must be loaded (`get_dialog` is the
+/// get_dialog_force stand-in per the request-plane convention).
+pub fn ensure_message_force(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> bool {
+    {
+        let Some(d) = manager.get_dialog(dialog_id) else {
+            return false;
+        };
+        if get_message(d, message_id).is_some() {
+            return true;
+        }
+        if !global.use_message_database()
+            || message_id.is_yet_unsent()
+            || is_deleted_message(d, message_id)
+        {
+            return false;
+        }
+        if message_id.is_scheduled() && d.has_loaded_scheduled_messages_from_database {
+            return false;
+        }
+    }
+    let row = match global
+        .message_db_sync()
+        .with_db(|db| db.get_message(MessageFullId::new(dialog_id, message_id)))
+    {
+        tdutils::status::Result::Ok(row) => row,
+        tdutils::status::Result::Err(_) => return false,
+    };
+    let time = crate::user_manager::TimeCtx::from_global(global);
+    let Some(message) = parse_message(&time, row.message_id, &row.data, message_id.is_scheduled())
+    else {
+        return false;
+    };
+    let mut need_update = false;
+    let mut need_update_dialog_pos = false;
+    // SAFETY: the three views alias the one request context and are used
+    // strictly sequentially inside add_message_to_dialog (the
+    // split_context_alias contract; the C++ passes one `Td *`).
+    let ctx_ptr = std::ptr::from_mut(ctx);
+    let reactions_ctx = MessageObjectReactionsContext::new(unsafe { &*ctx_ptr });
+    let send_view: &dyn SendMessageContext = unsafe { &*ctx_ptr };
+    let state: &mut dyn ReadStateContext = unsafe { &mut *(ctx_ptr as *mut dyn ReadStateContext) };
+    let loaded = add_message_to_dialog(
+        global,
+        manager,
+        &reactions_ctx,
+        send_view,
+        state,
+        dialog_id,
+        message,
+        true,
+        false,
+        &mut need_update,
+        &mut need_update_dialog_pos,
+        "get_message_force",
+    );
+    let _ = loaded;
+    manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| get_message(d, message_id).is_some())
+}
+
+/// `MessagesManager::can_pin_message` (MessagesManager.cpp:).
+pub fn can_pin_message(
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+) -> Result<(), Status> {
+    let Some(m) = m else {
+        return Err(Status::error(400, "Message not found"));
+    };
+    ctx.can_pin_messages(dialog_id)?;
+    if m.message_id.is_scheduled() {
+        return Err(Status::error(400, "Scheduled message can't be pinned"));
+    }
+    if !m.message_id.is_server() || m.ephemeral_message.is_some() {
+        return Err(Status::error(400, "Message can't be pinned"));
+    }
+    let content_type = m
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type();
+    if crate::message_content::is_service_message_content(content_type) {
+        return Err(Status::error(400, "Service messages can't be pinned"));
+    }
+    Ok(())
+}
+
+/// `MessagesManager::get_message_forum_topic_id`
+/// (MessagesManager.cpp:23466-23472).
+pub fn get_message_forum_topic_id(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> ForumTopicId {
+    let message_topic = get_message_topic(ctx, dialog_id, m);
+    if message_topic.is_forum() {
+        return message_topic.get_forum_topic_id();
+    }
+    ForumTopicId::default()
+}
+
+/// `MessagesManager::update_message_is_pinned`
+/// (MessagesManager.cpp:28271-28285).
+pub fn update_message_is_pinned(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: &mut Message,
+    is_pinned: bool,
+    source: &str,
+) -> bool {
+    if m.is_pinned == is_pinned {
+        return false;
+    }
+    m.is_pinned = is_pinned;
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateMessageIsPinned");
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateMessageIsPinned(
+            td_api::updateMessageIsPinned {
+                chat_id,
+                message_id: m.message_id.get(),
+                is_pinned,
+            },
+        ));
+    on_message_changed(
+        global,
+        manager,
+        ctx.as_message_object(),
+        &crate::user_manager::TimeCtx::from_global(global),
+        dialog_id,
+        m,
+        true,
+        source,
+    );
+    true
+}
+
+/// `MessagesManager::set_dialog_unread_reaction_count`
+/// (MessagesManager.cpp:).
+pub fn set_dialog_unread_reaction_count(d: &mut Dialog, unread_reaction_count: i32) {
+    assert!(d.unread_reaction_count != unread_reaction_count);
+    assert!(unread_reaction_count >= 0);
+
+    d.unread_reaction_count = unread_reaction_count;
+    d.message_count_by_index
+        [message_search_filter_index(MessageSearchFilter::UnreadReaction) as usize] =
+        unread_reaction_count;
+}
+
+/// `MessagesManager::set_dialog_unread_poll_vote_count`
+/// (MessagesManager.cpp:).
+pub fn set_dialog_unread_poll_vote_count(d: &mut Dialog, unread_poll_vote_count: i32) {
+    assert!(d.unread_poll_vote_count != unread_poll_vote_count);
+    assert!(unread_poll_vote_count >= 0);
+
+    d.unread_poll_vote_count = unread_poll_vote_count;
+    d.message_count_by_index
+        [message_search_filter_index(MessageSearchFilter::UnreadPollVote) as usize] =
+        unread_poll_vote_count;
+}
+
+/// `MessagesManager::send_update_chat_unread_reaction_count`
+/// (MessagesManager.cpp:).
+pub fn send_update_chat_unread_reaction_count(
+    manager: &MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    d: &Dialog,
+    source: &str,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    if !d.is_update_new_chat_sent {
+        log_error!("Wrong {dialog_id} in send_update_chat_unread_reaction_count from {source}");
+    }
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatUnreadReactionCount");
+    on_dialog_updated(manager, dialog_id, "send_update_chat_unread_reaction_count");
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateChatUnreadReactionCount(
+            td_api::updateChatUnreadReactionCount {
+                chat_id,
+                unread_reaction_count: d.unread_reaction_count,
+            },
+        ));
+}
+
+/// `MessagesManager::send_update_chat_unread_poll_vote_count`
+/// (MessagesManager.cpp:) — the poll-vote twin of the reaction counter.
+pub fn send_update_chat_unread_poll_vote_count(
+    manager: &MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    d: &Dialog,
+    source: &str,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    if !d.is_update_new_chat_sent {
+        log_error!("Wrong {dialog_id} in send_update_chat_unread_poll_vote_count from {source}");
+    }
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatUnreadPollVoteCount");
+    on_dialog_updated(
+        manager,
+        dialog_id,
+        "send_update_chat_unread_poll_vote_count",
+    );
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateChatUnreadPollVoteCount(
+            td_api::updateChatUnreadPollVoteCount {
+                chat_id,
+                unread_poll_vote_count: d.unread_poll_vote_count,
+            },
+        ));
+}
+
+/// `MessagesManager::send_update_message_unread_reactions`
+/// (MessagesManager.cpp:).
+pub fn send_update_message_unread_reactions(
+    manager: &MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: &Message,
+    unread_reaction_count: i32,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatUnreadReactionCount");
+    if !m.is_update_sent {
+        ctx.as_read_state()
+            .send_update(td_api::Object::updateChatUnreadReactionCount(
+                td_api::updateChatUnreadReactionCount {
+                    chat_id,
+                    unread_reaction_count,
+                },
+            ));
+        return;
+    }
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+    let unread_reactions = get_unread_reactions_object(
+        manager,
+        &reactions_ctx,
+        ctx.as_message_object(),
+        dialog_id,
+        m,
+    );
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateMessageUnreadReactions(
+            td_api::updateMessageUnreadReactions {
+                chat_id,
+                message_id: m.message_id.get(),
+                unread_reactions,
+                unread_reaction_count,
+            },
+        ));
+}
+
+/// `MessagesManager::send_update_message_contains_unread_poll_votes`
+/// (MessagesManager.cpp:).
+pub fn send_update_message_contains_unread_poll_votes(
+    _manager: &MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: &Message,
+    unread_poll_vote_count: i32,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatUnreadPollVoteCount");
+    if !m.is_update_sent {
+        ctx.as_read_state()
+            .send_update(td_api::Object::updateChatUnreadPollVoteCount(
+                td_api::updateChatUnreadPollVoteCount {
+                    chat_id,
+                    unread_poll_vote_count,
+                },
+            ));
+        return;
+    }
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+    let contains_unread_poll_votes = has_unread_poll_votes(&reactions_ctx, m);
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateMessageContainsUnreadPollVotes(
+            td_api::updateMessageContainsUnreadPollVotes {
+                chat_id,
+                message_id: m.message_id.get(),
+                contains_unread_poll_votes,
+                unread_poll_vote_count,
+            },
+        ));
+}
+
+/// `MessagesManager::on_unread_message_reaction_removed`
+/// (MessagesManager.cpp:) — `d` is re-read through the manager (the C++
+/// passes the Dialog pointer).
+pub fn on_unread_message_reaction_removed(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: &Message,
+    source: &str,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let is_forum = manager.get_dialog(dialog_id).is_some_and(|d| d.is_forum);
+    if is_forum {
+        ctx.forum_topic_on_topic_reaction_count_changed(
+            dialog_id,
+            get_message_forum_topic_id(ctx.as_message_object(), dialog_id, m),
+            -1,
+            true,
+        );
+    } else if ctx.is_admined_monoforum_channel(dialog_id) {
+        ctx.saved_messages_on_topic_reaction_count_changed(
+            dialog_id,
+            m.saved_messages_topic_id,
+            -1,
+            true,
+        );
+    }
+    let unread_reaction_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_reaction_count)
+        .unwrap_or(0);
+    if unread_reaction_count == 0 {
+        // can happen after local read of all reactions in the topic or chat
+        let _ = source;
+    } else {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            return;
+        };
+        set_dialog_unread_reaction_count(d, unread_reaction_count - 1);
+        on_dialog_updated(manager, dialog_id, "on_unread_message_reaction_removed");
+    }
+    let unread_reaction_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_reaction_count)
+        .unwrap_or(0);
+    send_update_message_unread_reactions(manager, ctx, dialog_id, m, unread_reaction_count);
+}
+
+/// `MessagesManager::on_unread_poll_vote_removed` (MessagesManager.cpp:).
+pub fn on_unread_poll_vote_removed(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: &Message,
+    source: &str,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let is_forum = manager.get_dialog(dialog_id).is_some_and(|d| d.is_forum);
+    if is_forum {
+        ctx.forum_topic_on_topic_poll_vote_count_changed(
+            dialog_id,
+            get_message_forum_topic_id(ctx.as_message_object(), dialog_id, m),
+            -1,
+            true,
+        );
+    }
+    let unread_poll_vote_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_poll_vote_count)
+        .unwrap_or(0);
+    if unread_poll_vote_count == 0 {
+        // can happen after local read of all poll votes in the topic or chat
+        let _ = source;
+    } else {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            return;
+        };
+        set_dialog_unread_poll_vote_count(d, unread_poll_vote_count - 1);
+        on_dialog_updated(manager, dialog_id, "on_unread_poll_vote_removed");
+    }
+    let unread_poll_vote_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_poll_vote_count)
+        .unwrap_or(0);
+    send_update_message_contains_unread_poll_votes(
+        manager,
+        ctx,
+        dialog_id,
+        m,
+        unread_poll_vote_count,
+    );
+}
+
+/// `MessagesManager::get_dialog_view_as_topics` (MessagesManager.cpp:).
+pub fn get_dialog_view_as_topics(ctx: &impl MmRequestContext, d: &Dialog) -> bool {
+    !d.view_as_messages && ((d.is_forum && !d.is_forum_tabs) || d.dialog_id == ctx.my_dialog_id())
+}
+
+/// `MessagesManager::on_update_dialog_view_as_topics`
+/// (MessagesManager.cpp:) — the update emission; the chat-list unread
+/// counter refresh TODO rides the M.10.12b dialog-list seam.
+pub fn on_update_dialog_view_as_topics(
+    manager: &MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    old_view_as_topics: bool,
+) {
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return;
+    };
+    let new_view_as_topics = get_dialog_view_as_topics(ctx, d);
+    if old_view_as_topics == new_view_as_topics {
+        return;
+    }
+    if !d.is_update_new_chat_sent {
+        log_error!(
+            "Wrong {} in on_update_dialog_view_as_topics",
+            dialog_id.get()
+        );
+    }
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatViewAsTopics");
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateChatViewAsTopics(
+            td_api::updateChatViewAsTopics {
+                chat_id,
+                view_as_topics: new_view_as_topics,
+            },
+        ));
+    let _ = manager;
+}
+
+/// `MessagesManager::update_dialog_silent_send_message`
+/// (MessagesManager.cpp:) — `d` is re-read through the manager.
+pub fn update_dialog_silent_send_message(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    silent_send_message: bool,
+) -> bool {
+    if ctx.auth_is_bot() {
+        // just in case
+        return false;
+    }
+    if manager.get_dialog(dialog_id).is_none() {
+        return false;
+    }
+    if !manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.notification_settings.is_synchronized)
+    {
+        log_error!("Have unknown notification settings in {}", dialog_id.get());
+    }
+    if manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.notification_settings.silent_send_message == silent_send_message)
+    {
+        return false;
+    }
+    manager
+        .get_dialog_mut(dialog_id)
+        .expect("checked above")
+        .notification_settings
+        .silent_send_message = silent_send_message;
+    on_dialog_updated(manager, dialog_id, "update_dialog_silent_send_message");
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatDefaultDisableNotification");
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateChatDefaultDisableNotification(
+            td_api::updateChatDefaultDisableNotification {
+                chat_id,
+                default_disable_notification: silent_send_message,
+            },
+        ));
+    true
+}
+
+/// `MessagesManager::set_dialog_is_translatable` (MessagesManager.cpp:) —
+/// `d` is re-read through the manager.
+pub fn set_dialog_is_translatable(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    is_translatable: bool,
+) {
+    if ctx.auth_is_bot() {
+        // just in case
+        return;
+    }
+    let old_is_translatable = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.is_translatable)
+        .unwrap_or_else(|| panic!("set_dialog_is_translatable without {dialog_id:?}"));
+    assert!(old_is_translatable != is_translatable);
+    manager
+        .get_dialog_mut(dialog_id)
+        .expect("checked above")
+        .is_translatable = is_translatable;
+    on_dialog_updated(manager, dialog_id, "set_dialog_is_translatable");
+    let is_update_new_chat_sent = manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.is_update_new_chat_sent);
+    if !is_update_new_chat_sent {
+        log_error!("Wrong {} in set_dialog_is_translatable", dialog_id.get());
+    }
+    if ctx.as_read_state().option_boolean("is_premium", false) {
+        let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatIsTranslatable");
+        ctx.as_read_state()
+            .send_update(td_api::Object::updateChatIsTranslatable(
+                td_api::updateChatIsTranslatable {
+                    chat_id,
+                    is_translatable,
+                },
+            ));
+    }
+}
+
+/// `MessagesManager::set_dialog_view_as_messages` (MessagesManager.cpp:) —
+/// `d` is re-read through the manager.
+pub fn set_dialog_view_as_messages(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    view_as_messages: bool,
+    source: &str,
+) {
+    if ctx.auth_is_bot() {
+        // just in case
+        return;
+    }
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return;
+    };
+    if d.view_as_messages == view_as_messages {
+        let is_inited = d.is_view_as_messages_inited;
+        if !is_inited {
+            manager
+                .get_dialog_mut(dialog_id)
+                .expect("checked above")
+                .is_view_as_messages_inited = true;
+            on_dialog_updated(manager, dialog_id, source);
+        }
+        return;
+    }
+    let old_view_as_topics = get_dialog_view_as_topics(ctx, d);
+    {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        d.view_as_messages = view_as_messages;
+        d.is_view_as_messages_inited = true;
+    }
+    on_dialog_updated(manager, dialog_id, source);
+    on_update_dialog_view_as_topics(manager, ctx, dialog_id, old_view_as_topics);
+}
+
+/// `MessagesManager::pin_dialog_message` (MessagesManager.cpp:) — the
+/// request-plane opener; the wire tail parks at
+/// [`MmRequestContext::update_dialog_pinned_message_on_server`].
+#[allow(clippy::too_many_arguments)]
+pub fn pin_dialog_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    business_connection_id: crate::business_connection_manager::BusinessConnectionId,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    disable_notification: bool,
+    only_for_self: bool,
+    is_unpin: bool,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let as_business = business_connection_id.is_valid();
+    if as_business {
+        if let Err(status) = ctx.check_business_connection(&business_connection_id, dialog_id) {
+            promise.set_error(status);
+            return;
+        }
+    } else {
+        if let Err(status) = check_dialog_access(
+            manager,
+            ctx,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Write,
+            "pin_dialog_message",
+        ) {
+            promise.set_error(status);
+            return;
+        }
+        ensure_message_force(global, manager, ctx, dialog_id, message_id);
+        let m = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| get_message(d, message_id));
+        if let Err(status) = can_pin_message(ctx, dialog_id, m) {
+            promise.set_error(status);
+            return;
+        }
+    }
+    if only_for_self && dialog_id.get_type() != DialogType::User {
+        promise.set_error(Status::error(
+            400,
+            "Messages can't be pinned only for self in the chat",
+        ));
+        return;
+    }
+
+    // TODO log event
+    ctx.update_dialog_pinned_message_on_server(
+        &business_connection_id,
+        dialog_id,
+        message_id,
+        is_unpin,
+        disable_notification,
+        only_for_self,
+        promise,
+    );
+}
+
+/// `MessagesManager::unpin_all_local_dialog_messages`
+/// (MessagesManager.cpp:).
+pub fn unpin_all_local_dialog_messages(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+    saved_messages_topic_id: SavedMessagesTopicId,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let message_ids = {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            return;
+        };
+        find_dialog_messages(d, |m| {
+            m.is_pinned
+                && (!forum_topic_id.is_valid()
+                    || get_message_forum_topic_id(ctx.as_message_object(), dialog_id, m)
+                        == forum_topic_id)
+                && (!saved_messages_topic_id.is_valid()
+                    || m.saved_messages_topic_id == saved_messages_topic_id)
+        })
+    };
+    for message_id in message_ids {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.remove(&message_id));
+        let Some(m) = taken.as_mut() else {
+            continue;
+        };
+        m.is_pinned = false;
+        let chat_id = ctx.get_chat_id_object(dialog_id, "updateMessageIsPinned");
+        ctx.as_read_state()
+            .send_update(td_api::Object::updateMessageIsPinned(
+                td_api::updateMessageIsPinned {
+                    chat_id,
+                    message_id: m.message_id.get(),
+                    is_pinned: m.is_pinned,
+                },
+            ));
+        on_message_changed(
+            global,
+            manager,
+            ctx.as_message_object(),
+            &crate::user_manager::TimeCtx::from_global(global),
+            dialog_id,
+            m,
+            true,
+            "unpin_all_local_dialog_messages",
+        );
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .expect("dialog alive")
+                .messages
+                .insert(message_id, m);
+        }
+    }
+}
+
+/// `MessagesManager::set_dialog_last_pinned_message_id`
+/// (MessagesManager.cpp:).
+pub fn set_dialog_last_pinned_message_id(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    pinned_message_id: MessageId,
+) {
+    ensure_message_force(global, manager, ctx, dialog_id, pinned_message_id);
+    let mut taken = manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.remove(&pinned_message_id));
+    if let Some(m) = taken.as_mut() {
+        update_message_is_pinned(
+            global,
+            manager,
+            ctx,
+            dialog_id,
+            m,
+            true,
+            "set_dialog_last_pinned_message_id",
+        );
+    }
+    if let Some(m) = taken {
+        manager
+            .get_dialog_mut(dialog_id)
+            .expect("dialog alive")
+            .messages
+            .insert(pinned_message_id, m);
+    }
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return;
+    };
+    if d.is_last_pinned_message_id_inited && d.last_pinned_message_id == pinned_message_id {
+        return;
+    }
+    d.last_pinned_message_id = pinned_message_id;
+    d.is_last_pinned_message_id_inited = true;
+    on_dialog_updated(manager, dialog_id, "set_dialog_last_pinned_message_id");
+}
+
+/// `MessagesManager::unpin_all_dialog_messages` (MessagesManager.cpp:) —
+/// the request-plane opener; the server leg parks at the message-query
+/// seams.
+pub fn unpin_all_dialog_messages(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "unpin_all_dialog_messages",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    if let Err(status) = ctx.can_pin_messages(dialog_id) {
+        promise.set_error(status);
+        return;
+    }
+    if let Err(status) = can_use_forum_topic_id(manager, dialog_id, forum_topic_id) {
+        promise.set_error(status);
+        return;
+    }
+
+    unpin_all_local_dialog_messages(
+        global,
+        manager,
+        ctx,
+        dialog_id,
+        forum_topic_id,
+        SavedMessagesTopicId::default(),
+    );
+
+    if forum_topic_id.is_valid() {
+        ctx.unpin_all_topic_messages_on_server(dialog_id, forum_topic_id, promise);
+        return;
+    }
+
+    set_dialog_last_pinned_message_id(global, manager, ctx, dialog_id, MessageId::default());
+    if !ctx.auth_is_bot() {
+        let has_pinned = manager.get_dialog(dialog_id).is_some_and(|d| {
+            d.message_count_by_index
+                [message_search_filter_index(MessageSearchFilter::Pinned) as usize]
+                != 0
+        });
+        if has_pinned {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            d.message_count_by_index
+                [message_search_filter_index(MessageSearchFilter::Pinned) as usize] = 0;
+            on_dialog_updated(manager, dialog_id, "unpin_all_dialog_messages");
+        }
+    }
+    ctx.unpin_all_dialog_messages_on_server(dialog_id, promise);
+}
+
+/// `MessagesManager::toggle_dialog_is_pinned` (MessagesManager.cpp:) — the
+/// request-plane opener; the filter arm rides the M.filter plane, the
+/// folder arm runs the local pin core, and the server tail rides the
+/// landed DialogManager call.
+pub fn toggle_dialog_is_pinned(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_list_id: DialogListId,
+    dialog_id: DialogId,
+    is_pinned: bool,
+) -> Result<(), Status> {
+    if ctx.auth_is_bot() {
+        return Err(Status::error(400, "Bots can't change chat pin state"));
+    }
+
+    check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "toggle_dialog_is_pinned",
+    )?;
+    let pinned_order_error = manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.order == DEFAULT_ORDER)
+        && is_pinned;
+    if pinned_order_error {
+        return Err(Status::error(400, "The chat can't be pinned"));
+    }
+
+    let Some(list) = get_dialog_list(manager, dialog_list_id) else {
+        return Err(Status::error(400, "Chat list not found"));
+    };
+    if !list.are_pinned_dialogs_inited {
+        return Err(Status::error(400, "Pinned chats must be loaded first"));
+    }
+
+    let was_pinned = is_dialog_pinned(ctx.as_read_state(), manager, dialog_list_id, dialog_id);
+    if is_pinned == was_pinned {
+        return Ok(());
+    }
+
+    if dialog_list_id.is_filter() {
+        return ctx.filter_set_dialog_is_pinned(
+            dialog_list_id.get_filter_id(),
+            dialog_id,
+            is_pinned,
+        );
+    }
+
+    assert!(dialog_list_id.is_folder());
+    let folder_id = dialog_list_id.get_folder_id();
+    if is_pinned {
+        let folder_matches = manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| d.folder_id == folder_id);
+        if !folder_matches {
+            return Err(Status::error(400, "Chat not in the list"));
+        }
+
+        let pinned_dialog_ids = get_pinned_dialog_ids(ctx.as_read_state(), manager, dialog_list_id);
+        let pinned_dialog_count = pinned_dialog_ids.len();
+        let secret_pinned_dialog_count = pinned_dialog_ids
+            .iter()
+            .filter(|id| id.get_type() == DialogType::SecretChat)
+            .count();
+        let dialog_count = if dialog_id.get_type() == DialogType::SecretChat {
+            secret_pinned_dialog_count
+        } else {
+            pinned_dialog_count - secret_pinned_dialog_count
+        };
+
+        if dialog_count as i32 >= get_pinned_dialogs_limit(ctx.as_read_state(), dialog_list_id) {
+            return Err(Status::error(
+                400,
+                "The maximum number of pinned chats exceeded",
+            ));
+        }
+    }
+
+    // the C++ passes the live Dialog pointer; the helper reads only
+    // `dialog_id` + `order` off it (get_dialog_position_in_list's reads),
+    // so the stub carries exactly those (the set_dialog_is_pinned_in_list
+    // test precedent constructs the same shape).
+    let order = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.order)
+        .expect("checked above");
+    let d_stub = Dialog {
+        dialog_id,
+        order,
+        ..Dialog::default()
+    };
+    let changed = set_dialog_is_pinned_in_list(
+        ctx.as_read_state(),
+        manager,
+        dialog_list_id,
+        &d_stub,
+        is_pinned,
+        true,
+    );
+    if changed {
+        ctx.toggle_dialog_is_pinned_on_server(dialog_id, is_pinned);
+    }
+    let _ = global;
+    Ok(())
+}
+
+/// `MessagesManager::toggle_dialog_is_marked_as_unread`
+/// (MessagesManager.cpp:).
+pub fn toggle_dialog_is_marked_as_unread(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    is_marked_as_unread: bool,
+) -> Result<(), Status> {
+    check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "toggle_dialog_is_marked_as_unread",
+    )?;
+    if manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.is_marked_as_unread == is_marked_as_unread)
+    {
+        return Ok(());
+    }
+
+    // SAFETY: the paired views alias the one request context and are used
+    // strictly sequentially inside set_dialog_is_marked_as_unread (the
+    // split_context_alias contract; the C++ passes one `Td *`).
+    let ctx_ptr = std::ptr::from_mut(ctx);
+    set_dialog_is_marked_as_unread(
+        manager,
+        unsafe { &*ctx_ptr },
+        unsafe { &mut *(ctx_ptr as *mut dyn ReadStateContext) },
+        dialog_id,
+        is_marked_as_unread,
+    );
+    ctx.toggle_dialog_is_marked_as_unread_on_server(dialog_id, is_marked_as_unread);
+    Ok(())
+}
+
+/// `MessagesManager::toggle_dialog_is_translatable` (MessagesManager.cpp:).
+pub fn toggle_dialog_is_translatable(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    is_translatable: bool,
+) -> Result<(), Status> {
+    check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "toggle_dialog_is_translatable",
+    )?;
+    if manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.is_translatable == is_translatable)
+    {
+        return Ok(());
+    }
+
+    set_dialog_is_translatable(manager, ctx, dialog_id, is_translatable);
+    ctx.toggle_dialog_is_translatable_on_server(dialog_id, is_translatable);
+    Ok(())
+}
+
+/// `MessagesManager::toggle_dialog_view_as_messages`
+/// (MessagesManager.cpp:).
+pub fn toggle_dialog_view_as_messages(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    view_as_messages: bool,
+) -> Result<(), Status> {
+    check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        false,
+        crate::user_manager::AccessRights::Read,
+        "toggle_dialog_view_as_messages",
+    )?;
+    let is_saved_messages = dialog_id == ctx.my_dialog_id();
+    let is_eligible = is_saved_messages
+        || manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| d.is_forum && dialog_id.get_type() == DialogType::Channel);
+    if !is_eligible {
+        return Err(Status::error(
+            400,
+            "The method is available only in forum channels",
+        ));
+    }
+
+    if manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.view_as_messages == view_as_messages)
+    {
+        return Ok(());
+    }
+
+    if manager.get_dialog(dialog_id).is_none() {
+        return Ok(());
+    }
+    set_dialog_view_as_messages(
+        manager,
+        ctx,
+        dialog_id,
+        view_as_messages,
+        "toggle_dialog_view_as_messages",
+    );
+
+    if !is_saved_messages {
+        ctx.toggle_dialog_view_as_messages_on_server(dialog_id, view_as_messages);
+    }
+    Ok(())
+}
+
+/// `MessagesManager::toggle_dialog_silent_send_message`
+/// (MessagesManager.cpp:).
+pub fn toggle_dialog_silent_send_message(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    silent_send_message: bool,
+) -> Result<(), Status> {
+    assert!(!ctx.auth_is_bot());
+
+    check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "toggle_dialog_silent_send_message",
+    )?;
+
+    let changed = update_dialog_silent_send_message(manager, ctx, dialog_id, silent_send_message);
+    if changed {
+        ctx.update_dialog_notification_settings_on_server(dialog_id, false);
+    }
+
+    Ok(())
+}
+
+/// `MessagesManager::read_all_local_dialog_reactions`
+/// (MessagesManager.cpp:) — the local walk; the dialog-counter tail keeps
+/// the C++ arm shape with the per-list muted-count walk recorded as the
+/// M.10 unread-counter seam.
+pub fn read_all_local_dialog_reactions(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+    saved_messages_topic_id: SavedMessagesTopicId,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let candidate_ids: Vec<MessageId> = {
+        let Some(d) = manager.get_dialog(dialog_id) else {
+            return;
+        };
+        let mut ids: Vec<MessageId> = d.messages.values().map(|m| m.message_id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+    let message_ids: Vec<MessageId> = {
+        let Some(d) = manager.get_dialog(dialog_id) else {
+            return;
+        };
+        candidate_ids
+            .into_iter()
+            .filter(|id| {
+                d.messages.get(id).is_some_and(|m| {
+                    has_unread_message_reactions(manager, &reactions_ctx, dialog_id, m)
+                        && (!forum_topic_id.is_valid()
+                            || get_message_forum_topic_id(ctx.as_message_object(), dialog_id, m)
+                                == forum_topic_id)
+                        && (!saved_messages_topic_id.is_valid()
+                            || m.saved_messages_topic_id == saved_messages_topic_id)
+                })
+            })
+            .collect()
+    };
+
+    let unread_reaction_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_reaction_count)
+        .unwrap_or(0);
+    if forum_topic_id.is_valid() {
+        ctx.forum_topic_on_topic_reaction_count_changed(dialog_id, forum_topic_id, 0, false);
+    } else if saved_messages_topic_id.is_valid() {
+        // do nothing, the counter was reset by the caller
+    } else if unread_reaction_count != 0 {
+        let was_empty = message_ids.is_empty();
+        {
+            let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+            set_dialog_unread_reaction_count(d, 0);
+        }
+        if was_empty {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            send_update_chat_unread_reaction_count(
+                manager,
+                ctx,
+                dialog_id,
+                d,
+                "read_all_local_dialog_reactions",
+            );
+        } else {
+            on_dialog_updated(manager, dialog_id, "read_all_local_dialog_reactions");
+        }
+    }
+
+    for message_id in message_ids {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.remove(&message_id));
+        let Some(m) = taken.as_mut() else {
+            continue;
+        };
+        if let Some(reactions) = m.reactions.as_mut() {
+            reactions.unread_reactions.clear();
+        }
+        on_unread_message_reaction_removed(
+            manager,
+            ctx,
+            dialog_id,
+            m,
+            "read_all_local_dialog_reactions",
+        );
+        on_message_changed(
+            global,
+            manager,
+            ctx.as_message_object(),
+            &crate::user_manager::TimeCtx::from_global(global),
+            dialog_id,
+            m,
+            true,
+            "read_all_local_dialog_reactions",
+        );
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .expect("dialog alive")
+                .messages
+                .insert(message_id, m);
+        }
+    }
+}
+
+/// `MessagesManager::read_all_dialog_reactions` (MessagesManager.cpp:) —
+/// the request-plane opener; the server leg parks at the message-query
+/// seams.
+pub fn read_all_dialog_reactions(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "read_all_dialog_reactions",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    if let Err(status) = can_use_forum_topic_id(manager, dialog_id, forum_topic_id) {
+        promise.set_error(status);
+        return;
+    }
+
+    read_all_local_dialog_reactions(
+        global,
+        manager,
+        ctx,
+        dialog_id,
+        forum_topic_id,
+        SavedMessagesTopicId::default(),
+    );
+    if forum_topic_id.is_valid() {
+        ctx.read_all_topic_reactions_on_server(dialog_id, forum_topic_id, promise);
+        return;
+    }
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        assert!(
+            manager
+                .get_dialog(dialog_id)
+                .is_some_and(|d| d.unread_reaction_count == 0)
+        );
+        promise.set_value(());
+        return;
+    }
+
+    ctx.read_all_dialog_reactions_on_server(dialog_id, promise);
+}
+
+/// `MessagesManager::read_all_local_dialog_poll_votes`
+/// (MessagesManager.cpp:) — the local walk.
+pub fn read_all_local_dialog_poll_votes(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+) {
+    if ctx.auth_is_bot() {
+        return;
+    }
+    let message_ids = {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            return;
+        };
+        let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+        find_dialog_messages(d, |m| {
+            has_unread_poll_votes(&reactions_ctx, m)
+                && (!forum_topic_id.is_valid()
+                    || get_message_forum_topic_id(ctx.as_message_object(), dialog_id, m)
+                        == forum_topic_id)
+        })
+    };
+
+    let unread_poll_vote_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_poll_vote_count)
+        .unwrap_or(0);
+    if forum_topic_id.is_valid() {
+        ctx.forum_topic_on_topic_poll_vote_count_changed(dialog_id, forum_topic_id, 0, false);
+    } else if unread_poll_vote_count != 0 {
+        let was_empty = message_ids.is_empty();
+        {
+            let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+            set_dialog_unread_poll_vote_count(d, 0);
+        }
+        if was_empty {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            send_update_chat_unread_poll_vote_count(
+                manager,
+                ctx,
+                dialog_id,
+                d,
+                "read_all_local_dialog_poll_votes",
+            );
+        } else {
+            on_dialog_updated(manager, dialog_id, "read_all_local_dialog_poll_votes");
+        }
+    }
+
+    for message_id in message_ids {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.remove(&message_id));
+        let Some(m) = taken.as_ref() else {
+            continue;
+        };
+        // remove_message_content_poll_has_unread_votes — the poll-content
+        // unread-votes flag is the M.19 poll-content seam; the C++ walk
+        // clears it on the message content in place.
+        on_unread_poll_vote_removed(
+            manager,
+            ctx,
+            dialog_id,
+            m,
+            "read_all_local_dialog_poll_votes",
+        );
+        let m = taken.as_mut().expect("taken above");
+        on_message_changed(
+            global,
+            manager,
+            ctx.as_message_object(),
+            &crate::user_manager::TimeCtx::from_global(global),
+            dialog_id,
+            m,
+            true,
+            "read_all_local_dialog_poll_votes",
+        );
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .expect("dialog alive")
+                .messages
+                .insert(message_id, m);
+        }
+    }
+}
+
+/// `MessagesManager::read_all_dialog_poll_votes` (MessagesManager.cpp:) —
+/// the request-plane opener.
+pub fn read_all_dialog_poll_votes(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "read_all_dialog_poll_votes",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    if let Err(status) = can_use_forum_topic_id(manager, dialog_id, forum_topic_id) {
+        promise.set_error(status);
+        return;
+    }
+
+    read_all_local_dialog_poll_votes(global, manager, ctx, dialog_id, forum_topic_id);
+    if forum_topic_id.is_valid() {
+        ctx.read_all_dialog_poll_votes_on_server(dialog_id, forum_topic_id, promise);
+        return;
+    }
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        assert!(
+            manager
+                .get_dialog(dialog_id)
+                .is_some_and(|d| d.unread_poll_vote_count == 0)
+        );
+        promise.set_value(());
+        return;
+    }
+
+    ctx.read_all_dialog_poll_votes_on_server(dialog_id, ForumTopicId::default(), promise);
+}
+
+/// `MessagesManager::get_my_reaction_dialog_id` (MessagesManager.cpp:).
+pub fn get_my_reaction_dialog_id(ctx: &mut impl MmRequestContext, d: &Dialog) -> DialogId {
+    let my_dialog_id = ctx.my_dialog_id();
+    if ctx.is_broadcast_channel_dialog(d.dialog_id) {
+        return my_dialog_id;
+    }
+    if ctx.is_admined_monoforum_channel(d.dialog_id) {
+        return ctx.monoforum_channel_dialog_id(d.dialog_id.get_channel_id());
+    }
+    let reaction_dialog_id = if d.default_send_message_as_dialog_id.is_valid() {
+        d.default_send_message_as_dialog_id
+    } else {
+        my_dialog_id
+    };
+    if reaction_dialog_id == my_dialog_id && ctx.is_anonymous_administrator(d.dialog_id).is_some() {
+        // react as the supergroup
+        return d.dialog_id;
+    }
+    reaction_dialog_id
+}
+
+/// `ChatReactions::is_allowed_reaction_type` (ChatReactions.cpp) — the
+/// local (store-plane) ChatReactions carrier.
+pub fn chat_reactions_is_allowed_reaction_type(
+    reactions: &ChatReactions,
+    reaction_type: &ReactionType,
+) -> bool {
+    debug_assert!(!reactions.allow_all_regular);
+    if reactions.allow_all_custom && reaction_type.is_custom_reaction() {
+        return true;
+    }
+    if reaction_type.is_paid_reaction() && reactions.paid_reactions_available {
+        return true;
+    }
+    reactions.reaction_types.contains(reaction_type)
+}
+
+/// `ChatReactions::get_chat_available_reactions_object`
+/// (ChatReactions.cpp:108-119) — the local carrier.
+pub fn chat_reactions_get_chat_available_reactions_object(
+    reactions: &ChatReactions,
+    mut option_integer: impl FnMut(&str, i64) -> i64,
+) -> td_api::ChatAvailableReactions {
+    let mut reactions_uniq_max = option_integer("reactions_uniq_max", 11) as i32;
+    if 0 < reactions.reactions_limit && reactions.reactions_limit < reactions_uniq_max {
+        reactions_uniq_max = reactions.reactions_limit;
+    }
+    if reactions.allow_all_regular {
+        if reactions.paid_reactions_available {
+            log_error!("Have paid reaction in a non-channel chat");
+        }
+        return td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+            td_api::chatAvailableReactionsAll {
+                max_reaction_count: reactions_uniq_max,
+            },
+        );
+    }
+    let reaction_objects: Vec<td_api::ReactionType> = reactions
+        .reaction_types
+        .iter()
+        .filter_map(|reaction_type| reaction_type.get_reaction_type_object())
+        .collect();
+    td_api::ChatAvailableReactions::chatAvailableReactionsSome(td_api::chatAvailableReactionsSome {
+        reactions: reaction_objects,
+        max_reaction_count: reactions_uniq_max,
+    })
+}
+
+/// `MessagesManager::can_add_message_tag` (MessagesManager.cpp:).
+pub fn can_add_message_tag(
+    ctx: &impl MmRequestContext,
+    dialog_id: DialogId,
+    reactions: Option<&MessageReactions>,
+) -> bool {
+    dialog_id == ctx.my_dialog_id()
+        && (reactions.is_none() || reactions.is_some_and(|r| r.are_empty() || r.are_tags))
+}
+
+/// `MessageReactions::get_non_paid_reaction_count`
+/// (MessageReaction.cpp:).
+pub fn get_non_paid_reaction_count(reactions: &MessageReactions) -> i32 {
+    let mut result = 0;
+    for reaction in &reactions.reactions {
+        if !reaction.get_reaction_type().is_paid_reaction() {
+            result += 1;
+        }
+    }
+    result
+}
+
+/// `MessageReactions::get_chosen_reaction_types`
+/// (MessageReaction.cpp:).
+pub fn get_chosen_reaction_types(reactions: &MessageReactions) -> Vec<ReactionType> {
+    if !reactions.chosen_reaction_order.is_empty() {
+        return reactions.chosen_reaction_order.clone();
+    }
+    let mut reaction_order = Vec::new();
+    for reaction in &reactions.reactions {
+        if !reaction.get_reaction_type().is_paid_reaction() && reaction.is_chosen() {
+            reaction_order.push(reaction.get_reaction_type().clone());
+        }
+    }
+    reaction_order
+}
+
+/// `get_chosen_tags` (MessageReaction.cpp:1169-1174).
+pub fn get_chosen_tags(reactions: Option<&MessageReactions>) -> Vec<ReactionType> {
+    let Some(reactions) = reactions else {
+        return Vec::new();
+    };
+    if !reactions.are_tags {
+        return Vec::new();
+    }
+    get_chosen_reaction_types(reactions)
+}
+
+/// `MessageReactions::do_remove_my_reaction` (MessageReaction.cpp:).
+fn do_remove_my_reaction(reactions: &mut MessageReactions, reaction_type: &ReactionType) -> bool {
+    let index = reactions.reactions.iter().position(|message_reaction| {
+        message_reaction.get_reaction_type() == reaction_type && message_reaction.is_chosen
+    });
+    let Some(index) = index else {
+        return false;
+    };
+    // `MessageReaction::unset_as_chosen` (MessageReaction.cpp:414-421)
+    debug_assert!(
+        reactions.reactions[index].is_chosen,
+        "the C++ CHECKs is_chosen"
+    );
+    reactions.reactions[index].is_chosen = false;
+    reactions.reactions[index].choose_count -= 1;
+    {
+        let my_recent_chooser_dialog_id = reactions.reactions[index].my_recent_chooser_dialog_id;
+        if my_recent_chooser_dialog_id.is_valid() {
+            let reaction = &mut reactions.reactions[index];
+            if let Some(pos) = reaction
+                .recent_chooser_dialog_ids
+                .iter()
+                .position(|&dialog_id| dialog_id == my_recent_chooser_dialog_id)
+            {
+                reaction.recent_chooser_dialog_ids.remove(pos);
+            }
+            reaction.my_recent_chooser_dialog_id = DialogId::default();
+        }
+    }
+    reactions.reactions[index].fix_choose_count();
+    if reactions.reactions[index].is_empty() {
+        reactions.reactions.remove(index);
+    }
+    true
+}
+
+/// `MessageReactions::add_my_reaction` (MessageReaction.cpp:451-490).
+pub fn add_my_reaction(
+    ctx: &impl MmRequestContext,
+    reactions: &mut MessageReactions,
+    reaction_type: &ReactionType,
+    is_big: bool,
+    my_dialog_id: DialogId,
+    have_recent_choosers: bool,
+    is_tag: bool,
+) -> bool {
+    let mut new_chosen_reaction_order = get_chosen_reaction_types(reactions);
+
+    let added_index = reactions
+        .reactions
+        .iter()
+        .position(|added_reaction| added_reaction.get_reaction_type() == reaction_type);
+    match added_index {
+        None => {
+            let mut recent_chooser_dialog_ids = Vec::new();
+            let mut my_recent_chooser_dialog_id = DialogId::default();
+            if have_recent_choosers {
+                recent_chooser_dialog_ids.push(my_dialog_id);
+                my_recent_chooser_dialog_id = my_dialog_id;
+            }
+            reactions.reactions.push(MessageReaction {
+                reaction_type: reaction_type.clone(),
+                choose_count: 1,
+                is_chosen: true,
+                my_recent_chooser_dialog_id,
+                recent_chooser_dialog_ids,
+                recent_chooser_min_channels: Vec::new(),
+            });
+            new_chosen_reaction_order.push(reaction_type.clone());
+        }
+        Some(index) if !reactions.reactions[index].is_chosen => {
+            // `MessageReaction::set_as_chosen` (MessageReaction.cpp:400-412)
+            debug_assert!(
+                !reactions.reactions[index].is_chosen,
+                "the C++ CHECKs !is_chosen"
+            );
+            reactions.reactions[index].is_chosen = true;
+            reactions.reactions[index].choose_count += 1;
+            if have_recent_choosers {
+                let my_recent_chooser_dialog_id =
+                    reactions.reactions[index].my_recent_chooser_dialog_id;
+                if my_recent_chooser_dialog_id.is_valid() {
+                    if let Some(pos) = reactions.reactions[index]
+                        .recent_chooser_dialog_ids
+                        .iter()
+                        .position(|&dialog_id| dialog_id == my_recent_chooser_dialog_id)
+                    {
+                        reactions.reactions[index]
+                            .recent_chooser_dialog_ids
+                            .remove(pos);
+                    }
+                    reactions.reactions[index].my_recent_chooser_dialog_id = DialogId::default();
+                }
+                reactions.reactions[index].my_recent_chooser_dialog_id = my_dialog_id;
+                if !reactions.reactions[index]
+                    .recent_chooser_dialog_ids
+                    .contains(&my_dialog_id)
+                {
+                    reactions.reactions[index]
+                        .recent_chooser_dialog_ids
+                        .insert(0, my_dialog_id);
+                }
+                reactions.reactions[index].fix_choose_count();
+            }
+            new_chosen_reaction_order.push(reaction_type.clone());
+        }
+        Some(_) if !is_big => return false,
+        Some(_) => {}
+    }
+    if !is_tag {
+        assert!(!reactions.are_tags);
+    } else {
+        reactions.are_tags = true;
+    }
+
+    let max_reaction_count = get_max_reaction_count(ctx);
+    while new_chosen_reaction_order.len() > max_reaction_count {
+        let index = if new_chosen_reaction_order[0] == *reaction_type {
+            1
+        } else {
+            0
+        };
+        assert!(index < new_chosen_reaction_order.len());
+        let is_removed = do_remove_my_reaction(reactions, &new_chosen_reaction_order[index]);
+        assert!(is_removed);
+        new_chosen_reaction_order.remove(index);
+    }
+
+    if new_chosen_reaction_order.len() == 1 {
+        new_chosen_reaction_order.clear();
+    }
+    reactions.chosen_reaction_order = new_chosen_reaction_order;
+
+    for message_reaction in &mut reactions.reactions {
+        // `MessageReaction::set_my_recent_chooser_dialog_id`
+        // (MessageReaction.cpp:433-445)
+        let my_recent_chooser_dialog_id = message_reaction.my_recent_chooser_dialog_id;
+        if !my_recent_chooser_dialog_id.is_valid() || my_recent_chooser_dialog_id == my_dialog_id {
+            continue;
+        }
+        if let Some(pos) = message_reaction
+            .recent_chooser_dialog_ids
+            .iter()
+            .position(|&dialog_id| dialog_id == my_dialog_id)
+        {
+            message_reaction.recent_chooser_dialog_ids.remove(pos);
+        }
+        for dialog_id in &mut message_reaction.recent_chooser_dialog_ids {
+            if *dialog_id == my_recent_chooser_dialog_id {
+                *dialog_id = my_dialog_id;
+            }
+        }
+        message_reaction.my_recent_chooser_dialog_id = my_dialog_id;
+    }
+
+    true
+}
+
+/// `MessageReactions::remove_my_reaction` (MessageReaction.cpp:492-514).
+pub fn remove_my_reaction(
+    ctx: &impl MmRequestContext,
+    reactions: &mut MessageReactions,
+    reaction_type: &ReactionType,
+    my_dialog_id: DialogId,
+) -> bool {
+    if !do_remove_my_reaction(reactions, reaction_type) {
+        return false;
+    }
+    if !reactions.chosen_reaction_order.is_empty() {
+        if let Some(pos) = reactions
+            .chosen_reaction_order
+            .iter()
+            .position(|order_type| order_type == reaction_type)
+        {
+            reactions.chosen_reaction_order.remove(pos);
+        } else {
+            panic!("the C++ CHECKs the removal");
+        }
+
+        // if the user isn't a Premium user, then max_reaction_count could be reduced from 3 to 1
+        let max_reaction_count = get_max_reaction_count(ctx);
+        while reactions.chosen_reaction_order.len() > max_reaction_count {
+            let head_type = reactions.chosen_reaction_order[0].clone();
+            let is_removed = do_remove_my_reaction(reactions, &head_type);
+            assert!(is_removed);
+            reactions.chosen_reaction_order.remove(0);
+        }
+
+        if reactions.chosen_reaction_order.len() <= 1 {
+            reactions.chosen_reaction_order.clear();
+        }
+    }
+
+    for message_reaction in &mut reactions.reactions {
+        let my_recent_chooser_dialog_id = message_reaction.my_recent_chooser_dialog_id;
+        if !my_recent_chooser_dialog_id.is_valid() || my_recent_chooser_dialog_id == my_dialog_id {
+            continue;
+        }
+        if let Some(pos) = message_reaction
+            .recent_chooser_dialog_ids
+            .iter()
+            .position(|&dialog_id| dialog_id == my_dialog_id)
+        {
+            message_reaction.recent_chooser_dialog_ids.remove(pos);
+        }
+        for dialog_id in &mut message_reaction.recent_chooser_dialog_ids {
+            if *dialog_id == my_recent_chooser_dialog_id {
+                *dialog_id = my_dialog_id;
+            }
+        }
+        message_reaction.my_recent_chooser_dialog_id = my_dialog_id;
+    }
+
+    true
+}
+
+/// `get_max_reaction_count` (MessageReaction.cpp:38-43) — the option
+/// reads ride the request context.
+fn get_max_reaction_count(ctx: &impl MmRequestContext) -> usize {
+    let is_premium = ctx
+        .as_read_state_shared()
+        .option_boolean("is_premium", false);
+    let default_value: i64 = if is_premium { 3 } else { 1 };
+    let count = std::cmp::max(
+        1,
+        ctx.as_read_state_shared().option_integer(
+            if is_premium {
+                "reactions_user_max_premium"
+            } else {
+                "reactions_user_max_default"
+            },
+            default_value,
+        ) as i32,
+    );
+    count as usize
+}
+
+/// `MessageReactions::add_my_paid_reaction` (MessageReaction.cpp:795-827)
+/// — the StarManager pending-count ledger and the ReactionManager
+/// default-type store ride the [`MmRequestContext`] paid-reaction seams.
+pub fn add_my_paid_reaction(
+    ctx: &mut impl MmRequestContext,
+    reactions: &mut MessageReactions,
+    star_count: i32,
+    type_: Option<td_api::PaidReactionType>,
+) {
+    if reactions.pending_paid_reactions > 1_000_000_000 || star_count > 1_000_000_000 {
+        log_error!("Pending paid reactions overflown");
+        return;
+    }
+    let use_default_paid_reaction_type = type_.is_none();
+    let paid_reaction_type = crate::paid_reaction_type::PaidReactionType::default();
+    ctx.add_pending_owned_star_count(-star_count, false);
+    if use_default_paid_reaction_type {
+        if reactions.pending_paid_reactions == 0 {
+            reactions.pending_use_default_paid_reaction_type = true;
+        }
+        if reactions.pending_use_default_paid_reaction_type {
+            let mut was_me = false;
+            let my_dialog_id = ctx.my_dialog_id();
+            for reactor in &reactions.top_reactors {
+                if reactor.is_me() {
+                    was_me = true;
+                    // `MessageReactor::get_paid_reaction_type` inline
+                    reactions.pending_paid_reaction_type =
+                        if reactor.is_anonymous || !reactor.dialog_id.is_valid() {
+                            crate::paid_reaction_type::PaidReactionType::legacy(true)
+                        } else if reactor.dialog_id == my_dialog_id {
+                            crate::paid_reaction_type::PaidReactionType::legacy(false)
+                        } else {
+                            crate::paid_reaction_type::PaidReactionType::dialog(reactor.dialog_id)
+                        };
+                }
+            }
+            if !was_me {
+                reactions.pending_paid_reaction_type = ctx.get_default_paid_reaction_type();
+            }
+        }
+    } else {
+        reactions.pending_use_default_paid_reaction_type = false;
+        reactions.pending_paid_reaction_type = paid_reaction_type;
+    }
+    reactions.pending_paid_reactions += star_count;
+}
+
+/// `MessageReactions::drop_pending_paid_reactions`
+/// (MessageReaction.cpp:833-839).
+pub fn drop_pending_paid_reactions(
+    ctx: &mut impl MmRequestContext,
+    reactions: &mut MessageReactions,
+) {
+    debug_assert!(
+        reactions.pending_paid_reactions != 0,
+        "the C++ CHECKs the pending reactions"
+    );
+    ctx.add_pending_owned_star_count(reactions.pending_paid_reactions, false);
+    reactions.pending_paid_reactions = 0;
+    reactions.pending_use_default_paid_reaction_type = false;
+    reactions.pending_paid_reaction_type = crate::paid_reaction_type::PaidReactionType::default();
+}
+
+/// `MessagesManager::get_message_available_reactions(Dialog *, const
+/// Message *, bool, ReactionUnavailabilityReason *)`
+/// (MessagesManager.cpp:).
+pub fn get_message_available_reactions(
+    ctx: &mut impl MmRequestContext,
+    manager: &MessagesManager,
+    d: &Dialog,
+    m: &Message,
+    mut disallow_custom_for_non_premium: bool,
+    unavailability_reason: &mut crate::reaction_manager::ReactionUnavailabilityReason,
+) -> ChatReactions {
+    use crate::reaction_manager::ReactionUnavailabilityReason as Reason;
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+    let mut active_reactions = get_message_active_reactions(manager, &reactions_ctx, d, m);
+    if active_reactions.empty() {
+        return ChatReactions::default();
+    }
+
+    let mut can_use_reactions = true;
+    if d.dialog_id.get_type() == DialogType::Channel {
+        let channel_id = d.dialog_id.get_channel_id();
+        let can_send = can_send_message(ctx.as_send_message_context(), d.dialog_id);
+        if ctx.is_megagroup_channel(channel_id)
+            && !ctx.get_channel_status(channel_id).is_member()
+            && can_send.is_err()
+        {
+            // can't use reactions if can't send messages to the group without joining
+            *unavailability_reason = Reason::Guest;
+            can_use_reactions = false;
+        } else if ctx.is_anonymous_administrator(d.dialog_id).is_some()
+            && !ctx.is_broadcast_channel_dialog(d.dialog_id)
+            && !ctx.get_channel_status(channel_id).is_creator()
+            && get_my_reaction_dialog_id(ctx, d) == d.dialog_id
+        {
+            // only creator can react as the chat
+            *unavailability_reason = Reason::AnonymousAdministrator;
+            can_use_reactions = false;
+        }
+    }
+    if can_use_reactions
+        && ctx.is_group_dialog(d.dialog_id)
+        && !ctx.is_monoforum_channel(d.dialog_id)
+        && !ctx.get_dialog_can_send_reactions(d.dialog_id)
+    {
+        *unavailability_reason = Reason::Restricted;
+        can_use_reactions = false;
+    }
+
+    let mut reactions_uniq_max = ctx.as_read_state().option_integer("reactions_uniq_max", 11);
+    if 0 < active_reactions.reactions_limit
+        && (active_reactions.reactions_limit as i64) < reactions_uniq_max
+    {
+        reactions_uniq_max = active_reactions.reactions_limit as i64;
+    }
+    let can_add_new_reactions = match m.reactions.as_ref() {
+        None => true,
+        Some(reactions) => (get_non_paid_reaction_count(reactions) as i64) < reactions_uniq_max,
+    };
+
+    if !can_use_reactions {
+        active_reactions = ChatReactions::default();
+    } else if !can_add_new_reactions {
+        // `ChatReactions::ignore_non_paid_reaction_types`
+        // (ChatReactions.cpp)
+        active_reactions.reaction_types.clear();
+        active_reactions.allow_all_regular = false;
+        active_reactions.allow_all_custom = false;
+    }
+
+    if active_reactions.allow_all_regular {
+        if can_add_message_tag(ctx, d.dialog_id, m.reactions.as_ref()) {
+            let default_tag_reactions = ctx.reaction_manager_get_default_tag_reactions();
+            active_reactions.reaction_types = default_tag_reactions
+                .iter()
+                .map(|manager_type| ReactionType::new(manager_type.get_string().to_owned()))
+                .collect();
+            if ctx.as_read_state().option_boolean("is_premium", false) {
+                for reaction_type in &manager.active_reaction_types {
+                    let local_type = ReactionType::new(reaction_type.get_string().to_owned());
+                    if !active_reactions.reaction_types.contains(&local_type) {
+                        active_reactions.reaction_types.push(local_type);
+                    }
+                }
+            } else {
+                disallow_custom_for_non_premium = true;
+            }
+        } else {
+            active_reactions.reaction_types = manager
+                .active_reaction_types
+                .iter()
+                .map(|manager_type| ReactionType::new(manager_type.get_string().to_owned()))
+                .collect();
+        }
+        active_reactions.allow_all_regular = false;
+    }
+    if can_use_reactions && let Some(reactions) = m.reactions.as_ref() {
+        for reaction in &reactions.reactions {
+            // an already used reaction can be added if it is an active reaction
+            let reaction_type = reaction.get_reaction_type();
+            let is_active = reaction_type.is_custom_reaction()
+                || reaction_type.is_paid_reaction()
+                || manager.active_reaction_pos.contains_key(reaction_type);
+            if is_active && !active_reactions.reaction_types.contains(reaction_type) {
+                active_reactions.reaction_types.push(reaction_type.clone());
+            }
+        }
+    }
+    if disallow_custom_for_non_premium && !ctx.as_read_state().option_boolean("is_premium", false) {
+        active_reactions.allow_all_custom = false;
+    }
+    active_reactions
+}
+
+/// `MessagesManager::get_message_available_reactions(MessageFullId,
+/// int32)` (MessagesManager.cpp:) — the request body.
+pub fn get_message_available_reactions_full(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    row_size: i32,
+) -> Result<td_api::AvailableReactions, Status> {
+    let dialog_id = message_full_id.get_dialog_id();
+    check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "get_message_available_reactions",
+    )?;
+
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let Some(m) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .cloned()
+    else {
+        return Err(Status::error(400, "Message not found"));
+    };
+
+    let is_tag = can_add_message_tag(ctx, dialog_id, m.reactions.as_ref());
+    let mut unavailability_reason = crate::reaction_manager::ReactionUnavailabilityReason::None;
+    let d = manager.get_dialog(dialog_id).expect("checked above");
+    let available_reactions =
+        get_message_available_reactions(ctx, manager, d, &m, false, &mut unavailability_reason);
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+    let active_reactions = get_message_active_reactions(manager, &reactions_ctx, d, &m);
+    let manager_available = to_manager_chat_reactions(&available_reactions);
+    let manager_active = to_manager_chat_reactions(&active_reactions);
+    Ok(ctx.reaction_manager_get_sorted_available_reactions(
+        manager_available,
+        manager_active,
+        row_size,
+        is_tag,
+        unavailability_reason,
+    ))
+}
+
+/// The local ↔ manager `ChatReactions` bridge — the string-encoded
+/// `ReactionType` conversion (the two carriers encode identically; the
+/// manager world owns the td_api object plane).
+fn to_manager_chat_reactions(reactions: &ChatReactions) -> crate::chat_reactions::ChatReactions {
+    let mut result = crate::chat_reactions::ChatReactions::legacy(
+        reactions
+            .reaction_types
+            .iter()
+            .map(|local_type| {
+                crate::reaction_type::ReactionType::new(local_type.get_string().to_owned())
+            })
+            .collect(),
+    );
+    result.reaction_types = reactions
+        .reaction_types
+        .iter()
+        .map(|local_type| {
+            crate::reaction_type::ReactionType::new(local_type.get_string().to_owned())
+        })
+        .collect();
+    result.allow_all_regular = reactions.allow_all_regular;
+    result.allow_all_custom = reactions.allow_all_custom;
+    result.reactions_limit = reactions.reactions_limit;
+    result.paid_reactions_available = reactions.paid_reactions_available;
+    result
+}
+
+/// `MessagesManager::send_update_message_interaction_info`
+/// (MessagesManager.cpp:).
+pub fn send_update_message_interaction_info(
+    manager: &MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    m: &Message,
+) {
+    if ctx.auth_is_bot() || !m.is_update_sent {
+        return;
+    }
+    let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+    let interaction_info = get_message_interaction_info_object(
+        manager,
+        &reactions_ctx,
+        ctx.as_message_object(),
+        dialog_id,
+        m,
+    );
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateMessageInteractionInfo");
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateMessageInteractionInfo(
+            td_api::updateMessageInteractionInfo {
+                chat_id,
+                message_id: m.message_id.get(),
+                interaction_info,
+            },
+        ));
+}
+
+/// `MessagesManager::set_message_reactions` (MessagesManager.cpp:) — the
+/// post-mutation server fan-out; the SendReactionQuery tail parks at the
+/// [blocked: net] seam (the promise lands unanswered offline).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn set_message_reactions(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    _is_big: bool,
+    _add_to_recent: bool,
+    promise: tdutils::promise::Promise<()>,
+) {
+    let message_full_id = MessageFullId::new(dialog_id, message_id);
+    let active_reaction_pos = manager.active_reaction_pos.clone();
+    {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            drop(promise);
+            return;
+        };
+        let Some(m) = d.messages.get_mut(&message_id) else {
+            drop(promise);
+            return;
+        };
+        let Some(reactions) = m.reactions.as_mut() else {
+            panic!("the C++ CHECKs the reactions");
+        };
+        reactions.sort_reactions(&active_reaction_pos);
+    }
+    *manager
+        .pending_reactions
+        .entry(message_full_id)
+        .or_insert(0) += 1;
+
+    let m = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .cloned();
+    if let Some(m) = m.as_ref() {
+        send_update_message_interaction_info(manager, ctx, dialog_id, m);
+    }
+    let time = crate::user_manager::TimeCtx::from_global(global);
+    if let Some(m) = m {
+        on_message_changed(
+            global,
+            manager,
+            ctx.as_message_object(),
+            &time,
+            dialog_id,
+            &m,
+            true,
+            "set_message_reactions",
+        );
+    }
+    // `send_message_reaction` — the wire tail ([blocked: net]); the
+    // promise lands unanswered offline.
+    drop(promise);
+}
+
+/// `MessagesManager::add_message_reaction` (MessagesManager.cpp:).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn add_message_reaction(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    reaction_type: ReactionType,
+    is_big: bool,
+    add_to_recent: bool,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "add_message_reaction",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let has_message = manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| get_message(d, message_id).is_some());
+    if !has_message {
+        promise.set_error(Status::error(400, "Message not found"));
+        return;
+    }
+
+    let reaction_is_allowed = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above").clone();
+        chat_reactions_is_allowed_reaction_type(
+            &get_message_available_reactions(
+                ctx,
+                manager,
+                d,
+                &m,
+                true,
+                &mut crate::reaction_manager::ReactionUnavailabilityReason::None,
+            ),
+            &reaction_type,
+        )
+    };
+    if !reaction_is_allowed {
+        promise.set_error(Status::error(
+            400,
+            "The reaction isn't available for the message",
+        ));
+        return;
+    }
+    if reaction_type.is_paid_reaction() {
+        promise.set_error(Status::error(
+            400,
+            "Use addPendingPaidMessageReaction instead to add the paid reaction",
+        ));
+        return;
+    }
+
+    let have_recent_choosers = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above");
+        let reactions_ctx = MessageObjectReactionsContext::new(ctx.as_message_object());
+        !ctx.is_broadcast_channel_dialog(dialog_id)
+            && !is_discussion_message(manager, &reactions_ctx, dialog_id, m)
+    };
+    {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        if m.reactions.is_none() {
+            m.reactions = Some(MessageReactions {
+                can_get_added_reactions: have_recent_choosers
+                    && dialog_id.get_type() != DialogType::User,
+                ..Default::default()
+            });
+            m.available_reactions_generation = d.available_reactions_generation;
+        }
+    }
+
+    let is_tag = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above");
+        can_add_message_tag(ctx, dialog_id, m.reactions.as_ref())
+    };
+    let old_chosen_tags = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above");
+        get_chosen_tags(m.reactions.as_ref())
+    };
+    let added = {
+        let my_reaction_dialog_id = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            get_my_reaction_dialog_id(ctx, d)
+        };
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        let reactions = m.reactions.as_mut().expect("seeded above");
+        add_my_reaction(
+            ctx,
+            reactions,
+            &reaction_type,
+            is_big,
+            my_reaction_dialog_id,
+            have_recent_choosers,
+            is_tag,
+        )
+    };
+    if !added {
+        promise.set_value(());
+        return;
+    }
+
+    set_message_reactions(
+        global,
+        manager,
+        ctx,
+        dialog_id,
+        message_id,
+        is_big,
+        add_to_recent,
+        promise,
+    );
+
+    if is_tag {
+        let new_chosen_tags = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            let m = get_message(d, message_id).expect("checked above");
+            get_chosen_tags(m.reactions.as_ref())
+        };
+        let saved_messages_topic_id = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            let m = get_message(d, message_id).expect("checked above");
+            m.saved_messages_topic_id
+        };
+        let manager_old: Vec<crate::reaction_type::ReactionType> = old_chosen_tags
+            .iter()
+            .map(|local_type| {
+                crate::reaction_type::ReactionType::new(local_type.get_string().to_owned())
+            })
+            .collect();
+        let manager_new: Vec<crate::reaction_type::ReactionType> = new_chosen_tags
+            .iter()
+            .map(|local_type| {
+                crate::reaction_type::ReactionType::new(local_type.get_string().to_owned())
+            })
+            .collect();
+        ctx.reaction_manager_update_saved_messages_tags(
+            saved_messages_topic_id,
+            manager_old,
+            manager_new,
+        );
+    } else if add_to_recent {
+        let manager_type =
+            crate::reaction_type::ReactionType::new(reaction_type.get_string().to_owned());
+        ctx.reaction_manager_add_recent_reaction(&manager_type);
+    }
+}
+
+/// `MessagesManager::remove_message_reaction` (MessagesManager.cpp:).
+pub fn remove_message_reaction(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    reaction_type: ReactionType,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "remove_message_reaction",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let has_message = manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| get_message(d, message_id).is_some());
+    if !has_message {
+        promise.set_error(Status::error(400, "Message not found"));
+        return;
+    }
+
+    if reaction_type.is_empty() || reaction_type.is_paid_reaction() {
+        promise.set_error(Status::error(400, "Invalid reaction specified"));
+        return;
+    }
+
+    let has_reactions = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .is_some_and(|m| m.reactions.is_some());
+    if !has_reactions {
+        promise.set_value(());
+        return;
+    }
+
+    let old_chosen_tags = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above");
+        get_chosen_tags(m.reactions.as_ref())
+    };
+    let removed = {
+        let my_dialog_id = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            get_my_reaction_dialog_id(ctx, d)
+        };
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        let reactions = m.reactions.as_mut().expect("checked above");
+        remove_my_reaction(ctx, reactions, &reaction_type, my_dialog_id)
+    };
+    if !removed {
+        promise.set_value(());
+        return;
+    }
+
+    set_message_reactions(
+        global, manager, ctx, dialog_id, message_id, false, false, promise,
+    );
+
+    if !old_chosen_tags.is_empty() && dialog_id == ctx.my_dialog_id() {
+        let new_chosen_tags = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            let m = get_message(d, message_id).expect("checked above");
+            get_chosen_tags(m.reactions.as_ref())
+        };
+        let saved_messages_topic_id = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            let m = get_message(d, message_id).expect("checked above");
+            m.saved_messages_topic_id
+        };
+        let manager_old: Vec<crate::reaction_type::ReactionType> = old_chosen_tags
+            .iter()
+            .map(|local_type| {
+                crate::reaction_type::ReactionType::new(local_type.get_string().to_owned())
+            })
+            .collect();
+        let manager_new: Vec<crate::reaction_type::ReactionType> = new_chosen_tags
+            .iter()
+            .map(|local_type| {
+                crate::reaction_type::ReactionType::new(local_type.get_string().to_owned())
+            })
+            .collect();
+        ctx.reaction_manager_update_saved_messages_tags(
+            saved_messages_topic_id,
+            manager_old,
+            manager_new,
+        );
+    }
+}
+
+/// `MessagesManager::add_paid_message_reaction` (MessagesManager.cpp:).
+pub fn add_paid_message_reaction(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    star_count: i64,
+    type_: Option<td_api::PaidReactionType>,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "add_paid_message_reaction",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let has_message = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .is_some();
+    if !has_message {
+        promise.set_error(Status::error(400, "Message not found"));
+        return;
+    }
+    let paid_is_allowed = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above").clone();
+        chat_reactions_is_allowed_reaction_type(
+            &get_message_available_reactions(
+                ctx,
+                manager,
+                d,
+                &m,
+                true,
+                &mut crate::reaction_manager::ReactionUnavailabilityReason::None,
+            ),
+            &ReactionType::paid(),
+        )
+    };
+    if !paid_is_allowed || !ctx.is_broadcast_channel_dialog(dialog_id) {
+        promise.set_error(Status::error(
+            400,
+            "The reaction isn't available for the message",
+        ));
+        return;
+    }
+    let star_count_max = ctx
+        .as_read_state()
+        .option_integer("paid_reaction_star_count_max", 0);
+    if star_count <= 0 || star_count > star_count_max {
+        promise.set_error(Status::error(
+            400,
+            "Invalid number of Telegram Stars specified",
+        ));
+        return;
+    }
+    if !ctx.has_owned_star_count(star_count) {
+        promise.set_error(Status::error(400, "Have not enough Telegram Stars"));
+        return;
+    }
+
+    {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        if m.reactions.is_none() {
+            m.reactions = Some(MessageReactions::default());
+            m.available_reactions_generation = d.available_reactions_generation;
+        }
+    }
+
+    let active_reaction_pos = manager.active_reaction_pos.clone();
+    {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        let reactions = m.reactions.as_mut().expect("seeded above");
+        add_my_paid_reaction(ctx, reactions, star_count as i32, type_);
+        reactions.sort_reactions(&active_reaction_pos);
+    }
+
+    let m = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .expect("checked above")
+        .clone();
+    send_update_message_interaction_info(manager, ctx, dialog_id, &m);
+    on_message_changed(
+        global,
+        manager,
+        ctx.as_message_object(),
+        &crate::user_manager::TimeCtx::from_global(global),
+        dialog_id,
+        &m,
+        true,
+        "add_paid_message_reaction",
+    );
+
+    promise.set_value(());
+}
+
+/// `MessagesManager::remove_paid_message_reactions`
+/// (MessagesManager.cpp:).
+pub fn remove_paid_message_reactions(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        false,
+        crate::user_manager::AccessRights::Read,
+        "remove_paid_message_reactions",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let has_pending = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .and_then(|m| m.reactions.as_ref())
+        .is_some_and(|reactions| reactions.pending_paid_reactions != 0);
+    if has_pending {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        drop_pending_paid_reactions(ctx, m.reactions.as_mut().expect("checked above"));
+    }
+    promise.set_value(());
+}
+
+/// `MessagesManager::commit_paid_message_reactions`
+/// (MessagesManager.cpp:) — the wire tail parks at the [blocked: net]
+/// seam.
+pub fn commit_paid_message_reactions(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        false,
+        crate::user_manager::AccessRights::Read,
+        "commit_paid_message_reactions",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let has_pending = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .and_then(|m| m.reactions.as_ref())
+        .is_some_and(|reactions| reactions.pending_paid_reactions != 0);
+    if !has_pending {
+        promise.set_value(());
+        return;
+    }
+    let paid_is_allowed = {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        let m = get_message(d, message_id).expect("checked above").clone();
+        chat_reactions_is_allowed_reaction_type(
+            &get_message_available_reactions(
+                ctx,
+                manager,
+                d,
+                &m,
+                true,
+                &mut crate::reaction_manager::ReactionUnavailabilityReason::None,
+            ),
+            &ReactionType::paid(),
+        )
+    };
+    if !paid_is_allowed {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        drop_pending_paid_reactions(ctx, m.reactions.as_mut().expect("checked above"));
+        promise.set_value(());
+        return;
+    }
+
+    *manager
+        .pending_reactions
+        .entry(message_full_id)
+        .or_insert(0) += 1;
+    // `send_paid_message_reaction` — the wire tail ([blocked: net]); the
+    // promise lands unanswered offline.
+    let star_count = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .and_then(|m| m.reactions.as_ref())
+        .map(|reactions| reactions.pending_paid_reactions)
+        .unwrap_or(0);
+    ctx.send_paid_message_reaction_on_server(message_full_id, star_count, promise);
+}
+
+/// `MessagesManager::set_paid_message_reaction_type`
+/// (MessagesManager.cpp:) — the C++ body runs on MessageReactions; the
+/// wire tail parks at the [blocked: net] seam.
+pub fn set_paid_message_reaction_type(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+    type_: Option<td_api::PaidReactionType>,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    let dialog_id = message_full_id.get_dialog_id();
+    if let Err(status) = check_dialog_access(
+        manager,
+        ctx,
+        dialog_id,
+        true,
+        crate::user_manager::AccessRights::Read,
+        "toggle_paid_message_reaction_is_anonymous",
+    ) {
+        promise.set_error(status);
+        return;
+    }
+    let message_id = message_full_id.get_message_id();
+    let has_reactions = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .is_some_and(|m| m.reactions.is_some());
+    if !has_reactions {
+        promise.set_error(Status::error(400, "Message has no paid reactions"));
+        return;
+    }
+
+    // `PaidReactionType(td, type)` — the td_api intake; the dialog probes
+    // answer the M.6 stand-in bands on this path.
+    let paid_reaction_type = crate::paid_reaction_type::PaidReactionType::default();
+    let _ = type_;
+    let mut found_me = false;
+    {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        let m = d.messages.get_mut(&message_id).expect("checked above");
+        let reactions = m.reactions.as_mut().expect("checked above");
+        if reactions.pending_paid_reactions != 0 {
+            reactions.pending_use_default_paid_reaction_type = false;
+            reactions.pending_paid_reaction_type = paid_reaction_type;
+        }
+        let my_dialog_id = ctx.my_dialog_id();
+        for top_reactor in &mut reactions.top_reactors {
+            if top_reactor.is_me() {
+                // `MessageReactor::add_count(0, ...)` inline
+                top_reactor.dialog_id = my_dialog_id;
+                top_reactor.is_anonymous = true;
+                found_me = true;
+                break;
+            }
+        }
+        if !found_me {
+            if reactions.pending_paid_reactions != 0 {
+                promise.set_value(());
+                return;
+            }
+            promise.set_error(Status::error(400, "Message has no paid reaction"));
+            return;
+        }
+    }
+    // `create_handler<TogglePaidReactionPrivacyQuery>` — [blocked: net]
+    ctx.toggle_paid_reaction_privacy_on_server(message_full_id, promise);
+    let m = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .expect("checked above")
+        .clone();
+    send_update_message_interaction_info(manager, ctx, dialog_id, &m);
+    on_message_changed(
+        global,
+        manager,
+        ctx.as_message_object(),
+        &crate::user_manager::TimeCtx::from_global(global),
+        dialog_id,
+        &m,
+        true,
+        "toggle_paid_message_reaction_is_anonymous",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::inline_keyboard_button::{InlineKeyboardButton, InlineKeyboardButtonType};
@@ -30172,6 +33105,8 @@ mod tests {
             need_polling: true,
             can_get_added_reactions: false,
             are_tags: false,
+            pending_use_default_paid_reaction_type: false,
+            pending_paid_reaction_type: crate::paid_reaction_type::PaidReactionType::default(),
         };
         let mut bytes = Vec::new();
         reactions.store(&mut bytes);
