@@ -51,6 +51,7 @@ use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
 use crate::td::AttachMenuEnv;
 use crate::td::AutosaveEnv;
+use crate::td::BackgroundEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
@@ -63,6 +64,7 @@ use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::TdAnimationsEnv;
 use crate::td::TdLinkEnv;
+use crate::td::TdStaticLinkEnv;
 use crate::td::ThemeEnv;
 use crate::td::TranslationEnv;
 use crate::td::WebBrowserEnv;
@@ -252,6 +254,18 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     &mut chat_updates,
                 );
                 updates.extend(chat_updates);
+            }
+
+            // BackgroundManager::get_current_state (Requests.cpp:2211 —
+            // after the chat block, before animations; the manager's own
+            // is_bot gate applies)
+            {
+                let mut manager = std::mem::take(&mut td.background_manager);
+                {
+                    let mut env = BackgroundEnv { td: &mut *td };
+                    manager.get_current_state(&mut env, &mut updates);
+                }
+                td.background_manager = manager;
             }
 
             // ReactionManager::get_current_state (Requests.cpp:2219 —
@@ -8825,6 +8839,15 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 chat_manager: &mut td.chat_manager,
                 file_manager: std::sync::Arc::clone(&td.file_manager),
                 updates: &mut td.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                documents_manager: &mut td.documents_manager,
+                audios: &mut td.audios_manager,
+                videos: &mut td.videos_manager,
+                voice_notes: &mut td.voice_notes_manager,
+                video_notes: &mut td.video_notes_manager,
+                background_manager: &mut td.background_manager,
+                background_updates: &mut td.background_updates,
             };
             td.theme_manager
                 .get_unique_gift_chat_themes(&mut env, &offset, request.limit, promise);
@@ -8908,6 +8931,182 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 is_gift,
                 promise,
             );
+        }
+
+        // --- backgrounds (Requests.cpp:1889-1893, 5826-5834, 8902-8946) ---
+        Function::searchBackground(request) => {
+            // SearchBackgroundRequest (Requests.cpp:1889-1893): set_tries(3);
+            // the answer is get_background_object of the searched pair — the
+            // C++ null result answers the 404 through Td::send_result
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(
+                    id,
+                    |background: Option<td_api::Background>| match background {
+                        Some(background) => Object::background(background),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    },
+                );
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.search_background(&mut env, &name, promise);
+            }
+            td.background_manager = manager;
+        }
+        Function::getInstalledBackgrounds(request) => {
+            // Requests.cpp:8902-8904
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |b: td_api::Backgrounds| Object::backgrounds(b));
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.get_backgrounds(&mut env, request.for_dark_theme, promise);
+            }
+            td.background_manager = manager;
+        }
+        Function::getBackgroundUrl(request) => {
+            // LinkManager::get_background_url (Requests.cpp:8905-8913)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let env = TdStaticLinkEnv {
+                options: td.option_manager.as_ref(),
+            };
+            let url =
+                match crate::link_manager::get_background_url(&env, &name, request.r#type.as_ref())
+                {
+                    Ok(url) => url,
+                    Err(status) => {
+                        td.send_error_impl(id, status.code(), status.message());
+                        return;
+                    }
+                };
+            td.send_result(id, Object::httpUrl(td_api::HttpUrl { url }));
+        }
+        Function::setDefaultBackground(request) => {
+            // Requests.cpp:8925-8929
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(
+                    id,
+                    |background: Option<td_api::Background>| match background {
+                        Some(background) => Object::background(background),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    },
+                );
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.set_background(
+                    &mut env,
+                    request.background.as_ref(),
+                    request.r#type.as_ref(),
+                    request.for_dark_theme,
+                    promise,
+                );
+            }
+            td.background_manager = manager;
+        }
+        Function::deleteDefaultBackground(request) => {
+            // Requests.cpp:8932-8935
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.delete_background(&mut env, request.for_dark_theme, promise);
+            }
+            td.background_manager = manager;
+        }
+        Function::removeInstalledBackground(request) => {
+            // Requests.cpp:8938-8942
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.remove_background(
+                    &mut env,
+                    crate::background_manager::BackgroundId::new(request.background_id),
+                    promise,
+                );
+            }
+            td.background_manager = manager;
+        }
+        Function::resetInstalledBackgrounds(_) => {
+            // Requests.cpp:8944-8946
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.reset_backgrounds(&mut env, promise);
+            }
+            td.background_manager = manager;
+        }
+        Function::setChatBackground(request) => {
+            // Requests.cpp:5826-5831
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.set_dialog_background(
+                    &mut env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.background.as_ref(),
+                    request.r#type.as_ref(),
+                    request.dark_theme_dimming,
+                    !request.only_for_self,
+                    promise,
+                );
+            }
+            td.background_manager = manager;
+        }
+        Function::deleteChatBackground(request) => {
+            // Requests.cpp:5834-5837
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut manager = std::mem::take(&mut td.background_manager);
+            {
+                let mut env = BackgroundEnv { td: &mut *td };
+                manager.delete_dialog_background(
+                    &mut env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.restore_previous,
+                    promise,
+                );
+            }
+            td.background_manager = manager;
         }
 
         // Everything else waits for its manager step.
@@ -15843,18 +16042,17 @@ mod request_census_tests {
         // reorderBotActiveUsernames, setBotProfilePhoto,
         // toggleBotCanManageEmojiStatus, toggleBotUsernameIsActive (871 + 5 = 876
         // dispatched / 125 interim).
-        // The M.react ReactionManager-remainder slice deepened three of
-        // those ReactionManager arms (setChatAvailableReactions,
-        // reportMessageReactions, getMessageAddedReactions) from the
-        // parked placeholders to the real C++ ladders — the counts do not
-        // move (the arms were already dispatched); the other ten reaction
-        // arms belong to the M.mmreq MessagesManager request plane.
+        // The BackgroundManager slice flipped 9 arms: searchBackground,
+        // getInstalledBackgrounds, getBackgroundUrl, setDefaultBackground,
+        // deleteDefaultBackground, removeInstalledBackground,
+        // resetInstalledBackgrounds, setChatBackground, deleteChatBackground
+        // (876 + 9 = 885 dispatched / 116 interim).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            877,
+            885,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 124, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 116, "interim count");
     }
 }

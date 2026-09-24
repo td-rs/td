@@ -2267,6 +2267,13 @@ pub struct Td {
     /// `Td::star_manager_` (Td.cpp:1287, the `Td::Td` manager block; the
     /// M.star slice).
     pub(crate) star_manager: crate::star_manager::StarManager,
+    /// `Td::background_manager_` (`Td.cpp:1169-1171`, the init managers
+    /// block; the Backgrounds slice) — the `start_up` half runs in
+    /// [`Td::init_background_manager`].
+    pub(crate) background_manager: crate::background_manager::BackgroundManager,
+    /// The background manager's `send_update` outbox — the same collapsed
+    /// hop; drained by [`Td::flush_user_updates`].
+    pub(crate) background_updates: Vec<td_api::Update>,
     /// `Td::theme_manager_` (`Td.cpp:1304`, the init managers block; the
     /// M.41 Wave-3 slice).
     pub(crate) theme_manager: crate::theme_manager::ThemeManager,
@@ -2715,6 +2722,8 @@ impl Td {
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
             star_manager: crate::star_manager::StarManager::new(),
+            background_manager: crate::background_manager::BackgroundManager::new(),
+            background_updates: Vec::new(),
             theme_manager: crate::theme_manager::ThemeManager::new(),
             theme_updates: Vec::new(),
             star_updates: Vec::new(),
@@ -3676,19 +3685,12 @@ impl Td {
         // connection state).
         self.complete_pending_preauthentication_requests(&[FunctionKind::Any]);
 
-        // BackgroundManager / FileManager init constants.
-        self.send_update(Object::updateDefaultBackground(
-            td_api::updateDefaultBackground {
-                for_dark_theme: false,
-                background: None,
-            },
-        ));
-        self.send_update(Object::updateDefaultBackground(
-            td_api::updateDefaultBackground {
-                for_dark_theme: true,
-                background: None,
-            },
-        ));
+        // `BackgroundManager::start_up` (BackgroundManager.cpp:396; the
+        // manager constructed at Td.cpp:1169-1171) — loads the persisted
+        // selected/local backgrounds and sends the two
+        // updateDefaultBackground updates for users (the pre-landing
+        // hardcoded constants retired).
+        self.init_background_manager();
         self.send_update(Object::updateFileDownloads(td_api::updateFileDownloads {
             total_size: 0,
             total_count: 0,
@@ -5412,6 +5414,23 @@ impl Td {
         }
     }
 
+    /// `BackgroundManager::start_up` (BackgroundManager.cpp:396-474; the
+    /// manager constructed at Td.cpp:1169-1171) — idempotent; the manager
+    /// no-ops for bots and loads the persisted selected/local backgrounds
+    /// otherwise.
+    fn init_background_manager(&mut self) {
+        let mut manager = std::mem::take(&mut self.background_manager);
+        {
+            let mut env = BackgroundEnv { td: self };
+            manager.init(&mut env);
+        }
+        self.background_manager = manager;
+        let background_updates = std::mem::take(&mut self.background_updates);
+        for update in background_updates {
+            self.send_update(update.into());
+        }
+    }
+
     /// `ThemeManager::init` (ThemeManager.cpp:439-452; the
     /// AuthManager.cpp:1552 call) — idempotent; the manager no-ops while
     /// unauthorized.
@@ -5425,6 +5444,15 @@ impl Td {
             chat_manager: &mut self.chat_manager,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             updates: &mut self.theme_updates,
+            file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            documents_manager: &mut self.documents_manager,
+            audios: &mut self.audios_manager,
+            videos: &mut self.videos_manager,
+            voice_notes: &mut self.voice_notes_manager,
+            video_notes: &mut self.video_notes_manager,
+            background_manager: &mut self.background_manager,
+            background_updates: &mut self.background_updates,
         };
         self.theme_manager.init(&mut env);
         let attach_menu_updates = std::mem::take(&mut self.attach_menu_updates);
@@ -10895,6 +10923,225 @@ impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
     }
 }
 
+/// The [`crate::background_manager::BackgroundManagerEnv`] over the whole
+/// `Td` — the request arms take the manager out of `Td` and hand the
+/// remainder to the env (the `BotEnv` convention), so every dialog/file/
+/// documents method is the real one.
+pub(crate) struct BackgroundEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::background_manager::BackgroundManagerEnv for BackgroundEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.td.global.close_flag() {
+            crate::config_result::request_aborted_error()
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.td.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.td.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.td.global.binlog_pmc().erase(key);
+    }
+
+    fn use_sqlite_pmc(&self) -> bool {
+        self.td.global.use_sqlite_pmc()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        // The C++ sqlite pmc `get` is async; the collapsed line inlines
+        // the callback (the common kv plays the pmc role on this line).
+        self.td.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.td.global.td_db().common_kv().set(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(update.into());
+    }
+
+    fn on_get_document(
+        &mut self,
+        document: telegram_api::Document,
+        document_subtype: crate::documents_manager::Subtype,
+    ) -> Option<FileId> {
+        let telegram_api::Document::document(document) = document else {
+            return None;
+        };
+        let (mut env, documents) = self.td.documents_env();
+        let parsed = documents.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            DialogId::new(0),
+            false,
+            false,
+            crate::document::DocumentType::General,
+            document_subtype,
+        );
+        parsed.file_id.is_valid().then_some(parsed.file_id)
+    }
+
+    fn get_document_object(
+        &mut self,
+        file_id: FileId,
+        thumbnail_format: crate::photo::PhotoFormat,
+    ) -> Option<td_api::Document> {
+        let td = &*self.td;
+        td.documents_manager
+            .get_document_object(td, file_id, thumbnail_format)
+    }
+
+    fn store_document_row(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        let (mut env, documents) = self.td.documents_env();
+        documents.store_document(file_id, &mut env, out);
+    }
+
+    fn parse_document_row(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<FileId, &'static str> {
+        let (mut env, documents) = self.td.documents_env();
+        // the documents parse answers the default (invalid) id on failure
+        Ok(documents.parse_document(&mut env, parser))
+    }
+
+    fn get_input_file_id(
+        &mut self,
+        type_: crate::files::FileType,
+        file: Option<&td_api::InputFile>,
+    ) -> tdutils::status::Result<FileId> {
+        match self.td.file_manager.lock().get_input_file_id(
+            type_,
+            file,
+            DialogId::new(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(file_id) => tdutils::status::Result::Ok(file_id),
+            Err(status) => tdutils::status::Result::from_status(status),
+        }
+    }
+
+    fn file_view(&mut self, file_id: FileId) -> Option<crate::background_manager::FileViewInfo> {
+        let file_manager = self.td.file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        Some(crate::background_manager::FileViewInfo {
+            is_encrypted: file_view.is_encrypted(),
+            has_full_local_location: file_view.has_full_local_location(),
+            has_generate_location: file_view.has_generate_location(),
+            main_file_id: file_view.get_main_file_id(),
+        })
+    }
+
+    fn file_merge(&mut self, x: FileId, y: FileId) -> tdutils::status::Result<()> {
+        match self.td.file_manager.lock().merge(x, y) {
+            Ok(()) => tdutils::status::Result::Ok(()),
+            Err(status) => tdutils::status::Result::from_status(status),
+        }
+    }
+
+    fn file_cancel_upload(&mut self, file_upload_id: crate::files::FileUploadId) {
+        let mut file_manager = self.td.file_manager.lock();
+        let mut file_load_manager = self.td.file_load_manager.lock();
+        file_manager.cancel_upload(file_upload_id, &mut file_load_manager);
+    }
+
+    fn file_add_source(
+        &mut self,
+        file_id: FileId,
+        source_id: crate::files::FileSourceId,
+        source: &str,
+    ) {
+        let _ = source;
+        self.td
+            .file_reference_manager
+            .add_file_source(file_id, source_id);
+    }
+
+    fn document_file_ids(&mut self, file_id: FileId) -> Vec<FileId> {
+        // `Document(Document::Type::General, file_id).get_file_ids(td_)` —
+        // the main id plus the thumbnail
+        let mut result = vec![file_id];
+        let thumbnail_file_id = self
+            .td
+            .documents_manager
+            .get_document_thumbnail_file_id(file_id);
+        if thumbnail_file_id.is_valid() {
+            result.push(thumbnail_file_id);
+        }
+        result
+    }
+
+    fn create_background_file_source(
+        &mut self,
+        background_id: crate::background_manager::BackgroundId,
+        access_hash: i64,
+    ) -> crate::files::FileSourceId {
+        self.td
+            .file_reference_manager
+            .intern(crate::files::FileSource::Background {
+                background_id,
+                access_hash,
+            })
+    }
+
+    fn get_internal_upload_id(&mut self) -> i64 {
+        self.td.file_manager.lock().get_internal_upload_id()
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        crate::dialog_manager::check_dialog_access(
+            &mut *self.td,
+            dialog_id,
+            allow_secret_chats,
+            access_rights,
+            source,
+        )
+    }
+
+    fn get_channel_permissions(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<crate::chat_manager::DialogParticipantStatus> {
+        let td = &*self.td;
+        Some(
+            td.chat_manager
+                .get_channel_permissions_id(&td.global, channel_id),
+        )
+    }
+
+    fn get_secret_chat_user_id(
+        &mut self,
+        secret_chat_id: crate::user_manager::SecretChatId,
+    ) -> crate::user_manager::UserId {
+        self.td.user_manager.get_secret_chat_user_id(secret_chat_id)
+    }
+}
+
 /// The [`crate::theme_manager::ThemeManagerEnv`] over the `Td` fields —
 /// built per call with the field-split borrows (the `NotificationEnv`
 /// convention), never held across calls; the file manager rides its `Arc`
@@ -10908,6 +11155,369 @@ pub(crate) struct ThemeEnv<'a> {
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    // the BackgroundManager seams the theme plane now routes through
+    // (the post-landing halves of the M.16 seam list)
+    pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) documents_manager: &'a mut crate::documents_manager::DocumentsManager,
+    pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
+    pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
+    pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
+    pub(crate) video_notes: &'a mut crate::video_notes_manager::VideoNotesManager,
+    pub(crate) background_manager: &'a mut crate::background_manager::BackgroundManager,
+    pub(crate) background_updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::documents_manager::DocumentsManagerEnv for ThemeEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn file_load_manager(
+        &self,
+    ) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>> {
+        std::sync::Arc::clone(&self.file_load_manager)
+    }
+
+    fn create_animation(
+        &mut self,
+        _file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _animated_thumbnail: crate::photo::AnimationSize,
+        _has_stickers: bool,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: crate::photo::Dimensions,
+        _replace: bool,
+    ) {
+        // the C++ routes this to `animations_manager_->create_animation`
+        // (the TdDocumentsEnv collapse; the theme path never creates
+        // animation records)
+        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+    }
+
+    fn create_sticker(
+        &mut self,
+        _file_id: FileId,
+        _premium_animation_file_id: FileId,
+        _minithumbnail: String,
+        _thumbnail: crate::photo::PhotoSize,
+        _dimensions: crate::photo::Dimensions,
+        _sticker: Option<telegram_api::documentAttributeSticker>,
+        _custom_emoji: Option<telegram_api::documentAttributeCustomEmoji>,
+        _sticker_format: crate::documents_manager::StickerFormat,
+    ) {
+        // the C++ routes this to `stickers_manager_->create_sticker`
+        // (the TdDocumentsEnv collapse; the theme path never creates
+        // sticker records)
+        tdutils::log_info!("create_sticker — [blocked: M.15 record dispatch]");
+    }
+
+    fn create_audio(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        title: String,
+        performer: String,
+        date: i32,
+        replace: bool,
+    ) {
+        self.audios.create_audio(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            file_name,
+            mime_type,
+            duration,
+            title,
+            performer,
+            date,
+            replace,
+        );
+    }
+
+    fn create_video(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        precise_duration: f64,
+        dimensions: crate::photo::Dimensions,
+        supports_streaming: bool,
+        is_animation: bool,
+        preload_prefix_size: i32,
+        start_ts: f64,
+        codec: String,
+        replace: bool,
+    ) {
+        self.videos.create_video(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            sticker_file_ids,
+            file_name,
+            mime_type,
+            duration,
+            precise_duration,
+            dimensions,
+            supports_streaming,
+            is_animation,
+            preload_prefix_size,
+            start_ts,
+            codec,
+            replace,
+        );
+    }
+
+    fn create_video_note(
+        &mut self,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.video_notes.create_video_note(
+            file_id,
+            minithumbnail,
+            thumbnail,
+            duration,
+            dimensions,
+            waveform,
+            replace,
+        );
+    }
+
+    fn create_voice_note(
+        &mut self,
+        file_id: FileId,
+        mime_type: String,
+        duration: i32,
+        waveform: String,
+        replace: bool,
+    ) {
+        self.voice_notes
+            .create_voice_note(file_id, mime_type, duration, waveform, replace);
+    }
+}
+
+impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.global.close_flag() {
+            crate::config_result::request_aborted_error()
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn use_sqlite_pmc(&self) -> bool {
+        self.global.use_sqlite_pmc()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        // The C++ sqlite pmc `get` is async; the collapsed line inlines
+        // the callback (the common kv plays the pmc role on this line).
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.background_updates.push(update);
+    }
+
+    fn on_get_document(
+        &mut self,
+        document: telegram_api::Document,
+        document_subtype: crate::documents_manager::Subtype,
+    ) -> Option<FileId> {
+        let telegram_api::Document::document(document) = document else {
+            return None;
+        };
+        let mut env = TdDocumentsEnv {
+            auth_is_bot: self.auth_is_bot,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            audios: self.audios,
+            videos: self.videos,
+            voice_notes: self.voice_notes,
+            video_notes: self.video_notes,
+        };
+        let parsed = self.documents_manager.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            DialogId::new(0),
+            false,
+            false,
+            crate::document::DocumentType::General,
+            document_subtype,
+        );
+        parsed.file_id.is_valid().then_some(parsed.file_id)
+    }
+
+    fn get_document_object(
+        &mut self,
+        file_id: FileId,
+        thumbnail_format: crate::photo::PhotoFormat,
+    ) -> Option<td_api::Document> {
+        let documents = &*self.documents_manager;
+        documents.get_document_object(&*self, file_id, thumbnail_format)
+    }
+
+    fn store_document_row(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        let documents = &*self.documents_manager;
+        let mut env = TdDocumentsEnv {
+            auth_is_bot: self.auth_is_bot,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            audios: self.audios,
+            videos: self.videos,
+            voice_notes: self.voice_notes,
+            video_notes: self.video_notes,
+        };
+        documents.store_document(file_id, &mut env, out);
+    }
+
+    fn parse_document_row(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<FileId, &'static str> {
+        let documents = &mut *self.documents_manager;
+        let mut env = TdDocumentsEnv {
+            auth_is_bot: self.auth_is_bot,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            audios: self.audios,
+            videos: self.videos,
+            voice_notes: self.voice_notes,
+            video_notes: self.video_notes,
+        };
+        // the documents parse answers the default (invalid) id on failure
+        Ok(documents.parse_document(&mut env, parser))
+    }
+
+    fn get_input_file_id(
+        &mut self,
+        type_: crate::files::FileType,
+        file: Option<&td_api::InputFile>,
+    ) -> tdutils::status::Result<FileId> {
+        match self.file_manager.lock().get_input_file_id(
+            type_,
+            file,
+            DialogId::new(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(file_id) => tdutils::status::Result::Ok(file_id),
+            Err(status) => tdutils::status::Result::from_status(status),
+        }
+    }
+
+    fn file_view(&mut self, file_id: FileId) -> Option<crate::background_manager::FileViewInfo> {
+        let file_manager = self.file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        Some(crate::background_manager::FileViewInfo {
+            is_encrypted: file_view.is_encrypted(),
+            has_full_local_location: file_view.has_full_local_location(),
+            has_generate_location: file_view.has_generate_location(),
+            main_file_id: file_view.get_main_file_id(),
+        })
+    }
+
+    fn file_merge(&mut self, x: FileId, y: FileId) -> tdutils::status::Result<()> {
+        match self.file_manager.lock().merge(x, y) {
+            Ok(()) => tdutils::status::Result::Ok(()),
+            Err(status) => tdutils::status::Result::from_status(status),
+        }
+    }
+
+    fn file_cancel_upload(&mut self, file_upload_id: crate::files::FileUploadId) {
+        let mut file_manager = self.file_manager.lock();
+        let mut file_load_manager = self.file_load_manager.lock();
+        file_manager.cancel_upload(file_upload_id, &mut file_load_manager);
+    }
+
+    fn file_add_source(
+        &mut self,
+        file_id: FileId,
+        source_id: crate::files::FileSourceId,
+        source: &str,
+    ) {
+        let _ = source;
+        self.file_reference_manager
+            .add_file_source(file_id, source_id);
+    }
+
+    fn document_file_ids(&mut self, file_id: FileId) -> Vec<FileId> {
+        // `Document(Document::Type::General, file_id).get_file_ids(td_)` —
+        // the main id plus the thumbnail
+        let mut result = vec![file_id];
+        let thumbnail_file_id = self
+            .documents_manager
+            .get_document_thumbnail_file_id(file_id);
+        if thumbnail_file_id.is_valid() {
+            result.push(thumbnail_file_id);
+        }
+        result
+    }
+
+    fn create_background_file_source(
+        &mut self,
+        background_id: crate::background_manager::BackgroundId,
+        access_hash: i64,
+    ) -> crate::files::FileSourceId {
+        self.file_reference_manager
+            .intern(crate::files::FileSource::Background {
+                background_id,
+                access_hash,
+            })
+    }
+
+    fn get_internal_upload_id(&mut self) -> i64 {
+        self.file_manager.lock().get_internal_upload_id()
+    }
 }
 
 impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
@@ -10971,99 +11581,39 @@ impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
         crate::theme_manager::BackgroundId,
         crate::theme_manager::BackgroundType,
     )> {
-        use crate::chat_manager::DcId;
-        use crate::files::{FileType, FullRemoteFileLocation};
-
-        let wallpaper = wallpaper?;
-        match wallpaper {
-            // the wallPaperNoFile half (BackgroundManager.cpp:1287-1310):
-            // the settings are required, the id must be valid and remote;
-            // the local-id counter is [blocked: M.16 Backgrounds]
-            telegram_api::WallPaper::wallPaperNoFile(wallpaper) => {
-                let settings = wallpaper.settings?;
-                let background_id = crate::theme_manager::BackgroundId::new(wallpaper.id);
-                if !background_id.is_valid() || background_id.is_local() {
-                    tdutils::log_error!("Receive an invalid no-file wallpaper id");
-                    return None;
-                }
-                let background_type = crate::theme_manager::BackgroundType::from_settings(
-                    true,
-                    is_no_file_pattern,
-                    Some(&settings),
-                );
-                Some((background_id, background_type))
-            }
-            // the wallPaper half (BackgroundManager.cpp:1312-1360): the id
-            // checks are inline, the document registers into the M.12 file
-            // plane with the C++ FromServer source (the
-            // DocumentsManager::on_get_document General/wallpaper collapse)
-            telegram_api::WallPaper::wallPaper(wallpaper) => {
-                let background_id = crate::theme_manager::BackgroundId::new(wallpaper.id);
-                if !background_id.is_valid() || background_id.is_local() {
-                    tdutils::log_error!("Receive an invalid wallpaper id");
-                    return None;
-                }
-                let is_pattern = wallpaper.pattern;
-                let Some(document) = wallpaper.document.as_ref() else {
-                    tdutils::log_error!("Receive a wallpaper without a document");
-                    return None;
-                };
-                let telegram_api::Document::document(document) = document else {
-                    tdutils::log_error!("Receive a wallpaper with documentEmpty");
-                    return None;
-                };
-                let dc_id = if DcId::is_valid_raw(document.dc_id) {
-                    DcId::internal(document.dc_id)
-                } else {
-                    DcId::invalid()
-                };
-                let location = FullRemoteFileLocation::from_document(
-                    FileType::Wallpaper,
-                    document.id,
-                    document.access_hash,
-                    dc_id,
-                    String::from_utf8_lossy(&document.file_reference).into_owned(),
-                );
-                let remote_name = document
-                    .attributes
-                    .iter()
-                    .find_map(|attribute| match attribute {
-                        telegram_api::DocumentAttribute::documentAttributeFilename(name) => {
-                            Some(name.file_name.clone())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| document.mime_type.clone());
-                let mut file_manager = self.file_manager.lock();
-                let file_id = file_manager.register_remote(
-                    location,
-                    crate::files::FileLocationSource::FromServer,
-                    crate::message_id::DialogId::new(0),
-                    document.size,
-                    document.size,
-                    remote_name,
-                );
-                if !file_id.is_valid() {
-                    tdutils::log_error!("Receive a wallpaper with an invalid document");
-                    return None;
-                }
-                let background_type = crate::theme_manager::BackgroundType::from_settings(
-                    false,
-                    is_pattern,
-                    wallpaper.settings.as_ref(),
-                );
-                Some((background_id, background_type))
-            }
-        }
+        // `BackgroundInfo::BackgroundInfo` (BackgroundInfo.cpp:14-20) —
+        // on_get_background(BackgroundId(), "", wallpaper, false, true,
+        // is_no_file_pattern); the real manager replaced the pre-landing
+        // inline register_remote collapse
+        let mut manager = std::mem::take(self.background_manager);
+        let result = manager.on_get_background(
+            self,
+            crate::background_manager::BackgroundId::new(0),
+            "",
+            wallpaper,
+            false,
+            true,
+            is_no_file_pattern,
+        );
+        let _ = std::mem::replace(self.background_manager, manager);
+        result
     }
 
     fn get_theme_background_object(
         &mut self,
         info: &crate::theme_manager::BackgroundInfo,
     ) -> Option<td_api::Background> {
-        // the BackgroundManager object cache ([blocked: M.16 Backgrounds])
-        let _ = info;
-        None
+        // `BackgroundInfo::get_background_object` (BackgroundInfo.cpp:22-24)
+        // — get_background_object(background_id, false, &background_type)
+        let mut manager = std::mem::take(self.background_manager);
+        let result = manager.get_background_object(
+            self,
+            info.background_id,
+            false,
+            Some(&info.background_type),
+        );
+        let _ = std::mem::replace(self.background_manager, manager);
+        result
     }
 
     fn store_background_row(
@@ -11071,21 +11621,22 @@ impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
         background_id: crate::theme_manager::BackgroundId,
         out: &mut Vec<u8>,
     ) -> bool {
-        // the full Background row store ([blocked: M.16 Backgrounds]) —
-        // the Td-side cache cannot answer yet, so a wallpaper-bearing
-        // theme stores background-less
-        let _ = (background_id, out);
-        false
+        // `BackgroundManager::store_background` (BackgroundManager.cpp:480-490)
+        let mut manager = std::mem::take(self.background_manager);
+        let result = manager.store_background(self, background_id, out);
+        let _ = std::mem::replace(self.background_manager, manager);
+        result
     }
 
     fn parse_background_row(
         &mut self,
         parser: &mut crate::store_parse::Parser,
     ) -> Result<crate::theme_manager::BackgroundId, &'static str> {
-        // the symmetric half of the store seam; with the store returning
-        // false the has_background flag keeps the row out of the stream
-        let _ = parser;
-        Result::Ok(crate::theme_manager::BackgroundId::new(0))
+        // `BackgroundManager::parse_background` (BackgroundManager.cpp:492-507)
+        let mut manager = std::mem::take(self.background_manager);
+        let result = manager.parse_background(self, parser);
+        let _ = std::mem::replace(self.background_manager, manager);
+        result
     }
 
     fn star_gift_object_for_theme(

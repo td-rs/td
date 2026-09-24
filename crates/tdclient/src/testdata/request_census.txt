@@ -158,7 +158,7 @@ deleteBusinessConnectedBot	dispatched
 deleteBusinessMessages	dispatched
 deleteBusinessStory	dispatched
 deleteChat	dispatched
-deleteChatBackground	interim
+deleteChatBackground	dispatched
 deleteChatFolder	dispatched
 deleteChatFolderInviteLink	dispatched
 deleteChatHistory	dispatched
@@ -167,7 +167,7 @@ deleteChatMessagesBySender	dispatched
 deleteChatReplyMarkup	dispatched
 deleteChatWelcomeMessage	dispatched
 deleteCommands	dispatched
-deleteDefaultBackground	interim
+deleteDefaultBackground	dispatched
 deleteDirectMessagesChatTopicHistory	dispatched
 deleteDirectMessagesChatTopicMessagesByDate	dispatched
 deleteEphemeralMessage	dispatched
@@ -267,7 +267,7 @@ getAutoDownloadSettingsPresets	interim
 getAutosaveSettings	dispatched
 getAvailableChatBoostSlots	dispatched
 getAvailableGifts	dispatched
-getBackgroundUrl	interim
+getBackgroundUrl	dispatched
 getBankCardInfo	dispatched
 getBasicGroup	dispatched
 getBasicGroupFullInfo	dispatched
@@ -403,7 +403,7 @@ getImportedContactCount	dispatched
 getInactiveSupergroupChats	dispatched
 getInlineGameHighScores	dispatched
 getInlineQueryResults	dispatched
-getInstalledBackgrounds	interim
+getInstalledBackgrounds	dispatched
 getInstalledStickerSets	interim
 getInternalLink	interim
 getInternalLinkType	interim
@@ -655,7 +655,7 @@ removeContacts	dispatched
 removeFavoriteSticker	interim
 removeFileFromDownloads	dispatched
 removeGiftCollectionGifts	dispatched
-removeInstalledBackground	interim
+removeInstalledBackground	dispatched
 removeLoginPasskey	dispatched
 removeMessageReaction	dispatched
 removeMessageSenderBotVerification	dispatched
@@ -713,7 +713,7 @@ resendPhoneNumberCode	interim
 resendRecoveryEmailAddressCode	dispatched
 resetAllNotificationSettings	dispatched
 resetAuthenticationEmailAddress	dispatched
-resetInstalledBackgrounds	interim
+resetInstalledBackgrounds	dispatched
 resetNetworkStatistics	interim
 resetPassword	dispatched
 reuseStarSubscription	dispatched
@@ -723,7 +723,7 @@ saveApplicationLogEvent	interim
 savePreparedInlineMessage	dispatched
 savePreparedKeyboardButton	dispatched
 searchAffiliatePrograms	dispatched
-searchBackground	interim
+searchBackground	dispatched
 searchCallMessages	dispatched
 searchChatAffiliateProgram	dispatched
 searchChatMembers	dispatched
@@ -821,7 +821,7 @@ setChatAccentColor	dispatched
 setChatActiveStoriesList	dispatched
 setChatAffiliateProgram	dispatched
 setChatAvailableReactions	dispatched
-setChatBackground	interim
+setChatBackground	dispatched
 setChatClientData	dispatched
 setChatDescription	dispatched
 setChatDirectMessagesGroup	dispatched
@@ -849,7 +849,7 @@ setCustomEmojiStickerSetThumbnail	dispatched
 setCustomLanguagePack	dispatched
 setCustomLanguagePackString	dispatched
 setDatabaseEncryptionKey	interim
-setDefaultBackground	interim
+setDefaultBackground	dispatched
 setDefaultChannelAdministratorRights	dispatched
 setDefaultGroupAdministratorRights	dispatched
 setDefaultMessageAutoDeleteTime	dispatched

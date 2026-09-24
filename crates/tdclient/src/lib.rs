@@ -18,6 +18,7 @@ pub mod auth_dispatch;
 pub mod auth_manager;
 
 pub mod autosave_manager;
+pub mod background_manager;
 pub mod birthdate;
 pub mod boost_manager;
 pub mod bot_access_settings;

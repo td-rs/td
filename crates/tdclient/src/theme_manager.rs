@@ -61,31 +61,10 @@ use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
-/// `td::BackgroundId` (BackgroundId.h) — the id wrapper slice the theme
-/// plane needs; the full header (store/parse, log events) is the M.16
-/// Backgrounds slice.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackgroundId(i64);
-
-impl BackgroundId {
-    pub fn new(id: i64) -> BackgroundId {
-        BackgroundId(id)
-    }
-
-    /// `BackgroundId::is_valid` — `id != 0`.
-    pub fn is_valid(self) -> bool {
-        self.0 != 0
-    }
-
-    /// `BackgroundId::is_local` — `0 < id <= 0x7FFFFFFF`.
-    pub fn is_local(self) -> bool {
-        0 < self.0 && self.0 <= 0x7FFF_FFFF
-    }
-
-    pub fn get(self) -> i64 {
-        self.0
-    }
-}
+/// `td::BackgroundId` (BackgroundId.h) — the canonical id wrapper lives in
+/// [`crate::background_manager`] (the Backgrounds slice); the theme plane
+/// re-exports it.
+pub use crate::background_manager::BackgroundId;
 
 /// `td::BaseTheme` (BaseTheme.h) — append-only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,13 +130,13 @@ fn is_valid_intensity(intensity: i32, allow_negative: bool) -> bool {
 /// `td::BackgroundFill` (BackgroundType.h:17-77) — the value plane the
 /// theme settings persist; the `get_link`/`is_dark`/td_api-input halves
 /// are the Backgrounds-track slice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BackgroundFill {
-    top_color: i32,
-    bottom_color: i32,
-    rotation_angle: i32,
-    third_color: i32,
-    fourth_color: i32,
+    pub(crate) top_color: i32,
+    pub(crate) bottom_color: i32,
+    pub(crate) rotation_angle: i32,
+    pub(crate) third_color: i32,
+    pub(crate) fourth_color: i32,
 }
 
 impl Default for BackgroundFill {
@@ -176,7 +155,7 @@ impl Default for BackgroundFill {
 }
 
 /// The `BackgroundFill::Type` discriminator (`get_type`, BackgroundType.h:50-58).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BackgroundFillType {
     #[default]
     Solid,
@@ -316,18 +295,18 @@ impl BackgroundFill {
 /// `td::BackgroundType` (BackgroundType.h:79-162) — the value plane the
 /// theme settings persist; the link/input/local-name halves are the
 /// Backgrounds-track slice.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BackgroundType {
-    r#type: BackgroundTypeType,
-    is_blurred: bool,
-    is_moving: bool,
-    intensity: i32,
-    fill: BackgroundFill,
-    theme_name: String,
+    pub(crate) r#type: BackgroundTypeType,
+    pub(crate) is_blurred: bool,
+    pub(crate) is_moving: bool,
+    pub(crate) intensity: i32,
+    pub(crate) fill: BackgroundFill,
+    pub(crate) theme_name: String,
 }
 
 /// The `BackgroundType::Type` discriminator.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BackgroundTypeType {
     Wallpaper = 0,
     Pattern = 1,
@@ -525,8 +504,8 @@ impl BackgroundType {
 /// is the Backgrounds-track slice.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundInfo {
-    background_id: BackgroundId,
-    background_type: BackgroundType,
+    pub(crate) background_id: BackgroundId,
+    pub(crate) background_type: BackgroundType,
 }
 
 impl BackgroundInfo {
