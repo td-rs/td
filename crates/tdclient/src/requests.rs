@@ -16046,13 +16046,14 @@ mod request_census_tests {
         // getInstalledBackgrounds, getBackgroundUrl, setDefaultBackground,
         // deleteDefaultBackground, removeInstalledBackground,
         // resetInstalledBackgrounds, setChatBackground, deleteChatBackground
-        // (876 + 9 = 885 dispatched / 116 interim).
+        // (877 + 9 = 886 dispatched / 115 interim; the net-step landing
+        // moved the baseline to 877/124 before this slice).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            885,
+            886,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 116, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 115, "interim count");
     }
 }
