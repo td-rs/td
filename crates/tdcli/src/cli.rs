@@ -54,6 +54,31 @@ struct FileGeneration {
     test_local_size_decrease: bool,
 }
 
+/// `struct SendMessageInfo` (cli.cpp:209) — per-message send timing probe.
+/// Tracks the wall-clock instant when `sendMessage` was dispatched
+/// (`start_time`), when the server acknowledged it
+/// (`updateMessageSendAcknowledged`; `quick_ack_time`), and when the server
+/// confirmed delivery (`updateMessageSendSucceeded`; `ack_time`).
+#[derive(Clone, Default)]
+struct SendMessageInfo {
+    start_time: f64,
+    quick_ack_time: f64,
+    ack_time: f64,
+}
+
+impl std::fmt::Display for SendMessageInfo {
+    /// `operator<<` (cli.cpp:218) — only the non-zero deltas are printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.quick_ack_time != 0.0 {
+            write!(f, "quick_ack:{} ", self.quick_ack_time - self.start_time)?;
+        }
+        if self.ack_time != 0.0 {
+            write!(f, "ack:{}", self.ack_time - self.start_time)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct CliClient {
     /// `std::queue<string> cmd_queue_`.
     cmd_queue: Mutex<VecDeque<String>>,
@@ -84,6 +109,14 @@ pub struct CliClient {
     closed_td: AtomicU64,
     /// `static uint64 query_num = 1` in `send_request` (process-wide).
     query_num: AtomicU64,
+    /// `FlatHashMap<uint64, SendMessageInfo> query_id_to_send_message_info_`
+    /// (cli.cpp:245) — keyed by the `send_request` id returned for a plain
+    /// `sendMessage`; consulted by the first timing lambda.
+    query_id_to_send_message_info: Mutex<HashMap<u64, SendMessageInfo>>,
+    /// `FlatHashMap<uint64, SendMessageInfo> message_id_to_send_message_info_`
+    /// (cli.cpp:246) — keyed by the server-assigned message id; consulted by
+    /// the quick-ack and full-ack lambdas.
+    message_id_to_send_message_info: Mutex<HashMap<i64, SendMessageInfo>>,
 
     // ---- the main() flags (set through argv in M.14.6) ------------------
     use_test_dc: AtomicBool,
@@ -255,6 +288,8 @@ pub fn instance() -> &'static CliClient {
         generation: AtomicU64::new(0),
         closed_td: AtomicU64::new(0),
         query_num: AtomicU64::new(0),
+        query_id_to_send_message_info: Mutex::new(HashMap::new()),
+        message_id_to_send_message_info: Mutex::new(HashMap::new()),
         use_test_dc: AtomicBool::new(false),
         get_chat_list: AtomicBool::new(false),
         disable_network: AtomicBool::new(false),
@@ -1846,8 +1881,43 @@ impl CliClient {
             return;
         }
 
-        // The three send-timing lambdas (`query_id_to_send_message_info_`)
-        // feed the M.14.6 perf-stat dev commands and land with them.
+        // cli.cpp:1902-1916 — the three send-timing lambdas.
+        // Lambda 1: on sendMessage reply carrying a message object, move the
+        // SendMessageInfo from the query map to the message map.
+        if id != 0 {
+            if let Some(info) = self
+                .query_id_to_send_message_info
+                .lock()
+                .unwrap()
+                .remove(&id)
+            {
+                if let Some(Object::message(ref msg)) = result {
+                    self.message_id_to_send_message_info
+                        .lock()
+                        .unwrap()
+                        .insert(msg.id, info);
+                }
+            }
+        }
+        // Lambda 2: on updateMessageSendAcknowledged, stamp quick_ack_time.
+        if let Some(Object::updateMessageSendAcknowledged(ref upd)) = result {
+            let mut map = self.message_id_to_send_message_info.lock().unwrap();
+            if let Some(info) = map.get_mut(&upd.message_id) {
+                info.quick_ack_time = time::now();
+            }
+        }
+        // Lambda 3: on updateMessageSendSucceeded, stamp ack_time and log.
+        if let Some(Object::updateMessageSendSucceeded(ref upd)) = result {
+            let info = self
+                .message_id_to_send_message_info
+                .lock()
+                .unwrap()
+                .remove(&upd.old_message_id);
+            if let Some(mut info) = info {
+                info.ack_time = time::now();
+                tdutils::log_info!("{}", info);
+            }
+        }
 
         let Some(result) = result else {
             // A null result switches on id 0 — the default arm.
@@ -1879,8 +1949,50 @@ impl CliClient {
             Object::updateNewMessage(_) => {
                 // The C++ `/start` responder is commented out on this tree.
             }
-            // The business-message welcome and the test-DC pre-checkout
-            // answer land with their M.14.4/M.14.6 command arms.
+            // cli.cpp:1990-2003 — on an incoming business message while
+            // use_test_dc is set, echo "Welcome!" back over the connection.
+            Object::updateNewBusinessMessage(update) => {
+                if !update
+                    .message
+                    .as_ref()
+                    .map_or(true, |m| m.message.as_ref().map_or(true, |m| m.is_outgoing))
+                    && self.use_test_dc.load(Ordering::SeqCst)
+                {
+                    let conn_id = update.connection_id.clone();
+                    let old = std::mem::replace(
+                        &mut *self.business_connection_id.lock().unwrap(),
+                        conn_id,
+                    );
+                    self.on_cmd("gbc".to_owned());
+                    if let Some(msg) = update.message.as_ref().and_then(|m| m.message.as_ref()) {
+                        self.send_message(
+                            msg.chat_id,
+                            td_api::InputMessageContent::inputMessageText(
+                                td_api::inputMessageText {
+                                    text: Some(td_api::FormattedText {
+                                        text: "Welcome!".to_owned(),
+                                        entities: vec![],
+                                    }),
+                                    link_preview_options: self.get_link_preview_options(),
+                                    clear_draft: true,
+                                },
+                            ),
+                        );
+                    }
+                    *self.business_connection_id.lock().unwrap() = old;
+                }
+            }
+            // cli.cpp:2005-2009 — auto-answer pre-checkout queries on test_dc.
+            Object::updateNewPreCheckoutQuery(update) => {
+                if self.use_test_dc.load(Ordering::SeqCst) {
+                    self.send_request(Function::answerPreCheckoutQuery(
+                        td_api::answerPreCheckoutQuery {
+                            pre_checkout_query_id: update.id,
+                            error_message: String::new(),
+                        },
+                    ));
+                }
+            }
             Object::updateConnectionState(_) => {
                 tdutils::log_warning!("{}", result_str);
             }
@@ -4253,7 +4365,7 @@ impl CliClient {
             sending_id: random::fast(1, 1000),
             only_preview: self.only_preview.load(Ordering::SeqCst),
         };
-        self.send_request(Function::sendMessage(td_api::sendMessage {
+        let id = self.send_request(Function::sendMessage(td_api::sendMessage {
             chat_id,
             topic_id: self.get_message_topic_id(),
             reply_to: self.get_input_message_reply_to(),
@@ -4261,6 +4373,15 @@ impl CliClient {
             reply_markup: None,
             input_message_content: Some(Box::new(content)),
         }));
+        // cli.cpp:3025 — record the start time keyed by the query id.
+        if id != 0 {
+            self.query_id_to_send_message_info
+                .lock()
+                .unwrap()
+                .entry(id)
+                .or_default()
+                .start_time = time::now();
+        }
     }
 
     /// `get_input_suggested_post_info` (cli.cpp:3028) — the suggested-post
@@ -17093,6 +17214,8 @@ mod tests {
             generation: AtomicU64::new(0),
             closed_td: AtomicU64::new(0),
             query_num: AtomicU64::new(0),
+            query_id_to_send_message_info: Mutex::new(HashMap::new()),
+            message_id_to_send_message_info: Mutex::new(HashMap::new()),
             use_test_dc: AtomicBool::new(false),
             get_chat_list: AtomicBool::new(false),
             disable_network: AtomicBool::new(false),
