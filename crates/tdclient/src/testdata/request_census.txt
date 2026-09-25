@@ -23,7 +23,7 @@ addOffer	interim
 addPendingLiveStoryReaction	dispatched
 addPendingPaidMessageReaction	dispatched
 addPollOption	dispatched
-addProfileAudio	interim
+addProfileAudio	dispatched
 addProxy	dispatched
 addQuickReplyShortcutInlineQueryResultMessage	dispatched
 addQuickReplyShortcutMessage	dispatched
@@ -31,7 +31,7 @@ addQuickReplyShortcutMessageAlbum	dispatched
 addRecentSticker	dispatched
 addRecentlyFoundChat	dispatched
 addSavedAnimation	dispatched
-addSavedNotificationSound	interim
+addSavedNotificationSound	dispatched
 addStickerToSet	dispatched
 addStoryAlbumStories	dispatched
 addTextCompositionStyle	dispatched
@@ -47,7 +47,7 @@ answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
 answerWebAppQuery	dispatched
 applyPremiumGiftCode	dispatched
-approveSuggestedPost	interim
+approveSuggestedPost	dispatched
 assignStoreTransaction	dispatched
 banChatMember	dispatched
 banGroupCallParticipants	dispatched
@@ -56,7 +56,7 @@ boostChat	dispatched
 buyGiftUpgrade	dispatched
 canBotSendMessages	dispatched
 canPostStory	dispatched
-canPurchaseFromStore	interim
+canPurchaseFromStore	dispatched
 canSendGift	dispatched
 canSendMessageToUser	dispatched
 canTransferOwnership	dispatched
@@ -84,9 +84,9 @@ checkEmailAddressVerificationCode	dispatched
 checkLoginEmailAddressCode	dispatched
 checkOauthRequestMatchCode	dispatched
 checkPasswordRecoveryCode	dispatched
-checkPhoneNumberCode	interim
+checkPhoneNumberCode	dispatched
 checkPremiumGiftCode	dispatched
-checkQuickReplyShortcutName	interim
+checkQuickReplyShortcutName	sync
 checkRecoveryEmailAddressCode	dispatched
 checkStickerSetName	dispatched
 checkWebAppFileDownload	dispatched
@@ -145,7 +145,7 @@ createTextCompositionStyle	dispatched
 createVideoChat	dispatched
 declineGroupCallInvitation	dispatched
 declineOauthRequest	dispatched
-declineSuggestedPost	interim
+declineSuggestedPost	dispatched
 decryptGroupCallData	dispatched
 deleteAccount	dispatched
 deleteAllCallMessages	dispatched
@@ -182,7 +182,7 @@ deleteMessageReactionsFromSender	dispatched
 deleteMessages	dispatched
 deletePassportElement	dispatched
 deletePollOption	dispatched
-deleteProfilePhoto	interim
+deleteProfilePhoto	dispatched
 deleteQuickReplyShortcut	dispatched
 deleteQuickReplyShortcutMessages	dispatched
 deleteRevokedChatInviteLink	dispatched
@@ -263,7 +263,7 @@ getAttachedStickerSets	dispatched
 getAttachmentMenuBot	dispatched
 getAuthenticationPasskeyParameters	dispatched
 getAuthorizationState	dispatched
-getAutoDownloadSettingsPresets	interim
+getAutoDownloadSettingsPresets	dispatched
 getAutosaveSettings	dispatched
 getAvailableChatBoostSlots	dispatched
 getAvailableGifts	dispatched
@@ -377,7 +377,7 @@ getFileExtension	sync
 getFileMimeType	sync
 getForumTopic	dispatched
 getForumTopicDefaultIcons	dispatched
-getForumTopicHistory	interim
+getForumTopicHistory	dispatched
 getForumTopicLink	dispatched
 getForumTopics	dispatched
 getFullRichMessage	dispatched
@@ -397,7 +397,7 @@ getGroupCall	dispatched
 getGroupCallParticipants	dispatched
 getGroupCallStreamSegment	dispatched
 getGroupCallStreams	dispatched
-getGroupsInCommon	interim
+getGroupsInCommon	dispatched
 getGuardBotWebAppUrl	dispatched
 getImportedContactCount	dispatched
 getInactiveSupergroupChats	dispatched
@@ -454,7 +454,7 @@ getMessageThreadHistory	dispatched
 getMessageViewers	dispatched
 getMessages	dispatched
 getNetworkStatistics	dispatched
-getNewChatPrivacySettings	interim
+getNewChatPrivacySettings	dispatched
 getOauthLinkInfo	dispatched
 getOption	dispatched
 getOwnedBots	dispatched
@@ -470,8 +470,8 @@ getPaymentReceipt	dispatched
 getPersonalChatHistory	dispatched
 getPhoneNumberInfo	interim
 getPhoneNumberInfoSync	interim
-getPollOptionProperties	interim
-getPollVoteStatistics	interim
+getPollOptionProperties	dispatched
+getPollVoteStatistics	dispatched
 getPollVoters	dispatched
 getPreferredCountryLanguage	dispatched
 getPremiumFeatures	dispatched
@@ -487,7 +487,7 @@ getPreparedKeyboardButton	dispatched
 getProxies	dispatched
 getPublicPostSearchLimits	dispatched
 getPushReceiverId	sync
-getReadDatePrivacySettings	interim
+getReadDatePrivacySettings	dispatched
 getReceivedGift	dispatched
 getReceivedGifts	dispatched
 getRecentEmojiStatuses	dispatched
@@ -504,8 +504,8 @@ getSavedAnimations	dispatched
 getSavedMessagesTags	dispatched
 getSavedMessagesTopicHistory	dispatched
 getSavedMessagesTopicMessageByDate	dispatched
-getSavedNotificationSound	interim
-getSavedNotificationSounds	interim
+getSavedNotificationSound	dispatched
+getSavedNotificationSounds	dispatched
 getSavedOrderInfo	dispatched
 getScopeNotificationSettings	dispatched
 getSearchSponsoredChats	dispatched
@@ -533,7 +533,7 @@ getStory	dispatched
 getStoryAlbumStories	dispatched
 getStoryAvailableReactions	dispatched
 getStoryInteractions	dispatched
-getStoryNotificationSettingsExceptions	interim
+getStoryNotificationSettingsExceptions	dispatched
 getStoryPublicForwards	dispatched
 getStoryStatistics	dispatched
 getSuggestedFileName	interim
@@ -544,7 +544,7 @@ getSupergroup	dispatched
 getSupergroupFullInfo	dispatched
 getSupergroupMembers	dispatched
 getSupportName	interim
-getSupportUser	interim
+getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
 getTextEntities	sync
@@ -565,7 +565,7 @@ getUser	dispatched
 getUserChatBoosts	dispatched
 getUserFullInfo	dispatched
 getUserLink	dispatched
-getUserPrivacySettingRules	interim
+getUserPrivacySettingRules	dispatched
 getUserProfileAudios	dispatched
 getUserProfilePhotos	dispatched
 getUserSupportInfo	interim
@@ -603,7 +603,7 @@ loadCommunityFullInfo	dispatched
 loadDirectMessagesChatTopics	dispatched
 loadGroupCallParticipants	dispatched
 loadQuickReplyShortcutMessages	dispatched
-loadQuickReplyShortcuts	interim
+loadQuickReplyShortcuts	dispatched
 loadSavedMessagesTopics	dispatched
 logOut	dispatched
 markChecklistTasksAsDone	dispatched
@@ -631,11 +631,11 @@ processGiftPurchaseOffer	dispatched
 processPushNotification	interim
 rateSpeechRecognition	dispatched
 readAllChatMentions	dispatched
-readAllChatPollVotes	interim
+readAllChatPollVotes	dispatched
 readAllChatReactions	dispatched
 readAllDirectMessagesChatTopicReactions	dispatched
 readAllForumTopicMentions	dispatched
-readAllForumTopicPollVotes	interim
+readAllForumTopicPollVotes	dispatched
 readAllForumTopicReactions	dispatched
 readBusinessMessage	dispatched
 readChatList	dispatched
@@ -669,7 +669,7 @@ removeRecentHashtag	dispatched
 removeRecentSticker	dispatched
 removeRecentlyFoundChat	dispatched
 removeSavedAnimation	dispatched
-removeSavedNotificationSound	interim
+removeSavedNotificationSound	dispatched
 removeSearchedForTag	dispatched
 removeStickerFromSet	dispatched
 removeStoryAlbumStories	dispatched
@@ -696,7 +696,7 @@ reportChat	dispatched
 reportChatPhoto	dispatched
 reportChatSponsoredMessage	dispatched
 reportMessageReactions	dispatched
-reportPhoneNumberCodeMissing	interim
+reportPhoneNumberCodeMissing	dispatched
 reportSponsoredChat	dispatched
 reportStory	dispatched
 reportSupergroupAntiSpamFalsePositive	dispatched
@@ -709,7 +709,7 @@ resendAuthenticationCode	dispatched
 resendEmailAddressVerificationCode	dispatched
 resendLoginEmailAddressCode	dispatched
 resendMessages	dispatched
-resendPhoneNumberCode	interim
+resendPhoneNumberCode	dispatched
 resendRecoveryEmailAddressCode	dispatched
 resetAllNotificationSettings	dispatched
 resetAuthenticationEmailAddress	dispatched
@@ -780,8 +780,8 @@ sendMessageAlbum	dispatched
 sendMessageViewMetrics	dispatched
 sendPassportAuthorizationForm	dispatched
 sendPaymentForm	dispatched
-sendPhoneNumberCode	interim
-sendPhoneNumberFirebaseSms	interim
+sendPhoneNumberCode	dispatched
+sendPhoneNumberFirebaseSms	dispatched
 sendQuickReplyShortcutMessages	dispatched
 sendResoldGift	dispatched
 sendRichMessageDraft	dispatched
@@ -796,7 +796,7 @@ setArchiveChatListSettings	dispatched
 setAuthenticationEmailAddress	dispatched
 setAuthenticationPhoneNumber	dispatched
 setAuthenticationPremiumPurchaseTransaction	dispatched
-setAutoDownloadSettings	interim
+setAutoDownloadSettings	dispatched
 setAutosaveSettings	dispatched
 setBio	dispatched
 setBirthdate	dispatched
@@ -808,7 +808,7 @@ setBotUpdatesStatus	dispatched
 setBusinessAccountBio	dispatched
 setBusinessAccountGiftSettings	dispatched
 setBusinessAccountName	dispatched
-setBusinessAccountProfilePhoto	interim
+setBusinessAccountProfilePhoto	dispatched
 setBusinessAccountUsername	dispatched
 setBusinessAwayMessageSettings	dispatched
 setBusinessConnectedBot	dispatched
@@ -848,7 +848,7 @@ setCommunityName	dispatched
 setCustomEmojiStickerSetThumbnail	dispatched
 setCustomLanguagePack	dispatched
 setCustomLanguagePackString	dispatched
-setDatabaseEncryptionKey	interim
+setDatabaseEncryptionKey	dispatched
 setDefaultBackground	dispatched
 setDefaultChannelAdministratorRights	dispatched
 setDefaultGroupAdministratorRights	dispatched
@@ -872,7 +872,7 @@ setLogStream	sync
 setLogTagVerbosityLevel	sync
 setLogVerbosityLevel	sync
 setLoginEmailAddress	dispatched
-setMainProfileTab	interim
+setMainProfileTab	dispatched
 setManagedBotAccessSettings	dispatched
 setMenuButton	dispatched
 setMessageFactCheck	dispatched
@@ -881,7 +881,7 @@ setMessageSenderBlockList	dispatched
 setMessageSenderBotVerification	dispatched
 setName	dispatched
 setNetworkType	dispatched
-setNewChatPrivacySettings	interim
+setNewChatPrivacySettings	dispatched
 setOption	dispatched
 setPaidMessageReactionType	dispatched
 setPassportElement	dispatched
@@ -893,12 +893,12 @@ setPinnedForumTopics	dispatched
 setPinnedGifts	dispatched
 setPinnedSavedMessagesTopics	dispatched
 setPollAnswer	dispatched
-setProfileAccentColor	interim
+setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
-setProfilePhoto	interim
+setProfilePhoto	dispatched
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
-setReadDatePrivacySettings	interim
+setReadDatePrivacySettings	dispatched
 setRecoveryEmailAddress	dispatched
 setSavedMessagesTagLabel	dispatched
 setScopeNotificationSettings	dispatched
@@ -917,11 +917,11 @@ setSupergroupStickerSet	dispatched
 setSupergroupUnrestrictBoostCount	dispatched
 setSupergroupUsername	dispatched
 setTdlibParameters	dispatched
-setUpgradedGiftColors	interim
+setUpgradedGiftColors	dispatched
 setUserEmojiStatus	dispatched
-setUserNote	interim
-setUserPersonalProfilePhoto	interim
-setUserPrivacySettingRules	interim
+setUserNote	dispatched
+setUserPersonalProfilePhoto	dispatched
+setUserPrivacySettingRules	dispatched
 setUserSupportInfo	interim
 setUsername	dispatched
 setVideoChatDefaultParticipant	dispatched
@@ -936,8 +936,8 @@ startScheduledVideoChat	dispatched
 stopBusinessPoll	dispatched
 stopPendingMessage	dispatched
 stopPoll	dispatched
-suggestUserBirthdate	interim
-suggestUserProfilePhoto	interim
+suggestUserBirthdate	dispatched
+suggestUserProfilePhoto	dispatched
 summarizeMessage	dispatched
 synchronizeLanguagePack	dispatched
 terminateAllOtherSessions	dispatched
