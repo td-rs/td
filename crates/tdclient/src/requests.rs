@@ -16501,6 +16501,437 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
             );
         }
 
+        _ => run_sticker_residue_requests(td, id, function),
+    }
+}
+
+/// The M.glue stickers-residue arm group of the request dispatcher: the
+/// recent/favorite/hashtag/emoji-search/sticker-set ladder the M.st
+/// StickersManager slice left interim (Requests.cpp:1438-1560, 3797-3825,
+/// 6827-6855, 7429-7544, 7667-7727, 8981-9002). Every arm routes into
+/// `td_->stickers_manager_->...`; the not-loaded/server tails are the
+/// [blocked: net] query seams and the emoji-status free functions are
+/// the EmojiStatus.cpp plane.
+fn run_sticker_residue_requests(td: &mut Td, id: u64, function: Function) {
+    use crate::stickers_manager::{StickerSetId, get_sticker_type};
+
+    match function {
+        Function::getInstalledStickerSets(request) => {
+            // Requests.cpp:7480-7483 — the not-loaded band parks on the
+            // GetAllStickersQuery.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StickerSets, _>(id, Object::stickerSets);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_installed_sticker_sets(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                promise,
+            );
+        }
+        Function::getArchivedStickerSets(request) => {
+            // Requests.cpp:7485-7496 — the scan bands are local; the
+            // tail parks on GetArchivedStickerSetsQuery (the collapsed
+            // single run answers the not-force band).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StickerSets, _>(id, Object::stickerSets);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_archived_sticker_sets(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                StickerSetId::new(request.offset_sticker_set_id),
+                request.limit,
+                false,
+                promise,
+            );
+        }
+        Function::getTrendingStickerSets(request) => {
+            // Requests.cpp:7491-7496 — the trending ladder.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::TrendingStickerSets, _>(
+                id,
+                Object::trendingStickerSets,
+            );
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_featured_sticker_sets(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                request.offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getAttachedStickerSets(request) => {
+            // Requests.cpp:7497-7501 — the file probe; the tail parks on
+            // GetAttachedStickersQuery.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StickerSets, _>(id, Object::stickerSets);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_attached_sticker_sets(
+                &mut env,
+                crate::files::FileId::new(request.file_id, 0),
+                promise,
+            );
+        }
+        Function::getStickerSet(request) => {
+            // Requests.cpp:7502-7525 — no CHECK band (the C++ arm has
+            // none); unknown ids ride the Great Minds reload seam.
+            let promise = td.deferred_promise::<td_api::StickerSet, _>(id, Object::stickerSet);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_sticker_set(&mut env, StickerSetId::new(request.set_id), promise);
+        }
+        Function::searchStickerSet(request) => {
+            // Requests.cpp:7511-7515 — the short-name search.
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::StickerSet, _>(id, Object::stickerSet);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_sticker_set(&mut env, name, request.ignore_cache, promise);
+        }
+        Function::searchInstalledStickerSets(request) => {
+            // Requests.cpp:7516-7521.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::StickerSets, _>(id, Object::stickerSets);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_installed_sticker_sets(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                query,
+                request.limit,
+                promise,
+            );
+        }
+        Function::searchStickerSets(request) => {
+            // Requests.cpp:7522-7526 — the mask band answers the empty
+            // list; the tail parks on SearchStickerSetsQuery.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::StickerSets, _>(id, Object::stickerSets);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_sticker_sets(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                query,
+                promise,
+            );
+        }
+        Function::changeStickerSet(request) => {
+            // Requests.cpp:7527-7531 — the lookup-miss 400 bands are the
+            // reachable behavior.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.change_sticker_set(
+                &mut env,
+                StickerSetId::new(request.set_id),
+                request.is_installed,
+                request.is_archived,
+                promise,
+            );
+        }
+        Function::getStickers(request) => {
+            // Requests.cpp:7429-7435 — the ladder parks per-plane.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_stickers(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                query,
+                request.limit,
+                crate::messages_manager::DialogId::new(request.chat_id),
+                false,
+                promise,
+            );
+        }
+        Function::getAllStickerEmojis(request) => {
+            // Requests.cpp:7436-7441.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::Emojis, _>(id, Object::emojis);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_all_sticker_emojis(
+                &mut env,
+                get_sticker_type(request.sticker_type.as_ref()),
+                query,
+                crate::messages_manager::DialogId::new(request.chat_id),
+                request.return_only_main_emoji,
+                promise,
+            );
+        }
+        Function::getRecentStickers(request) => {
+            // Requests.cpp:7667-7671.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_recent_stickers(&mut env, request.is_attached, promise);
+        }
+        Function::addRecentSticker(request) => {
+            // Requests.cpp:7672-7676.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.add_recent_sticker(
+                &mut env,
+                request.is_attached,
+                request.sticker.as_ref(),
+                promise,
+            );
+        }
+        Function::removeRecentSticker(request) => {
+            // Requests.cpp:7677-7681.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.remove_recent_sticker(
+                &mut env,
+                request.is_attached,
+                request.sticker.as_ref(),
+                promise,
+            );
+        }
+        Function::clearRecentStickers(request) => {
+            // Requests.cpp:7682-7686.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.clear_recent_stickers(&mut env, request.is_attached, promise);
+        }
+        Function::getFavoriteStickers(_) => {
+            // Requests.cpp:7687-7691.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_favorite_stickers(&mut env, promise);
+        }
+        Function::addFavoriteSticker(request) => {
+            // Requests.cpp:7692-7696.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.add_favorite_sticker(&mut env, request.sticker.as_ref(), promise);
+        }
+        Function::removeFavoriteSticker(request) => {
+            // Requests.cpp:7697-7701.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.remove_favorite_sticker(&mut env, request.sticker.as_ref(), promise);
+        }
+        Function::getStickerEmojis(request) => {
+            // Requests.cpp:7702-7706.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Emojis, _>(id, Object::emojis);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_sticker_emojis(&mut env, request.sticker.as_ref(), promise);
+        }
+        Function::searchEmojis(request) => {
+            // Requests.cpp:7707-7715 — the empty/unsupported bands answer
+            // the empty emojiKeywords; the prepared query reads the pmc
+            // keyword records.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
+                return;
+            };
+            let mut input_language_codes = Vec::with_capacity(request.input_language_codes.len());
+            for language_code in &request.input_language_codes {
+                let Some(language_code) = clean_or_utf8_error(td, id, language_code) else {
+                    return;
+                };
+                input_language_codes.push(language_code);
+            }
+            let promise =
+                td.deferred_promise::<td_api::EmojiKeywords, _>(id, Object::emojiKeywords);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_emojis(&mut env, text, input_language_codes, false, promise);
+        }
+        Function::getKeywordEmojis(request) => {
+            // Requests.cpp:7716-7727 — the keyword twin.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
+                return;
+            };
+            let mut input_language_codes = Vec::with_capacity(request.input_language_codes.len());
+            for language_code in &request.input_language_codes {
+                let Some(language_code) = clean_or_utf8_error(td, id, language_code) else {
+                    return;
+                };
+                input_language_codes.push(language_code);
+            }
+            let promise = td.deferred_promise::<td_api::Emojis, _>(id, Object::emojis);
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_keyword_emojis(
+                &mut env,
+                text,
+                input_language_codes,
+                false,
+                promise,
+            );
+        }
+        Function::searchHashtags(request) => {
+            // Requests.cpp:8981-8995 — the local hashtag-hints query; the
+            // answers come from the registry (sync in behavior, promise
+            // plane for the rewrap).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(prefix) = clean_or_utf8_error(td, id, &request.prefix) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::Hashtags, _>(id, Object::hashtags);
+            let (_env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.search_hashtags(prefix, request.limit, promise);
+        }
+        Function::removeRecentHashtag(request) => {
+            // Requests.cpp:8997-9002.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(hashtag) = clean_or_utf8_error(td, id, &request.hashtag) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.remove_recent_hashtag(&mut env, hashtag, promise);
+        }
+        Function::getSearchedForTags(request) => {
+            // Requests.cpp:3797-3810 — the searched-tags registry query
+            // (the cashtag twin rides the '$' prefix inside).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(tag_prefix) = clean_or_utf8_error(td, id, &request.tag_prefix) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::Hashtags, _>(id, Object::hashtags);
+            let (_env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.get_searched_for_tags(tag_prefix, request.limit, promise);
+        }
+        Function::removeSearchedForTag(request) => {
+            // Requests.cpp:3812-3817.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(tag) = clean_or_utf8_error(td, id, &request.tag) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.remove_searched_for_tag(&mut env, tag, promise);
+        }
+        Function::clearSearchedForTags(request) => {
+            // Requests.cpp:3819-3823.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
+            stickers_manager.clear_searched_for_tags(&mut env, request.clear_cashtags, promise);
+        }
+        Function::getDefaultEmojiStatuses(_) => {
+            // Requests.cpp:6827-6832 — the EmojiStatus.cpp cached-record
+            // plane; the refresh query parks ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
+            crate::stickers_manager::get_default_emoji_statuses(&mut env, promise);
+        }
+        Function::getDefaultChatEmojiStatuses(_) => {
+            // Requests.cpp:6833-6838.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
+                id,
+                Object::emojiStatusCustomEmojis,
+            );
+            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
+            crate::stickers_manager::get_default_channel_emoji_statuses(&mut env, promise);
+        }
+        Function::getRecentEmojiStatuses(_) => {
+            // Requests.cpp:6839-6844.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::EmojiStatuses, _>(id, Object::emojiStatuses);
+            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
+            crate::stickers_manager::get_recent_emoji_statuses(&mut env, promise);
+        }
+        Function::getUpgradedGiftEmojiStatuses(_) => {
+            // Requests.cpp:6845-6850.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::EmojiStatuses, _>(id, Object::emojiStatuses);
+            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
+            crate::stickers_manager::get_upgraded_gift_emoji_statuses(&mut env, promise);
+        }
+        Function::clearRecentEmojiStatuses(_) => {
+            // Requests.cpp:6851-6855 — the local empty-record write is
+            // immediate; the query tail owns the promise.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
+            crate::stickers_manager::clear_recent_emoji_statuses(&mut env, promise);
+        }
+
         _ => run_country_requests(td, id, function),
     }
 }
@@ -17466,19 +17897,28 @@ mod request_census_tests {
         // getAutoDownloadSettingsPresets, setAutoDownloadSettings
         // (936 + 8 = 944 dispatched / 63 - 8 = 55 interim, sync unmoved
         // 23 — the merged pin).
+        // The stickers residue glue slice flipped 31 arms over the d0c0e44
+        // base — the recent/favorite/hashtag/emoji-search/sticker-set
+        // ladder on the M.st StickersManager plane. The 5 EmojiStatus
+        // free-function arms (getDefaultEmojiStatuses,
+        // getDefaultChatEmojiStatuses, getRecentEmojiStatuses,
+        // getUpgradedGiftEmojiStatuses, clearRecentEmojiStatuses) were
+        // already dispatched on master by the M.4-tails landing, so the
+        // merge brings 26 net flips (944 + 26 = 970 dispatched / 55 - 26
+        // = 29 interim, sync unmoved 23 — the merged pin).
         // The countries glue slice flipped 6 arms: getCountries, getCountry,
         // getCountryCode, getPhoneNumberInfo (dispatched; the
         // help.getNearestDc/help.getCountriesList tails park at the
         // [blocked: net] seams) and getCountryFlagEmoji +
-        // getPhoneNumberInfoSync moving to the synchronous set (944 + 4 =
-        // 948 dispatched / 55 - 4 = 51 interim, 23 + 2 = 25 sync — the
+        // getPhoneNumberInfoSync moving to the synchronous set (970 + 4 =
+        // 974 dispatched / 29 - 4 - 2 = 23 interim, 23 + 2 = 25 sync — the
         // merged pin).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 25, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            948,
+            974,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 49, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 23, "interim count");
     }
 }
