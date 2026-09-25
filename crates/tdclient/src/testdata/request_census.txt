@@ -23,7 +23,7 @@ addOffer	interim
 addPendingLiveStoryReaction	dispatched
 addPendingPaidMessageReaction	dispatched
 addPollOption	dispatched
-addProfileAudio	interim
+addProfileAudio	dispatched
 addProxy	dispatched
 addQuickReplyShortcutInlineQueryResultMessage	dispatched
 addQuickReplyShortcutMessage	dispatched
@@ -94,7 +94,7 @@ cleanFileName	interim
 clearAllDraftMessages	dispatched
 clearAutosaveSettingsExceptions	dispatched
 clearImportedContacts	dispatched
-clearRecentEmojiStatuses	interim
+clearRecentEmojiStatuses	dispatched
 clearRecentReactions	dispatched
 clearRecentStickers	interim
 clearRecentlyFoundChats	dispatched
@@ -182,7 +182,7 @@ deleteMessageReactionsFromSender	dispatched
 deleteMessages	dispatched
 deletePassportElement	dispatched
 deletePollOption	dispatched
-deleteProfilePhoto	interim
+deleteProfilePhoto	dispatched
 deleteQuickReplyShortcut	dispatched
 deleteQuickReplyShortcutMessages	dispatched
 deleteRevokedChatInviteLink	dispatched
@@ -355,9 +355,9 @@ getCustomEmojiStickers	dispatched
 getDatabaseStatistics	dispatched
 getDeepLinkInfo	dispatched
 getDefaultBackgroundCustomEmojiStickers	dispatched
-getDefaultChatEmojiStatuses	interim
+getDefaultChatEmojiStatuses	dispatched
 getDefaultChatPhotoCustomEmojiStickers	dispatched
-getDefaultEmojiStatuses	interim
+getDefaultEmojiStatuses	dispatched
 getDefaultMessageAutoDeleteTime	dispatched
 getDefaultProfilePhotoCustomEmojiStickers	dispatched
 getDirectMessagesChatTopic	dispatched
@@ -490,7 +490,7 @@ getPushReceiverId	sync
 getReadDatePrivacySettings	interim
 getReceivedGift	dispatched
 getReceivedGifts	dispatched
-getRecentEmojiStatuses	interim
+getRecentEmojiStatuses	dispatched
 getRecentInlineBots	dispatched
 getRecentStickers	interim
 getRecentlyOpenedChats	dispatched
@@ -544,7 +544,7 @@ getSupergroup	dispatched
 getSupergroupFullInfo	dispatched
 getSupergroupMembers	dispatched
 getSupportName	interim
-getSupportUser	interim
+getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
 getTextEntities	sync
@@ -556,7 +556,7 @@ getTonTransactions	dispatched
 getTopChats	dispatched
 getTrendingStickerSets	interim
 getUpgradedGift	dispatched
-getUpgradedGiftEmojiStatuses	interim
+getUpgradedGiftEmojiStatuses	dispatched
 getUpgradedGiftValueInfo	dispatched
 getUpgradedGiftVariants	dispatched
 getUpgradedGiftWithdrawalUrl	dispatched
@@ -808,7 +808,7 @@ setBotUpdatesStatus	dispatched
 setBusinessAccountBio	dispatched
 setBusinessAccountGiftSettings	dispatched
 setBusinessAccountName	dispatched
-setBusinessAccountProfilePhoto	interim
+setBusinessAccountProfilePhoto	dispatched
 setBusinessAccountUsername	dispatched
 setBusinessAwayMessageSettings	dispatched
 setBusinessConnectedBot	dispatched
@@ -872,7 +872,7 @@ setLogStream	sync
 setLogTagVerbosityLevel	sync
 setLogVerbosityLevel	sync
 setLoginEmailAddress	dispatched
-setMainProfileTab	interim
+setMainProfileTab	dispatched
 setManagedBotAccessSettings	dispatched
 setMenuButton	dispatched
 setMessageFactCheck	dispatched
@@ -893,9 +893,9 @@ setPinnedForumTopics	dispatched
 setPinnedGifts	dispatched
 setPinnedSavedMessagesTopics	dispatched
 setPollAnswer	dispatched
-setProfileAccentColor	interim
+setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
-setProfilePhoto	interim
+setProfilePhoto	dispatched
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	interim
@@ -917,10 +917,10 @@ setSupergroupStickerSet	dispatched
 setSupergroupUnrestrictBoostCount	dispatched
 setSupergroupUsername	dispatched
 setTdlibParameters	dispatched
-setUpgradedGiftColors	interim
+setUpgradedGiftColors	dispatched
 setUserEmojiStatus	dispatched
-setUserNote	interim
-setUserPersonalProfilePhoto	interim
+setUserNote	dispatched
+setUserPersonalProfilePhoto	dispatched
 setUserPrivacySettingRules	interim
 setUserSupportInfo	interim
 setUsername	dispatched
@@ -936,8 +936,8 @@ startScheduledVideoChat	dispatched
 stopBusinessPoll	dispatched
 stopPendingMessage	dispatched
 stopPoll	dispatched
-suggestUserBirthdate	interim
-suggestUserProfilePhoto	interim
+suggestUserBirthdate	dispatched
+suggestUserProfilePhoto	dispatched
 summarizeMessage	dispatched
 synchronizeLanguagePack	dispatched
 terminateAllOtherSessions	dispatched
