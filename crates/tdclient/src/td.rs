@@ -66,7 +66,8 @@ use crate::chat_manager::{
 };
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, TdConfigSink, build_config_net_query,
-};use crate::config_manager::{
+};
+use crate::config_manager::{
     ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
 };
 use crate::config_recoverer::{
@@ -92,7 +93,7 @@ use crate::messages_manager::{
 use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
-use crate::phone_number_manager::{PhoneAnswer, PhonePendingKind, PhoneNumberManager};
+use crate::phone_number_manager::{PhoneAnswer, PhoneNumberManager, PhonePendingKind};
 use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
@@ -6161,15 +6162,16 @@ impl Td {
         settings: Option<&td_api::PhoneNumberAuthenticationSettings>,
         ty: Option<&td_api::PhoneNumberCodeType>,
     ) {
-        let prepared = match self
-            .phone_number_manager
-            .prepare_set_phone_number(phone_number, settings, ty)
-        {
-            std::result::Result::Ok(prepared) => prepared,
-            std::result::Result::Err(status) => {
-                return self.send_error_impl(request_id, status.code(), status.message());
-            }
-        };
+        let prepared =
+            match self
+                .phone_number_manager
+                .prepare_set_phone_number(phone_number, settings, ty)
+            {
+                std::result::Result::Ok(prepared) => prepared,
+                std::result::Result::Err(status) => {
+                    return self.send_error_impl(request_id, status.code(), status.message());
+                }
+            };
         if prepared.hide_check_phone_number {
             let mut action = crate::suggested_action::SuggestedAction::default();
             action.init(crate::suggested_action::SuggestedActionType::CheckPhoneNumber);
@@ -17154,6 +17156,182 @@ pub(crate) fn star_env_split(
         star_manager,
     )
 }
+/// The `Td`-level [`MmRequestContext`] — the request-plane surface the
+/// M.mmreq methods read. The landed manager tails run for real (the
+/// DialogManager server tails, the M.16 ReactionManager plane); the wire
+/// tails keep the trait's [blocked: net] default no-op bodies.
+impl crate::messages_manager::MmRequestContext for Td {
+    fn as_message_object(&self) -> &dyn crate::messages_manager::MessageObjectContext {
+        self
+    }
+
+    fn as_send_message_context(&self) -> &dyn crate::messages_manager::SendMessageContext {
+        self
+    }
+
+    fn as_read_state(&mut self) -> &mut dyn crate::messages_manager::ReadStateContext {
+        self
+    }
+
+    fn as_read_state_shared(&self) -> &dyn crate::messages_manager::ReadStateContext {
+        self
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+
+    fn my_dialog_id(&self) -> crate::messages_manager::DialogId {
+        crate::messages_manager::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_chat_id_object(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        _source: &str,
+    ) -> i64 {
+        dialog_id.get()
+    }
+
+    fn can_pin_messages(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        match crate::dialog_manager::can_pin_messages(self, dialog_id) {
+            tdutils::status::Result::Ok(()) => Ok(()),
+            tdutils::status::Result::Err(status) => Err(status),
+        }
+    }
+
+    fn check_business_connection(
+        &mut self,
+        business_connection_id: &crate::business_connection_manager::BusinessConnectionId,
+        dialog_id: crate::messages_manager::DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        let status = self
+            .business_connection_manager
+            .check_business_connection_with_dialog(business_connection_id, dialog_id);
+        if status.is_error() {
+            Err(status)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn toggle_dialog_is_pinned_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_pinned: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_is_pinned_on_server(self, dialog_id, is_pinned, 0);
+    }
+
+    fn toggle_dialog_is_marked_as_unread_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_marked_as_unread: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_is_marked_as_unread_on_server(
+            self,
+            dialog_id,
+            0,
+            is_marked_as_unread,
+            0,
+        );
+    }
+
+    fn toggle_dialog_is_translatable_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_translatable: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            self,
+            dialog_id,
+            is_translatable,
+            0,
+        );
+    }
+
+    fn toggle_dialog_view_as_messages_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        view_as_messages: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_view_as_messages_on_server(
+            self,
+            dialog_id,
+            view_as_messages,
+            0,
+        );
+    }
+
+    fn reaction_manager_get_sorted_available_reactions(
+        &mut self,
+        available_reactions: crate::chat_reactions::ChatReactions,
+        active_reactions: crate::chat_reactions::ChatReactions,
+        row_size: i32,
+        is_tag: bool,
+        unavailability_reason: crate::reaction_manager::ReactionUnavailabilityReason,
+    ) -> td_api::AvailableReactions {
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager.get_sorted_available_reactions(
+            &mut env,
+            available_reactions,
+            active_reactions,
+            row_size,
+            is_tag,
+            unavailability_reason,
+        )
+    }
+
+    fn reaction_manager_add_recent_reaction(
+        &mut self,
+        reaction_type: &crate::reaction_type::ReactionType,
+    ) {
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager
+            .add_recent_reaction(&mut env, reaction_type);
+    }
+
+    fn reaction_manager_get_default_tag_reactions(
+        &mut self,
+    ) -> Vec<crate::reaction_type::ReactionType> {
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager.get_default_tag_reactions(&mut env)
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+}
 
 /// The `G()`/`td_` slice [`crate::star_manager::StarManager`] reads
 /// through (the M.star env split; the StickersManager/PasswordManager
@@ -19772,7 +19950,9 @@ mod tests {
         assert!(!resp304.is_empty());
         assert!(matches!(resp304[0], Object::ok(_)));
 
-        // 5. toggleChatIsTranslatable: returns ok
+        // 5. toggleChatIsTranslatable: the real check_dialog_access
+        // ladder needs write access and the user was never loaded —
+        // 400 "Chat not found" (MessagesManager.cpp:16413)
         td.request(
             305,
             Function::toggleChatIsTranslatable(td_api::toggleChatIsTranslatable {
@@ -19780,11 +19960,11 @@ mod tests {
                 is_translatable: true,
             }),
         );
-        let resp305 = responses_of(&callback, 305);
-        assert!(!resp305.is_empty());
-        assert!(matches!(resp305[0], Object::ok(_)));
+        let err305 = error_of(&callback, 305);
+        assert_eq!(err305.code, 400);
+        assert_eq!(err305.message, "Chat not found");
 
-        // 6. toggleChatViewAsTopics: returns ok
+        // 6. toggleChatViewAsTopics: same access ladder — 400
         td.request(
             306,
             Function::toggleChatViewAsTopics(td_api::toggleChatViewAsTopics {
@@ -19792,11 +19972,11 @@ mod tests {
                 view_as_topics: true,
             }),
         );
-        let resp306 = responses_of(&callback, 306);
-        assert!(!resp306.is_empty());
-        assert!(matches!(resp306[0], Object::ok(_)));
+        let err306 = error_of(&callback, 306);
+        assert_eq!(err306.code, 400);
+        assert_eq!(err306.message, "Chat not found");
 
-        // 7. toggleChatIsMarkedAsUnread: returns ok
+        // 7. toggleChatIsMarkedAsUnread: same access ladder — 400
         td.request(
             307,
             Function::toggleChatIsMarkedAsUnread(td_api::toggleChatIsMarkedAsUnread {
@@ -19804,9 +19984,9 @@ mod tests {
                 is_marked_as_unread: true,
             }),
         );
-        let resp307 = responses_of(&callback, 307);
-        assert!(!resp307.is_empty());
-        assert!(matches!(resp307[0], Object::ok(_)));
+        let err307 = error_of(&callback, 307);
+        assert_eq!(err307.code, 400);
+        assert_eq!(err307.message, "Chat not found");
 
         // 8. deleteChatReplyMarkup: returns ok
         td.request(

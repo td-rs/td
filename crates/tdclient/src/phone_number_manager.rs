@@ -46,9 +46,16 @@ pub(crate) enum PhoneState {
 /// `check_code`), matched against the answer on the drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhonePendingKind {
-    SendCode { generation: i64 },
-    ResendCode { generation: i64 },
-    CheckCode { check: PhoneCheckQuery, generation: i64 },
+    SendCode {
+        generation: i64,
+    },
+    ResendCode {
+        generation: i64,
+    },
+    CheckCode {
+        check: PhoneCheckQuery,
+        generation: i64,
+    },
     FirebaseSms,
     ReportMissingCode,
 }
@@ -67,6 +74,7 @@ impl PhonePendingKind {
 
 /// The check-code query family (the C++ `check_code` type switch — the
 /// concrete query is fixed at dispatch, so the answer parse is too).
+#[allow(clippy::enum_variant_names)] // the C++ TL names changePhone/verifyPhone/confirmPhone
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhoneCheckQuery {
     ChangePhone,
@@ -75,6 +83,9 @@ pub(crate) enum PhoneCheckQuery {
 }
 
 /// The parsed phone-plane answer (the ResultHandler `on_result` shapes).
+// The wire structs ride unboxed: the value is parsed and matched in one
+// place (the C++ on_result holds the same fat locals).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum PhoneAnswer {
     /// `auth.sentCode` — the send/resend answer; applied by the manager
@@ -338,9 +349,10 @@ impl PhoneNumberManager {
         }
         self.phone_on_sent_code(sent_code);
         self.state = PhoneState::WaitCode;
-        Result::Ok(self
-            .send_code_helper
-            .get_authentication_code_info_object(tdutils::time::now()))
+        Result::Ok(
+            self.send_code_helper
+                .get_authentication_code_info_object(tdutils::time::now()),
+        )
     }
 
     /// `PhoneNumberManager::on_check_code_result` (cpp:332-344), phase 2:
@@ -365,7 +377,8 @@ impl PhoneNumberManager {
             // generated parse is total.
             None => AuthenticationCodeInfo::default(),
         };
-        self.send_code_helper.next_code_info = get_authentication_code_info(sent_code.next_type.as_ref());
+        self.send_code_helper.next_code_info =
+            get_authentication_code_info(sent_code.next_type.as_ref());
         self.send_code_helper.next_code_timestamp = tdutils::time::now() + sent_code.timeout as f64;
 
         if self.send_code_helper.next_code_info.ty == CodeType::None
@@ -388,7 +401,9 @@ impl PhoneNumberManager {
 /// `SendCodeHelper::get_authentication_code_info`
 /// (SendCodeHelper.cpp:166-186): the `auth_CodeType` mapping; `None` is
 /// the default (Type::None) info.
-fn get_authentication_code_info(code_type: Option<&telegram_api::auth_CodeType>) -> AuthenticationCodeInfo {
+fn get_authentication_code_info(
+    code_type: Option<&telegram_api::auth_CodeType>,
+) -> AuthenticationCodeInfo {
     use telegram_api::auth_CodeType as T;
     let Some(ty) = code_type else {
         return AuthenticationCodeInfo::default();
@@ -433,10 +448,7 @@ fn get_sent_authentication_code_info(
         T::auth_sentCodeTypeSmsWord(t) => {
             // The >1-letter guard (SendCodeHelper.cpp:241-245).
             let beginning = if tdutils::utf8::utf8_length(&t.beginning) > 1 {
-                tracing::error!(
-                    "Receive \"{}\" as word first letter",
-                    t.beginning
-                );
+                tracing::error!("Receive \"{}\" as word first letter", t.beginning);
                 String::new()
             } else {
                 t.beginning.clone()
@@ -480,9 +492,8 @@ fn get_input_code_settings(
         unknown_number = settings.has_unknown_phone_number;
         if let Some(firebase) = &settings.firebase_authentication_settings {
             allow_firebase = true;
-            if let td_api::FirebaseAuthenticationSettings::firebaseAuthenticationSettingsIos(
-                ios,
-            ) = firebase
+            if let td_api::FirebaseAuthenticationSettings::firebaseAuthenticationSettingsIos(ios) =
+                firebase
             {
                 flags |= CODE_SETTINGS_TOKEN_MASK;
                 device_token = ios.device_token.clone();
@@ -538,10 +549,7 @@ fn resend_code_query(
     reason: Option<&td_api::ResendCodeReason>,
 ) -> Result<telegram_api::auth_resendCode> {
     if send_code_helper.next_code_info.ty == CodeType::None {
-        return Result::Err(Status::error(
-            400,
-            "Authentication code can't be resend",
-        ));
+        return Result::Err(Status::error(400, "Authentication code can't be resend"));
     }
     let mut flags = 0;
     let reason_str = match reason {
@@ -733,10 +741,12 @@ mod tests {
         )
     }
 
-    /// The `auth.sentCode` wire answer (SMS type, call next type).
+    /// The `auth.sentCode` wire answer (SMS type, call next type). The
+    /// flags carry next_type (bit 1<<1) + timeout (bit 1<<2) — the wire
+    /// round-trip drops any field whose flag is unset.
     fn sent_code_answer_bytes() -> Vec<u8> {
         let answer = telegram_api::auth_SentCode::auth_sentCode(telegram_api::auth_sentCode {
-            flags: 0,
+            flags: 0b110,
             r#type: Some(telegram_api::auth_SentCodeType::auth_sentCodeTypeSms(
                 telegram_api::auth_sentCodeTypeSms { length: 5 },
             )),
@@ -760,26 +770,42 @@ mod tests {
         let error = manager
             .prepare_set_phone_number(String::new(), Some(&settings), Some(&change_type()))
             .unwrap_err();
-        assert_eq!((error.code(), error.message()), (400, "Phone number must be non-empty"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (400, "Phone number must be non-empty")
+        );
 
         // The `type == nullptr` band (PhoneNumberManager.cpp:243-245).
         let error = manager
             .prepare_set_phone_number("+42".to_string(), Some(&settings), None)
             .unwrap_err();
-        assert_eq!((error.code(), error.message()), (400, "Type must be non-empty"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (400, "Type must be non-empty")
+        );
 
         // The confirm arm cleans and empties the hash.
         let error = manager
             .prepare_set_phone_number("+42".to_string(), Some(&settings), Some(&confirm_type("")))
             .unwrap_err();
-        assert_eq!((error.code(), error.message()), (400, "Hash must be non-empty"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (400, "Hash must be non-empty")
+        );
 
         // A control-only hash cleans to empty (the C++ checks the cleaned
         // hash) — the empty band still fires.
         let error = manager
-            .prepare_set_phone_number("+42".to_string(), Some(&settings), Some(&confirm_type("\r")))
+            .prepare_set_phone_number(
+                "+42".to_string(),
+                Some(&settings),
+                Some(&confirm_type("\r")),
+            )
             .unwrap_err();
-        assert_eq!((error.code(), error.message()), (400, "Hash must be non-empty"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (400, "Hash must be non-empty")
+        );
     }
 
     #[test]
@@ -787,7 +813,11 @@ mod tests {
         let mut manager = PhoneNumberManager::new();
         let settings = default_settings();
         let prepared = manager
-            .prepare_set_phone_number("+15551234567".to_string(), Some(&settings), Some(&change_type()))
+            .prepare_set_phone_number(
+                "+15551234567".to_string(),
+                Some(&settings),
+                Some(&change_type()),
+            )
             .unwrap();
         assert!(prepared.hide_check_phone_number);
         assert_eq!(manager.flow, PhoneCodeFlow::ChangePhone);
@@ -805,8 +835,7 @@ mod tests {
         let prepared = manager
             .prepare_set_phone_number("+15551234567".to_string(), None, Some(&change_type()))
             .unwrap();
-        let telegram_api::Function::account_sendChangePhoneCode(query) = &prepared.function
-        else {
+        let telegram_api::Function::account_sendChangePhoneCode(query) = &prepared.function else {
             panic!("wrong query");
         };
         let empty_settings = query.settings.as_ref().unwrap();
@@ -854,14 +883,19 @@ mod tests {
             .unwrap();
         assert_eq!(manager.state, PhoneState::WaitCode);
         assert_eq!(info.phone_number, "+42");
-        assert_eq!(info.timeout, 61);
+        // The same-tick shown timeout (SendCodeHelper.cpp:45): the formula
+        // floors (60 - delta + 1 - 1e-9) with 0 < delta between the two
+        // f64 Time::now() reads — 60, not 61 (both sides are fractional).
+        assert!((59..=60).contains(&info.timeout));
         assert!(matches!(
             &info.r#type,
             Some(td_api::AuthenticationCodeType::authenticationCodeTypeSms(t)) if t.length == 5
         ));
         assert!(matches!(
             &info.next_type,
-            Some(td_api::AuthenticationCodeType::authenticationCodeTypeCall(_))
+            Some(td_api::AuthenticationCodeType::authenticationCodeTypeCall(
+                _
+            ))
         ));
     }
 
@@ -883,20 +917,22 @@ mod tests {
             next_type: None,
             timeout: 10,
         };
-        let error = err_of(
-            manager
-                .on_send_code_result(prepared.generation + 1, sent_code.clone()),
+        let error = err_of(manager.on_send_code_result(prepared.generation + 1, sent_code.clone()));
+        assert_eq!(
+            (error.code(), error.message()),
+            (500, "Request was canceled")
         );
-        assert_eq!((error.code(), error.message()), (500, "Request was canceled"));
 
         // The email types are rejected with the manager band.
         let mut email_code = sent_code.clone();
-        email_code.r#type =
-            Some(telegram_api::auth_SentCodeType::auth_sentCodeTypeEmailCode(
-                telegram_api::auth_sentCodeTypeEmailCode::default(),
-            ));
+        email_code.r#type = Some(telegram_api::auth_SentCodeType::auth_sentCodeTypeEmailCode(
+            telegram_api::auth_sentCodeTypeEmailCode::default(),
+        ));
         let error = err_of(manager.on_send_code_result(prepared.generation, email_code));
-        assert_eq!((error.code(), error.message()), (500, "Receive incorrect response"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (500, "Receive incorrect response")
+        );
 
         // The ResultHandler band: success/payment answers never apply.
         let success =
@@ -912,7 +948,10 @@ mod tests {
             Some(&bytes),
             None,
         ));
-        assert_eq!((error.code(), error.message()), (500, "Receive invalid response"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (500, "Receive invalid response")
+        );
     }
 
     #[test]
@@ -925,17 +964,19 @@ mod tests {
         let sent_code = telegram_api::auth_sentCode {
             flags: 0,
             // The safety-net firebase type (the TD_ANDROID-less build).
-            r#type: Some(telegram_api::auth_SentCodeType::auth_sentCodeTypeFirebaseSms(
-                telegram_api::auth_sentCodeTypeFirebaseSms {
-                    flags: 1,
-                    nonce: b"nonce".to_vec(),
-                    play_integrity_project_id: 7,
-                    play_integrity_nonce: Vec::new(),
-                    receipt: String::new(),
-                    push_timeout: 0,
-                    length: 6,
-                },
-            )),
+            r#type: Some(
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeFirebaseSms(
+                    telegram_api::auth_sentCodeTypeFirebaseSms {
+                        flags: 1,
+                        nonce: b"nonce".to_vec(),
+                        play_integrity_project_id: 7,
+                        play_integrity_nonce: Vec::new(),
+                        receipt: String::new(),
+                        push_timeout: 0,
+                        length: 6,
+                    },
+                ),
+            ),
             phone_code_hash: "hash".to_string(),
             next_type: None,
             timeout: 10,
@@ -981,7 +1022,10 @@ mod tests {
         assert_eq!(manager.state, PhoneState::Ok);
         // The generation moved — a stale check-code answer is canceled.
         let error = err_of(manager.on_check_code_result(prepared.generation));
-        assert_eq!((error.code(), error.message()), (500, "Request was canceled"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (500, "Request was canceled")
+        );
     }
 
     #[test]
@@ -992,11 +1036,15 @@ mod tests {
         );
 
         let error = manager.prepare_send_firebase_sms("token").unwrap_err();
-        assert_eq!((error.code(), error.message()), (400, "Can't send Firebase SMS"));
-        let error = manager
-            .prepare_report_missing_code("250")
-            .unwrap_err();
-        assert_eq!((error.code(), error.message()), (400, "Can't report missing code"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (400, "Can't send Firebase SMS")
+        );
+        let error = manager.prepare_report_missing_code("250").unwrap_err();
+        assert_eq!(
+            (error.code(), error.message()),
+            (400, "Can't report missing code")
+        );
         let error = manager.prepare_resend_code(Some(&reason)).unwrap_err();
         assert_eq!((error.code(), error.message()), (400, "Can't resend code"));
         let error = manager.prepare_check_code("12345".to_string()).unwrap_err();
@@ -1073,7 +1121,10 @@ mod tests {
         let telegram_api::Function::auth_resendCode(query) = &prepared.function else {
             panic!("wrong query");
         };
-        assert_eq!(query.flags & AUTH_RESEND_CODE_REASON_MASK, AUTH_RESEND_CODE_REASON_MASK);
+        assert_eq!(
+            query.flags & AUTH_RESEND_CODE_REASON_MASK,
+            AUTH_RESEND_CODE_REASON_MASK
+        );
         assert_eq!(query.reason, "FACE_NOT_RECOGNIZED");
         assert_eq!(query.phone_code_hash, "hash");
         assert_eq!(manager.state, PhoneState::WaitCode);
@@ -1122,7 +1173,10 @@ mod tests {
         assert!(code_settings.unknown_number);
         assert_eq!(code_settings.token, "dt");
         assert!(code_settings.app_sandbox);
-        assert_eq!(code_settings.logout_tokens, vec![b"abcdefghijklmnop".to_vec()]);
+        assert_eq!(
+            code_settings.logout_tokens,
+            vec![b"abcdefghijklmnop".to_vec()]
+        );
     }
 
     #[test]
@@ -1132,7 +1186,9 @@ mod tests {
         assert_eq!(base64url_decode("YWI=").unwrap(), b"ab".to_vec());
         assert_eq!(base64url_decode("YWJj").unwrap(), b"abc".to_vec());
         assert!(base64url_decode("Y").is_err());
-        assert!(base64url_decode("YWJjZA==").is_err()); // padding >= 3 minus one: two pads is fine, three is not
+        // Two pads is legal (the C++ drop_padding accepts < 3) — "YWJjZA==" decodes to "abcd".
+        assert_eq!(base64url_decode("YWJjZA==").unwrap(), b"abcd".to_vec());
+        assert!(base64url_decode("YWJjZA===").is_err()); // three pads: Wrong string padding
         assert!(base64url_decode("A").is_err());
     }
 
@@ -1143,10 +1199,19 @@ mod tests {
             None,
             Some(&Status::error(429, "PHONE_NUMBER_BANNED")),
         ));
-        assert_eq!((error.code(), error.message()), (429, "PHONE_NUMBER_BANNED"));
+        assert_eq!(
+            (error.code(), error.message()),
+            (429, "PHONE_NUMBER_BANNED")
+        );
 
-        let error = parse_phone_answer(&PhonePendingKind::ReportMissingCode, None, None)
-            .unwrap_err();
-        assert_eq!((error.code(), error.message()), (500, "the answer is missing"));
+        let error = err_of(parse_phone_answer(
+            &PhonePendingKind::ReportMissingCode,
+            None,
+            None,
+        ));
+        assert_eq!(
+            (error.code(), error.message()),
+            (500, "the answer is missing")
+        );
     }
 }

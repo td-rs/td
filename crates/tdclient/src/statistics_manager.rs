@@ -46,6 +46,14 @@ pub trait StatisticsManagerEnv {
         );
         let _ = is_dark;
     }
+    fn send_get_poll_stats_query(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        is_dark: bool,
+    ) {
+        tdutils::log_info!("Send messages.getPollVotes for {message_full_id:?} — [blocked: net]");
+        let _ = is_dark;
+    }
     fn send_get_dialog_revenue_withdrawal_url_query(
         &mut self,
         dialog_id: DialogId,
@@ -165,6 +173,9 @@ pub struct StatisticsManager {
     pub parked_withdrawal_urls: Vec<Promise<String>>,
     /// The `PublicForwards`-typed promises parked at the forwards seams.
     pub parked_public_forwards: Vec<Promise<td_api::PublicForwards>>,
+    /// The `PollVoteStatistics`-typed promises parked at the poll-stats
+    /// seam.
+    pub parked_poll_vote_statistics: Vec<Promise<td_api::PollVoteStatistics>>,
 }
 
 impl StatisticsManager {
@@ -227,6 +238,22 @@ impl StatisticsManager {
     ) {
         env.send_get_dialog_revenue_stats_query(dialog_id, is_dark);
         self.parked_revenue_statistics.push(promise);
+    }
+
+    /// `get_poll_statistics` (cpp:888-898) — the messages-manager gate
+    /// (`have_message_force` → "Message not found",
+    /// `can_get_message_poll_vote_statistics` → "Poll statistics are
+    /// inaccessible") runs in the dispatcher arm over the MessagesManager;
+    /// the GetPollStatsQuery send is the seam.
+    pub fn get_poll_statistics(
+        &mut self,
+        env: &mut impl StatisticsManagerEnv,
+        message_full_id: crate::message_id::MessageFullId,
+        is_dark: bool,
+        promise: Promise<td_api::PollVoteStatistics>,
+    ) {
+        env.send_get_poll_stats_query(message_full_id, is_dark);
+        self.parked_poll_vote_statistics.push(promise);
     }
 
     /// `get_dialog_revenue_withdrawal_url` (cpp:793-811) — the SRP
