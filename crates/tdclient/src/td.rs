@@ -93,6 +93,7 @@ use crate::messages_manager::{
 use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
+use crate::phone_number_manager::{PhoneAnswer, PhoneNumberManager, PhonePendingKind};
 use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
@@ -2051,6 +2052,9 @@ enum PendingNetKind {
     Auth(AuthPendingKind),
     GetMe,
     GetState,
+    /// The PhoneNumberManager plane (the glue slice): the change-phone /
+    /// verify-phone / confirm-ownership queries.
+    Phone(PhonePendingKind),
 }
 
 /// The dispatcher callback for the parked queries: files the completed
@@ -2261,6 +2265,10 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::phone_number_manager_` (`Td.cpp:1261`, the `init_managers`
+    /// block; the auth-tails slice) — the collapsed actor behind the
+    /// change/verify/confirm-phone code flows.
+    pub(crate) phone_number_manager: PhoneNumberManager,
     /// `Td::forum_topic_manager_` (`Td.cpp:1297`, M.49).
     pub(crate) forum_topic_manager: crate::forum_topic_manager::ForumTopicManager,
     /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
@@ -2723,6 +2731,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            phone_number_manager: PhoneNumberManager::new(),
             forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
@@ -4702,6 +4711,14 @@ impl Td {
         };
         match kind {
             PendingNetKind::Auth(kind) => self.on_auth_answer(request_id, kind, answer, error),
+            PendingNetKind::Phone(kind) => {
+                let wire_error = if query.is_error() {
+                    Some(query.error())
+                } else {
+                    None
+                };
+                self.on_phone_answer(request_id, kind, answer, wire_error)
+            }
             PendingNetKind::GetMe => {
                 let Some(data) = answer else {
                     let message =
@@ -4838,6 +4855,66 @@ impl Td {
             }
             tdutils::status::Result::Err(status) => {
                 self.send_error_impl(request_id, 400, status.message())
+            }
+        }
+    }
+
+    /// Route one PhoneNumberManager answer (the glue slice): the send/
+    /// resend answers apply through the manager (the generation guard),
+    /// the change-phone check applies the returned self user (the C++
+    /// `ChangePhoneQuery::on_result`), the rest answer ok.
+    fn on_phone_answer(
+        &mut self,
+        request_id: u64,
+        kind: PhonePendingKind,
+        answer: Option<&[u8]>,
+        error: Option<&Status>,
+    ) {
+        let generation = kind.generation();
+        match crate::phone_number_manager::parse_phone_answer(&kind, answer, error) {
+            tdutils::status::Result::Ok(PhoneAnswer::SentCode(sent_code)) => {
+                let generation = generation.unwrap_or_default();
+                match self
+                    .phone_number_manager
+                    .on_send_code_result(generation, sent_code)
+                {
+                    tdutils::status::Result::Ok(code_info) => {
+                        self.send_result(request_id, Object::authenticationCodeInfo(code_info));
+                    }
+                    tdutils::status::Result::Err(status) => {
+                        self.send_error_impl(request_id, status.code(), status.message())
+                    }
+                }
+            }
+            tdutils::status::Result::Ok(PhoneAnswer::ChangedUser(user)) => {
+                // ChangePhoneQuery::on_result — the changed self user
+                // applies before the ok (PhoneNumberManager.cpp:124).
+                self.apply_self_user(&user, true);
+                self.finish_check_code(request_id, generation);
+            }
+            tdutils::status::Result::Ok(PhoneAnswer::Ok) => match kind {
+                PhonePendingKind::CheckCode { .. } => {
+                    self.finish_check_code(request_id, generation);
+                }
+                // Firebase/report answers carry no manager state change.
+                _ => self.send_result(request_id, ok_object()),
+            },
+            tdutils::status::Result::Err(status) => {
+                self.send_error_impl(request_id, status.code(), status.message())
+            }
+        }
+    }
+
+    /// `PhoneNumberManager::on_check_code_result` + the ok (the glue
+    /// slice's check-code completion tail).
+    fn finish_check_code(&mut self, request_id: u64, generation: Option<i64>) {
+        match self
+            .phone_number_manager
+            .on_check_code_result(generation.unwrap_or_default())
+        {
+            tdutils::status::Result::Ok(()) => self.send_result(request_id, ok_object()),
+            tdutils::status::Result::Err(status) => {
+                self.send_error_impl(request_id, status.code(), status.message())
             }
         }
     }
@@ -6065,6 +6142,137 @@ impl Td {
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The PhoneNumberManager plane (the auth-tails glue slice). The five
+    // entry points follow the `set_authentication_phone_number` shape:
+    // prepare in the manager → park + dispatch the real query → the
+    // answer applies on the drain ([`Td::on_phone_answer`]).
+    // ------------------------------------------------------------------
+
+    /// `sendPhoneNumberCode` (Requests.cpp:2480-2486 →
+    /// `PhoneNumberManager::set_phone_number`). The ChangePhone arm hides
+    /// the `CheckPhoneNumber` suggested action between the validation and
+    /// the query (PhoneNumberManager.cpp:250-251).
+    pub(crate) fn send_phone_number_code(
+        &mut self,
+        request_id: u64,
+        phone_number: String,
+        settings: Option<&td_api::PhoneNumberAuthenticationSettings>,
+        ty: Option<&td_api::PhoneNumberCodeType>,
+    ) {
+        let prepared =
+            match self
+                .phone_number_manager
+                .prepare_set_phone_number(phone_number, settings, ty)
+            {
+                std::result::Result::Ok(prepared) => prepared,
+                std::result::Result::Err(status) => {
+                    return self.send_error_impl(request_id, status.code(), status.message());
+                }
+            };
+        if prepared.hide_check_phone_number {
+            let mut action = crate::suggested_action::SuggestedAction::default();
+            action.init(crate::suggested_action::SuggestedActionType::CheckPhoneNumber);
+            let mut env = AccountEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                user_manager: &mut self.user_manager,
+                device_token_manager: &mut self.device_token_manager,
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.account_updates,
+            };
+            self.suggested_action_manager
+                .hide_suggested_action(&mut env, action);
+        }
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::SendCode {
+                generation: prepared.generation,
+            }),
+        );
+        self.dispatch_walking_query(token, prepared.function, AuthFlag::On);
+    }
+
+    /// `sendPhoneNumberFirebaseSms` (Requests.cpp:2488-2493 →
+    /// `PhoneNumberManager::send_firebase_sms`).
+    pub(crate) fn send_phone_number_firebase_sms(&mut self, request_id: u64, token: String) {
+        let function = match self.phone_number_manager.prepare_send_firebase_sms(&token) {
+            std::result::Result::Ok(function) => function,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token_id = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::FirebaseSms),
+        );
+        self.dispatch_walking_query(token_id, function, AuthFlag::On);
+    }
+
+    /// `reportPhoneNumberCodeMissing` (Requests.cpp:2495-2500 →
+    /// `PhoneNumberManager::report_missing_code`).
+    pub(crate) fn report_phone_number_code_missing(
+        &mut self,
+        request_id: u64,
+        mobile_network_code: String,
+    ) {
+        let function = match self
+            .phone_number_manager
+            .prepare_report_missing_code(&mobile_network_code)
+        {
+            std::result::Result::Ok(function) => function,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::ReportMissingCode),
+        );
+        self.dispatch_walking_query(token, function, AuthFlag::On);
+    }
+
+    /// `resendPhoneNumberCode` (Requests.cpp:2502-2506 →
+    /// `PhoneNumberManager::resend_authentication_code`).
+    pub(crate) fn resend_phone_number_code(
+        &mut self,
+        request_id: u64,
+        reason: Option<&td_api::ResendCodeReason>,
+    ) {
+        let prepared = match self.phone_number_manager.prepare_resend_code(reason) {
+            std::result::Result::Ok(prepared) => prepared,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::ResendCode {
+                generation: prepared.generation,
+            }),
+        );
+        self.dispatch_walking_query(token, prepared.function, AuthFlag::On);
+    }
+
+    /// `checkPhoneNumberCode` (Requests.cpp:2508-2513 →
+    /// `PhoneNumberManager::check_code`).
+    pub(crate) fn check_phone_number_code(&mut self, request_id: u64, code: String) {
+        let prepared = match self.phone_number_manager.prepare_check_code(code) {
+            std::result::Result::Ok(prepared) => prepared,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::CheckCode {
+                check: prepared.check,
+                generation: prepared.generation,
+            }),
+        );
+        self.dispatch_walking_query(token, prepared.function, AuthFlag::On);
     }
 
     /// The `AuthManager::on_get_authorization` success broadcast in the

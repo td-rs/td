@@ -1030,10 +1030,22 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
         //    UserManager arm; sendMessage flipped to the real M.10.8–M.10.19
         //    send machinery (the write-family group below) --
         Function::getMe(_) => td.get_me(id),
-        Function::setDatabaseEncryptionKey(_) => {
-            // `G()->td_db()->get_binlog()->change_key(...)` — the binlog
-            // re-key lands with the TdDb binlog-close wiring.
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        Function::setDatabaseEncryptionKey(request) => {
+            // Requests.cpp:2048-2051 — `TdDb::as_db_key` + the binlog
+            // `change_key`. The re-key itself is the tddb encryption
+            // slice (ConcurrentBinlog::change_key — binlog/concurrent.rs,
+            // the reindex-with-encryption seam): the arm is the real
+            // request wiring and the binlog's Status surface answers, so
+            // the C++ wrong-key band reaches the client instead of the
+            // 500 placeholder.
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let db_key = as_db_key(request.new_encryption_key);
+            let status = td.global.td_db().binlog().change_key(db_key, None);
+            if status.is_ok() {
+                promise.set_value(());
+            } else {
+                promise.set_error(status);
+            }
         }
 
         // --- the M.11.4 generic (manager-free) family ---
@@ -13729,6 +13741,66 @@ fn run_password_and_auth_requests(td: &mut Td, id: u64, function: Function) {
                 Err(msg) => td.send_error_impl(id, 400, &msg),
             }
         }
+
+        // -- the PhoneNumberManager plane (the auth-tails glue slice):
+        //    Requests.cpp:2480-2513 — the change-phone / verify-phone /
+        //    confirm-ownership flows; the queries ride the NetQueryDispatcher
+        //    (the auth-net convention) and the answers apply on the drain --
+        Function::sendPhoneNumberCode(request) => {
+            // Requests.cpp:2480-2486 — CHECK_IS_USER + the phone clean.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(phone_number) = clean_or_utf8_error(td, id, &request.phone_number) else {
+                return;
+            };
+            td.send_phone_number_code(
+                id,
+                phone_number,
+                request.settings.as_ref(),
+                request.r#type.as_ref(),
+            );
+        }
+        Function::sendPhoneNumberFirebaseSms(request) => {
+            // Requests.cpp:2488-2493 — CHECK_IS_USER + the token clean.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(token) = clean_or_utf8_error(td, id, &request.token) else {
+                return;
+            };
+            td.send_phone_number_firebase_sms(id, token);
+        }
+        Function::reportPhoneNumberCodeMissing(request) => {
+            // Requests.cpp:2495-2500 — CHECK_IS_USER + the mnc clean.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(mobile_network_code) =
+                clean_or_utf8_error(td, id, &request.mobile_network_code)
+            else {
+                return;
+            };
+            td.report_phone_number_code_missing(id, mobile_network_code);
+        }
+        Function::resendPhoneNumberCode(request) => {
+            // Requests.cpp:2502-2506 — CHECK_IS_USER, no clean.
+            if !check_is_user(td, id) {
+                return;
+            }
+            td.resend_phone_number_code(id, request.reason.as_ref());
+        }
+        Function::checkPhoneNumberCode(request) => {
+            // Requests.cpp:2508-2513 — CHECK_IS_USER + the code clean.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(code) = clean_or_utf8_error(td, id, &request.code) else {
+                return;
+            };
+            td.check_phone_number_code(id, code);
+        }
+
         Function::requestQrCodeAuthentication(request) => {
             match td
                 .auth_manager
@@ -16660,6 +16732,16 @@ fn message_full_id(chat_id: i64, message_id: i64) -> crate::messages_manager::Me
     )
 }
 
+/// `TdDb::as_db_key` (TdDb.cpp:671-676) — the empty key becomes the
+/// well-known "cucumber" raw key.
+fn as_db_key(key: Vec<u8>) -> tddb::DbKey {
+    if key.is_empty() {
+        tddb::DbKey::raw_key(b"cucumber".to_vec())
+    } else {
+        tddb::DbKey::raw_key(key)
+    }
+}
+
 fn check_is_user(td: &mut Td, id: u64) -> bool {
     if td.auth_manager.is_bot() {
         td.send_error_impl(id, 400, "The method is not available to bots");
@@ -17092,12 +17174,19 @@ mod request_census_tests {
         // resetNetworkStatistics, setNetworkType) and getPushReceiverId
         // moving to the synchronous set (918 + 12 = 930 dispatched / 69
         // interim, 23 sync — the merged pin).
+        // The auth-tails glue slice flipped 6 arms: the 5
+        // PhoneNumberManager arms (sendPhoneNumberCode,
+        // checkPhoneNumberCode, resendPhoneNumberCode,
+        // reportPhoneNumberCodeMissing, sendPhoneNumberFirebaseSms — the
+        // queries ride the NetQueryDispatcher) and setDatabaseEncryptionKey
+        // through the binlog change_key wiring (930 + 6 = 936 dispatched /
+        // 69 - 6 = 63 interim, sync unmoved 23).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 23, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            930,
+            936,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 69, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 63, "interim count");
     }
 }
