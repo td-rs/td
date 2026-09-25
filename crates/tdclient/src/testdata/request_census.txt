@@ -31,7 +31,7 @@ addQuickReplyShortcutMessageAlbum	dispatched
 addRecentSticker	interim
 addRecentlyFoundChat	dispatched
 addSavedAnimation	dispatched
-addSavedNotificationSound	interim
+addSavedNotificationSound	dispatched
 addStickerToSet	dispatched
 addStoryAlbumStories	dispatched
 addTextCompositionStyle	dispatched
@@ -47,7 +47,7 @@ answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
 answerWebAppQuery	dispatched
 applyPremiumGiftCode	dispatched
-approveSuggestedPost	interim
+approveSuggestedPost	dispatched
 assignStoreTransaction	dispatched
 banChatMember	dispatched
 banGroupCallParticipants	dispatched
@@ -56,7 +56,7 @@ boostChat	dispatched
 buyGiftUpgrade	dispatched
 canBotSendMessages	dispatched
 canPostStory	dispatched
-canPurchaseFromStore	interim
+canPurchaseFromStore	dispatched
 canSendGift	dispatched
 canSendMessageToUser	dispatched
 canTransferOwnership	dispatched
@@ -86,7 +86,7 @@ checkOauthRequestMatchCode	dispatched
 checkPasswordRecoveryCode	dispatched
 checkPhoneNumberCode	interim
 checkPremiumGiftCode	dispatched
-checkQuickReplyShortcutName	interim
+checkQuickReplyShortcutName	sync
 checkRecoveryEmailAddressCode	dispatched
 checkStickerSetName	dispatched
 checkWebAppFileDownload	dispatched
@@ -145,7 +145,7 @@ createTextCompositionStyle	dispatched
 createVideoChat	dispatched
 declineGroupCallInvitation	dispatched
 declineOauthRequest	dispatched
-declineSuggestedPost	interim
+declineSuggestedPost	dispatched
 decryptGroupCallData	dispatched
 deleteAccount	dispatched
 deleteAllCallMessages	dispatched
@@ -377,7 +377,7 @@ getFileExtension	sync
 getFileMimeType	sync
 getForumTopic	dispatched
 getForumTopicDefaultIcons	dispatched
-getForumTopicHistory	interim
+getForumTopicHistory	dispatched
 getForumTopicLink	dispatched
 getForumTopics	dispatched
 getFullRichMessage	dispatched
@@ -397,7 +397,7 @@ getGroupCall	dispatched
 getGroupCallParticipants	dispatched
 getGroupCallStreamSegment	dispatched
 getGroupCallStreams	dispatched
-getGroupsInCommon	interim
+getGroupsInCommon	dispatched
 getGuardBotWebAppUrl	dispatched
 getImportedContactCount	dispatched
 getInactiveSupergroupChats	dispatched
@@ -470,8 +470,8 @@ getPaymentReceipt	dispatched
 getPersonalChatHistory	dispatched
 getPhoneNumberInfo	interim
 getPhoneNumberInfoSync	interim
-getPollOptionProperties	interim
-getPollVoteStatistics	interim
+getPollOptionProperties	dispatched
+getPollVoteStatistics	dispatched
 getPollVoters	dispatched
 getPreferredCountryLanguage	dispatched
 getPremiumFeatures	dispatched
@@ -504,8 +504,8 @@ getSavedAnimations	dispatched
 getSavedMessagesTags	dispatched
 getSavedMessagesTopicHistory	dispatched
 getSavedMessagesTopicMessageByDate	dispatched
-getSavedNotificationSound	interim
-getSavedNotificationSounds	interim
+getSavedNotificationSound	dispatched
+getSavedNotificationSounds	dispatched
 getSavedOrderInfo	dispatched
 getScopeNotificationSettings	dispatched
 getSearchSponsoredChats	dispatched
@@ -533,7 +533,7 @@ getStory	dispatched
 getStoryAlbumStories	dispatched
 getStoryAvailableReactions	dispatched
 getStoryInteractions	dispatched
-getStoryNotificationSettingsExceptions	interim
+getStoryNotificationSettingsExceptions	dispatched
 getStoryPublicForwards	dispatched
 getStoryStatistics	dispatched
 getSuggestedFileName	interim
@@ -603,7 +603,7 @@ loadCommunityFullInfo	dispatched
 loadDirectMessagesChatTopics	dispatched
 loadGroupCallParticipants	dispatched
 loadQuickReplyShortcutMessages	dispatched
-loadQuickReplyShortcuts	interim
+loadQuickReplyShortcuts	dispatched
 loadSavedMessagesTopics	dispatched
 logOut	dispatched
 markChecklistTasksAsDone	dispatched
@@ -631,11 +631,11 @@ processGiftPurchaseOffer	dispatched
 processPushNotification	interim
 rateSpeechRecognition	dispatched
 readAllChatMentions	dispatched
-readAllChatPollVotes	interim
+readAllChatPollVotes	dispatched
 readAllChatReactions	dispatched
 readAllDirectMessagesChatTopicReactions	dispatched
 readAllForumTopicMentions	dispatched
-readAllForumTopicPollVotes	interim
+readAllForumTopicPollVotes	dispatched
 readAllForumTopicReactions	dispatched
 readBusinessMessage	dispatched
 readChatList	dispatched
@@ -669,7 +669,7 @@ removeRecentHashtag	interim
 removeRecentSticker	interim
 removeRecentlyFoundChat	dispatched
 removeSavedAnimation	dispatched
-removeSavedNotificationSound	interim
+removeSavedNotificationSound	dispatched
 removeSearchedForTag	interim
 removeStickerFromSet	dispatched
 removeStoryAlbumStories	dispatched
