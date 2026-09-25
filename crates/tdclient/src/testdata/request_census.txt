@@ -84,7 +84,7 @@ checkEmailAddressVerificationCode	dispatched
 checkLoginEmailAddressCode	dispatched
 checkOauthRequestMatchCode	dispatched
 checkPasswordRecoveryCode	dispatched
-checkPhoneNumberCode	interim
+checkPhoneNumberCode	dispatched
 checkPremiumGiftCode	dispatched
 checkQuickReplyShortcutName	interim
 checkRecoveryEmailAddressCode	dispatched
@@ -696,7 +696,7 @@ reportChat	dispatched
 reportChatPhoto	dispatched
 reportChatSponsoredMessage	dispatched
 reportMessageReactions	dispatched
-reportPhoneNumberCodeMissing	interim
+reportPhoneNumberCodeMissing	dispatched
 reportSponsoredChat	dispatched
 reportStory	dispatched
 reportSupergroupAntiSpamFalsePositive	dispatched
@@ -709,7 +709,7 @@ resendAuthenticationCode	dispatched
 resendEmailAddressVerificationCode	dispatched
 resendLoginEmailAddressCode	dispatched
 resendMessages	dispatched
-resendPhoneNumberCode	interim
+resendPhoneNumberCode	dispatched
 resendRecoveryEmailAddressCode	dispatched
 resetAllNotificationSettings	dispatched
 resetAuthenticationEmailAddress	dispatched
@@ -780,8 +780,8 @@ sendMessageAlbum	dispatched
 sendMessageViewMetrics	dispatched
 sendPassportAuthorizationForm	dispatched
 sendPaymentForm	dispatched
-sendPhoneNumberCode	interim
-sendPhoneNumberFirebaseSms	interim
+sendPhoneNumberCode	dispatched
+sendPhoneNumberFirebaseSms	dispatched
 sendQuickReplyShortcutMessages	dispatched
 sendResoldGift	dispatched
 sendRichMessageDraft	dispatched
@@ -848,7 +848,7 @@ setCommunityName	dispatched
 setCustomEmojiStickerSetThumbnail	dispatched
 setCustomLanguagePack	dispatched
 setCustomLanguagePackString	dispatched
-setDatabaseEncryptionKey	interim
+setDatabaseEncryptionKey	dispatched
 setDefaultBackground	dispatched
 setDefaultChannelAdministratorRights	dispatched
 setDefaultGroupAdministratorRights	dispatched
