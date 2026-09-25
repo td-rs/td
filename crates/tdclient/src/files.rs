@@ -3288,28 +3288,16 @@ impl fmt::Display for FileData {
 
 // ==== FileSource (M.12.2a) ====
 
-/// `td::BackgroundId` (BackgroundId.h) — a wire-format definition; it moves
-/// to the BackgroundManager module when that manager lands (Wave 2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BackgroundId(i64);
+/// `td::BackgroundId` (BackgroundId.h) — the canonical id wrapper lives in
+/// [`crate::background_manager`] (the Backgrounds slice); the FileSource
+/// wire format re-exports it.
+pub use crate::background_manager::BackgroundId;
 
 impl BackgroundId {
-    pub fn new(id: i64) -> BackgroundId {
-        BackgroundId(id)
-    }
-
-    pub fn get(self) -> i64 {
-        self.0
-    }
-
-    /// `BackgroundId::store` (BackgroundId.h:50-52).
-    pub fn store(self, out: &mut Vec<u8>) {
-        store_parse::store_i64(out, self.0);
-    }
-
-    /// `BackgroundId::parse` (BackgroundId.h:54-56).
+    /// The FileSource-codec name for `BackgroundId::parse` (the canonical
+    /// wrapper's method is `parse`).
     pub fn parse_from(parser: &mut Parser) -> Result<BackgroundId, &'static str> {
-        Ok(BackgroundId::new(parser.i64_()?))
+        BackgroundId::parse(parser)
     }
 }
 
