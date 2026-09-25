@@ -12,14 +12,14 @@ addChecklistTasks	dispatched
 addContact	dispatched
 addCustomServerLanguagePack	dispatched
 addFavoriteSticker	dispatched
-addFileToDownloads	interim
+addFileToDownloads	dispatched
 addGiftCollectionGifts	dispatched
 addLocalMessage	dispatched
 addLogMessage	sync
 addLoginPasskey	dispatched
 addMessageReaction	dispatched
 addNetworkStatistics	dispatched
-addOffer	interim
+addOffer	dispatched
 addPendingLiveStoryReaction	dispatched
 addPendingPaidMessageReaction	dispatched
 addPollOption	dispatched
@@ -90,7 +90,7 @@ checkQuickReplyShortcutName	sync
 checkRecoveryEmailAddressCode	dispatched
 checkStickerSetName	dispatched
 checkWebAppFileDownload	dispatched
-cleanFileName	interim
+cleanFileName	sync
 clearAllDraftMessages	dispatched
 clearAutosaveSettingsExceptions	dispatched
 clearImportedContacts	dispatched
@@ -171,7 +171,7 @@ deleteDefaultBackground	dispatched
 deleteDirectMessagesChatTopicHistory	dispatched
 deleteDirectMessagesChatTopicMessagesByDate	dispatched
 deleteEphemeralMessage	dispatched
-deleteFile	interim
+deleteFile	dispatched
 deleteForumTopic	dispatched
 deleteGiftCollection	dispatched
 deleteGroupCallMessages	dispatched
@@ -256,7 +256,7 @@ getAllPassportElements	dispatched
 getAllStickerEmojis	dispatched
 getAnimatedEmoji	dispatched
 getApplicationConfig	dispatched
-getApplicationDownloadLink	interim
+getApplicationDownloadLink	dispatched
 getArchiveChatListSettings	dispatched
 getArchivedStickerSets	dispatched
 getAttachedStickerSets	dispatched
@@ -430,7 +430,7 @@ getLoginUrlInfo	dispatched
 getMainWebApp	dispatched
 getManagedBotAccessSettings	dispatched
 getManagedBotToken	dispatched
-getMapThumbnailFile	interim
+getMapThumbnailFile	dispatched
 getMarkdownText	sync
 getMe	dispatched
 getMenuButton	dispatched
@@ -536,7 +536,7 @@ getStoryInteractions	dispatched
 getStoryNotificationSettingsExceptions	dispatched
 getStoryPublicForwards	dispatched
 getStoryStatistics	dispatched
-getSuggestedFileName	interim
+getSuggestedFileName	dispatched
 getSuggestedStickerSetName	dispatched
 getSuitableDiscussionChats	dispatched
 getSuitablePersonalChats	dispatched
@@ -639,7 +639,7 @@ readAllForumTopicPollVotes	dispatched
 readAllForumTopicReactions	dispatched
 readBusinessMessage	dispatched
 readChatList	dispatched
-readFilePart	interim
+readFilePart	dispatched
 readdQuickReplyShortcutMessages	dispatched
 recognizeSpeech	dispatched
 recoverAuthenticationPassword	dispatched
@@ -719,7 +719,7 @@ resetPassword	dispatched
 reuseStarSubscription	dispatched
 revokeChatInviteLink	dispatched
 revokeGroupCallInviteLink	dispatched
-saveApplicationLogEvent	interim
+saveApplicationLogEvent	dispatched
 savePreparedInlineMessage	dispatched
 savePreparedKeyboardButton	dispatched
 searchAffiliatePrograms	dispatched
@@ -791,7 +791,7 @@ sendWebAppData	dispatched
 setAccentColor	dispatched
 setAccountTtl	dispatched
 setAlarm	dispatched
-setApplicationVerificationToken	interim
+setApplicationVerificationToken	dispatched
 setArchiveChatListSettings	dispatched
 setAuthenticationEmailAddress	dispatched
 setAuthenticationPhoneNumber	dispatched
