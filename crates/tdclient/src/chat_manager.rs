@@ -10655,6 +10655,13 @@ impl ChatManager {
         }
     }
 
+    /// `is_appointed_chat_administrator` (ChatManager.cpp:8589-8595) — the
+    /// bot-side rights probe of `setChatAvailableReactions`.
+    pub fn is_appointed_chat_administrator(&self, chat_id: ChatId) -> bool {
+        self.get_chat(chat_id)
+            .is_some_and(|c| c.status.is_administrator())
+    }
+
     /// `get_chat_permissions(const Chat *)` (ChatManager.cpp:8582-8588).
     pub fn get_chat_permissions_record(c: &Chat) -> DialogParticipantStatus {
         if !c.is_active {

@@ -13,8 +13,12 @@ pub mod age_verification_parameters;
 pub mod animations_manager;
 pub mod attach_menu_manager;
 pub mod audios_manager;
+pub mod auth_data_shared;
+pub mod auth_dispatch;
 pub mod auth_manager;
+
 pub mod autosave_manager;
+pub mod background_manager;
 pub mod birthdate;
 pub mod boost_manager;
 pub mod bot_access_settings;
@@ -48,6 +52,7 @@ pub mod chat_manager;
 pub mod chat_reactions;
 pub mod client;
 pub mod client_json;
+
 pub mod community_id;
 pub mod community_manager;
 pub mod config_dispatch;
@@ -57,6 +62,8 @@ pub mod config_result;
 pub mod connection_creator;
 pub mod contact;
 pub mod convert;
+
+pub mod dc_auth_manager;
 pub mod device_token_manager;
 pub mod dh_cache;
 pub mod dialog_db;
@@ -76,6 +83,7 @@ pub mod forum_topic_manager;
 pub mod game;
 pub mod game_manager;
 pub mod global;
+
 pub mod group_call_manager;
 pub mod inline_keyboard_button;
 pub mod inline_message_manager;
@@ -98,13 +106,15 @@ pub mod message_reactor;
 pub mod message_sender;
 pub mod messages_manager;
 pub mod misc;
-pub mod net;
+
 pub mod notification;
 pub mod notification_db;
 pub mod notification_manager;
 pub mod notification_settings;
 pub mod notification_settings_manager;
 pub mod option_manager;
+
+pub mod mtproto_header;
 pub mod paid_reaction_type;
 pub mod password_manager;
 pub mod payments;
@@ -127,6 +137,7 @@ pub mod request_actor;
 pub mod requested_dialog_type;
 pub mod requests;
 pub mod restriction_reason;
+
 pub mod rich_button_style;
 pub mod saved_messages_manager;
 pub mod secret_chat;
@@ -134,6 +145,7 @@ pub mod secret_chats_manager;
 pub mod secure_manager;
 pub mod secure_storage;
 pub mod secure_value;
+pub mod session_multi_proxy;
 pub mod sponsored_message_manager;
 pub mod star_gift_manager;
 pub mod star_manager;
@@ -165,6 +177,7 @@ pub mod translation_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+
 pub mod video_notes_manager;
 pub mod videos_manager;
 pub mod voice_notes_manager;

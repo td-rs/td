@@ -21,7 +21,7 @@
 //! - `VLOG(notifications)` traces are dropped; `LOG(ERROR)` warnings are kept
 //!   via `log_error!`.
 
-use crate::chat_manager::{ChannelId, ChatId};
+use crate::chat_manager::{ChannelId, ChatId, DialogParticipantStatus};
 use crate::files::{FileId, FileSourceId};
 use crate::inline_keyboard_button::InlineKeyboardButtonEnv;
 use crate::message_content::{
@@ -42,7 +42,7 @@ use crate::reply_markup::{
     get_reply_markup_object, parse_reply_markup, store_reply_markup,
 };
 use crate::td_api;
-use crate::user_manager::{SecretChatId, UserId};
+use crate::user_manager::{AccessRights, SecretChatId, UserId};
 use std::collections::{HashMap, HashSet};
 use tdmtproto::telegram_api;
 use tdutils::hash::{combine_hashes, hash_int64, hash_uint32};
@@ -3098,6 +3098,16 @@ impl ChatReactions {
     /// `ChatReactions::empty` (ChatReactions.h:56-58).
     pub fn empty(&self) -> bool {
         self.reaction_types.is_empty() && !self.allow_all_regular && !self.paid_reactions_available
+    }
+
+    /// `ChatReactions::fix_broadcast_reactions` (ChatReactions.cpp:89-95)
+    /// over the dialog-store form.
+    pub fn fix_broadcast_reactions(&mut self, active_reaction_types: &[ReactionType]) {
+        if self.allow_all_regular {
+            self.reaction_types = active_reaction_types.to_vec();
+            self.allow_all_regular = false;
+            self.allow_all_custom = false;
+        }
     }
 }
 
@@ -9117,6 +9127,415 @@ pub fn has_unread_poll_votes(ctx: &dyn DialogReactionsContext, m: &Message) -> b
         return false;
     }
     false // [blocked: M.9.17] get_message_content_poll_has_unread_votes over the poll manager seam
+}
+
+// ---- the available-reactions request plane (the M.react slice;
+// Requests.cpp:6082-6087, MessagesManager.cpp:30373-30424) ----
+
+/// The `Td *td` slice of `set_dialog_available_reactions`. The access
+/// checks answer the collapsed-world bands (the M.6 dialog integration
+/// owns the full rights/restrictions family), the update emitters are
+/// the M.7/M.10 emission plane, and the server query is the net seam.
+pub trait DialogAvailableReactionsEnv: crate::chat_reactions::ChatReactionsEnv {
+    /// `td_->auth_manager_->is_bot()`.
+    fn is_bot(&self) -> bool;
+
+    /// `td_->dialog_manager_->is_broadcast_channel(dialog_id)` — the
+    /// `allow_all_custom` input of the td_api conversion.
+    fn is_broadcast_channel(&mut self, dialog_id: DialogId) -> bool;
+
+    /// `td_->dialog_manager_->check_dialog_access(dialog_id, false,
+    /// AccessRights::Read, source)`.
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: DialogId,
+        allow_secret_chats: bool,
+        access_rights: AccessRights,
+        source: &str,
+    ) -> Result<(), Status>;
+
+    /// `td_->chat_manager_->get_chat_permissions(chat_id)`.
+    fn get_chat_permissions(&mut self, chat_id: ChatId) -> DialogParticipantStatus;
+
+    /// `td_->chat_manager_->is_appointed_chat_administrator(chat_id)` —
+    /// the bot leg of the basic-group rights check.
+    fn is_appointed_chat_administrator(&mut self, chat_id: ChatId) -> bool;
+
+    /// `td_->chat_manager_->get_channel_permissions(channel_id)`.
+    fn get_channel_permissions(&mut self, channel_id: ChannelId) -> DialogParticipantStatus;
+
+    /// `need_hide_dialog_reactions(d)` — the ban gate of the
+    /// client-update emission; the collapsed line answers false (the M.6
+    /// ban plane).
+    fn is_chat_banned(&mut self, dialog_id: DialogId) -> bool {
+        let _ = dialog_id;
+        false
+    }
+
+    // -- the update plane ([blocked: M.7/M.10 emission])
+    /// `send_closure(G()->td(), &Td::send_update, ...)`.
+    fn send_update(&mut self, _update: td_api::Update) {}
+    /// `send_update_message_unread_reactions(dialog_id, m,
+    /// d->unread_reaction_count)` — the message-object build is the
+    /// emission plane.
+    fn send_update_message_unread_reactions(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _unread_reaction_count: i32,
+    ) {
+    }
+    /// `send_update_message_interaction_info(dialog_id, m)`.
+    fn send_update_message_interaction_info(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+    ) {
+    }
+
+    // -- the net query seam ([blocked: net])
+    /// `td_->dialog_manager_->set_dialog_available_reactions_on_server`
+    /// — the changed-reactions server ack; dropping the promise keeps
+    /// the C++ request unanswered offline.
+    fn set_dialog_available_reactions_on_server(
+        &mut self,
+        dialog_id: DialogId,
+        available_reactions: &ChatReactions,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (dialog_id, available_reactions, promise);
+    }
+}
+
+/// `operator==(ChatReactions, ChatReactions)` (ChatReactions.cpp:138-142)
+/// over the dialog-store form — `allow_all_custom` is deliberately not
+/// compared, unlike the derived `PartialEq` of this module's struct.
+fn chat_reactions_eq(lhs: &ChatReactions, rhs: &ChatReactions) -> bool {
+    lhs.reaction_types == rhs.reaction_types
+        && lhs.allow_all_regular == rhs.allow_all_regular
+        && lhs.reactions_limit == rhs.reactions_limit
+        && lhs.paid_reactions_available == rhs.paid_reactions_available
+}
+
+/// `ChatReactions::get_active_reactions` (ChatReactions.cpp:76-87) over
+/// the dialog-store form — the M.16 container method's semantics; the
+/// older [`get_active_reactions`] above records the Wave-2
+/// simplification used by the chat-object plane.
+fn get_active_reactions_exact(
+    pos: &HashMap<ReactionType, usize>,
+    available_reactions: &ChatReactions,
+) -> ChatReactions {
+    let mut result = available_reactions.clone();
+    if !result.reaction_types.is_empty() {
+        debug_assert!(!result.allow_all_regular);
+        debug_assert!(!result.allow_all_custom);
+        result
+            .reaction_types
+            .retain(|reaction_type| pos.contains_key(reaction_type));
+    }
+    result
+}
+
+/// `MessagesManager::get_active_reactions` (MessagesManager.cpp:6416-6421).
+fn get_active_reactions_member(
+    is_bot: bool,
+    pos: &HashMap<ReactionType, usize>,
+    available_reactions: &ChatReactions,
+) -> ChatReactions {
+    if is_bot {
+        return available_reactions.clone();
+    }
+    get_active_reactions_exact(pos, available_reactions)
+}
+
+/// The dialog-store `ChatReactions` rebuilt as the M.16 behavior
+/// container — the two Rust structs split the same C++ class (and the
+/// two `ReactionType`s share the string encoding); the converters
+/// collapse at the M.16/M.10 dialog integration.
+fn chat_reactions_to_container(reactions: &ChatReactions) -> crate::chat_reactions::ChatReactions {
+    crate::chat_reactions::ChatReactions {
+        reaction_types: reactions
+            .reaction_types
+            .iter()
+            .map(|reaction_type| {
+                crate::reaction_type::ReactionType::new(reaction_type.get_string().to_owned())
+            })
+            .collect(),
+        allow_all_regular: reactions.allow_all_regular,
+        allow_all_custom: reactions.allow_all_custom,
+        reactions_limit: reactions.reactions_limit,
+        paid_reactions_available: reactions.paid_reactions_available,
+    }
+}
+
+/// `get_chat_id_object(dialog_id, source)` for the chat/channel ids this
+/// plane emits — both wire kinds carry a `chat_id`.
+fn get_chat_id_object(dialog_id: DialogId) -> i64 {
+    match dialog_id.get_type() {
+        DialogType::Chat => dialog_id.get_chat_id().get(),
+        DialogType::Channel => dialog_id.get_channel_id().get(),
+        _ => 0,
+    }
+}
+
+/// `MessagesManager::set_dialog_available_reactions`
+/// (MessagesManager.cpp:30373-30424).
+pub fn set_dialog_available_reactions(
+    manager: &mut MessagesManager,
+    env: &mut impl DialogAvailableReactionsEnv,
+    dialog_id: DialogId,
+    available_reactions: Option<td_api::ChatAvailableReactions>,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    if let Err(status) = env.check_dialog_access(
+        dialog_id,
+        false,
+        AccessRights::Read,
+        "set_dialog_available_reactions",
+    ) {
+        return promise.set_error(status);
+    }
+
+    let allow_all_custom = !env.is_broadcast_channel(dialog_id);
+    // `ChatReactions(td_api::object_ptr<ChatAvailableReactions>, bool)`
+    // (ChatReactions.cpp:51-74) over the M.16 container, then the
+    // dialog-store copy.
+    let converted =
+        crate::chat_reactions::ChatReactions::from_td_api(available_reactions, allow_all_custom);
+    let mut available_reactions = ChatReactions {
+        reaction_types: converted
+            .reaction_types()
+            .iter()
+            .map(|reaction_type| ReactionType::new(reaction_type.get_string()))
+            .collect(),
+        allow_all_regular: converted.allow_all_regular(),
+        allow_all_custom: converted.allow_all_custom(),
+        reactions_limit: converted.reactions_limit(),
+        paid_reactions_available: converted.paid_reactions_available(),
+    };
+
+    let active_reactions = get_active_reactions_member(
+        env.is_bot(),
+        &manager.active_reaction_pos,
+        &available_reactions,
+    );
+    if active_reactions.reaction_types.len() != available_reactions.reaction_types.len() {
+        return promise.set_error(Status::error(400, "Invalid reactions specified"));
+    }
+    available_reactions = active_reactions;
+
+    match dialog_id.get_type() {
+        DialogType::User => {
+            return promise.set_error(Status::error(
+                400,
+                "Can't change private chat available reactions",
+            ));
+        }
+        DialogType::Chat => {
+            let chat_id = dialog_id.get_chat_id();
+            let status = env.get_chat_permissions(chat_id);
+            if !status.can_change_info_and_settings()
+                || (env.is_bot() && !env.is_appointed_chat_administrator(chat_id))
+            {
+                return promise.set_error(Status::error(
+                    400,
+                    "Not enough rights to change chat available reactions",
+                ));
+            }
+        }
+        DialogType::Channel => {
+            let status = env.get_channel_permissions(dialog_id.get_channel_id());
+            if !status.can_change_info_and_settings() {
+                return promise.set_error(Status::error(
+                    400,
+                    "Not enough rights to change chat available reactions",
+                ));
+            }
+        }
+        DialogType::SecretChat | DialogType::None => {
+            unreachable!("check_dialog_access only passes users, basic groups and channels")
+        }
+    }
+
+    // the pos snapshot feeds both the dialog tail and the update build;
+    // clone it before the dialog borrow aliases the manager
+    let pos = manager.active_reaction_pos.clone();
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        // C++ receives `d` from the same access check; the collapsed
+        // access check consults the chat/user managers, so the dialog
+        // can still be missing in memory.
+        return promise.set_error(Status::error(400, "Chat not found"));
+    };
+
+    let is_changed = !chat_reactions_eq(&d.available_reactions, &available_reactions);
+    let is_bot = env.is_bot();
+    // the C++ passes a copy into the private setter, keeping the
+    // active-filtered value alive for the server query below; the
+    // db-save tail returns to the caller because the dialog borrow
+    // aliases the manager
+    let need_db_save =
+        set_dialog_available_reactions_in_dialog(env, &pos, d, available_reactions.clone(), is_bot);
+    if need_db_save {
+        on_dialog_updated(manager, dialog_id, "set_dialog_available_reactions");
+    }
+
+    if !is_changed {
+        return promise.set_value(());
+    }
+
+    env.set_dialog_available_reactions_on_server(dialog_id, &available_reactions, promise);
+}
+
+/// `MessagesManager::set_dialog_available_reactions(Dialog *, ChatReactions)`
+/// (MessagesManager.cpp:6265-6303) — returns whether `on_dialog_updated`
+/// must fire.
+fn set_dialog_available_reactions_in_dialog(
+    env: &mut impl DialogAvailableReactionsEnv,
+    pos: &HashMap<ReactionType, usize>,
+    d: &mut Dialog,
+    mut available_reactions: ChatReactions,
+    is_bot: bool,
+) -> bool {
+    match d.dialog_id.get_type() {
+        DialogType::Chat | DialogType::Channel => {}
+        _ => unreachable!("set_dialog_available_reactions expects a basic group or a channel"),
+    }
+    if env.is_broadcast_channel(d.dialog_id) {
+        // `fix_broadcast_reactions(active_reaction_types_)` — the pos map
+        // keys in their position order
+        let mut active_reaction_types: Vec<ReactionType> = pos.keys().cloned().collect();
+        active_reaction_types.sort_by_key(|reaction_type| pos[reaction_type]);
+        available_reactions.fix_broadcast_reactions(&active_reaction_types);
+    }
+    if chat_reactions_eq(&d.available_reactions, &available_reactions) {
+        if !d.is_available_reactions_inited {
+            d.is_available_reactions_inited = true;
+            return true;
+        }
+        return false;
+    }
+
+    let old_active_reactions = get_active_reactions_member(is_bot, pos, &d.available_reactions);
+    let new_active_reactions = get_active_reactions_member(is_bot, pos, &available_reactions);
+    let need_update = !chat_reactions_eq(&old_active_reactions, &new_active_reactions);
+    let need_update_message_reactions_visibility =
+        old_active_reactions.empty() != new_active_reactions.empty() && !is_bot;
+
+    d.available_reactions = available_reactions;
+    d.is_available_reactions_inited = true;
+    if need_update_message_reactions_visibility {
+        if !old_active_reactions.empty() {
+            hide_dialog_message_reactions(env, d);
+        }
+        set_dialog_next_available_reactions_generation(env, pos, d);
+    }
+
+    if need_update {
+        send_update_chat_available_reactions(env, pos, d);
+    }
+    true
+}
+
+/// `MessagesManager::hide_dialog_message_reactions`
+/// (MessagesManager.cpp:6340-6362) — the local half; the message-object
+/// builds and the db resave ride the emission plane.
+fn hide_dialog_message_reactions(env: &mut impl DialogAvailableReactionsEnv, d: &mut Dialog) {
+    debug_assert!(!env.is_bot());
+    match d.dialog_id.get_type() {
+        DialogType::Chat | DialogType::Channel => {}
+        _ => unreachable!("hide_dialog_message_reactions expects a basic group or a channel"),
+    }
+    let message_ids = find_dialog_messages(d, |m| {
+        m.reactions
+            .as_ref()
+            .is_some_and(|reactions| !reactions.are_empty())
+    });
+    for message_id in message_ids {
+        let Some(m) = d.messages.get_mut(&message_id) else {
+            unreachable!("find_dialog_messages returned a message the dialog does not hold");
+        };
+        let need_update_unread_reactions = m
+            .reactions
+            .as_ref()
+            .is_some_and(|reactions| !reactions.unread_reactions.is_empty());
+        m.reactions = None;
+        // don't resave all messages to the database
+        if need_update_unread_reactions {
+            env.send_update_message_unread_reactions(
+                d.dialog_id,
+                message_id,
+                d.unread_reaction_count,
+            );
+        }
+        env.send_update_message_interaction_info(d.dialog_id, message_id);
+    }
+    if d.unread_reaction_count != 0 {
+        // `set_dialog_unread_reaction_count(d, 0)` — the local field; the
+        // repair/update tail is the M.10.7 counters plane
+        d.unread_reaction_count = 0;
+    }
+}
+
+/// `MessagesManager::set_dialog_next_available_reactions_generation`
+/// (MessagesManager.cpp:6306-6333).
+fn set_dialog_next_available_reactions_generation(
+    env: &impl DialogAvailableReactionsEnv,
+    pos: &HashMap<ReactionType, usize>,
+    d: &mut Dialog,
+) {
+    match d.dialog_id.get_type() {
+        DialogType::Chat | DialogType::Channel => {}
+        _ => unreachable!("the generation plane expects a basic group or a channel"),
+    }
+    let generation =
+        if get_active_reactions_member(env.is_bot(), pos, &d.available_reactions).empty() {
+            // 0 -> 1
+            // 1 -> 3
+            d.available_reactions_generation + (d.available_reactions_generation & 1) + 1
+        } else {
+            // 0 -> 2
+            // 1 -> 2
+            d.available_reactions_generation - (d.available_reactions_generation & 1) + 2
+        };
+    d.available_reactions_generation = generation;
+}
+
+/// `MessagesManager::send_update_chat_available_reactions`
+/// (MessagesManager.cpp:27574-27585).
+fn send_update_chat_available_reactions(
+    env: &mut impl DialogAvailableReactionsEnv,
+    pos: &HashMap<ReactionType, usize>,
+    d: &mut Dialog,
+) {
+    // LOG_CHECK(d->is_update_new_chat_sent) — the in-memory setter plane
+    // keeps the flag set by the time this runs
+    debug_assert!(d.is_update_new_chat_sent);
+    // `need_hide_dialog_reactions(d)` (MessagesManager.cpp:27558-27571)
+    let need_hide = match d.dialog_id.get_type() {
+        DialogType::Chat | DialogType::Channel => env.is_chat_banned(d.dialog_id),
+        _ => false,
+    };
+    if !need_hide || !d.last_need_hide_reactions {
+        d.last_need_hide_reactions = need_hide;
+        // `get_dialog_active_reactions(d)` (MessagesManager.cpp:6423-6440)
+        let available_reactions = match d.dialog_id.get_type() {
+            DialogType::User => ChatReactions::from_all_flags(true, true),
+            DialogType::Chat | DialogType::Channel => {
+                get_active_reactions_member(env.is_bot(), pos, &d.available_reactions)
+            }
+            _ => ChatReactions::default(),
+        };
+        let available_reactions = Some(
+            chat_reactions_to_container(&available_reactions)
+                .get_chat_available_reactions_object(env),
+        );
+        env.send_update(td_api::Update::updateChatAvailableReactions(
+            td_api::updateChatAvailableReactions {
+                chat_id: get_chat_id_object(d.dialog_id),
+                available_reactions,
+            },
+        ));
+    }
 }
 
 /// `MessagesManager::get_message_index_mask` (MessagesManager.cpp:4161-4197).
@@ -19619,6 +20038,18 @@ fn have_message_force(d: &Dialog, message_id: MessageId, source: &str) -> bool {
     have
 }
 
+/// `MessagesManager::have_message_force(MessageFullId, source)` — the
+/// dialog-lookup form over the same in-memory probe.
+pub(crate) fn have_message_force_full(
+    manager: &MessagesManager,
+    message_full_id: MessageFullId,
+    source: &str,
+) -> bool {
+    manager
+        .get_dialog(message_full_id.get_dialog_id())
+        .is_some_and(|d| have_message_force(d, message_full_id.get_message_id(), source))
+}
+
 /// `MessagesManager::register_dialog_ephemeral_message` /
 /// `unregister_dialog_ephemeral_message` (MessagesManager.cpp:13806-13820).
 fn register_dialog_ephemeral_message(d: &mut Dialog, ephemeral_message_id: EphemeralMessageId) {
@@ -27311,6 +27742,359 @@ mod tests {
     use crate::keyboard_button::{KeyboardButton, KeyboardButtonType};
     use crate::keyboard_button_style::{KeyboardButtonStyle, KeyboardButtonStyleType};
     use crate::requested_dialog_type::{RequestedDialogType, RequestedDialogTypeType};
+
+    /// the local emoji of the dialog-store reaction world
+    fn local_emoji(reaction: &str) -> ReactionType {
+        ReactionType::new(reaction)
+    }
+
+    /// the recording env of the `setChatAvailableReactions` plane
+    struct AvailReactionsEnv {
+        is_bot: bool,
+        broadcast: bool,
+        access_ok: bool,
+        status_can_change: bool,
+        appointed_admin: bool,
+        server_calls: Vec<DialogId>,
+        updates: Vec<&'static str>,
+    }
+
+    impl Default for AvailReactionsEnv {
+        fn default() -> AvailReactionsEnv {
+            AvailReactionsEnv {
+                is_bot: false,
+                broadcast: false,
+                access_ok: true,
+                status_can_change: true,
+                appointed_admin: true,
+                server_calls: Vec::new(),
+                updates: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::chat_reactions::ChatReactionsEnv for AvailReactionsEnv {
+        fn get_option_integer(&self, _name: &str, default_value: i64) -> i64 {
+            default_value
+        }
+    }
+
+    impl DialogAvailableReactionsEnv for AvailReactionsEnv {
+        fn is_bot(&self) -> bool {
+            self.is_bot
+        }
+
+        fn is_broadcast_channel(&mut self, _dialog_id: DialogId) -> bool {
+            self.broadcast
+        }
+
+        fn check_dialog_access(
+            &mut self,
+            _dialog_id: DialogId,
+            _allow_secret_chats: bool,
+            _access_rights: AccessRights,
+            _source: &str,
+        ) -> Result<(), Status> {
+            if self.access_ok {
+                Ok(())
+            } else {
+                Err(Status::error(400, "Chat not found"))
+            }
+        }
+
+        fn get_chat_permissions(&mut self, _chat_id: ChatId) -> DialogParticipantStatus {
+            if self.status_can_change {
+                DialogParticipantStatus::creator(false, false, String::new())
+            } else {
+                DialogParticipantStatus::banned(0, String::new())
+            }
+        }
+
+        fn is_appointed_chat_administrator(&mut self, _chat_id: ChatId) -> bool {
+            self.appointed_admin
+        }
+
+        fn get_channel_permissions(&mut self, _channel_id: ChannelId) -> DialogParticipantStatus {
+            if self.status_can_change {
+                DialogParticipantStatus::creator(false, false, String::new())
+            } else {
+                DialogParticipantStatus::banned(0, String::new())
+            }
+        }
+
+        fn is_chat_banned(&mut self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn send_update(&mut self, update: td_api::Update) {
+            if matches!(update, td_api::Update::updateChatAvailableReactions(_)) {
+                self.updates.push("updateChatAvailableReactions");
+            }
+        }
+
+        fn set_dialog_available_reactions_on_server(
+            &mut self,
+            dialog_id: DialogId,
+            _available_reactions: &ChatReactions,
+            _promise: tdutils::promise::Promise<()>,
+        ) {
+            self.server_calls.push(dialog_id);
+        }
+    }
+
+    fn channel_dialog(channel_id: i64) -> (DialogId, Box<Dialog>) {
+        let dialog_id = DialogId::from_channel_id(ChannelId::new(channel_id));
+        let mut d = Box::new(Dialog::default());
+        d.dialog_id = dialog_id;
+        // the send_update_chat_available_reactions LOG_CHECK precondition
+        d.is_update_new_chat_sent = true;
+        (dialog_id, d)
+    }
+
+    fn some_reactions_input(emoji: &str) -> Option<td_api::ChatAvailableReactions> {
+        Some(td_api::ChatAvailableReactions::chatAvailableReactionsSome(
+            td_api::chatAvailableReactionsSome {
+                reactions: vec![td_api::ReactionType::reactionTypeEmoji(
+                    td_api::reactionTypeEmoji {
+                        emoji: emoji.to_owned(),
+                    },
+                )],
+                max_reaction_count: 3,
+            },
+        ))
+    }
+
+    /// the invalid-reactions band and the private-chat rejection; neither
+    /// reaches the dialog or the server seam
+    #[test]
+    fn set_available_reactions_rejects_invalid_and_private_targets() {
+        let mut manager = MessagesManager::default();
+        let mut env = AvailReactionsEnv::default();
+
+        // a user dialog cannot take available reactions
+        let user_dialog_id = DialogId::from_user_id(UserId::new(2000));
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            user_dialog_id,
+            some_reactions_input("👍"),
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.server_calls.is_empty());
+        assert!(manager.dialogs.is_empty());
+
+        // an emoji outside the active set is filtered out -> the size
+        // mismatch fires "Invalid reactions specified" (the pos map is
+        // empty here, so the 👍 input does not survive the filter)
+        let (dialog_id, d) = channel_dialog(100);
+        manager.dialogs.insert(dialog_id, d);
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            some_reactions_input("👍"),
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.server_calls.is_empty());
+        assert!(!manager.dialogs[&dialog_id].is_available_reactions_inited);
+    }
+
+    /// the basic-group/channel rights gates, including the bot leg
+    #[test]
+    fn set_available_reactions_requires_change_rights() {
+        let mut manager = MessagesManager::default();
+        let (dialog_id, d) = channel_dialog(100);
+        manager.dialogs.insert(dialog_id, d);
+
+        // a channel without the change rights
+        let mut env = AvailReactionsEnv {
+            status_can_change: false,
+            ..AvailReactionsEnv::default()
+        };
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            None,
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.server_calls.is_empty());
+        assert!(!manager.dialogs[&dialog_id].is_available_reactions_inited);
+
+        // a bot without the appointed-administrator flag
+        let mut env = AvailReactionsEnv {
+            is_bot: true,
+            appointed_admin: false,
+            ..AvailReactionsEnv::default()
+        };
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            None,
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.server_calls.is_empty());
+
+        // an appointed bot passes the rights gate; the empty None input
+        // matches the default dialog state only through the C++ equality
+        // (both empty), so the request lands on the unchanged path
+        let mut env = AvailReactionsEnv {
+            is_bot: true,
+            appointed_admin: true,
+            ..AvailReactionsEnv::default()
+        };
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            None,
+            tdutils::promise::Promise::default(),
+        );
+        assert!(env.server_calls.is_empty());
+        assert!(manager.dialogs[&dialog_id].is_available_reactions_inited);
+    }
+
+    /// the changed path mutates the dialog, marks it inited and parks the
+    /// promise in the server seam; the unchanged path answers Ok inline
+    #[test]
+    fn set_available_reactions_updates_the_dialog_and_parks_on_server() {
+        let mut manager = MessagesManager::default();
+        let (dialog_id, d) = channel_dialog(100);
+        manager.dialogs.insert(dialog_id, d);
+        manager.active_reaction_pos.insert(local_emoji("👍"), 0);
+
+        let cell: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>> =
+            std::sync::Arc::default();
+        let promise_cell = cell.clone();
+        let mut env = AvailReactionsEnv::default();
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            some_reactions_input("👍"),
+            tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<()>| match result {
+                    tdutils::status::Result::Ok(()) => {
+                        *promise_cell.lock().unwrap() = Some(Ok(()));
+                    }
+                    tdutils::status::Result::Err(status) => {
+                        *promise_cell.lock().unwrap() = Some(Err(status.message().to_owned()));
+                    }
+                },
+            ),
+        );
+        assert_eq!(env.server_calls, vec![dialog_id]);
+        let d = &manager.dialogs[&dialog_id];
+        assert_eq!(
+            d.available_reactions.reaction_types,
+            vec![local_emoji("👍")]
+        );
+        assert_eq!(d.available_reactions.reactions_limit, 3);
+        assert!(d.is_available_reactions_inited);
+        // the server seam owns the promise now: the dropped copy resolves
+        // through the "Lost promise" band, the parked-offline convention
+        match cell.lock().unwrap().take().unwrap() {
+            Err(message) => assert_eq!(message, "Lost promise"),
+            Ok(()) => panic!("the parked promise must not answer Ok"),
+        }
+
+        // repeating the same value rides the unchanged short-circuit
+        let cell: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>> =
+            std::sync::Arc::default();
+        let promise_cell = cell.clone();
+        let mut env = AvailReactionsEnv::default();
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            some_reactions_input("👍"),
+            tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<()>| match result {
+                    tdutils::status::Result::Ok(()) => {
+                        *promise_cell.lock().unwrap() = Some(Ok(()));
+                    }
+                    tdutils::status::Result::Err(status) => {
+                        *promise_cell.lock().unwrap() = Some(Err(status.message().to_owned()));
+                    }
+                },
+            ),
+        );
+        assert!(env.server_calls.is_empty());
+        assert!(
+            cell.lock().unwrap().is_some(),
+            "the unchanged path answers Ok"
+        );
+    }
+
+    /// the empty-flip runs the hide walk, zeroes the unread counter and
+    /// applies the C++ generation table; the update fires only when the
+    /// active set changed
+    #[test]
+    fn hide_walk_and_generation_follow_the_cpp_tables() {
+        let mut manager = MessagesManager::default();
+        let (dialog_id, mut d) = channel_dialog(100);
+        d.available_reactions = ChatReactions::legacy(vec![local_emoji("👍")]);
+        d.is_available_reactions_inited = true;
+        d.available_reactions_generation = 1;
+        d.unread_reaction_count = 3;
+        let mut m = Box::new(Message::default());
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+        let mut reactions = MessageReactions::default();
+        reactions.reactions.push(MessageReaction {
+            reaction_type: local_emoji("👍"),
+            choose_count: 2,
+            is_chosen: false,
+            my_recent_chooser_dialog_id: DialogId::new(0),
+            recent_chooser_dialog_ids: Vec::new(),
+            recent_chooser_min_channels: Vec::new(),
+        });
+        m.reactions = Some(reactions);
+        d.messages.insert(m.message_id, m);
+        manager.dialogs.insert(dialog_id, d);
+        manager.active_reaction_pos.insert(local_emoji("👍"), 0);
+
+        let mut env = AvailReactionsEnv::default();
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            None,
+            tdutils::promise::Promise::default(),
+        );
+        let d = &manager.dialogs[&dialog_id];
+        assert!(d.available_reactions.empty());
+        assert!(d.unread_reaction_count == 0);
+        // 1 -> 3 on the empty side of the C++ table
+        assert_eq!(d.available_reactions_generation, 3);
+        assert_eq!(env.updates, vec!["updateChatAvailableReactions"]);
+        assert_eq!(env.server_calls, vec![dialog_id]);
+        let m = d
+            .messages
+            .get(&MessageId::from_server_message_id(ServerMessageId::new(
+                400,
+            )))
+            .unwrap();
+        assert!(m.reactions.is_none(), "the hide walk clears the reactions");
+
+        // the non-empty side: empty -> non-empty flips 0 -> 2 and hides
+        // nothing (the old set was already empty)
+        let (dialog_id, mut d) = channel_dialog(200);
+        d.available_reactions_generation = 1;
+        manager.dialogs.insert(dialog_id, d);
+        let mut env = AvailReactionsEnv::default();
+        set_dialog_available_reactions(
+            &mut manager,
+            &mut env,
+            dialog_id,
+            some_reactions_input("👍"),
+            tdutils::promise::Promise::default(),
+        );
+        let d = &manager.dialogs[&dialog_id];
+        // 1 -> 2 on the non-empty side of the C++ table
+        assert_eq!(d.available_reactions_generation, 2);
+        assert_eq!(env.updates, vec!["updateChatAvailableReactions"]);
+    }
 
     #[test]
     fn story_ids_semantics_and_roundtrip() {
