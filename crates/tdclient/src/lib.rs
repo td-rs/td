@@ -63,6 +63,7 @@ pub mod config_result;
 pub mod connection_creator;
 pub mod contact;
 pub mod convert;
+pub mod country_info_manager;
 
 pub mod dc_auth_manager;
 pub mod device_token_manager;
