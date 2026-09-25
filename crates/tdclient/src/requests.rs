@@ -15380,6 +15380,225 @@ fn run_proxy_network_requests(td: &mut Td, id: u64, function: Function) {
             td.send_result(id, ok_object());
         }
 
+        _ => run_privacy_auto_download_requests(td, id, function),
+    }
+}
+
+/// The glue-slice privacy+auto-download arm group of the request
+/// dispatcher — see the frame note at the forward site in
+/// [`run_proxy_network_requests`]. The user-privacy arms run the C++
+/// `PrivacyManager::get_privacy`/`set_privacy` halves over the per-key
+/// cache (the PrivacyManager.cpp:120-155 plane); the
+/// new-chat/read-date arms run the `GlobalPrivacySettings` local plane
+/// (the constructors, the builders, the apply-changes merge); the
+/// auto-download arms run the null-settings band, the
+/// `get_auto_download_settings` intake and the net-type-keyed
+/// roaming/wifi flag derivation. The `account.getPrivacy`/
+/// `setPrivacy`/`getGlobalPrivacySettings`/`setGlobalPrivacySettings`/
+/// `getAutoDownloadSettings`/`saveAutoDownloadSettings` query tails are
+/// the `[blocked: net]` seams, the M.31 convention.
+#[inline(never)]
+fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) {
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    match function {
+        Function::getUserPrivacySettingRules(request) => {
+            // Requests.cpp:2418-2422 — `PrivacyManager::get_privacy`; the
+            // synchronized cache band answers the rules builder and the
+            // `account.getPrivacy` tail is the `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::UserPrivacySettingRules, _>(
+                id,
+                Object::userPrivacySettingRules,
+            );
+            let mut manager = std::mem::take(&mut td.privacy_manager);
+            let result = {
+                let mut env = crate::td::PrivacyEnv { td };
+                manager.get_privacy(&mut env, request.setting.as_ref(), promise)
+            };
+            td.privacy_manager = manager;
+            if let Err(status) = result {
+                td.send_error_impl(id, status.code(), status.message());
+            }
+        }
+        Function::setUserPrivacySettingRules(request) => {
+            // Requests.cpp:2424-2428 — `PrivacyManager::set_privacy`; the
+            // rules intake bands are real and the `account.setPrivacy`
+            // tail is the `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut manager = std::mem::take(&mut td.privacy_manager);
+            let result = {
+                let mut env = crate::td::PrivacyEnv { td };
+                manager.set_privacy(
+                    &mut env,
+                    request.setting.as_ref(),
+                    request.rules.as_ref(),
+                    promise,
+                )
+            };
+            td.privacy_manager = manager;
+            if let Err(status) = result {
+                td.send_error_impl(id, status.code(), status.message());
+            }
+        }
+        Function::getAutoDownloadSettingsPresets(_) => {
+            // Requests.cpp:3119-3123 — `get_auto_download_settings_presets`;
+            // the `account.getAutoDownloadSettings` fetch is the
+            // `[blocked: net]` seam (the clamped presets builder is its
+            // result half).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::AutoDownloadSettingsPresets, _>(
+                id,
+                Object::autoDownloadSettingsPresets,
+            );
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::auto_download_settings::get_auto_download_settings_presets(&mut env, promise);
+        }
+        Function::setAutoDownloadSettings(request) => {
+            // Requests.cpp:3125-3132 — the "New settings must be
+            // non-empty" band, then `set_auto_download_settings` with the
+            // get_net_type mapping and the field-for-field settings
+            // intake; the `account.saveAutoDownloadSettings` tail is the
+            // `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(settings) = request.settings.as_ref() else {
+                return td.send_error_impl(id, 400, "New settings must be non-empty");
+            };
+            let promise = ok_promise!(td);
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::auto_download_settings::set_auto_download_settings(
+                &mut env,
+                crate::connection_creator::get_net_type(request.r#type.as_ref()),
+                crate::auto_download_settings::get_auto_download_settings(settings),
+                promise,
+            );
+        }
+        Function::getReadDatePrivacySettings(_) => {
+            // Requests.cpp:5711-5723 — the query-promise lambda rewraps
+            // the fetched `GlobalPrivacySettings` into the td_api object;
+            // the `account.getGlobalPrivacySettings` fetch is the
+            // `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::ReadDatePrivacySettings, _>(
+                id,
+                Object::readDatePrivacySettings,
+            );
+            let query_promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<
+                    crate::privacy_manager::GlobalPrivacySettings,
+                >| {
+                    match result {
+                        tdutils::status::Result::Ok(settings) => {
+                            let mut promise = promise;
+                            promise.set_value(settings.get_read_date_privacy_settings_object());
+                        }
+                        tdutils::status::Result::Err(status) => {
+                            let mut promise = promise;
+                            promise.set_error(status);
+                        }
+                    }
+                },
+            );
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::privacy_manager::GlobalPrivacySettings::get_global_privacy_settings(
+                &mut env,
+                query_promise,
+            );
+        }
+        Function::setReadDatePrivacySettings(request) => {
+            // Requests.cpp:5725-5730 — the `GlobalPrivacySettings`
+            // constructor holds the null-settings band (`hide_read_marks_`
+            // = `settings == nullptr || !settings->show_read_date_`); the
+            // archive hide is statically dead for this set type and the
+            // get → `apply_changes` → `account.setGlobalPrivacySettings`
+            // chain parks at the `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let set_settings =
+                crate::privacy_manager::GlobalPrivacySettings::from_read_date_privacy_settings(
+                    request.settings,
+                );
+            let promise = ok_promise!(td);
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::privacy_manager::GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                set_settings,
+                promise,
+            );
+        }
+        Function::getNewChatPrivacySettings(_) => {
+            // Requests.cpp:5732-5744 — the query-promise lambda rewrap of
+            // `get_new_chat_privacy_settings_object`; the
+            // `account.getGlobalPrivacySettings` fetch is the
+            // `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::NewChatPrivacySettings, _>(
+                id,
+                Object::newChatPrivacySettings,
+            );
+            let query_promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<
+                    crate::privacy_manager::GlobalPrivacySettings,
+                >| {
+                    match result {
+                        tdutils::status::Result::Ok(settings) => {
+                            let mut promise = promise;
+                            promise.set_value(settings.get_new_chat_privacy_settings_object());
+                        }
+                        tdutils::status::Result::Err(status) => {
+                            let mut promise = promise;
+                            promise.set_error(status);
+                        }
+                    }
+                },
+            );
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::privacy_manager::GlobalPrivacySettings::get_global_privacy_settings(
+                &mut env,
+                query_promise,
+            );
+        }
+        Function::setNewChatPrivacySettings(request) => {
+            // Requests.cpp:5746-5751 — the `GlobalPrivacySettings`
+            // constructor holds the null-settings band and the
+            // `[0, 1000000]` star-count clamp; the archive hide is
+            // statically dead for this set type and the get →
+            // `apply_changes` → `account.setGlobalPrivacySettings` chain
+            // parks at the `[blocked: net]` seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let set_settings =
+                crate::privacy_manager::GlobalPrivacySettings::from_new_chat_privacy_settings(
+                    request.settings,
+                );
+            let promise = ok_promise!(td);
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::privacy_manager::GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                set_settings,
+                promise,
+            );
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -16239,12 +16458,18 @@ mod request_census_tests {
         // (addNetworkStatistics, getNetworkStatistics,
         // resetNetworkStatistics, setNetworkType) and getPushReceiverId
         // moving to the synchronous set (22/898/102).
+        // The privacy+auto-download glue slice flipped 8 arms:
+        // getUserPrivacySettingRules, setUserPrivacySettingRules,
+        // getNewChatPrivacySettings, setNewChatPrivacySettings,
+        // getReadDatePrivacySettings, setReadDatePrivacySettings,
+        // getAutoDownloadSettingsPresets, setAutoDownloadSettings
+        // (22/906/94).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 22, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            898,
+            906,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 102, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 94, "interim count");
     }
 }

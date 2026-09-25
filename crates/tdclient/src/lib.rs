@@ -16,6 +16,7 @@ pub mod audios_manager;
 pub mod auth_data_shared;
 pub mod auth_dispatch;
 pub mod auth_manager;
+pub mod auto_download_settings;
 
 pub mod autosave_manager;
 pub mod background_manager;
@@ -124,6 +125,7 @@ pub mod photo;
 pub mod poll_manager;
 pub mod premium;
 pub mod premium_gift_option;
+pub mod privacy_manager;
 pub mod promo_data_manager;
 pub mod query_combiner;
 pub mod query_merger;
