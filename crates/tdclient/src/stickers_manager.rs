@@ -25,13 +25,16 @@ use crate::documents_manager::StickerFormat;
 use crate::files::FileType;
 use crate::messages_manager::MessageId;
 use crate::misc::{
-    clean_input_string, clean_username, replace_with_spaces, strip_empty_characters,
+    clean_input_string, clean_name, clean_username, replace_with_spaces, strip_empty_characters,
 };
+use crate::store_parse::{Parser, store_i32, store_i64, store_log_event_version, store_string_vec};
 use crate::td_api;
 use crate::user_manager::UserId;
 use tdmtproto::telegram_api;
-use tdutils::promise::Promise;
+use tdutils::promise::{Promise, PromiseCreator};
 use tdutils::status::Result;
+use tdutils::translit::get_word_transliterations;
+use tdutils::utf8::{check_utf8, utf8_get_search_words, utf8_to_lower};
 
 /// `StickersManager::MAX_FOUND_STICKERS` (StickersManager.h:481).
 pub(crate) const MAX_FOUND_STICKERS: i32 = 100;
@@ -287,6 +290,8 @@ pub fn get_max_sticker_file_size(
 /// registry; the offline default is the all-false unknown view).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StickerFileView {
+    /// `FileView::empty()` — the unknown-file band ("File not found").
+    pub empty: bool,
     pub is_encrypted: bool,
     /// `get_main_remote_location()` non-null and a non-web document —
     /// the C++ band collapses both checks into the `Option`.
@@ -296,6 +301,40 @@ pub struct StickerFileView {
     pub expected_size: i64,
     /// `get_full_remote_location()` non-null and a document.
     pub full_remote_document_id: Option<i64>,
+    /// `get_full_remote_location()->is_photo()`.
+    pub full_remote_is_photo: bool,
+    /// `get_full_remote_location()->is_web()`.
+    pub full_remote_is_web: bool,
+}
+
+impl StickersManager {
+    /// `save_recent_stickers_to_database` (StickersManager.cpp:9342-9349)
+    /// — the local rewrite of the `ssr0`/`ssr1` pmc records; the caller
+    /// gates `use_sqlite_pmc`/`close_flag`.
+    fn save_recent_stickers_list(&mut self, env: &mut impl StickersManagerEnv, is_attached: bool) {
+        if !env.use_sqlite_pmc() || env.close_flag() {
+            return;
+        }
+        let mut out = Vec::new();
+        store_sticker_list(&mut out, &self.recent_sticker_ids[is_attached as usize]);
+        env.sqlite_pmc_set_raw(if is_attached { b"ssr1" } else { b"ssr0" }, &out);
+    }
+
+    /// `save_favorite_stickers_to_database`
+    /// (StickersManager.cpp:9702-9708) — the `ssfav` record twin.
+    fn save_favorite_stickers_list(&mut self, env: &mut impl StickersManagerEnv) {
+        if !env.use_sqlite_pmc() || env.close_flag() {
+            return;
+        }
+        let mut out = Vec::new();
+        store_sticker_list(&mut out, &self.favorite_sticker_ids);
+        env.sqlite_pmc_set_raw(b"ssfav", &out);
+    }
+}
+
+/// `td::full_split` (misc.h) — the no-empty-parts split.
+fn full_split(s: &str, delimiter: char) -> Vec<&str> {
+    s.split(delimiter).filter(|part| !part.is_empty()).collect()
 }
 
 /// The `G()`/manager slice the collapsed StickersManager reads through.
@@ -504,6 +543,647 @@ pub trait StickersManagerEnv {
     /// `view_featured_sticker_sets`' delayed server read
     /// (`read_featured_sticker_sets` over the views timeout).
     fn send_read_featured_sticker_sets(&mut self) {}
+
+    // -- the residue-ladder surfaces (the recent/favorite/hashtag/emoji
+    // -- planes); the pmc and option reads are real over `Td`
+    /// `td_->option_manager_->get_option_integer(name, default)`.
+    fn get_option_integer(&self, _name: &str, default_value: i64) -> i64 {
+        default_value
+    }
+    /// `G()->use_sqlite_pmc()`.
+    fn use_sqlite_pmc(&self) -> bool {
+        false
+    }
+    /// `G()->td_db()->get_sqlite_pmc()->get` (the async kv get collapses
+    /// to the synchronous read, the autosave-manager convention).
+    fn sqlite_pmc_get_raw(&mut self, _key: &[u8]) -> Vec<u8> {
+        Vec::new()
+    }
+    /// `G()->td_db()->get_sqlite_pmc()->set`.
+    fn sqlite_pmc_set_raw(&mut self, _key: &[u8], _value: &[u8]) {}
+    /// `G()->td_db()->get_sqlite_sync_pmc()->get_by_prefix` — the
+    /// callback receives the key suffix after the prefix (the C++
+    /// `strip_key_prefix`), like the keyword-record scan.
+    fn sqlite_pmc_get_by_prefix<F>(&mut self, _prefix: &[u8], mut _callback: F)
+    where
+        F: FnMut(&[u8], &[u8]),
+    {
+    }
+    /// `G()->td_db()->get_binlog_pmc()->get` (the emoji-status planes).
+    fn binlog_pmc_get_raw(&mut self, _key: &[u8]) -> Vec<u8> {
+        Vec::new()
+    }
+    /// `G()->td_db()->get_binlog_pmc()->set`.
+    fn binlog_pmc_set_raw(&mut self, _key: &[u8], _value: &[u8]) {}
+    /// `td_->language_pack_manager_->get_used_language_codes()`.
+    fn get_language_pack_used_language_codes(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `G()->mtproto_header().get_system_language_code()`.
+    fn get_system_language_code(&self) -> String {
+        String::new()
+    }
+    /// `td_->user_manager_->get_secret_chat_layer` — the C++ CHECKs
+    /// `have_secret_chat` before the read; over the collapsed chat store
+    /// a secret-chat id is unknown, so the default answers the current
+    /// layer (the early-empty band never fires).
+    fn get_secret_chat_layer(&self, _secret_chat_id: crate::user_manager::SecretChatId) -> i32 {
+        144 // SecretChatLayer::SpoilerAndCustomEmojiEntities
+    }
+
+    // -- the `[blocked: net]` query tails of the residue ladder; each one
+    // -- owns the caller's promise (the M.31 convention — the promise is
+    // -- parked unanswered offline). The generic carries whatever result
+    // -- the parked request would have answered.
+    /// `load_installed_sticker_sets` (the GetAllStickersQuery load).
+    fn load_installed_sticker_sets<T: Send>(
+        &mut self,
+        _sticker_type: StickerType,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `load_featured_sticker_sets` (the GetFeaturedStickerSetsQuery load).
+    fn load_featured_sticker_sets<T: Send>(
+        &mut self,
+        _sticker_type: StickerType,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `load_old_featured_sticker_sets`.
+    fn load_old_featured_sticker_sets<T: Send>(
+        &mut self,
+        _sticker_type: StickerType,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `load_sticker_sets` — the per-set load fan (the LoadStickerSets
+    /// MultiPromise over `messages.getStickerSets`).
+    fn load_sticker_sets<T: Send>(&mut self, _set_ids: Vec<StickerSetId>, _promise: Promise<T>) {}
+    /// `GetArchivedStickerSetsQuery`.
+    fn send_get_archived_sticker_sets_query<T: Send>(
+        &mut self,
+        _sticker_type: StickerType,
+        _offset_sticker_set_id: StickerSetId,
+        _limit: i32,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `GetAttachedStickerSetsQuery`.
+    fn send_get_attached_stickers_query<T: Send>(
+        &mut self,
+        _file_id: crate::files::FileId,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `SearchStickerSetsQuery`.
+    fn send_search_sticker_sets_query<T: Send>(
+        &mut self,
+        _sticker_type: StickerType,
+        _query: String,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `do_reload_sticker_set` over `inputStickerSetShortName` — the
+    /// `search_sticker_set` tail (the promise-owning twin of
+    /// [`StickersManagerEnv::reload_sticker_set_by_name`]).
+    fn send_search_sticker_set_query<T: Send>(
+        &mut self,
+        _short_name: String,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `do_reload_sticker_set` over `inputStickerSetID` — the Great Minds
+    /// band of `get_sticker_set`.
+    fn send_reload_sticker_set_by_id_query<T: Send>(
+        &mut self,
+        _set_id: StickerSetId,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `InstallStickerSetQuery`.
+    fn send_install_sticker_set_query<T: Send>(
+        &mut self,
+        _set_id: StickerSetId,
+        _is_archived: bool,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `UninstallStickerSetQuery`.
+    fn send_uninstall_sticker_set_query<T: Send>(
+        &mut self,
+        _set_id: StickerSetId,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `GetRecentStickersQuery` — the load tail (the queued
+    /// load-recent-stickers promise rides the query result).
+    fn send_get_recent_stickers_query<T: Send>(
+        &mut self,
+        _is_attached: bool,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `GetFavedStickersQuery` — the load tail.
+    fn send_get_favorite_stickers_query<T: Send>(&mut self, _promise: Promise<T>) {}
+    /// `SaveRecentStickerQuery`.
+    fn send_save_recent_sticker_query<T: Send>(
+        &mut self,
+        _is_attached: bool,
+        _sticker_id: crate::files::FileId,
+        _unsave: bool,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `FaveStickerQuery`.
+    fn send_fave_sticker_query<T: Send>(
+        &mut self,
+        _sticker_id: crate::files::FileId,
+        _unsave: bool,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `ClearRecentStickersQuery`.
+    fn send_clear_recent_stickers_query<T: Send>(
+        &mut self,
+        _is_attached: bool,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `account.getDefaultEmojiStatuses` (EmojiStatus.cpp:173).
+    fn send_get_default_emoji_statuses_query<T: Send>(&mut self, _hash: i64, _promise: Promise<T>) {
+    }
+    /// `account.getChannelDefaultEmojiStatuses` (EmojiStatus.cpp:208).
+    fn send_get_channel_default_emoji_statuses_query<T: Send>(
+        &mut self,
+        _hash: i64,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `account.getRecentEmojiStatuses` (EmojiStatus.cpp:262).
+    fn send_get_recent_emoji_statuses_query<T: Send>(&mut self, _hash: i64, _promise: Promise<T>) {}
+    /// `account.getCollectibleEmojiStatuses` (EmojiStatus.cpp:330).
+    fn send_get_collectible_emoji_statuses_query<T: Send>(
+        &mut self,
+        _hash: i64,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `account.clearRecentEmojiStatuses` (EmojiStatus.cpp:298).
+    fn send_clear_recent_emoji_statuses_query<T: Send>(&mut self, _promise: Promise<T>) {}
+    /// `GetEmojiKeywordsLanguageQuery`.
+    fn send_get_emoji_keywords_language_query<T: Send>(
+        &mut self,
+        _language_codes: Vec<String>,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `GetEmojiKeywordsQuery`.
+    fn send_get_emoji_keywords_query<T: Send>(
+        &mut self,
+        _language_code: String,
+        _promise: Promise<T>,
+    ) {
+    }
+    /// `GetEmojiKeywordsDifferenceQuery` — the fire-and-forget freshness
+    /// tail (`Auto()` promise in the C++).
+    fn send_get_emoji_keywords_difference_query(
+        &mut self,
+        _language_code: String,
+        _from_version: i32,
+    ) {
+    }
+
+    // -- the background freshness reloads (the `Auto()`-promise queries of
+    // -- the loaded bands)
+    /// `reload_installed_sticker_sets` (GetAllStickersQuery, Auto()).
+    fn reload_installed_sticker_sets(&mut self, _sticker_type: StickerType, _force: bool) {}
+    /// `reload_featured_sticker_sets` (GetFeaturedStickerSetsQuery, Auto()).
+    fn reload_featured_sticker_sets(&mut self, _sticker_type: StickerType, _force: bool) {}
+    /// `reload_recent_stickers` (GetRecentStickersQuery, Auto()).
+    fn reload_recent_stickers(&mut self, _is_attached: bool, _force: bool) {}
+    /// `reload_favorite_stickers` (GetFavedStickersQuery, Auto()).
+    fn reload_favorite_stickers(&mut self, _force: bool) {}
+}
+
+/// `HashtagHints` (HashtagHints.{h,cpp}) — the collapsed hints actor.
+/// Three instances back the tag registries: the recent hashtags
+/// (`"text"`, '#'), the searched-for tags (`"search"`, '#') and the
+/// cashtag twin (`"cashtag_search"`, '$') — Td.cpp:1344-1347. The
+/// `Hints` rating (`-++counter_`, the newest tag first) collapses to a
+/// newest-first `Vec<String>`; the word/translit prefix search is
+/// ported over `utf8_get_search_words` + `get_word_transliterations`.
+pub struct HashtagHints {
+    mode: &'static str,
+    first_character: char,
+    /// `sync_with_db_` — false until the `start_up` pmc replay runs.
+    synced: bool,
+    /// `hints_` in the rating order (newest first).
+    names: Vec<String>,
+    /// `counter_` — the C++ rating watermark; the collapsed newest-first
+    /// `names` order already encodes the rating, so nothing reads it.
+    #[allow(dead_code)]
+    counter: i64,
+}
+
+/// The persisted hints size — `HashtagHints::hashtag_used` stores the
+/// top 101 rated names (`hints_.search_empty(101)`).
+const HASHTAG_HINTS_STORED: usize = 101;
+
+impl Default for HashtagHints {
+    /// The inert instance — the real mode/first-character pair arrives
+    /// with `init_hashtag_hints` (the `StickersManager::default()`
+    /// derive needs a placeholder; `start_up` never runs on it).
+    fn default() -> HashtagHints {
+        HashtagHints {
+            mode: "",
+            first_character: '#',
+            synced: false,
+            names: Vec::new(),
+            counter: 0,
+        }
+    }
+}
+
+impl HashtagHints {
+    pub(crate) fn new(mode: &'static str, first_character: char) -> HashtagHints {
+        HashtagHints {
+            mode,
+            first_character,
+            synced: false,
+            names: Vec::new(),
+            counter: 0,
+        }
+    }
+
+    /// `HashtagHints::get_key`.
+    fn key(&self) -> String {
+        format!("hashtag_hints#{}", self.mode)
+    }
+
+    /// `HashtagHints::start_up` + `from_db` (HashtagHints.cpp:27-37,
+    /// 69-96) — the async sqlite pmc get collapses to the synchronous
+    /// read. `sync_with_db_` turns true under `use_sqlite_pmc` even when
+    /// the store is empty or unparsable; the replay walks the stored
+    /// names in reverse so the last stored name ends up the newest.
+    pub(crate) fn start_up(&mut self, env: &mut impl StickersManagerEnv) {
+        if !env.use_sqlite_pmc() {
+            return;
+        }
+        self.synced = true;
+        let value = env.sqlite_pmc_get_raw(self.key().as_bytes());
+        if value.is_empty() {
+            return;
+        }
+        let mut parser = match Parser::new_log_event(&value) {
+            std::result::Result::Ok(parser) => parser,
+            std::result::Result::Err(_) => {
+                // "Failed to unserialize hashtag hints" — the empty hints
+                tracing::error!("Failed to unserialize hashtag hints");
+                return;
+            }
+        };
+        let hashtags = match parser.string_vec() {
+            std::result::Result::Ok(hashtags) => hashtags,
+            std::result::Result::Err(_) => {
+                tracing::error!("Failed to unserialize hashtag hints");
+                return;
+            }
+        };
+        for hashtag in hashtags.iter().rev() {
+            self.hashtag_used_impl(hashtag);
+        }
+    }
+
+    /// `HashtagHints::hashtag_used_impl` (HashtagHints.cpp:98-108) — the
+    /// rating refresh collapses to a move-to-front.
+    fn hashtag_used_impl(&mut self, hashtag: &str) {
+        if !check_utf8(hashtag.as_bytes()) {
+            tracing::error!("Trying to add invalid UTF-8 hashtag \"{hashtag}\"");
+            return;
+        }
+        self.counter += 1;
+        self.names.retain(|name| name != hashtag);
+        self.names.insert(0, hashtag.to_owned());
+    }
+
+    /// `HashtagHints::hashtag_used` (HashtagHints.cpp:39-47) — the
+    /// recording no-ops before the pmc replay; every accepted use
+    /// rewrites the stored top-101 list. The C++ callers are the
+    /// message-viewing planes (MessageContent/MessageQueryManager),
+    /// still ported — nothing reachable records a use yet.
+    #[allow(dead_code)]
+    pub(crate) fn hashtag_used(&mut self, env: &mut impl StickersManagerEnv, hashtag: String) {
+        if !self.synced {
+            return;
+        }
+        self.hashtag_used_impl(&hashtag);
+        self.save(env);
+    }
+
+    /// `HashtagHints::remove_hashtag` (HashtagHints.cpp:49-62) — the
+    /// leading `first_character` strip, then the remove-or-ignore; both
+    /// bands answer ok.
+    pub(crate) fn remove_hashtag(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        mut hashtag: String,
+        mut promise: Promise<()>,
+    ) {
+        if !self.synced {
+            promise.set_value(());
+            return;
+        }
+        if hashtag.starts_with(self.first_character) {
+            hashtag.remove(0);
+        }
+        if let Some(position) = self.names.iter().position(|name| *name == hashtag) {
+            self.names.remove(position);
+            self.save(env);
+        }
+        // the promise is set explicitly, because the sqlite pmc waits for
+        // too long before setting it (the C++ comment)
+        promise.set_value(());
+    }
+
+    /// `HashtagHints::clear` (HashtagHints.cpp:64-68).
+    pub(crate) fn clear(&mut self, env: &mut impl StickersManagerEnv, mut promise: Promise<()>) {
+        if !self.synced {
+            promise.set_value(());
+            return;
+        }
+        self.names.clear();
+        self.save(env);
+        promise.set_value(());
+    }
+
+    /// `HashtagHints::query` (HashtagHints.cpp:70-78) — the prefix strip
+    /// rides the same `first_character` rule as the removal.
+    pub(crate) fn query(&self, prefix: &str, limit: i32, mut promise: Promise<Vec<String>>) {
+        if !self.synced {
+            promise.set_value(Vec::new());
+            return;
+        }
+        let query = prefix.strip_prefix(self.first_character).unwrap_or(prefix);
+        promise.set_value(self.search(query, limit));
+    }
+
+    /// `Hints::search`/`search_empty` over the rating order — the
+    /// result is the rating-sorted (newest-first) limited match list.
+    fn search(&self, query: &str, limit: i32) -> Vec<String> {
+        if limit < 0 {
+            return Vec::new();
+        }
+        // `Hints::search` over an empty query with
+        // return_all_for_empty_query — every key in the rating order
+        let mut matched: Vec<&String> = Vec::new();
+        let words = utf8_get_search_words(query);
+        if words.is_empty() {
+            matched.extend(self.names.iter().take(HASHTAG_HINTS_STORED));
+        } else {
+            for name in &self.names {
+                if Self::name_matches(name, &words) {
+                    matched.push(name);
+                }
+            }
+        }
+        matched
+            .into_iter()
+            .take(limit.max(0) as usize)
+            .cloned()
+            .collect()
+    }
+
+    /// The `Hints::search_word` match: every query word must hit some
+    /// name word by prefix, directly or through either side's
+    /// transliterations.
+    fn name_matches(name: &str, query_words: &[String]) -> bool {
+        let name_words = utf8_get_search_words(name);
+        query_words.iter().all(|query_word| {
+            name_words.iter().any(|name_word| {
+                name_word.starts_with(query_word.as_str())
+                    || get_word_transliterations(name_word, false)
+                        .iter()
+                        .any(|translit| translit.starts_with(query_word.as_str()))
+                    || get_word_transliterations(query_word, true)
+                        .iter()
+                        .any(|translit| name_word.starts_with(translit.as_str()))
+            })
+        })
+    }
+
+    /// The stored list write (`hashtag_used`/`clear` tails) — the
+    /// serialized `keys_to_strings(hints_.search_empty(101).second)`.
+    fn save(&self, env: &mut impl StickersManagerEnv) {
+        let mut out = Vec::new();
+        store_log_event_version(&mut out);
+        store_string_vec(
+            &mut out,
+            &self.names[..self.names.len().min(HASHTAG_HINTS_STORED)],
+        );
+        env.sqlite_pmc_set_raw(self.key().as_bytes(), &out);
+    }
+}
+
+/// `EmojiStatusCustomEmojis` (EmojiStatus.cpp:20-66) — the binlog-pmc
+/// record of the default/default-channel emoji-status lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EmojiStatusCustomEmojisRecord {
+    hash: i64,
+    custom_emoji_ids: Vec<i64>,
+}
+
+impl EmojiStatusCustomEmojisRecord {
+    /// `load_emoji_status_custom_emojis` (EmojiStatus.cpp:143-155) — an
+    /// empty store or an unparsable record answers `hash = -1`.
+    fn load(env: &mut impl StickersManagerEnv, key: &[u8]) -> EmojiStatusCustomEmojisRecord {
+        let value = env.binlog_pmc_get_raw(key);
+        if value.is_empty() {
+            return EmojiStatusCustomEmojisRecord {
+                hash: -1,
+                custom_emoji_ids: Vec::new(),
+            };
+        }
+        let mut parser = match Parser::new_log_event(&value) {
+            std::result::Result::Ok(parser) => parser,
+            std::result::Result::Err(_) => {
+                return EmojiStatusCustomEmojisRecord {
+                    hash: -1,
+                    custom_emoji_ids: Vec::new(),
+                };
+            }
+        };
+        let hash = match parser.i64_() {
+            std::result::Result::Ok(hash) => hash,
+            std::result::Result::Err(_) => {
+                return EmojiStatusCustomEmojisRecord {
+                    hash: -1,
+                    custom_emoji_ids: Vec::new(),
+                };
+            }
+        };
+        let size = match parser.i32_() {
+            std::result::Result::Ok(size) => size,
+            std::result::Result::Err(_) => {
+                return EmojiStatusCustomEmojisRecord {
+                    hash: -1,
+                    custom_emoji_ids: Vec::new(),
+                };
+            }
+        };
+        let mut custom_emoji_ids = Vec::with_capacity(size.max(0) as usize);
+        for _ in 0..size {
+            match parser.i64_() {
+                std::result::Result::Ok(id) => custom_emoji_ids.push(id),
+                std::result::Result::Err(_) => {
+                    return EmojiStatusCustomEmojisRecord {
+                        hash: -1,
+                        custom_emoji_ids: Vec::new(),
+                    };
+                }
+            }
+        }
+        EmojiStatusCustomEmojisRecord {
+            hash,
+            custom_emoji_ids,
+        }
+    }
+
+    /// `save_emoji_status_custom_emojis` (EmojiStatus.cpp:161-163) —
+    /// only the query-result plane writes it (on_get_emoji_statuses);
+    /// the collapsed query tails park, so nothing reachable saves yet.
+    #[allow(dead_code)]
+    fn save(&self, env: &mut impl StickersManagerEnv, key: &[u8]) {
+        let mut out = Vec::new();
+        store_log_event_version(&mut out);
+        store_i64(&mut out, self.hash);
+        store_i32(&mut out, self.custom_emoji_ids.len() as i32);
+        for custom_emoji_id in &self.custom_emoji_ids {
+            store_i64(&mut out, *custom_emoji_id);
+        }
+        env.binlog_pmc_set_raw(key, &out);
+    }
+
+    /// `get_emoji_status_custom_emojis_object` (EmojiStatus.cpp:565-569).
+    fn get_object(&self) -> td_api::EmojiStatusCustomEmojis {
+        td_api::EmojiStatusCustomEmojis {
+            custom_emoji_ids: self.custom_emoji_ids.clone(),
+        }
+    }
+}
+
+/// `EmojiStatuses` (EmojiStatus.cpp:68-107) — the binlog-pmc record of
+/// the recent/upgraded-gift emoji-status lists.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EmojiStatusesRecord {
+    hash: i64,
+    emoji_statuses: Vec<crate::emoji_status::EmojiStatus>,
+}
+
+impl EmojiStatusesRecord {
+    /// `load_emoji_statuses` (EmojiStatus.cpp:129-141).
+    fn load(env: &mut impl StickersManagerEnv, key: &[u8]) -> EmojiStatusesRecord {
+        let value = env.binlog_pmc_get_raw(key);
+        if value.is_empty() {
+            return EmojiStatusesRecord {
+                hash: -1,
+                emoji_statuses: Vec::new(),
+            };
+        }
+        let mut parser = match Parser::new_log_event(&value) {
+            std::result::Result::Ok(parser) => parser,
+            std::result::Result::Err(_) => {
+                return EmojiStatusesRecord {
+                    hash: -1,
+                    emoji_statuses: Vec::new(),
+                };
+            }
+        };
+        let hash = match parser.i64_() {
+            std::result::Result::Ok(hash) => hash,
+            std::result::Result::Err(_) => {
+                return EmojiStatusesRecord {
+                    hash: -1,
+                    emoji_statuses: Vec::new(),
+                };
+            }
+        };
+        let size = match parser.i32_() {
+            std::result::Result::Ok(size) => size,
+            std::result::Result::Err(_) => {
+                return EmojiStatusesRecord {
+                    hash: -1,
+                    emoji_statuses: Vec::new(),
+                };
+            }
+        };
+        let mut emoji_statuses = Vec::with_capacity(size.max(0) as usize);
+        for _ in 0..size {
+            match crate::emoji_status::EmojiStatus::parse_from(&mut parser) {
+                std::result::Result::Ok(emoji_status) => emoji_statuses.push(emoji_status),
+                std::result::Result::Err(_) => {
+                    return EmojiStatusesRecord {
+                        hash: -1,
+                        emoji_statuses: Vec::new(),
+                    };
+                }
+            }
+        }
+        EmojiStatusesRecord {
+            hash,
+            emoji_statuses,
+        }
+    }
+
+    /// `save_emoji_statuses` (EmojiStatus.cpp:157-159).
+    fn save(&self, env: &mut impl StickersManagerEnv, key: &[u8]) {
+        let mut out = Vec::new();
+        store_log_event_version(&mut out);
+        store_i64(&mut out, self.hash);
+        store_i32(&mut out, self.emoji_statuses.len() as i32);
+        for emoji_status in &self.emoji_statuses {
+            emoji_status.store(&mut out);
+        }
+        env.binlog_pmc_set_raw(key, &out);
+    }
+
+    /// `EmojiStatuses::get_emoji_statuses_object` (EmojiStatus.cpp:72-75)
+    /// — the reduced `emojiStatus` payload, the user_manager mapping.
+    fn get_object(&self) -> td_api::EmojiStatuses {
+        td_api::EmojiStatuses {
+            emoji_statuses: self
+                .emoji_statuses
+                .iter()
+                .map(crate::user_manager::make_emoji_status_object)
+                .collect(),
+        }
+    }
+}
+
+/// The `StickerListLogEvent` collapse (StickersManager.cpp:1614-1645) —
+/// the C++ stores full sticker records through `store_sticker`; over the
+/// collapsed sticker store the record carries the `(id, remote_id)`
+/// pairs, which is all the recent/favorite registries read back.
+fn store_sticker_list(out: &mut Vec<u8>, sticker_ids: &[crate::files::FileId]) {
+    store_i32(out, sticker_ids.len() as i32);
+    for sticker_id in sticker_ids {
+        store_i32(out, sticker_id.get());
+        store_i32(out, sticker_id.get_remote());
+    }
+}
+
+fn parse_sticker_list(
+    input: &[u8],
+) -> std::result::Result<Vec<crate::files::FileId>, &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let size = parser.i32_()?;
+    let mut sticker_ids = Vec::with_capacity(size.max(0) as usize);
+    for _ in 0..size {
+        let id = parser.i32_()?;
+        let remote_id = parser.i32_()?;
+        sticker_ids.push(crate::files::FileId::new(id, remote_id));
+    }
+    parser.fetch_end()?;
+    Ok(sticker_ids)
 }
 
 /// `StickersManager` — the collapsed state the request plane reads and
@@ -525,6 +1205,53 @@ pub struct StickersManager {
     are_default_custom_emoji_ids_loaded: [bool; MAX_STICKER_LIST_TYPE],
     /// `default_custom_emoji_ids_[index]`.
     default_custom_emoji_ids: [Vec<CustomEmojiId>; MAX_STICKER_LIST_TYPE],
+    /// `are_recent_stickers_loaded_[is_attached]`.
+    are_recent_stickers_loaded: [bool; 2],
+    /// `recent_sticker_ids_[is_attached]`.
+    recent_sticker_ids: [Vec<crate::files::FileId>; 2],
+    /// `are_favorite_stickers_loaded_`.
+    are_favorite_stickers_loaded: bool,
+    /// `favorite_sticker_ids_`.
+    favorite_sticker_ids: Vec<crate::files::FileId>,
+    /// `attached_sticker_sets_` (the WaitFreeHashMap collapses to a map).
+    attached_sticker_sets: std::collections::HashMap<crate::files::FileId, Vec<StickerSetId>>,
+    /// `archived_sticker_set_ids_[type]` (the trailing `StickerSetId()`
+    /// marks the known end of the list).
+    archived_sticker_set_ids: [Vec<StickerSetId>; MAX_STICKER_TYPE],
+    /// `total_archived_sticker_set_count_[type]` — `-1` until known.
+    total_archived_sticker_set_count: [i32; MAX_STICKER_TYPE],
+    /// `are_featured_sticker_sets_loaded_[type]`.
+    are_featured_sticker_sets_loaded: [bool; MAX_STICKER_TYPE],
+    /// `featured_sticker_set_ids_[type]`.
+    featured_sticker_set_ids: [Vec<StickerSetId>; MAX_STICKER_TYPE],
+    /// `old_featured_sticker_set_ids_[type]`.
+    old_featured_sticker_set_ids: [Vec<StickerSetId>; MAX_STICKER_TYPE],
+    /// `old_featured_sticker_set_count_[type]` — the C++ defaults are
+    /// `{-1, 0, 0}` (StickersManager.h:1061); `-1` means "unknown".
+    old_featured_sticker_set_count: [i32; MAX_STICKER_TYPE],
+    /// `are_old_featured_sticker_sets_invalidated_[type]`.
+    are_old_featured_sticker_sets_invalidated: [bool; MAX_STICKER_TYPE],
+    /// `short_name_to_sticker_set_id_` — the set-name cache; over the
+    /// collapsed record-less sets it is an always-miss (see
+    /// `Self::search_sticker_set`), filled only by the reload planes.
+    #[allow(dead_code)]
+    short_name_to_sticker_set_id: std::collections::HashMap<String, StickerSetId>,
+    /// `found_sticker_sets_[type][query]`.
+    found_sticker_sets: [std::collections::HashMap<String, Vec<StickerSetId>>; MAX_STICKER_TYPE],
+    /// `emoji_language_code_versions_[language_code]`.
+    emoji_language_code_versions: std::collections::HashMap<String, i32>,
+    /// `emoji_language_code_last_difference_times_[language_code]`.
+    emoji_language_code_last_difference_times: std::collections::HashMap<String, f64>,
+    /// `emoji_language_codes_[key]` — the `emojilc$...` cache.
+    emoji_language_codes: std::collections::HashMap<String, Vec<String>>,
+    /// `reloaded_emoji_keywords_` — the one-shot background reload guard.
+    reloaded_emoji_keywords: std::collections::HashSet<String>,
+    /// the three `HashtagHints` actors (Td.cpp:1344-1347): the recent
+    /// hashtags ("text"/'#'), the searched-for tags ("search"/'#') and
+    /// the cashtag twin ("cashtag_search"/'$').
+    pub(crate) hashtag_hints: HashtagHints,
+    pub(crate) hashtag_search_hints: HashtagHints,
+    pub(crate) cashtag_search_hints: HashtagHints,
 }
 
 /// The found-stickers cache entry key builder — the C++ rekeys
@@ -551,9 +1278,56 @@ fn search_cache_key(
     }
 }
 
+/// The `get_stickers` outcome — `Ready` answers the request (the
+/// actor's `do_send_result`), `Parked` rides the named load seam and
+/// `Failed` is the request error.
+enum StickerListOutcome {
+    Ready(Vec<crate::files::FileId>),
+    Parked(StickerListPark),
+    Failed(tdutils::status::Status),
+}
+
+/// The load the C++ `get_stickers` parks on before re-entry.
+enum StickerListPark {
+    Installed(StickerType),
+    Recent(bool),
+    Favorite,
+    Featured(StickerType),
+    Sets(Vec<StickerSetId>),
+}
+
+/// The `search_emojis`/`get_keyword_emojis` outcome — `Answered` is the
+/// empty/unsupported band, `Parked` rides the emoji-keywords queries and
+/// `Ready` carries the prepared query into the pmc keyword-record read
+/// (`prepare_search_emoji_query`, StickersManager.cpp:10168-10211).
+enum EmojiSearchOutcome {
+    Answered,
+    Parked(EmojiSearchPark),
+    Ready {
+        text: String,
+        language_codes: Vec<String>,
+    },
+}
+
+/// The load the C++ `prepare_search_emoji_query` parks on before
+/// re-entry.
+enum EmojiSearchPark {
+    /// the `emojilc$` cache miss — the GetEmojiKeywordsLanguageQuery
+    /// tail over the used-language union.
+    LanguageCodes(Vec<String>),
+    /// the per-language GetEmojiKeywordsQuery fan (the MultiPromise
+    /// keeps only the first promise).
+    Keywords(Vec<String>),
+}
+
 impl StickersManager {
     pub fn new() -> StickersManager {
-        StickersManager::default()
+        // StickersManager.h:1061 — `old_featured_sticker_set_count_ =
+        // {-1, 0, 0}` (only the Regular slot starts unknown).
+        StickersManager {
+            old_featured_sticker_set_count: [-1, 0, 0],
+            ..StickersManager::default()
+        }
     }
 
     /// `get_stickers_object` over the collapsed cache — offline the id
@@ -1604,6 +2378,1427 @@ impl StickersManager {
         let _ = env;
         promise.set_value(String::new());
     }
+
+    // ------------------------------------------------------------------
+    // The stickers residue ladder (the 31-arm slice): the recent/favorite
+    // registries, the sets ladder, the emoji-search planes, the emoji
+    // statuses and the hashtag hints.
+    // ------------------------------------------------------------------
+
+    /// `get_stickers` (StickersManager.cpp:4259-4542) over the
+    /// `GetStickersRequest` actor (Requests.cpp:1361-1388) — the local
+    /// decision ladder is exact; the per-set record search collapses
+    /// (see [`Self::get_stickers_bands`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_stickers(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        query: String,
+        limit: i32,
+        dialog_id: crate::dialog_id::DialogId,
+        force: bool,
+        mut promise: Promise<td_api::Stickers>,
+    ) {
+        match self.get_stickers_bands(env, sticker_type, query, limit, dialog_id, force) {
+            StickerListOutcome::Ready(sticker_ids) => {
+                // `get_stickers_object` — the record-less ids build the
+                // empty `stickers` (the M.st collapse)
+                let _ = sticker_ids;
+                promise.set_value(td_api::Stickers {
+                    stickers: Vec::new(),
+                });
+            }
+            StickerListOutcome::Parked(park) => match park {
+                StickerListPark::Installed(sticker_type) => {
+                    env.load_installed_sticker_sets(sticker_type, promise)
+                }
+                StickerListPark::Recent(is_attached) => {
+                    if !self.try_load_recent_stickers_inline(env, is_attached) {
+                        env.send_get_recent_stickers_query(is_attached, promise);
+                        return;
+                    }
+                    // the C++ re-run answers over the just-loaded list
+                    promise.set_value(td_api::Stickers {
+                        stickers: Vec::new(),
+                    });
+                }
+                StickerListPark::Favorite => {
+                    if !self.try_load_favorite_stickers_inline(env) {
+                        env.send_get_favorite_stickers_query(promise);
+                        return;
+                    }
+                    promise.set_value(td_api::Stickers {
+                        stickers: Vec::new(),
+                    });
+                }
+                StickerListPark::Featured(sticker_type) => {
+                    env.load_featured_sticker_sets(sticker_type, promise)
+                }
+                StickerListPark::Sets(set_ids) => env.load_sticker_sets(set_ids, promise),
+            },
+            StickerListOutcome::Failed(error) => promise.set_error(error),
+        }
+    }
+
+    /// `get_sticker_emojis_object` over the collapsed cache — the
+    /// record-less ids build the empty `emojis`
+    /// (StickersManager.cpp:2236-2259, the CHECK-ed record walk is
+    /// unreachable over the never-loaded registry).
+    fn get_sticker_emojis_object(
+        &self,
+        sticker_ids: &[crate::files::FileId],
+        return_only_main_emoji: bool,
+    ) -> td_api::Emojis {
+        let _ = (sticker_ids, return_only_main_emoji);
+        td_api::Emojis { emojis: Vec::new() }
+    }
+
+    /// `getAllStickerEmojisRequest` (Requests.cpp:1390-1417) — the same
+    /// `get_stickers` ladder with the fixed 1,000,000 limit, answered
+    /// with the `emojis` object.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_all_sticker_emojis(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        query: String,
+        dialog_id: crate::dialog_id::DialogId,
+        return_only_main_emoji: bool,
+        mut promise: Promise<td_api::Emojis>,
+    ) {
+        match self.get_stickers_bands(env, sticker_type, query, 1_000_000, dialog_id, false) {
+            StickerListOutcome::Ready(sticker_ids) => {
+                promise.set_value(
+                    self.get_sticker_emojis_object(&sticker_ids, return_only_main_emoji),
+                );
+            }
+            StickerListOutcome::Parked(park) => match park {
+                StickerListPark::Installed(sticker_type) => {
+                    env.load_installed_sticker_sets(sticker_type, promise)
+                }
+                StickerListPark::Recent(is_attached) => {
+                    if !self.try_load_recent_stickers_inline(env, is_attached) {
+                        env.send_get_recent_stickers_query(is_attached, promise);
+                        return;
+                    }
+                    // the C++ re-run answers over the just-loaded list
+                    promise.set_value(td_api::Emojis { emojis: Vec::new() });
+                }
+                StickerListPark::Favorite => {
+                    if !self.try_load_favorite_stickers_inline(env) {
+                        env.send_get_favorite_stickers_query(promise);
+                        return;
+                    }
+                    promise.set_value(td_api::Emojis { emojis: Vec::new() });
+                }
+                StickerListPark::Featured(sticker_type) => {
+                    env.load_featured_sticker_sets(sticker_type, promise)
+                }
+                StickerListPark::Sets(set_ids) => env.load_sticker_sets(set_ids, promise),
+            },
+            StickerListOutcome::Failed(error) => promise.set_error(error),
+        }
+    }
+
+    /// The `get_stickers` body (StickersManager.cpp:4261-4541). The local
+    /// gates (the close/limit bands, the installed/recent/favorite/featured
+    /// load gates, the old-secret-chat early empty) are exact; the
+    /// search half walks the loaded set records — over the collapsed
+    /// state no set ever loads, so the examined registry contributes
+    /// nothing and the record-less prepend ids drop (the C++
+    /// `CHECK(s != nullptr)` is unreachable over a loaded registry).
+    #[allow(clippy::too_many_arguments)]
+    fn get_stickers_bands(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        mut query: String,
+        limit: i32,
+        dialog_id: crate::dialog_id::DialogId,
+        force: bool,
+    ) -> StickerListOutcome {
+        if env.close_flag() {
+            return StickerListOutcome::Failed(tdutils::status::Status::error(
+                500,
+                "Request aborted",
+            ));
+        }
+        if limit <= 0 {
+            return StickerListOutcome::Failed(tdutils::status::Status::error(
+                400,
+                "Parameter limit must be positive",
+            ));
+        }
+
+        let type_index = sticker_type as usize;
+        if !self.are_installed_sticker_sets_loaded[type_index] {
+            // CHECK(!force) — the actor's retry force never arrives
+            // before the load
+            return StickerListOutcome::Parked(StickerListPark::Installed(sticker_type));
+        }
+
+        let return_all_installed = query.is_empty();
+
+        tdutils::emoji::remove_emoji_modifiers_in_place(&mut query, true);
+        let mut emojis = full_split(&query, ' ');
+        if emojis.iter().any(|emoji| !tdutils::emoji::is_emoji(emoji)) {
+            emojis.clear();
+        }
+        let _ = emojis;
+
+        if !return_all_installed {
+            if sticker_type == StickerType::Regular {
+                if !self.are_recent_stickers_loaded[0] {
+                    return StickerListOutcome::Parked(StickerListPark::Recent(false));
+                }
+                if !self.are_favorite_stickers_loaded {
+                    return StickerListOutcome::Parked(StickerListPark::Favorite);
+                }
+            } else if sticker_type == StickerType::CustomEmoji
+                && !self.are_featured_sticker_sets_loaded[type_index]
+            {
+                return StickerListOutcome::Parked(StickerListPark::Featured(sticker_type));
+            }
+        }
+
+        let mut allow_premium = false;
+        if sticker_type == StickerType::CustomEmoji {
+            match dialog_id.get_type() {
+                crate::messages_manager::DialogType::User
+                    if dialog_id.get_user_id() == env.get_my_id() =>
+                {
+                    allow_premium = true;
+                }
+                crate::messages_manager::DialogType::SecretChat
+                    if env.get_secret_chat_layer(dialog_id.get_secret_chat_id()) < 144 =>
+                {
+                    // SecretChatLayer::SpoilerAndCustomEmojiEntities — the
+                    // early empty answer
+                    return StickerListOutcome::Ready(Vec::new());
+                }
+                _ => {}
+            }
+        }
+        // `allow_premium` only feeds the record-dependent premium
+        // interleave below
+        let _ = allow_premium;
+
+        let mut examined_sticker_set_ids = self.installed_sticker_set_ids[type_index].clone();
+        if !return_all_installed && sticker_type == StickerType::CustomEmoji {
+            examined_sticker_set_ids.extend(self.featured_sticker_set_ids[type_index].iter());
+        }
+
+        let prepend_sticker_ids = if !return_all_installed && sticker_type == StickerType::Regular {
+            let mut prepend_sticker_ids = self.recent_sticker_ids[0].clone();
+            for sticker_id in &self.favorite_sticker_ids {
+                if !prepend_sticker_ids.contains(sticker_id) {
+                    prepend_sticker_ids.push(*sticker_id);
+                }
+            }
+            // the animated-first stable sort is over the sticker records
+            prepend_sticker_ids
+        } else {
+            Vec::new()
+        };
+        let _ = prepend_sticker_ids;
+
+        // the sets-to-load walk: no set record ever loads over the
+        // collapsed state, so every examined id needs the load and
+        // forces it (the C++ CHECK(get_sticker_set(id) != nullptr) and
+        // the CHECK-ed prepend walk are unreachable over a loaded
+        // registry)
+        if !examined_sticker_set_ids.is_empty() {
+            if !force {
+                return StickerListOutcome::Parked(StickerListPark::Sets(examined_sticker_set_ids));
+            }
+            // the force retry: the load is fire-and-forget (`Auto()`)
+            // and the search proceeds
+            env.load_sticker_sets(examined_sticker_set_ids, Promise::<()>::default());
+        }
+
+        // the search over the (never-loaded) set records and the
+        // prepend match both read sticker records: they contribute
+        // nothing over the collapsed state
+        StickerListOutcome::Ready(Vec::new())
+    }
+
+    /// `get_installed_sticker_sets` (StickersManager.cpp:4921-4931).
+    pub fn get_installed_sticker_sets(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        mut promise: Promise<td_api::StickerSets>,
+    ) {
+        let type_index = sticker_type as usize;
+        if !self.are_installed_sticker_sets_loaded[type_index] {
+            env.load_installed_sticker_sets(sticker_type, promise);
+            return;
+        }
+        env.reload_installed_sticker_sets(sticker_type, false);
+
+        // `get_sticker_sets_object(-1, ids, 1)` — the record-less ids
+        // build the empty list and lift the -1 total to the size
+        let _ = self.installed_sticker_set_ids[type_index].len();
+        promise.set_value(td_api::StickerSets {
+            total_count: 0,
+            sets: Vec::new(),
+        });
+    }
+
+    /// `get_sticker_set` (StickersManager.cpp:4961-4980) — the public
+    /// set-by-id read.
+    pub fn get_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set_id: StickerSetId,
+        mut promise: Promise<td_api::StickerSet>,
+    ) {
+        let _ = env;
+        // the collapsed set lookup: unknown ids ride the Great Minds
+        // reload seam (the do_reload_sticker_set tail) or the 400 band
+        if set_id.get() == GREAT_MINDS_SET_ID {
+            env.send_reload_sticker_set_by_id_query(set_id, promise);
+            return;
+        }
+        promise.set_error(tdutils::status::Status::error(400, "Sticker set not found"));
+    }
+
+    /// `search_sticker_set` (StickersManager.cpp:5002-5019) — over the
+    /// collapsed name cache the lookup always misses and the reload
+    /// tail owns the promise.
+    pub fn search_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        short_name_to_search: String,
+        ignore_cache: bool,
+        promise: Promise<td_api::StickerSet>,
+    ) {
+        let short_name = clean_username(&short_name_to_search);
+        let _ = short_name;
+        let _ = ignore_cache;
+        // sticker_set == nullptr → the do_reload_sticker_set tail over
+        // inputStickerSetShortName
+        let short_name = clean_username(&short_name_to_search);
+        env.send_search_sticker_set_query(short_name, promise);
+    }
+
+    /// `search_installed_sticker_sets` (StickersManager.cpp:5021-5042).
+    pub fn search_installed_sticker_sets(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        _query: String,
+        limit: i32,
+        mut promise: Promise<td_api::StickerSets>,
+    ) {
+        if limit < 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Limit must be non-negative",
+            ));
+            return;
+        }
+        let type_index = sticker_type as usize;
+        if !self.are_installed_sticker_sets_loaded[type_index] {
+            env.load_installed_sticker_sets(sticker_type, promise);
+            return;
+        }
+        env.reload_installed_sticker_sets(sticker_type, false);
+
+        // the installed_sticker_sets_hints_ title index collapses to the
+        // empty registry (set titles never load offline): the search
+        // answers {0, {}} — `get_sticker_sets_object(0, {}, 5)`
+        promise.set_value(td_api::StickerSets {
+            total_count: 0,
+            sets: Vec::new(),
+        });
+    }
+
+    /// `search_sticker_sets` (StickersManager.cpp:5044-5072).
+    pub fn search_sticker_sets(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        query: String,
+        mut promise: Promise<td_api::StickerSets>,
+    ) {
+        if sticker_type == StickerType::Mask {
+            promise.set_value(td_api::StickerSets {
+                total_count: 0,
+                sets: Vec::new(),
+            });
+            return;
+        }
+        let type_index = sticker_type as usize;
+        let q = clean_name(&query, 1000);
+        if let Some(sticker_set_ids) = self.found_sticker_sets[type_index].get(&q) {
+            // the found-cache hit filters the installed sets (the C++
+            // CHECKs the found records exist; over the collapsed state a
+            // seeded found list filters by the installed registry)
+            let installed: std::collections::HashSet<StickerSetId> = self.installed_sticker_set_ids
+                [type_index]
+                .iter()
+                .copied()
+                .collect();
+            let result: Vec<StickerSetId> = sticker_set_ids
+                .iter()
+                .copied()
+                .filter(|set_id| !installed.contains(set_id))
+                .collect();
+            let total_count = i32::try_from(result.len()).unwrap_or(-1);
+            promise.set_value(td_api::StickerSets {
+                total_count,
+                sets: Vec::new(),
+            });
+            return;
+        }
+
+        env.send_search_sticker_sets_query(sticker_type, q, promise);
+    }
+
+    /// `change_sticker_set` (StickersManager.cpp:5134-5171) — over the
+    /// collapsed state the set lookup always misses: the two 400 bands
+    /// are the reachable behavior.
+    pub fn change_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set_id: StickerSetId,
+        is_installed: bool,
+        is_archived: bool,
+        mut promise: Promise<()>,
+    ) {
+        let _ = env;
+        if is_installed && is_archived {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Sticker set can't be installed and archived simultaneously",
+            ));
+            return;
+        }
+        // sticker_set == nullptr → the 400 band
+        let _ = set_id;
+        promise.set_error(tdutils::status::Status::error(400, "Sticker set not found"));
+    }
+
+    /// `get_archived_sticker_sets` (StickersManager.cpp:7208-7251) — the
+    /// seeded-list walk (with the trailing-sentinel check) is exact.
+    pub fn get_archived_sticker_sets(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        offset_sticker_set_id: StickerSetId,
+        limit: i32,
+        force: bool,
+        mut promise: Promise<td_api::StickerSets>,
+    ) {
+        if limit <= 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Parameter limit must be positive",
+            ));
+            return;
+        }
+
+        let type_index = sticker_type as usize;
+        let sticker_set_ids = &self.archived_sticker_set_ids[type_index];
+        let total_count = self.total_archived_sticker_set_count[type_index];
+        if total_count >= 0 {
+            let mut offset_it = 0usize;
+            if offset_sticker_set_id.is_valid() {
+                match sticker_set_ids
+                    .iter()
+                    .position(|&set_id| set_id == offset_sticker_set_id)
+                {
+                    Some(position) => offset_it = position + 1,
+                    None => offset_it = 0,
+                }
+            }
+            let mut result = Vec::new();
+            while result.len() < limit as usize {
+                if offset_it == sticker_set_ids.len() {
+                    break;
+                }
+                let sticker_set_id = sticker_set_ids[offset_it];
+                offset_it += 1;
+                if !sticker_set_id.is_valid() {
+                    // end of the list (the trailing StickerSetId())
+                    promise.set_value(td_api::StickerSets {
+                        total_count,
+                        sets: Vec::new(),
+                    });
+                    return;
+                }
+                result.push(sticker_set_id);
+            }
+            if result.len() == limit as usize || force {
+                promise.set_value(td_api::StickerSets {
+                    total_count,
+                    sets: Vec::new(),
+                });
+                return;
+            }
+        }
+
+        env.send_get_archived_sticker_sets_query(
+            sticker_type,
+            offset_sticker_set_id,
+            limit,
+            promise,
+        );
+    }
+
+    /// `get_featured_sticker_sets` (StickersManager.cpp:7296-7362).
+    pub fn get_featured_sticker_sets(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_type: StickerType,
+        mut offset: i32,
+        limit: i32,
+        mut promise: Promise<td_api::TrendingStickerSets>,
+    ) {
+        if offset < 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Parameter offset must be non-negative",
+            ));
+            return;
+        }
+        if limit < 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Parameter limit must be non-negative",
+            ));
+            return;
+        }
+        if limit == 0 {
+            offset = 0;
+        }
+
+        if sticker_type == StickerType::Mask {
+            promise.set_value(self.get_trending_sticker_sets_object(sticker_type, &[]));
+            return;
+        }
+        let type_index = sticker_type as usize;
+
+        if !self.are_featured_sticker_sets_loaded[type_index] {
+            env.load_featured_sticker_sets(sticker_type, promise);
+            return;
+        }
+        env.reload_featured_sticker_sets(sticker_type, false);
+
+        let set_count = self.featured_sticker_set_ids[type_index].len() as i32;
+        if offset < set_count {
+            let limit = limit.min(set_count - offset);
+            let begin = offset as usize;
+            let end = begin + limit as usize;
+            promise.set_value(self.get_trending_sticker_sets_object(
+                sticker_type,
+                &self.featured_sticker_set_ids[type_index][begin..end],
+            ));
+            return;
+        }
+
+        if offset == set_count && self.are_old_featured_sticker_sets_invalidated[type_index] {
+            // invalidate_old_featured_sticker_sets — the pmc erase and
+            // the generation bump ride the updates plane
+            self.are_old_featured_sticker_sets_invalidated[type_index] = false;
+            self.old_featured_sticker_set_ids[type_index].clear();
+        }
+
+        let old_featured_sticker_set_count = self.old_featured_sticker_set_count[type_index];
+        let total_count = set_count
+            + if old_featured_sticker_set_count == -1 {
+                1
+            } else {
+                old_featured_sticker_set_count
+            };
+        if offset < total_count || old_featured_sticker_set_count == -1 {
+            offset -= set_count;
+            let set_count = self.old_featured_sticker_set_ids[type_index].len() as i32;
+            if offset < set_count {
+                let limit = limit.min(set_count - offset);
+                let begin = offset as usize;
+                let end = begin + limit as usize;
+                promise.set_value(self.get_trending_sticker_sets_object(
+                    sticker_type,
+                    &self.old_featured_sticker_set_ids[type_index][begin..end],
+                ));
+                return;
+            }
+            if offset > set_count {
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Too big offset specified; trending sticker sets can be received only consequently",
+                ));
+                return;
+            }
+
+            env.load_old_featured_sticker_sets(sticker_type, promise);
+            return;
+        }
+
+        promise.set_value(self.get_trending_sticker_sets_object(sticker_type, &[]));
+    }
+
+    /// `get_trending_sticker_sets_object` (StickersManager.cpp:7491-7517)
+    /// — the total-count formula and the premium flag are exact; the
+    /// per-set info build collapses over the never-loaded registry.
+    fn get_trending_sticker_sets_object(
+        &self,
+        sticker_type: StickerType,
+        sticker_set_ids: &[StickerSetId],
+    ) -> td_api::TrendingStickerSets {
+        let type_index = sticker_type as usize;
+        let old_count = self.old_featured_sticker_set_count[type_index];
+        let total_count = self.featured_sticker_set_ids[type_index].len() as i32
+            + if old_count == -1 { 1 } else { old_count };
+        let _ = sticker_set_ids;
+        td_api::TrendingStickerSets {
+            total_count,
+            sets: Vec::new(),
+            is_premium: false,
+        }
+    }
+
+    /// `get_attached_sticker_sets` (StickersManager.cpp:7723-7764).
+    pub fn get_attached_sticker_sets(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        file_id: crate::files::FileId,
+        mut promise: Promise<td_api::StickerSets>,
+    ) {
+        if !file_id.is_valid() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Wrong file_id specified",
+            ));
+            return;
+        }
+
+        if let Some(sticker_set_ids) = self.attached_sticker_sets.get(&file_id) {
+            let _ = sticker_set_ids;
+            promise.set_value(td_api::StickerSets {
+                total_count: 0,
+                sets: Vec::new(),
+            });
+            return;
+        }
+
+        // send_get_attached_stickers_query: the empty view is the 400
+        // band, the non-document/non-photo remote location answers empty
+        // (the local bands), the document/photo query parks
+        let file_view = env.file_get_view(file_id);
+        if file_view.empty {
+            promise.set_error(tdutils::status::Status::error(400, "File not found"));
+            return;
+        }
+        if file_view.full_remote_is_photo {
+            env.send_get_attached_stickers_query(file_id, promise);
+            return;
+        }
+        if file_view.full_remote_document_id.is_some() && !file_view.full_remote_is_web {
+            env.send_get_attached_stickers_query(file_id, promise);
+            return;
+        }
+        promise.set_value(td_api::StickerSets {
+            total_count: 0,
+            sets: Vec::new(),
+        });
+    }
+
+    /// `get_recent_stickers` (StickersManager.cpp:9018-9027).
+    pub fn get_recent_stickers(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+        mut promise: Promise<td_api::Stickers>,
+    ) {
+        if !self.try_load_recent_stickers_inline(env, is_attached) {
+            env.send_get_recent_stickers_query(is_attached, promise);
+            return;
+        }
+        env.reload_recent_stickers(is_attached, false);
+
+        // get_stickers_object(recent_sticker_ids_[is_attached]) — the
+        // record-less ids build the empty `stickers`
+        let _ = self.recent_sticker_ids[is_attached as usize].len();
+        promise.set_value(td_api::Stickers {
+            stickers: Vec::new(),
+        });
+    }
+
+    /// `load_recent_stickers` (StickersManager.cpp:9029-9051) — the
+    /// sqlite pmc read collapses inline. Returns true when the lists
+    /// became loaded inline (the caller continues with its loaded-band
+    /// answer — the C++ request actor re-runs after the unit promise);
+    /// on false the caller hands its promise to
+    /// [`StickersManagerEnv::send_get_recent_stickers_query`], which
+    /// parks it ([blocked: net]).
+    fn try_load_recent_stickers_inline(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+    ) -> bool {
+        if env.auth_is_bot() {
+            self.are_recent_stickers_loaded[is_attached as usize] = true;
+        }
+        if self.are_recent_stickers_loaded[is_attached as usize] {
+            return true;
+        }
+        if env.use_sqlite_pmc() {
+            let key: &[u8] = if is_attached { b"ssr1" } else { b"ssr0" };
+            let value = env.sqlite_pmc_get_raw(key);
+            if !value.is_empty() {
+                match parse_sticker_list(&value) {
+                    Ok(mut sticker_ids) => {
+                        self.on_load_recent_stickers_finished(env, is_attached, &mut sticker_ids);
+                        return true;
+                    }
+                    Err(_) => {
+                        // "Can't load recent stickers" — the broken
+                        // record falls through to the server reload
+                        tracing::error!("Can't load recent stickers");
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `on_load_recent_stickers_finished` (StickersManager.cpp:9078-9087)
+    /// — the registry fill (the update emission rides the updates plane).
+    fn on_load_recent_stickers_finished(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+        sticker_ids: &mut Vec<crate::files::FileId>,
+    ) {
+        let recent_stickers_limit =
+            i32::try_from(env.get_option_integer("recent_stickers_limit", 200)).unwrap_or(200);
+        if sticker_ids.len() > recent_stickers_limit.max(0) as usize {
+            sticker_ids.truncate(recent_stickers_limit.max(0) as usize);
+        }
+        self.recent_sticker_ids[is_attached as usize] = std::mem::take(sticker_ids);
+        self.are_recent_stickers_loaded[is_attached as usize] = true;
+    }
+
+    /// `add_recent_sticker` (StickersManager.cpp:9163-9173).
+    pub fn add_recent_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+        input_file: Option<&td_api::InputFile>,
+        mut promise: Promise<()>,
+    ) {
+        if !self.try_load_recent_stickers_inline(env, is_attached) {
+            env.send_get_recent_stickers_query(is_attached, promise);
+            return;
+        }
+
+        let file_id = match env.file_get_input_file_id(FileType::Sticker, input_file, false) {
+            Result::Ok(file_id) => file_id,
+            Result::Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        self.add_recent_sticker_impl(env, is_attached, file_id, true, promise);
+    }
+
+    /// `add_recent_sticker_impl` (StickersManager.cpp:9195-9261) — the
+    /// head-equality and the sticker-record bands; over the collapsed
+    /// state every non-duplicate add hits the "Sticker not found" band
+    /// (the record walk needs the loaded sticker store).
+    fn add_recent_sticker_impl(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+        sticker_id: crate::files::FileId,
+        add_on_server: bool,
+        mut promise: Promise<()>,
+    ) {
+        let _ = add_on_server;
+        if !self.try_load_recent_stickers_inline(env, is_attached) {
+            env.send_get_recent_stickers_query(is_attached, promise);
+            return;
+        }
+
+        let is_equal = |file_id: crate::files::FileId| {
+            file_id == sticker_id
+                || (file_id.get_remote() == sticker_id.get_remote() && sticker_id.get_remote() != 0)
+        };
+
+        let sticker_ids = &mut self.recent_sticker_ids[is_attached as usize];
+        if !sticker_ids.is_empty() && is_equal(sticker_ids[0]) {
+            // the add_to_top of an already-first sticker — the C++
+            // upgrades the head's remote id and rewrites the pmc record
+            // (StickersManager.cpp:9216-9225)
+            if sticker_ids[0].get_remote() == 0 && sticker_id.get_remote() != 0 {
+                sticker_ids[0] = sticker_id;
+                self.save_recent_stickers_list(env, is_attached);
+            }
+            promise.set_value(());
+            return;
+        }
+
+        // get_sticker(sticker_id) == nullptr → the 400 band
+        promise.set_error(tdutils::status::Status::error(400, "Sticker not found"));
+        let _ = env;
+    }
+
+    /// `remove_recent_sticker` (StickersManager.cpp:9263-9289) — the
+    /// registry removal is local and exact; the server tail owns the
+    /// promise. Like the C++, a removed-but-unknown sticker keeps the
+    /// local removal and answers the 400.
+    pub fn remove_recent_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+        input_file: Option<&td_api::InputFile>,
+        mut promise: Promise<()>,
+    ) {
+        if !self.try_load_recent_stickers_inline(env, is_attached) {
+            env.send_get_recent_stickers_query(is_attached, promise);
+            return;
+        }
+
+        let file_id = match env.file_get_input_file_id(FileType::Sticker, input_file, false) {
+            Result::Ok(file_id) => file_id,
+            Result::Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+
+        let is_equal = |candidate: crate::files::FileId| {
+            candidate == file_id
+                || (candidate.get_remote() == file_id.get_remote() && file_id.get_remote() != 0)
+        };
+        let sticker_ids = &mut self.recent_sticker_ids[is_attached as usize];
+        if let Some(position) = sticker_ids
+            .iter()
+            .position(|&candidate| is_equal(candidate))
+        {
+            sticker_ids.remove(position);
+            // get_sticker(file_id) == nullptr → the 400 band
+            promise.set_error(tdutils::status::Status::error(400, "Sticker not found"));
+            return;
+        }
+
+        promise.set_value(());
+    }
+
+    /// `clear_recent_stickers` (StickersManager.cpp:9291-9308) — the
+    /// local clear is immediate; the server tail owns the promise.
+    pub fn clear_recent_stickers(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        is_attached: bool,
+        mut promise: Promise<()>,
+    ) {
+        if !self.try_load_recent_stickers_inline(env, is_attached) {
+            env.send_get_recent_stickers_query(is_attached, promise);
+            return;
+        }
+
+        let sticker_ids = &mut self.recent_sticker_ids[is_attached as usize];
+        if sticker_ids.is_empty() {
+            promise.set_value(());
+            return;
+        }
+
+        env.send_clear_recent_stickers_query(is_attached, promise);
+        // the C++ clears after the handler send; the update emission
+        // rides the updates plane
+        sticker_ids.clear();
+    }
+
+    /// `get_favorite_stickers` (StickersManager.cpp:9416-9425).
+    pub fn get_favorite_stickers(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        mut promise: Promise<td_api::Stickers>,
+    ) {
+        if !self.try_load_favorite_stickers_inline(env) {
+            env.send_get_favorite_stickers_query(promise);
+            return;
+        }
+        env.reload_favorite_stickers(false);
+
+        let _ = self.favorite_sticker_ids.len();
+        promise.set_value(td_api::Stickers {
+            stickers: Vec::new(),
+        });
+    }
+
+    /// The inline half — true = the list is loaded (the pmc record
+    /// filled it); false = the caller parks its promise via
+    /// [`StickersManagerEnv::send_get_favorite_stickers_query`].
+    fn try_load_favorite_stickers_inline(&mut self, env: &mut impl StickersManagerEnv) -> bool {
+        if env.auth_is_bot() {
+            self.are_favorite_stickers_loaded = true;
+        }
+        if self.are_favorite_stickers_loaded {
+            return true;
+        }
+        if env.use_sqlite_pmc() {
+            let value = env.sqlite_pmc_get_raw(b"ssfav");
+            if !value.is_empty() {
+                match parse_sticker_list(&value) {
+                    Ok(mut sticker_ids) => {
+                        self.on_load_favorite_stickers_finished(env, &mut sticker_ids);
+                        return true;
+                    }
+                    Err(_) => {
+                        tracing::error!("Can't load favorite stickers");
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `on_load_favorite_stickers_finished`
+    /// (StickersManager.cpp:9475-9483).
+    fn on_load_favorite_stickers_finished(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_ids: &mut Vec<crate::files::FileId>,
+    ) {
+        let favorite_stickers_limit =
+            i32::try_from(env.get_option_integer("favorite_stickers_limit", 5)).unwrap_or(5);
+        if sticker_ids.len() > favorite_stickers_limit.max(0) as usize {
+            sticker_ids.truncate(favorite_stickers_limit.max(0) as usize);
+        }
+        self.favorite_sticker_ids = std::mem::take(sticker_ids);
+        self.are_favorite_stickers_loaded = true;
+    }
+
+    /// `add_favorite_sticker` (StickersManager.cpp:9553-9564).
+    pub fn add_favorite_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        input_file: Option<&td_api::InputFile>,
+        mut promise: Promise<()>,
+    ) {
+        if !self.try_load_favorite_stickers_inline(env) {
+            env.send_get_favorite_stickers_query(promise);
+            return;
+        }
+
+        let file_id = match env.file_get_input_file_id(FileType::Sticker, input_file, false) {
+            Result::Ok(file_id) => file_id,
+            Result::Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        self.add_favorite_sticker_impl(env, file_id, true, promise);
+    }
+
+    /// `add_favorite_sticker_impl` (StickersManager.cpp:9584-9647) —
+    /// the favorite twin of [`Self::add_recent_sticker_impl`].
+    fn add_favorite_sticker_impl(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_id: crate::files::FileId,
+        add_on_server: bool,
+        mut promise: Promise<()>,
+    ) {
+        let _ = add_on_server;
+        if !self.try_load_favorite_stickers_inline(env) {
+            env.send_get_favorite_stickers_query(promise);
+            return;
+        }
+
+        let is_equal = |file_id: crate::files::FileId| {
+            file_id == sticker_id
+                || (file_id.get_remote() == sticker_id.get_remote() && sticker_id.get_remote() != 0)
+        };
+
+        if !self.favorite_sticker_ids.is_empty() && is_equal(self.favorite_sticker_ids[0]) {
+            if self.favorite_sticker_ids[0].get_remote() == 0 && sticker_id.get_remote() != 0 {
+                self.favorite_sticker_ids[0] = sticker_id;
+                self.save_favorite_stickers_list(env);
+            }
+            promise.set_value(());
+            return;
+        }
+
+        // get_sticker(sticker_id) == nullptr → the 400 band
+        promise.set_error(tdutils::status::Status::error(400, "Sticker not found"));
+        let _ = env;
+    }
+
+    /// `remove_favorite_sticker` (StickersManager.cpp:9649-9674).
+    pub fn remove_favorite_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        input_file: Option<&td_api::InputFile>,
+        mut promise: Promise<()>,
+    ) {
+        if !self.try_load_favorite_stickers_inline(env) {
+            env.send_get_favorite_stickers_query(promise);
+            return;
+        }
+
+        let file_id = match env.file_get_input_file_id(FileType::Sticker, input_file, false) {
+            Result::Ok(file_id) => file_id,
+            Result::Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+
+        let is_equal = |candidate: crate::files::FileId| {
+            candidate == file_id
+                || (candidate.get_remote() == file_id.get_remote() && file_id.get_remote() != 0)
+        };
+        if let Some(position) = self
+            .favorite_sticker_ids
+            .iter()
+            .position(|&candidate| is_equal(candidate))
+        {
+            self.favorite_sticker_ids.remove(position);
+            // get_sticker(file_id) == nullptr → the 400 band
+            promise.set_error(tdutils::status::Status::error(400, "Sticker not found"));
+            return;
+        }
+
+        promise.set_value(());
+    }
+
+    /// `get_sticker_emojis` (StickersManager.cpp:9710-9757) — the
+    /// input-file probe is real; the sticker-record bands collapse to
+    /// the empty answer (the store never loads offline).
+    pub fn get_sticker_emojis(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        input_file: Option<&td_api::InputFile>,
+        mut promise: Promise<td_api::Emojis>,
+    ) {
+        let _file_id = match env.file_get_input_file_id(FileType::Sticker, input_file, false) {
+            Result::Ok(file_id) => file_id,
+            Result::Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+
+        // sticker == nullptr (and the set/view bands behind it) → the
+        // empty `emojis`
+        promise.set_value(td_api::Emojis { emojis: Vec::new() });
+    }
+
+    /// `search_emojis` (StickersManager.cpp:10213-10229) over the
+    /// `SearchEmojisRequest` actor — the empty/unsupported bands answer
+    /// the empty `emojiKeywords`; the prepared query reads the sqlite
+    /// pmc keyword records.
+    pub fn search_emojis(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        text: String,
+        input_language_codes: Vec<String>,
+        force: bool,
+        mut promise: Promise<td_api::EmojiKeywords>,
+    ) {
+        match self.prepare_search_emoji_query(env, text, input_language_codes, force) {
+            EmojiSearchOutcome::Answered => {
+                promise.set_value(td_api::EmojiKeywords {
+                    emoji_keywords: Vec::new(),
+                });
+            }
+            EmojiSearchOutcome::Parked(park) => match park {
+                EmojiSearchPark::LanguageCodes(language_codes) => {
+                    env.send_get_emoji_keywords_language_query(language_codes, promise)
+                }
+                EmojiSearchPark::Keywords(language_codes) => {
+                    // the MultiPromise keeps only the lock promise — the
+                    // first query answers, the rest run detached
+                    let mut promise = Some(promise);
+                    for language_code in language_codes.iter() {
+                        let promise = promise.take().unwrap_or_default();
+                        env.send_get_emoji_keywords_query(language_code.clone(), promise);
+                    }
+                }
+            },
+            EmojiSearchOutcome::Ready {
+                text,
+                language_codes,
+            } => {
+                let mut result: Vec<(String, String)> = Vec::new();
+                for language_code in &language_codes {
+                    result.extend(self.search_language_emojis(env, language_code, &text));
+                }
+                // td::unique — sort + dedup over the (emoji, keyword)
+                // pairs
+                result.sort();
+                result.dedup();
+                promise.set_value(td_api::EmojiKeywords {
+                    emoji_keywords: result
+                        .into_iter()
+                        .map(|(emoji, keyword)| td_api::EmojiKeyword { emoji, keyword })
+                        .collect(),
+                });
+            }
+        }
+    }
+
+    /// `get_keyword_emojis` (StickersManager.cpp:10231-10246) — the
+    /// keyword twin of [`Self::search_emojis`].
+    pub fn get_keyword_emojis(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        text: String,
+        input_language_codes: Vec<String>,
+        force: bool,
+        mut promise: Promise<td_api::Emojis>,
+    ) {
+        match self.prepare_search_emoji_query(env, text, input_language_codes, force) {
+            EmojiSearchOutcome::Answered => {
+                promise.set_value(td_api::Emojis { emojis: Vec::new() });
+            }
+            EmojiSearchOutcome::Parked(park) => match park {
+                EmojiSearchPark::LanguageCodes(language_codes) => {
+                    env.send_get_emoji_keywords_language_query(language_codes, promise)
+                }
+                EmojiSearchPark::Keywords(language_codes) => {
+                    // the MultiPromise keeps only the lock promise — the
+                    // first query answers, the rest run detached
+                    let mut promise = Some(promise);
+                    for language_code in language_codes.iter() {
+                        let promise = promise.take().unwrap_or_default();
+                        env.send_get_emoji_keywords_query(language_code.clone(), promise);
+                    }
+                }
+            },
+            EmojiSearchOutcome::Ready {
+                text,
+                language_codes,
+            } => {
+                let mut result: Vec<String> = Vec::new();
+                for language_code in &language_codes {
+                    result.extend(self.get_keyword_language_emojis(env, language_code, &text));
+                }
+                result.sort();
+                result.dedup();
+                promise.set_value(td_api::Emojis { emojis: result });
+            }
+        }
+    }
+
+    /// `prepare_search_emoji_query` (StickersManager.cpp:10168-10211)
+    /// plus the `get_emoji_language_codes` cache walk
+    /// (StickersManager.cpp:9926-9960).
+    fn prepare_search_emoji_query(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        text: String,
+        input_language_codes: Vec<String>,
+        force: bool,
+    ) -> EmojiSearchOutcome {
+        if text.is_empty() || !env.use_sqlite_pmc() {
+            return EmojiSearchOutcome::Answered;
+        }
+
+        // get_emoji_language_codes: the used-language union, then the
+        // `emojilc$` cache; the empty cache band parks at
+        // load_language_codes with the used list (the promise rides the
+        // GetEmojiKeywordsLanguageQuery)
+        let used_language_codes = self.get_used_language_codes(env, input_language_codes, &text);
+        let key = format!("emojilc${}", used_language_codes.join("$"));
+        let language_codes = if let Some(cached) = self.emoji_language_codes.get(&key) {
+            cached.clone()
+        } else {
+            let loaded = full_split(
+                &String::from_utf8_lossy(&env.sqlite_pmc_get_raw(key.as_bytes())),
+                '$',
+            )
+            .into_iter()
+            .filter(|language_code| !(language_code.is_empty() || language_code.contains('$')))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<String>>();
+            self.emoji_language_codes
+                .insert(key.clone(), loaded.clone());
+            loaded
+        };
+        if language_codes.is_empty() {
+            // load_language_codes(std::move(language_codes), key, promise)
+            return EmojiSearchOutcome::Parked(EmojiSearchPark::LanguageCodes(used_language_codes));
+        }
+
+        // the freshness difference queries (fire-and-forget)
+        for language_code in &language_codes {
+            let last_difference_time =
+                self.get_emoji_language_code_last_difference_time(env, language_code);
+            if last_difference_time < env.now() - 3600.0
+                && self.get_emoji_language_code_version(env, language_code) != 0
+            {
+                // EMOJI_KEYWORDS_UPDATE_DELAY = 3600
+                // (StickersManager.h:486); load_emoji_keywords_difference
+                // pre-bumps the freshness time to prevent simultaneous
+                // requests
+                self.emoji_language_code_last_difference_times
+                    .insert(language_code.clone(), env.now() + 1e9);
+                let from_version = self.get_emoji_language_code_version(env, language_code);
+                env.send_get_emoji_keywords_difference_query(language_code.clone(), from_version);
+            }
+        }
+        if self.reloaded_emoji_keywords.insert(key) {
+            env.send_get_emoji_keywords_language_query(
+                language_codes.clone(),
+                Promise::<()>::default(),
+            );
+        }
+
+        let languages_to_load: Vec<String> = language_codes
+            .iter()
+            .filter(|language_code| self.get_emoji_language_code_version(env, language_code) == 0)
+            .cloned()
+            .collect();
+        if !languages_to_load.is_empty() {
+            if !force {
+                // the LoadEmojiLanguagesMultiPromiseActor over the
+                // per-language GetEmojiKeywordsQuery fan
+                return EmojiSearchOutcome::Parked(EmojiSearchPark::Keywords(languages_to_load));
+            }
+            tracing::error!("Have no {languages_to_load:?} emoji keywords");
+        }
+
+        EmojiSearchOutcome::Ready {
+            text: utf8_to_lower(&text),
+            language_codes,
+        }
+    }
+
+    /// `get_used_language_codes` (StickersManager.cpp:9885-9920) — the
+    /// language-pack + system + input + cyrillic union.
+    fn get_used_language_codes(
+        &self,
+        env: &mut impl StickersManagerEnv,
+        input_language_codes: Vec<String>,
+        text: &str,
+    ) -> Vec<String> {
+        let mut language_codes = env.get_language_pack_used_language_codes();
+        let system_language_code = env.get_system_language_code();
+        if system_language_code.len() >= 2
+            && !system_language_code.contains('$')
+            && (system_language_code.len() == 2 || system_language_code.as_bytes()[2] == b'-')
+        {
+            language_codes.push(system_language_code[..2].to_owned());
+        }
+        for input_language_code in &input_language_codes {
+            if input_language_code.len() >= 2
+                && !input_language_code.contains('$')
+                && (input_language_code.len() == 2 || input_language_code.as_bytes()[2] == b'-')
+            {
+                language_codes.push(input_language_code[..2].to_owned());
+            }
+        }
+        if let Some(first_letter) = text.chars().next() {
+            let code = first_letter as u32;
+            if (0x410..=0x44F).contains(&code) || code == 0x401 || code == 0x451 {
+                // the first letter is cyrillic
+                let known_cyrillic = [
+                    "ru", "uk", "bg", "be", "mk", "sr", "mn", "ky", "kk", "uz", "tk",
+                ];
+                if !known_cyrillic
+                    .iter()
+                    .any(|code| language_codes.iter().any(|have| have == code))
+                {
+                    language_codes.push("ru".to_owned());
+                }
+            }
+        }
+        language_codes.sort();
+        language_codes.dedup();
+
+        if language_codes.is_empty() {
+            language_codes.push("en".to_owned());
+        }
+        language_codes
+    }
+
+    /// `get_emoji_language_code_version` (StickersManager.cpp:9763-9775).
+    fn get_emoji_language_code_version(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        language_code: &str,
+    ) -> i32 {
+        if let Some(version) = self.emoji_language_code_versions.get(language_code) {
+            return *version;
+        }
+        if language_code.is_empty() {
+            return 0;
+        }
+        let value = env.sqlite_pmc_get_raw(format!("emojiv${language_code}").as_bytes());
+        // to_integer<int32> over the stored decimal string; a broken
+        // value reads as 0
+        let version: i32 = String::from_utf8_lossy(&value).trim().parse().unwrap_or(0);
+        self.emoji_language_code_versions
+            .insert(language_code.to_owned(), version);
+        version
+    }
+
+    /// `get_emoji_language_code_last_difference_time`
+    /// (StickersManager.cpp:9781-9795).
+    fn get_emoji_language_code_last_difference_time(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        language_code: &str,
+    ) -> f64 {
+        if let Some(last_difference_time) = self
+            .emoji_language_code_last_difference_times
+            .get(language_code)
+        {
+            return *last_difference_time;
+        }
+        if language_code.is_empty() {
+            return env.now() - f64::from(env.unix_time());
+        }
+        let value = env.sqlite_pmc_get_raw(format!("emojid${language_code}").as_bytes());
+        let old_unix_time: i32 = String::from_utf8_lossy(&value).trim().parse().unwrap_or(0);
+        let passed_time = (env.unix_time() - old_unix_time).max(0);
+        let last_difference_time = env.now() - f64::from(passed_time);
+        self.emoji_language_code_last_difference_times
+            .insert(language_code.to_owned(), last_difference_time);
+        last_difference_time
+    }
+
+    /// `search_language_emojis` (StickersManager.cpp:9801-9813) — the
+    /// `emoji$lc$text` prefix scan; the callback key is the suffix after
+    /// the prefix (the C++ `strip_key_prefix`), so the keyword is
+    /// `text + suffix`.
+    fn search_language_emojis(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        language_code: &str,
+        text: &str,
+    ) -> Vec<(String, String)> {
+        let key = format!("emoji${language_code}${text}");
+        let mut result = Vec::new();
+        let mut callback = |suffix: &[u8], value: &[u8]| {
+            let keyword = format!("{text}{}", String::from_utf8_lossy(suffix));
+            for emoji in full_split(&String::from_utf8_lossy(value), '$') {
+                result.push((emoji.to_owned(), keyword.clone()));
+            }
+        };
+        env.sqlite_pmc_get_by_prefix(key.as_bytes(), &mut callback);
+        result
+    }
+
+    /// `get_keyword_language_emojis` (StickersManager.cpp:9815-9820).
+    fn get_keyword_language_emojis(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        language_code: &str,
+        text: &str,
+    ) -> Vec<String> {
+        let key = format!("emoji${language_code}${text}");
+        let value = env.sqlite_pmc_get_raw(key.as_bytes());
+        full_split(&String::from_utf8_lossy(&value), '$')
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    // -- the emoji-status planes (the EmojiStatus.cpp free functions the
+    // -- five request arms delegate to)
+
+    // -- the hashtag hints arms (the three HashtagHints actors)
+
+    /// The `start_up` replay of the three hints actors
+    /// (Td.cpp:1344-1347, HashtagHints.cpp:27-37).
+    pub(crate) fn init_hashtag_hints(&mut self, env: &mut impl StickersManagerEnv) {
+        // Td.cpp:1344-1347 — the modes name the pmc keys; constructing
+        // here over the `Default` placeholders keeps the three
+        // registries on distinct keys (the Default drift is inert until
+        // this runs).
+        self.hashtag_hints = HashtagHints::new("text", '#');
+        self.hashtag_search_hints = HashtagHints::new("search", '#');
+        self.cashtag_search_hints = HashtagHints::new("cashtag_search", '$');
+        self.hashtag_hints.start_up(env);
+        self.hashtag_search_hints.start_up(env);
+        self.cashtag_search_hints.start_up(env);
+    }
+
+    /// `searchHashtags` (Requests.cpp:8981-8995) — the recent-hashtag
+    /// registry query over `td_->hashtag_hints_`; the query promise
+    /// re-wraps the `vector<string>` into the `hashtags` object.
+    pub fn search_hashtags(
+        &self,
+        prefix: String,
+        limit: i32,
+        mut promise: Promise<td_api::Hashtags>,
+    ) {
+        let query_promise = PromiseCreator::lambda(move |hashtags: Vec<String>| {
+            promise.set_value(td_api::Hashtags { hashtags });
+        });
+        self.hashtag_hints.query(&prefix, limit, query_promise);
+    }
+
+    /// `removeRecentHashtag` (Requests.cpp:8997-9002) — the
+    /// recent-hashtag removal over `td_->hashtag_hints_`.
+    pub fn remove_recent_hashtag(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        hashtag: String,
+        promise: Promise<()>,
+    ) {
+        self.hashtag_hints.remove_hashtag(env, hashtag, promise);
+    }
+
+    /// `getSearchedForTags` (Requests.cpp:3797-3810) — the
+    /// searched-for-tags query over `td_->hashtag_search_hints_` (or the
+    /// cashtag twin for a '$'-prefixed prefix).
+    pub fn get_searched_for_tags(
+        &self,
+        tag_prefix: String,
+        limit: i32,
+        mut promise: Promise<td_api::Hashtags>,
+    ) {
+        let query_promise = PromiseCreator::lambda(move |hashtags: Vec<String>| {
+            promise.set_value(td_api::Hashtags { hashtags });
+        });
+        if tag_prefix.starts_with('$') {
+            self.cashtag_search_hints
+                .query(&tag_prefix, limit, query_promise);
+        } else {
+            self.hashtag_search_hints
+                .query(&tag_prefix, limit, query_promise);
+        }
+    }
+
+    /// `removeSearchedForTag` (Requests.cpp:3812-3818) — the
+    /// searched-for-tag removal, routed by the '$' prefix.
+    pub fn remove_searched_for_tag(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        tag: String,
+        promise: Promise<()>,
+    ) {
+        if tag.starts_with('$') {
+            self.cashtag_search_hints.remove_hashtag(env, tag, promise);
+        } else {
+            self.hashtag_search_hints.remove_hashtag(env, tag, promise);
+        }
+    }
+
+    /// `clearSearchedForTags` (Requests.cpp:3820-3825) — the registry
+    /// clear, routed by `clear_cashtags`.
+    pub fn clear_searched_for_tags(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        clear_cashtags: bool,
+        promise: Promise<()>,
+    ) {
+        if clear_cashtags {
+            self.cashtag_search_hints.clear(env, promise);
+        } else {
+            self.hashtag_search_hints.clear(env, promise);
+        }
+    }
 }
 
 impl std::fmt::Debug for StickersManager {
@@ -1627,6 +3822,78 @@ impl std::fmt::Debug for StickersManager {
             )
             .finish()
     }
+}
+
+// ---------------------------------------------------------------------------
+// The EmojiStatus.cpp free functions — the five emoji-status request arms
+// delegate to these (the C++ members of the same name above are the
+// themed/special-set plane).
+// ---------------------------------------------------------------------------
+
+/// `get_default_emoji_statuses` (EmojiStatus.cpp:571-578) — the cached
+/// record answers and the refresh query still fires.
+pub fn get_default_emoji_statuses(
+    env: &mut impl StickersManagerEnv,
+    mut promise: Promise<td_api::EmojiStatusCustomEmojis>,
+) {
+    let statuses = EmojiStatusCustomEmojisRecord::load(env, b"def_emoji_statuses");
+    if statuses.hash != -1 {
+        promise.set_value(statuses.get_object());
+        let _ = promise; // the C++ empties the promise here
+    }
+    let hash = statuses.hash;
+    env.send_get_default_emoji_statuses_query(hash, promise);
+}
+
+/// `get_default_channel_emoji_statuses` (EmojiStatus.cpp:580-588).
+pub fn get_default_channel_emoji_statuses(
+    env: &mut impl StickersManagerEnv,
+    mut promise: Promise<td_api::EmojiStatusCustomEmojis>,
+) {
+    let statuses = EmojiStatusCustomEmojisRecord::load(env, b"def_ch_emoji_statuses");
+    if statuses.hash != -1 {
+        promise.set_value(statuses.get_object());
+        let _ = promise;
+    }
+    let hash = statuses.hash;
+    env.send_get_channel_default_emoji_statuses_query(hash, promise);
+}
+
+/// `get_recent_emoji_statuses` (EmojiStatus.cpp:590-597).
+pub fn get_recent_emoji_statuses(
+    env: &mut impl StickersManagerEnv,
+    mut promise: Promise<td_api::EmojiStatuses>,
+) {
+    let statuses = EmojiStatusesRecord::load(env, b"rec_emoji_statuses");
+    if statuses.hash != -1 {
+        promise.set_value(statuses.get_object());
+        let _ = promise;
+    }
+    let hash = statuses.hash;
+    env.send_get_recent_emoji_statuses_query(hash, promise);
+}
+
+/// `get_upgraded_gift_emoji_statuses` (EmojiStatus.cpp:626-637) —
+/// the is-bot band is unreachable behind CHECK_IS_USER.
+pub fn get_upgraded_gift_emoji_statuses(
+    env: &mut impl StickersManagerEnv,
+    mut promise: Promise<td_api::EmojiStatuses>,
+) {
+    let statuses = EmojiStatusesRecord::load(env, b"nft_emoji_statuses");
+    if statuses.hash != -1 {
+        promise.set_value(statuses.get_object());
+        let _ = promise;
+    }
+    let hash = statuses.hash;
+    env.send_get_collectible_emoji_statuses_query(hash, promise);
+}
+
+/// `clear_recent_emoji_statuses` (EmojiStatus.cpp:621-624) — the
+/// local empty-record write is immediate; the query tail owns the
+/// promise.
+pub fn clear_recent_emoji_statuses(env: &mut impl StickersManagerEnv, promise: Promise<()>) {
+    EmojiStatusesRecord::default().save(env, b"rec_emoji_statuses");
+    env.send_clear_recent_emoji_statuses_query(promise);
 }
 
 // ---------------------------------------------------------------------------

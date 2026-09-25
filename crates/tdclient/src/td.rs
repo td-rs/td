@@ -3692,6 +3692,14 @@ impl Td {
             });
         }
 
+        // `Td::init` starts the three HashtagHints actors
+        // (Td.cpp:1344-1347) — the recent-hashtag/searched-tag/cashtag
+        // registries replay their pmc records at start_up.
+        {
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(self);
+            stickers_manager.init_hashtag_hints(&mut env);
+        }
+
         // `make_unique<WebBrowserManager>` (Td.cpp:1332, the init_managers
         // block) + its `start_up` (WebBrowserManager.cpp:142-144) — loads
         // the saved settings only while authorized and non-bot.
@@ -16206,22 +16214,34 @@ impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
         use crate::stickers_manager::StickerFileView;
         let file_manager = self.file_manager.lock();
         let Some(file_view) = file_manager.get_file_view(file_id) else {
-            return StickerFileView::default();
+            return StickerFileView {
+                empty: true,
+                ..StickerFileView::default()
+            };
         };
         let main_remote_document_id = file_view
             .get_main_remote_location()
             .filter(|location| location.is_document() && !location.is_web())
             .map(|location| location.get_id());
+        let full_remote_document_id = file_view
+            .get_full_remote_location()
+            .filter(|location| location.is_document());
         StickerFileView {
+            empty: false,
             is_encrypted: file_view.is_encrypted(),
             main_remote_document_id,
             has_url: file_view.has_url(),
             has_full_local_location: file_view.has_full_local_location(),
             expected_size: file_view.expected_size(false),
-            full_remote_document_id: file_view
-                .get_full_remote_location()
-                .filter(|location| location.is_document())
+            full_remote_document_id: full_remote_document_id
+                .as_ref()
                 .map(|location| location.get_id()),
+            full_remote_is_photo: full_remote_document_id
+                .as_ref()
+                .is_some_and(|location| location.is_photo()),
+            full_remote_is_web: full_remote_document_id
+                .as_ref()
+                .is_some_and(|location| location.is_web()),
         }
     }
 
