@@ -2323,6 +2323,11 @@ pub struct Td {
     /// constructor + start_up work runs in [`Td::init_language_pack_manager`]
     /// where the option manager exists.
     pub(crate) language_pack_manager: crate::language_pack_manager::LanguagePackManager,
+    /// The C++ `Td::country_info_manager_` (`Td.cpp:1202`) — the countries
+    /// glue slice; the actor halves are the collapsed world (the
+    /// constructor's fragment-prefixes read runs in
+    /// [`Td::init_country_info_manager`]).
+    pub(crate) country_info_manager: crate::country_info_manager::CountryInfoManager,
     /// The language pack manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -2757,6 +2762,7 @@ impl Td {
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
             language_pack_updates: Vec::new(),
+            country_info_manager: crate::country_info_manager::CountryInfoManager::default(),
             animations_manager: crate::animations_manager::AnimationsManager::new(),
             animations_updates: Vec::new(),
             audios_manager: crate::audios_manager::AudiosManager::new(),
@@ -3071,6 +3077,12 @@ impl Td {
             let app_config = self.global.binlog_pmc().get_raw(b"app_config");
             self.config_manager = Some(ConfigManager::new(&app_config));
         }
+
+        // `Td::init_pure_actor_managers` (Td.cpp:1202): the
+        // CountryInfoManager constructor half — the fragment-prefixes
+        // option read, after the option manager attach like the C++
+        // `init_options_and_network` → `init_pure_actor_managers` order.
+        self.init_country_info_manager();
 
         // we need to process td_api::setOption before managers are created,
         // because their initialization may be affected by the options
@@ -5643,6 +5655,16 @@ impl Td {
             updates: &mut self.language_pack_updates,
         };
         self.language_pack_manager.init(&mut env);
+    }
+
+    /// `CountryInfoManager::CountryInfoManager` (CountryInfoManager.cpp:129-131,
+    /// `Td.cpp:1202`) — the constructor's fragment-prefixes option read;
+    /// the C++ `init_pure_actor_managers` order puts it after the option
+    /// manager attach, mirrored here.
+    fn init_country_info_manager(&mut self) {
+        let (mut env, mut manager) = country_env_split(self);
+        manager.init(&mut env);
+        self.country_info_manager = manager;
     }
 
     /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
@@ -11247,6 +11269,77 @@ impl crate::connection_creator::ConnectionCreatorEnv for ConnectionEnv<'_> {
         // seam; the promise resolves with the C++ LambdaPromise drop.
         drop(promise);
     }
+}
+
+/// The [`crate::country_info_manager::CountryInfoManagerEnv`] over the
+/// whole `Td` — the request arms split the manager out of `Td` and hand
+/// the remainder to the env (the [`ConnectionEnv`] convention).
+pub(crate) struct CountryEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::country_info_manager::CountryInfoManagerEnv for CountryEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.td.close_flag != 0
+    }
+
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn have_option(&self, name: &str) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .is_some_and(|options| options.have_option(name))
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.td.option_manager.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    /// `to_lower(td_->language_pack_manager_->get_main_language_code())`
+    /// (CountryInfoManager.cpp:188-190) — the collapsed manager runs
+    /// through its own env, like [`Td::init_language_pack_manager`].
+    fn get_main_language_code(&mut self) -> String {
+        let mut env = LanguagePackEnv {
+            options: self.td.option_manager.as_mut(),
+            updates: &mut self.td.language_pack_updates,
+        };
+        self.td
+            .language_pack_manager
+            .get_main_language_code(&mut env)
+            .to_ascii_lowercase()
+    }
+
+    /// `GetNearestDcQuery::send` — the `[blocked: net]` seam. Dropping
+    /// the promise answers with the C++ LambdaPromise drop ("Lost
+    /// promise") until the net step completes the query.
+    fn get_nearest_dc_via_net(&mut self, promise: Promise<String>) {
+        drop(promise);
+    }
+
+    /// `GetCountriesListQuery::send` — the `[blocked: net]` seam; the
+    /// pending promises stay queued in the manager (dropping with it)
+    /// until the net step completes the query.
+    fn get_countries_list_via_net(&mut self, _language_code: &str, _hash: i32) {}
+}
+
+/// The `G()`/manager split of the collapsed CountryInfoManager — the
+/// request arms and the init site take the manager out of `Td` (the
+/// `promo_env_split` convention) so the env can hold the remainder.
+pub(crate) fn country_env_split(
+    td: &mut Td,
+) -> (
+    CountryEnv<'_>,
+    crate::country_info_manager::CountryInfoManager,
+) {
+    let manager = std::mem::take(&mut td.country_info_manager);
+    let env = CountryEnv { td };
+    (env, manager)
 }
 
 /// The [`crate::privacy_manager::PrivacyManagerEnv`] +

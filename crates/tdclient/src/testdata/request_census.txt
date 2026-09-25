@@ -343,10 +343,10 @@ getConnectedAffiliateProgram	dispatched
 getConnectedAffiliatePrograms	dispatched
 getConnectedWebsites	dispatched
 getContacts	dispatched
-getCountries	interim
-getCountry	interim
-getCountryCode	interim
-getCountryFlagEmoji	interim
+getCountries	dispatched
+getCountry	dispatched
+getCountryCode	dispatched
+getCountryFlagEmoji	sync
 getCreatedPublicChats	dispatched
 getCurrentState	dispatched
 getCurrentWeather	dispatched
@@ -468,8 +468,8 @@ getPasswordState	dispatched
 getPaymentForm	dispatched
 getPaymentReceipt	dispatched
 getPersonalChatHistory	dispatched
-getPhoneNumberInfo	interim
-getPhoneNumberInfoSync	interim
+getPhoneNumberInfo	dispatched
+getPhoneNumberInfoSync	sync
 getPollOptionProperties	dispatched
 getPollVoteStatistics	dispatched
 getPollVoters	dispatched
