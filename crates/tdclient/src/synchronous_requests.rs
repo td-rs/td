@@ -7,9 +7,12 @@
 //! `getMarkdownText` — the C++ `parseHtml` is the `parseTextEntities`
 //! HTML parse mode), and M.24 flips `getLanguagePackString` (the
 //! `SynchronousRequests::do_request` tail over the language pack
-//! database). The phone-number and push-id functions still land with
-//! their managers (Wave 3); until then they report "The method can't be
-//! executed synchronously", like any other request.
+//! database). The countries glue slice flips `getCountryFlagEmoji` and
+//! `getPhoneNumberInfoSync` (the CountryInfoManager statics), and the
+//! push-id function landed with its manager. `searchQuote`,
+//! `checkQuickReplyShortcutName` and `cleanFileName` still land with
+//! theirs; until then they report "The method can't be executed
+//! synchronously", like any other request.
 
 use std::sync::Mutex;
 
@@ -97,10 +100,11 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getLanguagePackString(_)
             | Function::getChatFolderDefaultIconName(_)
             | Function::getPushReceiverId(_)
+            | Function::getCountryFlagEmoji(_)
+            | Function::getPhoneNumberInfoSync(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
     // Not ported yet (need their managers): searchQuote,
-    // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
-    // getPhoneNumberInfoSync.
+    // checkQuickReplyShortcutName, cleanFileName.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -224,6 +228,23 @@ pub fn run_request(function: Function) -> Object {
                 }
                 Err((code, message)) => make_error(code, &message),
             }
+        }
+        Function::getCountryFlagEmoji(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:257-260)
+            // — no UTF-8 check on the country code.
+            Object::text(td_api::Text {
+                text: crate::country_info_manager::get_country_flag_emoji(&request.country_code),
+            })
+        }
+        Function::getPhoneNumberInfoSync(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:282-286)
+            // — no UTF-8 check on the language code/phone number; the
+            // static CountryInfoManager lookup over the compiled-in "en"
+            // fallback list.
+            Object::phoneNumberInfo(crate::country_info_manager::get_phone_number_info_sync(
+                &request.language_code,
+                request.phone_number_prefix,
+            ))
         }
         Function::getJsonValue(request) => match get_json_value(&request.json) {
             Result::Ok(value) => json_value_object(value),
@@ -880,6 +901,68 @@ mod tests {
         assert_eq!(
             run_request(function).to_json(),
             r#"{"@type":"logVerbosityLevel","verbosity_level":3}"#
+        );
+    }
+
+    #[test]
+    fn get_country_flag_emoji_answers_the_cpp_bytes() {
+        // SynchronousRequests.cpp:257-260 — the CountryInfoManager static.
+        // The JsonEmitter keeps non-ASCII raw UTF-8 (the M.8 codegen fact,
+        // the 234-record golden); no surrogate escaping.
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "US".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"text\",\"text\":\"\u{1F1FA}\u{1F1F8}\"}"
+        );
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "yl".to_string(),
+        });
+        // the crystal ball special case
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"text\",\"text\":\"\u{1F52E}\"}"
+        );
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "FT".to_string(),
+        });
+        // the pirate flag special case
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"text\",\"text\":\"\u{1F3F4}\u{200D}\u{2620}\u{FE0F}\"}"
+        );
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "USA".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+    }
+
+    #[test]
+    fn get_phone_number_info_sync_answers_from_the_embedded_list() {
+        // SynchronousRequests.cpp:282-286 — the CountryInfoManager static
+        // over the compiled-in "en" list.
+        let function = Function::getPhoneNumberInfoSync(td_api::getPhoneNumberInfoSync {
+            language_code: "en".to_string(),
+            phone_number_prefix: "+1 (999) 123-4567".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"US\",\"name\":\"USA\",\"english_name\":\"USA\",\"flag_emoji\":\"\u{1F1FA}\u{1F1F8}\",\"is_hidden\":false,\"calling_codes\":[\"1\"]},\"country_calling_code\":\"1\",\"formatted_phone_number\":\"999 123 4567\",\"is_anonymous\":false}"
+        );
+        // the missing-language "en" fallback + the fragment country
+        // (the FT flag rides the pirate-flag special case); the JsonEmitter
+        // keeps non-ASCII raw UTF-8 (the M.8 codegen fact)
+        let function = Function::getPhoneNumberInfoSync(td_api::getPhoneNumberInfoSync {
+            language_code: "de".to_string(),
+            phone_number_prefix: "88812345678".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"FT\",\"name\":\"Anonymous Numbers\",\"english_name\":\"Anonymous Numbers\",\"flag_emoji\":\"\u{1F3F4}\u{200D}\u{2620}\u{FE0F}\",\"is_hidden\":true,\"calling_codes\":[\"888\"]},\"country_calling_code\":\"888\",\"formatted_phone_number\":\"1234 5678\",\"is_anonymous\":true}"
         );
     }
 

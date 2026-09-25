@@ -50,6 +50,12 @@ pub fn get_vector_hash(numbers: &[u64]) -> i64 {
     acc as i64
 }
 
+/// `td::clean_phone_number` (misc.cpp:58-60) — keeps the ASCII digits
+/// only (`td::remove_if` over `!is_digit`).
+pub fn clean_phone_number(phone_number: &mut String) {
+    phone_number.retain(|c| c.is_ascii_digit());
+}
+
 /// `td::clean_input_string` (misc.cpp:79-161): valid UTF-8 only; control
 /// characters 0-9, 11, 12 and 14-32 become spaces, `\r` is dropped, `\n`
 /// survives; the UTF-8 line/paragraph separators U+2028-U+202A and the

@@ -15380,6 +15380,65 @@ fn run_proxy_network_requests(td: &mut Td, id: u64, function: Function) {
             td.send_result(id, ok_object());
         }
 
+        _ => run_country_requests(td, id, function),
+    }
+}
+
+/// The glue-slice countries arm group of the request dispatcher — the
+/// CountryInfoManager plane (CountryInfoManager.cpp). The cache answers
+/// from the compiled-in "en" fallback list and the C++
+/// `next_reload_time` window; the help.getNearestDc /
+/// help.getCountriesList query tails (`GetNearestDcQuery::send`,
+/// `GetCountriesListQuery::send`) park at the `[blocked: net]` seams,
+/// the M.31 promise-drop convention.
+#[inline(never)]
+fn run_country_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::getCountries(_) => {
+            // Requests.cpp:9227-9230 — `get_countries`.
+            let promise = td.deferred_promise::<td_api::Countries, _>(id, Object::countries);
+            let (mut env, mut manager) = crate::td::country_env_split(td);
+            manager.get_countries(&mut env, promise);
+            td.country_info_manager = manager;
+        }
+        Function::getCountry(request) => {
+            // Requests.cpp:9232-9235 — `get_country`; the unknown-code
+            // null answer rides the `Td::send_result` 404 band
+            // (Td.cpp:1406-1408).
+            let promise = td.deferred_promise::<Option<td_api::CountryInfo>, _>(
+                id,
+                |info: Option<td_api::CountryInfo>| match info {
+                    Some(info) => Object::countryInfo(info),
+                    None => Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_string(),
+                    }),
+                },
+            );
+            let (mut env, mut manager) = crate::td::country_env_split(td);
+            manager.get_country(&mut env, request.country_code, promise);
+            td.country_info_manager = manager;
+        }
+        Function::getCountryCode(_) => {
+            // Requests.cpp:9237-9240 — the CREATE_TEXT_REQUEST_PROMISE +
+            // `get_current_country_code`; the GetNearestDcQuery tail is
+            // the `[blocked: net]` seam.
+            let promise =
+                td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
+            let (mut env, mut manager) = crate::td::country_env_split(td);
+            manager.get_current_country_code(&mut env, promise);
+            td.country_info_manager = manager;
+        }
+        Function::getPhoneNumberInfo(request) => {
+            // Requests.cpp:9242-9245 — `get_phone_number_info` (the
+            // manager cleans the prefix).
+            let promise =
+                td.deferred_promise::<td_api::PhoneNumberInfo, _>(id, Object::phoneNumberInfo);
+            let (mut env, mut manager) = crate::td::country_env_split(td);
+            manager.get_phone_number_info(&mut env, request.phone_number_prefix, promise);
+            td.country_info_manager = manager;
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -16239,12 +16298,17 @@ mod request_census_tests {
         // (addNetworkStatistics, getNetworkStatistics,
         // resetNetworkStatistics, setNetworkType) and getPushReceiverId
         // moving to the synchronous set (22/898/102).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 22, "sync count");
+        // The countries glue slice flipped 6 arms: getCountries, getCountry,
+        // getCountryCode, getPhoneNumberInfo (dispatched; the
+        // help.getNearestDc/help.getCountriesList tails park at the
+        // [blocked: net] seams) and getCountryFlagEmoji +
+        // getPhoneNumberInfoSync moving to the synchronous set (24/902/96).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 24, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            898,
+            902,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 102, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 96, "interim count");
     }
 }
