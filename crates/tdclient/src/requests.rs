@@ -34,6 +34,7 @@ use crate::call_id::{CallId, InputCallId};
 use crate::call_protocol::CallProtocol;
 use crate::chat_manager::{ChannelId, DialogId, StickerSetId};
 use crate::community_id::CommunityId;
+use crate::connection_creator::ConnectionCreatorEnv as _;
 use crate::contact::Contact;
 use crate::dialog_participant_manager::DialogParticipantManagerEnv;
 use crate::message_id::{MessageFullId, MessageId};
@@ -16025,6 +16026,189 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
             };
             td.premium_manager.can_purchase_premium(&mut env, promise);
         }
+        _ => run_proxy_network_requests(td, id, function),
+    }
+}
+
+/// The glue-slice proxy+network arm group of the request dispatcher —
+/// see the frame note at the forward site in [`run_request`]. The
+/// ConnectionCreator proxy registry arms run the C++ `add_proxy` ladder
+/// over the pmc-backed registry (the ConnectionCreator.cpp:158-478
+/// plane); the resolve/connect tails (`ping_proxy_resolved`,
+/// `ProxyChecker::test_proxy`) are the `[blocked: net]` seams; the
+/// network-statistics arms answer the C++ disabled band (the
+/// `net_stats_manager_` empty branch — the NetStatsManager port is its
+/// own slice), and `getPushReceiverId` is the SynchronousRequests arm.
+#[inline(never)]
+fn run_proxy_network_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::addProxy(request) => {
+            // Requests.cpp:9278-9283 — CLEAN_INPUT_STRING(comment) +
+            // `ConnectionCreator::add_proxy(-1, ...)`.
+            let Some(comment) = clean_or_utf8_error(td, id, &request.comment) else {
+                return;
+            };
+            let mut promise = td.deferred_promise::<td_api::AddedProxy, _>(id, Object::addedProxy);
+            let mut creator = td.connection_creator.take();
+            let result = {
+                let mut env = crate::td::ConnectionEnv { td };
+                creator.as_mut().unwrap().add_proxy(
+                    &mut env,
+                    -1,
+                    request.proxy.as_ref(),
+                    request.enable,
+                    comment,
+                )
+            };
+            td.connection_creator = creator;
+            match result {
+                Ok(added) => promise.set_value(added),
+                Err(message) => promise.set_error(tdutils::status::Status::error(400, &message)),
+            }
+        }
+        Function::editProxy(request) => {
+            // Requests.cpp:9284-9294 — the negative-id band, the comment
+            // clean, then the same `add_proxy` entry with the edit id.
+            if request.proxy_id < 0 {
+                return td.send_error_impl(id, 400, "Proxy identifier invalid");
+            }
+            let Some(comment) = clean_or_utf8_error(td, id, &request.comment) else {
+                return;
+            };
+            let mut promise = td.deferred_promise::<td_api::AddedProxy, _>(id, Object::addedProxy);
+            let mut creator = td.connection_creator.take();
+            let result = {
+                let mut env = crate::td::ConnectionEnv { td };
+                creator.as_mut().unwrap().add_proxy(
+                    &mut env,
+                    request.proxy_id,
+                    request.proxy.as_ref(),
+                    request.enable,
+                    comment,
+                )
+            };
+            td.connection_creator = creator;
+            match result {
+                Ok(added) => promise.set_value(added),
+                Err(message) => promise.set_error(tdutils::status::Status::error(400, &message)),
+            }
+        }
+        Function::enableProxy(request) => {
+            // Requests.cpp:9295-9299 — `enable_proxy` with the
+            // "Unknown proxy identifier" band.
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut creator = td.connection_creator.take();
+            let result = {
+                let mut env = crate::td::ConnectionEnv { td };
+                creator
+                    .as_mut()
+                    .unwrap()
+                    .enable_proxy(&mut env, request.proxy_id)
+            };
+            td.connection_creator = creator;
+            match result {
+                Ok(()) => promise.set_value(()),
+                Err(message) => promise.set_error(tdutils::status::Status::error(400, &message)),
+            }
+        }
+        Function::disableProxy(_) => {
+            // Requests.cpp:9300-9304 — `disable_proxy`.
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut creator = td.connection_creator.take();
+            {
+                let mut env = crate::td::ConnectionEnv { td };
+                creator.as_mut().unwrap().disable_proxy(&mut env);
+            }
+            td.connection_creator = creator;
+            promise.set_value(());
+        }
+        Function::removeProxy(request) => {
+            // Requests.cpp:9305-9309 — `remove_proxy`.
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut creator = td.connection_creator.take();
+            let result = {
+                let mut env = crate::td::ConnectionEnv { td };
+                creator
+                    .as_mut()
+                    .unwrap()
+                    .remove_proxy(&mut env, request.proxy_id)
+            };
+            td.connection_creator = creator;
+            match result {
+                Ok(()) => promise.set_value(()),
+                Err(message) => promise.set_error(tdutils::status::Status::error(400, &message)),
+            }
+        }
+        Function::getProxies(_) => {
+            // Requests.cpp:9310-9314 — `get_proxies`.
+            let mut promise =
+                td.deferred_promise::<td_api::AddedProxies, _>(id, Object::addedProxies);
+            let creator = td.connection_creator.take();
+            let proxies = creator.as_ref().unwrap().get_proxies();
+            td.connection_creator = creator;
+            promise.set_value(proxies);
+        }
+        Function::pingProxy(request) => {
+            // Requests.cpp:9315-9325 — the `seconds` rewrap around
+            // `ConnectionCreator::ping_proxy`; the C++ null-proxy band is
+            // inexpressible (the flattened model makes `proxy`
+            // non-nullable). The resolve/connect tail parks at the
+            // `[blocked: net]` seam.
+            let promise = td.deferred_promise::<f64, _>(id, |seconds| {
+                Object::seconds(td_api::Seconds { seconds })
+            });
+            let mut creator = td.connection_creator.take();
+            let result = {
+                let mut env = crate::td::ConnectionEnv { td };
+                creator
+                    .as_mut()
+                    .unwrap()
+                    .ping_proxy(&mut env, request.proxy.as_ref(), promise)
+            };
+            td.connection_creator = creator;
+            if let Err(message) = result {
+                td.send_error_impl(id, 400, &message);
+            }
+        }
+        Function::testProxy(request) => {
+            // Requests.cpp:9463-9471 — `Proxy::create_proxy` answers the
+            // validation band, then `ProxyChecker::test_proxy`; the
+            // checker handshake is the `[blocked: net]` seam.
+            let proxy = match crate::connection_creator::Proxy::create_proxy(request.proxy.as_ref())
+            {
+                Ok(proxy) => proxy,
+                Err(message) => return td.send_error_impl(id, 400, &message),
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = crate::td::ConnectionEnv { td };
+            env.test_proxy_via_net(&proxy, request.dc_id, request.timeout, promise);
+        }
+        Function::addNetworkStatistics(_) => {
+            // Requests.cpp:3059-3076 — the C++ checks the entry pointer
+            // first (the flattened model makes it non-nullable, the band
+            // is inexpressible), then the manager registry. The collapsed
+            // world runs without the NetStatsManager, so the C++
+            // `net_stats_manager_.empty()` branch answers.
+            td.send_error_impl(id, 400, "Network statistics are disabled");
+        }
+        Function::getNetworkStatistics(_) => {
+            // Requests.cpp:3031-3058 — the manager-empty band fires
+            // before the `disable_persistent_network_statistics` option
+            // check; the collapsed world always answers it.
+            td.send_error_impl(id, 400, "Network statistics are disabled");
+        }
+        Function::resetNetworkStatistics(_) => {
+            // Requests.cpp:3050-3058 — the manager-empty band; the C++
+            // answers ok after the reset closure, unreachable here.
+            td.send_error_impl(id, 400, "Network statistics are disabled");
+        }
+        Function::setNetworkType(request) => {
+            // Requests.cpp:3113-3117 — `StateManager::on_network` with the
+            // get_net_type mapping; the state consumers are the net-step
+            // seams and the promise answers ok immediately.
+            td.network_type = crate::connection_creator::get_net_type(request.r#type.as_ref());
+            td.send_result(id, ok_object());
+        }
 
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -16901,12 +17085,19 @@ mod request_census_tests {
         // flips are 16: checkQuickReplyShortcutName moves to the sync set
         // (21 + 1 = 22 sync) and the other 15 go interim -> dispatched
         // (903 + 15 = 918 dispatched / 98 - 16 = 82 interim).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 22, "sync count");
+        // The proxy+network glue slice flipped 13 arms: the 8 proxy arms
+        // (addProxy, editProxy, enableProxy, disableProxy, removeProxy,
+        // getProxies, pingProxy, testProxy), the 4 network arms
+        // (addNetworkStatistics, getNetworkStatistics,
+        // resetNetworkStatistics, setNetworkType) and getPushReceiverId
+        // moving to the synchronous set (918 + 12 = 930 dispatched / 69
+        // interim, 23 sync — the merged pin).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 23, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            918,
+            930,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 82, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 69, "interim count");
     }
 }
