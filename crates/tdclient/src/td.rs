@@ -2269,6 +2269,9 @@ pub struct Td {
     /// block; the auth-tails slice) — the collapsed actor behind the
     /// change/verify/confirm-phone code flows.
     pub(crate) phone_number_manager: PhoneNumberManager,
+    /// `Td::privacy_manager_` (the `Td::Td` manager block; the C++
+    /// `PrivacyManager` actor, collapsed).
+    pub(crate) privacy_manager: crate::privacy_manager::PrivacyManager,
     /// `Td::forum_topic_manager_` (`Td.cpp:1297`, M.49).
     pub(crate) forum_topic_manager: crate::forum_topic_manager::ForumTopicManager,
     /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
@@ -2732,6 +2735,7 @@ impl Td {
             ),
             account_updates: Vec::new(),
             phone_number_manager: PhoneNumberManager::new(),
+            privacy_manager: crate::privacy_manager::PrivacyManager::new(),
             forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
@@ -11233,6 +11237,167 @@ impl crate::connection_creator::ConnectionCreatorEnv for ConnectionEnv<'_> {
     ) {
         // `ProxyChecker::test_proxy` — the `[blocked: net]` handshake
         // seam; the promise resolves with the C++ LambdaPromise drop.
+        drop(promise);
+    }
+}
+
+/// The [`crate::privacy_manager::PrivacyManagerEnv`] +
+/// [`crate::auto_download_settings::AutoDownloadSettingsEnv`] over the
+/// whole `Td` — the request arms take the manager out of `Td` and hand
+/// the remainder to the env (the [`ConnectionEnv`] convention).
+pub(crate) struct PrivacyEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        crate::dialog_manager::have_dialog_force(self.td, dialog_id, source)
+    }
+
+    fn is_megagroup_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        // `ChatManager::is_megagroup_channel` — the unloaded-channel read
+        // is the M.6 stub (the stub inventory).
+        crate::dialog_manager::is_megagroup_channel(channel_id)
+    }
+
+    fn get_user_ids_object(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+        _source: &str,
+    ) -> Vec<i64> {
+        user_ids.iter().map(|&user_id| user_id.get()).collect()
+    }
+
+    fn get_chat_ids_object(
+        &mut self,
+        dialog_ids: &[crate::dialog_id::DialogId],
+        source: &str,
+    ) -> Vec<i64> {
+        crate::dialog_manager::get_chat_ids_object(dialog_ids, source)
+    }
+
+    fn send_update_privacy_rules(&mut self, update: td_api::updateUserPrivacySettingRules) {
+        self.td
+            .send_update(td_api::Object::updateUserPrivacySettingRules(update));
+    }
+
+    fn on_update_online_status_privacy(&mut self) {
+        let this = &mut *self.td;
+        let mut user_env = UserEnv {
+            global: &mut this.global,
+            options: this
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: this.auth_manager.is_bot(),
+        };
+        this.user_manager
+            .on_update_online_status_privacy(&mut user_env);
+    }
+
+    fn on_update_phone_number_privacy(&mut self) {
+        let this = &mut *self.td;
+        let user_env = UserEnv {
+            global: &mut this.global,
+            options: this
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: this.auth_manager.is_bot(),
+        };
+        this.user_manager.on_update_phone_number_privacy(&user_env);
+    }
+
+    fn reload_user(&mut self, _user_id: crate::user_manager::UserId, _source: &str) {
+        // `UserManager::reload_user` — the user-reload plane
+        // (`[blocked: user-reload]`, the stub inventory).
+    }
+
+    fn hide_archive_and_mute_suggested_action(&mut self) {
+        let this = &mut *self.td;
+        let crate::td::Td {
+            global,
+            option_manager,
+            user_manager,
+            device_token_manager,
+            auth_manager,
+            suggested_action_manager,
+            account_updates,
+            ..
+        } = this;
+        let mut action = crate::suggested_action::SuggestedAction::default();
+        action.init(crate::suggested_action::SuggestedActionType::EnableArchiveAndMuteNewChats);
+        let mut account_env = AccountEnv {
+            global,
+            options: option_manager.as_mut(),
+            user_manager,
+            device_token_manager,
+            auth_is_bot: auth_manager.is_bot(),
+            updates: account_updates,
+        };
+        suggested_action_manager.hide_suggested_action(&mut account_env, action);
+    }
+
+    fn get_privacy_via_net(&mut self, _key: crate::privacy_manager::UserPrivacySettingType) {
+        // `GetPrivacyQuery::send` — `account.getPrivacy`; the queued
+        // caller promises ride the `PrivacyManager` state until the net
+        // step's `on_get_user_privacy_settings` drains them
+        // (`[blocked: net]`).
+    }
+
+    fn set_privacy_via_net(
+        &mut self,
+        _key: crate::privacy_manager::UserPrivacySettingType,
+        _rules: crate::privacy_manager::UserPrivacySettingRules,
+        promise: Promise<()>,
+    ) {
+        // `SetPrivacyQuery::send` — `account.setPrivacy`; the caller
+        // promise resolves with the C++ LambdaPromise drop
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn get_global_privacy_via_net(
+        &mut self,
+        promise: Promise<crate::privacy_manager::GlobalPrivacySettings>,
+    ) {
+        // `GetGlobalPrivacySettingsQuery::send` —
+        // `account.getGlobalPrivacySettings` (`[blocked: net]`); the
+        // promise resolves with the C++ LambdaPromise drop.
+        drop(promise);
+    }
+
+    fn set_global_privacy_via_net(
+        &mut self,
+        _settings: crate::privacy_manager::GlobalPrivacySettings,
+        promise: Promise<()>,
+    ) {
+        // the get → `apply_changes` → `SetGlobalPrivacySettingsQuery::send`
+        // chain (GlobalPrivacySettings.cpp:187-197); the caller promise
+        // rides the dropped query half (`[blocked: net]`).
+        drop(promise);
+    }
+}
+
+impl crate::auto_download_settings::AutoDownloadSettingsEnv for PrivacyEnv<'_> {
+    fn get_auto_download_settings_via_net(
+        &mut self,
+        promise: Promise<td_api::AutoDownloadSettingsPresets>,
+    ) {
+        // `GetAutoDownloadSettingsQuery::send` —
+        // `account.getAutoDownloadSettings` (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn set_auto_download_settings_via_net(
+        &mut self,
+        _is_roaming: bool,
+        _is_wifi: bool,
+        _settings: crate::auto_download_settings::AutoDownloadSettings,
+        promise: Promise<()>,
+    ) {
+        // `SaveAutoDownloadSettingsQuery::send` —
+        // `account.saveAutoDownloadSettings` (`[blocked: net]`).
         drop(promise);
     }
 }
