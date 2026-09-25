@@ -261,6 +261,206 @@ impl EmojiStatus {
         }
         Ok(result)
     }
+
+    /// `EmojiStatus::get_emoji_status_object` (EmojiStatus.cpp:488-503) —
+    /// the empty status is the C++ `nullptr` (the callers that move the
+    /// object into a vector drop the empty entry, mirroring the C++
+    /// null-element shape the flattened model cannot carry).
+    pub fn get_emoji_status_object(&self) -> Option<td_api::EmojiStatus> {
+        if self.is_empty() {
+            return None;
+        }
+        let r#type = if self.custom_emoji_id.is_valid() {
+            td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+                td_api::emojiStatusTypeCustomEmoji {
+                    custom_emoji_id: self.custom_emoji_id.get(),
+                },
+            )
+        } else {
+            td_api::EmojiStatusType::emojiStatusTypeUpgradedGift(
+                td_api::emojiStatusTypeUpgradedGift {
+                    upgraded_gift_id: self.collectible_id,
+                    gift_title: self.title.clone(),
+                    gift_name: self.slug.clone(),
+                    model_custom_emoji_id: self.model_custom_emoji_id.get(),
+                    symbol_custom_emoji_id: self.pattern_custom_emoji_id.get(),
+                    backdrop_colors: Some(td_api::UpgradedGiftBackdropColors {
+                        center_color: self.center_color,
+                        edge_color: self.edge_color,
+                        symbol_color: self.pattern_color,
+                        text_color: self.text_color,
+                    }),
+                },
+            )
+        };
+        Some(td_api::EmojiStatus {
+            r#type: Some(r#type),
+            expiration_date: self.until_date,
+        })
+    }
+}
+
+/// `EmojiStatusCustomEmojis` (EmojiStatus.cpp:24-55) — the binlog-pmc
+/// cache behind the default-emoji-status lists: the server hash plus the
+/// collected custom emoji ids. The server-answer constructor (the C++
+/// `telegram_api::account_emojiStatuses` intake) lands with the net
+/// queries.
+#[derive(Clone, Debug, Default)]
+pub struct EmojiStatusCustomEmojisCache {
+    pub hash: i64,
+    pub custom_emoji_ids: Vec<CustomEmojiId>,
+}
+
+impl EmojiStatusCustomEmojisCache {
+    /// `get_emoji_status_custom_emojis_object`
+    /// (EmojiStatus.cpp:565-569).
+    pub fn get_emoji_status_custom_emojis_object(&self) -> td_api::EmojiStatusCustomEmojis {
+        td_api::EmojiStatusCustomEmojis {
+            custom_emoji_ids: self.custom_emoji_ids.iter().map(|id| id.get()).collect(),
+        }
+    }
+
+    /// `EmojiStatusCustomEmojis::store` (EmojiStatus.cpp:44-48).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        use store_parse::*;
+        store_i64(out, self.hash);
+        store_i64_vec(
+            out,
+            &self
+                .custom_emoji_ids
+                .iter()
+                .map(|id| id.get())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// `EmojiStatusCustomEmojis::parse` (EmojiStatus.cpp:50-54).
+    pub fn parse(input: &[u8]) -> Result<EmojiStatusCustomEmojisCache, &'static str> {
+        use store_parse::*;
+        let mut parser = Parser::new(input);
+        let hash = parser.i64_()?;
+        let count = parser.i32_()?;
+        let mut custom_emoji_ids = Vec::with_capacity(count.max(0) as usize);
+        for _ in 0..count {
+            custom_emoji_ids.push(CustomEmojiId::new(parser.i64_()?));
+        }
+        parser.fetch_end()?;
+        Ok(EmojiStatusCustomEmojisCache {
+            hash,
+            custom_emoji_ids,
+        })
+    }
+}
+
+/// `EmojiStatuses` (EmojiStatus.cpp:68-106) — the binlog-pmc cache behind
+/// the recent/collectible emoji-status lists.
+#[derive(Clone, Debug, Default)]
+pub struct EmojiStatusesCache {
+    pub hash: i64,
+    pub emoji_statuses: Vec<EmojiStatus>,
+}
+
+impl EmojiStatusesCache {
+    /// `get_emoji_statuses_object` (EmojiStatus.cpp:72-75); empty
+    /// statuses are skipped (see
+    /// [`EmojiStatus::get_emoji_status_object`](EmojiStatus::get_emoji_status_object)).
+    pub fn get_emoji_statuses_object(&self) -> td_api::EmojiStatuses {
+        td_api::EmojiStatuses {
+            emoji_statuses: self
+                .emoji_statuses
+                .iter()
+                .filter_map(EmojiStatus::get_emoji_status_object)
+                .collect(),
+        }
+    }
+
+    /// `EmojiStatuses::store` (EmojiStatus.cpp:95-99).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        use store_parse::*;
+        store_i64(out, self.hash);
+        store_i32(out, self.emoji_statuses.len() as i32);
+        for emoji_status in &self.emoji_statuses {
+            emoji_status.store(out);
+        }
+    }
+
+    /// `EmojiStatuses::parse` (EmojiStatus.cpp:101-105).
+    pub fn parse(input: &[u8]) -> Result<EmojiStatusesCache, &'static str> {
+        use store_parse::*;
+        let mut parser = Parser::new(input);
+        let hash = parser.i64_()?;
+        let count = parser.i32_()?;
+        let mut emoji_statuses = Vec::with_capacity(count.max(0) as usize);
+        for _ in 0..count {
+            emoji_statuses.push(EmojiStatus::parse_from(&mut parser)?);
+        }
+        parser.fetch_end()?;
+        Ok(EmojiStatusesCache {
+            hash,
+            emoji_statuses,
+        })
+    }
+}
+
+/// `get_default_emoji_statuses_database_key` (EmojiStatus.cpp:109-112).
+pub const DEFAULT_EMOJI_STATUSES_DATABASE_KEY: &[u8] = b"def_emoji_statuses";
+
+/// `get_default_channel_emoji_statuses_database_key`
+/// (EmojiStatus.cpp:114-117).
+pub const DEFAULT_CHANNEL_EMOJI_STATUSES_DATABASE_KEY: &[u8] = b"def_ch_emoji_statuses";
+
+/// `get_recent_emoji_statuses_database_key` (EmojiStatus.cpp:119-122).
+pub const RECENT_EMOJI_STATUSES_DATABASE_KEY: &[u8] = b"rec_emoji_statuses";
+
+/// `get_upgraded_gift_emoji_statuses_database_key`
+/// (EmojiStatus.cpp:124-127).
+pub const UPGRADED_GIFT_EMOJI_STATUSES_DATABASE_KEY: &[u8] = b"nft_emoji_statuses";
+
+/// `load_emoji_status_custom_emojis` (EmojiStatus.cpp:143-156): an empty
+/// or unparsable value is the `hash = -1` "no cache" state.
+pub(crate) fn load_emoji_status_custom_emojis(
+    binlog_pmc: &mut tddb::binlog_key_value::BinlogKeyValue,
+    key: &[u8],
+) -> EmojiStatusCustomEmojisCache {
+    let value = binlog_pmc.get_raw(key);
+    if value.is_empty() {
+        return EmojiStatusCustomEmojisCache {
+            hash: -1,
+            custom_emoji_ids: Vec::new(),
+        };
+    }
+    EmojiStatusCustomEmojisCache::parse(&value).unwrap_or(EmojiStatusCustomEmojisCache {
+        hash: -1,
+        custom_emoji_ids: Vec::new(),
+    })
+}
+
+/// `load_emoji_statuses` (EmojiStatus.cpp:129-142).
+pub(crate) fn load_emoji_statuses(
+    binlog_pmc: &mut tddb::binlog_key_value::BinlogKeyValue,
+    key: &[u8],
+) -> EmojiStatusesCache {
+    let value = binlog_pmc.get_raw(key);
+    if value.is_empty() {
+        return EmojiStatusesCache {
+            hash: -1,
+            emoji_statuses: Vec::new(),
+        };
+    }
+    EmojiStatusesCache::parse(&value).unwrap_or(EmojiStatusesCache {
+        hash: -1,
+        emoji_statuses: Vec::new(),
+    })
+}
+
+/// `save_emoji_statuses`/`save_emoji_status_custom_emojis`
+/// (EmojiStatus.cpp:157-164).
+pub(crate) fn save_emoji_statuses_cache(
+    binlog_pmc: &mut tddb::binlog_key_value::BinlogKeyValue,
+    key: &[u8],
+    value: &[u8],
+) {
+    binlog_pmc.set_raw(key, value);
 }
 
 #[cfg(test)]
@@ -362,5 +562,92 @@ mod tests {
             status.store(&mut bytes);
             assert_eq!(EmojiStatus::parse(&bytes).unwrap(), status);
         }
+    }
+
+    #[test]
+    fn emoji_status_object_builder_matches_the_td_api_shape() {
+        // the plain status
+        let status = EmojiStatus {
+            custom_emoji_id: CustomEmojiId::new(42),
+            until_date: 1000,
+            ..EmojiStatus::default()
+        };
+        match status.get_emoji_status_object() {
+            Some(td_api::EmojiStatus {
+                r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(type_)),
+                expiration_date,
+            }) => {
+                assert_eq!(type_.custom_emoji_id, 42);
+                assert_eq!(expiration_date, 1000);
+            }
+            other => panic!("wrong plain object shape: {other:?}"),
+        }
+
+        // the collectible status
+        let collectible_status = EmojiStatus::from_telegram(collectible(1));
+        match collectible_status.get_emoji_status_object() {
+            Some(td_api::EmojiStatus {
+                r#type: Some(td_api::EmojiStatusType::emojiStatusTypeUpgradedGift(type_)),
+                expiration_date,
+            }) => {
+                assert_eq!(type_.upgraded_gift_id, 1);
+                assert_eq!(type_.gift_title, "Model");
+                assert_eq!(type_.model_custom_emoji_id, 10);
+                assert_eq!(type_.symbol_custom_emoji_id, 20);
+                let backdrop = type_
+                    .backdrop_colors
+                    .expect("the collectible carries its colors");
+                assert_eq!(backdrop.center_color, 1);
+                assert_eq!(expiration_date, 0);
+            }
+            other => panic!("wrong collectible object shape: {other:?}"),
+        }
+
+        // the empty status is the C++ nullptr
+        assert!(EmojiStatus::default().get_emoji_status_object().is_none());
+    }
+
+    #[test]
+    fn emoji_status_cache_round_trips_and_preserves_the_hash() {
+        let custom = EmojiStatusCustomEmojisCache {
+            hash: -77,
+            custom_emoji_ids: vec![
+                CustomEmojiId::new(1),
+                CustomEmojiId::new(2),
+                CustomEmojiId::new(3),
+            ],
+        };
+        let mut bytes = Vec::new();
+        custom.store(&mut bytes);
+        let parsed = EmojiStatusCustomEmojisCache::parse(&bytes).unwrap();
+        assert_eq!(parsed.hash, -77);
+        assert_eq!(
+            parsed
+                .get_emoji_status_custom_emojis_object()
+                .custom_emoji_ids,
+            vec![1, 2, 3]
+        );
+
+        let statuses = EmojiStatusesCache {
+            hash: 19,
+            emoji_statuses: vec![
+                EmojiStatus {
+                    custom_emoji_id: CustomEmojiId::new(9),
+                    until_date: 55,
+                    ..EmojiStatus::default()
+                },
+                EmojiStatus::from_telegram(collectible(2)),
+            ],
+        };
+        let mut bytes = Vec::new();
+        statuses.store(&mut bytes);
+        let parsed = EmojiStatusesCache::parse(&bytes).unwrap();
+        assert_eq!(parsed.hash, 19);
+        assert_eq!(parsed.emoji_statuses, statuses.emoji_statuses);
+        assert_eq!(parsed.get_emoji_statuses_object().emoji_statuses.len(), 2);
+
+        // the unparsable framing is the "no cache" state at the load layer
+        let empty = EmojiStatusCustomEmojisCache::parse(&[0u8; 3]);
+        assert!(empty.is_err());
     }
 }
