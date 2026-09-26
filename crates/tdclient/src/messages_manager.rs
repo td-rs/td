@@ -22702,10 +22702,10 @@ pub fn send_message_group(
 
         if !message_send_options.only_preview {
             save_send_message_log_event(global, dialog_id, &mut m);
-            manager
+            let d = manager
                 .get_dialog_mut(dialog_id)
-                .and_then(|d| d.messages.insert(message_id, m))
                 .expect("get_message_to_send inserted the message");
+            d.messages.insert(message_id, m);
             do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
 
             if !ctx.is_bot() {
@@ -22714,16 +22714,16 @@ pub fn send_message_group(
                     .and_then(|d| d.messages.remove(&message_id))
                     .expect("get_message_to_send inserted the message");
                 send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
-                manager
+                let d = manager
                     .get_dialog_mut(dialog_id)
-                    .and_then(|d| d.messages.insert(message_id, m))
                     .expect("get_message_to_send inserted the message");
+                d.messages.insert(message_id, m);
             }
         } else {
-            manager
+            let d = manager
                 .get_dialog_mut(dialog_id)
-                .and_then(|d| d.messages.insert(message_id, m))
                 .expect("get_message_to_send inserted the message");
+            d.messages.insert(message_id, m);
         }
     }
 
@@ -22868,10 +22868,10 @@ pub fn send_message(
             &mut m,
             "send_message",
         );
-        manager
+        let d = manager
             .get_dialog_mut(dialog_id)
-            .and_then(|d| d.messages.insert(message_id, m))
             .expect("get_message_to_send inserted the message");
+        d.messages.insert(message_id, m);
         return message_object.ok_or_else(|| (500, "Can't send message".to_owned()));
     }
 
@@ -22904,10 +22904,10 @@ pub fn send_message(
             .and_then(|d| d.messages.remove(&message_id))
             .expect("get_message_to_send inserted the message");
         send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
-        manager
+        let d = manager
             .get_dialog_mut(dialog_id)
-            .and_then(|d| d.messages.insert(message_id, m))
             .expect("get_message_to_send inserted the message");
+        d.messages.insert(message_id, m);
 
         if need_update_dialog_pos {
             send_update_chat_last_message(
@@ -22934,10 +22934,10 @@ pub fn send_message(
         &mut m,
         "send_message",
     );
-    manager
+    let d = manager
         .get_dialog_mut(dialog_id)
-        .and_then(|d| d.messages.insert(message_id, m))
         .expect("get_message_to_send inserted the message");
+    d.messages.insert(message_id, m);
     message_object.ok_or_else(|| (500, "Can't send message".to_owned()))
 }
 

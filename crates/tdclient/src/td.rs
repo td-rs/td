@@ -1957,6 +1957,19 @@ impl crate::messages_manager::SendMessageContext for Td {
             tdutils::log_debug!("Send messages.sendMessage — [net-inert]");
             return;
         };
+        tdutils::log_debug!(
+            "Send messages.sendMessage: flags = {:#x}, peer = {:?}, random_id = {}, msg = {:?}, sched = {}, effect = {}, stars = {}, entities = {}, markup = {:?}, thumb = {}",
+            params.flags,
+            peer,
+            params.random_id,
+            params.message,
+            params.schedule_date,
+            params.effect,
+            params.allow_paid_stars,
+            params.entities.len(),
+            params.reply_markup.is_some(),
+            params.top_msg_id
+        );
         let reply_to = params.reply_to_message_id.map(|reply_to_msg_id| {
             // inputReplyToMessage flags.0 — the top_msg_id gate.
             const TOP_MSG_ID_MASK: i32 = 1;
