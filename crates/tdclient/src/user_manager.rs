@@ -1248,6 +1248,10 @@ pub struct UserFull {
     pub charge_paid_message_stars: i64,
     pub send_paid_message_stars: i64,
 
+    /// `UserFull::gift_settings` (UserManager.h) — the `setGiftSettings`
+    /// slice ([`crate::star_gift_settings`]).
+    pub gift_settings: crate::star_gift_settings::StarGiftSettings,
+
     /// `UserFull::first_saved_music_file_id` (UserManager.h:787) — the
     /// id is a placeholder until the Files step and the store keeps the
     /// flag forced off (the C++ persists it through
@@ -1303,6 +1307,7 @@ impl Default for UserFull {
             linked_community_id: CommunityId::default(),
             charge_paid_message_stars: 0,
             send_paid_message_stars: 0,
+            gift_settings: crate::star_gift_settings::StarGiftSettings::default(),
             first_saved_music_file_id: FileId::default(),
             is_first_saved_music_file_id_changed: false,
             is_blocked: false,
@@ -1376,7 +1381,7 @@ impl UserFull {
         let has_bot_verification = false;
         let has_charge_paid_message_stars = self.charge_paid_message_stars != 0;
         let has_send_paid_message_stars = self.send_paid_message_stars != 0;
-        let has_gift_settings = false; // GiftSettings subsystem
+        let has_gift_settings = !self.gift_settings.is_default();
         let has_star_rating = false; // StarRating subsystem
         let has_pending_star_rating = false;
         let has_main_profile_tab = false; // ProfileTab subsystem
@@ -1474,6 +1479,9 @@ impl UserFull {
         }
         if has_send_paid_message_stars {
             store_i64(out, self.send_paid_message_stars);
+        }
+        if has_gift_settings {
+            self.gift_settings.store(out);
         }
         if has_linked_community_id {
             store_i64(out, self.linked_community_id.get());
@@ -1586,7 +1594,6 @@ impl UserFull {
             || has_referral_program_info
             || has_verifier_settings
             || has_bot_verification
-            || has_gift_settings
             || has_star_rating
             || has_pending_star_rating
             || has_main_profile_tab
@@ -1640,6 +1647,9 @@ impl UserFull {
         }
         if has_send_paid_message_stars {
             result.send_paid_message_stars = parser.i64_()?;
+        }
+        if has_gift_settings {
+            result.gift_settings = crate::star_gift_settings::StarGiftSettings::parse_from(parser)?;
         }
         if has_linked_community_id {
             result.linked_community_id = CommunityId::new(parser.i64_()?);
@@ -2289,6 +2299,41 @@ impl UserManager {
             tdutils::log_error!("Wrong or unknown my ID returned");
         }
         self.my_id
+    }
+
+    /// `UserManager::on_update_my_user_gift_settings`
+    /// (UserManager.cpp:4253-4263) — the `setGiftSettings` chain's
+    /// local half; the full-info flip is the only real effect and the
+    /// promise answers ok (the C++ caller rides the
+    /// `account.setGlobalPrivacySettings` query result).
+    pub fn on_update_my_user_gift_settings(
+        &mut self,
+        env: &mut UserEnv,
+        gift_settings: crate::star_gift_settings::StarGiftSettings,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        let user_id = self.get_my_id();
+        if self.get_user_full_force(env, user_id, "on_update_my_user_gift_settings") {
+            let is_changed = {
+                let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
+                if user_full.gift_settings != gift_settings {
+                    user_full.gift_settings = gift_settings;
+                    user_full.is_changed = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if is_changed {
+                self.update_user_full(env, user_id, "on_update_my_user_gift_settings", false);
+            }
+        }
+        promise.set_value(());
     }
 
     /// `UserManager::set_my_id` (UserManager.cpp:2999-3017).
@@ -5175,10 +5220,17 @@ impl UserManager {
         // (apply_pending_user_photo, cpp:8986)
         self.apply_pending_user_photo(env, user_id, "on_get_user_full");
 
-        // The User facts the application reads (cpp:9112, 9140, 9235).
-        let (is_premium_user, is_contact, user_linked_community_id) = {
+        // The User facts the application reads (cpp:9112, 9140, 9235,
+        // 9049-9051).
+        let (is_premium_user, is_contact, user_linked_community_id, is_deleted_user, is_bot_user) = {
             let u = self.users.get(&user_id.get()).unwrap();
-            (u.is_premium, u.is_contact, u.linked_community_id)
+            (
+                u.is_premium,
+                u.is_contact,
+                u.linked_community_id,
+                u.is_deleted,
+                u.is_bot,
+            )
         };
 
         let flags = user_full.flags;
@@ -5237,6 +5289,15 @@ impl UserManager {
                 .map(|settings| settings.charge_paid_message_stars)
                 .unwrap_or_default(),
         );
+        // the gift-settings intake (cpp:9048-9051) — the deleted/bot
+        // override forces the allow-nothing settings.
+        let mut gift_settings = crate::star_gift_settings::StarGiftSettings::new(
+            user_full.display_gifts_button,
+            user_full.disallowed_gifts,
+        );
+        if is_deleted_user || is_bot_user {
+            gift_settings = crate::star_gift_settings::StarGiftSettings::allow_nothing();
+        }
         // on_update_user_full_need_phone_number_privacy_exception
         // (cpp:9029-9031 + hook cpp:4446-4459).
         let mut need_phone_number_privacy_exception = user_full
@@ -5352,6 +5413,10 @@ impl UserManager {
             }
             if stored.unofficial_security_risk != unofficial_security_risk {
                 stored.unofficial_security_risk = unofficial_security_risk;
+                stored.is_changed = true;
+            }
+            if stored.gift_settings != gift_settings {
+                stored.gift_settings = gift_settings;
                 stored.is_changed = true;
             }
             if stored.birthdate != birthdate {
@@ -5556,7 +5621,7 @@ impl UserManager {
             user_full.read_dates_private = false;
             user_full.contact_require_premium = false;
             user_full.birthdate = Birthdate::default();
-            // gift_settings — with the StarGiftSettings step
+            user_full.gift_settings = crate::star_gift_settings::StarGiftSettings::allow_nothing();
             user_full.sponsored_enabled = false;
             user_full.has_preview_medias = false;
             user_full.can_view_revenue = false;
@@ -6081,10 +6146,7 @@ impl UserManager {
             group_in_common_count: user_full.common_chat_count,
             incoming_paid_message_star_count: user_full.charge_paid_message_stars,
             outgoing_paid_message_star_count: user_full.send_paid_message_stars,
-            gift_settings: Some(td_api::GiftSettings {
-                show_gift_button: false,
-                accepted_gift_types: Some(td_api::AcceptedGiftTypes::default()),
-            }),
+            gift_settings: Some(user_full.gift_settings.get_gift_settings_object()),
             bot_verification: Some(td_api::BotVerification {
                 bot_user_id: 0,
                 icon_custom_emoji_id: 0,

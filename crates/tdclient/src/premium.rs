@@ -145,8 +145,15 @@ pub trait PremiumEnv {
             "Send payments.sendStarsGift(user_id = {user_id}, star_count = {star_count}, month_count = {month_count}) — [blocked: net]"
         );
     }
-    fn send_launch_prepaid_giveaway_query(&mut self, giveaway_id: i64) {
-        tdutils::log_info!("Send payments.launchPrepaidGiveaway({giveaway_id}) — [blocked: net]");
+    fn send_launch_prepaid_giveaway_query(
+        &mut self,
+        giveaway_id: i64,
+        user_count: i32,
+        star_count: i64,
+    ) {
+        tdutils::log_info!(
+            "Send payments.launchPrepaidGiveaway({giveaway_id}, users = {user_count}, stars = {star_count}) — [blocked: net]"
+        );
     }
     fn send_get_giveaway_info_query(&mut self, dialog_id: i64, message_id: i64) {
         tdutils::log_info!(
@@ -313,15 +320,24 @@ impl PremiumManager {
         self.net_blocked_promises.push(promise);
     }
 
-    /// `launch_prepaid_premium_giveaway` (Premium.cpp) — the query is the
-    /// seam.
+    /// `launch_prepaid_premium_giveaway` (Premium.cpp:710-717) — the
+    /// `GiveawayParameters::get_giveaway_parameters` validation runs the
+    /// non-empty band here; the boosted-channel/option ladder is the
+    /// PaymentsEnv plane (the payments arms are not Td-wired yet) and
+    /// rides the seam. The query is the seam.
     pub fn launch_prepaid_premium_giveaway(
         &mut self,
         env: &mut impl PremiumEnv,
         giveaway_id: i64,
-        promise: Promise<()>,
+        parameters: Option<&td_api::GiveawayParameters>,
+        user_count: i32,
+        star_count: i64,
+        mut promise: Promise<()>,
     ) {
-        env.send_launch_prepaid_giveaway_query(giveaway_id);
+        let Some(_parameters) = parameters else {
+            return promise.set_error(Status::error(400, "Giveaway parameters must be non-empty"));
+        };
+        env.send_launch_prepaid_giveaway_query(giveaway_id, user_count, star_count);
         self.net_blocked_promises.push(promise);
     }
 
@@ -618,5 +634,46 @@ mod tests {
             Promise::from_interface(RecordingFeatures(recorded.clone())),
             RecordedFeatures(recorded),
         )
+    }
+    #[test]
+    fn launch_prepaid_giveaway_validates_and_parks() {
+        let mut env = TestEnv {
+            options: std::collections::BTreeMap::new(),
+            option_strings: std::collections::BTreeMap::new(),
+            queries: Vec::new(),
+        };
+        let mut manager = PremiumManager::default();
+
+        // the C++ get_giveaway_parameters non-empty band answers locally
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.launch_prepaid_premium_giveaway(&mut env, 7, None, 10, 100, promise);
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Giveaway parameters must be non-empty"),
+            "expected the parameters error"
+        );
+
+        // the validated query parks (the parameters ladder rides the
+        // PaymentsEnv plane)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        let parameters = td_api::GiveawayParameters {
+            boosted_chat_id: -1000000000000,
+            additional_chat_ids: Vec::new(),
+            winners_selection_date: 2000000000,
+            only_new_members: false,
+            has_public_winners: true,
+            country_codes: Vec::new(),
+            prize_description: "Prize".to_string(),
+        };
+        manager.launch_prepaid_premium_giveaway(&mut env, 7, Some(&parameters), 10, 100, promise);
+        assert_eq!(manager.net_blocked_promises.len(), 1);
+        assert!((*slot.lock().unwrap()).is_none());
     }
 }

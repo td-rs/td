@@ -17252,6 +17252,210 @@ fn run_files_glue_requests(td: &mut Td, id: u64, function: Function) {
             let _ = (request.chat_id, event_type, data, promise);
         }
 
+        _ => run_misc_glue_requests(td, id, function),
+    }
+}
+
+/// The glue-slice misc arm group of the request dispatcher — the
+/// Requests.cpp residue: the local LinkManager pair, the Premium
+/// giveaway pair, the push/account-ttl/token/call-log singles and the
+/// gift-settings leg. The query tails park at the `[blocked: net]`
+/// seams, the M.31 promise-drop convention.
+#[inline(never)]
+fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::getInternalLink(request) => {
+            // Requests.cpp:3575-3583 — LinkManager::get_internal_link is
+            // local; no CHECK_IS_USER (the preauthentication set).
+            let mut promise = td.deferred_promise::<td_api::HttpUrl, _>(id, Object::httpUrl);
+            let result = {
+                let mut env = crate::td::TdLinkEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                };
+                crate::link_manager::get_internal_link(
+                    &mut env,
+                    request.r#type.as_deref(),
+                    !request.is_http,
+                )
+            };
+            match result {
+                Ok(link) => promise.set_value(td_api::HttpUrl { url: link }),
+                Err(status) => promise.set_error(status),
+            }
+        }
+        Function::getInternalLinkType(request) => {
+            // Requests.cpp:3584-3588 — the parse is local; the C++ null
+            // answer for an unparseable link parks (the recorded
+            // null-response divergence — promise.set_value(nullptr) is
+            // inexpressible).
+            let object = {
+                let mut env = crate::td::TdLinkEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                };
+                crate::link_manager::parse_internal_link(&mut env, &request.link, false)
+                    .map(|link| Object::from(link.get_internal_link_type_object(&env)))
+            };
+            if let Some(object) = object {
+                td.send_result(id, object);
+            }
+        }
+        Function::getGiveawayInfo(request) => {
+            // Requests.cpp:9087-9091 → Premium.cpp:720-725: the
+            // `get_giveaway_message_id` band (the giveaway-message
+            // lookup, MessagesManager.cpp:36676) rides the M.10
+            // get_message_force seam; the payments.getGiveawayInfo query
+            // parks in the premium manager.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::GiveawayInfo, _>(id, Object::from);
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.get_premium_giveaway_info(
+                &mut env,
+                request.chat_id,
+                request.message_id,
+                promise,
+            );
+        }
+        Function::launchPrepaidGiveaway(request) => {
+            // Requests.cpp:9080-9085 → Premium.cpp:710-717: the
+            // parameters non-empty band is real, the rest of the
+            // validation ladder rides the PaymentsEnv plane; the
+            // payments.launchPrepaidGiveaway query parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.launch_prepaid_premium_giveaway(
+                &mut env,
+                request.giveaway_id,
+                request.parameters.as_ref(),
+                request.winner_count,
+                request.star_count,
+                promise,
+            );
+        }
+        Function::processPushNotification(request) => {
+            // Requests.cpp:2403-2409 — CHECK_IS_USER + the payload clean;
+            // the manager runs the disabled/"{}" and receiver-id bands,
+            // the decrypt/run plane parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(payload) = crate::misc::clean_input_string(&request.payload) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
+            };
+            td.notification_manager
+                .process_push_notification(&mut env, payload, promise);
+        }
+        Function::searchUserByToken(request) => {
+            // Requests.cpp:2521-2526 — CHECK_IS_USER + the token clean;
+            // the contacts.importContactToken query parks in the account
+            // manager.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(token) = crate::misc::clean_input_string(&request.token) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::User, _>(id, Object::user);
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .import_contact_token(&mut env, token, promise);
+        }
+        Function::sendCallLog(request) => {
+            // Requests.cpp:5148-5152 — CHECK_IS_USER; the CallManager
+            // close/call-id bands are real, the M.12 file intake and the
+            // phone.saveCallLog upload park.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager
+                .send_call_log(&mut env, &request.call_id, request.log_file, promise);
+        }
+        Function::setGiftSettings(request) => {
+            // Requests.cpp:8440-8454 — CHECK_IS_USER; the GlobalPrivacy
+            // Settings gift leg over the StarGiftSettings value plane;
+            // the saveGlobalPrivacySettings query parks at the seam and
+            // the on-result `on_update_my_user_gift_settings` store lands
+            // with the net result handlers.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let set_settings = crate::privacy_manager::GlobalPrivacySettings::from_gift_settings(
+                request.settings.as_ref(),
+            );
+            let mut env = crate::td::PrivacyEnv { td };
+            crate::privacy_manager::GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                set_settings,
+                promise,
+            );
+        }
+        Function::setInactiveSessionTtl(request) => {
+            // Requests.cpp:2566-2570 — CHECK_IS_USER; the
+            // SetAuthorizationTtlOnServer log event (0x505) + the
+            // account.setAuthorizationTTL seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.set_inactive_session_ttl_days(
+                &mut env,
+                request.inactive_session_ttl_days,
+                promise,
+            );
+        }
+        Function::testNetwork(_) => {
+            // Requests.cpp:9451-9462 — no CHECK_IS_USER (the
+            // preauthentication set); the ok promise rides the
+            // get_current_country_code query, which parks at the
+            // [blocked: net] seam.
+            let promise = td.deferred_promise::<String, _>(id, |_country_code| ok_object());
+            let (mut env, mut manager) = crate::td::country_env_split(td);
+            manager.get_current_country_code(&mut env, promise);
+            td.country_info_manager = manager;
+        }
+
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -18189,12 +18393,25 @@ mod request_census_tests {
         // editUserInfo/getSupportName queries ride the [blocked: net]
         // seams) (983 + 3 = 986 dispatched / 13 - 3 = 10 interim, sync
         // unmoved 26 — the merged pin).
+        // The misc glue slice flipped 10 arms: the link pair
+        // (getInternalLink, getInternalLinkType — the LinkManager local
+        // halves answer, the unparseable-link null parks), the giveaway
+        // pair (getGiveawayInfo, launchPrepaidGiveaway — the Premium.cpp
+        // query seams over the parameters/message-lookup bands),
+        // processPushNotification (the disabled/"{}" and receiver-id
+        // bands answer, the decrypt/run plane parks), searchUserByToken +
+        // setInactiveSessionTtl (the AccountManager seams over the 0x505
+        // SetAuthorizationTtlOnServer log event), sendCallLog (the
+        // close/call-id bands, the M.12 file intake + upload park) and
+        // setGiftSettings (the GlobalPrivacySettings gift leg over the
+        // StarGiftSettings value plane) (986 + 10 = 996 dispatched /
+        // 10 - 10 = 0 interim, sync unmoved 26 — the census closes).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            986,
+            996,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 10, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 0, "interim count");
     }
 }

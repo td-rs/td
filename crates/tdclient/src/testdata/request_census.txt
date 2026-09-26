@@ -388,7 +388,7 @@ getGiftChatThemes	dispatched
 getGiftCollections	dispatched
 getGiftUpgradePreview	dispatched
 getGiftsForCrafting	dispatched
-getGiveawayInfo	interim
+getGiveawayInfo	dispatched
 getGramRevenueStatistics	dispatched
 getGramWithdrawalUrl	dispatched
 getGreetingStickers	dispatched
@@ -405,8 +405,8 @@ getInlineGameHighScores	dispatched
 getInlineQueryResults	dispatched
 getInstalledBackgrounds	dispatched
 getInstalledStickerSets	dispatched
-getInternalLink	interim
-getInternalLinkType	interim
+getInternalLink	dispatched
+getInternalLinkType	dispatched
 getJsonString	sync
 getJsonValue	sync
 getKeywordEmojis	dispatched
@@ -592,7 +592,7 @@ joinChatByInviteLink	dispatched
 joinGroupCall	dispatched
 joinLiveStory	dispatched
 joinVideoChat	dispatched
-launchPrepaidGiveaway	interim
+launchPrepaidGiveaway	dispatched
 leaveChat	dispatched
 leaveGroupCall	dispatched
 listenToAudio	dispatched
@@ -628,7 +628,7 @@ processChatHasProtectedContentDisableRequest	dispatched
 processChatJoinRequest	dispatched
 processChatJoinRequests	dispatched
 processGiftPurchaseOffer	dispatched
-processPushNotification	interim
+processPushNotification	dispatched
 rateSpeechRecognition	dispatched
 readAllChatMentions	dispatched
 readAllChatPollVotes	dispatched
@@ -756,7 +756,7 @@ searchStickers	dispatched
 searchStringsByPrefix	sync
 searchTextCompositionStyle	dispatched
 searchUserByPhoneNumber	dispatched
-searchUserByToken	interim
+searchUserByToken	dispatched
 searchWebApp	dispatched
 sellGift	dispatched
 sendAuthenticationFirebaseSms	dispatched
@@ -764,7 +764,7 @@ sendBotStartMessage	dispatched
 sendBusinessMessage	dispatched
 sendBusinessMessageAlbum	dispatched
 sendCallDebugInformation	dispatched
-sendCallLog	interim
+sendCallLog	dispatched
 sendCallRating	dispatched
 sendCallSignalingData	dispatched
 sendChatAction	dispatched
@@ -861,11 +861,11 @@ setForumTopicNotificationSettings	dispatched
 setGameScore	dispatched
 setGiftCollectionName	dispatched
 setGiftResalePrice	dispatched
-setGiftSettings	interim
+setGiftSettings	dispatched
 setGroupCallPaidMessageStarCount	dispatched
 setGroupCallParticipantIsSpeaking	dispatched
 setGroupCallParticipantVolumeLevel	dispatched
-setInactiveSessionTtl	interim
+setInactiveSessionTtl	dispatched
 setInlineGameScore	dispatched
 setLiveStoryMessageSender	dispatched
 setLogStream	sync
@@ -950,7 +950,7 @@ testCallVectorIntObject	dispatched
 testCallVectorString	dispatched
 testCallVectorStringObject	dispatched
 testGetDifference	dispatched
-testNetwork	interim
+testNetwork	dispatched
 testProxy	dispatched
 testReturnError	sync
 testSquareInt	dispatched

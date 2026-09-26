@@ -152,6 +152,7 @@ pub mod secure_value;
 pub mod session_multi_proxy;
 pub mod sponsored_message_manager;
 pub mod star_gift_manager;
+pub mod star_gift_settings;
 pub mod star_manager;
 pub mod statistics_manager;
 pub mod stickers_manager;

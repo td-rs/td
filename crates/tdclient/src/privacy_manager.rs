@@ -20,7 +20,8 @@
 //!
 //! The `gift_settings_` field, the `StarGiftSettings` constructor and the
 //! `get_input_global_privacy_settings` telegram builder
-//! (GlobalPrivacySettings.cpp:139-154) ride the `setGiftSettings` slice.
+//! (GlobalPrivacySettings.cpp:139-154) landed with the `setGiftSettings`
+//! slice (the models live in [`crate::star_gift_settings`]).
 
 use tdutils::promise::Promise;
 use tdutils::status::Status;
@@ -605,13 +606,12 @@ pub(crate) enum SetType {
     Archive,
     ReadDate,
     NewChat,
-    #[allow(dead_code)] // the Gift set plane (the giftSettings_ constructor) lands with its slice
     Gift,
 }
 
 /// `td::GlobalPrivacySettings` (GlobalPrivacySettings.h:20-55) — the
-/// new-chat/read-date plane; the `gift_settings_` field and the
-/// Archive/Gift constructors land with their slices.
+/// new-chat/read-date plane plus the gift settings; the Archive
+/// constructor lands with its slice.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GlobalPrivacySettings {
     set_type: SetType,
@@ -623,6 +623,8 @@ pub(crate) struct GlobalPrivacySettings {
     hide_read_marks: bool,
     new_noncontact_peers_require_premium: bool,
     noncontact_peers_paid_star_count: i64,
+    /// `GlobalPrivacySettings.h:29` — the `setGiftSettings` slice.
+    gift_settings: crate::star_gift_settings::StarGiftSettings,
 }
 
 impl GlobalPrivacySettings {
@@ -664,6 +666,20 @@ impl GlobalPrivacySettings {
         }
     }
 
+    /// `GlobalPrivacySettings(td_api::giftSettings *)`
+    /// (GlobalPrivacySettings.cpp:110-113).
+    pub(crate) fn from_gift_settings(
+        settings: Option<&td_api::GiftSettings>,
+    ) -> GlobalPrivacySettings {
+        GlobalPrivacySettings {
+            set_type: SetType::Gift,
+            gift_settings: crate::star_gift_settings::StarGiftSettings::from_gift_settings(
+                settings,
+            ),
+            ..GlobalPrivacySettings::default()
+        }
+    }
+
     /// `GlobalPrivacySettings::apply_changes` (GlobalPrivacySettings.cpp:115-137).
     #[allow(dead_code)] // the get → apply_changes chain parks until the net result handlers land
     fn apply_changes(&mut self, set_settings: &GlobalPrivacySettings) {
@@ -685,8 +701,7 @@ impl GlobalPrivacySettings {
                     set_settings.noncontact_peers_paid_star_count;
             }
             SetType::Gift => {
-                // the `gift_settings_` assignment lands with the
-                // StarGiftSettings port (the module docs)
+                self.gift_settings = set_settings.gift_settings.clone();
             }
             SetType::None => unreachable!("the C++ UNREACHABLE default"),
         }
@@ -708,6 +723,41 @@ impl GlobalPrivacySettings {
         td_api::NewChatPrivacySettings {
             allow_new_chats_from_unknown_users: !self.new_noncontact_peers_require_premium,
             incoming_paid_message_star_count: self.noncontact_peers_paid_star_count,
+        }
+    }
+
+    /// `GlobalPrivacySettings::get_input_global_privacy_settings`
+    /// (GlobalPrivacySettings.cpp:139-154) — the telegram form the
+    /// `SetGlobalPrivacySettingsQuery` sends (its sender rides the
+    /// `[blocked: net]` result handlers). The masks are the C++
+    /// `NONCONTACT_PEERS_PAID_STARS_MASK`/`DISALLOWED_GIFTS_MASK` (bits
+    /// 6/7 of the `globalPrivacySettings` flags).
+    #[allow(dead_code)] // the SetGlobalPrivacySettingsQuery sender (the [blocked: net] tail)
+    pub(crate) fn get_input_global_privacy_settings(
+        &self,
+    ) -> tdmtproto::telegram_api::GlobalPrivacySettings {
+        debug_assert_eq!(self.set_type, SetType::None);
+        let mut flags = 0;
+        if self.noncontact_peers_paid_star_count > 0 {
+            flags |= 1 << 6; // NONCONTACT_PEERS_PAID_STARS_MASK
+        }
+        let gifts_settings = self
+            .gift_settings
+            .get_disallowed_gifts()
+            .get_input_disallowed_gifts_settings();
+        if gifts_settings.is_some() {
+            flags |= 1 << 7; // DISALLOWED_GIFTS_MASK
+        }
+        tdmtproto::telegram_api::GlobalPrivacySettings {
+            flags,
+            archive_and_mute_new_noncontact_peers: self.archive_and_mute_new_noncontact_peers,
+            keep_archived_unmuted: self.keep_archived_unmuted,
+            keep_archived_folders: self.keep_archived_folders,
+            hide_read_marks: self.hide_read_marks,
+            new_noncontact_peers_require_premium: self.new_noncontact_peers_require_premium,
+            display_gifts_button: self.gift_settings.get_display_gifts_button(),
+            noncontact_peers_paid_stars: self.noncontact_peers_paid_star_count,
+            disallowed_gifts: gifts_settings,
         }
     }
 
