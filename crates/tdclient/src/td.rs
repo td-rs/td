@@ -3656,6 +3656,10 @@ impl Td {
         let unix_time = self.global.unix_time();
         let use_chat_info_database = self.global.use_chat_info_database();
         let auth_is_bot = self.auth_manager.is_bot();
+        // bots never maintain the messages ordered tree (the C++
+        // is_bot() gates at MessagesManager.cpp:31458/13661) — the flag
+        // rides the manager from the restore-time auth state
+        self.messages_manager.bot_mode = auth_is_bot;
         self.user_manager.init_contacts_state(
             self.global.binlog_pmc(),
             unix_time,
@@ -4065,6 +4069,9 @@ impl Td {
         // updateDefaultBackground updates for users (the pre-landing
         // hardcoded constants retired).
         self.init_background_manager();
+        // `DownloadManagerImpl::start_up`'s initial counters flush — the
+        // C++ record order (backgrounds, then updateFileDownloads) pins
+        // the position; later updates ride update_counters' change gate.
         self.send_update(Object::updateFileDownloads(td_api::updateFileDownloads {
             total_size: 0,
             total_count: 0,
@@ -4116,6 +4123,7 @@ impl Td {
 
     /// `Td::close` / `Td::destroy` / `Td::close_impl` (Td.cpp:768-807).
     pub(crate) fn close_impl(&mut self, destroy_flag: bool) {
+        eprintln!("closelog: close_impl begin destroy={}", destroy_flag);
         self.destroy_flag |= destroy_flag;
         if self.close_flag != 0 {
             return;
@@ -6987,6 +6995,10 @@ impl Td {
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
     /// `my_id` option) then `updateUser` (AuthManager.cpp:1517-1520).
     fn apply_self_user(&mut self, user: &telegram_api::user, broadcast: bool) {
+        // the live-login bot flag refresh (the restore-time set is in the
+        // init block) — is_bot settles with the bot-token check before
+        // the self user applies
+        self.messages_manager.bot_mode = self.auth_manager.is_bot();
         let object = convert::user_object(user, true);
         self.my_id = object.id;
         self.my_access_hash = user.access_hash;
@@ -9526,7 +9538,9 @@ impl Actor for Td {
     /// `Td::hangup` (Td.cpp:481-485): the ClientManager's ActorOwn erase
     /// lands here and starts the close machine.
     fn hangup(&mut self) {
+        eprintln!("closelog: td hangup begin");
         self.close_impl(false);
+        eprintln!("closelog: td close_impl done");
         self.dec_stop_cnt();
     }
 

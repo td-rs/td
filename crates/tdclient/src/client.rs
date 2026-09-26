@@ -260,6 +260,7 @@ impl MultiImpl {
                 // The C++ `while (concurrent_scheduler->run_main(10)) {}` — 10 ms
                 // slices; inbound events wake the idle pump immediately.
                 while thread_scheduler.lock().unwrap().run_main(0.01) {}
+                eprintln!("closelog: run_main loop exited");
             })
             .expect("the scheduler pump thread spawn");
         Self {
@@ -311,17 +312,22 @@ impl MultiImpl {
 
 impl Drop for MultiImpl {
     fn drop(&mut self) {
+        eprintln!("closelog: drop begin");
         {
             let _guard = self.send_ptr.guard(false);
             // ActorOwn drop → hangup → MultiTd teardown → each Td's callback
             // destructor posts the close notification.
             self.multi_td.take();
         }
+        eprintln!("closelog: multi_td dropped");
         self.scheduler.lock().unwrap().finish();
+        eprintln!("closelog: finish 1 done; joining scheduler thread");
         if let Some(thread) = self.scheduler_thread.take() {
             let _ = thread.join();
         }
+        eprintln!("closelog: scheduler thread joined");
         self.scheduler.lock().unwrap().finish();
+        eprintln!("closelog: drop done");
     }
 }
 

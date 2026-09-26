@@ -8647,6 +8647,12 @@ pub const MAX_GET_DIALOGS: i32 = 100;
 /// touch land here per slice, the rest grow with their owning tasks.
 #[derive(Debug, Default)]
 pub struct MessagesManager {
+    /// The C++ `td_->auth_manager_->is_bot()` — process-constant per
+    /// session; bots never maintain the ordered-message tree (the C++
+    /// gates both the insert, MessagesManager.cpp:31458, and the erase,
+    /// MessagesManager.cpp:13661, on `!is_bot`). Set at each
+    /// authorization (Td::apply_self_user).
+    pub(crate) bot_mode: bool,
     /// `dialogs_` (MessagesManager.h:2948).
     pub(crate) dialogs: HashMap<DialogId, Box<Dialog>>,
     /// `update_message_ids_` — new_message_id -> temporary_id.
@@ -20709,10 +20715,13 @@ pub fn add_message_to_dialog(
         }
 
         // the ordered-container insert (31088) — from_update drives the
-        // auto-attach
-        let d = manager.get_dialog_mut(dialog_id).unwrap();
-        d.ordered_messages
-            .insert(message_id, from_update, old_last_message_id, source);
+        // auto-attach; bots never maintain the tree (31458's
+        // `!is_bot` gate around add_message_to_dialog_message_list)
+        if !manager.bot_mode {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            d.ordered_messages
+                .insert(message_id, from_update, old_last_message_id, source);
+        }
     }
 
     // update_replied_by_message_count (+1) (31462) — the reply registry is
@@ -24277,14 +24286,18 @@ pub fn do_delete_message(
         // M.10.15 suffix-load slice
     }
 
+    let bot_mode = manager.bot_mode;
     let result = {
         let d = manager.get_dialog_mut(dialog_id).unwrap();
         let result = d.messages.remove(&message_id);
         if result.is_some() {
             d.message_lru_list.remove(message_id);
         }
-        d.ordered_messages
-            .erase(message_id, only_from_memory, source);
+        // bots never maintain the ordered tree (MessagesManager.cpp:13661)
+        if !bot_mode {
+            d.ordered_messages
+                .erase(message_id, only_from_memory, source);
+        }
         d.being_deleted_message_id = MessageId::default();
         result
     };
@@ -25546,6 +25559,7 @@ pub fn fail_send_message(
     // in M.10.6)
     let need_update_dialog_pos = false;
     manager.being_readded_message_full_id = message_full_id;
+    let bot_mode = manager.bot_mode;
     let message = {
         let d = manager.get_dialog_mut(dialog_id).unwrap();
         let removed = if old_message_id.is_scheduled() {
@@ -25558,8 +25572,13 @@ pub fn fail_send_message(
         if removed.is_some() {
             if !old_message_id.is_scheduled() {
                 d.message_lru_list.remove(old_message_id);
-                d.ordered_messages
-                    .erase(old_message_id, false, "fail send message");
+                // bots never maintain the ordered tree
+                // (MessagesManager.cpp:13661, via the fail-path
+                // delete_message → erase_message route)
+                if !bot_mode {
+                    d.ordered_messages
+                        .erase(old_message_id, false, "fail send message");
+                }
             }
             d.being_deleted_message_id = MessageId::default();
         }
@@ -25732,6 +25751,7 @@ fn add_message_to_dialog_memory_only(
     source: &'static str,
 ) -> Result<MessageFullId, String> {
     let message_id = message.message_id;
+    let bot_mode = manager.bot_mode;
     let d = manager.get_dialog_mut(dialog_id).ok_or("no dialog")?;
     if d.messages.contains_key(&message_id) {
         return Err("adding already existing message".to_string());
@@ -25739,8 +25759,12 @@ fn add_message_to_dialog_memory_only(
     if message_id > d.max_added_message_id {
         d.max_added_message_id = message_id;
     }
-    d.ordered_messages
-        .insert(message_id, false, MessageId::default(), source);
+    // the ordered insert rides the same `!is_bot` gate as the full add
+    // (MessagesManager.cpp:31458 → 31088)
+    if !bot_mode {
+        d.ordered_messages
+            .insert(message_id, false, MessageId::default(), source);
+    }
     message.debug_source = source;
     d.messages.insert(message_id, message);
     d.message_lru_list.put_back(message_id);
