@@ -8647,6 +8647,12 @@ pub const MAX_GET_DIALOGS: i32 = 100;
 /// touch land here per slice, the rest grow with their owning tasks.
 #[derive(Debug, Default)]
 pub struct MessagesManager {
+    /// The C++ `td_->auth_manager_->is_bot()` — process-constant per
+    /// session; bots never maintain the ordered-message tree (the C++
+    /// gates both the insert, MessagesManager.cpp:31458, and the erase,
+    /// MessagesManager.cpp:13661, on `!is_bot`). Set at each
+    /// authorization (Td::apply_self_user).
+    pub(crate) bot_mode: bool,
     /// `dialogs_` (MessagesManager.h:2948).
     pub(crate) dialogs: HashMap<DialogId, Box<Dialog>>,
     /// `update_message_ids_` — new_message_id -> temporary_id.
@@ -8807,6 +8813,14 @@ impl MessagesManager {
         let dialog = self.dialogs.entry(dialog_id).or_insert_with(|| {
             let mut dialog = Box::new(Dialog::default());
             dialog.dialog_id = dialog_id;
+            // the collapsed `add_new_dialog` tail: the C++ counterpart
+            // emits updateNewChat and sets the flag in the same breath
+            // (send_update_new_chat, MessagesManager.cpp:27209); the
+            // emission lives in the skeleton's ensure_chat for user
+            // dialogs, and the flag follows it.
+            if dialog_id.get_type() == DialogType::User {
+                dialog.is_update_new_chat_sent = true;
+            }
             dialog
         });
         dialog.as_mut()
@@ -19811,6 +19825,14 @@ pub trait SendMessageContext: MessageObjectContext {
     fn remove_inactive_channel(&self, channel_id: ChannelId) {
         let _ = channel_id;
     }
+
+    /// `td_->create_handler<SendMessageQuery>()->send(...)` — the text
+    /// wire send (the `DoSendAction::TextReady` tail). The default is the
+    /// offline posture: the query is not sent and the completion never
+    /// arrives (the message stays in the send queue machinery).
+    fn send_text_message_query(&mut self, params: TextMessageQueryParams) {
+        let _ = params;
+    }
 }
 
 /// `MessagesManager::get_next_yet_unsent_message_id`
@@ -20693,10 +20715,13 @@ pub fn add_message_to_dialog(
         }
 
         // the ordered-container insert (31088) — from_update drives the
-        // auto-attach
-        let d = manager.get_dialog_mut(dialog_id).unwrap();
-        d.ordered_messages
-            .insert(message_id, from_update, old_last_message_id, source);
+        // auto-attach; bots never maintain the tree (31458's
+        // `!is_bot` gate around add_message_to_dialog_message_list)
+        if !manager.bot_mode {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            d.ordered_messages
+                .insert(message_id, from_update, old_last_message_id, source);
+        }
     }
 
     // update_replied_by_message_count (+1) (31462) — the reply registry is
@@ -22686,10 +22711,10 @@ pub fn send_message_group(
 
         if !message_send_options.only_preview {
             save_send_message_log_event(global, dialog_id, &mut m);
-            manager
+            let d = manager
                 .get_dialog_mut(dialog_id)
-                .and_then(|d| d.messages.insert(message_id, m))
                 .expect("get_message_to_send inserted the message");
+            d.messages.insert(message_id, m);
             do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
 
             if !ctx.is_bot() {
@@ -22698,16 +22723,16 @@ pub fn send_message_group(
                     .and_then(|d| d.messages.remove(&message_id))
                     .expect("get_message_to_send inserted the message");
                 send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
-                manager
+                let d = manager
                     .get_dialog_mut(dialog_id)
-                    .and_then(|d| d.messages.insert(message_id, m))
                     .expect("get_message_to_send inserted the message");
+                d.messages.insert(message_id, m);
             }
         } else {
-            manager
+            let d = manager
                 .get_dialog_mut(dialog_id)
-                .and_then(|d| d.messages.insert(message_id, m))
                 .expect("get_message_to_send inserted the message");
+            d.messages.insert(message_id, m);
         }
     }
 
@@ -22852,10 +22877,10 @@ pub fn send_message(
             &mut m,
             "send_message",
         );
-        manager
+        let d = manager
             .get_dialog_mut(dialog_id)
-            .and_then(|d| d.messages.insert(message_id, m))
             .expect("get_message_to_send inserted the message");
+        d.messages.insert(message_id, m);
         return message_object.ok_or_else(|| (500, "Can't send message".to_owned()));
     }
 
@@ -22870,11 +22895,17 @@ pub fn send_message(
     );
 
     save_send_message_log_event(global, dialog_id, &mut m);
-    manager
+    let d = manager
         .get_dialog_mut(dialog_id)
-        .and_then(|d| d.messages.insert(message_id, m))
         .expect("get_message_to_send inserted the message");
-    do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
+    d.messages.insert(message_id, m);
+    let send_action = do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
+    if send_action == DoSendAction::TextReady {
+        // `on_text_message_ready_to_send` — the text wire send (the
+        // C++ DoSendAction switch); the upload/media actions keep their
+        // M.12/net seams in do_send_message.
+        on_text_message_ready_to_send(manager, ctx, dialog_id, message_id);
+    }
 
     if !ctx.is_bot() {
         let mut m = manager
@@ -22882,10 +22913,10 @@ pub fn send_message(
             .and_then(|d| d.messages.remove(&message_id))
             .expect("get_message_to_send inserted the message");
         send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
-        manager
+        let d = manager
             .get_dialog_mut(dialog_id)
-            .and_then(|d| d.messages.insert(message_id, m))
             .expect("get_message_to_send inserted the message");
+        d.messages.insert(message_id, m);
 
         if need_update_dialog_pos {
             send_update_chat_last_message(
@@ -22912,10 +22943,10 @@ pub fn send_message(
         &mut m,
         "send_message",
     );
-    manager
+    let d = manager
         .get_dialog_mut(dialog_id)
-        .and_then(|d| d.messages.insert(message_id, m))
         .expect("get_message_to_send inserted the message");
+    d.messages.insert(message_id, m);
     message_object.ok_or_else(|| (500, "Can't send message".to_owned()))
 }
 
@@ -24255,14 +24286,18 @@ pub fn do_delete_message(
         // M.10.15 suffix-load slice
     }
 
+    let bot_mode = manager.bot_mode;
     let result = {
         let d = manager.get_dialog_mut(dialog_id).unwrap();
         let result = d.messages.remove(&message_id);
         if result.is_some() {
             d.message_lru_list.remove(message_id);
         }
-        d.ordered_messages
-            .erase(message_id, only_from_memory, source);
+        // bots never maintain the ordered tree (MessagesManager.cpp:13661)
+        if !bot_mode {
+            d.ordered_messages
+                .erase(message_id, only_from_memory, source);
+        }
         d.being_deleted_message_id = MessageId::default();
         result
     };
@@ -24833,6 +24868,370 @@ pub fn on_update_message_id(
     true
 }
 
+/// `MessagesManager::get_message_flags` (MessagesManager.cpp:24198-24244) —
+/// the `messages.sendMessage` flag word over the message model.
+fn get_message_flags(m: &Message) -> i32 {
+    const DISABLE_WEB_PAGE_PREVIEW: i32 = 1 << 1;
+    const HAS_REPLY_MARKUP: i32 = 1 << 2;
+    const DISABLE_NOTIFICATION: i32 = 1 << 5;
+    const FROM_BACKGROUND: i32 = 1 << 6;
+    const CLEAR_DRAFT: i32 = 1 << 7;
+    const HAS_SCHEDULE_DATE: i32 = 1 << 10;
+    const HAS_SCHEDULE_REPEAT_PERIOD: i32 = 1 << 24;
+    const UPDATE_STICKER_SETS_ORDER: i32 = 1 << 15;
+    const INVERT_MEDIA: i32 = 1 << 16;
+    const EFFECT: i32 = 1 << 18;
+    const ALLOW_PAID: i32 = 1 << 19;
+    const ALLOW_PAID_STARS: i32 = 1 << 21;
+
+    let mut flags = 0;
+    if m.disable_web_page_preview {
+        flags |= DISABLE_WEB_PAGE_PREVIEW;
+    }
+    if m.reply_markup.is_some() {
+        flags |= HAS_REPLY_MARKUP;
+    }
+    if m.disable_notification {
+        flags |= DISABLE_NOTIFICATION;
+    }
+    if m.from_background {
+        flags |= FROM_BACKGROUND;
+    }
+    if m.clear_draft {
+        flags |= CLEAR_DRAFT;
+    }
+    if m.message_id.is_scheduled() {
+        flags |= HAS_SCHEDULE_DATE;
+        if m.schedule_repeat_period != 0 {
+            flags |= HAS_SCHEDULE_REPEAT_PERIOD;
+        }
+    }
+    if m.update_stickersets_order {
+        flags |= UPDATE_STICKER_SETS_ORDER;
+    }
+    if m.invert_media {
+        flags |= INVERT_MEDIA;
+    }
+    if m.effect_id.is_valid() {
+        flags |= EFFECT;
+    }
+    if m.allow_paid {
+        flags |= ALLOW_PAID;
+    }
+    if m.paid_message_star_count != 0 {
+        flags |= ALLOW_PAID_STARS;
+    }
+    flags
+}
+
+/// The `SendMessageQuery::send` wire payload (MessagesManager.cpp:1207-1249)
+/// — the manager-level data prebuilt where the message lives; the
+/// dialog-level pieces (the write input peer) resolve in the Td impl of
+/// [`SendMessageContext::send_text_message_query`].
+pub struct TextMessageQueryParams {
+    pub flags: i32,
+    pub no_webpage: bool,
+    pub silent: bool,
+    pub background: bool,
+    pub clear_draft: bool,
+    pub noforwards: bool,
+    pub update_stickersets_order: bool,
+    pub invert_media: bool,
+    pub allow_paid_floodskip: bool,
+    pub dialog_id: DialogId,
+    /// `inputReplyToMessage` — the plain reply arm; the
+    /// story/ephemeral/quote/topic arms ride their slices (documented in
+    /// [`get_input_reply_to_for_send`]).
+    pub reply_to_message_id: Option<i32>,
+    pub top_msg_id: i32,
+    pub message: String,
+    pub random_id: i64,
+    /// `get_input_reply_markup` — the wire form.
+    pub reply_markup: Option<tdmtproto::telegram_api::ReplyMarkup>,
+    pub entities: Vec<tdmtproto::telegram_api::MessageEntity>,
+    pub schedule_date: i32,
+    pub schedule_repeat_period: i32,
+    pub effect: i64,
+    pub allow_paid_stars: i64,
+    pub suggested_post: Option<SuggestedPost>,
+}
+
+/// `MessageInputReplyTo::get_input_reply_to` (MessageInputReplyTo.cpp:97-176)
+/// — the plain arms the send wire exercises: the empty reply and the
+/// ordinary/scheduled message reply. The story arm, the ephemeral arm, the
+/// quote plane and the monoforum/saved-input-peer arms keep their
+/// documented seams (the walking-skeleton send path is the plain reply).
+fn get_input_reply_to_for_send(input_reply_to: &MessageInputReplyTo) -> Option<(Option<i32>, i32)> {
+    if input_reply_to.story_full_id.is_valid() || input_reply_to.ephemeral_message_id.is_valid() {
+        tdutils::log_debug!(
+            "Reply wire arm stays the story/ephemeral seam — dropped from the send query"
+        );
+        return None;
+    }
+    let reply_to_message_id = input_reply_to.message_id;
+    if reply_to_message_id == MessageId::default() {
+        return None;
+    }
+    if !reply_to_message_id.is_server() && !reply_to_message_id.is_valid_scheduled() {
+        // the C++ rewrites non-server ids through the sent-message
+        // correspondence; the yet-unsent reply rides that plane
+        tdutils::log_debug!("Reply to a non-server message id stays the sent-correspondence seam");
+        return None;
+    }
+    Some((Some(reply_to_message_id.get() as i32), 0))
+}
+
+/// `MessagesManager::on_text_message_ready_to_send` (MessagesManager.cpp:22787-22841)
+/// — the text wire send: the secret arm keeps its SecretChats seam, the
+/// plain arm registers the random id and hands the query payload to the
+/// [`SendMessageContext::send_text_message_query`] net leg.
+#[allow(clippy::type_complexity)] // one field-read tuple, mirroring do_send_message
+pub fn on_text_message_ready_to_send(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn SendMessageContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) {
+    // the C++ `G()->close_flag()` guard is the actor-close race window;
+    // the collapsed send runs inside the request turn that just passed the
+    // dispatcher's own close checks.
+    tracing::info!("Ready to send {:?} to {:?}", message_id, dialog_id);
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        assert!(!message_id.is_scheduled());
+        // `send_secret_message` — the SecretChats seam ([blocked: M.9/M.50])
+        tdutils::log_debug!("Secret-chat send arm stays the SecretChats seam");
+        return;
+    }
+
+    // the field-read dance (the `Message` is the C++ pointer view): the
+    // content and the query inputs come out, the manager borrow drops
+    // before `begin_send_message` mutates the registry.
+    let Some((
+        content,
+        stored_random_id,
+        input_reply_to,
+        reply_markup,
+        is_topic_message,
+        top_thread_message_id,
+        suggested_post,
+        schedule_repeat_period,
+        disable_web_page_preview,
+        disable_notification,
+        from_background,
+        clear_draft,
+        noforwards,
+        update_stickersets_order,
+        invert_media,
+        allow_paid,
+        effect_id,
+        paid_message_star_count,
+    )) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+        .map(|m| {
+            assert!(message_id.is_yet_unsent());
+            (
+                m.content.clone(),
+                m.random_id,
+                m.input_reply_to.clone(),
+                m.reply_markup.clone(),
+                m.is_topic_message,
+                m.top_thread_message_id,
+                m.suggested_post.clone(),
+                m.schedule_repeat_period,
+                m.disable_web_page_preview,
+                m.disable_notification,
+                m.from_background,
+                m.clear_draft,
+                m.noforwards,
+                m.update_stickersets_order,
+                m.invert_media,
+                m.allow_paid,
+                m.effect_id,
+                m.paid_message_star_count,
+            )
+        })
+    else {
+        return;
+    };
+
+    let Some(message_text) = crate::message_content::get_message_content_text(
+        content.as_ref().expect("a text send carries content"),
+    )
+    .cloned() else {
+        panic!("on_text_message_ready_to_send without a text content");
+    };
+
+    let probe = Message {
+        message_id,
+        random_id: stored_random_id,
+        ..Message::default()
+    };
+    let random_id = begin_send_message(manager, dialog_id, &probe);
+
+    // `get_message_flags` + the input-reply/topic tails; the send-as arm
+    // (`get_send_message_as_input_peer`) keeps the explicit-sender seam.
+    let mut flags = {
+        let m = Message {
+            message_id,
+            reply_markup: reply_markup.clone(),
+            schedule_repeat_period,
+            disable_web_page_preview,
+            disable_notification,
+            from_background,
+            clear_draft,
+            noforwards,
+            update_stickersets_order,
+            invert_media,
+            allow_paid,
+            effect_id,
+            paid_message_star_count,
+            ..Message::default()
+        };
+        get_message_flags(&m)
+    };
+    let reply_to = get_input_reply_to_for_send(&input_reply_to);
+    let reply_to_message_id = reply_to.as_ref().and_then(|(id, _)| *id);
+    if reply_to_message_id.is_some() {
+        flags |= SEND_MESSAGE_FLAG_REPLY_TO_MASK;
+    }
+    // the None-backed pass is the () resolver — no user-manager reads
+    // (the custom-emoji entity band rides the UserManager split)
+    let entities = crate::message_entity::get_input_message_entities::<()>(
+        None,
+        &message_text.entities,
+        "SendMessageQuery",
+    );
+    if !entities.is_empty() {
+        flags |= SEND_MESSAGE_FLAG_HAS_ENTITIES;
+    }
+    if reply_markup.is_some() {
+        flags |= SEND_MESSAGE_FLAG_HAS_REPLY_MARKUP;
+    }
+    let top_msg_id = if is_topic_message {
+        top_thread_message_id.get() as i32
+    } else {
+        0
+    };
+    let params = TextMessageQueryParams {
+        flags,
+        no_webpage: disable_web_page_preview,
+        silent: disable_notification,
+        background: from_background,
+        clear_draft,
+        noforwards,
+        update_stickersets_order,
+        invert_media,
+        allow_paid_floodskip: allow_paid,
+        dialog_id,
+        reply_to_message_id,
+        top_msg_id,
+        message: message_text.text.clone(),
+        random_id,
+        reply_markup: reply_markup
+            .as_deref()
+            .and_then(crate::reply_markup::get_input_reply_markup),
+        entities,
+        schedule_date: if message_id.is_scheduled() {
+            probe_date(manager, dialog_id, message_id)
+        } else {
+            0
+        },
+        schedule_repeat_period,
+        effect: effect_id.get(),
+        allow_paid_stars: paid_message_star_count,
+        suggested_post,
+    };
+    ctx.send_text_message_query(params);
+}
+
+/// `get_message_schedule_date` (MessagesManager.cpp:23415-23424) — the
+/// edited date else the message date.
+fn probe_date(manager: &MessagesManager, dialog_id: DialogId, message_id: MessageId) -> i32 {
+    manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+        .map(|m| {
+            if m.edited_schedule_date != 0 {
+                m.edited_schedule_date
+            } else {
+                m.date
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// `SendMessageQuery` flag constants (MessagesManager.h:136-150) — the
+/// `flags` word rides the generated bool fields for the masked bases, so
+/// only the pointer-bearing bits are set here.
+const SEND_MESSAGE_FLAG_REPLY_TO_MASK: i32 = 1;
+const SEND_MESSAGE_FLAG_HAS_REPLY_MARKUP: i32 = 1 << 2;
+const SEND_MESSAGE_FLAG_HAS_ENTITIES: i32 = 1 << 3;
+
+/// `MessagesManager::on_update_sent_text_message` (MessagesManager.cpp:12643-12707)
+/// — the `updateShortSentMessage` content swap: the being-sent message
+/// gets the server-built text (entities + the web-page media), and the
+/// changed-content machinery runs its emissions.
+pub fn on_update_sent_text_message(
+    _global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    _ctx: &dyn SendMessageContext,
+    _state: &mut dyn ReadStateContext,
+    random_id: i64,
+    message_media: Option<tdmtproto::telegram_api::MessageMedia>,
+    entities: Vec<tdmtproto::telegram_api::MessageEntity>,
+) {
+    let Some(message_full_id) = manager.being_sent_messages.get(&random_id).copied() else {
+        // the result has already arrived through getDifference
+        return;
+    };
+    let dialog_id = message_full_id.get_dialog_id();
+    let old_message_id = message_full_id.get_message_id();
+    let Some(m) = manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.get_mut(&old_message_id))
+    else {
+        // the message has already been deleted
+        return;
+    };
+    assert!(m.message_id.is_yet_unsent());
+    if !matches!(
+        m.content.as_ref().map(|content| content.get_type()),
+        Some(crate::message_content::MessageContentType::Text)
+    ) {
+        log_error!("Text message content has been already changed");
+        return;
+    }
+    let old_message_text = crate::message_content::get_message_content_text(
+        m.content.as_ref().expect("checked above"),
+    )
+    .expect("a text content carries its text");
+    // the C++ rebuilds the FormattedText through get_message_text +
+    // get_message_content (the merge/reregister/emit tail rides the
+    // M.9 content plane); the plain-text S76 shape carries no user
+    // entities, so the None user-manager pass is the documented stand-in.
+    let new_message_text = crate::message_entity::get_message_text::<()>(
+        None,
+        old_message_text.text.clone(),
+        entities,
+        true,
+        false,
+        m.date,
+        m.media_album_id != 0,
+        "on_update_sent_text_message",
+    );
+    let _ = message_media;
+    let mut new_content = m.content.clone().expect("checked above");
+    if let crate::message_content::MessageContent::Text(ref mut message_text) = new_content {
+        message_text.text = new_message_text;
+    }
+    m.content = Some(new_content);
+    m.is_content_secret = m
+        .ttl
+        .is_secret_message_content(crate::message_content::MessageContentType::Text);
+}
+
 /// `MessagesManager::on_send_message_success` (MessagesManager.cpp:
 /// 27848-27960) — the send-completion core (the `updateShortSentMessage`
 /// / Updates-container ack path).
@@ -25160,6 +25559,7 @@ pub fn fail_send_message(
     // in M.10.6)
     let need_update_dialog_pos = false;
     manager.being_readded_message_full_id = message_full_id;
+    let bot_mode = manager.bot_mode;
     let message = {
         let d = manager.get_dialog_mut(dialog_id).unwrap();
         let removed = if old_message_id.is_scheduled() {
@@ -25172,8 +25572,13 @@ pub fn fail_send_message(
         if removed.is_some() {
             if !old_message_id.is_scheduled() {
                 d.message_lru_list.remove(old_message_id);
-                d.ordered_messages
-                    .erase(old_message_id, false, "fail send message");
+                // bots never maintain the ordered tree
+                // (MessagesManager.cpp:13661, via the fail-path
+                // delete_message → erase_message route)
+                if !bot_mode {
+                    d.ordered_messages
+                        .erase(old_message_id, false, "fail send message");
+                }
             }
             d.being_deleted_message_id = MessageId::default();
         }
@@ -25346,6 +25751,7 @@ fn add_message_to_dialog_memory_only(
     source: &'static str,
 ) -> Result<MessageFullId, String> {
     let message_id = message.message_id;
+    let bot_mode = manager.bot_mode;
     let d = manager.get_dialog_mut(dialog_id).ok_or("no dialog")?;
     if d.messages.contains_key(&message_id) {
         return Err("adding already existing message".to_string());
@@ -25353,8 +25759,12 @@ fn add_message_to_dialog_memory_only(
     if message_id > d.max_added_message_id {
         d.max_added_message_id = message_id;
     }
-    d.ordered_messages
-        .insert(message_id, false, MessageId::default(), source);
+    // the ordered insert rides the same `!is_bot` gate as the full add
+    // (MessagesManager.cpp:31458 → 31088)
+    if !bot_mode {
+        d.ordered_messages
+            .insert(message_id, false, MessageId::default(), source);
+    }
     message.debug_source = source;
     d.messages.insert(message_id, message);
     d.message_lru_list.put_back(message_id);

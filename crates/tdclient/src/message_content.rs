@@ -12953,7 +12953,13 @@ pub fn get_input_message_content(
     {
         return Err(Status::error(400, "Message caption is too long"));
     }
-    let thumbnail = td.get_input_thumbnail_photo_size(input_thumbnail, dialog_id, is_secret)?;
+    // the C++ reads the input thumbnail only inside the media arms; the
+    // text/contact/location kinds never touch the file plane
+    let thumbnail = if file_type != crate::files::FileType::None {
+        td.get_input_thumbnail_photo_size(input_thumbnail, dialog_id, is_secret)?
+    } else {
+        crate::photo::PhotoSize::default()
+    };
     create_input_message_content(
         td,
         dialog_id,
