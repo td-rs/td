@@ -16990,6 +16990,220 @@ fn run_country_requests(td: &mut Td, id: u64, function: Function) {
             manager.get_phone_number_info(&mut env, request.phone_number_prefix, promise);
             td.country_info_manager = manager;
         }
+        _ => run_files_glue_requests(td, id, function),
+    }
+}
+
+/// The M.glue files arm group of the request dispatcher — see the frame
+/// note at the forward site in [`run_sticker_residue_requests`]. The
+/// FileManager arms run the C++ ladders over the collapsed files.rs
+/// manager (the validation bands real, the read/unlink tails
+/// synchronous); `addFileToDownloads` rides the MessagesManager
+/// file-source plane into `DownloadManager::add_file`; `addOffer` runs
+/// the suggested-post/access/offer bands and parks the
+/// `forward_message` tail (the monoforum stub-inventory keeps the C++
+/// offer band false, the send machinery is the M.10 send plane). The
+/// three pure-server arms (`getApplicationDownloadLink`,
+/// `saveApplicationLogEvent`, `setApplicationVerificationToken`) park at
+/// the `[blocked: net]` seams, the M.31 convention.
+#[inline(never)]
+fn run_files_glue_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::addOffer(request) => {
+            // Requests.cpp:6383-6389 → MessagesManager.cpp:24497-24520 —
+            // CHECK_IS_USER; the suggested-post-options band, the
+            // `check_dialog_access` Write gate and the
+            // `can_add_message_offer` band; the `forward_message(...,
+            // true)` tail parks at the send plane.
+            if !check_is_user(td, id) {
+                return;
+            }
+            if let Some(options) = request.options.as_ref() {
+                if options.suggested_post_info.is_none() {
+                    return td.send_error_impl(id, 400, "Suggested post info must be non-empty");
+                }
+            } else {
+                return td.send_error_impl(id, 400, "Suggested post info must be non-empty");
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let access = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                false,
+                crate::user_manager::AccessRights::Write,
+                "add_offer",
+            );
+            if access.is_error() {
+                let status = access.error();
+                return td.send_error_impl(id, status.code(), status.message());
+            }
+            let message_id = MessageId::new(request.message_id);
+            let manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            // SAFETY: as approveSuggestedPost — the manager is out of the
+            // struct while the context alias reaches the rest of td
+            let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+            let result = match crate::messages_manager::get_message_for_request(
+                &manager, dialog_id, message_id,
+            ) {
+                None => Err(Status::error(400, "Wrong message identifier specified")),
+                Some(m) => {
+                    if !crate::messages_manager::can_add_message_offer(ctx, dialog_id, Some(m)) {
+                        Err(Status::error(400, "Wrong message identifier specified"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            td.messages_manager = manager;
+            match result {
+                // the forward_message tail — [blocked: send plane]
+                Ok(()) => {}
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getSuggestedFileName(request) => {
+            // Requests.cpp:6474-6480 — the synchronous
+            // `FileManager::get_suggested_file_name` rewrapped into `text`.
+            let outcome = td.file_manager.lock().get_suggested_file_name(
+                crate::files::FileId::new(request.file_id, 0),
+                &request.directory,
+            );
+            match outcome {
+                Ok(file_name) => td.send_result(id, Object::text(td_api::Text { text: file_name })),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::deleteFile(request) => {
+            // Requests.cpp:6503-6507 — the ok promise rides into
+            // `FileManager::delete_file` with the "td_api::deleteFile"
+            // source tag; the pmc/notify halves are the manager seams.
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut file_manager = td.file_manager.lock();
+            let mut file_load_manager = td.file_load_manager.lock();
+            file_manager.delete_file(
+                crate::files::FileId::new(request.file_id, 0),
+                promise,
+                "td_api::deleteFile",
+                &mut file_load_manager,
+            );
+        }
+        Function::readFilePart(request) => {
+            // Requests.cpp:6518-6522 — CREATE_DATA_REQUEST_PROMISE rewraps
+            // the read bytes into `data`; left_tries is the C++ literal 2.
+            let promise = td.deferred_promise::<Vec<u8>, _>(id, |bytes| {
+                Object::data(td_api::Data { data: bytes })
+            });
+            let mut file_manager = td.file_manager.lock();
+            let mut file_load_manager = td.file_load_manager.lock();
+            file_manager.read_file_part(
+                crate::files::FileId::new(request.file_id, 0),
+                request.offset,
+                request.count,
+                2,
+                promise,
+                &mut file_load_manager,
+            );
+        }
+        Function::addFileToDownloads(request) => {
+            // Requests.cpp:6530-6535 → MessagesManager.cpp:36874-36906 —
+            // the priority band, the message/file walks and the
+            // `DownloadManager::add_file` registration; the file object
+            // answers the promise.
+            let promise = td.deferred_promise(id, Object::file);
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_full_id = MessageFullId::new(dialog_id, MessageId::new(request.message_id));
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            // SAFETY: as approveSuggestedPost — the manager is out of the
+            // struct while the context alias reaches the rest of td
+            let ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let mut file_manager = td.file_manager.lock();
+            let mut download_manager = td.download_manager.lock();
+            crate::messages_manager::add_message_file_to_downloads(
+                ctx,
+                &mut manager,
+                &mut file_manager,
+                &mut download_manager,
+                message_full_id,
+                crate::files::FileId::new(request.file_id, 0),
+                request.priority,
+                promise,
+            );
+            td.messages_manager = manager;
+        }
+        Function::setApplicationVerificationToken(request) => {
+            // Requests.cpp:6569-6574 — CHECK_IS_USER, the token intake,
+            // then `NetQueryDispatcher::set_verification_token` — the
+            // age-verification upload is the `[blocked: net]` seam and the
+            // ok promise parks like the C++ dispatcher without a network.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(token) = clean_or_utf8_error(td, id, &request.token) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let _ = (request.verification_id, token, promise);
+        }
+        Function::getMapThumbnailFile(request) => {
+            // Requests.cpp:7989-8003 — the not-force-loaded dialog id
+            // degrades to the empty dialog, then the
+            // `get_map_thumbnail_file_id` ladder; the answer is the
+            // registered file object.
+            let mut dialog_id = MmDialogId::new(request.chat_id);
+            if !crate::dialog_manager::have_dialog_force(td, dialog_id, "getMapThumbnailFile") {
+                dialog_id = MmDialogId::default();
+            }
+            let default_location = td_api::Location::default();
+            let location = crate::chat_manager::Location::from_td_api_location(
+                request.location.as_ref().unwrap_or(&default_location),
+            );
+            let outcome = td.file_manager.lock().get_map_thumbnail_file_id(
+                &location,
+                request.zoom,
+                request.width,
+                request.height,
+                request.scale,
+                dialog_id,
+            );
+            match outcome {
+                Ok(file_id) => {
+                    let file = td.file_manager.lock().get_file_object(file_id);
+                    td.send_result(id, Object::file(file));
+                }
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::getApplicationDownloadLink(_) => {
+            // Requests.cpp:9252-9255 — CHECK_IS_USER, then
+            // `get_invite_text` (Application.cpp:81-83): the
+            // account.getInviteText query is the `[blocked: net]` seam and
+            // the httpUrl promise parks like the C++ actor without a
+            // network.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<String, _>(id, |url| Object::httpUrl(td_api::HttpUrl { url }));
+            let _ = promise;
+        }
+        Function::saveApplicationLogEvent(request) => {
+            // Requests.cpp:9270-9275 — CHECK_IS_USER, the type intake and
+            // the `convert_json_value` data wire form; the `save_app_log`
+            // inputAppEvent build (Application.cpp:120-127) and the
+            // help.saveAppLog query are the `[blocked: net]` seam — the ok
+            // promise parks like the C++ actor without a network.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(event_type) = clean_or_utf8_error(td, id, &request.r#type) else {
+                return;
+            };
+            let data = crate::synchronous_requests::convert_json_value(request.data.as_deref());
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let _ = (request.chat_id, event_type, data, promise);
+        }
 
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -17913,12 +18127,21 @@ mod request_census_tests {
         // getPhoneNumberInfoSync moving to the synchronous set (970 + 4 =
         // 974 dispatched / 29 - 4 - 2 = 23 interim, 23 + 2 = 25 sync — the
         // merged pin).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 25, "sync count");
+        // The files glue slice flipped 10 arms: the 9 file/message arms
+        // (addFileToDownloads, addOffer, deleteFile,
+        // getApplicationDownloadLink, getMapThumbnailFile,
+        // getSuggestedFileName, readFilePart, saveApplicationLogEvent,
+        // setApplicationVerificationToken) over the collapsed files.rs
+        // FileManager/DownloadManager plane plus the MessagesManager
+        // add-message-file ladder, and cleanFileName moving to the
+        // synchronous set (974 + 9 = 983 dispatched / 23 - 10 = 13
+        // interim, 25 + 1 = 26 sync — the merged pin).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            974,
+            983,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 23, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 13, "interim count");
     }
 }
