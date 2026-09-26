@@ -4119,7 +4119,6 @@ impl Td {
 
     /// `Td::close` / `Td::destroy` / `Td::close_impl` (Td.cpp:768-807).
     pub(crate) fn close_impl(&mut self, destroy_flag: bool) {
-        eprintln!("closelog: close_impl begin destroy={}", destroy_flag);
         self.destroy_flag |= destroy_flag;
         if self.close_flag != 0 {
             return;
@@ -9534,9 +9533,7 @@ impl Actor for Td {
     /// `Td::hangup` (Td.cpp:481-485): the ClientManager's ActorOwn erase
     /// lands here and starts the close machine.
     fn hangup(&mut self) {
-        eprintln!("closelog: td hangup begin");
         self.close_impl(false);
-        eprintln!("closelog: td close_impl done");
         self.dec_stop_cnt();
     }
 
