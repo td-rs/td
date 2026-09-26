@@ -5865,24 +5865,27 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         Function::sendMessage(request) => {
             // Requests.cpp:4231-4241 — the M.10.8/M.10.19 send machinery:
             // the yet-unsent message (the durable send log event already
-            // written) answers synchronously; the wire query rides the net
-            // seam (`do_send_message`'s TextReady action, [blocked: net]).
+            // written) answers synchronously; the wire query rides the
+            // pools (do_send_message's TextReady action → the
+            // SendMessageQuery send).
             let dialog_id = MmDialogId::new(request.chat_id);
-            let mut manager = std::mem::take(&mut td.messages_manager);
-            let mut global = std::mem::take(&mut td.global);
-            // SAFETY: the ctx/state/reactions views alias one Td and are
-            // used strictly sequentially inside the callee (the
-            // split_context_alias contract); the manager and the global
-            // are taken out for the call and restored after.
+            // SAFETY: the manager/global/ctx/state/reactions views alias
+            // one Td and are used strictly sequentially inside the callee
+            // (the split_context_alias contract, the apply_new_message
+            // shape) — the manager must stay in place because the ctx
+            // reads (have_input_peer_read in get_message_to_send) see it.
             let td_ptr = std::ptr::from_mut(td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
             let state: &mut dyn crate::messages_manager::ReadStateContext =
                 unsafe { crate::td::split_context_alias(td_ptr) };
             let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
             let reactions_ctx =
                 crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
             let result = crate::messages_manager::send_message(
-                &mut global,
-                &mut manager,
+                global,
+                manager,
                 &reactions_ctx,
                 ctx,
                 state,
@@ -5893,8 +5896,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.reply_markup,
                 request.input_message_content.map(|content| *content),
             );
-            td.global = global;
-            td.messages_manager = manager;
             match result {
                 Ok(message) => td.send_result(id, Object::message(message)),
                 Err((code, message)) => td.send_error_impl(id, code, &message),
@@ -5902,20 +5903,21 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::sendMessageAlbum(request) => {
             // Requests.cpp:4242-4251 — the album path over the M.9.5 splat
-            // gate + the upload fan-in; the wire leg is the same net seam.
+            // gate + the upload fan-in; the wire leg rides the same pools.
             let dialog_id = MmDialogId::new(request.chat_id);
-            let mut manager = std::mem::take(&mut td.messages_manager);
-            let mut global = std::mem::take(&mut td.global);
-            // SAFETY: as sendMessage above.
+            // SAFETY: as sendMessage above (raw aliases, no take/put).
             let td_ptr = std::ptr::from_mut(td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
             let state: &mut dyn crate::messages_manager::ReadStateContext =
                 unsafe { crate::td::split_context_alias(td_ptr) };
             let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
             let reactions_ctx =
                 crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
             let result = crate::messages_manager::send_message_group(
-                &mut global,
-                &mut manager,
+                global,
+                manager,
                 &reactions_ctx,
                 ctx,
                 state,
@@ -5929,8 +5931,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                     .map(|content| Some(*content))
                     .collect(),
             );
-            td.global = global;
-            td.messages_manager = manager;
             match result {
                 Ok(messages) => td.send_result(id, Object::messages(messages)),
                 Err((code, message)) => td.send_error_impl(id, code, &message),
