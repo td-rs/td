@@ -21101,4 +21101,358 @@ mod tests {
         let err405 = error_of(&callback, 405);
         assert_eq!(err405.code, 400);
     }
+    // ---- the net-send slice: the GetDifference family + the sendMessage
+    // wire leg ride the pools (the netfix reconcile tests). The dispatcher
+    // is swapped for a recording one; answers are injected through the
+    // real callbacks and drained through the real Td machinery. ----
+
+    use crate::messages_manager::SendMessageContext as _;
+
+    struct RecNetSession {
+        sent: parking_lot::Mutex<Vec<NetQuery>>,
+    }
+
+    struct RecNetSessionHandle(Arc<RecNetSession>);
+
+    impl tdnet::net_query::SessionSink for RecNetSessionHandle {
+        fn send(&mut self, _dc_id: DcId, _query_type: NetQueryType, query: NetQuery) {
+            self.0.sent.lock().push(query);
+        }
+    }
+
+    struct NullConfigSink;
+
+    impl tdnet::net_query::TdSink for NullConfigSink {
+        fn on_result(&mut self, _query: NetQuery) {}
+    }
+
+    struct AcceptingDcInitSink;
+
+    impl tdnet::net_query::DcInitSink for AcceptingDcInitSink {
+        fn init_dc(&mut self, _dc_id: DcId) -> bool {
+            true
+        }
+
+        fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+    }
+
+    /// A parameterized, force-authorized Td whose net query dispatcher is
+    /// a recording session sink. Returns the recorder too.
+    fn netted_td(name: &str) -> (Td, Arc<RecNetSession>) {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir(name);
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        td.auth_manager.force_authorized_for_test();
+        let rec = Arc::new(RecNetSession {
+            sent: parking_lot::Mutex::new(Vec::new()),
+        });
+        let dispatcher = NetQueryDispatcher::new(
+            Box::new(RecNetSessionHandle(rec.clone())),
+            Box::new(NullConfigSink),
+            Box::new(AcceptingDcInitSink),
+        );
+        dispatcher.mark_dc_inited(1);
+        td.net_query_dispatcher = Some(Arc::new(dispatcher));
+        (td, rec)
+    }
+
+    /// The env exactly as the production drains build it — expanded at the
+    /// call site so the field borrows stay disjoint.
+    macro_rules! mk_env {
+        ($td:ident) => {{
+            let net = $td.updates_net();
+            TdUpdatesEnv {
+                global: &mut $td.global,
+                options: $td.option_manager.as_mut().expect("option manager set"),
+                auth_is_authorized: $td.auth_manager.is_authorized(),
+                auth_is_bot: $td.auth_manager.is_bot(),
+                my_id: $td.user_manager.get_my_id().get(),
+                can_ignore_background_updates: $td.can_ignore_background_updates,
+                net,
+            }
+        }};
+    }
+
+    fn net_complete(query: NetQuery, answer: Vec<u8>) {
+        let mut query = query;
+        let Some(mut callback) = query.move_callback() else {
+            panic!("the dispatched query carries no callback");
+        };
+        query.set_ok(answer);
+        callback.on_result(query);
+    }
+
+    fn net_fail(query: NetQuery, code: i32, message: &str) {
+        let mut query = query;
+        let Some(mut callback) = query.move_callback() else {
+            panic!("the dispatched query carries no callback");
+        };
+        query.set_error(Status::error(code, message));
+        callback.on_result(query);
+    }
+
+    fn state_answer(pts: i32, date: i32, seq: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::updates_State {
+            pts,
+            qts: 1,
+            date,
+            seq,
+            unread_count: 0,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    #[test]
+    fn get_updates_state_then_get_difference_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_updates_state_then_get_difference_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_updates_state_then_get_difference_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-gus-gd");
+
+        // 1. The engine's pts starts at 0 after the parameters restore, so
+        //    the first get_difference dispatches the real query.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "one getDifference dispatch");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getDifference::ID
+        );
+        let mut empty_bytes = Vec::new();
+        telegram_api::updates_differenceEmpty { date: 100, seq: 7 }.store_boxed(&mut empty_bytes);
+        net_complete(sent.into_iter().next().unwrap(), empty_bytes);
+        td.dispatch_completed_updates_net();
+
+        // 2. The empty difference cleared the running flag and set the
+        //    date: the next query re-sends with the engine's real state.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "re-armed after the empty difference");
+        let function = match telegram_api::Function::parse(sent[0].query()) {
+            Ok(telegram_api::Function::updates_getDifference(d)) => d,
+            _ => panic!("a getDifference payload"),
+        };
+        assert_eq!(function.date, 100, "the empty difference set the date");
+        drop(sent);
+
+        // 3. The GetUpdatesState sender + drain: the state intake sticks
+        //    (the pts shows up in the next getDifference payload).
+        {
+            let mut env = mk_env!(td);
+            env.send_get_updates_state();
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "one getState dispatch");
+        assert_eq!(sent[0].tl_constructor(), telegram_api::updates_getState::ID);
+        net_complete(sent.into_iter().next().unwrap(), state_answer(5, 100, 0));
+        td.dispatch_completed_updates_net();
+
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the state-fed engine re-sends");
+        let function = match telegram_api::Function::parse(sent[0].query()) {
+            Ok(telegram_api::Function::updates_getDifference(d)) => d,
+            _ => panic!("a getDifference payload"),
+        };
+        assert_eq!(function.pts, 5, "the getState drain moved the pts");
+    }
+
+    #[test]
+    fn get_difference_failure_ladder_reroutes() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_difference_failure_ladder_reroutes_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_difference_failure_ladder_reroutes_impl() {
+        let (mut td, rec) = netted_td("netfix-gd-fail");
+
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 500, "boom");
+        // the error drains through on_failed_get_difference, which clears
+        // the running flag and re-arms the retry timer.
+        td.dispatch_completed_updates_net();
+
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "re-sent after the failure ladder");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getDifference::ID
+        );
+    }
+
+    #[test]
+    fn ping_and_confirm_pts_qts_route_through_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ping_and_confirm_pts_qts_route_through_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn ping_and_confirm_pts_qts_route_through_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-ping");
+
+        // The PingServerQuery collapse sends updates.getState and feeds
+        // on_server_pong (UpdatesManager.cpp:152-166).
+        {
+            let mut env = mk_env!(td);
+            env.send_ping_server();
+            env.send_confirm_pts_qts(5, 1);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 2, "both queries dispatched");
+        assert_eq!(sent[0].tl_constructor(), telegram_api::updates_getState::ID);
+        let mut queries = sent;
+        net_complete(queries.remove(0), state_answer(5, 100, 0));
+        net_fail(queries.remove(0), 404, "TIMEOUT");
+        td.dispatch_completed_updates_net();
+        assert!(td.updates_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn send_message_wire_leg_guards_and_drains() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(send_message_wire_leg_guards_and_drains_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn send_message_wire_leg_guards_and_drains_impl() {
+        let (mut td, rec) = netted_td("netfix-send");
+
+        // 1. The no-write-access band: an unknown dialog has no input
+        //    peer — the C++ 400 ladder runs inline and nothing dispatches
+        //    (MessagesManager.cpp:1209-1213).
+        td.send_text_message_query(crate::messages_manager::TextMessageQueryParams {
+            flags: 0,
+            no_webpage: false,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            dialog_id: crate::messages_manager::DialogId::new(-777),
+            reply_to_message_id: None,
+            top_msg_id: 0,
+            message: "hi".to_string(),
+            random_id: -12345,
+            reply_markup: None,
+            entities: Vec::new(),
+            schedule_date: 0,
+            schedule_repeat_period: 0,
+            effect: 0,
+            allow_paid_stars: 0,
+            suggested_post: None,
+        });
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the guard band dispatches nothing"
+        );
+
+        // 2. The error answer drains through the fail ladder (the unknown
+        //    random_id logs and drops — the C++ "no more than once" arm).
+        let mut query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            telegram_api::messages_sendMessage::ID,
+            Vec::new(),
+            u32::MAX,
+            60,
+        );
+        query.set_error(Status::error(420, "FLOOD_WAIT_7"));
+        td.send_message_net_completed.lock().push((
+            -12345,
+            crate::messages_manager::DialogId::new(-777),
+            query,
+        ));
+        td.dispatch_completed_send_message_net();
+        assert!(
+            td.send_message_net_completed.lock().is_empty(),
+            "the error answer drained"
+        );
+
+        // 3. The updateShortSentMessage arm parses and routes (the
+        //    unknown random_id has already arrived through getDifference —
+        //    the documented early return).
+        let mut sent_bytes = Vec::new();
+        telegram_api::updateShortSentMessage {
+            flags: 0,
+            out: true,
+            id: 11,
+            pts: 5,
+            pts_count: 1,
+            date: 100,
+            media: None,
+            entities: Vec::new(),
+            ttl_period: 0,
+        }
+        .store_boxed(&mut sent_bytes);
+        let mut query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            telegram_api::messages_sendMessage::ID,
+            Vec::new(),
+            u32::MAX,
+            60,
+        );
+        query.set_ok(sent_bytes);
+        td.send_message_net_completed.lock().push((
+            -12345,
+            crate::messages_manager::DialogId::new(-777),
+            query,
+        ));
+        td.dispatch_completed_send_message_net();
+        assert!(
+            td.send_message_net_completed.lock().is_empty(),
+            "the shortSentMessage answer drained"
+        );
+    }
 }
