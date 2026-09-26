@@ -5989,20 +5989,27 @@ impl UserManager {
         let emoji_status = u
             .last_sent_emoji_status
             .as_ref()
-            .map(make_emoji_status_object)
-            .unwrap_or_else(empty_emoji_status_object);
+            .map(make_emoji_status_object);
         let restricts_new_chats = u.contact_require_premium && !u.is_mutual_contact;
         let have_access = self.have_input_peer_user(env, user_id, AccessRights::Know);
         td_api::User {
             id: user_id.get(),
             first_name: u.first_name.clone(),
             last_name: u.last_name.clone(),
-            usernames: Some(u.usernames.get_usernames_object()),
+            // `u->usernames.get_usernames_object()` — null when empty
+            // (Usernames.cpp:69-72)
+            usernames: if u.usernames.is_empty() {
+                None
+            } else {
+                Some(u.usernames.get_usernames_object())
+            },
             phone_number: u.phone_number.clone(),
             status: Some(self.get_user_status_object(env, user_id)),
-            // profile_photo: null in the C++ until the Files step — the
-            // codegen forces an empty payload here (module docs)
-            profile_photo: Some(empty_profile_photo_object()),
+            // `get_profile_photo_object` is null while the stored
+            // small_file_id is invalid (DialogPhoto.cpp:68-73) — the file
+            // ids are placeholders until the Files step, so the field is
+            // always null on this tree
+            profile_photo: None,
             accent_color_id: {
                 // ThemeManager::get_accent_color_id_object(accent, default):
                 // invalid ids fall back to the id-derived default
@@ -6013,19 +6020,25 @@ impl UserManager {
                 }
             },
             background_custom_emoji_id: u.background_custom_emoji_id.get(),
-            upgraded_gift_colors: Some(
-                u.peer_color_collectible
-                    .as_ref()
-                    .map(|collectible| collectible.get_upgraded_gift_colors_object())
-                    .unwrap_or_default(),
-            ),
+            // `u->peer_color_collectible == nullptr ? nullptr : ...`
+            // (UserManager.cpp:10329)
+            upgraded_gift_colors: u
+                .peer_color_collectible
+                .as_ref()
+                .map(|collectible| collectible.get_upgraded_gift_colors_object()),
             profile_accent_color_id: u.profile_accent_color_id.get(),
             profile_background_custom_emoji_id: u.profile_background_custom_emoji_id.get(),
-            emoji_status: Some(emoji_status),
+            emoji_status,
             is_contact: self.is_user_contact_of(user_id, false),
             is_mutual_contact: self.is_user_contact_of(user_id, true),
             is_close_friend: u.is_close_friend,
-            verification_status: Some(td_api::VerificationStatus {
+            // `get_verification_status_object` — null when everything is
+            // unset (VerificationStatus.cpp:11-17)
+            verification_status: (u.is_verified
+                || u.is_scam
+                || u.is_fake
+                || u.bot_verification_icon.is_valid())
+            .then(|| td_api::VerificationStatus {
                 is_verified: u.is_verified,
                 is_scam: u.is_scam,
                 is_fake: u.is_fake,
@@ -6033,28 +6046,34 @@ impl UserManager {
             }),
             is_premium: u.is_premium,
             is_support: u.is_support,
-            restriction_info: Some(
-                get_restriction_info_object(&u.restriction_reasons, &env.restriction_options())
-                    .unwrap_or(td_api::RestrictionInfo {
-                        restriction_reason: String::new(),
-                        has_sensitive_content: false,
-                    }),
+            // `get_restriction_info_object` — null when there is nothing
+            // to restrict (RestrictionReason.cpp:77-91)
+            restriction_info: get_restriction_info_object(
+                &u.restriction_reasons,
+                &env.restriction_options(),
             ),
-            active_story_state: Some({
+            active_story_state: {
+                // `get_active_story_state_object` — null without a server
+                // story id (ActiveStoryState.cpp:16-19)
                 let (max_active, max_read, has_live) = self.get_user_active_story_state(user_id);
                 if !max_active.is_server() {
-                    // the C++ emits null; the forced stand-in is the read state
-                    td_api::ActiveStoryState::activeStoryStateRead(td_api::activeStoryStateRead)
+                    None
                 } else if has_live {
-                    td_api::ActiveStoryState::activeStoryStateLive(td_api::activeStoryStateLive {
-                        story_id: max_active.get(),
-                    })
+                    Some(td_api::ActiveStoryState::activeStoryStateLive(
+                        td_api::activeStoryStateLive {
+                            story_id: max_active.get(),
+                        },
+                    ))
                 } else if max_active.get() > max_read.get() {
-                    td_api::ActiveStoryState::activeStoryStateUnread(td_api::activeStoryStateUnread)
+                    Some(td_api::ActiveStoryState::activeStoryStateUnread(
+                        td_api::activeStoryStateUnread,
+                    ))
                 } else {
-                    td_api::ActiveStoryState::activeStoryStateRead(td_api::activeStoryStateRead)
+                    Some(td_api::ActiveStoryState::activeStoryStateRead(
+                        td_api::activeStoryStateRead,
+                    ))
                 }
-            }),
+            },
             restricts_new_chats,
             paid_message_star_count: u.paid_message_star_count,
             have_access,
@@ -10857,17 +10876,6 @@ pub(crate) fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiSta
     }
 }
 
-/// The forced-empty `emojiStatus` payload (the codegen cannot express
-/// null; module docs).
-fn empty_emoji_status_object() -> td_api::EmojiStatus {
-    td_api::EmojiStatus {
-        r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
-            td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-        )),
-        expiration_date: 0,
-    }
-}
-
 /// `UserManager::get_update_unknown_secret_chat_object`
 /// (UserManager.cpp:10496-10500).
 fn make_unknown_secret_chat_object(secret_chat_id: SecretChatId) -> td_api::SecretChat {
@@ -10914,96 +10922,34 @@ fn get_secret_chat_state_object(state: SecretChatState) -> td_api::SecretChatSta
     }
 }
 
-/// The forced-empty `file` payload with the never-null `local`/`remote`
-/// object_ptrs materialized (td's generated `File` always emits them).
-fn empty_file_object() -> td_api::File {
-    td_api::File {
-        id: 0,
-        size: 0,
-        expected_size: 0,
-        local: Some(td_api::LocalFile {
-            path: String::new(),
-            can_be_downloaded: false,
-            can_be_deleted: false,
-            is_downloading_active: false,
-            is_downloading_completed: false,
-            download_offset: 0,
-            downloaded_prefix_size: 0,
-            downloaded_size: 0,
-        }),
-        remote: Some(td_api::RemoteFile {
-            id: String::new(),
-            unique_id: String::new(),
-            is_uploading_active: false,
-            is_uploading_completed: false,
-            uploaded_size: 0,
-        }),
-    }
-}
-
-/// The forced-empty `profilePhoto` payload (the codegen cannot express
-/// null; module docs).
-fn empty_profile_photo_object() -> td_api::ProfilePhoto {
-    td_api::ProfilePhoto {
-        id: 0,
-        small: Some(empty_file_object()),
-        big: Some(empty_file_object()),
-        minithumbnail: Some(td_api::Minithumbnail {
-            width: 0,
-            height: 0,
-            data: Vec::new(),
-        }),
-        has_animation: false,
-        is_personal: false,
-    }
-}
-
 /// `UserManager::get_update_unknown_user_object`'s payload
-/// (UserManager.cpp:10269-10276).
+/// (UserManager.cpp:10269-10276) — the C++ passes nullptr for the
+/// usernames/photo/collectible/emoji-status/verification/restriction/
+/// story-state object fields and the JSON plane omits them.
 fn make_unknown_user_object(user_id: UserId, my_id: UserId) -> td_api::User {
     let have_access = user_id == my_id;
     td_api::User {
         id: user_id.get(),
         first_name: String::new(),
         last_name: String::new(),
-        usernames: Some(td_api::Usernames {
-            active_usernames: Vec::new(),
-            disabled_usernames: Vec::new(),
-            editable_username: String::new(),
-            collectible_usernames: Vec::new(),
-        }),
+        usernames: None,
         phone_number: String::new(),
         status: Some(td_api::UserStatus::userStatusEmpty(td_api::userStatusEmpty)),
-        profile_photo: Some(empty_profile_photo_object()),
+        profile_photo: None,
         accent_color_id: AccentColorId::from_peer_id(user_id.get()).get(),
         background_custom_emoji_id: 0,
-        upgraded_gift_colors: Some(td_api::UpgradedGiftColors::default()),
+        upgraded_gift_colors: None,
         profile_accent_color_id: -1,
         profile_background_custom_emoji_id: 0,
-        emoji_status: Some(td_api::EmojiStatus {
-            r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
-                td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-            )),
-            expiration_date: 0,
-        }),
+        emoji_status: None,
         is_contact: false,
         is_mutual_contact: false,
         is_close_friend: false,
-        verification_status: Some(td_api::VerificationStatus {
-            is_verified: false,
-            is_scam: false,
-            is_fake: false,
-            bot_verification_icon_custom_emoji_id: 0,
-        }),
+        verification_status: None,
         is_premium: false,
         is_support: false,
-        restriction_info: Some(td_api::RestrictionInfo {
-            restriction_reason: String::new(),
-            has_sensitive_content: false,
-        }),
-        active_story_state: Some(td_api::ActiveStoryState::activeStoryStateRead(
-            td_api::activeStoryStateRead,
-        )),
+        restriction_info: None,
+        active_story_state: None,
         restricts_new_chats: false,
         paid_message_star_count: 0,
         have_access,
@@ -13929,13 +13875,65 @@ mod tests {
         // The S12 gate proved `to_json` byte-identical to td's converter;
         // the pinned string below pins the get_user_object field mapping
         // (UserManager.cpp:10301-10336) in the td_json order: int64 ids
-        // ride the td_json string form and the codegen-forced payloads
-        // (profile_photo, upgraded_gift_colors, emoji_status) stand in
-        // for the C++ nulls (module docs).
+        // ride the td_json string form and the nullable object fields
+        // the C++ leaves null (photo — the stored small_file_id is
+        // invalid, collectible colors, emoji status, verification,
+        // restriction info, story state) are omitted exactly like the
+        // C++ JSON plane.
         assert_eq!(
             json,
-            r#"{"@type":"user","id":5,"first_name":"Alice","last_name":"Liddell","usernames":{"@type":"usernames","active_usernames":["alice"],"disabled_usernames":[],"editable_username":"alice","collectible_usernames":[]},"phone_number":"42777","status":{"@type":"userStatusEmpty"},"profile_photo":{"@type":"profilePhoto","id":"0","small":{"@type":"file","id":0,"size":0,"expected_size":0,"local":{"@type":"localFile","path":"","can_be_downloaded":false,"can_be_deleted":false,"is_downloading_active":false,"is_downloading_completed":false,"download_offset":0,"downloaded_prefix_size":0,"downloaded_size":0},"remote":{"@type":"remoteFile","id":"","unique_id":"","is_uploading_active":false,"is_uploading_completed":false,"uploaded_size":0}},"big":{"@type":"file","id":0,"size":0,"expected_size":0,"local":{"@type":"localFile","path":"","can_be_downloaded":false,"can_be_deleted":false,"is_downloading_active":false,"is_downloading_completed":false,"download_offset":0,"downloaded_prefix_size":0,"downloaded_size":0},"remote":{"@type":"remoteFile","id":"","unique_id":"","is_uploading_active":false,"is_uploading_completed":false,"uploaded_size":0}},"minithumbnail":{"@type":"minithumbnail","width":0,"height":0,"data":""},"has_animation":false,"is_personal":false},"accent_color_id":5,"background_custom_emoji_id":"0","upgraded_gift_colors":{"@type":"upgradedGiftColors","id":"0","model_custom_emoji_id":"0","symbol_custom_emoji_id":"0","light_theme_accent_color":0,"light_theme_colors":[],"dark_theme_accent_color":0,"dark_theme_colors":[]},"profile_accent_color_id":-1,"profile_background_custom_emoji_id":"0","emoji_status":{"@type":"emojiStatus","type":{"@type":"emojiStatusTypeCustomEmoji","custom_emoji_id":"0"},"expiration_date":0},"is_contact":false,"is_mutual_contact":false,"is_close_friend":false,"verification_status":{"@type":"verificationStatus","is_verified":false,"is_scam":false,"is_fake":false,"bot_verification_icon_custom_emoji_id":"0"},"is_premium":false,"is_support":false,"restriction_info":{"@type":"restrictionInfo","restriction_reason":"","has_sensitive_content":false},"active_story_state":{"@type":"activeStoryStateRead"},"restricts_new_chats":false,"paid_message_star_count":0,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":"","added_to_attachment_menu":false}"#
+            r#"{"@type":"user","id":5,"first_name":"Alice","last_name":"Liddell","usernames":{"@type":"usernames","active_usernames":["alice"],"disabled_usernames":[],"editable_username":"alice","collectible_usernames":[]},"phone_number":"42777","status":{"@type":"userStatusEmpty"},"accent_color_id":5,"background_custom_emoji_id":"0","profile_accent_color_id":-1,"profile_background_custom_emoji_id":"0","is_contact":false,"is_mutual_contact":false,"is_close_friend":false,"is_premium":false,"is_support":false,"restricts_new_chats":false,"paid_message_star_count":0,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":"","added_to_attachment_menu":false}"#
         );
+    }
+
+    /// The live S76 residue regression: a min user applied through
+    /// `on_get_user` emits one `updateUser` whose object carries only the
+    /// fields the min application stored — byte-equal to the C++ record
+    /// (the echo intake of the S76 corpus, UserManager.cpp:3205/:3397
+    /// guards + the null-omitting object builder).
+    #[test]
+    fn min_user_emission_matches_the_cpp_record() {
+        let (mut temp, mut um) = test_env();
+
+        let mut user = received_user(2202815082);
+        user.min = true;
+        user.first_name = "..".to_owned();
+        user.lang_code = "en".to_owned();
+        let user_id = um.on_get_user(
+            &mut temp.env(true),
+            telegram_api::User::user(user),
+            "Updates",
+        );
+        assert_eq!(user_id.get(), 2202815082);
+
+        // exactly one updateUser, with the min-shaped object
+        let updates = um.take_updates();
+        assert_eq!(updates.len(), 1, "one emission for a new min user");
+        let json = match &updates[0] {
+            td_api::Update::updateUser(update) => update
+                .user
+                .as_ref()
+                .expect("updateUser carries the user object")
+                .to_json(),
+            other => panic!("unexpected update: {other:?}"),
+        };
+        assert_eq!(
+            json,
+            r#"{"@type":"user","id":2202815082,"first_name":"..","last_name":"","phone_number":"","status":{"@type":"userStatusEmpty"},"accent_color_id":6,"background_custom_emoji_id":"0","profile_accent_color_id":-1,"profile_background_custom_emoji_id":"0","is_contact":false,"is_mutual_contact":false,"is_close_friend":false,"is_premium":false,"is_support":false,"restricts_new_chats":false,"paid_message_star_count":0,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":"en","added_to_attachment_menu":false}"#
+        );
+
+        // the unchanged re-application is silent (no is_changed)
+        let mut again = received_user(2202815082);
+        again.min = true;
+        again.first_name = "..".to_owned();
+        again.flags |= 1;
+        again.lang_code = "en".to_owned();
+        um.on_get_user(
+            &mut temp.env(true),
+            telegram_api::User::user(again),
+            "Updates",
+        );
+        assert!(um.take_updates().is_empty(), "no emission without a change");
     }
 
     #[test]
