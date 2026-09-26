@@ -11503,6 +11503,77 @@ impl crate::auto_download_settings::AutoDownloadSettingsEnv for PrivacyEnv<'_> {
     }
 }
 
+/// The [`crate::support_manager::SupportEnv`] over the whole `Td` — the
+/// request arms hand the `Td` remainder to the env (the `PrivacyEnv`
+/// convention), so the query-send halves read the real user manager.
+pub(crate) struct SupportEnvTd<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::support_manager::SupportEnv for SupportEnvTd<'_> {
+    fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn get_my_user_id(&self) -> UserId {
+        self.td.user_manager.get_my_id()
+    }
+
+    fn get_always_parse_markdown(&self) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .expect("user requests run with the initialized option manager")
+            .get_option_boolean("always_parse_markdown", false)
+    }
+
+    fn get_session_count(&self) -> i32 {
+        self.td
+            .option_manager
+            .as_ref()
+            .expect("user requests run with the initialized option manager")
+            .get_option_integer("session_count", 1)
+            .try_into()
+            .unwrap()
+    }
+
+    fn get_user_info_via_net(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        promise: Promise<td_api::UserSupportInfo>,
+    ) {
+        // `GetUserInfoQuery::send` — `help.getUserInfo`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn edit_user_info_via_net(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        _message: telegram_api::TextWithEntities,
+        promise: Promise<td_api::UserSupportInfo>,
+    ) {
+        // `EditUserInfoQuery::send` — `help.editUserInfo`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn get_support_name_via_net(&mut self, promise: Promise<String>) {
+        // `GetSupportNameQuery::send` — `help.getSupportName`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+}
+
 /// The [`crate::background_manager::BackgroundManagerEnv`] over the whole
 /// `Td` — the request arms take the manager out of `Td` and hand the
 /// remainder to the env (the `BotEnv` convention), so every dialog/file/

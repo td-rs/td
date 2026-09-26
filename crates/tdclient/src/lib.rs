@@ -168,6 +168,7 @@ pub mod story_stealth_mode;
 pub mod story_viewer;
 pub mod suggested_action;
 pub mod suggested_action_manager;
+pub mod support_manager;
 pub mod synchronous_requests;
 pub mod target_dialog_types;
 pub mod td;
