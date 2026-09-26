@@ -1941,10 +1941,7 @@ impl crate::messages_manager::SendMessageContext for Td {
     /// the write peer resolves here (the dialog-manager read), the
     /// payload rides the params, and the answer drains through
     /// [`Td::on_send_message_answer`].
-    fn send_text_message_query(
-        &mut self,
-        params: crate::messages_manager::TextMessageQueryParams,
-    ) {
+    fn send_text_message_query(&mut self, params: crate::messages_manager::TextMessageQueryParams) {
         // `input_peer == nullptr → on_error(400 "Have no write access to
         // the chat")` (MessagesManager.cpp:1209-1213).
         let Some(peer) = crate::dialog_manager::get_input_peer(
@@ -1953,11 +1950,7 @@ impl crate::messages_manager::SendMessageContext for Td {
             crate::user_manager::AccessRights::Write,
         ) else {
             tdutils::log_info!("Have no write access to the chat");
-            self.run_send_message_fail(
-                params.random_id,
-                400,
-                "Have no write access to the chat",
-            );
+            self.run_send_message_fail(params.random_id, 400, "Have no write access to the chat");
             return;
         };
         let Some(dispatcher) = self.net_query_dispatcher.clone() else {
@@ -1968,7 +1961,11 @@ impl crate::messages_manager::SendMessageContext for Td {
             // inputReplyToMessage flags.0 — the top_msg_id gate.
             const TOP_MSG_ID_MASK: i32 = 1;
             telegram_api::InputReplyTo::inputReplyToMessage(telegram_api::inputReplyToMessage {
-                flags: if params.top_msg_id != 0 { TOP_MSG_ID_MASK } else { 0 },
+                flags: if params.top_msg_id != 0 {
+                    TOP_MSG_ID_MASK
+                } else {
+                    0
+                },
                 reply_to_msg_id,
                 top_msg_id: params.top_msg_id,
                 reply_to_peer_id: None,
@@ -1985,8 +1982,8 @@ impl crate::messages_manager::SendMessageContext for Td {
         if params.suggested_post.is_some() {
             tdutils::log_debug!("Suggested-post send arm stays its slice seam");
         }
-        let function = telegram_api::Function::messages_sendMessage(
-            telegram_api::messages_sendMessage {
+        let function =
+            telegram_api::Function::messages_sendMessage(telegram_api::messages_sendMessage {
                 flags: params.flags,
                 no_webpage: params.no_webpage,
                 silent: params.silent,
@@ -2010,8 +2007,7 @@ impl crate::messages_manager::SendMessageContext for Td {
                 allow_paid_stars: params.allow_paid_stars,
                 suggested_post: None,
                 rich_message: None,
-            },
-        );
+            });
         let mut bytes = Vec::new();
         function.store(&mut bytes);
         let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
@@ -2234,12 +2230,14 @@ impl UpdatesNetHandle {
             u32::MAX,
             60 * 60 * 24,
         );
-        self.dispatcher
-            .dispatch_with_callback(net_query, Box::new(UpdatesNetDispatchCallback {
+        self.dispatcher.dispatch_with_callback(
+            net_query,
+            Box::new(UpdatesNetDispatchCallback {
                 kind,
                 completed: Arc::clone(&self.completed),
                 shared: self.shared.clone(),
-            }));
+            }),
+        );
     }
 }
 
@@ -2725,8 +2723,7 @@ pub struct Td {
     updates_net_completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
-    send_message_net_completed:
-        Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
+    send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
     /// The net dispatch token allocator.
     net_dispatch_token: u64,
     /// The authorized self id (from `auth.authorization`).
@@ -2832,15 +2829,17 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
         match &self.net {
             Some(net) => net.dispatch(
                 UpdatesNetKind::GetDifference,
-                telegram_api::Function::updates_getDifference(telegram_api::updates_getDifference {
-                    flags: 0,
-                    pts,
-                    pts_limit: 0,
-                    pts_total_limit: 0,
-                    date,
-                    qts,
-                    qts_limit: 0,
-                }),
+                telegram_api::Function::updates_getDifference(
+                    telegram_api::updates_getDifference {
+                        flags: 0,
+                        pts,
+                        pts_limit: 0,
+                        pts_total_limit: 0,
+                        date,
+                        qts,
+                        qts_limit: 0,
+                    },
+                ),
             ),
             None => tdutils::log_debug!(
                 "Send GetDifference(pts = {pts}, date = {date}, qts = {qts}) — [net-inert]"
@@ -2872,19 +2871,21 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
         match &self.net {
             Some(net) => net.dispatch(
                 UpdatesNetKind::ConfirmPtsQts,
-                telegram_api::Function::updates_getDifference(telegram_api::updates_getDifference {
-                    flags,
-                    pts,
-                    pts_limit: 1,
-                    pts_total_limit: 0,
-                    date: i32::MAX,
-                    qts,
-                    qts_limit: 1,
-                }),
+                telegram_api::Function::updates_getDifference(
+                    telegram_api::updates_getDifference {
+                        flags,
+                        pts,
+                        pts_limit: 1,
+                        pts_total_limit: 0,
+                        date: i32::MAX,
+                        qts,
+                        qts_limit: 1,
+                    },
+                ),
             ),
-            None => tdutils::log_debug!(
-                "Send ConfirmPtsQts(pts = {pts}, qts = {qts}) — [net-inert]"
-            ),
+            None => {
+                tdutils::log_debug!("Send ConfirmPtsQts(pts = {pts}, qts = {qts}) — [net-inert]")
+            }
         }
     }
 
@@ -2898,15 +2899,17 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
         match &self.net {
             Some(net) => net.dispatch(
                 UpdatesNetKind::GetPtsUpdate,
-                telegram_api::Function::updates_getDifference(telegram_api::updates_getDifference {
-                    flags,
-                    pts,
-                    pts_limit: 1,
-                    pts_total_limit: 0,
-                    date: i32::MAX,
-                    qts: 0,
-                    qts_limit: 0,
-                }),
+                telegram_api::Function::updates_getDifference(
+                    telegram_api::updates_getDifference {
+                        flags,
+                        pts,
+                        pts_limit: 1,
+                        pts_total_limit: 0,
+                        date: i32::MAX,
+                        qts: 0,
+                        qts_limit: 0,
+                    },
+                ),
             ),
             None => tdutils::log_debug!("Send GetPtsUpdate(pts = {pts}) — [net-inert]"),
         }
@@ -3958,7 +3961,7 @@ impl Td {
                 auth_is_bot: self.auth_manager.is_bot(),
                 my_id: self.user_manager.get_my_id().get(),
                 can_ignore_background_updates: self.can_ignore_background_updates,
-            net,
+                net,
             };
             self.updates_manager.get_difference(&mut env, "init");
         }
@@ -4143,7 +4146,7 @@ impl Td {
                     auth_is_bot: self.auth_manager.is_bot(),
                     my_id: self.user_manager.get_my_id().get(),
                     can_ignore_background_updates: self.can_ignore_background_updates,
-                net,
+                    net,
                 };
                 self.updates_manager.timeout_expired(&mut env);
             }
@@ -5078,9 +5081,7 @@ impl Td {
                     let status = query.error().clone();
                     self.updates_manager
                         .on_failed_get_difference(&mut env, status);
-                } else if let Ok(difference) =
-                    telegram_api::updates_Difference::parse(query.ok())
-                {
+                } else if let Ok(difference) = telegram_api::updates_Difference::parse(query.ok()) {
                     self.updates_manager.on_get_difference(&mut env, difference);
                 } else {
                     tdutils::log_error!("Failed to parse the getDifference answer");
@@ -5092,8 +5093,11 @@ impl Td {
                     self.updates_manager
                         .on_failed_get_updates_state(&mut env, status);
                 } else if let Ok(state) = telegram_api::updates_State::parse(query.ok()) {
-                    self.updates_manager
-                        .on_get_updates_state(&mut env, state, "GetUpdatesStateQuery");
+                    self.updates_manager.on_get_updates_state(
+                        &mut env,
+                        state,
+                        "GetUpdatesStateQuery",
+                    );
                 } else {
                     tdutils::log_error!("Failed to parse the updates.getState answer");
                 }
@@ -5103,10 +5107,7 @@ impl Td {
                     // the C++ on_error logs unless the status is expected
                     // (the 404/TIMEOUT class); the collapsed expected-error
                     // table logs at debug.
-                    tdutils::log_debug!(
-                        "Failed to confirm PTS/QTS: {}",
-                        query.error().message()
-                    );
+                    tdutils::log_debug!("Failed to confirm PTS/QTS: {}", query.error().message());
                 }
             }
             UpdatesNetKind::Ping => {
@@ -5315,8 +5316,11 @@ impl Td {
             can_ignore_background_updates: self.can_ignore_background_updates,
             net,
         };
-        self.updates_manager
-            .on_get_updates(&mut env, updates, tdutils::promise::Promise::default());
+        self.updates_manager.on_get_updates(
+            &mut env,
+            updates,
+            tdutils::promise::Promise::default(),
+        );
         self.drain_sink();
     }
 
@@ -7075,7 +7079,7 @@ impl Td {
             auth_is_bot: self.auth_manager.is_bot(),
             my_id: self.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.can_ignore_background_updates,
-        net,
+            net,
         };
         self.updates_manager
             .on_get_updates(&mut env, umbrella, Promise::default());
@@ -14322,7 +14326,7 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
             auth_is_bot: self.td.auth_manager.is_bot(),
             my_id: self.td.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.td.can_ignore_background_updates,
-        net,
+            net,
         };
         self.td
             .updates_manager

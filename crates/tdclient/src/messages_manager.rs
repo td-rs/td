@@ -24948,11 +24948,11 @@ pub struct TextMessageQueryParams {
 /// ordinary/scheduled message reply. The story arm, the ephemeral arm, the
 /// quote plane and the monoforum/saved-input-peer arms keep their
 /// documented seams (the walking-skeleton send path is the plain reply).
-fn get_input_reply_to_for_send(
-    input_reply_to: &MessageInputReplyTo,
-) -> Option<(Option<i32>, i32)> {
+fn get_input_reply_to_for_send(input_reply_to: &MessageInputReplyTo) -> Option<(Option<i32>, i32)> {
     if input_reply_to.story_full_id.is_valid() || input_reply_to.ephemeral_message_id.is_valid() {
-        tdutils::log_debug!("Reply wire arm stays the story/ephemeral seam — dropped from the send query");
+        tdutils::log_debug!(
+            "Reply wire arm stays the story/ephemeral seam — dropped from the send query"
+        );
         return None;
     }
     let reply_to_message_id = input_reply_to.message_id;
@@ -25043,12 +25043,10 @@ pub fn on_text_message_ready_to_send(
         return;
     };
 
-    let Some(message_text) =
-        crate::message_content::get_message_content_text(
-            content.as_ref().expect("a text send carries content"),
-        )
-            .cloned()
-    else {
+    let Some(message_text) = crate::message_content::get_message_content_text(
+        content.as_ref().expect("a text send carries content"),
+    )
+    .cloned() else {
         panic!("on_text_message_ready_to_send without a text content");
     };
 
@@ -25087,12 +25085,11 @@ pub fn on_text_message_ready_to_send(
     }
     // the None-backed pass is the () resolver — no user-manager reads
     // (the custom-emoji entity band rides the UserManager split)
-    let entities =
-        crate::message_entity::get_input_message_entities::<()>(
-            None,
-            &message_text.entities,
-            "SendMessageQuery",
-        );
+    let entities = crate::message_entity::get_input_message_entities::<()>(
+        None,
+        &message_text.entities,
+        "SendMessageQuery",
+    );
     if !entities.is_empty() {
         flags |= SEND_MESSAGE_FLAG_HAS_ENTITIES;
     }
@@ -25193,15 +25190,15 @@ pub fn on_update_sent_text_message(
         log_error!("Text message content has been already changed");
         return;
     }
-    let old_message_text =
-        crate::message_content::get_message_content_text(m.content.as_ref().expect("checked above"))
-        .expect("a text content carries its text");
+    let old_message_text = crate::message_content::get_message_content_text(
+        m.content.as_ref().expect("checked above"),
+    )
+    .expect("a text content carries its text");
     // the C++ rebuilds the FormattedText through get_message_text +
     // get_message_content (the merge/reregister/emit tail rides the
     // M.9 content plane); the plain-text S76 shape carries no user
     // entities, so the None user-manager pass is the documented stand-in.
-    let new_message_text =
-        crate::message_entity::get_message_text::<()>(
+    let new_message_text = crate::message_entity::get_message_text::<()>(
         None,
         old_message_text.text.clone(),
         entities,
