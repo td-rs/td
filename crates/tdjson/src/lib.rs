@@ -232,6 +232,17 @@ unsafe fn cstr<'a>(request: *const c_char) -> &'a str {
 mod tests {
     use super::*;
 
+    /// Serializes the manager-API (`td_receive`) tests. The manager has one
+    /// receiver whose `TdReceiver::receive` carries the C++-parity
+    /// concurrent-receive guard (`Client.cpp`'s receive_lock — a second
+    /// concurrent receive is a LOG(FATAL) abort), so two tests looping
+    /// `td_receive` in parallel abort the process: the deterministic
+    /// SIGABRT the parallel gate hit. The C++ never receives concurrently
+    /// (the ABI contract); the tests honor it through this lock. The legacy
+    /// `td_json_client_*` tests stay outside — each ClientJson owns a
+    /// private receiver.
+    static MANAGER_RECEIVE_LOCK: Mutex<()> = Mutex::new(());
+
     /// The 14 symbols of `tdclientjson_export_list`, in the export order —
     /// the S67 verification list (also checked against the built cdylib by
     /// `verify_symbols.sh` in the conformance crate).
@@ -309,6 +320,7 @@ mod tests {
 
     #[test]
     fn create_client_id_send_receive() {
+        let _receive = MANAGER_RECEIVE_LOCK.lock().unwrap();
         unsafe {
             let client_id = td_create_client_id();
             let request = c"{\"@type\":\"getOption\",\"name\":\"version\"}";
@@ -335,6 +347,7 @@ mod tests {
 
     #[test]
     fn fresh_client_id_emits_the_startup_authorization_state() {
+        let _receive = MANAGER_RECEIVE_LOCK.lock().unwrap();
         unsafe {
             // The C++ creates the Td actor inside create_client_id, so a
             // bare td_receive with no td_send yields the startup
@@ -368,6 +381,7 @@ mod tests {
     /// the legacy trio still answers on the same process afterwards.
     #[test]
     fn python_example_flow_bare_receive_then_close_then_legacy() {
+        let _receive = MANAGER_RECEIVE_LOCK.lock().unwrap();
         unsafe {
             let client_id = td_create_client_id();
             let mut saw_wait_params = false;
