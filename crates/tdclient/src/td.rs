@@ -4069,14 +4069,10 @@ impl Td {
         // updateDefaultBackground updates for users (the pre-landing
         // hardcoded constants retired).
         self.init_background_manager();
-        // `DownloadManagerImpl::start_up`'s initial counters flush — the
-        // C++ record order (backgrounds, then updateFileDownloads) pins
-        // the position; later updates ride update_counters' change gate.
-        self.send_update(Object::updateFileDownloads(td_api::updateFileDownloads {
-            total_size: 0,
-            total_count: 0,
-            downloaded_size: 0,
-        }));
+        // The updateFileDownloads record after the backgrounds comes from
+        // the DownloadManager's own init counters flush through the
+        // update_counters callback (the C++ DownloadManagerImpl::start_up
+        // shape) — NOT from here; a second emission here duplicates it.
 
         // ConnectionStateManager::start_up: the initial real state.
         self.send_update(Object::updateConnectionState(
