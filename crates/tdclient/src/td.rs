@@ -4073,6 +4073,12 @@ impl Td {
         // the DownloadManager's own init counters flush through the
         // update_counters callback (the C++ DownloadManagerImpl::start_up
         // shape) — NOT from here; a second emission here duplicates it.
+        // That queued flush rides the outbox until the next drive, so
+        // drain it here to hold the C++ slot (backgrounds ->
+        // updateFileDownloads -> connecting) — otherwise the record lands
+        // after the connecting state, the ±1 startup race the live gate
+        // pinned.
+        self.drain_file_shared();
 
         // ConnectionStateManager::start_up: the initial real state.
         self.send_update(Object::updateConnectionState(
@@ -7011,6 +7017,47 @@ impl Td {
                 user: Some(object),
             }));
         }
+        // the C++ AuthManager applies the self user through the manager
+        // (the AuthManager.cpp:1517-1520 emission is the manager's own
+        // `update_user`); the store must be primed here too, or the first
+        // min-user echo re-applies the self user as new. The broadcast
+        // pair above is that one emission, so the manager's queued record
+        // (and the `my_id` option record `set_my_id` queues) are consumed
+        // by it — flushed instead when nothing was broadcast.
+        if self.option_manager.is_some() {
+            let mut manager = std::mem::take(&mut self.user_manager);
+            let options = self.option_manager.as_mut();
+            if let Some(options) = options {
+                let mut env = UserEnv {
+                    global: &mut self.global,
+                    options,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                };
+                manager.set_my_id(&mut env, UserId::new(user.id));
+                manager.on_get_user(
+                    &mut env,
+                    telegram_api::User::user(user.clone()),
+                    "AuthManager",
+                );
+            }
+            self.user_manager = manager;
+            let pending = self.user_manager.take_updates();
+            if !broadcast {
+                for update in pending {
+                    self.send_update(update.into());
+                }
+            }
+            if let Some(options) = self.option_manager.as_mut() {
+                for update in options.take_updates() {
+                    // the broadcast pair above already carried `my_id`
+                    let is_broadcast_my_id = broadcast
+                        && matches!(&update, Object::updateOption(o) if o.name == "my_id");
+                    if !is_broadcast_my_id {
+                        self.send_update(update);
+                    }
+                }
+            }
+        }
     }
 
     /// `getMe` (Requests.cpp): the cached self user, the UserManager store
@@ -7128,17 +7175,28 @@ impl Td {
                 }
             }
             self.user_manager = user_manager;
-        }
-        for user in &sink.users {
-            if let telegram_api::User::user(user) = user {
-                self.peer_access.insert(user.id, user.access_hash);
-                let object = convert::user_object(user, user.id == self.my_id);
-                let changed = self.users.get(&object.id) != Some(&object);
-                self.users.insert(object.id, object.clone());
-                if changed {
-                    self.send_update(Object::updateUser(td_api::updateUser {
-                        user: Some(object),
-                    }));
+            // the manager's own `updateUser` emissions — the C++ sends
+            // them synchronously from `UserManager::update_user`
+            // (UserManager.cpp:10040-10045), change-gated
+            for update in self.user_manager.take_updates() {
+                self.send_update(update.into());
+            }
+            // the Td-level cache mirrors the guarded store: a min user
+            // must not downgrade the cached access_hash/photo of a
+            // received user (UserManager.cpp:3205/:3397); the raw-wire
+            // updateUser emission from this cache is retired — the
+            // manager above is the emitter
+            for user in &sink.users {
+                if let telegram_api::User::user(user) = user {
+                    if user.min {
+                        self.peer_access.entry(user.id).or_insert(user.access_hash);
+                        let object = convert::user_object(user, user.id == self.my_id);
+                        self.users.entry(object.id).or_insert(object);
+                    } else {
+                        self.peer_access.insert(user.id, user.access_hash);
+                        let object = convert::user_object(user, user.id == self.my_id);
+                        self.users.insert(object.id, object);
+                    }
                 }
             }
         }
