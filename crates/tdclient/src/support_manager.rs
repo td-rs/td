@@ -184,6 +184,7 @@ mod tests {
 
     /// A `Promise<td_api::UserSupportInfo>` capturing its `Result` into
     /// a shared slot.
+    #[allow(clippy::type_complexity)] // the promise + its capture slot, test-local
     fn support_info_promise() -> (
         Promise<td_api::UserSupportInfo>,
         Arc<Mutex<Option<tdutils::status::Result<td_api::UserSupportInfo>>>>,
@@ -327,7 +328,16 @@ mod tests {
             &env.user_info_queries[0],
             tdmtproto::telegram_api::InputUser::inputUser(user) if user.user_id == 5
         ));
-        assert!((*result.lock().unwrap()).is_none());
+        // the seam drops the promise — the dropped LambdaPromise parks the
+        // captured slot with the "Lost promise" error (the recorded
+        // parked-arm convention until the net step answers)
+        assert!(
+            matches!(
+                *result.lock().unwrap(),
+                Some(tdutils::status::Result::Err(_))
+            ),
+            "expected the parked promise"
+        );
     }
 
     /// `set_user_info` runs the intake first, then the send-half
@@ -362,16 +372,26 @@ mod tests {
         ));
         assert_eq!(wire.text, "Fix it");
         assert!(wire.entities.is_empty());
-        assert!((*result.lock().unwrap()).is_none());
+        // the seam drops the promise — the dropped LambdaPromise parks the
+        // captured slot with the "Lost promise" error (the recorded
+        // parked-arm convention until the net step answers)
+        assert!(
+            matches!(
+                *result.lock().unwrap(),
+                Some(tdutils::status::Result::Err(_))
+            ),
+            "expected the parked promise"
+        );
     }
 
     /// The my-dialog context and the always_parse_markdown option ride
-    /// the intake: markdown parses into a bold entity and the entities
-    /// build into the wire message.
+    /// the intake: the markdown v3 doubled markers parse into a bold
+    /// entity and the entities build into the wire message (single
+    /// `*bold*` pairs stay literal in v3 — the v1-only shape).
     #[test]
     fn set_user_info_threads_the_intake_context() {
         let message = Some(td_api::FormattedText {
-            text: "*Fix it*".to_string(),
+            text: "**Fix it**".to_string(),
             entities: Vec::new(),
         });
 
@@ -379,13 +399,12 @@ mod tests {
             always_parse_markdown: true,
             ..TestEnv::default()
         };
-        let (promise, result) = support_info_promise();
+        let (promise, _result) = support_info_promise();
         set_user_info(&mut env, UserId::new(5), message, promise);
         assert_eq!(env.edit_user_info_queries.len(), 1);
         let wire = &env.edit_user_info_queries[0].1;
-        assert_eq!(wire.text, "*Fix it*");
+        assert_eq!(wire.text, "Fix it");
         assert!(!wire.entities.is_empty());
-        assert!((*result.lock().unwrap()).is_none());
     }
 
     /// `get_support_name` parks its query at the seam.
