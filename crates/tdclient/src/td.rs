@@ -11332,7 +11332,7 @@ pub(crate) fn country_env_split(
     let manager = std::mem::take(&mut td.country_info_manager);
     let env = CountryEnv { td };
     (env, manager)
-    }
+}
 
 /// The [`crate::privacy_manager::PrivacyManagerEnv`] +
 /// [`crate::auto_download_settings::AutoDownloadSettingsEnv`] over the

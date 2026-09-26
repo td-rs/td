@@ -104,6 +104,12 @@ pub trait NotificationManagerEnv: NotificationTypeEnv {
     /// td_->auth_manager_->is_bot()` (cpp:170-172).
     fn is_disabled(&self) -> bool;
 
+    /// `DeviceTokenManager::get_actor_unsafe()->get_encryption_keys()` +
+    /// the push decrypt/run plane (cpp:2146-2166) — `[blocked: net]`.
+    fn send_process_push_notification_query(&mut self, _receiver_id: i64) {
+        tdutils::log_info!("Process the push decrypt/run plane — [blocked: net]");
+    }
+
     /// `G()->close_flag()` — used separately from [`Self::is_disabled`].
     fn close_flag(&self) -> bool;
 
@@ -338,6 +344,10 @@ pub struct NotificationManager {
     pub temporary_notification_object_ids: HashMap<NotificationId, NotificationObjectFullId>,
     pub push_notification_promises: HashMap<NotificationId, Vec<Promise<()>>>,
 
+    /// The `()`-typed promises parked at the process-push decrypt/run
+    /// seam (the net_blocked_promises convention).
+    pub parked_process_push_promises: Vec<Promise<()>>,
+
     pub active_call_notifications: HashMap<DialogId, Vec<ActiveCallNotification>>,
 
     pub announcement_id_date: HashMap<i32, i32>,
@@ -378,6 +388,7 @@ impl Default for NotificationManager {
             temporary_notifications: HashMap::new(),
             temporary_notification_object_ids: HashMap::new(),
             push_notification_promises: HashMap::new(),
+            parked_process_push_promises: Vec::new(),
             active_call_notifications: HashMap::new(),
             announcement_id_date: HashMap::new(),
         }
@@ -388,6 +399,32 @@ impl NotificationManager {
     /// `NotificationManager::start_up` (cpp:201-203).
     pub fn start_up(&mut self, env: &mut impl NotificationManagerEnv) {
         self.init(env);
+    }
+
+    /// `NotificationManager::process_push_notification`
+    /// (NotificationManager.cpp:2124-2160) — the disabled/"{}" band and
+    /// the push-receiver-id parse are real; the encryption-key
+    /// decrypt/run plane is the `[blocked: net]` seam and the promise
+    /// parks (the wrapping lambda's error-200 mapping inlines to the OK
+    /// answer here).
+    pub fn process_push_notification(
+        &mut self,
+        env: &mut impl NotificationManagerEnv,
+        payload: String,
+        mut promise: Promise<()>,
+    ) {
+        if env.is_disabled() || payload == "{}" {
+            // the C++ `promise.set_error(200, "Immediate success")` maps
+            // to the user-promise OK over its wrapping lambda
+            promise.set_value(());
+            return;
+        }
+        let receiver_id = match get_push_receiver_id(&payload) {
+            Ok(receiver_id) => receiver_id,
+            Err((code, message)) => return promise.set_error(Status::error(code, &message)),
+        };
+        env.send_process_push_notification_query(receiver_id);
+        self.parked_process_push_promises.push(promise);
     }
 
     /// `NotificationManager::init` (cpp:205-315).
@@ -6519,5 +6556,45 @@ mod tests {
         let group_updates = sent_group_updates(&env.updates);
         assert_eq!(group_updates.len(), 1);
         assert_eq!(group_updates[0].removed_notification_ids, vec![2]);
+    }
+
+    #[test]
+    fn process_push_notification_runs_the_local_bands_and_parks() {
+        let mut env = TestEnv::new();
+        let mut manager = NotificationManager::default();
+
+        // the disabled/"{}" band answers ok inline (the C++ error-200
+        // mapping over the wrapping lambda)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = PromiseCreator::lambda_result(move |r| *capture.lock().unwrap() = Some(r));
+        manager.process_push_notification(&mut env, "{}".to_string(), promise);
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(manager.parked_process_push_promises.is_empty());
+
+        // an unparseable payload errors with the receiver-id band
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = PromiseCreator::lambda_result(move |r| *capture.lock().unwrap() = Some(r));
+        manager.process_push_notification(&mut env, "garbage".to_string(), promise);
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.code() == 400),
+            "expected the receiver-id error"
+        );
+
+        // a real payload parks at the decrypt/run seam
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = PromiseCreator::lambda_result(move |r| *capture.lock().unwrap() = Some(r));
+        manager.process_push_notification(
+            &mut env,
+            "{\"p\":\"abcdefghabcdefghabcdefghabcdefgh\"}".to_string(),
+            promise,
+        );
+        assert_eq!(manager.parked_process_push_promises.len(), 1);
+        assert!((*slot.lock().unwrap()).is_none());
     }
 }
