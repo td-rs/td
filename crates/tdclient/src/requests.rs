@@ -4215,6 +4215,53 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let env = user_env!(td);
             td.user_manager.get_support_user(&env, promise);
         }
+        Function::getUserSupportInfo(request) => {
+            // Requests.cpp:9328-9332 → Support.cpp:126-128: the
+            // GetUserInfoQuery send half (the get_input_user validation)
+            // answers here; the help.getUserInfo query is
+            // [blocked: net] and get_user_support_info_object is its
+            // result half.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::UserSupportInfo, _>(id, Object::userSupportInfo);
+            let mut env = crate::td::SupportEnvTd { td };
+            crate::support_manager::get_user_info(&mut env, UserId::new(request.user_id), promise);
+        }
+        Function::setUserSupportInfo(request) => {
+            // Requests.cpp:9334-9338 → Support.cpp:130-136: the
+            // get_formatted_text intake (the my-dialog context,
+            // allow_empty, skip media timestamps, no trim) runs before
+            // the EditUserInfoQuery send half; the help.editUserInfo
+            // query is [blocked: net].
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::UserSupportInfo, _>(id, Object::userSupportInfo);
+            let mut env = crate::td::SupportEnvTd { td };
+            crate::support_manager::set_user_info(
+                &mut env,
+                UserId::new(request.user_id),
+                request.message,
+                promise,
+            );
+        }
+        Function::getSupportName(_) => {
+            // Requests.cpp:9340-9343 → Support.cpp:138-140: the
+            // help.getSupportName query is [blocked: net]; the
+            // CREATE_TEXT_REQUEST_PROMISE wrapper (Requests.cpp:2022)
+            // rewraps the fetched name into the td_api text object.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<String, _>(id, |name| {
+                Object::text(td_api::Text { text: name })
+            });
+            let mut env = crate::td::SupportEnvTd { td };
+            crate::support_manager::get_support_name(&mut env, promise);
+        }
         Function::getDefaultEmojiStatuses(_) => {
             // Requests.cpp:6827-6831 → EmojiStatus.cpp:571-578: the
             // cached list answers here; the hash-revalidation query is
@@ -17407,12 +17454,18 @@ mod request_census_tests {
         // getAutoDownloadSettingsPresets, setAutoDownloadSettings
         // (936 + 8 = 944 dispatched / 63 - 8 = 55 interim, sync unmoved
         // 23 — the merged pin).
+        // The support glue slice flipped 3 arms: getUserSupportInfo,
+        // setUserSupportInfo and getSupportName (the Support.cpp
+        // send-half validation bands are real; the help.getUserInfo/
+        // editUserInfo/getSupportName queries ride the [blocked: net]
+        // seams) (944 + 3 = 947 dispatched / 55 - 3 = 52 interim, sync
+        // unmoved 23 — the merged pin).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 23, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            944,
+            947,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 55, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 52, "interim count");
     }
 }

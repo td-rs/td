@@ -543,7 +543,7 @@ getSuitablePersonalChats	dispatched
 getSupergroup	dispatched
 getSupergroupFullInfo	dispatched
 getSupergroupMembers	dispatched
-getSupportName	interim
+getSupportName	dispatched
 getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
@@ -568,7 +568,7 @@ getUserLink	dispatched
 getUserPrivacySettingRules	dispatched
 getUserProfileAudios	dispatched
 getUserProfilePhotos	dispatched
-getUserSupportInfo	interim
+getUserSupportInfo	dispatched
 getVideoChatAvailableParticipants	dispatched
 getVideoChatInviteLink	dispatched
 getVideoChatRtmpUrl	dispatched
@@ -922,7 +922,7 @@ setUserEmojiStatus	dispatched
 setUserNote	dispatched
 setUserPersonalProfilePhoto	dispatched
 setUserPrivacySettingRules	dispatched
-setUserSupportInfo	interim
+setUserSupportInfo	dispatched
 setUsername	dispatched
 setVideoChatDefaultParticipant	dispatched
 setVideoChatTitle	dispatched
