@@ -27749,6 +27749,107 @@ pub fn remove_message_file_sources(
     }
 }
 
+/// `MessagesManager::can_add_message_offer` (MessagesManager.cpp:8150-8162)
+/// in the `add_offer` call shape (`only_new = only_edit = false` — the
+/// suggested-post legs are statically dead and collapse away). The
+/// `DialogManager::is_monoforum_channel` half rides the context (the
+/// stub-inventory `false` until the monoforum plane lands).
+pub fn can_add_message_offer(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+) -> bool {
+    if ctx.is_bot() {
+        return false;
+    }
+    if !ctx.is_monoforum_channel_dialog(dialog_id) {
+        return false;
+    }
+    let Some(m) = m else {
+        return false;
+    };
+    if !m.message_id.is_server() || m.ephemeral_message.is_some() {
+        return false;
+    }
+    // `can_forward_message(dialog_id, m, m->forward_info == nullptr)` — the
+    // copy flag is the not-a-forward probe
+    can_forward_message(ctx, dialog_id, Some(m), m.forward_info.is_none())
+}
+
+/// `MessagesManager::add_message_file_to_downloads`
+/// (MessagesManager.cpp:36874-36906) — the `addFileToDownloads` ladder:
+/// the priority band, the message/file walks and the
+/// search-text/file-source derivation, ending in the
+/// `DownloadManager::add_file` registration. The C++
+/// `CHECK(file_source_id.is_valid())` after the registry read is satisfied
+/// by convention: the registry hands out the M.12-seam default id (the
+/// id allocation lands with the FileReferenceManager plane).
+#[allow(clippy::too_many_arguments)]
+pub fn add_message_file_to_downloads(
+    ctx: &dyn SendMessageContext,
+    manager: &mut MessagesManager,
+    file_manager: &mut crate::files::FileManager,
+    download_manager: &mut crate::files::DownloadManager,
+    message_full_id: MessageFullId,
+    mut file_id: FileId,
+    priority: i32,
+    mut promise: tdutils::promise::Promise<td_api::File>,
+) {
+    // `TRY_STATUS_PROMISE(promise, FileManager::check_priority(priority))`
+    if let Err(status) = crate::files::check_priority(priority) {
+        promise.set_error(status);
+        return;
+    }
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    let search_text = {
+        let Some(m) = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| get_message_in_dialog(d, message_id))
+        else {
+            promise.set_error(Status::error(400, "Message not found"));
+            return;
+        };
+        let Some(file_view) = file_manager.get_file_view(file_id) else {
+            promise.set_error(Status::error(400, "File not found"));
+            return;
+        };
+        file_id = file_view.get_main_file_id();
+        let mut is_found = false;
+        for message_file_id in get_message_file_ids(ctx.content_context(), m) {
+            // `CHECK(!message_file_view.empty())` — the walk ids always
+            // resolve
+            let Some(message_file_view) = file_manager.get_file_view(message_file_id) else {
+                promise.set_error(Status::error(400, "File not found"));
+                return;
+            };
+            if message_file_view.get_main_file_id() == file_id {
+                is_found = true;
+            }
+        }
+        if !is_found {
+            promise.set_error(Status::error(400, "Message has no specified file"));
+            return;
+        }
+        if m.message_id.is_yet_unsent() {
+            promise.set_error(Status::error(
+                400,
+                "Yet unsent messages can't be added to Downloads",
+            ));
+            return;
+        }
+        get_message_search_text(m)
+    };
+    let file_source_id = get_message_file_source_id(ctx, manager, message_full_id, true);
+    match download_manager.add_file(file_id, file_source_id, &search_text, priority as i8) {
+        Ok(Some(file)) => promise.set_value(file),
+        // the unwired-callback world: never on `Td` (the callback is wired
+        // at init), the promise parks like the C++ missing actor
+        Ok(None) => {}
+        Err(status) => promise.set_error(status),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // M.mmreq — the MessagesManager request plane: the 65 td_api arms that
 // route into MessagesManager (pin/unpin, the reactions intake,
@@ -39404,5 +39505,275 @@ mod tests {
             get_send_message_topic(&ctx, other, Some(&topic)),
             Err((400, "Chat not found".to_owned()))
         );
+    }
+
+    // -------------------------------------------------------------------
+    // M.glue files — the add-message-file + offer ladders
+    // -------------------------------------------------------------------
+
+    /// The captured `Result<td_api::File>` of an add-message-file promise.
+    #[allow(clippy::type_complexity)]
+    fn capture_file_promise() -> (
+        tdutils::promise::Promise<td_api::File>,
+        std::sync::Arc<parking_lot::Mutex<Option<tdutils::status::Result<td_api::File>>>>,
+    ) {
+        let slot: std::sync::Arc<
+            parking_lot::Mutex<Option<tdutils::status::Result<td_api::File>>>,
+        > = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<td_api::File>| {
+                *capture.lock() = Some(result);
+            },
+        );
+        (promise, slot)
+    }
+
+    /// The minimal `FileManagerContext` of the ladder tests: the walks
+    /// only resolve nodes, so the path halves are never hit.
+    struct LadderFilesContext;
+
+    impl crate::files::FileManagerContext for LadderFilesContext {
+        fn real_path(&self, path: &str) -> Result<String, Status> {
+            std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|_| Status::error(400, "Can't find real file path"))
+        }
+        fn files_dir(&self) -> String {
+            format!("{}/", std::env::temp_dir().to_string_lossy())
+        }
+    }
+
+    /// The callback returning the real file object — the `Td`-wired shape
+    /// the C++ `DownloadManager` actor rides.
+    struct FileObjectCallback;
+
+    impl crate::files::DownloadManagerCallback for FileObjectCallback {
+        fn get_file_object(&mut self, file_id: crate::files::FileId) -> Option<td_api::File> {
+            Some(td_api::File {
+                id: file_id.get(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn ladder_photo_message(file_id: crate::files::FileId) -> Message {
+        let mut m = m10_10_editable_message(1, true);
+        m.content = Some(crate::message_content::MessageContent::Photo(
+            crate::message_content::MessagePhoto {
+                photo: crate::photo::Photo {
+                    photos: vec![crate::photo::PhotoSize {
+                        file_id,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        m
+    }
+
+    #[test]
+    fn mglue_add_message_file_to_downloads_bands() {
+        let mut manager = MessagesManager::new();
+        let ctx = m10_10_ctx(1700000000);
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        manager.add_dialog_for_new_message(dialog_id);
+        let mut file_manager = crate::files::FileManager::new();
+        file_manager.set_context(Box::new(LadderFilesContext));
+        let mut download_manager = crate::files::DownloadManager::new();
+        let full_id = MessageFullId::new(dialog_id, m10_7_server_id(5));
+
+        // the priority band fires before any lookup
+        for priority in [0, 33] {
+            let (promise, slot) = capture_file_promise();
+            add_message_file_to_downloads(
+                &ctx,
+                &mut manager,
+                &mut file_manager,
+                &mut download_manager,
+                full_id,
+                crate::files::FileId::new(1, 0),
+                priority,
+                promise,
+            );
+            let result = slot.lock().take().expect("settled");
+            assert_eq!(
+                result.error().message(),
+                "Priority must be between 1 and 32"
+            );
+        }
+
+        // the missing-message band
+        let (promise, slot) = capture_file_promise();
+        add_message_file_to_downloads(
+            &ctx,
+            &mut manager,
+            &mut file_manager,
+            &mut download_manager,
+            full_id,
+            crate::files::FileId::new(1, 0),
+            1,
+            promise,
+        );
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.error().message(), "Message not found");
+
+        // the missing-file band: the message is there, the file id is not
+        let message = m10_10_editable_message(1, true);
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .insert(m10_7_server_id(5), Box::new(message));
+        let (promise, slot) = capture_file_promise();
+        add_message_file_to_downloads(
+            &ctx,
+            &mut manager,
+            &mut file_manager,
+            &mut download_manager,
+            full_id,
+            crate::files::FileId::new(41, 0),
+            1,
+            promise,
+        );
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.error().message(), "File not found");
+    }
+
+    #[test]
+    fn mglue_add_message_file_to_downloads_walk_and_register() {
+        let root = std::env::temp_dir().join("td_rs_add_message_file");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let mut manager = MessagesManager::new();
+        let ctx = m10_10_ctx(1700000000);
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        manager.add_dialog_for_new_message(dialog_id);
+        let mut file_manager = crate::files::FileManager::new();
+        file_manager.set_context(Box::new(LadderFilesContext));
+
+        // a real cached file; the message content carries its id
+        let path = format!("{root_str}/photo.bin");
+        std::fs::write(&path, b"jpeg").unwrap();
+        let file_id = file_manager
+            .register_local(
+                crate::files::FullLocalFileLocation::new(crate::files::FileType::Document, path, 0),
+                DialogId::default(),
+                4,
+                false,
+                false,
+                crate::files::FileId::default(),
+            )
+            .expect("register_local");
+
+        // the walk band: a text message does not carry the file
+        let text = m10_10_editable_message(1, true);
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .insert(m10_7_server_id(5), Box::new(text));
+        let mut download_manager = crate::files::DownloadManager::new();
+        let (promise, slot) = capture_file_promise();
+        add_message_file_to_downloads(
+            &ctx,
+            &mut manager,
+            &mut file_manager,
+            &mut download_manager,
+            MessageFullId::new(dialog_id, m10_7_server_id(5)),
+            file_id,
+            16,
+            promise,
+        );
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.error().message(), "Message has no specified file");
+
+        // the yet-unsent band: the photo message under a yet-unsent id
+        let unsent_id = m10_8_yet_unsent(1);
+        let mut unsent = ladder_photo_message(file_id);
+        unsent.message_id = unsent_id;
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .insert(unsent_id, Box::new(unsent));
+        let (promise, slot) = capture_file_promise();
+        add_message_file_to_downloads(
+            &ctx,
+            &mut manager,
+            &mut file_manager,
+            &mut download_manager,
+            MessageFullId::new(dialog_id, unsent_id),
+            file_id,
+            16,
+            promise,
+        );
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(
+            result.error().message(),
+            "Yet unsent messages can't be added to Downloads"
+        );
+
+        // the happy path: the photo message registers into the download
+        // manager and the file object answers the promise
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .insert(m10_7_server_id(5), Box::new(ladder_photo_message(file_id)));
+        download_manager.set_callback(Box::new(FileObjectCallback));
+        download_manager.init();
+        let (promise, slot) = capture_file_promise();
+        add_message_file_to_downloads(
+            &ctx,
+            &mut manager,
+            &mut file_manager,
+            &mut download_manager,
+            MessageFullId::new(dialog_id, m10_7_server_id(5)),
+            file_id,
+            16,
+            promise,
+        );
+        let file = slot.lock().take().expect("settled").move_as_ok();
+        assert_eq!(file.id, file_id.get());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mglue_can_add_message_offer_tables() {
+        let plain_ctx = m10_10_ctx(1700000000);
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        let message = m10_10_editable_message(1, true);
+
+        // the null-message band
+        assert!(!can_add_message_offer(&plain_ctx, dialog_id, None));
+        // the monoforum stub band: the DialogManager stub answers false
+        assert!(!can_add_message_offer(
+            &plain_ctx,
+            dialog_id,
+            Some(&message)
+        ));
+
+        // with the monoforum channel set, a server text message passes the
+        // probe; a local id and an ephemeral message fail
+        let mut mono_ctx = m10_10_ctx(1700000000);
+        mono_ctx.monoforum_channel = Some(crate::chat_manager::ChannelId::new(9));
+        assert!(can_add_message_offer(&mono_ctx, dialog_id, Some(&message)));
+        let local = m10_10_editable_message(1, true);
+        let mut local = local;
+        local.message_id = m10_8_yet_unsent(1);
+        assert!(!can_add_message_offer(&mono_ctx, dialog_id, Some(&local)));
+        let mut ephemeral = m10_10_editable_message(1, true);
+        ephemeral.ephemeral_message = Some(Box::new(Message::default()));
+        assert!(!can_add_message_offer(
+            &mono_ctx,
+            dialog_id,
+            Some(&ephemeral)
+        ));
     }
 }

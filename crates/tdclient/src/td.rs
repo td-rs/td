@@ -3704,6 +3704,14 @@ impl Td {
             });
         }
 
+        // `Td::init` starts the three HashtagHints actors
+        // (Td.cpp:1344-1347) — the recent-hashtag/searched-tag/cashtag
+        // registries replay their pmc records at start_up.
+        {
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(self);
+            stickers_manager.init_hashtag_hints(&mut env);
+        }
+
         // `make_unique<WebBrowserManager>` (Td.cpp:1332, the init_managers
         // block) + its `start_up` (WebBrowserManager.cpp:142-144) — loads
         // the saved settings only while authorized and non-bot.
@@ -11495,6 +11503,77 @@ impl crate::auto_download_settings::AutoDownloadSettingsEnv for PrivacyEnv<'_> {
     }
 }
 
+/// The [`crate::support_manager::SupportEnv`] over the whole `Td` — the
+/// request arms hand the `Td` remainder to the env (the `PrivacyEnv`
+/// convention), so the query-send halves read the real user manager.
+pub(crate) struct SupportEnvTd<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::support_manager::SupportEnv for SupportEnvTd<'_> {
+    fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn get_my_user_id(&self) -> UserId {
+        self.td.user_manager.get_my_id()
+    }
+
+    fn get_always_parse_markdown(&self) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .expect("user requests run with the initialized option manager")
+            .get_option_boolean("always_parse_markdown", false)
+    }
+
+    fn get_session_count(&self) -> i32 {
+        self.td
+            .option_manager
+            .as_ref()
+            .expect("user requests run with the initialized option manager")
+            .get_option_integer("session_count", 1)
+            .try_into()
+            .unwrap()
+    }
+
+    fn get_user_info_via_net(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        promise: Promise<td_api::UserSupportInfo>,
+    ) {
+        // `GetUserInfoQuery::send` — `help.getUserInfo`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn edit_user_info_via_net(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        _message: telegram_api::TextWithEntities,
+        promise: Promise<td_api::UserSupportInfo>,
+    ) {
+        // `EditUserInfoQuery::send` — `help.editUserInfo`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn get_support_name_via_net(&mut self, promise: Promise<String>) {
+        // `GetSupportNameQuery::send` — `help.getSupportName`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+}
+
 /// The [`crate::background_manager::BackgroundManagerEnv`] over the whole
 /// `Td` — the request arms take the manager out of `Td` and hand the
 /// remainder to the env (the `BotEnv` convention), so every dialog/file/
@@ -16299,22 +16378,34 @@ impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
         use crate::stickers_manager::StickerFileView;
         let file_manager = self.file_manager.lock();
         let Some(file_view) = file_manager.get_file_view(file_id) else {
-            return StickerFileView::default();
+            return StickerFileView {
+                empty: true,
+                ..StickerFileView::default()
+            };
         };
         let main_remote_document_id = file_view
             .get_main_remote_location()
             .filter(|location| location.is_document() && !location.is_web())
             .map(|location| location.get_id());
+        let full_remote_document_id = file_view
+            .get_full_remote_location()
+            .filter(|location| location.is_document());
         StickerFileView {
+            empty: false,
             is_encrypted: file_view.is_encrypted(),
             main_remote_document_id,
             has_url: file_view.has_url(),
             has_full_local_location: file_view.has_full_local_location(),
             expected_size: file_view.expected_size(false),
-            full_remote_document_id: file_view
-                .get_full_remote_location()
-                .filter(|location| location.is_document())
+            full_remote_document_id: full_remote_document_id
+                .as_ref()
                 .map(|location| location.get_id()),
+            full_remote_is_photo: full_remote_document_id
+                .as_ref()
+                .is_some_and(|location| location.is_photo()),
+            full_remote_is_web: full_remote_document_id
+                .as_ref()
+                .is_some_and(|location| location.is_web()),
         }
     }
 

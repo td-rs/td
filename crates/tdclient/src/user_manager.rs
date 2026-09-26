@@ -10846,7 +10846,7 @@ impl UserManager {
 /// `EmojiStatus::get_emoji_status_object` — the reduced payload; the
 /// collectible upgraded-gift form lands with the Gifts step (the C++
 /// emits `emojiStatusUpgradedGift` there).
-fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
+pub(crate) fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
     td_api::EmojiStatus {
         r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
             td_api::emojiStatusTypeCustomEmoji {
