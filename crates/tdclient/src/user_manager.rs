@@ -1248,6 +1248,10 @@ pub struct UserFull {
     pub charge_paid_message_stars: i64,
     pub send_paid_message_stars: i64,
 
+    /// `UserFull::gift_settings` (UserManager.h) — the `setGiftSettings`
+    /// slice ([`crate::star_gift_settings`]).
+    pub gift_settings: crate::star_gift_settings::StarGiftSettings,
+
     /// `UserFull::first_saved_music_file_id` (UserManager.h:787) — the
     /// id is a placeholder until the Files step and the store keeps the
     /// flag forced off (the C++ persists it through
@@ -1303,6 +1307,7 @@ impl Default for UserFull {
             linked_community_id: CommunityId::default(),
             charge_paid_message_stars: 0,
             send_paid_message_stars: 0,
+            gift_settings: crate::star_gift_settings::StarGiftSettings::default(),
             first_saved_music_file_id: FileId::default(),
             is_first_saved_music_file_id_changed: false,
             is_blocked: false,
@@ -1376,7 +1381,7 @@ impl UserFull {
         let has_bot_verification = false;
         let has_charge_paid_message_stars = self.charge_paid_message_stars != 0;
         let has_send_paid_message_stars = self.send_paid_message_stars != 0;
-        let has_gift_settings = false; // GiftSettings subsystem
+        let has_gift_settings = !self.gift_settings.is_default();
         let has_star_rating = false; // StarRating subsystem
         let has_pending_star_rating = false;
         let has_main_profile_tab = false; // ProfileTab subsystem
@@ -1474,6 +1479,9 @@ impl UserFull {
         }
         if has_send_paid_message_stars {
             store_i64(out, self.send_paid_message_stars);
+        }
+        if has_gift_settings {
+            self.gift_settings.store(out);
         }
         if has_linked_community_id {
             store_i64(out, self.linked_community_id.get());
@@ -1586,7 +1594,6 @@ impl UserFull {
             || has_referral_program_info
             || has_verifier_settings
             || has_bot_verification
-            || has_gift_settings
             || has_star_rating
             || has_pending_star_rating
             || has_main_profile_tab
@@ -1640,6 +1647,9 @@ impl UserFull {
         }
         if has_send_paid_message_stars {
             result.send_paid_message_stars = parser.i64_()?;
+        }
+        if has_gift_settings {
+            result.gift_settings = crate::star_gift_settings::StarGiftSettings::parse_from(parser)?;
         }
         if has_linked_community_id {
             result.linked_community_id = CommunityId::new(parser.i64_()?);
@@ -2055,6 +2065,20 @@ pub struct UserManager {
     /// `reload_my_saved_music_queries_` (UserManager.h:1297).
     reload_my_saved_music_queries: Vec<Promise<()>>,
 
+    /// `support_user_id_` (UserManager.h:1318) — the cached support user.
+    support_user_id: UserId,
+    /// The parked `GetSupportUserQuery` promise (the tail is
+    /// [blocked: net]; `on_get_support_user` is its ack intake).
+    pending_support_user_queries: Vec<Promise<td_api::User>>,
+    /// The parked `GetDefaultEmojiStatusesQuery` /
+    /// `GetChannelDefaultEmojiStatusesQuery` promises (the tails are
+    /// [blocked: net]; the acks split by family at the net-query
+    /// integration).
+    pending_default_emoji_statuses_queries: Vec<Promise<td_api::EmojiStatusCustomEmojis>>,
+    /// The parked `GetRecentEmojiStatusesQuery` /
+    /// `GetCollectibleEmojiStatusesQuery` promises.
+    pending_recent_emoji_statuses_queries: Vec<Promise<td_api::EmojiStatuses>>,
+
     /// The FileReferenceManager stand-in: the allocator behind every
     /// `FileSourceId` this module hands out.
     next_file_source_id: i32,
@@ -2275,6 +2299,41 @@ impl UserManager {
             tdutils::log_error!("Wrong or unknown my ID returned");
         }
         self.my_id
+    }
+
+    /// `UserManager::on_update_my_user_gift_settings`
+    /// (UserManager.cpp:4253-4263) — the `setGiftSettings` chain's
+    /// local half; the full-info flip is the only real effect and the
+    /// promise answers ok (the C++ caller rides the
+    /// `account.setGlobalPrivacySettings` query result).
+    pub fn on_update_my_user_gift_settings(
+        &mut self,
+        env: &mut UserEnv,
+        gift_settings: crate::star_gift_settings::StarGiftSettings,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        let user_id = self.get_my_id();
+        if self.get_user_full_force(env, user_id, "on_update_my_user_gift_settings") {
+            let is_changed = {
+                let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
+                if user_full.gift_settings != gift_settings {
+                    user_full.gift_settings = gift_settings;
+                    user_full.is_changed = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if is_changed {
+                self.update_user_full(env, user_id, "on_update_my_user_gift_settings", false);
+            }
+        }
+        promise.set_value(());
     }
 
     /// `UserManager::set_my_id` (UserManager.cpp:2999-3017).
@@ -5161,10 +5220,17 @@ impl UserManager {
         // (apply_pending_user_photo, cpp:8986)
         self.apply_pending_user_photo(env, user_id, "on_get_user_full");
 
-        // The User facts the application reads (cpp:9112, 9140, 9235).
-        let (is_premium_user, is_contact, user_linked_community_id) = {
+        // The User facts the application reads (cpp:9112, 9140, 9235,
+        // 9049-9051).
+        let (is_premium_user, is_contact, user_linked_community_id, is_deleted_user, is_bot_user) = {
             let u = self.users.get(&user_id.get()).unwrap();
-            (u.is_premium, u.is_contact, u.linked_community_id)
+            (
+                u.is_premium,
+                u.is_contact,
+                u.linked_community_id,
+                u.is_deleted,
+                u.is_bot,
+            )
         };
 
         let flags = user_full.flags;
@@ -5223,6 +5289,15 @@ impl UserManager {
                 .map(|settings| settings.charge_paid_message_stars)
                 .unwrap_or_default(),
         );
+        // the gift-settings intake (cpp:9048-9051) — the deleted/bot
+        // override forces the allow-nothing settings.
+        let mut gift_settings = crate::star_gift_settings::StarGiftSettings::new(
+            user_full.display_gifts_button,
+            user_full.disallowed_gifts,
+        );
+        if is_deleted_user || is_bot_user {
+            gift_settings = crate::star_gift_settings::StarGiftSettings::allow_nothing();
+        }
         // on_update_user_full_need_phone_number_privacy_exception
         // (cpp:9029-9031 + hook cpp:4446-4459).
         let mut need_phone_number_privacy_exception = user_full
@@ -5338,6 +5413,10 @@ impl UserManager {
             }
             if stored.unofficial_security_risk != unofficial_security_risk {
                 stored.unofficial_security_risk = unofficial_security_risk;
+                stored.is_changed = true;
+            }
+            if stored.gift_settings != gift_settings {
+                stored.gift_settings = gift_settings;
                 stored.is_changed = true;
             }
             if stored.birthdate != birthdate {
@@ -5542,7 +5621,7 @@ impl UserManager {
             user_full.read_dates_private = false;
             user_full.contact_require_premium = false;
             user_full.birthdate = Birthdate::default();
-            // gift_settings — with the StarGiftSettings step
+            user_full.gift_settings = crate::star_gift_settings::StarGiftSettings::allow_nothing();
             user_full.sponsored_enabled = false;
             user_full.has_preview_medias = false;
             user_full.can_view_revenue = false;
@@ -6067,10 +6146,7 @@ impl UserManager {
             group_in_common_count: user_full.common_chat_count,
             incoming_paid_message_star_count: user_full.charge_paid_message_stars,
             outgoing_paid_message_star_count: user_full.send_paid_message_stars,
-            gift_settings: Some(td_api::GiftSettings {
-                show_gift_button: false,
-                accepted_gift_types: Some(td_api::AcceptedGiftTypes::default()),
-            }),
+            gift_settings: Some(user_full.gift_settings.get_gift_settings_object()),
             bot_verification: Some(td_api::BotVerification {
                 bot_user_id: 0,
                 icon_custom_emoji_id: 0,
@@ -7499,6 +7575,439 @@ impl UserManager {
                 self.update_user_full(env, my_user_id, "on_toggle_sponsored_messages", false);
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M.4 tails: the profile-note/tab/birthdate setters, the photo-set
+    // family and the support-user/emoji-status query planes
+    // (UserManager.cpp:5981-6835, 7178-7212 + EmojiStatus.cpp:571-637).
+    // Every net query send is the [blocked: net] park; the file-coupled
+    // photo legs stay the Files-slice seams.
+
+    /// `UserManager::set_user_note` (UserManager.cpp:6440-6466). The
+    /// contact/self gates and the formatted-text normalization answer
+    /// here; the `UpdateContactNoteQuery` send and the ack-gated
+    /// `on_set_user_note` cache write are [blocked: net]. The
+    /// entity-plane `user_manager` plumbing rides the
+    /// MessageContentContext integration — the `None` input is the
+    /// documented `()` stand-in.
+    pub fn set_user_note(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        note: Option<td_api::FormattedText>,
+        mut promise: Promise<()>,
+    ) {
+        if let Err(error) = self.get_input_user(env, user_id) {
+            return promise.set_error(error);
+        }
+        if !self.is_user_contact_of(user_id, false) {
+            return promise.set_error(Status::error(400, "User isn't a contact"));
+        }
+        if user_id == self.get_my_id() {
+            return promise.set_error(Status::error(400, "Can't set note to self"));
+        }
+
+        let note_text = match crate::message_entity::get_formatted_text_of_input::<()>(
+            None,
+            crate::message_entity::DialogId::None,
+            note,
+            false,
+            true,
+            true,
+            false,
+            None,
+            env.options
+                .get_option_boolean("always_parse_markdown", false),
+            env.options
+                .get_option_integer("session_count", 1)
+                .try_into()
+                .unwrap(),
+            None,
+            false,
+        ) {
+            Ok(mut note_text) => {
+                crate::message_entity::remove_unallowed_quote_entities(&mut note_text);
+                note_text
+            }
+            Err(error) => return promise.set_error(error),
+        };
+        let _ = note_text;
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Send messages.updateContactNote — [blocked: net]");
+    }
+
+    /// `UserManager::set_main_profile_tab` (UserManager.cpp:6688-6701)
+    /// with the td_api `get_profile_tab` ladder (ProfileTab.cpp:61-95):
+    /// the null gate and the `ChannelType::Unknown` allow-list answer
+    /// here; the `SetMainProfileTabQuery` send and the ack-gated
+    /// `on_set_main_profile_tab` user_full write are [blocked: net] (the
+    /// ProfileTab subsystem).
+    pub fn set_main_profile_tab(
+        &mut self,
+        main_profile_tab: Option<td_api::ProfileTab>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(profile_tab) = main_profile_tab else {
+            return promise.set_error(Status::error(400, "Profile tab must be non-empty"));
+        };
+        let profile_tab = match profile_tab {
+            td_api::ProfileTab::profileTabPosts(_) => crate::chat_manager::ProfileTab::Posts,
+            td_api::ProfileTab::profileTabGifts(_) => crate::chat_manager::ProfileTab::Gifts,
+            _ => {
+                return promise.set_error(Status::error(
+                    400,
+                    "Invalid profile tab specified for the chat",
+                ));
+            }
+        };
+        let _ = profile_tab;
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Send users.setMainProfileTab — [blocked: net]");
+    }
+
+    /// `UserManager::suggest_user_birthdate` (UserManager.cpp:6471-6480):
+    /// the input/self/bot gates answer here; the
+    /// `SuggestUserBirthdayQuery` send is [blocked: net].
+    pub fn suggest_user_birthdate(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        birthdate: td_api::Birthdate,
+        mut promise: Promise<()>,
+    ) {
+        if let Err(error) = self.get_input_user(env, user_id) {
+            return promise.set_error(error);
+        }
+        if user_id == self.get_my_id() {
+            return promise.set_error(Status::error(400, "Can't suggest birthdate to self"));
+        }
+        if self.is_user_bot_of(user_id) {
+            return promise.set_error(Status::error(400, "Can't suggest birthdate to bots"));
+        }
+        let _ = Birthdate::new(birthdate.day, birthdate.month, birthdate.year);
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Send users.suggestBirthday — [blocked: net]");
+    }
+
+    /// `UserManager::add_new_saved_music` (UserManager.cpp:7178-7212).
+    /// The null/title/performer gates answer here; the
+    /// `get_input_file_id(FileType::Audio, ...)` resolution, the
+    /// encrypted/web gates, the remote-location fast path
+    /// (`add_saved_music`) and the `create_audio`/`upload_saved_music`
+    /// tail are the FileManager/AudiosManager seams (they join the
+    /// FileManager env half of the M.4 tail).
+    pub fn add_new_saved_music(
+        &mut self,
+        input_audio: Option<td_api::InputAudio>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(input_audio) = input_audio else {
+            return promise.set_error(Status::error(400, "Audio must be non-empty"));
+        };
+        if crate::misc::clean_input_string(&input_audio.title).is_none()
+            || crate::misc::clean_input_string(&input_audio.performer).is_none()
+        {
+            return promise.set_error(Status::error(400, "Strings must be encoded in UTF-8"));
+        }
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("upload_saved_music — [blocked: net]");
+    }
+
+    /// `UserManager::get_support_user` (UserManager.cpp:6798-6815): the
+    /// cached id answers here; the `GetSupportUserQuery` send is
+    /// [blocked: net] and `on_get_support_user` is its ack intake.
+    pub fn get_support_user(&mut self, env: &UserEnv, mut promise: Promise<td_api::User>) {
+        if self.support_user_id.is_valid() {
+            promise.set_value(self.get_user_object_of(env, self.support_user_id));
+            return;
+        }
+        self.pending_support_user_queries.push(promise);
+        tdutils::log_info!("Send users.getSupport — [blocked: net]");
+    }
+
+    /// `UserManager::on_get_support_user` (UserManager.cpp:6817-6831) —
+    /// the net-query ack intake; the parked promises resolve with the
+    /// fresh object, like the C++ query promise.
+    pub fn on_get_support_user(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        mut promise: Promise<td_api::User>,
+    ) {
+        let is_support = match self.get_user(user_id) {
+            Some(u) => u.is_support,
+            None => return promise.set_error(Status::error(500, "Can't find support user")),
+        };
+        if !is_support {
+            tdutils::log_error!("Receive non-support {user_id:?}, but expected a support user");
+        }
+        self.support_user_id = user_id;
+        let object = self.get_user_object_of(env, user_id);
+        self.pending_support_user_queries.push(promise);
+        for mut parked in self.pending_support_user_queries.drain(..) {
+            parked.set_value(object.clone());
+        }
+    }
+
+    /// `UserManager::set_profile_photo` (UserManager.cpp:5996-6002); the
+    /// `UserpicSetup` suggested-action dismissal is the caller's seam
+    /// (the Td-level arm hosts it like the Payments-side dismiss).
+    pub fn set_profile_photo(
+        &mut self,
+        env: &UserEnv,
+        input_photo: Option<&td_api::InputChatPhoto>,
+        is_fallback: bool,
+        promise: Promise<()>,
+    ) {
+        let my_id = self.get_my_id();
+        self.set_profile_photo_impl(env, my_id, input_photo, is_fallback, false, promise);
+    }
+
+    /// `UserManager::set_profile_photo_impl` (UserManager.cpp:6004-6070)
+    /// — the validation bands answer here. The static/animation upload
+    /// flow and the `UpdateProfilePhotoQuery`/`UploadProfilePhotoQuery`
+    /// sends are the [blocked: net/Files] seams; the sticker arm needs
+    /// `StickerPhotoSize::get_sticker_photo_size` over the td_api input
+    /// (the M.st StickerPhotoSize seam).
+    pub fn set_profile_photo_impl(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        input_photo: Option<&td_api::InputChatPhoto>,
+        is_fallback: bool,
+        only_suggest: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(input_photo) = input_photo else {
+            return promise.set_error(Status::error(400, "New profile photo must be non-empty"));
+        };
+        let _ = (is_fallback, only_suggest);
+        match input_photo {
+            td_api::InputChatPhoto::inputChatPhotoPrevious(photo) => {
+                if user_id != self.get_my_id() || env.auth_is_bot {
+                    return promise
+                        .set_error(Status::error(400, "Can't use inputChatPhotoPrevious"));
+                }
+                let photo_id = photo.chat_photo_id;
+                if !self.my_photo_file_id.contains_key(&photo_id) {
+                    return promise
+                        .set_error(Status::error(400, "Unknown profile photo ID specified"));
+                }
+                self.net_blocked_promises.push(promise);
+                tdutils::log_info!("Send photos.updateProfilePhoto — [blocked: net]");
+            }
+            td_api::InputChatPhoto::inputChatPhotoStatic(_) => {
+                self.net_blocked_promises.push(promise);
+                tdutils::log_info!("Upload profile photo — [blocked: net/Files]");
+            }
+            td_api::InputChatPhoto::inputChatPhotoAnimation(photo) => {
+                const MAX_ANIMATION_DURATION: f64 = 10.0;
+                if photo.main_frame_timestamp < 0.0
+                    || photo.main_frame_timestamp > MAX_ANIMATION_DURATION
+                {
+                    return promise
+                        .set_error(Status::error(400, "Wrong main frame timestamp specified"));
+                }
+                self.net_blocked_promises.push(promise);
+                tdutils::log_info!("Upload animated profile photo — [blocked: net/Files]");
+            }
+            td_api::InputChatPhoto::inputChatPhotoSticker(_) => {
+                self.net_blocked_promises.push(promise);
+                tdutils::log_info!("Upload sticker profile photo — [blocked: net/Files]");
+            }
+        }
+    }
+
+    /// `UserManager::set_user_profile_photo` (UserManager.cpp:6071-6097)
+    /// — serves both setUserPersonalProfilePhoto and
+    /// suggestUserProfilePhoto (`only_suggest`).
+    pub fn set_user_profile_photo(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        input_photo: Option<&td_api::InputChatPhoto>,
+        only_suggest: bool,
+        mut promise: Promise<()>,
+    ) {
+        if let Err(error) = self.get_input_user(env, user_id) {
+            return promise.set_error(error);
+        }
+        if !only_suggest && !self.is_user_contact_of(user_id, false) {
+            return promise.set_error(Status::error(400, "User isn't a contact"));
+        }
+        if user_id == self.get_my_id() {
+            return promise.set_error(Status::error(
+                400,
+                "Can't set personal or suggest photo to self",
+            ));
+        }
+        if self.is_user_bot_of(user_id) {
+            return promise.set_error(Status::error(
+                400,
+                "Can't set personal or suggest photo to bots",
+            ));
+        }
+        let Some(input_photo) = input_photo else {
+            let mut promise = promise;
+            if only_suggest {
+                return promise.set_error(Status::error(400, "Photo must be non-empty"));
+            }
+            self.net_blocked_promises.push(promise);
+            tdutils::log_info!("Send contacts.deleteContactProfilePhoto — [blocked: net]");
+            return;
+        };
+        self.set_profile_photo_impl(
+            env,
+            user_id,
+            Some(input_photo),
+            false,
+            only_suggest,
+            promise,
+        );
+    }
+
+    /// `UserManager::delete_profile_photo` (UserManager.cpp:6395-6426) —
+    /// the cache bands answer here; the user_full reload retry ladder,
+    /// the `UpdateProfilePhotoQuery` reset and the
+    /// `DeleteProfilePhotoQuery` send are [blocked: net].
+    pub fn delete_profile_photo(
+        &mut self,
+        env: &mut UserEnv,
+        profile_photo_id: i64,
+        mut promise: Promise<()>,
+    ) {
+        let my_id = self.get_my_id();
+        if !self.get_user_full_force(env, my_id, "delete_profile_photo") {
+            // the C++ loads the UserFull first (the fallback photo can't
+            // be deleted via the plain query); the reload half is the net
+            // step
+            self.net_blocked_promises.push(promise);
+            tdutils::log_info!("Reload UserFullInfo — [blocked: net]");
+            return;
+        }
+        let mut profile_photo_id = profile_photo_id;
+        let (update_main_photo, update_fallback_photo) = {
+            let user_full = self
+                .users_full
+                .get(&my_id.get())
+                .expect("forced just above");
+            if env.auth_is_bot {
+                if user_full.photo.id == 0 {
+                    promise.set_value(());
+                    return;
+                }
+                profile_photo_id = user_full.photo.id;
+            }
+            (
+                user_full.photo.id != 0 && user_full.photo.id == profile_photo_id,
+                user_full.fallback_photo.id != 0 && user_full.fallback_photo.id == profile_photo_id,
+            )
+        };
+        let _ = profile_photo_id;
+        self.net_blocked_promises.push(promise);
+        if update_main_photo || update_fallback_photo {
+            tdutils::log_info!("Send photos.updateProfilePhoto (reset) — [blocked: net]");
+        } else {
+            tdutils::log_info!("Send photos.deleteProfilePhoto — [blocked: net]");
+        }
+    }
+
+    // --- the emoji-status query planes (EmojiStatus.cpp:571-637) —
+    // the cached lists answer here; the hash-revalidation query sends
+    // are [blocked: net] ---
+
+    /// `get_default_emoji_statuses` (EmojiStatus.cpp:571-578).
+    pub fn get_default_emoji_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        mut promise: Promise<td_api::EmojiStatusCustomEmojis>,
+    ) {
+        let statuses = crate::emoji_status::load_emoji_status_custom_emojis(
+            env.global.binlog_pmc(),
+            crate::emoji_status::DEFAULT_EMOJI_STATUSES_DATABASE_KEY,
+        );
+        if statuses.hash != -1 {
+            promise.set_value(statuses.get_emoji_status_custom_emojis_object());
+            return;
+        }
+        self.pending_default_emoji_statuses_queries.push(promise);
+        tdutils::log_info!("Send account.getDefaultEmojiStatuses — [blocked: net]");
+    }
+
+    /// `get_default_channel_emoji_statuses` (EmojiStatus.cpp:580-588) —
+    /// serves getDefaultChatEmojiStatuses.
+    pub fn get_default_channel_emoji_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        mut promise: Promise<td_api::EmojiStatusCustomEmojis>,
+    ) {
+        let statuses = crate::emoji_status::load_emoji_status_custom_emojis(
+            env.global.binlog_pmc(),
+            crate::emoji_status::DEFAULT_CHANNEL_EMOJI_STATUSES_DATABASE_KEY,
+        );
+        if statuses.hash != -1 {
+            promise.set_value(statuses.get_emoji_status_custom_emojis_object());
+            return;
+        }
+        self.pending_default_emoji_statuses_queries.push(promise);
+        tdutils::log_info!("Send account.getChannelDefaultEmojiStatuses — [blocked: net]");
+    }
+
+    /// `get_recent_emoji_statuses` (EmojiStatus.cpp:590-597).
+    pub fn get_recent_emoji_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        mut promise: Promise<td_api::EmojiStatuses>,
+    ) {
+        let statuses = crate::emoji_status::load_emoji_statuses(
+            env.global.binlog_pmc(),
+            crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY,
+        );
+        if statuses.hash != -1 {
+            promise.set_value(statuses.get_emoji_statuses_object());
+            return;
+        }
+        self.pending_recent_emoji_statuses_queries.push(promise);
+        tdutils::log_info!("Send account.getRecentEmojiStatuses — [blocked: net]");
+    }
+
+    /// `clear_recent_emoji_statuses` (EmojiStatus.cpp:621-624) — the
+    /// cache clears here; the `ClearRecentEmojiStatusesQuery` send is
+    /// [blocked: net].
+    pub fn clear_recent_emoji_statuses(&mut self, env: &mut UserEnv, promise: Promise<()>) {
+        let empty = crate::emoji_status::EmojiStatusesCache::default();
+        let mut stored = Vec::new();
+        empty.store(&mut stored);
+        crate::emoji_status::save_emoji_statuses_cache(
+            env.global.binlog_pmc(),
+            crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY,
+            &stored,
+        );
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Send account.clearRecentEmojiStatuses — [blocked: net]");
+    }
+
+    /// `get_upgraded_gift_emoji_statuses` (EmojiStatus.cpp:626-637) —
+    /// the bot arm drops the promise like the C++ `CHECK(!promise)`.
+    pub fn get_upgraded_gift_emoji_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        mut promise: Promise<td_api::EmojiStatuses>,
+    ) {
+        if env.auth_is_bot {
+            return;
+        }
+        let statuses = crate::emoji_status::load_emoji_statuses(
+            env.global.binlog_pmc(),
+            crate::emoji_status::UPGRADED_GIFT_EMOJI_STATUSES_DATABASE_KEY,
+        );
+        if statuses.hash != -1 {
+            promise.set_value(statuses.get_emoji_statuses_object());
+            return;
+        }
+        self.pending_recent_emoji_statuses_queries.push(promise);
+        tdutils::log_info!("Send account.getCollectibleEmojiStatuses — [blocked: net]");
     }
 
     // ------------------------------------------------------------------
@@ -10337,7 +10846,7 @@ impl UserManager {
 /// `EmojiStatus::get_emoji_status_object` — the reduced payload; the
 /// collectible upgraded-gift form lands with the Gifts step (the C++
 /// emits `emojiStatusUpgradedGift` there).
-fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
+pub(crate) fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
     td_api::EmojiStatus {
         r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
             td_api::emojiStatusTypeCustomEmoji {
@@ -14792,6 +15301,23 @@ mod tests {
         )
     }
 
+    /// The typed `promise_result` slots (a type-complexity clippy
+    /// alias, generic over the promise payload).
+    type TypedSlots<T> = (
+        Promise<T>,
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>,
+    );
+    /// The typed `promise_result`: a `Promise<T>` capturing its `Result`
+    /// into a shared slot.
+    fn typed_promise_result<T: Send + 'static>() -> TypedSlots<T> {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        (
+            PromiseCreator::lambda_result(move |r| *result_clone.lock().unwrap() = Some(r)),
+            result,
+        )
+    }
+
     /// Loads the contacts (marking `are_contacts_loaded_`) through the
     /// `on_get_contacts` intake, like the first server answer would.
     fn load_contacts_via_on_get_contacts(
@@ -15987,5 +16513,281 @@ mod tests {
         assert_eq!(um.user_full_contact_price.get(&6), Some(&0));
         um.allow_send_message_to_user(&env, UserId::new(7));
         assert_eq!(um.user_full_contact_price.get(&7), Some(&15));
+    }
+
+    #[test]
+    fn set_main_profile_tab_gates_null_and_the_unknown_channel_allow_list() {
+        let (_temp, mut um) = test_env();
+
+        // the null gate
+        let (promise, result) = promise_result();
+        um.set_main_profile_tab(None, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Profile tab must be non-empty")
+        );
+
+        // ProfileTab.cpp:61-95 with ChannelType::Unknown: only Posts/Gifts
+        let (promise, result) = promise_result();
+        um.set_main_profile_tab(
+            Some(td_api::ProfileTab::profileTabMedia(
+                td_api::profileTabMedia {},
+            )),
+            promise,
+        );
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Invalid profile tab specified for the chat")
+        );
+
+        // the allowed tabs park on the SetMainProfileTabQuery
+        let (promise, result) = promise_result();
+        um.set_main_profile_tab(
+            Some(td_api::ProfileTab::profileTabPosts(
+                td_api::profileTabPosts {},
+            )),
+            promise,
+        );
+        assert_eq!(um.net_blocked_promises.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+        um.net_blocked_promises.clear();
+    }
+
+    #[test]
+    fn set_user_note_runs_the_input_user_and_contact_gates() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        let user_id = add_received_user(&mut um, &mut env, 5, "Alice");
+
+        // the unknown user is the get_input_user 400
+        let (promise, result) = promise_result();
+        um.set_user_note(&env, UserId::new(99), None, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.code() == 400)
+        );
+
+        // the known non-contact is the contact-gate 400
+        let (promise, result) = promise_result();
+        um.set_user_note(&env, user_id, None, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "User isn't a contact")
+        );
+
+        // my own id fails the same contact gate first, like the C++
+        let (promise, result) = promise_result();
+        um.set_user_note(&env, um.get_my_id(), None, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "User isn't a contact")
+        );
+    }
+
+    #[test]
+    fn suggest_user_birthdate_gates_self_bots_and_parks() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        let user_id = add_received_user(&mut um, &mut env, 5, "Alice");
+        let birthdate = td_api::Birthdate {
+            day: 10,
+            month: 6,
+            year: 1990,
+        };
+
+        // self
+        let (promise, result) = promise_result();
+        um.suggest_user_birthdate(&env, um.get_my_id(), birthdate.clone(), promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Can't suggest birthdate to self")
+        );
+
+        // the known non-contact parks on the SuggestUserBirthdayQuery
+        // (the C++ has no contact gate here)
+        let (promise, result) = promise_result();
+        um.suggest_user_birthdate(&env, user_id, birthdate, promise);
+        assert_eq!(um.net_blocked_promises.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+        um.net_blocked_promises.clear();
+    }
+
+    #[test]
+    fn get_support_user_parks_until_the_ack_then_answers_from_the_cache() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        let user_id = add_received_user(&mut um, &mut env, 5, "Support");
+
+        // the uncached call parks on the GetSupportUserQuery
+        let (promise, result) = typed_promise_result();
+        um.get_support_user(&env, promise);
+        assert_eq!(um.pending_support_user_queries.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+
+        // the ack caches the id and answers the parked promise
+        let (promise, ack_result) = typed_promise_result();
+        um.on_get_support_user(&env, user_id, promise);
+        assert!(matches!(
+            *ack_result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(_))
+        ));
+
+        // the cached id answers immediately without parking
+        let (promise, result) = typed_promise_result();
+        um.get_support_user(&env, promise);
+        assert!(um.pending_support_user_queries.is_empty());
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(_))
+        ));
+    }
+
+    #[test]
+    fn set_profile_photo_impl_runs_the_validation_bands() {
+        let (mut temp, mut um) = test_env();
+        let env = temp.env(false);
+        let my_id = um.get_my_id();
+
+        // the null gate
+        let (promise, result) = promise_result();
+        um.set_profile_photo_impl(&env, my_id, None, false, false, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "New profile photo must be non-empty")
+        );
+
+        // inputChatPhotoPrevious for another user is the C++ 400
+        let previous =
+            td_api::InputChatPhoto::inputChatPhotoPrevious(td_api::inputChatPhotoPrevious {
+                chat_photo_id: 7,
+            });
+        let (promise, result) = promise_result();
+        um.set_profile_photo_impl(&env, UserId::new(5), Some(&previous), false, false, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Can't use inputChatPhotoPrevious")
+        );
+
+        // an unknown photo id is the cache-miss 400
+        let (promise, result) = promise_result();
+        um.set_profile_photo_impl(&env, my_id, Some(&previous), false, false, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Unknown profile photo ID specified")
+        );
+
+        // the animation timestamp band
+        let animation =
+            td_api::InputChatPhoto::inputChatPhotoAnimation(td_api::inputChatPhotoAnimation {
+                animation: None,
+                main_frame_timestamp: 42.0,
+            });
+        let (promise, result) = promise_result();
+        um.set_profile_photo_impl(&env, my_id, Some(&animation), false, false, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Wrong main frame timestamp specified")
+        );
+
+        // a static photo parks on the upload flow
+        let static_photo =
+            td_api::InputChatPhoto::inputChatPhotoStatic(td_api::inputChatPhotoStatic {
+                photo: None,
+            });
+        let (promise, result) = promise_result();
+        um.set_profile_photo_impl(&env, my_id, Some(&static_photo), false, false, promise);
+        assert_eq!(um.net_blocked_promises.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+        um.net_blocked_promises.clear();
+    }
+
+    #[test]
+    fn delete_profile_photo_parks_on_the_unloaded_user_full() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+
+        // no cached UserFull: the C++ reloads first ([blocked: net])
+        let (promise, result) = promise_result();
+        um.delete_profile_photo(&mut env, 7, promise);
+        assert_eq!(um.net_blocked_promises.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+        um.net_blocked_promises.clear();
+    }
+
+    #[test]
+    fn add_new_saved_music_runs_the_input_gates() {
+        let (_temp, mut um) = test_env();
+
+        // the null gate
+        let (promise, result) = promise_result();
+        um.add_new_saved_music(None, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Audio must be non-empty")
+        );
+
+        // the title/performer UTF-8 gate is the C++ raw-string band: a
+        // typed Rust String is always valid UTF-8, so it is exercised at
+        // the JSON plane, not here
+
+        // the clean input parks on the FileManager seam
+        let (promise, result) = promise_result();
+        um.add_new_saved_music(
+            Some(td_api::InputAudio {
+                audio: None,
+                album_cover_thumbnail: None,
+                duration: 10,
+                title: "Title".to_owned(),
+                performer: "Performer".to_owned(),
+            }),
+            promise,
+        );
+        assert_eq!(um.net_blocked_promises.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+        um.net_blocked_promises.clear();
+    }
+
+    #[test]
+    fn emoji_status_queries_answer_from_the_pmc_cache_and_park_when_empty() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+
+        // no cache: the get arms park, the cache stays untouched
+        let (promise, result) = typed_promise_result();
+        um.get_recent_emoji_statuses(&mut env, promise);
+        assert_eq!(um.pending_recent_emoji_statuses_queries.len(), 1);
+        assert!((*result.lock().unwrap()).is_none());
+        um.pending_recent_emoji_statuses_queries.clear();
+
+        // seed the recent cache (the C++ pmc framing) and re-query
+        let cache = crate::emoji_status::EmojiStatusesCache {
+            hash: 5,
+            emoji_statuses: vec![crate::emoji_status::EmojiStatus::from_telegram(
+                telegram_api::EmojiStatus::emojiStatus(telegram_api::emojiStatus {
+                    flags: 0,
+                    document_id: 42,
+                    until: 0,
+                }),
+            )],
+        };
+        let mut stored = Vec::new();
+        cache.store(&mut stored);
+        env.global.binlog_pmc().set_raw(
+            crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY,
+            &stored,
+        );
+
+        let (promise, result) = typed_promise_result();
+        um.get_recent_emoji_statuses(&mut env, promise);
+        assert!(um.pending_recent_emoji_statuses_queries.is_empty());
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(statuses)) => {
+                assert_eq!(statuses.emoji_statuses.len(), 1);
+            }
+            _ => panic!("the cached list must answer"),
+        }
+
+        // clear_recent_emoji_statuses empties the cache and parks the ok
+        let (promise, result) = promise_result();
+        um.clear_recent_emoji_statuses(&mut env, promise);
+        assert_eq!(um.net_blocked_promises.len(), 1);
+        let cleared = env
+            .global
+            .binlog_pmc()
+            .get_raw(crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY);
+        let parsed = crate::emoji_status::EmojiStatusesCache::parse(&cleared).unwrap();
+        assert_eq!(parsed.hash, 0);
+        assert!(parsed.emoji_statuses.is_empty());
+        assert!((*result.lock().unwrap()).is_none());
+        um.net_blocked_promises.clear();
     }
 }

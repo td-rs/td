@@ -127,6 +127,16 @@ impl QuickReplyManager {
         self.net_blocked_promises.push(promise);
     }
 
+    /// `get_quick_reply_shortcuts` (QuickReplyManager.cpp:1126-1137).
+    /// The C++ answers ok from the loaded shortcuts state and parks the
+    /// promise in `load_queries_` until the messages.getQuickReplies
+    /// reload lands; the load/reload machinery is the net seam here, so
+    /// the promise parks (the loaded fast path joins the intake port).
+    pub fn get_quick_reply_shortcuts(&mut self, promise: Promise<()>) {
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Send messages.getQuickReplies — [blocked: net]");
+    }
+
     /// `delete_quick_reply_shortcut` (QuickReplyManager.cpp:1412-1438).
     pub fn delete_quick_reply_shortcut(
         &mut self,

@@ -8314,7 +8314,9 @@ fn to_messages_manager_message_id(message_id: MessageId) -> crate::messages_mana
 /// The reverse bridge: the action plane reads `RepliedMessageInfo` ids in
 /// the `messages_manager` space, but the message structs still carry the
 /// pre-integration `chat_manager::MessageId`.
-fn to_chat_manager_message_id(message_id: crate::messages_manager::MessageId) -> MessageId {
+pub(crate) fn to_chat_manager_message_id(
+    message_id: crate::messages_manager::MessageId,
+) -> MessageId {
     MessageId::new(message_id.get())
 }
 

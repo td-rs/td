@@ -3492,6 +3492,12 @@ impl Location {
         result
     }
 
+    /// `Location::is_valid_map_point` (Location.cpp:78-81).
+    pub fn is_valid_map_point(&self) -> bool {
+        const MAX_VALID_MAP_LATITUDE: f64 = 85.05112877;
+        !self.is_empty() && self.latitude_.abs() <= MAX_VALID_MAP_LATITUDE
+    }
+
     /// `Location::get_location_object` (Location.cpp:83-88).
     pub fn get_location_object(&self) -> Option<td_api::Location> {
         if self.is_empty() {

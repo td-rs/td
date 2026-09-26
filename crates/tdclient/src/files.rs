@@ -15978,6 +15978,25 @@ impl FileLoadManager {
         query_id
     }
 
+    /// `FileLoadManager::read_file_part` (FileLoadManager.cpp:18-20) — the
+    /// synchronous `read_file_str` tail of the collapsed actor; the C++
+    /// `promise.set_result(...)` becomes the returned result.
+    pub fn read_file_part(
+        &mut self,
+        path: &str,
+        offset: i64,
+        count: i64,
+    ) -> Result<Vec<u8>, Status> {
+        read_file_str(path, count, offset)
+    }
+
+    /// `FileLoadManager::unlink_file` (FileLoadManager.cpp:22-24) — the
+    /// best-effort unlink; the immediate `promise.set_value(Unit())`
+    /// rides the caller.
+    pub fn unlink_file(&mut self, path: &str) {
+        let _ = std::fs::remove_file(path);
+    }
+
     fn download_resource_pool(&mut self, is_small: bool, dc_id: DcId) -> ResourcePool {
         let pool = ResourcePool {
             max_resource_limit: self.max_download_resource_limit,
@@ -16640,6 +16659,29 @@ pub fn open_partial_file_impl(path: &str, write: bool) -> Result<File, Status> {
         .map_err(|e| Status::error(500, &format!("Can't open the file \"{path}\": {e}")))
 }
 
+/// `read_file_str` (filesystem.cpp:36-58, the `read_file_impl<string>`
+/// tail): pread `size` bytes at `offset`; `size < 0` reads to the end.
+/// The C++ `string` is a byte string — the Rust twin returns the raw
+/// bytes (the `readFilePart` files may be binary).
+pub fn read_file_str(path: &str, mut size: i64, offset: i64) -> Result<Vec<u8>, Status> {
+    let from_file = open_partial_file_impl(path, false)?;
+    let file_size = from_file
+        .metadata()
+        .map_err(|_| Status::error_message("Can't get stat about the file"))?
+        .len() as i64;
+    if !(0..=file_size).contains(&offset) {
+        return Err(Status::error_message("Failed to read file: invalid offset"));
+    }
+    if size < 0 || size > file_size - offset {
+        size = file_size - offset;
+    }
+    let mut content = vec![0u8; size.max(0) as usize];
+    from_file
+        .read_exact_at(&mut content, offset as u64)
+        .map_err(|_| Status::error_message("Failed to read file"))?;
+    Ok(content)
+}
+
 /// `open_temp_file` (FileLoaderUtils.cpp:85-102): the id-named temp file
 /// under the per-base "temp" directory.
 pub fn open_temp_file_impl(
@@ -16691,6 +16733,69 @@ pub fn create_from_temp_impl(
     std::fs::rename(temp_path, &perm_path)
         .map_err(|e| Status::error(500, &format!("Can't rename the temporary file: {e}")))?;
     Ok(perm_path)
+}
+
+/// `get_suggested_file_name` (FileLoaderUtils.cpp:164-204) — the
+/// `getSuggestedFileName` tail: the cleaned name, or, when the directory
+/// exists, the first free `stem (N).ext` slot of the directory.
+pub fn get_suggested_file_name_impl<C: FileManagerContext + ?Sized>(
+    context: &C,
+    directory: &str,
+    file_name: &str,
+) -> String {
+    let cleaned_name = clean_filename(file_name);
+
+    let directory = if directory.is_empty() {
+        "./"
+    } else {
+        directory
+    };
+
+    let dir_stat = match context.stat(directory) {
+        Ok(stat) => stat,
+        Err(_) => return cleaned_name,
+    };
+    if !dir_stat.is_dir {
+        return cleaned_name;
+    }
+
+    let path_view = tdutils::path_view::PathView::new(&cleaned_name);
+    let stem = path_view.file_stem();
+    let ext = path_view.extension();
+
+    if stem.is_empty() {
+        return cleaned_name;
+    }
+
+    let mut directory = directory;
+    while directory.len() > 1 && (directory.ends_with('/') || directory.ends_with('\\')) {
+        directory = &directory[..directory.len() - 1];
+    }
+
+    let with_ext = |stem: &str| {
+        if ext.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{stem}.{ext}")
+        }
+    };
+    let check_file_name = |name: &str| context.stat(&format!("{directory}/{name}")).is_err();
+
+    let checked_name = with_ext(stem);
+    if check_file_name(&checked_name) {
+        return checked_name;
+    }
+
+    for i in 1..100 {
+        let checked_name = with_ext(&format!("{stem} ({i})"));
+        if check_file_name(&checked_name) {
+            return checked_name;
+        }
+    }
+
+    // `StringBuilder::FixedDouble(Clocks::system(), 3)` — the current
+    // system time with three decimals.
+    with_ext(&format!("{stem} - {:.3}", tdutils::time::now()))
 }
 
 /// One event of the collapsed [`FileGenerateManager`] callback plane —
@@ -18505,6 +18610,17 @@ fn check_download_priority(priority: i32) -> Result<(), Status> {
         Ok(())
     } else {
         Err(Status::error(400, "Invalid priority specified"))
+    }
+}
+
+/// `FileManager::check_priority` (FileManager.cpp:1424-1429) — the
+/// download/upload priority band behind `downloadFile` and
+/// `addFileToDownloads`.
+pub fn check_priority(priority: i32) -> Result<(), Status> {
+    if (1..=32).contains(&priority) {
+        Ok(())
+    } else {
+        Err(Status::error(400, "Priority must be between 1 and 32"))
     }
 }
 
@@ -21939,6 +22055,267 @@ impl FileManager {
         node.is_download_started = true;
         fllm.from_bytes(query_id, file_id, file_type, bytes, suggested_path);
         true
+    }
+
+    /// `FileManager::read_file_part` (FileManager.cpp:2843-2913) — the
+    /// validation ladder, then the synchronous read of the downloaded
+    /// prefix. The C++ retry actor (`SleepActor` + `left_tries`) collapses
+    /// to the inline retry loop — nothing can change between the tries of
+    /// a synchronous read, so a partial-local retry replays the identical
+    /// read and answers the same way; the loop burns all `left_tries`
+    /// before the error, like the C++ reschedule chain.
+    pub fn read_file_part(
+        &mut self,
+        file_id: FileId,
+        offset: i64,
+        mut count: i64,
+        left_tries: i32,
+        mut promise: tdutils::promise::Promise<Vec<u8>>,
+        fllm: &mut FileLoadManager,
+    ) {
+        if !file_id.is_valid() {
+            promise.set_error(Status::error(400, "File identifier is invalid"));
+            return;
+        }
+        let node_snapshot = self.get_file_view(file_id).map(|view| {
+            (
+                view.get_full_local_location().map(|full| full.path.clone()),
+                view.node.local.clone(),
+                view.get_type(),
+                view.downloaded_prefix(offset),
+            )
+        });
+        let Some((full_path, local, file_type, prefix)) = node_snapshot else {
+            promise.set_error(Status::error(400, "File not found"));
+            return;
+        };
+        if offset < 0 {
+            promise.set_error(Status::error(400, "Parameter offset must be non-negative"));
+            return;
+        }
+        if count < 0 {
+            promise.set_error(Status::error(400, "Parameter count must be non-negative"));
+            return;
+        }
+        if count == 0 {
+            count = prefix;
+            if count == 0 {
+                promise.set_value(Vec::new());
+                return;
+            }
+        } else if prefix < count {
+            // TODO this check is safer to do in another thread
+            promise.set_error(Status::error(
+                400,
+                "There is not enough downloaded bytes in the file to read",
+            ));
+            return;
+        }
+        if count >= (usize::MAX / 2 - 1) as i64 {
+            promise.set_error(Status::error(400, "Part length is too big"));
+            return;
+        }
+
+        let (path, is_partial) = if let Some(path) = full_path {
+            let (files_dir, secure_files_dir) = {
+                let ctx = self.ctx();
+                (ctx.files_dir(), ctx.secure_files_dir())
+            };
+            if !path.starts_with(&get_files_dir(file_type, &files_dir, &secure_files_dir)) {
+                promise.set_error(Status::error(400, "File is not inside the cache"));
+                return;
+            }
+            (path, false)
+        } else {
+            match local {
+                LocalFileLocation::Partial(partial) => (partial.path, true),
+                _ => unreachable!("read_file_part: neither full nor partial local location"),
+            }
+        };
+
+        let mut remaining = left_tries;
+        loop {
+            match fllm.read_file_part(&path, offset, count) {
+                Result::Ok(bytes) => {
+                    promise.set_value(bytes);
+                    return;
+                }
+                Result::Err(status) => {
+                    tracing::info!("Failed to read file bytes: {status}");
+                    remaining -= 1;
+                    // the C++ errors when `left_tries == 1` and otherwise
+                    // reschedules with `left_tries - 1` — `left_tries`
+                    // attempts in total
+                    if !is_partial || remaining == 0 {
+                        promise.set_error(Status::error(400, "Failed to read the file"));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `FileManager::delete_file` (FileManager.cpp:2915-2952) — the local
+    /// location teardown + the unlink tail. The pmc/notify halves ride the
+    /// worker/context seams, exactly like the C++ `clear_from_pmc` and
+    /// `Context::on_new_file` calls.
+    pub fn delete_file(
+        &mut self,
+        file_id: FileId,
+        mut promise: tdutils::promise::Promise<()>,
+        source: &str,
+        fllm: &mut FileLoadManager,
+    ) {
+        tracing::info!("Trying to delete file {file_id} from {source}");
+        let Some(node_id) = self.node_id_of(file_id) else {
+            promise.set_value(());
+            return;
+        };
+
+        let snapshot = {
+            let node = self.file_nodes[node_id].as_ref().expect("node");
+            let view = FileView::new(node);
+            (
+                view.get_main_file_id(),
+                view.has_full_local_location(),
+                view.get_type(),
+                view.size(),
+                view.path().to_string(),
+                matches!(node.local, LocalFileLocation::Partial(_)),
+                node.local.clone(),
+            )
+        };
+        let (main_file_id, has_full_local, file_type, size, node_path, is_partial, local) =
+            snapshot;
+
+        if let Some(worker) = self.worker.as_deref_mut() {
+            worker.remove_file_if_finished(main_file_id);
+        }
+
+        let (files_dir, secure_files_dir) = {
+            let ctx = self.ctx();
+            (ctx.files_dir(), ctx.secure_files_dir())
+        };
+        let files_dir = get_files_dir(file_type, &files_dir, &secure_files_dir);
+        let mut path = String::new();
+        if has_full_local {
+            if node_path.starts_with(&files_dir) {
+                if let Some(node) = self.file_nodes[node_id].as_ref()
+                    && let Some(worker) = self.worker.as_deref_mut()
+                {
+                    worker.clear_from_pmc(node);
+                }
+                if self.ctx().need_notify_on_new_files() {
+                    // `FileView::get_allocated_local_size`
+                    // (FileManager.cpp:1000-1008): the stat'ed disk usage,
+                    // 0 when the path is gone.
+                    let allocated = if node_path.is_empty() {
+                        0
+                    } else {
+                        self.ctx()
+                            .stat(&node_path)
+                            .map(|stat| stat.real_size)
+                            .unwrap_or(0)
+                    };
+                    self.ctx().on_new_file(-size, -allocated, -1);
+                }
+                path = node_path;
+            }
+        } else {
+            if file_type == FileType::Encrypted
+                && let Some(node) = self.file_nodes[node_id].as_ref()
+                && let Some(worker) = self.worker.as_deref_mut()
+            {
+                worker.clear_from_pmc(node);
+            }
+            if is_partial {
+                path = match local {
+                    LocalFileLocation::Partial(partial) => partial.path,
+                    _ => unreachable!("delete_file: partial flag without the location"),
+                };
+            }
+        }
+
+        if path.is_empty() {
+            promise.set_value(());
+            return;
+        }
+
+        tracing::info!("Unlink file {file_id} at {path}");
+        if let Some(node) = self.file_nodes[node_id].as_mut() {
+            node.drop_local_location();
+        }
+        self.try_flush_node(node_id);
+        fllm.unlink_file(&path);
+        promise.set_value(());
+    }
+
+    /// `FileManager::get_suggested_file_name` (FileManager.cpp:5374-5383).
+    pub fn get_suggested_file_name(
+        &mut self,
+        file_id: FileId,
+        directory: &str,
+    ) -> Result<String, Status> {
+        if !file_id.is_valid() {
+            return Err(Status::error(400, "Invalid file identifier"));
+        }
+        let suggested_path = match self.get_file_view(file_id) {
+            Some(view) => view.suggested_path(),
+            None => return Err(Status::error(400, "Wrong file identifier")),
+        };
+        Ok(get_suggested_file_name_impl(
+            self.ctx(),
+            directory,
+            tdutils::path_view::PathView::new(&suggested_path).file_name(),
+        ))
+    }
+
+    /// `FileManager::get_map_thumbnail_file_id` (FileManager.cpp:4311-4350)
+    /// — the validation ladder, the mercator tile coordinates and the
+    /// `#map#` generate registration. The tile fetch itself is the
+    /// remotely-generated seam (`is_remotely_generated_file`) parked at
+    /// the `[blocked: net]` generate plane.
+    pub fn get_map_thumbnail_file_id(
+        &mut self,
+        location: &crate::chat_manager::Location,
+        zoom: i32,
+        width: i32,
+        height: i32,
+        scale: i32,
+        owner_dialog_id: DialogId,
+    ) -> Result<FileId, Status> {
+        if !location.is_valid_map_point() {
+            return Err(Status::error(400, "Invalid location specified"));
+        }
+        if !(13..=20).contains(&zoom) {
+            return Err(Status::error(400, "Wrong zoom"));
+        }
+        if !(16..=1024).contains(&width) {
+            return Err(Status::error(400, "Wrong width"));
+        }
+        if !(16..=1024).contains(&height) {
+            return Err(Status::error(400, "Wrong height"));
+        }
+        if !(1..=3).contains(&scale) {
+            return Err(Status::error(400, "Wrong scale"));
+        }
+
+        const PI: f64 = std::f64::consts::PI;
+        let sin_latitude = (location.get_latitude() * PI / 180.0).sin();
+        let size = 256i32 * (1i32 << zoom);
+        let mut x = ((location.get_longitude() + 180.0) / 360.0 * size as f64) as i32;
+        let mut y = ((0.5 - ((1.0 + sin_latitude) / (1.0 - sin_latitude)).ln() / (4.0 * PI))
+            * size as f64) as i32;
+        x = x.clamp(0, size - 1); // just in case
+        y = y.clamp(0, size - 1); // just in case
+
+        let conversion = format!("#map#{zoom}#{x}#{y}#{width}#{height}#{scale}#");
+        let file_type = if owner_dialog_id.get_type() == DialogType::SecretChat {
+            FileType::EncryptedThumbnail
+        } else {
+            FileType::Thumbnail
+        };
+        Ok(self.register_generate(file_type, String::new(), conversion, owner_dialog_id, 0))
     }
 }
 
@@ -25389,5 +25766,328 @@ mod file_load_manager_tests {
         let node = file_manager.get_file_node(file_id).expect("node");
         assert_eq!(node.upload_priority, 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The files-glue slice tests: the `readFilePart`/`deleteFile`/
+/// `getSuggestedFileName`/`getMapThumbnailFile` FileManager arms over real
+/// temp files, in the C++ `FileManager` test order.
+#[cfg(test)]
+mod files_glue_tests {
+    use super::*;
+
+    /// The never-queried net factory: the read/unlink arms never touch the
+    /// download nets.
+    struct NopFactory;
+
+    impl FileLoadNetFactory for NopFactory {
+        fn download_net(&mut self) -> Box<dyn FileDownloaderNet> {
+            unimplemented!("read_file_part never opens a net")
+        }
+        fn upload_net(&mut self) -> Box<dyn FileUploaderNet> {
+            unimplemented!("read_file_part never opens a net")
+        }
+        fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet> {
+            unimplemented!("read_file_part never opens a net")
+        }
+        fn utils_net(&mut self) -> Box<dyn FileDownloaderNet> {
+            unimplemented!("read_file_part never opens a net")
+        }
+    }
+
+    /// The captured `Result<[u8]>`/`Result<()>` of a file promise.
+    #[allow(clippy::type_complexity)]
+    fn capture_promise<T: Send + 'static>() -> (
+        tdutils::promise::Promise<T>,
+        Arc<parking_lot::Mutex<Option<tdutils::status::Result<T>>>>,
+    ) {
+        let slot: Arc<parking_lot::Mutex<Option<tdutils::status::Result<T>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let capture = Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<T>| {
+                *capture.lock() = Some(result);
+            },
+        );
+        (promise, slot)
+    }
+
+    /// A context over a real temp root: `files_dir()` is the root, the
+    /// stat/realpath halves hit the real filesystem.
+    struct TempDirContext {
+        root: String,
+    }
+
+    impl FileManagerContext for TempDirContext {
+        fn real_path(&self, path: &str) -> Result<String, Status> {
+            std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|_| Status::error(400, "Can't find real file path"))
+        }
+        fn files_dir(&self) -> String {
+            format!("{}/", self.root)
+        }
+    }
+
+    /// Registers a `size`-byte local file under the temp root; returns the
+    /// file id and the file bytes.
+    fn register_cached_file(
+        manager: &mut FileManager,
+        root: &str,
+        name: &str,
+        contents: &[u8],
+    ) -> (FileId, Vec<u8>) {
+        // the registered location must sit under the per-type files dir
+        // (`{root}/documents/`), like every C++ cached file
+        let dir = format!("{root}/documents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = format!("{dir}/{name}");
+        std::fs::write(&path, contents).unwrap();
+        let file_id = manager
+            .register_local(
+                FullLocalFileLocation::new(FileType::Document, path, 0),
+                DialogId::default(),
+                contents.len() as i64,
+                false,
+                false,
+                FileId::default(),
+            )
+            .expect("register_local");
+        (file_id, contents.to_vec())
+    }
+
+    #[test]
+    fn read_file_part_validation_table() {
+        let mut manager = FileManager::new();
+        let fllm =
+            &mut FileLoadManager::new(Box::new(NopFactory), FileLoadManagerOptions::default());
+
+        let (promise, slot) = capture_promise();
+        manager.read_file_part(FileId::new(0, 0), 0, 1, 2, promise, fllm);
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.error().message(), "File identifier is invalid");
+
+        let (promise, slot) = capture_promise();
+        manager.read_file_part(FileId::new(41, 0), 0, 1, 2, promise, fllm);
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.error().message(), "File not found");
+
+        let root = std::env::temp_dir().join("td_rs_read_file_part_bands");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (file_id, _) =
+            register_cached_file(&mut manager, &root.to_string_lossy(), "unused", b"x");
+        for (offset, count, message) in [
+            (-1, 1, "Parameter offset must be non-negative"),
+            (0, -1, "Parameter count must be non-negative"),
+        ] {
+            let (promise, slot) = capture_promise();
+            manager.read_file_part(file_id, offset, count, 2, promise, fllm);
+            let result = slot.lock().take().expect("settled");
+            assert_eq!(result.error().message(), message);
+        }
+    }
+
+    #[test]
+    fn read_file_part_reads_the_downloaded_prefix() {
+        let root = std::env::temp_dir().join("td_rs_read_file_part");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let mut manager = FileManager::new();
+        manager.set_context(Box::new(TempDirContext {
+            root: root_str.clone(),
+        }));
+        let contents = b"hello, files glue";
+        let (file_id, _) = register_cached_file(&mut manager, &root_str, "part.bin", contents);
+        let fllm =
+            &mut FileLoadManager::new(Box::new(NopFactory), FileLoadManagerOptions::default());
+
+        // count == 0 reads the whole downloaded prefix
+        let (promise, slot) = capture_promise();
+        manager.read_file_part(file_id, 0, 0, 2, promise, fllm);
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.move_as_ok(), contents.to_vec());
+
+        // an explicit count inside the prefix reads the window
+        let (promise, slot) = capture_promise();
+        manager.read_file_part(file_id, 7, 5, 2, promise, fllm);
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.move_as_ok(), b"files".to_vec());
+
+        // count beyond the prefix is the C++ 400
+        let (promise, slot) = capture_promise();
+        manager.read_file_part(file_id, 0, contents.len() as i64 + 1, 2, promise, fllm);
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(
+            result.error().message(),
+            "There is not enough downloaded bytes in the file to read"
+        );
+
+        // an offset beyond the registered size reads nothing
+        let (promise, slot) = capture_promise();
+        manager.read_file_part(file_id, contents.len() as i64, 0, 2, promise, fllm);
+        let result = slot.lock().take().expect("settled");
+        assert_eq!(result.move_as_ok(), Vec::<u8>::new());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_file_unlinks_cached_files_and_answers_ok() {
+        let root = std::env::temp_dir().join("td_rs_delete_file");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let mut manager = FileManager::new();
+        manager.set_context(Box::new(TempDirContext {
+            root: root_str.clone(),
+        }));
+        let (file_id, _) = register_cached_file(&mut manager, &root_str, "gone.bin", b"bye");
+        let path = root_str.clone() + "/documents/gone.bin";
+        let fllm =
+            &mut FileLoadManager::new(Box::new(NopFactory), FileLoadManagerOptions::default());
+
+        let (promise, slot) = capture_promise();
+        manager.delete_file(file_id, promise, "deleteFile", fllm);
+        assert_eq!(slot.lock().take().expect("settled").move_as_ok(), ());
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the file is unlinked"
+        );
+        // the local location is dropped from the node
+        assert_eq!(manager.get_file_node(file_id).expect("node").path(), "");
+
+        // an unknown file id answers ok, like the C++ null-node band
+        let (promise, slot) = capture_promise();
+        manager.delete_file(FileId::new(41, 0), promise, "deleteFile", fllm);
+        assert_eq!(slot.lock().take().expect("settled").move_as_ok(), ());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_suggested_file_name_avoids_collisions() {
+        let root = std::env::temp_dir().join("td_rs_suggested_name");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let mut manager = FileManager::new();
+        manager.set_context(Box::new(TempDirContext {
+            root: root_str.clone(),
+        }));
+        let context = TempDirContext {
+            root: root_str.clone(),
+        };
+
+        // an unknown file id is the C++ "Wrong file identifier" band
+        let error = manager
+            .get_suggested_file_name(FileId::new(41, 0), "")
+            .unwrap_err();
+        assert_eq!(error.message(), "Wrong file identifier");
+
+        // an empty directory means the cleaned name, unchanged
+        let named = manager.register_remote(
+            FullRemoteFileLocation::from_document(
+                FileType::Document,
+                1,
+                2,
+                DcId::internal(1),
+                "ref".to_owned(),
+            ),
+            FileLocationSource::FromUser,
+            DialogId::default(),
+            7,
+            0,
+            "doc.bin".to_owned(),
+        );
+        let cleaned = manager
+            .get_suggested_file_name(named, &root_str)
+            .expect("ok");
+        assert_eq!(cleaned, "doc.bin");
+
+        // the first free `stem (N).ext` slot wins
+        std::fs::write(format!("{root_str}/doc.bin"), b"x").unwrap();
+        let cleaned = manager
+            .get_suggested_file_name(named, &root_str)
+            .expect("ok");
+        assert_eq!(cleaned, "doc (1).bin");
+        std::fs::write(format!("{root_str}/doc (1).bin"), b"x").unwrap();
+        let cleaned = manager
+            .get_suggested_file_name(named, &root_str)
+            .expect("ok");
+        assert_eq!(cleaned, "doc (2).bin");
+
+        // a non-existent directory answers the cleaned name
+        let cleaned = manager
+            .get_suggested_file_name(named, "/no/such/dir/")
+            .expect("ok");
+        assert_eq!(cleaned, "doc.bin");
+
+        drop(context);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_map_thumbnail_file_id_validates_and_builds_the_conversion() {
+        let mut manager = FileManager::new();
+        let location = crate::chat_manager::Location::from_td_api_location(&td_api::Location {
+            latitude: 37.484,
+            longitude: 55.8987,
+            horizontal_accuracy: 0.0,
+        });
+
+        // the validation ladder, in the C++ order
+        let bad_location = crate::chat_manager::Location::from_td_api_location(&td_api::Location {
+            latitude: 95.0,
+            longitude: 0.0,
+            horizontal_accuracy: 0.0,
+        });
+        assert_eq!(
+            manager
+                .get_map_thumbnail_file_id(&bad_location, 15, 100, 100, 1, DialogId::default())
+                .unwrap_err()
+                .message(),
+            "Invalid location specified"
+        );
+        for (zoom, width, height, scale, message) in [
+            (12, 100, 100, 1, "Wrong zoom"),
+            (21, 100, 100, 1, "Wrong zoom"),
+            (15, 15, 100, 1, "Wrong width"),
+            (15, 1025, 100, 1, "Wrong width"),
+            (15, 100, 15, 1, "Wrong height"),
+            (15, 100, 1025, 1, "Wrong height"),
+            (15, 100, 100, 0, "Wrong scale"),
+            (15, 100, 100, 4, "Wrong scale"),
+        ] {
+            assert_eq!(
+                manager
+                    .get_map_thumbnail_file_id(
+                        &location,
+                        zoom,
+                        width,
+                        height,
+                        scale,
+                        DialogId::default()
+                    )
+                    .unwrap_err()
+                    .message(),
+                message,
+            );
+        }
+
+        // the mercator tile coordinates land in the `#map#` conversion
+        let file_id = manager
+            .get_map_thumbnail_file_id(&location, 15, 100, 100, 1, DialogId::default())
+            .expect("ok");
+        let node = manager.get_file_node(file_id).expect("node");
+        let generate = node.generate.as_ref().expect("generate location");
+        assert_eq!(generate.file_type, FileType::Thumbnail);
+        // the C++ mercator tail: x over the longitude, y over
+        // `log((1 + sin lat) / (1 - sin lat))` — both clamped into the tile
+        assert_eq!(generate.conversion, "#map#15#5496838#3250931#100#100#1#");
     }
 }

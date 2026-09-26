@@ -7,11 +7,16 @@
 //! `getMarkdownText` — the C++ `parseHtml` is the `parseTextEntities`
 //! HTML parse mode), and M.24 flips `getLanguagePackString` (the
 //! `SynchronousRequests::do_request` tail over the language pack
-//! database). The phone-number and push-id functions still land with
-//! their managers (Wave 3); until then they report "The method can't be
-//! executed synchronously", like any other request.
+//! database). The countries glue slice flips `getCountryFlagEmoji` and
+//! `getPhoneNumberInfoSync` (the CountryInfoManager statics), and the
+//! push-id function landed with its manager. `searchQuote`,
+//! `checkQuickReplyShortcutName` and `cleanFileName` still land with
+//! theirs; until then they report "The method can't be executed
+//! synchronously", like any other request.
 
 use std::sync::Mutex;
+
+use tdmtproto::telegram_api;
 
 use crate::message_entity;
 use crate::option_manager;
@@ -96,10 +101,13 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::searchStringsByPrefix(_)
             | Function::getLanguagePackString(_)
             | Function::getChatFolderDefaultIconName(_)
+            | Function::checkQuickReplyShortcutName(_)
+            | Function::getPushReceiverId(_)
+            | Function::getCountryFlagEmoji(_)
+            | Function::getPhoneNumberInfoSync(_)
+            | Function::cleanFileName(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
-    // Not ported yet (need their managers): searchQuote,
-    // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
-    // getPhoneNumberInfoSync, getPushReceiverId.
+    // Not ported yet (need their managers): searchQuote.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -183,6 +191,59 @@ fn get_json_string(json_value: &TdJsonValue) -> String {
     tdutils::json::json_encode(&json_value_to_json(json_value), false)
 }
 
+/// `JsonValue.cpp:convert_json_value_member` (JsonValue.cpp:93-99) — the
+/// object-member intake; the invalid-UTF-8 key clearing rides the C++
+/// `clean_input_string` mutation.
+fn convert_json_value_member(member: &td_api::JsonObjectMember) -> telegram_api::JSONObjectValue {
+    telegram_api::JSONObjectValue {
+        key: crate::misc::clean_input_string(&member.key).unwrap_or_default(),
+        value: Some(Box::new(convert_json_value(member.value.as_deref()))),
+    }
+}
+
+/// `JsonValue.cpp:convert_json_value` (JsonValue.cpp:101-131) — the td_api
+/// JsonValue → `telegram_api::JSONValue` wire conversion (the
+/// `saveApplicationLogEvent` data intake). The C++ null pointer becomes
+/// `jsonNull` like the leading null branch — here the `None` of the
+/// flattened model.
+pub fn convert_json_value(json_value: Option<&TdJsonValue>) -> telegram_api::JSONValue {
+    let Some(json_value) = json_value else {
+        return telegram_api::JSONValue::jsonNull(telegram_api::jsonNull);
+    };
+    match json_value {
+        TdJsonValue::jsonValueNull(_) => telegram_api::JSONValue::jsonNull(telegram_api::jsonNull),
+        TdJsonValue::jsonValueBoolean(value) => {
+            telegram_api::JSONValue::jsonBool(telegram_api::jsonBool { value: value.value })
+        }
+        TdJsonValue::jsonValueNumber(value) => {
+            telegram_api::JSONValue::jsonNumber(telegram_api::jsonNumber { value: value.value })
+        }
+        TdJsonValue::jsonValueString(value) => {
+            // an invalid-UTF-8 string clears, like the C++ in-place mutation
+            let value = crate::misc::clean_input_string(&value.value).unwrap_or_default();
+            telegram_api::JSONValue::jsonString(telegram_api::jsonString { value })
+        }
+        TdJsonValue::jsonValueArray(value) => {
+            telegram_api::JSONValue::jsonArray(telegram_api::jsonArray {
+                value: value
+                    .values
+                    .iter()
+                    .map(|item| Box::new(convert_json_value(Some(item.as_ref()))))
+                    .collect(),
+            })
+        }
+        TdJsonValue::jsonValueObject(value) => {
+            telegram_api::JSONValue::jsonObject(telegram_api::jsonObject {
+                value: value
+                    .members
+                    .iter()
+                    .map(|member| Box::new(convert_json_value_member(member)))
+                    .collect(),
+            })
+        }
+    }
+}
+
 /// `SynchronousRequests::run_request` — the dispatcher behind `td_execute`.
 pub fn run_request(function: Function) -> Object {
     match function {
@@ -212,6 +273,52 @@ pub fn run_request(function: Function) -> Object {
             let icon_name =
                 crate::dialog_filter_manager::DialogFilter::get_default_icon_name(&folder);
             Object::chatFolderIcon(td_api::ChatFolderIcon { name: icon_name })
+        }
+        // `SynchronousRequests::do_request(checkQuickReplyShortcutName)`
+        // (SynchronousRequests.cpp:248-255) — the pure
+        // `QuickReplyManager::check_shortcut_name` static; the error code
+        // is the sync-handler 200, not the status's own code.
+        Function::checkQuickReplyShortcutName(request) => {
+            match crate::quick_reply_manager::check_shortcut_name(&request.name) {
+                Ok(()) => Object::ok(td_api::Ok),
+                Err(status) => make_error(200, status.message()),
+            }
+        }
+        Function::getPushReceiverId(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:288-303)
+            // — the NotificationManager payload walk; the VLOG(notifications)
+            // error log rides the result arm.
+            match crate::notification_manager::get_push_receiver_id(&request.payload) {
+                Ok(receiver_id) => {
+                    Object::pushReceiverId(td_api::PushReceiverId { id: receiver_id })
+                }
+                Err((code, message)) => make_error(code, &message),
+            }
+        }
+        Function::getCountryFlagEmoji(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:257-260)
+            // — no UTF-8 check on the country code.
+            Object::text(td_api::Text {
+                text: crate::country_info_manager::get_country_flag_emoji(&request.country_code),
+            })
+        }
+        Function::getPhoneNumberInfoSync(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:282-286)
+            // — no UTF-8 check on the language code/phone number; the
+            // static CountryInfoManager lookup over the compiled-in "en"
+            // fallback list.
+            Object::phoneNumberInfo(crate::country_info_manager::get_phone_number_info_sync(
+                &request.language_code,
+                request.phone_number_prefix,
+            ))
+        }
+        Function::cleanFileName(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:272-276)
+            // — the pure `clean_filename` static; like its neighbours the
+            // file name UTF-8 correctness is not checked.
+            Object::text(td_api::Text {
+                text: crate::files::clean_filename(&request.file_name),
+            })
         }
         Function::getJsonValue(request) => match get_json_value(&request.json) {
             Result::Ok(value) => json_value_object(value),
@@ -872,6 +979,68 @@ mod tests {
     }
 
     #[test]
+    fn get_country_flag_emoji_answers_the_cpp_bytes() {
+        // SynchronousRequests.cpp:257-260 — the CountryInfoManager static.
+        // The JsonEmitter keeps non-ASCII raw UTF-8 (the M.8 codegen fact,
+        // the 234-record golden); no surrogate escaping.
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "US".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"text\",\"text\":\"\u{1F1FA}\u{1F1F8}\"}"
+        );
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "yl".to_string(),
+        });
+        // the crystal ball special case
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"text\",\"text\":\"\u{1F52E}\"}"
+        );
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "FT".to_string(),
+        });
+        // the pirate flag special case
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"text\",\"text\":\"\u{1F3F4}\u{200D}\u{2620}\u{FE0F}\"}"
+        );
+        let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
+            country_code: "USA".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+    }
+
+    #[test]
+    fn get_phone_number_info_sync_answers_from_the_embedded_list() {
+        // SynchronousRequests.cpp:282-286 — the CountryInfoManager static
+        // over the compiled-in "en" list.
+        let function = Function::getPhoneNumberInfoSync(td_api::getPhoneNumberInfoSync {
+            language_code: "en".to_string(),
+            phone_number_prefix: "+1 (999) 123-4567".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"US\",\"name\":\"USA\",\"english_name\":\"USA\",\"flag_emoji\":\"\u{1F1FA}\u{1F1F8}\",\"is_hidden\":false,\"calling_codes\":[\"1\"]},\"country_calling_code\":\"1\",\"formatted_phone_number\":\"999 123 4567\",\"is_anonymous\":false}"
+        );
+        // the missing-language "en" fallback + the fragment country
+        // (the FT flag rides the pirate-flag special case); the JsonEmitter
+        // keeps non-ASCII raw UTF-8 (the M.8 codegen fact)
+        let function = Function::getPhoneNumberInfoSync(td_api::getPhoneNumberInfoSync {
+            language_code: "de".to_string(),
+            phone_number_prefix: "88812345678".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"FT\",\"name\":\"Anonymous Numbers\",\"english_name\":\"Anonymous Numbers\",\"flag_emoji\":\"\u{1F3F4}\u{200D}\u{2620}\u{FE0F}\",\"is_hidden\":true,\"calling_codes\":[\"888\"]},\"country_calling_code\":\"888\",\"formatted_phone_number\":\"1234 5678\",\"is_anonymous\":true}"
+        );
+    }
+
+    #[test]
     fn test_return_error_passes_through() {
         let function = Function::testReturnError(td_api::testReturnError {
             error: Some(td_api::Error {
@@ -1040,5 +1209,88 @@ mod tests {
             run_request(empty_function).to_json(),
             r#"{"@type":"error","code":400,"message":"Chat folder must be non-empty"}"#
         );
+    }
+
+    // -------------------------------------------------------------------
+    // M.glue files — the cleanFileName sync arm + the app-log data wire
+    // conversion
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn clean_filename_reports_the_cleaned_name() {
+        // `SynchronousRequests::do_request(cleanFileName)`
+        // (SynchronousRequests.cpp:272-276) — the pure `clean_filename`
+        // static; the reserved code points drop out of the name.
+        let response = run_request(Function::cleanFileName(td_api::cleanFileName {
+            file_name: "a<b>c.png".to_owned(),
+        }));
+        assert_eq!(response.to_json(), r#"{"@type":"text","text":"a b c.png"}"#);
+    }
+
+    #[test]
+    fn convert_json_value_builds_the_wire_shapes() {
+        // the C++ null-pointer branch answers jsonNull
+        assert!(matches!(
+            convert_json_value(None),
+            telegram_api::JSONValue::jsonNull(_)
+        ));
+
+        // the object walk: every member keeps its key and its converted
+        // wire variant
+        let value = TdJsonValue::jsonValueObject(td_api::jsonValueObject {
+            members: vec![
+                Box::new(td_api::JsonObjectMember {
+                    key: "b".to_owned(),
+                    value: Some(Box::new(TdJsonValue::jsonValueBoolean(
+                        td_api::jsonValueBoolean { value: true },
+                    ))),
+                }),
+                Box::new(td_api::JsonObjectMember {
+                    key: "n".to_owned(),
+                    value: Some(Box::new(TdJsonValue::jsonValueNumber(
+                        td_api::jsonValueNumber { value: 1.5 },
+                    ))),
+                }),
+                Box::new(td_api::JsonObjectMember {
+                    key: "s".to_owned(),
+                    value: Some(Box::new(TdJsonValue::jsonValueString(
+                        td_api::jsonValueString {
+                            value: "x".to_owned(),
+                        },
+                    ))),
+                }),
+            ],
+        });
+        let converted = convert_json_value(Some(&value));
+        let telegram_api::JSONValue::jsonObject(object) = converted else {
+            panic!("expected the jsonObject wire shape");
+        };
+        assert_eq!(object.value.len(), 3);
+        assert_eq!(object.value[0].key, "b");
+        assert!(matches!(
+            object.value[0].value.as_deref(),
+            Some(telegram_api::JSONValue::jsonBool(_))
+        ));
+        assert_eq!(object.value[1].key, "n");
+        let telegram_api::JSONValue::jsonNumber(number) = object.value[1].value.as_deref().unwrap()
+        else {
+            panic!("expected the jsonNumber wire shape");
+        };
+        assert_eq!(number.value, 1.5);
+        assert_eq!(object.value[2].key, "s");
+        let telegram_api::JSONValue::jsonString(string) = object.value[2].value.as_deref().unwrap()
+        else {
+            panic!("expected the jsonString wire shape");
+        };
+        assert_eq!(string.value, "x");
+
+        // the array walk
+        let array = TdJsonValue::jsonValueArray(td_api::jsonValueArray {
+            values: vec![Box::new(TdJsonValue::jsonValueNull(td_api::jsonValueNull))],
+        });
+        assert!(matches!(
+            convert_json_value(Some(&array)),
+            telegram_api::JSONValue::jsonArray(_)
+        ));
     }
 }

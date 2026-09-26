@@ -51,6 +51,20 @@ pub trait CallManagerEnv: CallActorEnv + DhCacheEnv {
             "Send phone.setCallRating(rating = {rating}, comment = {comment}) — [blocked: net]"
         );
     }
+
+    /// `SaveCallLogQuery` (CallManager.cpp:96-118) — `[blocked: net]`
+    /// over the M.12 upload surface.
+    fn send_save_call_log_query(
+        &mut self,
+        input_call: &InputCallId,
+        log_file: &Option<td_api::InputFile>,
+    ) {
+        tdutils::log_info!(
+            "Send phone.saveCallLog(has_file = {}) — [blocked: net]",
+            log_file.is_some()
+        );
+        let _ = input_call;
+    }
 }
 
 /// `CallManager::CallInfo` (CallManager.h:60-63).
@@ -296,6 +310,30 @@ impl CallManager {
             }
         };
         self.do_send_call_debug_information(env, call_id, data, promise);
+    }
+
+    /// `send_call_log` (CallManager.cpp:614-634) — the close gate and
+    /// the InputCallId resolution bands are real; the call-log file
+    /// intake (`FileManager::get_input_file_id(FileType::CallLog)` + the
+    /// encrypted-file band) rides the M.12 env surface and the
+    /// `SaveCallLogQuery` upload parks (the recorded upload queue).
+    pub fn send_call_log(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        input_call: &Option<td_api::InputCall>,
+        log_file: Option<td_api::InputFile>,
+        mut promise: Promise<()>,
+    ) {
+        let status = env.close_status();
+        if status.is_error() {
+            return promise.set_error(status);
+        }
+        let call_id = match InputCallId::get_input_call_id(input_call) {
+            Ok(call_id) => call_id,
+            Err(status) => return promise.set_error(status),
+        };
+        env.send_save_call_log_query(&call_id, &log_file);
+        self.net_blocked_promises.push(promise);
     }
 
     /// `rate_call` (CallManager.cpp:256-273) — the `SetCallRatingQuery`
@@ -708,5 +746,32 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_some());
         assert!(env.queries.is_empty());
         assert!(manager.net_blocked_promises.is_empty());
+    }
+
+    #[test]
+    fn send_call_log_validates_the_input_call_and_parks() {
+        let mut env = TestEnv::new();
+        let mut manager = CallManager::new();
+
+        // a missing input call errors on the resolution band
+        let (promise, recorded) = record::<()>();
+        manager.send_call_log(&mut env, &None, None, promise);
+        assert!(matches!(
+            recorded.0.lock().unwrap().take().unwrap(),
+            Result::Err(ref status) if status.message() == "Input call must be non-empty"
+        ));
+
+        // a call id rides to the upload seam and parks
+        let (promise, recorded) = record::<()>();
+        manager.send_call_log(
+            &mut env,
+            &Some(td_api::InputCall::inputCallDiscarded(
+                td_api::inputCallDiscarded { call_id: 9 },
+            )),
+            None,
+            promise,
+        );
+        assert!(recorded.0.lock().unwrap().is_none());
+        assert_eq!(manager.net_blocked_promises.len(), 1);
     }
 }

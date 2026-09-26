@@ -6,8 +6,9 @@
 //! binlog log events (0x500-0x508) replay through [`AccountManager::on_binlog_events`],
 //! and the actor timeout (the unconfirmed-session expiry re-check) is the
 //! recorded collapse. The flows with no td_api arm in this revision
-//! (set_default_message_ttl/get_default_message_ttl/set_inactive_session_ttl_days/
-//! import_contact_token) are recorded here, not ported.
+//! (set_default_message_ttl/get_default_message_ttl) are recorded here,
+//! not ported; `set_inactive_session_ttl_days`/`import_contact_token`
+//! landed with the misc glue slice (the arms over the net seams).
 
 use crate::age_verification_parameters::AgeVerificationParameters;
 use crate::store_parse::{self, Parser};
@@ -114,6 +115,15 @@ pub trait AccountManagerEnv {
 
     fn send_get_account_ttl_query(&mut self) {
         tdutils::log_info!("Send account.getAccountTTL — [blocked: net]");
+    }
+
+    fn send_set_authorization_ttl_query(&mut self, days: i32) {
+        tdutils::log_info!("Send account.setAuthorizationTTL({days}) — [blocked: net]");
+    }
+
+    fn send_import_contact_token_query(&mut self, token: &str) {
+        tdutils::log_info!("Send contacts.importContactToken — [blocked: net]");
+        let _ = token;
     }
 }
 
@@ -456,6 +466,9 @@ pub struct AccountManager {
     /// The `td_api::ConnectedWebsites`-typed promises parked at the
     /// GetWebAuthorizations seam.
     pub parked_websites_promises: Vec<Promise<td_api::ConnectedWebsites>>,
+    /// The `td_api::User`-typed promises parked at the
+    /// ImportContactToken seam.
+    pub parked_user_promises: Vec<Promise<td_api::User>>,
 }
 
 impl AccountManager {
@@ -661,6 +674,40 @@ impl AccountManager {
     ) {
         env.send_get_web_authorizations_query();
         self.parked_websites_promises.push(promise);
+    }
+
+    /// `import_contact_token` (cpp:831-833) — the
+    /// `contacts.importContactToken` query is the seam; the user-typed
+    /// promise parks.
+    pub fn import_contact_token(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        token: String,
+        promise: Promise<td_api::User>,
+    ) {
+        env.send_import_contact_token_query(&token);
+        if !promise.is_empty() {
+            self.parked_user_promises.push(promise);
+        }
+    }
+
+    /// `set_inactive_session_ttl_days` (cpp:1004-1006 →
+    /// `set_authorization_ttl_on_server` cpp:1124-1133) — the
+    /// SetAuthorizationTtlOnServer log event (0x505) + the query seam;
+    /// the ok answers at send time (the `set_account_ttl` convention —
+    /// the server ack resolves through the net result handler).
+    pub fn set_inactive_session_ttl_days(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        authorization_ttl_days: i32,
+        mut promise: Promise<()>,
+    ) {
+        let mut data = Vec::new();
+        store_parse::store_log_event_version(&mut data);
+        store_parse::store_i32(&mut data, authorization_ttl_days);
+        let _log_event_id = env.binlog_add(SET_AUTHORIZATION_TTL_ON_SERVER, &data);
+        env.send_set_authorization_ttl_query(authorization_ttl_days);
+        promise.set_value(());
     }
 
     /// `disconnect_website` (cpp:1173-1175).
@@ -1230,6 +1277,14 @@ mod tests {
             self.queries.push(format!("setAccountTTL {account_ttl}"));
         }
 
+        fn send_set_authorization_ttl_query(&mut self, days: i32) {
+            self.queries.push(format!("setAuthorizationTTL {days}"));
+        }
+
+        fn send_import_contact_token_query(&mut self, _token: &str) {
+            self.queries.push("importContactToken".to_string());
+        }
+
         fn send_get_account_ttl_query(&mut self) {
             self.queries.push("getAccountTTL".to_string());
         }
@@ -1408,5 +1463,54 @@ mod tests {
         ));
         assert!(!session.can_accept_calls);
         assert!(session.can_accept_secret_chats);
+    }
+
+    #[test]
+    fn import_contact_token_parks_at_the_query_seam() {
+        let mut env = TestEnv::new();
+        let mut manager = AccountManager::default();
+
+        // an empty promise answers nothing and does not park (the
+        // get_active_sessions convention)
+        manager.import_contact_token(&mut env, "abc".to_string(), Promise::default());
+        assert_eq!(env.queries, vec!["importContactToken".to_string()]);
+        assert!(manager.parked_user_promises.is_empty());
+
+        // a real promise parks for the net result handler
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.import_contact_token(&mut env, "abc".to_string(), promise);
+        assert_eq!(env.queries.len(), 2);
+        assert_eq!(manager.parked_user_promises.len(), 1);
+        assert!((*slot.lock().unwrap()).is_none());
+    }
+
+    #[test]
+    fn set_inactive_session_ttl_days_writes_the_log_event_and_answers() {
+        let mut env = TestEnv::new();
+        let mut manager = AccountManager::default();
+
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.set_inactive_session_ttl_days(&mut env, 90, promise);
+
+        assert_eq!(env.queries, vec!["setAuthorizationTTL 90".to_string()]);
+        assert_eq!(env.binlog_events.len(), 1);
+        let (handler_type, _id, data) = &env.binlog_events[0];
+        assert_eq!(*handler_type, SET_AUTHORIZATION_TTL_ON_SERVER);
+        // the version word + the little-endian days payload
+        assert_eq!(data.len(), 8);
+        assert_eq!(data[4..8], 90i32.to_le_bytes());
+        // the ok answers at send time (the set_account_ttl convention)
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
     }
 }

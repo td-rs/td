@@ -75,7 +75,7 @@ use crate::config_recoverer::{
     RecovererNetType, SimpleConfigResult, load_dc_options_update,
 };
 use crate::config_result;
-use crate::connection_creator::ConnectionCreator;
+use crate::connection_creator::{ConnectionCreator, NetType};
 use crate::contact::Contact;
 use crate::convert;
 use crate::dc_auth_manager::{DcAuthManager, DcCompletedQueue};
@@ -93,6 +93,7 @@ use crate::messages_manager::{
 use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
+use crate::phone_number_manager::{PhoneAnswer, PhoneNumberManager, PhonePendingKind};
 use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
@@ -2182,6 +2183,9 @@ enum PendingNetKind {
     Auth(AuthPendingKind),
     GetMe,
     GetState,
+    /// The PhoneNumberManager plane (the glue slice): the change-phone /
+    /// verify-phone / confirm-ownership queries.
+    Phone(PhonePendingKind),
 }
 
 /// The UpdatesManager in-flight query kinds (the C++
@@ -2338,6 +2342,10 @@ pub struct Td {
     /// dc-options consumer slice; the connection machinery (the
     /// `DcOptionsSet` orderings, the link loop) is the net step.
     pub(crate) connection_creator: Option<ConnectionCreator>,
+    /// The collapsed `StateManager::network_type_` (StateManager.cpp) —
+    /// the flag `setNetworkType` feeds; the state manager's consumers
+    /// (the recoverer's network callbacks) are the net-step seams.
+    pub(crate) network_type: NetType,
     /// The C++ `Td::config_manager_` — created by `init_options_and_network`; its
     /// expire timer rides the Td's actor timeout slot and its queries
     /// dispatch through the client-side dispatcher (M.3.8.1).
@@ -2489,6 +2497,13 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::phone_number_manager_` (`Td.cpp:1261`, the `init_managers`
+    /// block; the auth-tails slice) — the collapsed actor behind the
+    /// change/verify/confirm-phone code flows.
+    pub(crate) phone_number_manager: PhoneNumberManager,
+    /// `Td::privacy_manager_` (the `Td::Td` manager block; the C++
+    /// `PrivacyManager` actor, collapsed).
+    pub(crate) privacy_manager: crate::privacy_manager::PrivacyManager,
     /// `Td::forum_topic_manager_` (`Td.cpp:1297`, M.49).
     pub(crate) forum_topic_manager: crate::forum_topic_manager::ForumTopicManager,
     /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
@@ -2540,6 +2555,11 @@ pub struct Td {
     /// constructor + start_up work runs in [`Td::init_language_pack_manager`]
     /// where the option manager exists.
     pub(crate) language_pack_manager: crate::language_pack_manager::LanguagePackManager,
+    /// The C++ `Td::country_info_manager_` (`Td.cpp:1202`) — the countries
+    /// glue slice; the actor halves are the collapsed world (the
+    /// constructor's fragment-prefixes read runs in
+    /// [`Td::init_country_info_manager`]).
+    pub(crate) country_info_manager: crate::country_info_manager::CountryInfoManager,
     /// The language pack manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -2982,6 +3002,7 @@ impl Td {
             header_options: HeaderOptions::default(),
             option_manager: None,
             connection_creator: None,
+            network_type: NetType::Other,
             config_manager: None,
             net_query_dispatcher: None,
             net_router: None,
@@ -3032,6 +3053,8 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            phone_number_manager: PhoneNumberManager::new(),
+            privacy_manager: crate::privacy_manager::PrivacyManager::new(),
             forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
@@ -3053,6 +3076,7 @@ impl Td {
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
             language_pack_updates: Vec::new(),
+            country_info_manager: crate::country_info_manager::CountryInfoManager::default(),
             animations_manager: crate::animations_manager::AnimationsManager::new(),
             animations_updates: Vec::new(),
             audios_manager: crate::audios_manager::AudiosManager::new(),
@@ -3354,14 +3378,27 @@ impl Td {
         // which persists the empty list and re-adds the defaults. The
         // actor machinery around it is the net step.
         let is_test_dc = self.global.is_test_dc();
-        self.connection_creator =
-            Some(ConnectionCreator::new(self.global.binlog_pmc(), is_test_dc));
+        let mut connection_creator = ConnectionCreator::new(self.global.binlog_pmc(), is_test_dc);
+        // The `start_up` proxy restore (ConnectionCreator.cpp:1111-1119)
+        // — the `enabled_proxy_id` option write needs the option manager,
+        // so it runs through the env here, in the C++ `start_up` order.
+        {
+            let mut env = ConnectionEnv { td: &mut *self };
+            connection_creator.restore_proxies(&mut env);
+        }
+        self.connection_creator = Some(connection_creator);
 
         // VLOG "Create ConfigManager" (Td.cpp:1070-1072).
         {
             let app_config = self.global.binlog_pmc().get_raw(b"app_config");
             self.config_manager = Some(ConfigManager::new(&app_config));
         }
+
+        // `Td::init_pure_actor_managers` (Td.cpp:1202): the
+        // CountryInfoManager constructor half — the fragment-prefixes
+        // option read, after the option manager attach like the C++
+        // `init_options_and_network` → `init_pure_actor_managers` order.
+        self.init_country_info_manager();
 
         // we need to process td_api::setOption before managers are created,
         // because their initialization may be affected by the options
@@ -3983,6 +4020,14 @@ impl Td {
                 is_bot,
                 global: &mut self.global,
             });
+        }
+
+        // `Td::init` starts the three HashtagHints actors
+        // (Td.cpp:1344-1347) — the recent-hashtag/searched-tag/cashtag
+        // registries replay their pmc records at start_up.
+        {
+            let (mut env, stickers_manager) = crate::td::stickers_env_split(self);
+            stickers_manager.init_hashtag_hints(&mut env);
         }
 
         // `make_unique<WebBrowserManager>` (Td.cpp:1332, the init_managers
@@ -5101,6 +5146,14 @@ impl Td {
         };
         match kind {
             PendingNetKind::Auth(kind) => self.on_auth_answer(request_id, kind, answer, error),
+            PendingNetKind::Phone(kind) => {
+                let wire_error = if query.is_error() {
+                    Some(query.error())
+                } else {
+                    None
+                };
+                self.on_phone_answer(request_id, kind, answer, wire_error)
+            }
             PendingNetKind::GetMe => {
                 let Some(data) = answer else {
                     let message =
@@ -5416,6 +5469,66 @@ impl Td {
             }
             tdutils::status::Result::Err(status) => {
                 self.send_error_impl(request_id, 400, status.message())
+            }
+        }
+    }
+
+    /// Route one PhoneNumberManager answer (the glue slice): the send/
+    /// resend answers apply through the manager (the generation guard),
+    /// the change-phone check applies the returned self user (the C++
+    /// `ChangePhoneQuery::on_result`), the rest answer ok.
+    fn on_phone_answer(
+        &mut self,
+        request_id: u64,
+        kind: PhonePendingKind,
+        answer: Option<&[u8]>,
+        error: Option<&Status>,
+    ) {
+        let generation = kind.generation();
+        match crate::phone_number_manager::parse_phone_answer(&kind, answer, error) {
+            tdutils::status::Result::Ok(PhoneAnswer::SentCode(sent_code)) => {
+                let generation = generation.unwrap_or_default();
+                match self
+                    .phone_number_manager
+                    .on_send_code_result(generation, sent_code)
+                {
+                    tdutils::status::Result::Ok(code_info) => {
+                        self.send_result(request_id, Object::authenticationCodeInfo(code_info));
+                    }
+                    tdutils::status::Result::Err(status) => {
+                        self.send_error_impl(request_id, status.code(), status.message())
+                    }
+                }
+            }
+            tdutils::status::Result::Ok(PhoneAnswer::ChangedUser(user)) => {
+                // ChangePhoneQuery::on_result — the changed self user
+                // applies before the ok (PhoneNumberManager.cpp:124).
+                self.apply_self_user(&user, true);
+                self.finish_check_code(request_id, generation);
+            }
+            tdutils::status::Result::Ok(PhoneAnswer::Ok) => match kind {
+                PhonePendingKind::CheckCode { .. } => {
+                    self.finish_check_code(request_id, generation);
+                }
+                // Firebase/report answers carry no manager state change.
+                _ => self.send_result(request_id, ok_object()),
+            },
+            tdutils::status::Result::Err(status) => {
+                self.send_error_impl(request_id, status.code(), status.message())
+            }
+        }
+    }
+
+    /// `PhoneNumberManager::on_check_code_result` + the ok (the glue
+    /// slice's check-code completion tail).
+    fn finish_check_code(&mut self, request_id: u64, generation: Option<i64>) {
+        match self
+            .phone_number_manager
+            .on_check_code_result(generation.unwrap_or_default())
+        {
+            tdutils::status::Result::Ok(()) => self.send_result(request_id, ok_object()),
+            tdutils::status::Result::Err(status) => {
+                self.send_error_impl(request_id, status.code(), status.message())
             }
         }
     }
@@ -6134,6 +6247,16 @@ impl Td {
         self.language_pack_manager.init(&mut env);
     }
 
+    /// `CountryInfoManager::CountryInfoManager` (CountryInfoManager.cpp:129-131,
+    /// `Td.cpp:1202`) — the constructor's fragment-prefixes option read;
+    /// the C++ `init_pure_actor_managers` order puts it after the option
+    /// manager attach, mirrored here.
+    fn init_country_info_manager(&mut self) {
+        let (mut env, mut manager) = country_env_split(self);
+        manager.init(&mut env);
+        self.country_info_manager = manager;
+    }
+
     /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
     /// auth-success moment shared with `init_notification_manager`.
     fn init_terms_of_service_manager(&mut self) {
@@ -6643,6 +6766,137 @@ impl Td {
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The PhoneNumberManager plane (the auth-tails glue slice). The five
+    // entry points follow the `set_authentication_phone_number` shape:
+    // prepare in the manager → park + dispatch the real query → the
+    // answer applies on the drain ([`Td::on_phone_answer`]).
+    // ------------------------------------------------------------------
+
+    /// `sendPhoneNumberCode` (Requests.cpp:2480-2486 →
+    /// `PhoneNumberManager::set_phone_number`). The ChangePhone arm hides
+    /// the `CheckPhoneNumber` suggested action between the validation and
+    /// the query (PhoneNumberManager.cpp:250-251).
+    pub(crate) fn send_phone_number_code(
+        &mut self,
+        request_id: u64,
+        phone_number: String,
+        settings: Option<&td_api::PhoneNumberAuthenticationSettings>,
+        ty: Option<&td_api::PhoneNumberCodeType>,
+    ) {
+        let prepared =
+            match self
+                .phone_number_manager
+                .prepare_set_phone_number(phone_number, settings, ty)
+            {
+                std::result::Result::Ok(prepared) => prepared,
+                std::result::Result::Err(status) => {
+                    return self.send_error_impl(request_id, status.code(), status.message());
+                }
+            };
+        if prepared.hide_check_phone_number {
+            let mut action = crate::suggested_action::SuggestedAction::default();
+            action.init(crate::suggested_action::SuggestedActionType::CheckPhoneNumber);
+            let mut env = AccountEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                user_manager: &mut self.user_manager,
+                device_token_manager: &mut self.device_token_manager,
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.account_updates,
+            };
+            self.suggested_action_manager
+                .hide_suggested_action(&mut env, action);
+        }
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::SendCode {
+                generation: prepared.generation,
+            }),
+        );
+        self.dispatch_walking_query(token, prepared.function, AuthFlag::On);
+    }
+
+    /// `sendPhoneNumberFirebaseSms` (Requests.cpp:2488-2493 →
+    /// `PhoneNumberManager::send_firebase_sms`).
+    pub(crate) fn send_phone_number_firebase_sms(&mut self, request_id: u64, token: String) {
+        let function = match self.phone_number_manager.prepare_send_firebase_sms(&token) {
+            std::result::Result::Ok(function) => function,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token_id = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::FirebaseSms),
+        );
+        self.dispatch_walking_query(token_id, function, AuthFlag::On);
+    }
+
+    /// `reportPhoneNumberCodeMissing` (Requests.cpp:2495-2500 →
+    /// `PhoneNumberManager::report_missing_code`).
+    pub(crate) fn report_phone_number_code_missing(
+        &mut self,
+        request_id: u64,
+        mobile_network_code: String,
+    ) {
+        let function = match self
+            .phone_number_manager
+            .prepare_report_missing_code(&mobile_network_code)
+        {
+            std::result::Result::Ok(function) => function,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::ReportMissingCode),
+        );
+        self.dispatch_walking_query(token, function, AuthFlag::On);
+    }
+
+    /// `resendPhoneNumberCode` (Requests.cpp:2502-2506 →
+    /// `PhoneNumberManager::resend_authentication_code`).
+    pub(crate) fn resend_phone_number_code(
+        &mut self,
+        request_id: u64,
+        reason: Option<&td_api::ResendCodeReason>,
+    ) {
+        let prepared = match self.phone_number_manager.prepare_resend_code(reason) {
+            std::result::Result::Ok(prepared) => prepared,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::ResendCode {
+                generation: prepared.generation,
+            }),
+        );
+        self.dispatch_walking_query(token, prepared.function, AuthFlag::On);
+    }
+
+    /// `checkPhoneNumberCode` (Requests.cpp:2508-2513 →
+    /// `PhoneNumberManager::check_code`).
+    pub(crate) fn check_phone_number_code(&mut self, request_id: u64, code: String) {
+        let prepared = match self.phone_number_manager.prepare_check_code(code) {
+            std::result::Result::Ok(prepared) => prepared,
+            std::result::Result::Err(status) => {
+                return self.send_error_impl(request_id, status.code(), status.message());
+            }
+        };
+        let token = self.park_net(
+            request_id,
+            PendingNetKind::Phone(PhonePendingKind::CheckCode {
+                check: prepared.check,
+                generation: prepared.generation,
+            }),
+        );
+        self.dispatch_walking_query(token, prepared.function, AuthFlag::On);
     }
 
     /// The `AuthManager::on_get_authorization` success broadcast in the
@@ -11586,6 +11840,403 @@ impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
     }
 }
 
+/// The [`crate::connection_creator::ConnectionCreatorEnv`] over the whole
+/// `Td` — the request arms take the manager out of `Td` and hand the
+/// remainder to the env (the [`BackgroundEnv`] convention).
+pub(crate) struct ConnectionEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::connection_creator::ConnectionCreatorEnv for ConnectionEnv<'_> {
+    fn binlog_pmc_get(&mut self, key: &[u8]) -> String {
+        String::from_utf8_lossy(&self.td.global.binlog_pmc().get_raw(key)).into_owned()
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.td.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.td.global.binlog_pmc().erase(key);
+    }
+
+    fn binlog_pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.td.global.binlog_pmc().prefix_get(prefix)
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_boolean(name, default_value)
+            })
+    }
+
+    fn set_option_integer(&mut self, name: &str, value: i64) {
+        if let Some(options) = self.td.option_manager.as_mut() {
+            options.set_option_integer(name, value);
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.td.option_manager.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn request_config(&mut self, _reopen_sessions: bool) {
+        // `send_closure(G()->config_manager(), &ConfigManager::request_config,
+        // false)` — the config refetch cycle after the proxy went away. The
+        // collapsed config machinery fetches through its own paths; the
+        // proxy-aware refetch closes with the net step.
+    }
+
+    fn remove_sponsored_dialog(&mut self) {
+        let (mut promo_env, promo_data_manager) = promo_env_split(self.td);
+        promo_data_manager.remove_sponsored_dialog(&mut promo_env);
+    }
+
+    fn reload_promo_data(&mut self) {
+        let (mut promo_env, promo_data_manager) = promo_env_split(self.td);
+        promo_data_manager.reload_promo_data(&mut promo_env);
+    }
+
+    fn update_mtproto_header(&mut self, _proxy: Option<&crate::connection_creator::Proxy>) {
+        // `ConnectionCreator::update_mtproto_header` — the net step's
+        // session/mtproto-header rebuild (`[blocked: net]`).
+    }
+
+    fn on_proxy_state(&mut self, _use_proxy: bool) {
+        // `StateManager::on_proxy` — the state flag's consumers (the
+        // recoverer's reconnect cycle) are the net-step seams; the flag
+        // itself rides the collapsed state world.
+    }
+
+    fn ping_via_net(&mut self, _proxy: &crate::connection_creator::Proxy, promise: Promise<f64>) {
+        // `GetHostByNameActor::run` + `ping_proxy_resolved` — the
+        // `[blocked: net]` resolve/connect seam. Dropping the promise
+        // answers with the C++ LambdaPromise drop ("Lost promise") until
+        // the net step's ping machinery completes it.
+        drop(promise);
+    }
+
+    fn test_proxy_via_net(
+        &mut self,
+        _proxy: &crate::connection_creator::Proxy,
+        _dc_id: i32,
+        _timeout: f64,
+        promise: Promise<()>,
+    ) {
+        // `ProxyChecker::test_proxy` — the `[blocked: net]` handshake
+        // seam; the promise resolves with the C++ LambdaPromise drop.
+        drop(promise);
+    }
+}
+
+/// The [`crate::country_info_manager::CountryInfoManagerEnv`] over the
+/// whole `Td` — the request arms split the manager out of `Td` and hand
+/// the remainder to the env (the [`ConnectionEnv`] convention).
+pub(crate) struct CountryEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::country_info_manager::CountryInfoManagerEnv for CountryEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.td.close_flag != 0
+    }
+
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn have_option(&self, name: &str) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .is_some_and(|options| options.have_option(name))
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.td.option_manager.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    /// `to_lower(td_->language_pack_manager_->get_main_language_code())`
+    /// (CountryInfoManager.cpp:188-190) — the collapsed manager runs
+    /// through its own env, like [`Td::init_language_pack_manager`].
+    fn get_main_language_code(&mut self) -> String {
+        let mut env = LanguagePackEnv {
+            options: self.td.option_manager.as_mut(),
+            updates: &mut self.td.language_pack_updates,
+        };
+        self.td
+            .language_pack_manager
+            .get_main_language_code(&mut env)
+            .to_ascii_lowercase()
+    }
+
+    /// `GetNearestDcQuery::send` — the `[blocked: net]` seam. Dropping
+    /// the promise answers with the C++ LambdaPromise drop ("Lost
+    /// promise") until the net step completes the query.
+    fn get_nearest_dc_via_net(&mut self, promise: Promise<String>) {
+        drop(promise);
+    }
+
+    /// `GetCountriesListQuery::send` — the `[blocked: net]` seam; the
+    /// pending promises stay queued in the manager (dropping with it)
+    /// until the net step completes the query.
+    fn get_countries_list_via_net(&mut self, _language_code: &str, _hash: i32) {}
+}
+
+/// The `G()`/manager split of the collapsed CountryInfoManager — the
+/// request arms and the init site take the manager out of `Td` (the
+/// `promo_env_split` convention) so the env can hold the remainder.
+pub(crate) fn country_env_split(
+    td: &mut Td,
+) -> (
+    CountryEnv<'_>,
+    crate::country_info_manager::CountryInfoManager,
+) {
+    let manager = std::mem::take(&mut td.country_info_manager);
+    let env = CountryEnv { td };
+    (env, manager)
+}
+
+/// The [`crate::privacy_manager::PrivacyManagerEnv`] +
+/// [`crate::auto_download_settings::AutoDownloadSettingsEnv`] over the
+/// whole `Td` — the request arms take the manager out of `Td` and hand
+/// the remainder to the env (the [`ConnectionEnv`] convention).
+pub(crate) struct PrivacyEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        crate::dialog_manager::have_dialog_force(self.td, dialog_id, source)
+    }
+
+    fn is_megagroup_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        // `ChatManager::is_megagroup_channel` — the unloaded-channel read
+        // is the M.6 stub (the stub inventory).
+        crate::dialog_manager::is_megagroup_channel(channel_id)
+    }
+
+    fn get_user_ids_object(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+        _source: &str,
+    ) -> Vec<i64> {
+        user_ids.iter().map(|&user_id| user_id.get()).collect()
+    }
+
+    fn get_chat_ids_object(
+        &mut self,
+        dialog_ids: &[crate::dialog_id::DialogId],
+        source: &str,
+    ) -> Vec<i64> {
+        crate::dialog_manager::get_chat_ids_object(dialog_ids, source)
+    }
+
+    fn send_update_privacy_rules(&mut self, update: td_api::updateUserPrivacySettingRules) {
+        self.td
+            .send_update(td_api::Object::updateUserPrivacySettingRules(update));
+    }
+
+    fn on_update_online_status_privacy(&mut self) {
+        let this = &mut *self.td;
+        let mut user_env = UserEnv {
+            global: &mut this.global,
+            options: this
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: this.auth_manager.is_bot(),
+        };
+        this.user_manager
+            .on_update_online_status_privacy(&mut user_env);
+    }
+
+    fn on_update_phone_number_privacy(&mut self) {
+        let this = &mut *self.td;
+        let user_env = UserEnv {
+            global: &mut this.global,
+            options: this
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: this.auth_manager.is_bot(),
+        };
+        this.user_manager.on_update_phone_number_privacy(&user_env);
+    }
+
+    fn reload_user(&mut self, _user_id: crate::user_manager::UserId, _source: &str) {
+        // `UserManager::reload_user` — the user-reload plane
+        // (`[blocked: user-reload]`, the stub inventory).
+    }
+
+    fn hide_archive_and_mute_suggested_action(&mut self) {
+        let this = &mut *self.td;
+        let crate::td::Td {
+            global,
+            option_manager,
+            user_manager,
+            device_token_manager,
+            auth_manager,
+            suggested_action_manager,
+            account_updates,
+            ..
+        } = this;
+        let mut action = crate::suggested_action::SuggestedAction::default();
+        action.init(crate::suggested_action::SuggestedActionType::EnableArchiveAndMuteNewChats);
+        let mut account_env = AccountEnv {
+            global,
+            options: option_manager.as_mut(),
+            user_manager,
+            device_token_manager,
+            auth_is_bot: auth_manager.is_bot(),
+            updates: account_updates,
+        };
+        suggested_action_manager.hide_suggested_action(&mut account_env, action);
+    }
+
+    fn get_privacy_via_net(&mut self, _key: crate::privacy_manager::UserPrivacySettingType) {
+        // `GetPrivacyQuery::send` — `account.getPrivacy`; the queued
+        // caller promises ride the `PrivacyManager` state until the net
+        // step's `on_get_user_privacy_settings` drains them
+        // (`[blocked: net]`).
+    }
+
+    fn set_privacy_via_net(
+        &mut self,
+        _key: crate::privacy_manager::UserPrivacySettingType,
+        _rules: crate::privacy_manager::UserPrivacySettingRules,
+        promise: Promise<()>,
+    ) {
+        // `SetPrivacyQuery::send` — `account.setPrivacy`; the caller
+        // promise resolves with the C++ LambdaPromise drop
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn get_global_privacy_via_net(
+        &mut self,
+        promise: Promise<crate::privacy_manager::GlobalPrivacySettings>,
+    ) {
+        // `GetGlobalPrivacySettingsQuery::send` —
+        // `account.getGlobalPrivacySettings` (`[blocked: net]`); the
+        // promise resolves with the C++ LambdaPromise drop.
+        drop(promise);
+    }
+
+    fn set_global_privacy_via_net(
+        &mut self,
+        _settings: crate::privacy_manager::GlobalPrivacySettings,
+        promise: Promise<()>,
+    ) {
+        // the get → `apply_changes` → `SetGlobalPrivacySettingsQuery::send`
+        // chain (GlobalPrivacySettings.cpp:187-197); the caller promise
+        // rides the dropped query half (`[blocked: net]`).
+        drop(promise);
+    }
+}
+
+impl crate::auto_download_settings::AutoDownloadSettingsEnv for PrivacyEnv<'_> {
+    fn get_auto_download_settings_via_net(
+        &mut self,
+        promise: Promise<td_api::AutoDownloadSettingsPresets>,
+    ) {
+        // `GetAutoDownloadSettingsQuery::send` —
+        // `account.getAutoDownloadSettings` (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn set_auto_download_settings_via_net(
+        &mut self,
+        _is_roaming: bool,
+        _is_wifi: bool,
+        _settings: crate::auto_download_settings::AutoDownloadSettings,
+        promise: Promise<()>,
+    ) {
+        // `SaveAutoDownloadSettingsQuery::send` —
+        // `account.saveAutoDownloadSettings` (`[blocked: net]`).
+        drop(promise);
+    }
+}
+
+/// The [`crate::support_manager::SupportEnv`] over the whole `Td` — the
+/// request arms hand the `Td` remainder to the env (the `PrivacyEnv`
+/// convention), so the query-send halves read the real user manager.
+pub(crate) struct SupportEnvTd<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::support_manager::SupportEnv for SupportEnvTd<'_> {
+    fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn get_my_user_id(&self) -> UserId {
+        self.td.user_manager.get_my_id()
+    }
+
+    fn get_always_parse_markdown(&self) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .expect("user requests run with the initialized option manager")
+            .get_option_boolean("always_parse_markdown", false)
+    }
+
+    fn get_session_count(&self) -> i32 {
+        self.td
+            .option_manager
+            .as_ref()
+            .expect("user requests run with the initialized option manager")
+            .get_option_integer("session_count", 1)
+            .try_into()
+            .unwrap()
+    }
+
+    fn get_user_info_via_net(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        promise: Promise<td_api::UserSupportInfo>,
+    ) {
+        // `GetUserInfoQuery::send` — `help.getUserInfo`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn edit_user_info_via_net(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        _message: telegram_api::TextWithEntities,
+        promise: Promise<td_api::UserSupportInfo>,
+    ) {
+        // `EditUserInfoQuery::send` — `help.editUserInfo`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+
+    fn get_support_name_via_net(&mut self, promise: Promise<String>) {
+        // `GetSupportNameQuery::send` — `help.getSupportName`
+        // (`[blocked: net]`).
+        drop(promise);
+    }
+}
+
 /// The [`crate::background_manager::BackgroundManagerEnv`] over the whole
 /// `Td` — the request arms take the manager out of `Td` and hand the
 /// remainder to the env (the `BotEnv` convention), so every dialog/file/
@@ -16392,22 +17043,34 @@ impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
         use crate::stickers_manager::StickerFileView;
         let file_manager = self.file_manager.lock();
         let Some(file_view) = file_manager.get_file_view(file_id) else {
-            return StickerFileView::default();
+            return StickerFileView {
+                empty: true,
+                ..StickerFileView::default()
+            };
         };
         let main_remote_document_id = file_view
             .get_main_remote_location()
             .filter(|location| location.is_document() && !location.is_web())
             .map(|location| location.get_id());
+        let full_remote_document_id = file_view
+            .get_full_remote_location()
+            .filter(|location| location.is_document());
         StickerFileView {
+            empty: false,
             is_encrypted: file_view.is_encrypted(),
             main_remote_document_id,
             has_url: file_view.has_url(),
             has_full_local_location: file_view.has_full_local_location(),
             expected_size: file_view.expected_size(false),
-            full_remote_document_id: file_view
-                .get_full_remote_location()
-                .filter(|location| location.is_document())
+            full_remote_document_id: full_remote_document_id
+                .as_ref()
                 .map(|location| location.get_id()),
+            full_remote_is_photo: full_remote_document_id
+                .as_ref()
+                .is_some_and(|location| location.is_photo()),
+            full_remote_is_web: full_remote_document_id
+                .as_ref()
+                .is_some_and(|location| location.is_web()),
         }
     }
 
@@ -17506,6 +18169,182 @@ pub(crate) fn star_env_split(
         },
         star_manager,
     )
+}
+/// The `Td`-level [`MmRequestContext`] — the request-plane surface the
+/// M.mmreq methods read. The landed manager tails run for real (the
+/// DialogManager server tails, the M.16 ReactionManager plane); the wire
+/// tails keep the trait's [blocked: net] default no-op bodies.
+impl crate::messages_manager::MmRequestContext for Td {
+    fn as_message_object(&self) -> &dyn crate::messages_manager::MessageObjectContext {
+        self
+    }
+
+    fn as_send_message_context(&self) -> &dyn crate::messages_manager::SendMessageContext {
+        self
+    }
+
+    fn as_read_state(&mut self) -> &mut dyn crate::messages_manager::ReadStateContext {
+        self
+    }
+
+    fn as_read_state_shared(&self) -> &dyn crate::messages_manager::ReadStateContext {
+        self
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+
+    fn my_dialog_id(&self) -> crate::messages_manager::DialogId {
+        crate::messages_manager::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_chat_id_object(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        _source: &str,
+    ) -> i64 {
+        dialog_id.get()
+    }
+
+    fn can_pin_messages(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        match crate::dialog_manager::can_pin_messages(self, dialog_id) {
+            tdutils::status::Result::Ok(()) => Ok(()),
+            tdutils::status::Result::Err(status) => Err(status),
+        }
+    }
+
+    fn check_business_connection(
+        &mut self,
+        business_connection_id: &crate::business_connection_manager::BusinessConnectionId,
+        dialog_id: crate::messages_manager::DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        let status = self
+            .business_connection_manager
+            .check_business_connection_with_dialog(business_connection_id, dialog_id);
+        if status.is_error() {
+            Err(status)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn toggle_dialog_is_pinned_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_pinned: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_is_pinned_on_server(self, dialog_id, is_pinned, 0);
+    }
+
+    fn toggle_dialog_is_marked_as_unread_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_marked_as_unread: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_is_marked_as_unread_on_server(
+            self,
+            dialog_id,
+            0,
+            is_marked_as_unread,
+            0,
+        );
+    }
+
+    fn toggle_dialog_is_translatable_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_translatable: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            self,
+            dialog_id,
+            is_translatable,
+            0,
+        );
+    }
+
+    fn toggle_dialog_view_as_messages_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        view_as_messages: bool,
+    ) {
+        crate::dialog_manager::toggle_dialog_view_as_messages_on_server(
+            self,
+            dialog_id,
+            view_as_messages,
+            0,
+        );
+    }
+
+    fn reaction_manager_get_sorted_available_reactions(
+        &mut self,
+        available_reactions: crate::chat_reactions::ChatReactions,
+        active_reactions: crate::chat_reactions::ChatReactions,
+        row_size: i32,
+        is_tag: bool,
+        unavailability_reason: crate::reaction_manager::ReactionUnavailabilityReason,
+    ) -> td_api::AvailableReactions {
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager.get_sorted_available_reactions(
+            &mut env,
+            available_reactions,
+            active_reactions,
+            row_size,
+            is_tag,
+            unavailability_reason,
+        )
+    }
+
+    fn reaction_manager_add_recent_reaction(
+        &mut self,
+        reaction_type: &crate::reaction_type::ReactionType,
+    ) {
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager
+            .add_recent_reaction(&mut env, reaction_type);
+    }
+
+    fn reaction_manager_get_default_tag_reactions(
+        &mut self,
+    ) -> Vec<crate::reaction_type::ReactionType> {
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager.get_default_tag_reactions(&mut env)
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
 }
 
 /// The `G()`/`td_` slice [`crate::star_manager::StarManager`] reads
@@ -20125,7 +20964,9 @@ mod tests {
         assert!(!resp304.is_empty());
         assert!(matches!(resp304[0], Object::ok(_)));
 
-        // 5. toggleChatIsTranslatable: returns ok
+        // 5. toggleChatIsTranslatable: the real check_dialog_access
+        // ladder needs write access and the user was never loaded —
+        // 400 "Chat not found" (MessagesManager.cpp:16413)
         td.request(
             305,
             Function::toggleChatIsTranslatable(td_api::toggleChatIsTranslatable {
@@ -20133,11 +20974,11 @@ mod tests {
                 is_translatable: true,
             }),
         );
-        let resp305 = responses_of(&callback, 305);
-        assert!(!resp305.is_empty());
-        assert!(matches!(resp305[0], Object::ok(_)));
+        let err305 = error_of(&callback, 305);
+        assert_eq!(err305.code, 400);
+        assert_eq!(err305.message, "Chat not found");
 
-        // 6. toggleChatViewAsTopics: returns ok
+        // 6. toggleChatViewAsTopics: same access ladder — 400
         td.request(
             306,
             Function::toggleChatViewAsTopics(td_api::toggleChatViewAsTopics {
@@ -20145,11 +20986,11 @@ mod tests {
                 view_as_topics: true,
             }),
         );
-        let resp306 = responses_of(&callback, 306);
-        assert!(!resp306.is_empty());
-        assert!(matches!(resp306[0], Object::ok(_)));
+        let err306 = error_of(&callback, 306);
+        assert_eq!(err306.code, 400);
+        assert_eq!(err306.message, "Chat not found");
 
-        // 7. toggleChatIsMarkedAsUnread: returns ok
+        // 7. toggleChatIsMarkedAsUnread: same access ladder — 400
         td.request(
             307,
             Function::toggleChatIsMarkedAsUnread(td_api::toggleChatIsMarkedAsUnread {
@@ -20157,9 +20998,9 @@ mod tests {
                 is_marked_as_unread: true,
             }),
         );
-        let resp307 = responses_of(&callback, 307);
-        assert!(!resp307.is_empty());
-        assert!(matches!(resp307[0], Object::ok(_)));
+        let err307 = error_of(&callback, 307);
+        assert_eq!(err307.code, 400);
+        assert_eq!(err307.message, "Chat not found");
 
         // 8. deleteChatReplyMarkup: returns ok
         td.request(
