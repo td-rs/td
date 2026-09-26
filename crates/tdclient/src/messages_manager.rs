@@ -21504,7 +21504,6 @@ pub fn get_message_to_send(
             is_quick_reply_message,
         )
     };
-    tdutils::log_debug!("netfix: gmts after create_message_to_send");
     let message_id = message.message_id;
     let random_id = {
         let d = manager
@@ -21519,7 +21518,6 @@ pub fn get_message_to_send(
         ctx.have_input_peer_read(dialog_id, true),
         "have_input_peer(Read) failed for {dialog_id:?} in get_message_to_send"
     );
-    tdutils::log_debug!("netfix: gmts before add_message_to_dialog");
     let mut need_update = false;
     let result = add_message_to_dialog(
         global,
@@ -22820,7 +22818,6 @@ pub fn send_message(
     let invert_media = message_content.invert_media;
     let content = *message_content.content;
     let mut need_update_dialog_pos = false;
-    tdutils::log_debug!("netfix: before get_message_to_send");
     let message_full_id = get_message_to_send(
         ctx,
         global,
@@ -22878,7 +22875,6 @@ pub fn send_message(
         return message_object.ok_or_else(|| (500, "Can't send message".to_owned()));
     }
 
-    tdutils::log_debug!("netfix: after get_message_to_send + dance");
     let obj_ctx: &dyn MessageObjectContext = ctx;
     clear_dialog_draft_by_sent_message(
         manager,
@@ -22889,16 +22885,12 @@ pub fn send_message(
         !need_update_dialog_pos,
     );
 
-    tdutils::log_debug!("netfix: after clear_draft");
     save_send_message_log_event(global, dialog_id, &mut m);
-    tdutils::log_debug!("netfix: after save_log_event");
     let d = manager
         .get_dialog_mut(dialog_id)
         .expect("get_message_to_send inserted the message");
     d.messages.insert(message_id, m);
-    tdutils::log_debug!("netfix: before do_send_message");
     let send_action = do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
-    tdutils::log_debug!("netfix: do_send_message action = {:?}", send_action);
     if send_action == DoSendAction::TextReady {
         // `on_text_message_ready_to_send` — the text wire send (the
         // C++ DoSendAction switch); the upload/media actions keep their
@@ -25065,9 +25057,7 @@ pub fn on_text_message_ready_to_send(
         random_id: stored_random_id,
         ..Message::default()
     };
-    tdutils::log_debug!("netfix: ready_to_send before begin (random {})", stored_random_id);
     let random_id = begin_send_message(manager, dialog_id, &probe);
-    tdutils::log_debug!("netfix: after begin_send_message");
 
     // `get_message_flags` + the input-reply/topic tails; the send-as arm
     // (`get_send_message_as_input_peer`) keeps the explicit-sender seam.
@@ -25143,9 +25133,7 @@ pub fn on_text_message_ready_to_send(
         allow_paid_stars: paid_message_star_count,
         suggested_post,
     };
-    tdutils::log_debug!("netfix: calling send_text_message_query");
     ctx.send_text_message_query(params);
-    tdutils::log_debug!("netfix: send_text_message_query returned");
 }
 
 /// `get_message_schedule_date` (MessagesManager.cpp:23415-23424) — the
