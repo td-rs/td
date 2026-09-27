@@ -16,7 +16,11 @@ parking_lot = "0.12"
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["deflate", "gzip", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-tokio-rustls = "0.26"
+# default-features = false: tokio-rustls's defaults include rustls's aws_lc_rs
+# provider, which drags aws-lc-sys (boringssl C) into every native build — dead
+# weight behind the explicit ring provider installed in src/tls.rs, and it does
+# not cross-compile to x86_64-pc-windows-gnu (the S82 windows artifact).
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 webpki-roots = "0.26"
 tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }
 

@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>td-rs tdweb deep harness</title></head>
+<body style="font-family: monospace; white-space: pre-wrap; padding: 1em">
+<h3>td-rs tdweb DEEP harness — post-params phase in-browser</h3>
+<div id="log">starting…</div>
+<script>
+  const log = document.getElementById('log');
+  const line = s => { log.textContent += '\n' + s; };
+  line('crossOriginIsolated(main): ' + self.crossOriginIsolated);
+  const w = new Worker('/tdweb-deep-worker.js', { name: 'tdweb-deep' });
+  w.onmessage = e => {
+    const m = e.data;
+    line(JSON.stringify(m).slice(0, 300));
+    fetch('/report?m=' + encodeURIComponent(JSON.stringify(m))).catch(() => {});
+    if (m.t === 'TDWEB_DEEP_PASS') line('=== TDWEB_DEEP_PASS ===');
+    if (m.t === 'TDWEB_DEEP_FAIL' || m.t === 'DEEP_ERROR') line('=== TDWEB_DEEP_FAIL ===');
+  };
+  w.onerror = e => line('WORKER_ERROR: ' + e.message);
+</script>
+</body>
+</html>

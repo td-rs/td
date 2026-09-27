@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>td-rs tdweb harness</title></head>
+<body style="font-family: monospace; white-space: pre-wrap; padding: 1em">
+<h3>td-rs tdweb harness — pthread release module</h3>
+<div id="log">starting…</div>
+<script>
+  const log = document.getElementById('log');
+  const line = s => { log.textContent += '\n' + s; };
+  line('crossOriginIsolated(main): ' + self.crossOriginIsolated);
+  const w = new Worker('/tdweb-smoke-worker.js', { name: 'tdweb-smoke' });
+  w.onmessage = e => {
+    const m = e.data;
+    line(JSON.stringify(m));
+    fetch('/report?m=' + encodeURIComponent(JSON.stringify(m))).catch(() => {});
+    if (m.t === 'TDWEB_SMOKE_PASS') line('=== TDWEB_SMOKE_PASS ===');
+    if (m.t === 'TDWEB_SMOKE_FAIL' || m.t === 'SMOKE_ERROR') line('=== TDWEB_SMOKE_FAIL ===');
+  };
+  w.onerror = e => line('WORKER_ERROR: ' + e.message);
+</script>
+</body>
+</html>

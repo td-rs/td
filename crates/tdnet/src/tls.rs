@@ -50,8 +50,8 @@ pub struct SslCtx {
 impl SslCtx {
     /// `SslCtx::create(cert_file, verify_peer)`.
     pub fn create(cert_file: &str, verify_peer: VerifyPeer) -> Result<Self> {
-        // An explicit provider: the dependency graph may enable several
-        // rustls crypto backends (reqwest pulls aws-lc-rs), which defeats
+        // An explicit provider: the wider dependency graph can grow extra
+        // rustls crypto backends through feature union, which defeats
         // rustls's process-level auto-detection.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
