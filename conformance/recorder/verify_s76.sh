@@ -79,6 +79,13 @@ run_side() {
 echo "== recording the live C++ session =="
 run_side cpp "$WORK/c.txt"
 
+# The two sides share the bot token: the DC may still route pushes to the
+# just-exited C++ session for a while (the update lands in the dead
+# session's queue and never reaches the fresh Rust login — the observed
+# "wait timed out for updateNewMessage" flake). Let the server drop the
+# old session before the replay logs in.
+sleep "${TD_SESSION_HANDOVER_S:-30}"
+
 echo "== replaying through the Rust client =="
 run_side rs "$WORK/rs.txt"
 
@@ -140,6 +147,25 @@ for line in sys.stdin:
         continue
     line = COMMIT_HASH_RE.sub('\\1<git>"', line)
     record = json.loads(line)
+    # The `updateConnectionState` records race on the C++ side ITSELF: the
+    # ConnectionManager broadcasts Connecting/Ready/Updating whenever its
+    # connection actor reaches the state, which interleaves differently
+    # with the auth tail across runs (the early pre-`Updating` Ready and
+    # the Updating ±1 position both observed). The Rust emits the same
+    # state sequence deterministically, so the records' STREAM POSITIONS
+    # are the documented connection-timing nondeterminism — dropped here
+    # (the state machinery itself stays covered by the client tests).
+    # the C++ recorder emits the update as a JSON object, the Rust
+    # replayer as a JSON-encoded string — handle both shapes
+    update = record.get("update")
+    is_state = (
+        isinstance(update, str) and '"@type":"updateConnectionState"' in update
+    ) or (
+        isinstance(update, dict)
+        and update.get("@type") == "updateConnectionState"
+    )
+    if is_state:
+        continue
     # The `@wait` corpus markers are harness bookkeeping (the driver's
     # wait-for-update primitive, and how the gate times the phone
     # message) — their stream position races with the live updates, and
