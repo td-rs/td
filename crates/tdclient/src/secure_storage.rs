@@ -154,9 +154,8 @@ impl DataView for FileDataView<'_> {
     }
 
     fn pread(&self, offset: i64, size: i64) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
         let mut slice = vec![0u8; size as usize];
-        let actual_size = match self.fd.read_at(&mut slice, offset as u64) {
+        let actual_size = match crate::files::compat_read_at(self.fd, &mut slice, offset as u64) {
             Ok(size) => size,
             Err(_) => return Result::Err(Status::error(0, "Failed to pread file")),
         };

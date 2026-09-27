@@ -18,10 +18,23 @@ members = [
 ]
 # conformance is a standalone crate since S04 (extract-test-data); fuzz and bench
 # grow their own manifests in later steps (S78/S79). All are built separately.
-exclude = ["conformance", "fuzz", "bench"]
+# vendor/ holds patched third-party forks consumed via [patch.crates-io] below —
+# path deps, never built standalone, so they stay out of the member list.
+exclude = ["conformance", "fuzz", "bench", "vendor"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "BSL-1.0"
 publish = false
+
+[patch.crates-io]
+# sqlcipher on wasm32-unknown-emscripten: emcc's backend rejects .fini_array
+# sections, and the sqlcipher amalgamation's non-Windows/non-Apple fini
+# registration lands there (emscripten defines neither guard). The vendored
+# fork is upstream libsqlite3-sys 0.38.2 plus exactly the 4-line
+# __EMSCRIPTEN__ branch in sqlcipher/sqlite3.c (see vendor/README.md);
+# native builds compile the identical preprocessed source. Upstreaming the
+# branch is an optional follow-on; vendoring keeps the wasm build
+# self-contained.
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }

@@ -32,7 +32,7 @@ g++ -std=c++17 -O2 -Wall -Wextra "$WORK/dump.cpp" -o "$WORK/dump"
 "$WORK/dump" "$WORK"
 
 echo "== running the Rust extractor =="
-env -u RUSTC_WRAPPER cargo run -q --manifest-path "$SCRIPT_DIR/../Cargo.toml" -- "$TD_ROOT" "$VEC_DIR"
+env -u RUSTC_WRAPPER cargo run -q --manifest-path "$SCRIPT_DIR/../Cargo.toml" --bin extract-test-data -- "$TD_ROOT" "$VEC_DIR"
 
 echo "== byte-comparing Rust vectors vs C++ oracle =="
 for cpp_bin in "$WORK"/*.cpp.bin; do

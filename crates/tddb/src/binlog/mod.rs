@@ -467,12 +467,64 @@ impl Binlog {
     }
 }
 
-/// `FileFd::lock(FileFd::LockFlags::Write)` — an exclusive advisory flock.
+/// `FileFd::lock(FileFd::LockFlags::Write)` — an exclusive advisory lock.
+/// C++ parity: POSIX fcntl/F_SETLK vs Windows LockFileEx (FileFd.cpp:452-495);
+/// the unix side uses flock (equivalent advisory semantics for our callers).
+#[cfg(unix)]
 fn lock_file(file: &File) -> std::result::Result<(), String> {
     use std::os::fd::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         return Err(format!("flock failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_file(file: &File) -> std::result::Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct Overlapped {
+        Internal: usize,
+        InternalHigh: usize,
+        Pointer: *mut core::ffi::c_void,
+        hEvent: isize,
+    }
+    unsafe extern "system" {
+        fn LockFileEx(
+            hFile: isize,
+            dwFlags: u32,
+            dwReserved: u32,
+            nNumberOfBytesToLockLow: u32,
+            nNumberOfBytesToLockHigh: u32,
+            lpOverlapped: *mut Overlapped,
+        ) -> i32;
+    }
+    // The whole file (MAXDWORD/MAXDWORD), exclusive, non-blocking.
+    let mut overlapped = Overlapped {
+        Internal: 0,
+        InternalHigh: 0,
+        Pointer: core::ptr::null_mut(),
+        hEvent: 0,
+    };
+    let rc = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as isize,
+            LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if rc == 0 {
+        return Err(format!(
+            "LockFileEx failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }

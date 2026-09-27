@@ -3,7 +3,7 @@
 Extracted by plan step S04; see `RUST_REWRITE_PLAN.md` in the C++ repo.
 
 - Source file: `test/data.cpp` in the C++ td repository
-- Source commit: `d1085f9cebc5a62379991ae1652673954f229c1f`
+- Source commit: `a997aa864278e3941bef94e10fb974374df10998`
 - Regenerate: from `conformance/`, `cargo run -- <td-repo-root> vectors`
 
 Integrity: `sha256sum -c sha256sums.txt`
