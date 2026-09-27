@@ -13,10 +13,13 @@ use crate::packet::{self, ReadResult};
 use crate::packet_info::PacketInfo;
 use crate::transport::{IStreamTransport, create_transport};
 use crate::transport_type::TransportType;
+use std::pin::Pin;
+use std::task::{Context, Poll, RawWaker, Waker};
 use tdutils::buffer::{BufferSlice, ChainBufferWriter};
 use tdutils::random;
 use tdutils::status::{Result, Status};
-use tokio::io::AsyncWriteExt;
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// `td::mtproto::RawConnection::StatsCallback`.
 pub trait StatsCallback {
@@ -51,8 +54,15 @@ pub trait RawConnectionCallback {
 }
 
 /// `td::mtproto::RawConnectionDefault` (the non-watchOS path).
-pub struct RawConnection {
-    stream: tokio::net::TcpStream,
+///
+/// Generic over the byte stream so the wasm build can ride a WebSocket
+/// (`ws_stream::WsStream`); native keeps the default `TcpStream` and every
+/// existing signature/monomorphization is unchanged.
+pub struct RawConnection<S = crate::DefaultStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream: S,
     transport: Box<dyn IStreamTransport>,
     input_writer: ChainBufferWriter,
     output_writer: ChainBufferWriter,
@@ -62,15 +72,37 @@ pub struct RawConnection {
     stats_callback: Option<Box<dyn StatsCallback>>,
 }
 
+/// Readiness for the session/handshake driver's `select!` arm: TcpStream
+/// has `readable()` natively; the wasm `WsStream` provides its own.
+pub trait StreamReadable {
+    fn stream_readable(&mut self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl StreamReadable for tokio::net::TcpStream {
+    async fn stream_readable(&mut self) {
+        if let Err(error) = tokio::net::TcpStream::readable(self).await {
+            tdutils::log_debug!("TcpStream readable error: {error}");
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl StreamReadable for crate::ws_stream::WsStream {
+    async fn stream_readable(&mut self) {
+        self.readable().await
+    }
+}
+
 /// `RawConnection::MAX_PACKET_SIZE` (flush_read).
 const MAX_PACKET_SIZE: usize = (1 << 22) + 1024;
 
-impl RawConnection {
+impl<S: AsyncRead + AsyncWrite + Unpin> RawConnection<S> {
     /// `RawConnection::create`: the tokio stream takes the C++ `SocketFd`
     /// role; the transport is created from the type and takes ownership of
     /// the input reader (the C++ `input_` pointer).
     pub fn new(
-        stream: tokio::net::TcpStream,
+        stream: S,
         transport_type: TransportType,
         stats_callback: Option<Box<dyn StatsCallback>>,
     ) -> Self {
@@ -175,7 +207,7 @@ impl RawConnection {
         self.transport.write(packet, false, &mut self.output_writer);
     }
 
-    pub fn stream(&mut self) -> &mut tokio::net::TcpStream {
+    pub fn stream(&mut self) -> &mut S {
         &mut self.stream
     }
 
@@ -246,21 +278,27 @@ impl RawConnection {
         auth_key: &AuthKey,
         callback: &mut dyn RawConnectionCallback,
     ) -> Status {
-        // Non-blocking socket read into the transport's input stream.
+        // Non-blocking stream read into the transport's input stream (a
+        // noop-waker poll keeps the `WouldBlock` contract stream-generic).
         let mut buf = [0u8; 65536];
-        match self.stream.try_read(&mut buf) {
-            Ok(0) => return Status::error(2, "Connection closed"),
-            Ok(size) => {
-                self.input_writer.append(&buf[..size], 0);
-                if size != 0 {
-                    if let Some(stats) = self.stats_callback.as_deref_mut() {
-                        stats.on_read(size as u64);
-                    }
-                    callback.on_read(size);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+        let mut stream = Pin::new(&mut self.stream);
+        match stream.as_mut().poll_read(&mut cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let size = read_buf.filled().len();
+                if size == 0 {
+                    return Status::error(2, "Connection closed");
                 }
+                self.input_writer.append(&buf[..size], 0);
+                if let Some(stats) = self.stats_callback.as_deref_mut() {
+                    stats.on_read(size as u64);
+                }
+                callback.on_read(size);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Status::error(2, &error.to_string()),
+            Poll::Pending => {}
+            Poll::Ready(Err(error)) => return Status::error(2, &error.to_string()),
         }
 
         while self.transport.can_read() {
@@ -344,15 +382,27 @@ impl RawConnection {
         let mut written = 0usize;
         while !reader.empty() {
             let slice = reader.prepare_read();
-            match self.stream.write(slice).await {
-                Ok(size) => {
+            // The 100ms timeout is the wasm lifeline: a first write can park
+            // on the not-yet-open browser WebSocket, and emscripten can lose
+            // the cross-thread wake from the main-thread on_open callback
+            // into this pthread's parked task. Re-polling on the local timer
+            // rescues the write; native writes never take 100ms, so the arm
+            // is dead code there.
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                self.stream.write(slice),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(size)) => {
                     if size == 0 {
                         return Status::error(2, "Connection closed");
                     }
                     reader.confirm_read(size);
                     written += size;
                 }
-                Err(error) => return Status::error(2, &error.to_string()),
+                Ok(Err(error)) => return Status::error(2, &error.to_string()),
+                Err(_elapsed) => continue,
             }
         }
         self.output_writer = ChainBufferWriter::new();
@@ -382,6 +432,19 @@ fn on_quick_ack(
         }
     };
     callback.on_quick_ack(token)
+}
+
+/// A no-op waker for non-blocking polls (`try_read` semantics over any
+/// stream type).
+fn noop_waker() -> Waker {
+    fn noop(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &NOOP_VTABLE)
+    }
+    static NOOP_VTABLE: std::task::RawWakerVTable =
+        std::task::RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: the vtable functions never dereference the data pointer.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
 }
 
 /// `RawConnectionDefault::on_read_mtproto_error`.

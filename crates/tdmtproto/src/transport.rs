@@ -500,11 +500,12 @@ pub mod tcp {
             } else {
                 self.aes_ctr_byte_flow.as_mut().expect("init").wakeup();
             }
-            Result::Ok(self.impl_.read_from_stream(
+            let r = self.impl_.read_from_stream(
                 self.byte_flow_sink.as_mut().expect("init").get_output(),
                 message,
                 quick_ack,
-            ))
+            );
+            Result::Ok(r)
         }
 
         fn support_quick_ack(&self) -> bool {
