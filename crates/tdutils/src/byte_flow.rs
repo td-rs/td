@@ -759,14 +759,21 @@ impl<'a> ByteFlowInterface for ByteFlowMoveSink<'a> {
 /// `td::AesCtrByteFlow` — an in-place AES-CTR flow node (S55, the
 /// obfuscated transport decrypts its incoming stream with it).
 pub struct AesCtrByteFlow<'a> {
-    base: ByteFlowInplaceBase<'a>,
+    // Writer-based (NOT the C++'s ByteFlowInplaceBase): the C++ hands the
+    // sink a POINTER to its in-place output reader so `advance_end` is
+    // visible to the sink; Rust readers are by-value, and a clone's end
+    // stays frozen at hand-off — the sink starved forever (the wasm
+    // obfuscated transport was the first live consumer). Copying the
+    // encrypted window into an own writer preserves the bytes and the
+    // extracted-reader sync works.
+    base: ByteFlowBase<'a>,
     state: AesCtrState,
 }
 
 impl<'a> AesCtrByteFlow<'a> {
     pub fn new() -> Self {
         Self {
-            base: ByteFlowInplaceBase::default(),
+            base: ByteFlowBase::default(),
             state: AesCtrState::new(),
         }
     }
@@ -818,15 +825,17 @@ impl<'a> ByteFlowInterface for AesCtrByteFlow<'a> {
             if len != 0 {
                 // SAFETY: the reader window is stable until `confirm_read`
                 // below, and no other reader may access it (the single-writer
-                // discipline) — this is C++'s in-place `state_.encrypt(ready,
-                // ready)`.
+                // discipline) — C++'s in-place `state_.encrypt(ready, ready)`.
                 state.encrypt_in_place(std::slice::from_raw_parts_mut(ptr as *mut u8, len));
+                // SAFETY: the window above is still live (confirm_read below
+                // only advances the reader's position).
+                let window = std::slice::from_raw_parts(ptr, len);
+                output.append(window, 0);
                 common
                     .input
                     .as_mut()
                     .expect("aes-ctr flow input")
                     .confirm_read(len);
-                output.advance_end(len);
                 result = true;
             }
 
@@ -996,5 +1005,27 @@ mod tests {
         input_writer.append(b"inplace", 0);
         assert_eq!(inplace.common.get_read_size_impl(), 7);
         assert_eq!(inplace.output.size(), 0, "window starts empty");
+    }
+}
+
+#[cfg(test)]
+mod aes_flow_tests {
+    use super::*;
+
+    #[test]
+    fn aes_flow_feeds_sink() {
+        let mut writer = ChainBufferWriter::new();
+        let mut aes = Box::new(AesCtrByteFlow::new());
+        let mut sink = Box::new(ByteFlowSink::default());
+        aes.init(&[7u8; 32], &[9u8; 16]);
+        aes.set_input(writer.extract_reader());
+        aes.set_parent(&mut *sink);
+        let payload = vec![1u8; 104];
+        writer.append(&payload, 0);
+        aes.wakeup();
+        let out = sink.get_output();
+        assert_eq!(out.size(), 104, "sink must receive the AES-processed bytes");
+        assert_eq!(out.prepare_read().len(), 104);
+        assert_eq!(sink.get_read_size(), 104);
     }
 }

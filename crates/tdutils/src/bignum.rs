@@ -7,7 +7,9 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
 
-/// Limb budget of the Montgomery fast path (4,096-bit operands).
+/// Limb budget of the Montgomery fast path (4,096-bit operands at 64-bit
+/// limbs; crypto-bigint's limb width follows the machine word, so the byte
+/// arithmetic below is expressed through `Limb::BYTES`/`Limb::BITS`).
 const MONT_LIMBS: usize = 64;
 
 /// `base^exponent mod modulus` through `crypto-bigint`'s Montgomery
@@ -20,7 +22,7 @@ macro_rules! montgomery_modpow_fn {
     ($name:ident, $LIMBS:literal) => {
         fn $name(base: &BigInt, exponent: &BigInt, modulus: &BigInt) -> BigInt {
             let to_padded = |value: &BigUint| -> Vec<u8> {
-                let mut out = vec![0u8; $LIMBS * 8];
+                let mut out = vec![0u8; $LIMBS * crypto_bigint::Limb::BYTES];
                 let bytes = value.to_bytes_le();
                 out[..bytes.len()].copy_from_slice(&bytes);
                 out
@@ -316,9 +318,15 @@ impl BigNum {
     /// arithmetic. Everything else falls back to `modpow` verbatim. The
     /// vartime form matches the C++ (tdlib never sets `BN_FLG_CONSTTIME`).
     pub fn mod_exp(a: &BigNum, p: &BigNum, m: &BigNum, _context: &mut BigNumContext) -> Self {
-        let eligible = m.value.bits() <= (MONT_LIMBS * 64) as u64
-            && p.value.bits() <= (MONT_LIMBS * 64) as u64
-            && a.value.bits() <= (MONT_LIMBS * 64) as u64
+        let montgomery_budget = (MONT_LIMBS * crypto_bigint::Limb::BITS as usize) as u64;
+        // The Montgomery path is limb-width-correct (the padding and the
+        // thresholds go through `Limb::BYTES`/`Limb::BITS`, so 2,048-bit
+        // primes ride the 64-limb budget on 32-bit words too); it matters
+        // on wasm, where num-bigint's generic modpow is ~25s per 2,048-bit
+        // DH operation — past Telegram's handshake window.
+        let eligible = m.value.bits() <= montgomery_budget
+            && p.value.bits() <= montgomery_budget
+            && a.value.bits() <= montgomery_budget
             && !m.value.is_zero()
             && m.value.bit(0);
         if !eligible {
@@ -328,9 +336,11 @@ impl BigNum {
         }
         // The Montgomery working width must match the modulus width: the
         // limb count drives every multiplication, so a 2,048-bit prime in a
-        // 4,096-bit budget pays ~4x for nothing (the first S79 cut). 32
-        // limbs covers the Telegram primes; 64 is the fallback for larger.
-        if m.value.bits() <= 2048 {
+        // 4,096-bit budget pays ~4x for nothing (the first S79 cut). The
+        // thresholds go through `Limb::BITS` — 32 limbs cover the Telegram
+        // primes at 64-bit words (wasm32 words are half as wide, so a
+        // 2,048-bit prime rides the 64-limb path there); 64 is the cap.
+        if m.value.bits() <= (32 * crypto_bigint::Limb::BITS as usize) as u64 {
             return Self {
                 value: montgomery_modpow_32(&a.value, &p.value, &m.value),
             };

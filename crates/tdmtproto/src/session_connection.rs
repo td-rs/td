@@ -1558,3 +1558,219 @@ fn build_crypto_packet(
         (parts, parent_message_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records what the session machinery emits for service messages —
+    /// the assertions the wasm live runs traced by hand (the container
+    /// with new_session_created + msgs_ack + future_salts).
+    #[derive(Default)]
+    struct TestCallback {
+        acks: Vec<u64>,
+        updates: Vec<Vec<u8>>,
+        new_sessions: Vec<u64>,
+        salt_updates: usize,
+        time_diff: Vec<bool>,
+    }
+
+    impl SessionConnectionCallback for TestCallback {
+        fn on_connected(&mut self) {}
+        fn on_closed(&mut self, _status: Status) {}
+        fn on_server_salt_updated(&mut self) {
+            self.salt_updates += 1;
+        }
+        fn on_server_time_difference_updated(&mut self, force: bool) {
+            self.time_diff.push(force);
+        }
+        fn on_new_session_created(&mut self, unique_id: u64, _first_message_id: MessageId) {
+            self.new_sessions.push(unique_id);
+        }
+        fn on_session_failed(&mut self, _status: Status) {}
+        fn on_container_sent(&mut self, _container: MessageId, _ids: Vec<MessageId>) {}
+        fn on_pong(&mut self, _ping: f64, _pong: f64, _now: f64) -> Status {
+            Status::ok()
+        }
+        fn on_update(&mut self, packet: BufferSlice) -> Status {
+            self.updates.push(packet.as_slice().to_vec());
+            Status::ok()
+        }
+        fn on_message_ack(&mut self, message_id: MessageId) {
+            self.acks.push(message_id.get());
+        }
+        fn on_message_result_ok(
+            &mut self,
+            _message_id: MessageId,
+            _packet: BufferSlice,
+            _original_size: usize,
+        ) -> Status {
+            Status::ok()
+        }
+        fn on_message_result_error(
+            &mut self,
+            _message_id: MessageId,
+            _code: i32,
+            _message: String,
+        ) {
+        }
+        fn on_message_failed(&mut self, _message_id: MessageId, _status: Status) {}
+        fn on_message_info(
+            &mut self,
+            _message_id: MessageId,
+            _state: i32,
+            _answer: MessageId,
+            _answer_size: i32,
+            _source: i32,
+        ) {
+        }
+        fn on_destroy_auth_key(&mut self) -> Status {
+            Status::ok()
+        }
+    }
+
+    fn put_i32(out: &mut Vec<u8>, v: i32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_i64(out: &mut Vec<u8>, v: i64) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// One container inner message: `msg_id:long seqno:int bytes:int` +
+    /// payload (the `mtproto_api::message` framing).
+    fn message(msg_id: u64, seq_no: i32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_i64(&mut out, msg_id as i64);
+        put_i32(&mut out, seq_no);
+        put_i32(&mut out, payload.len() as i32);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `on_slice_packet` never touches the socket, but the connection
+    /// owns one — a loopback pair satisfies the type.
+    fn session() -> SessionConnection {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let stream = runtime
+            .block_on(tokio::net::TcpStream::connect(addr))
+            .expect("connect");
+        let raw = RawConnection::new(
+            stream,
+            crate::transport_type::TransportType::new(
+                crate::transport_type::TransportTypeEnum::Tcp,
+                1,
+                crate::proxy_secret::ProxySecret::default(),
+            ),
+            None,
+        );
+        let mut auth_data = AuthData::new();
+        auth_data.set_session_id(123456789);
+        auth_data.set_main_auth_key(crate::auth_key::AuthKey::new(
+            0x1122334455667788,
+            vec![0u8; 256],
+        ));
+        auth_data.set_use_pfs(false);
+        SessionConnection::new(SessionMode::Tcp, raw, auth_data)
+    }
+
+    /// The exact container a live run receives right after the
+    /// handshake (new_session_created, msgs_ack, future_salts): every
+    /// item must parse and reach its callback with no silent aborts.
+    #[test]
+    fn container_service_messages_all_dispatch() {
+        let mut connection = session();
+
+        let mut nsc = Vec::new();
+        put_i32(&mut nsc, mtproto_api::NewSession::ID);
+        put_i64(&mut nsc, 0x100); // first_msg_id
+        put_i64(&mut nsc, 0xABCDEF01); // unique_id
+        put_i64(&mut nsc, 0x5555); // server_salt
+
+        let mut ack = Vec::new();
+        put_i32(&mut ack, mtproto_api::MsgsAck::ID);
+        put_i32(&mut ack, tl::VECTOR_ID);
+        put_i32(&mut ack, 1);
+        put_i64(&mut ack, 0x100);
+
+        let mut salts = Vec::new();
+        put_i32(&mut salts, mtproto_api::FutureSalts::ID);
+        put_i64(&mut salts, 0x100); // req_msg_id
+        put_i32(&mut salts, 100); // now
+        put_i32(&mut salts, 1); // one salt
+        put_i32(&mut salts, 100); // valid_since
+        put_i32(&mut salts, 200); // valid_until
+        put_i64(&mut salts, 0x7777); // salt
+
+        let mut container = Vec::new();
+        put_i32(&mut container, MSG_CONTAINER_ID);
+        put_i32(&mut container, 3);
+        container.extend_from_slice(&message(0x200, 1, &nsc));
+        container.extend_from_slice(&message(0x204, 2, &ack));
+        container.extend_from_slice(&message(0x208, 3, &salts));
+
+        let info = MsgInfo {
+            message_id: MessageId::new(0x210),
+            seq_no: 2,
+            size: container.len(),
+        };
+
+        let mut callback = TestCallback::default();
+        // SAFETY: the pointer is only used inside the on_slice_packet call
+        // below, while `callback` is alive — the same contract as `flush`.
+        connection.callback = unsafe {
+            std::mem::transmute::<
+                &mut dyn SessionConnectionCallback,
+                *mut (dyn SessionConnectionCallback + 'static),
+            >(&mut callback)
+        };
+        let status = connection.on_slice_packet(&info, container.as_slice());
+        assert!(
+            status.is_ok(),
+            "container must fully parse: {}",
+            status.message()
+        );
+        assert_eq!(callback.new_sessions, vec![0xABCDEF01]);
+        assert_eq!(
+            callback.acks,
+            vec![0x100],
+            "msgs_ack must reach on_message_ack"
+        );
+        assert_eq!(
+            callback.salt_updates, 1,
+            "future_salts must update the salts"
+        );
+        assert_eq!(callback.updates.len(), 0);
+    }
+
+    /// A bare (non-container) update packet rides the on_update path.
+    #[test]
+    fn non_service_packet_dispatches_as_update() {
+        let mut connection = session();
+        // updatesTooLong#9046c2e8 — no fields.
+        let mut update = Vec::new();
+        put_i32(&mut update, 0x9046c2e8u32 as i32);
+
+        let info = MsgInfo {
+            message_id: MessageId::new((time::now() * (1u64 << 32) as f64) as u64 & !3 | 1),
+            seq_no: 1,
+            size: update.len(),
+        };
+        let mut callback = TestCallback::default();
+        // SAFETY: same as above — valid for the duration of the call.
+        connection.callback = unsafe {
+            std::mem::transmute::<
+                &mut dyn SessionConnectionCallback,
+                *mut (dyn SessionConnectionCallback + 'static),
+            >(&mut callback)
+        };
+        let status = connection.on_slice_packet(&info, update.as_slice());
+        assert!(status.is_ok(), "update must dispatch: {}", status.message());
+        assert_eq!(callback.updates.len(), 1);
+        assert_eq!(callback.updates[0], update);
+    }
+}
