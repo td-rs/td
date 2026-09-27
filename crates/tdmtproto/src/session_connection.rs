@@ -110,7 +110,10 @@ const HTTP_MAX_AFTER: i32 = 10; // 0.01s
 const HTTP_MAX_DELAY: i32 = 30; // 0.03s
 
 /// `td::mtproto::SessionConnection`.
-pub struct SessionConnection {
+pub struct SessionConnection<S = crate::DefaultStream>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     online_flag: bool,
     is_main: bool,
 
@@ -152,15 +155,18 @@ pub struct SessionConnection {
     container_message_id: MessageId,
     main_message_id: MessageId,
 
-    raw_connection: RawConnection,
+    raw_connection: RawConnection<S>,
     auth_data: AuthData,
     /// The C++ `callback_` pointer — valid for the duration of a `flush`
     /// call.
     callback: *mut (dyn SessionConnectionCallback + 'static),
 }
 
-impl SessionConnection {
-    pub fn new(mode: SessionMode, raw_connection: RawConnection, auth_data: AuthData) -> Self {
+impl<S> SessionConnection<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    pub fn new(mode: SessionMode, raw_connection: RawConnection<S>, auth_data: AuthData) -> Self {
         Self {
             online_flag: false,
             is_main: false,
@@ -202,13 +208,13 @@ impl SessionConnection {
         &mut self.auth_data
     }
 
-    pub fn raw_connection(&mut self) -> &mut RawConnection {
+    pub fn raw_connection(&mut self) -> &mut RawConnection<S> {
         &mut self.raw_connection
     }
 
     /// `SessionConnection::move_as_raw_connection` — consuming (the C++
     /// moves the unique_ptr out, leaving the session unusable).
-    pub fn move_as_raw_connection(mut self) -> RawConnection {
+    pub fn move_as_raw_connection(mut self) -> RawConnection<S> {
         self.callback = null_callback();
         self.raw_connection
     }
@@ -1151,7 +1157,7 @@ impl SessionConnection {
         // The raw connection and the callback borrow disjoint parts of this
         // struct; the C++ holds raw pointers for exactly this reason, and
         // the split borrow is not expressible in safe Rust.
-        let raw = &mut self.raw_connection as *mut RawConnection;
+        let raw = &mut self.raw_connection as *mut RawConnection<S>;
         // SAFETY: `raw` aliases only `self.raw_connection`; the callback
         // (`self`) touches the other fields, never the connection itself.
         let result = unsafe { (&mut *raw).flush(&auth_key, self).await };
@@ -1186,7 +1192,10 @@ impl SessionConnection {
     }
 }
 
-impl RawConnectionCallback for SessionConnection {
+impl<S> RawConnectionCallback for SessionConnection<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     fn on_raw_packet(&mut self, packet_info: &PacketInfo, packet: BufferSlice) -> Status {
         let old_main_message_id = self.main_message_id;
         self.main_message_id = packet_info.message_id;
@@ -1216,7 +1225,10 @@ impl RawConnectionCallback for SessionConnection {
     }
 }
 
-impl SessionConnection {
+impl<S> SessionConnection<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     fn raw_connection_moved(&self) -> bool {
         false
     }
@@ -1647,20 +1659,10 @@ mod tests {
         out
     }
 
-    /// `on_slice_packet` never touches the socket, but the connection
-    /// owns one — a loopback pair satisfies the type.
-    fn session() -> SessionConnection {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().unwrap();
-        let stream = runtime
-            .block_on(tokio::net::TcpStream::connect(addr))
-            .expect("connect");
+    fn session() -> SessionConnection<tokio::io::DuplexStream> {
+        let (client, _server) = tokio::io::duplex(4096);
         let raw = RawConnection::new(
-            stream,
+            client,
             crate::transport_type::TransportType::new(
                 crate::transport_type::TransportTypeEnum::Tcp,
                 1,
@@ -1678,9 +1680,9 @@ mod tests {
         SessionConnection::new(SessionMode::Tcp, raw, auth_data)
     }
 
-    /// The exact container a live run receives right after the
-    /// handshake (new_session_created, msgs_ack, future_salts): every
-    /// item must parse and reach its callback with no silent aborts.
+    /// The exact container the live wasm run received after the handshake:
+    /// new_session_created + msgs_ack (the 0x62d6b459 item) + future_salts.
+    /// Every item must parse and reach its callback — no silent aborts.
     #[test]
     fn container_service_messages_all_dispatch() {
         let mut connection = session();

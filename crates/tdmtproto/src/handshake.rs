@@ -419,7 +419,6 @@ impl AuthKeyHandshake {
         }
 
         self.server_time_diff = dh_inner_data.server_time as f64 - time::now();
-
         let mut handshake = DhHandshake::new();
         handshake.set_config(dh_inner_data.g, &dh_inner_data.dh_prime);
         handshake.set_g_a(&dh_inner_data.g_a);
@@ -429,7 +428,6 @@ impl AuthKeyHandshake {
         }
         let g_b = handshake.get_g_b();
         let (auth_key_id, auth_key) = handshake.gen_key();
-
         let mut data = Vec::new();
         mtproto_api::Client_DH_Inner_Data {
             nonce: int128_from_bytes(&self.nonce),

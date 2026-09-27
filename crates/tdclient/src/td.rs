@@ -11271,7 +11271,7 @@ fn get_operating_system_version() -> String {
     // session query with CONNECTION_SYSTEM_EMPTY.
     #[cfg(target_family = "wasm")]
     {
-        return "WebAssembly".to_string();
+        "WebAssembly".to_string()
     }
     #[cfg(not(target_family = "wasm"))]
     {

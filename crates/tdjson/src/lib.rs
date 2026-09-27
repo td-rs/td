@@ -10,6 +10,26 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Mutex;
 
+/// The dev-harness ws bridge setter (S82): routes the wasm transport's
+/// WebSocket dial through a local ws↔TCP bridge instead of Telegram's
+/// origin-gated `*.web.telegram.org` endpoints (see
+/// `tdclient::session_multi_proxy::set_ws_bridge_url`).
+///
+/// # Safety
+/// `base_url` must be a valid NUL-terminated string.
+#[cfg(target_family = "wasm")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tdweb_set_ws_bridge_url(base_url: *const c_char) -> c_int {
+    if base_url.is_null() {
+        return -1;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(base_url) }
+        .to_string_lossy()
+        .into_owned();
+    tdclient::session_multi_proxy::set_ws_bridge_url(s);
+    0
+}
+
 use tdclient::client_json::{self, ClientJson, store_string};
 
 // ---------- legacy td_json_client API (ClientJson.cpp) ----------

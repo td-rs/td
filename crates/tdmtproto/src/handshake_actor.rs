@@ -18,7 +18,6 @@ use crate::raw_connection::{RawConnection, RawConnectionCallback};
 use crate::transport_type::TransportType;
 use tdutils::buffer::BufferSlice;
 use tdutils::status::{Result, Status};
-use tokio::net::TcpStream;
 
 /// Queues handshake queries for the driver to send.
 struct SendNoCrypto<'a> {
@@ -33,14 +32,20 @@ impl AuthKeyHandshakeCallback for SendNoCrypto<'_> {
 
 /// The C++ `HandshakeConnection`: owns the raw connection, borrows the
 /// handshake state machine and its context.
-struct HandshakeConnection<'a> {
-    raw_connection: RawConnection,
+struct HandshakeConnection<'a, S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    raw_connection: RawConnection<S>,
     handshake: &'a mut AuthKeyHandshake,
     context: &'a mut dyn AuthKeyHandshakeContext,
     pending: Vec<Vec<u8>>,
 }
 
-impl RawConnectionCallback for HandshakeConnection<'_> {
+impl<S> RawConnectionCallback for HandshakeConnection<'_, S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     fn on_raw_packet(&mut self, packet_info: &PacketInfo, mut packet: BufferSlice) -> Status {
         if !packet_info.no_crypto_flag {
             return Status::error_message("Expected not encrypted packet");
@@ -63,14 +68,17 @@ impl RawConnectionCallback for HandshakeConnection<'_> {
     }
 }
 
-impl HandshakeConnection<'_> {
+impl<'a, S> HandshakeConnection<'a, S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     /// One C++ `flush()`: read the pending response, then write the queued
     /// next query.
     async fn flush_once(&mut self) -> Status {
         // The raw connection and the callback borrow disjoint parts of this
         // struct; the C++ holds raw pointers for exactly this reason, and
         // the split borrow is not expressible in safe Rust.
-        let raw = &mut self.raw_connection as *mut RawConnection;
+        let raw = &mut self.raw_connection as *mut RawConnection<S>;
         // SAFETY: `raw` aliases only `self.raw_connection`; the callback
         // (`self`) touches the other fields, never the connection itself.
         let status = unsafe { (&mut *raw).flush(&AuthKey::default(), self).await };
@@ -96,13 +104,16 @@ impl HandshakeConnection<'_> {
 /// `HandshakeActor`: runs the whole auth-key generation against the given
 /// socket and returns the raw connection (with the generated key inside the
 /// handshake).
-pub async fn run_handshake(
-    stream: TcpStream,
+pub async fn run_handshake<S>(
+    stream: S,
     transport_type: TransportType,
     context: &mut dyn AuthKeyHandshakeContext,
     timeout: f64,
     handshake: &mut AuthKeyHandshake,
-) -> Result<RawConnection> {
+) -> Result<RawConnection<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + crate::raw_connection::StreamReadable,
+{
     let raw_connection = RawConnection::new(stream, transport_type, None);
     let mut connection = HandshakeConnection {
         raw_connection,
@@ -124,11 +135,19 @@ pub async fn run_handshake(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(timeout);
     loop {
+        // The 100ms tick is the wasm lifeline: emscripten can lose the
+        // cross-thread wake from the main-thread WebSocket callbacks into
+        // this pthread's parked task (observed intermittently — a parked
+        // write never resumes after on_open). Re-polling on the local timer
+        // rescues both the parked write and unread input; on native the
+        // handshakes finish in well under a tick, so the arm never fires.
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
                 return Result::Err(Status::error_message("Timeout expired"));
             }
-            _ = connection.raw_connection.stream().readable() => {}
+            _ = connection.raw_connection.stream().stream_readable() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::now()
+                + Duration::from_millis(100)) => {}
         }
 
         let status = connection.flush_once().await;

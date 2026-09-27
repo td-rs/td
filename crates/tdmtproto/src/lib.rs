@@ -17,7 +17,6 @@ pub mod connection_manager;
 pub mod dh_callback;
 pub mod dh_handshake;
 pub mod handshake;
-#[cfg(not(target_family = "wasm"))]
 pub mod handshake_actor;
 #[cfg(not(target_family = "wasm"))]
 pub mod http_transport;
@@ -29,18 +28,22 @@ pub mod persistence;
 #[cfg(not(target_family = "wasm"))]
 pub mod ping;
 pub mod proxy_secret;
-#[cfg(not(target_family = "wasm"))]
 pub mod raw_connection;
 pub mod rsa;
 #[cfg(not(target_family = "wasm"))]
 pub mod session;
-#[cfg(not(target_family = "wasm"))]
-#[path = "session_connection.rs"]
-pub mod session_connection;
-#[cfg(target_family = "wasm")]
-#[path = "wasm/session_connection.rs"]
 pub mod session_connection;
 pub mod tls_reader_byte_flow;
+#[cfg(target_family = "wasm")]
+#[path = "wasm/ws_stream.rs"]
+pub mod ws_stream;
+
+/// The default byte stream: the tokio TCP stream natively, the browser
+/// WebSocket stream on wasm (tokio's `net` feature has no wasm backend).
+#[cfg(not(target_family = "wasm"))]
+pub type DefaultStream = tokio::net::TcpStream;
+#[cfg(target_family = "wasm")]
+pub type DefaultStream = ws_stream::WsStream;
 pub mod transport;
 pub mod transport_type;
 pub mod utils;

@@ -37,11 +37,9 @@ use tdmtproto::auth_data::AuthData;
 use tdmtproto::auth_key::AuthKey;
 use tdmtproto::dh_callback::DhCallback;
 use tdmtproto::handshake::{AuthKeyHandshake, AuthKeyHandshakeContext};
-#[cfg(not(target_family = "wasm"))]
 use tdmtproto::handshake_actor::run_handshake;
 use tdmtproto::message_id::MessageId;
 use tdmtproto::proxy_secret::ProxySecret;
-#[cfg(not(target_family = "wasm"))]
 use tdmtproto::raw_connection::RawConnection;
 use tdmtproto::rsa::{PublicRsaKeyInterface, Rsa, RsaKey};
 use tdmtproto::session_connection::{SessionConnection, SessionConnectionCallback, SessionMode};
@@ -866,7 +864,7 @@ async fn open_connection(
     auth_data: &Arc<AuthDataShared>,
     raw_dc_id: i32,
     is_main: &AtomicBool,
-) -> std::result::Result<SessionConnection, Status> {
+) -> std::result::Result<Conn, Status> {
     let option = pick_dc_option(shared, raw_dc_id)
         .ok_or_else(|| Status::error(500, &format!("No usable dc option for DC {raw_dc_id}")))?;
     let port =
@@ -932,18 +930,127 @@ async fn open_connection(
     Ok(connection)
 }
 
-/// wasm: browsers cannot open raw TCP sockets to the DCs; the pools fail
-/// fast here until the WebSocket transport slice lands.
+/// The per-target session connection: native rides the tokio TCP stream,
+/// wasm rides the browser WebSocket stream.
+#[cfg(not(target_family = "wasm"))]
+type Conn = SessionConnection;
+#[cfg(target_family = "wasm")]
+type Conn = SessionConnection<tdmtproto::ws_stream::WsStream>;
+
+/// The TD_EMSCRIPTEN web DC table (ConnectionCreator.cpp:1244-1256, prod):
+/// wss://<host>.web.telegram.org/apiws — the browser transport's endpoints.
+#[cfg(target_family = "wasm")]
+fn web_dc_host(raw_dc_id: i32) -> &'static str {
+    match raw_dc_id {
+        1 => "pluto.web.telegram.org",
+        2 => "venus.web.telegram.org",
+        3 => "aurora.web.telegram.org",
+        4 => "vesta.web.telegram.org",
+        _ => "flora.web.telegram.org",
+    }
+}
+
+/// The dev-harness bridge override (S82): Telegram's `*.web.telegram.org`
+/// ws endpoints are origin-gated to the official web clients, so the
+/// harness bridges `ws://127.0.0.1:8909/dcN` to the real DC over raw TCP
+/// (the same obfuscated-MTProto bytes the native transport sends). When
+/// unset, the real browser endpoints are used.
+#[cfg(target_family = "wasm")]
+fn ws_bridge_override() -> &'static std::sync::Mutex<Option<String>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Set the bridge base URL (e.g. `ws://127.0.0.1:8909`); the DC id is
+/// appended as `/dc<id>`.
+#[cfg(target_family = "wasm")]
+pub fn set_ws_bridge_url(base: String) {
+    *ws_bridge_override().lock().unwrap() = Some(base);
+}
+
+/// `open_connection` on wasm: MTProto over WebSocket — the same obfuscated
+/// transport and auth-key flow as native, over `WsStream`.
 #[cfg(target_family = "wasm")]
 async fn open_connection(
-    _shared: &Arc<NetShared>,
-    _auth_data: &Arc<AuthDataShared>,
-    _raw_dc_id: i32,
-    _is_main: &AtomicBool,
-) -> std::result::Result<SessionConnection, Status> {
-    Err(Status::error_message(
-        "Network sessions are unsupported on this platform until the browser transport slice",
-    ))
+    shared: &Arc<NetShared>,
+    auth_data: &Arc<AuthDataShared>,
+    raw_dc_id: i32,
+    is_main: &AtomicBool,
+) -> std::result::Result<Conn, Status> {
+    use tdmtproto::ws_stream::WsStream;
+
+    let option = pick_dc_option(shared, raw_dc_id)
+        .ok_or_else(|| Status::error(500, &format!("No usable dc option for DC {raw_dc_id}")))?;
+    let url = {
+        let bridge = ws_bridge_override().lock().unwrap().clone();
+        match bridge {
+            Some(base) => format!("{base}/dc{}", option.raw_dc_id()),
+            None => format!("wss://{}/apiws", web_dc_host(option.raw_dc_id())),
+        }
+    };
+
+    let transport_dc = shared.transport_dc_id(raw_dc_id);
+    let transport_type = TransportType::new(
+        TransportTypeEnum::ObfuscatedTcp,
+        transport_dc as i16,
+        ProxySecret::default(),
+    );
+    let now = tdutils::time::now();
+    let mut auth_local = AuthData::new();
+    auth_local.set_use_pfs(false);
+    auth_local.set_session_id(fresh_session_id());
+    auth_local.set_header(shared.header.lock().clone());
+
+    let auth_key = auth_data.get_auth_key();
+    if auth_key.empty() {
+        let mut context = HandshakeContext {
+            dh: PrimeCallback,
+            rsa: SharedRsaInterface(shared.public_rsa_key.clone()),
+        };
+        let mut handshake = AuthKeyHandshake::new(transport_dc, 0);
+        let raw_connection = match run_handshake(
+            WsStream::connect(&url).map_err(|e| Status::error(500, &format!("ws connect: {e}")))?,
+            transport_type,
+            &mut context,
+            30.0,
+            &mut handshake,
+        )
+        .await
+        {
+            Result::Ok(connection) => connection,
+            Result::Err(status) => return Err(status),
+        };
+        let auth_key = handshake.release_auth_key();
+        let time_diff = handshake.get_server_time_diff();
+        let salt = handshake.get_server_salt();
+        auth_local.set_main_auth_key(auth_key.clone());
+        auth_local.reset_server_time_difference(time_diff);
+        auth_local.set_server_salt(salt as i64, tdutils::time::now());
+        auth_data.set_auth_key(auth_key);
+        shared.events.push(NetEvent::ServerTimeDifference {
+            raw_dc_id,
+            diff: time_diff,
+            force: false,
+        });
+        let mut connection = SessionConnection::new(SessionMode::Tcp, raw_connection, auth_local);
+        connection.set_online(true, is_main.load(Ordering::Relaxed));
+        return Ok(connection);
+    }
+
+    auth_local.set_main_auth_key(auth_key);
+    let diff = auth_data.get_server_time_difference() + wall_minus_monotonic();
+    auth_local.reset_server_time_difference(diff);
+    auth_local.set_future_salts(auth_data.get_future_salts(), now);
+
+    let raw_connection = RawConnection::new(
+        WsStream::connect(&url).map_err(|e| Status::error(500, &format!("ws connect: {e}")))?,
+        transport_type,
+        None,
+    );
+    let mut connection = SessionConnection::new(SessionMode::Tcp, raw_connection, auth_local);
+    connection.set_online(true, is_main.load(Ordering::Relaxed));
+    Ok(connection)
 }
 
 /// The `DcOptionsSet::fetch_dc_option` v1 — the first usable
