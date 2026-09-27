@@ -7,12 +7,21 @@ publish.workspace = true
 
 [dependencies]
 tdutils = { path = "../tdutils" }
+parking_lot = "0.12"
+
+# The socket/TLS backend: mio (tokio `net`) refuses wasm32-unknown-emscripten
+# and ring leaves SystemRandom unimplemented there, so the native reqwest +
+# rustls stack links only off-wasm; wasm gets the value-type shims in src/wasm/
+# (the browser WebSocket transport is the follow-on slice).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["deflate", "gzip", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }
-parking_lot = "0.12"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }

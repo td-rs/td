@@ -2059,7 +2059,7 @@ pub mod tl {
             out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
             counted = len;
         } else {
-            assert!(len < (1usize << 32), "String size {len} is too big to be stored");
+            assert!((len as u64) < (1u64 << 32), "String size {len} is too big to be stored");
             out.push(255);
             out.extend_from_slice(&(len as u32).to_le_bytes());
             out.extend_from_slice(&[0, 0, 0]);

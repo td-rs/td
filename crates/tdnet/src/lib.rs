@@ -26,20 +26,40 @@
 //! the C++ `HttpTransport` drives raw HTTP over the DC socket, outside
 //! S48's reqwest-based `wget`.
 
+#[cfg(not(target_family = "wasm"))]
 mod transparent;
 
+#[cfg(not(target_family = "wasm"))]
 pub mod dns;
 pub mod http;
 pub mod http_query;
 pub mod net_query;
+#[cfg(not(target_family = "wasm"))]
 pub mod proxy;
+#[cfg(not(target_family = "wasm"))]
 pub mod tcp;
+#[cfg(not(target_family = "wasm"))]
+#[path = "tls.rs"]
 pub mod tls;
+#[cfg(target_family = "wasm")]
+#[path = "wasm/tls.rs"]
+pub mod tls;
+#[cfg(not(target_family = "wasm"))]
 pub mod tls_init;
+#[cfg(not(target_family = "wasm"))]
 pub mod udp;
+#[cfg(not(target_family = "wasm"))]
+#[path = "wget.rs"]
+pub mod wget;
+#[cfg(target_family = "wasm")]
+#[path = "wasm/wget.rs"]
 pub mod wget;
 
+#[cfg(not(target_family = "wasm"))]
 pub use dns::{GetHostByName, NativeResolver, Options, Resolver, idn_to_ascii};
+#[cfg(not(target_family = "wasm"))]
 pub use proxy::{http_proxy_connect, socks5_connect};
+#[cfg(not(target_family = "wasm"))]
 pub use tcp::{AcceptCallback, TcpListener, connect};
+#[cfg(not(target_family = "wasm"))]
 pub use udp::{BufferedUdp, UdpMessage};
