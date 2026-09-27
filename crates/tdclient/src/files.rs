@@ -40,7 +40,6 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use crate::chat_manager::{ChannelId, ChatId, DcId};
@@ -10031,13 +10030,59 @@ impl ResourceManagerWorker for FileUploader {
     }
 }
 
+/// Positional read/write shims: `FileFd::pread`/`pwrite` ride the unix
+/// `FileExt`/windows `seek_*` halves of the same std feature pair.
+#[cfg(unix)]
+pub(crate) fn compat_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+pub(crate) fn compat_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(unix)]
+pub(crate) fn compat_write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(windows)]
+pub(crate) fn compat_write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+/// `FileExt::read_exact_at` — the unix half has it natively; the loop is the
+/// std definition (EOF mid-read surfaces as an UnexpectedEof error).
+pub(crate) fn compat_read_exact_at(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = compat_read_at(file, &mut buf[total..], offset + total as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        total += n;
+    }
+    Ok(())
+}
+
 /// `pread` (FileFd) — a positional read filling the buffer; a zero read is
 /// the end of file.
 fn pread_at(fd: &File, buf: &mut [u8], offset: u64) -> Result<usize, Status> {
     let mut total = 0usize;
     while total < buf.len() {
-        let n = fd
-            .read_at(&mut buf[total..], offset + total as u64)
+        let n = compat_read_at(fd, &mut buf[total..], offset + total as u64)
             .map_err(|e| Status::error_message(format!("Failed to read: {e}").as_str()))?;
         if n == 0 {
             break;
@@ -11087,9 +11132,7 @@ impl FileDownloader {
         let written_slice_len = (bytes.len() as i64).min(part.size as i64) as usize;
         self.acquire_fd()?;
         let fd = self.fd.as_mut().expect("acquired fd");
-        use std::os::unix::fs::FileExt as _;
-        let written = fd
-            .write_at(&bytes[..written_slice_len], part.offset as u64)
+        let written = compat_write_at(fd, &bytes[..written_slice_len], part.offset as u64)
             .map_err(|e| Status::error_message(format!("Failed to write: {e}").as_str()))?;
         // may write less than part.size, when size of downloadable file is
         // unknown
@@ -16676,8 +16719,7 @@ pub fn read_file_str(path: &str, mut size: i64, offset: i64) -> Result<Vec<u8>, 
         size = file_size - offset;
     }
     let mut content = vec![0u8; size.max(0) as usize];
-    from_file
-        .read_exact_at(&mut content, offset as u64)
+    compat_read_exact_at(&from_file, &mut content, offset as u64)
         .map_err(|_| Status::error_message("Failed to read file"))?;
     Ok(content)
 }

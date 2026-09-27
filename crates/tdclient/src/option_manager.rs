@@ -1254,10 +1254,11 @@ fn value_constructor_id(value: &OptionValue) -> i32 {
 }
 
 /// `Clocks::tz_offset()`: the local UTC offset in seconds (east positive),
-/// computed once per manager like the C++ `Clocks::update` — the
-/// `tm_gmtoff` field straight from `localtime_r` (the C++ reads the same
-/// glibc field).
+/// computed once per manager like the C++ `Clocks::update`.
+#[cfg(unix)]
 fn tz_offset() -> i32 {
+    // the `tm_gmtoff` field straight from `localtime_r` (the C++ reads the
+    // same glibc field).
     let now = std::time::SystemTime::now();
     let unix = now
         .duration_since(std::time::UNIX_EPOCH)
@@ -1268,6 +1269,48 @@ fn tz_offset() -> i32 {
         libc::localtime_r(&unix, &mut tm);
     }
     tm.tm_gmtoff as i32
+}
+
+/// The Windows half: `std::localtime` on Windows resolves through the same
+/// registry timezone info `GetTimeZoneInformation` reports, so the C++
+/// localtime−gmtime arithmetic collapses onto the bias fields (east-positive
+/// offset = −(Bias [+ DaylightBias]) × 60).
+#[cfg(windows)]
+fn tz_offset() -> i32 {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct SystemTimeT {
+        wYear: u16,
+        wMonth: u16,
+        wDayOfWeek: u16,
+        wDay: u16,
+        wHour: u16,
+        wMinute: u16,
+        wSecond: u16,
+        wMilliseconds: u16,
+    }
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct TimeZoneInformation {
+        Bias: i32,
+        StandardName: [u16; 32],
+        StandardDate: SystemTimeT,
+        DaylightName: [u16; 32],
+        DaylightDate: SystemTimeT,
+        DaylightBias: i32,
+    }
+    unsafe extern "system" {
+        fn GetTimeZoneInformation(lptimezoneinformation: *mut TimeZoneInformation) -> u32;
+    }
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    let mut tzi: TimeZoneInformation = unsafe { std::mem::zeroed() };
+    let rc = unsafe { GetTimeZoneInformation(&mut tzi) };
+    let bias = if rc == TIME_ZONE_ID_DAYLIGHT {
+        tzi.Bias + tzi.DaylightBias
+    } else {
+        tzi.Bias
+    };
+    -bias * 60
 }
 
 #[cfg(test)]
