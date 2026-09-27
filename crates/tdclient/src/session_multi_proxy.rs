@@ -37,9 +37,11 @@ use tdmtproto::auth_data::AuthData;
 use tdmtproto::auth_key::AuthKey;
 use tdmtproto::dh_callback::DhCallback;
 use tdmtproto::handshake::{AuthKeyHandshake, AuthKeyHandshakeContext};
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::handshake_actor::run_handshake;
 use tdmtproto::message_id::MessageId;
 use tdmtproto::proxy_secret::ProxySecret;
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::raw_connection::RawConnection;
 use tdmtproto::rsa::{PublicRsaKeyInterface, Rsa, RsaKey};
 use tdmtproto::session_connection::{SessionConnection, SessionConnectionCallback, SessionMode};
@@ -49,6 +51,7 @@ use tdnet::net_query::{AuthFlag, DcId, DcInitSink, GzipFlag, NetQuery, NetQueryT
 use tdutils::buffer::BufferSlice;
 use tdutils::random;
 use tdutils::status::{Result, Status};
+#[cfg(not(target_family = "wasm"))]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -821,6 +824,7 @@ fn fail_pending(
 /// The `ConnectionCreator::create` + `Session::open_connection` v1:
 /// first usable option, fresh TCP connection, handshake when the key is
 /// empty (the C++ `GenAuthKeyActor` leg).
+#[cfg(not(target_family = "wasm"))]
 async fn open_connection(
     shared: &Arc<NetShared>,
     auth_data: &Arc<AuthDataShared>,
@@ -890,6 +894,20 @@ async fn open_connection(
     let mut connection = SessionConnection::new(SessionMode::Tcp, raw_connection, auth_local);
     connection.set_online(true, is_main.load(Ordering::Relaxed));
     Ok(connection)
+}
+
+/// wasm: browsers cannot open raw TCP sockets to the DCs; the pools fail
+/// fast here until the WebSocket transport slice lands.
+#[cfg(target_family = "wasm")]
+async fn open_connection(
+    _shared: &Arc<NetShared>,
+    _auth_data: &Arc<AuthDataShared>,
+    _raw_dc_id: i32,
+    _is_main: &AtomicBool,
+) -> std::result::Result<SessionConnection, Status> {
+    Err(Status::error_message(
+        "Network sessions are unsupported on this platform until the browser transport slice",
+    ))
 }
 
 /// The `DcOptionsSet::fetch_dc_option` v1 — the first usable

@@ -37,6 +37,7 @@
 
 use std::sync::OnceLock;
 
+#[cfg(not(target_family = "wasm"))]
 use tokio::net::TcpStream;
 
 use base64::Engine as _;
@@ -45,9 +46,11 @@ use tdmtproto::auth_data::{AuthData, ServerSalt, parse_server_salt, store_server
 use tdmtproto::auth_key::AuthKey;
 use tdmtproto::dh_callback::DhCallback;
 use tdmtproto::handshake::{AuthKeyHandshake, AuthKeyHandshakeContext};
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::handshake_actor::run_handshake;
 use tdmtproto::message_id::MessageId;
 use tdmtproto::proxy_secret::ProxySecret;
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::raw_connection::RawConnection;
 use tdmtproto::rsa::{PublicRsaKeyInterface, RsaKey};
 use tdmtproto::session_connection::{SessionConnection, SessionConnectionCallback, SessionMode};
@@ -1833,6 +1836,7 @@ pub async fn fetch_full_config(
 
 /// [`fetch_full_config`] with the actor budget injected (the tests shrink
 /// it).
+#[cfg(not(target_family = "wasm"))]
 async fn fetch_full_config_impl(
     option: &RecovererDcOption,
     is_test_dc: bool,
@@ -2028,6 +2032,22 @@ async fn fetch_full_config_impl(
             }
         }
     }
+}
+
+/// wasm: the direct-DC config leg needs raw TCP, which browsers cannot
+/// open; fail fast (the browser transport is the follow-on slice).
+#[cfg(target_family = "wasm")]
+async fn fetch_full_config_impl(
+    _option: &RecovererDcOption,
+    _is_test_dc: bool,
+    _header_options: &RecoveryHeaderOptions,
+    _server_time_difference: f64,
+    _pmc: &mut BinlogKeyValue,
+    _timeout: std::time::Duration,
+) -> Result<(telegram_api::Config, Option<(f64, bool)>), Status> {
+    Err(Status::error_message(
+        "Direct-DC config fetch is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]

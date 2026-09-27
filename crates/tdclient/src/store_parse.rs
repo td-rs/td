@@ -123,7 +123,7 @@ pub fn store_string_bytes(out: &mut Vec<u8>, value: &[u8]) {
         out.push(0xfe);
         out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
         4
-    } else if len < (1usize << 32) {
+    } else if (len as u64) < (1u64 << 32) {
         out.push(0xff);
         out.extend_from_slice(&(len as u64).to_le_bytes()[..4]);
         out.extend_from_slice(&[0, 0, 0]);

@@ -1,0 +1,19 @@
+# S82 wasm slice: the tdjson cdylib link through emcc.
+# - EXPORTED_FUNCTIONS: the 14-symbol C ABI (S83's audited surface)
+# - MODULARIZE + EXPORT_NAME=tdjson: the tdweb-style loadable module shape
+# - ALLOW_MEMORY_GROWTH: TDLib's heap grows past the emscripten default
+# - USE_PTHREADS (the tdactor scheduler's std::thread workers) is NOT set:
+#   stable rustc ignores `-C target-feature=+atomics` on this target
+#   (unstable feature), so the objects come out without atomics and
+#   wasm-ld rejects --shared-memory. The pthread link needs a nightly
+#   toolchain (or -Zbuild-std) with +atomics,+bulk-memory,+mutable-globals
+#   — recorded as the follow-up; until then threads error at runtime.
+[target.wasm32-unknown-emscripten]
+linker = "emcc"
+rustflags = [
+  "-C", "link-args=-sEXPORTED_FUNCTIONS=_td_create_client_id,_td_send,_td_receive,_td_execute,_td_json_client_create,_td_json_client_destroy,_td_json_client_send,_td_json_client_receive,_td_json_client_execute,_td_set_log_verbosity_level,_td_set_log_file_path,_td_set_log_max_file_size,_td_set_log_fatal_error_callback,_td_set_log_message_callback",
+  "-C", "link-args=-sMODULARIZE=1",
+  "-C", "link-args=-sEXPORT_NAME=tdjson",
+  "-C", "link-args=-sALLOW_MEMORY_GROWTH=1",
+  "-C", "link-args=-sENVIRONMENT=web,worker",
+]

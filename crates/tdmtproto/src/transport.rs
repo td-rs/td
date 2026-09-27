@@ -50,10 +50,22 @@ pub fn create_transport(transport_type: TransportType) -> Box<dyn IStreamTranspo
             transport_type.dc_id,
             transport_type.secret,
         )),
-        TransportTypeEnum::Http => Box::new(crate::http_transport::HttpTransport::new(
-            transport_type.secret.get_raw_secret().to_vec(),
-        )),
+        TransportTypeEnum::Http => {
+            new_http_transport(transport_type.secret.get_raw_secret().to_vec())
+        }
     }
+}
+
+/// The HTTP transport rides raw-socket HTTP framing (`http_transport.rs`),
+/// which is not linked on wasm.
+#[cfg(not(target_family = "wasm"))]
+fn new_http_transport(secret: Vec<u8>) -> Box<dyn IStreamTransport> {
+    Box::new(crate::http_transport::HttpTransport::new(secret))
+}
+
+#[cfg(target_family = "wasm")]
+fn new_http_transport(_secret: Vec<u8>) -> Box<dyn IStreamTransport> {
+    panic!("HTTP transport is not linked on this platform")
 }
 
 pub mod tcp {
