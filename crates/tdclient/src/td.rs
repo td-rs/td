@@ -4437,6 +4437,13 @@ impl Td {
         // saved-animations-limit options are config-applied only, and the
         // manager re-reads + dedupes them per call, so the unconditional
         // per-apply fire is observationally the C++ changed-only path.
+        // The pair order is the C++ `process_app_config` write order: the
+        // provider option is set in the string-keys walk (mid-config) and
+        // the emojis option in the final aggregated block, so the provider
+        // fire comes FIRST — the pair emits ("none", []) then ("none",
+        // [list]) exactly like the C++ (emojis-first emits a ("", [list])
+        // record the C++ never produces; found by the S75 live user-path
+        // gate 2026-09-28).
         {
             let mut env = TdAnimationsEnv {
                 global: &mut self.global,
@@ -4447,9 +4454,9 @@ impl Td {
                 updates: &mut self.animations_updates,
             };
             self.animations_manager
-                .on_update_animation_search_emojis(&mut env);
-            self.animations_manager
                 .on_update_animation_search_provider(&mut env);
+            self.animations_manager
+                .on_update_animation_search_emojis(&mut env);
             self.animations_manager
                 .on_update_saved_animations_limit(&mut env);
         }
@@ -4459,6 +4466,15 @@ impl Td {
             option_manager.update_premium_options();
         }
         self.flush_option_updates();
+        // The animations fan-out above queued into `animations_updates`;
+        // drain it HERE, with the config wave — the C++ send_closures the
+        // records during `process_app_config` itself. Without the drain
+        // the pair sits buffered until the next request pump and lands in
+        // a later stream window (the S75 live user-path gate found the
+        // pair straddling the idle boundary a full request late).
+        for update in std::mem::take(&mut self.animations_updates) {
+            self.send_update(update.into());
+        }
 
         // The M.3.9.2 manager fan-outs — the C++ `send_closure`s from
         // `process_app_config`, applied to the Td's manager states after
