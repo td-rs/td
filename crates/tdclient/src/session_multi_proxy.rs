@@ -146,21 +146,57 @@ impl PublicRsaKeyInterface for SharedRsaInterface {
     fn drop_keys(&mut self) {}
 }
 
-/// The built-in-prime stand-in (the C++ `DhCallback` behind the
-/// handshake `Context`): reports unknown primes so the handshake runs
-/// the primality checks (per-process only; the C++ persists the
-/// learned primes).
-#[derive(Default)]
+/// The official Telegram 2048-bit DH prime: pre-seeded into the
+/// good-prime cache. The C++ callback caches after the first (fast,
+/// native) safe-prime check; a first check under emscripten costs ~a
+/// minute of Miller-Rabin in a debug build, which blows Telegram's
+/// handshake window — seeding the one prime everyone uses equals the
+/// post-first-check cache state.
+const OFFICIAL_DH_PRIME_HEX: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
+
+fn official_prime_bytes() -> Vec<u8> {
+    (0..OFFICIAL_DH_PRIME_HEX.len() / 2)
+        .map(|i| u8::from_str_radix(&OFFICIAL_DH_PRIME_HEX[2 * i..2 * i + 2], 16).expect("hex"))
+        .collect()
+}
+
+type PrimeCache = std::sync::Mutex<(
+    std::collections::HashSet<Vec<u8>>,
+    std::collections::HashSet<Vec<u8>>,
+)>;
+
+fn prime_cache() -> &'static PrimeCache {
+    static CACHE: std::sync::OnceLock<PrimeCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let cache: PrimeCache = Default::default();
+        cache.lock().unwrap().0.insert(official_prime_bytes());
+        cache
+    })
+}
+
+/// The C++ `DhCallback` behind the handshake `Context`: the safe-prime
+/// verdicts cache per process (the C++ persists the learned primes).
 struct PrimeCallback;
 
 impl DhCallback for PrimeCallback {
-    fn is_good_prime(&self, _prime_str: &[u8]) -> i32 {
+    fn is_good_prime(&self, prime_str: &[u8]) -> i32 {
+        let cache = prime_cache().lock().unwrap();
+        if cache.0.contains(prime_str) {
+            return 1;
+        }
+        if cache.1.contains(prime_str) {
+            return 0;
+        }
         -1
     }
 
-    fn add_good_prime(&self, _prime_str: &[u8]) {}
+    fn add_good_prime(&self, prime_str: &[u8]) {
+        prime_cache().lock().unwrap().0.insert(prime_str.to_vec());
+    }
 
-    fn add_bad_prime(&self, _prime_str: &[u8]) {}
+    fn add_bad_prime(&self, prime_str: &[u8]) {
+        prime_cache().lock().unwrap().1.insert(prime_str.to_vec());
+    }
 }
 
 struct HandshakeContext {

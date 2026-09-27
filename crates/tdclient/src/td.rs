@@ -11265,17 +11265,28 @@ fn trim_ascii(s: &str) -> &str {
 /// default `system_version` when the client passes an empty one. The Linux
 /// uname syscall is replaced by the procfs files (same source strings).
 fn get_operating_system_version() -> String {
-    let read = |path: &str| {
-        std::fs::read_to_string(path)
-            .map(|s| s.trim().to_owned())
-            .ok()
-    };
-    match (
-        read("/proc/sys/kernel/ostype"),
-        read("/proc/sys/kernel/osrelease"),
-    ) {
-        (Some(ostype), Some(osrelease)) => format!("{ostype} {osrelease}"),
-        _ => String::new(),
+    // The C++ TD_EMSCRIPTEN branch detects the OS from JS
+    // (uname.cpp:94+); the /proc reads below don't exist in the browser
+    // MEMFS, and an empty system_version makes Telegram reject every
+    // session query with CONNECTION_SYSTEM_EMPTY.
+    #[cfg(target_family = "wasm")]
+    {
+        return "WebAssembly".to_string();
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let read = |path: &str| {
+            std::fs::read_to_string(path)
+                .map(|s| s.trim().to_owned())
+                .ok()
+        };
+        match (
+            read("/proc/sys/kernel/ostype"),
+            read("/proc/sys/kernel/osrelease"),
+        ) {
+            (Some(ostype), Some(osrelease)) => format!("{ostype} {osrelease}"),
+            _ => String::new(),
+        }
     }
 }
 
