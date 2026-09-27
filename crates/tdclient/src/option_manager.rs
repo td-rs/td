@@ -6,10 +6,12 @@
 //! Divergences (all documented inline):
 //! - `is_bot` is `false` until the AuthManager lands (S71) — matches an
 //!   unauthorized client, where the C++ also evaluates the non-bot branches.
-//! - The `on_option_updated` manager fan-out and the internal-option updates
-//!   (`default_reaction`, `otherwise_relogin_days`, `whitelisted_bots`) are
-//!   TODO until their managers exist; the option values themselves behave
-//!   identically.
+//! - The `on_option_updated` manager fan-out stays partial (the manager
+//!   call sites drive their halves directly); the internal-option updates
+//!   (`default_reaction` → updateDefaultReactionType, `otherwise_relogin_days`
+//!   → updateSuggestedActions, `whitelisted_bots` → updateTrustedMiniAppBots)
+//!   are implemented at both emission sites (set_option + the pmc-restore
+//!   loop) — surfaced by the S75 live user-path gate 2026-09-28.
 //! - `online` is served from the store-less `OnlineManager` and `unix_time`
 //!   from the server-time-corrected `G()->unix_time()`; both report the
 //!   interim local values until those managers land.
@@ -25,6 +27,26 @@ use crate::td_api;
 use crate::td_api::OptionValue;
 use tddb::binlog_key_value::BinlogKeyValue;
 use tddb::seq_key_value::SeqKeyValue;
+
+/// `full_split` + `to_integer<int64>` over a comma-joined id list — the
+/// C++ `transform(full_split(...), to_integer<int64>)` in
+/// `get_internal_option_update`. `to_integer` stops at the first
+/// non-digit and yields 0 for garbage, never panics.
+fn full_split_ids(value: &str) -> Vec<i64> {
+    fn to_integer_i64(s: &str) -> i64 {
+        let s = s.strip_prefix('-').unwrap_or(s);
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return 0;
+        }
+        digits.parse::<i64>().unwrap_or(0)
+    }
+    value
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(to_integer_i64)
+        .collect()
+}
 
 /// The `set_option_from_api` outcomes: the store write completed, or the
 /// ConfigManager must take over (the C++ `OptionManager::set_option`
@@ -340,8 +362,52 @@ impl OptionManager {
                     name: name.to_string(),
                     value: Some(Self::get_option_value_object(&self.get_option(name))),
                 }));
+        } else if let Some(update) = self.get_internal_option_update(name) {
+            self.pending_updates.push(update.into());
         }
         true
+    }
+
+    /// `get_internal_option_update` (OptionManager.cpp:569-585): the
+    /// dedicated update an internal option emits instead of `updateOption`
+    /// — `updateTrustedMiniAppBots` for `whitelisted_bots` (always, even
+    /// empty), `updateDefaultReactionType` for `default_reaction`, and the
+    /// SetPassword suggested action for a positive `otherwise_relogin_days`.
+    fn get_internal_option_update(&self, name: &str) -> Option<td_api::Update> {
+        match name {
+            "default_reaction" => {
+                crate::reaction_type::ReactionType::new(self.get_option_string(name, ""))
+                    .get_update_default_reaction_type()
+            }
+            "otherwise_relogin_days" => {
+                // `narrow_cast<int32>` — the option never carries a value
+                // beyond i32 in practice.
+                let days = self.get_option_integer(name, 0) as i32;
+                if days > 0 {
+                    Some(
+                        crate::suggested_action::get_update_suggested_actions_object(
+                            None,
+                            &[crate::suggested_action::SuggestedAction {
+                                type_: crate::suggested_action::SuggestedActionType::SetPassword,
+                                otherwise_relogin_days: days,
+                                ..Default::default()
+                            }],
+                            &[],
+                            "get_internal_option_update",
+                            &self.get_option_string("premium_manage_subscription_url", ""),
+                        ),
+                    )
+                } else {
+                    None
+                }
+            }
+            "whitelisted_bots" => Some(td_api::Update::updateTrustedMiniAppBots(
+                td_api::updateTrustedMiniAppBots {
+                    bot_user_ids: full_split_ids(&self.get_option_string(name, "")),
+                },
+            )),
+            _ => None,
+        }
     }
 
     pub fn set_option_boolean(&mut self, name: &str, value: bool) -> bool {
@@ -1233,9 +1299,12 @@ impl OptionManager {
                     name: name.clone(),
                     value: Some(Self::get_option_value_object(&value)),
                 }));
+            } else if let Some(update) = self.get_internal_option_update(&name) {
+                // Internal options emit their dedicated updates instead
+                // (get_internal_option_update) — the pmc-restore loop of
+                // OptionManager.cpp:73-78.
+                updates.push(update.into());
             }
-            // Internal options emit their dedicated updates
-            // (get_internal_option_update) — TODO until those managers land.
         }
     }
 }
