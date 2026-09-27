@@ -21,10 +21,39 @@ fn main() {
         .unwrap_or(0u64);
 
     let client = ClientJson::new();
+    // Everything drained since the last real request: an @wait directive
+    // must also match updates that already arrived in the previous drain
+    // (a state can complete inside the prior request's drain window —
+    // the code-check → WaitPassword transition does this when the server
+    // is fast), not only updates that arrive while the wait is watching.
+    // Mirrors record.cpp exactly.
+    let mut drained_since_request = String::new();
     for line in std::io::stdin().lines() {
         let Ok(request) = line else { break };
         if request.is_empty() {
             break;
+        }
+        // A `{"@idle":N}` directive sends nothing: drain until the stream
+        // has been silent for N consecutive seconds (quiescence) — the
+        // config fan-out window pinner for the live user-path corpus.
+        // Mirrors record.cpp; the drain also feeds
+        // drained_since_request for later @wait matches.
+        if let Some(rest) = request.strip_prefix("{\"@idle\":") {
+            println!("{{\"request\": {request}}}");
+            let idle_secs: f64 = rest.trim_end_matches('}').parse().unwrap_or(1.0);
+            let deadline = Instant::now() + Duration::from_secs_f64(idle_secs.clamp(0.0, 120.0));
+            let mut quiet = 0.0f64;
+            while Instant::now() < deadline && quiet < idle_secs {
+                match client.receive(0.25) {
+                    Some(response) => {
+                        quiet = 0.0;
+                        println!("{{\"update\": {response}}}");
+                        drained_since_request.push_str(&response);
+                    }
+                    None => quiet += 0.25,
+                }
+            }
+            continue;
         }
         // A `{"@wait":"<@type>"}` directive sends nothing: drain until the
         // update with the given @type arrives (then to idle) — the C++
@@ -37,11 +66,13 @@ fn main() {
                 .and_then(|rest| rest.split('"').next())
                 .unwrap_or_default();
             let needle = format!("\"@type\":\"{cond}\"");
-            let mut matched = false;
-            for _ in 0..1200 {
+            let mut matched = cond.is_empty() || drained_since_request.contains(&needle);
+            let mut probes = 0u32;
+            while !matched && probes < 1200 {
                 match client.receive(0.25) {
                     Some(response) => {
                         println!("{{\"update\": {response}}}");
+                        drained_since_request.push_str(&response);
                         if !cond.is_empty() && response.contains(&needle) {
                             matched = true;
                             break;
@@ -49,6 +80,7 @@ fn main() {
                     }
                     None => {}
                 }
+                probes += 1;
             }
             if !matched {
                 eprintln!("wait timed out for {cond}");
@@ -62,13 +94,17 @@ fn main() {
             }
             continue;
         }
+        drained_since_request.clear();
         client.send(&request);
         println!("{{\"request\": {request}}}");
 
         // Drain until the queue is idle (the C++ recorder's 0.5 s probe).
         for _ in 0..100 {
             match client.receive(0.5) {
-                Some(response) => println!("{{\"update\": {response}}}"),
+                Some(response) => {
+                    println!("{{\"update\": {response}}}");
+                    drained_since_request.push_str(&response);
+                }
                 None => break,
             }
         }

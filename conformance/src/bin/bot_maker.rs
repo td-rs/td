@@ -6,11 +6,26 @@
 //! Usage:
 //!   bot_maker <state-file> [--fetch]                          (print the bot token)
 //!   bot_maker <state-file> --send <peer username> <text>      (send one message)
+//!   bot_maker <state-file> --password-info                    (2FA state + hint)
+//!   bot_maker <state-file> --wait-code                        (print LOGIN_CODE=<n>)
 //!
 //! Prints `BOT_TOKEN=<token>`/`BOT_USERNAME=<username>` (fetch), or
 //! `SENT to <username>` (send). Bot tokens are reusable — unlike phone
 //! codes — so the C++ recorder and the Rust replayer both log in with the
 //! same token.
+//!
+//! The S75 user-path modes ride the account's own service chat (777000):
+//! a tdlib phone login delivers its code to the active sessions as a
+//! message from 777000, so `--wait-code` reads it over the persisted
+//! session instead of asking the operator to retype it. Push-only by
+//! design: the test DC does not resolve the service account's username
+//! (`USERNAME_NOT_OCCUPIED`), so there is no access hash for history
+//! reads — but pushes are real-time on a fresh session over the existing
+//! auth key, which is exactly the freshness guarantee the caller needs
+//! (start `--wait-code` BEFORE the login request fires; every code
+//! message it then sees is that login's). `--password-info` calls
+//! account.getPassword read-only (whether a cloud password gates the
+//! login, and its hint).
 
 use std::time::{Duration, Instant};
 
@@ -127,6 +142,9 @@ enum Awaiting {
     Resolve,
     Send,
     History,
+    PasswordInfo,
+    Diff,
+    State,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +196,21 @@ struct BotCallback {
     last_awaiting: Option<Awaiting>,
     last_query: Option<Vec<u8>>,
     salt_retries: usize,
+    /// `--wait-code`: listen for the 777000 login-code push (push-only —
+    /// the service account has no resolvable username on the test DC).
+    wait_code: bool,
+    login_code: Option<String>,
+    /// `--wait-code` freshness: wall-clock start (unix) — only messages
+    /// dated at/after it count, so codes from earlier login requests
+    /// (sitting in the account backlog) are never picked up. The slack
+    /// covers a code requested moments BEFORE the listener started (the
+    /// login may already be sitting in WaitCode when the listener comes
+    /// up) — Telegram invalidates older codes when a new one is issued,
+    /// so the newest backlog code is always the live login's.
+    started_at: i32,
+    /// `--wait-code` catch-up: the pts the wait-side last held (None =
+    /// nothing synced — diff from zero).
+    last_pts: Option<i32>,
 }
 
 impl BotCallback {
@@ -256,6 +289,49 @@ impl BotCallback {
         self.queue(Awaiting::History, query);
     }
 
+    /// A 777000 service-chat text arrived — as a real-time push or inside
+    /// a getDifference backlog walk. The date guard is the freshness
+    /// boundary: only messages from at/after the wait started count, so
+    /// codes from earlier login requests never match. Returns true when
+    /// it carried the code.
+    fn on_code_text(&mut self, date: i32, text: &str) -> bool {
+        if date + 900 < self.started_at {
+            return false; // older than the wait (slack) — stale code
+        }
+        match extract_login_code(text) {
+            Some(code) => {
+                eprintln!("777000: login code message received (date {date})");
+                self.login_code = Some(code);
+                self.done = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `--wait-code` catch-up: run updates.getDifference from the last
+    /// held pts (zero when nothing synced yet) — a stale account makes
+    /// the server answer pushes with updatesTooLong, and the messages
+    /// (the code included) sit behind the difference.
+    fn queue_diff(&mut self) {
+        let pts = self.last_pts.unwrap_or(0);
+        eprintln!("fetching the update difference from pts {pts}");
+        self.queue(
+            Awaiting::Diff,
+            telegram_api::Function::updates_getDifference(
+                telegram_api::updates_getDifference {
+                    flags: 0,
+                    pts,
+                    pts_limit: 0,
+                    pts_total_limit: 0,
+                    date: 0,
+                    qts: 0,
+                    qts_limit: 0,
+                },
+            ),
+        );
+    }
+
     /// The FSM step after a fresh BotFather message arrives. Returns true
     /// when the message advanced the flow (a send was queued or the token
     /// landed).
@@ -300,8 +376,29 @@ impl BotCallback {
         }
     }
 
+    /// Walks a getDifference page for the 777000 login-code message.
+    fn scan_diff_messages(&mut self, messages: &[telegram_api::Message]) {
+        for message in messages {
+            let telegram_api::Message::message(m) = message else {
+                continue;
+            };
+            if m.out || m.message.is_empty() {
+                continue;
+            }
+            if self.on_code_text(m.date, &m.message) {
+                return;
+            }
+        }
+    }
+
     /// The poll stage: re-query the history until the prompt appears.
     fn poll(&mut self) {
+        // `--wait-code` never polls (no resolved peer for the service
+        // chat — push-only); the guard also keeps the idle-re-arm in
+        // `on_update` from reaching `queue_history`'s peer expect.
+        if self.wait_code {
+            return;
+        }
         if let Some(next) = self.next_poll_at {
             if Instant::now() < next {
                 return; // paced — the main loop re-polls when due
@@ -343,6 +440,23 @@ impl BotCallback {
     }
 }
 
+/// Scans a 777000 service message for the login code — "Login code:
+/// 12345. Do not give this code to anyone…". The digit run right after
+/// the marker words is the code (4–8 digits).
+fn extract_login_code(text: &str) -> Option<String> {
+    let (_, rest) = text.split_once("Login code")?;
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if (4..=8).contains(&digits.len()) {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
 /// Scans a BotFather reply for the bot token (`123456789:AA...`). Walks
 /// every digit run (usernames like `tdrs76_9507bot` carry digits too) and
 /// matches the one followed by `:` and a long token part.
@@ -379,7 +493,14 @@ fn extract_token(text: &str) -> Option<String> {
 }
 
 impl SessionConnectionCallback for BotCallback {
-    fn on_connected(&mut self) {}
+    fn on_connected(&mut self) {
+        // The `--wait-code` orchestrator waits for this line before it
+        // fires the login: the code push only reaches sessions that are
+        // up when the server sends it.
+        if self.wait_code {
+            eprintln!("bot_maker: session up — listening for the login-code push");
+        }
+    }
 
     fn on_closed(&mut self, status: Status) {
         eprintln!("session closed: {}", status.message());
@@ -411,13 +532,32 @@ impl SessionConnectionCallback for BotCallback {
         // BotFather replies can arrive as pushes; feed the plain-text
         // messages into the FSM (the history poll covers the rest and
         // dedups through the text guard).
-        let Ok(updates) = telegram_api::Updates::parse(packet.as_slice()) else {
+        let data = packet.as_slice();
+        if self.wait_code {
+            // Diagnostics + the gap catch-up: a stale account (pending
+            // updates) makes the server answer pushes with
+            // updatesTooLong — the actual messages sit behind
+            // updates.getDifference, which the wait mode runs from zero
+            // (a fresh session tracks no pts of its own).
+            let ctor =
+                i32::from_le_bytes(data.get(..4).and_then(|b| b.try_into().ok()).unwrap_or([0; 4]));
+            eprintln!("push ctor 0x{ctor:08x} ({} bytes)", data.len());
+            if ctor == telegram_api::updatesTooLong::ID {
+                self.queue_diff();
+                return Status::ok();
+            }
+        }
+        let Ok(updates) = telegram_api::Updates::parse(data) else {
             return Status::ok();
         };
         let mut texts: Vec<String> = Vec::new();
+        // `--wait-code`: the 777000 code message arrives as a push.
+        let mut code_texts: Vec<(i32, String)> = Vec::new();
         match updates {
             telegram_api::Updates::updateShortMessage(m) => {
-                if m.user_id == self.botfather_user_id || m.user_id == 0 {
+                if self.wait_code && (m.user_id == 777000 || m.user_id == 0) {
+                    code_texts.push((m.date, m.message));
+                } else if m.user_id == self.botfather_user_id || m.user_id == 0 {
                     texts.push(m.message);
                 }
             }
@@ -438,7 +578,11 @@ impl SessionConnectionCallback for BotCallback {
                         continue;
                     };
                     if !m.out && !m.message.is_empty() {
-                        texts.push(m.message);
+                        if self.wait_code {
+                            code_texts.push((m.date, m.message));
+                        } else {
+                            texts.push(m.message);
+                        }
                     }
                 }
             }
@@ -454,11 +598,18 @@ impl SessionConnectionCallback for BotCallback {
                         continue;
                     };
                     if !m.out && !m.message.is_empty() {
-                        texts.push(m.message);
+                        if self.wait_code {
+                            code_texts.push((m.date, m.message));
+                        } else {
+                            texts.push(m.message);
+                        }
                     }
                 }
             }
             _ => {}
+        }
+        for (date, text) in code_texts {
+            self.on_code_text(date, &text);
         }
         for text in texts {
             self.on_botfather_text(&text);
@@ -651,6 +802,68 @@ impl SessionConnectionCallback for BotCallback {
                     self.fatal = Some(format!("messages.Messages parse: {error}"));
                 }
             },
+            Awaiting::PasswordInfo => match telegram_api::account_Password::parse(data) {
+                Ok(password) => {
+                    println!("HAS_PASSWORD={}", password.has_password);
+                    println!("HINT={}", password.hint);
+                    self.done = true;
+                }
+                Err(error) => {
+                    self.fatal = Some(format!("account.Password parse: {error}"));
+                }
+            },
+            Awaiting::State => match telegram_api::updates_State::parse(data) {
+                Ok(state) => {
+                    self.last_pts = Some(state.pts);
+                    eprintln!(
+                        "state: pts={} qts={} seq={} — in the update flow, listening",
+                        state.pts, state.qts, state.seq
+                    );
+                }
+                Err(error) => {
+                    self.fatal = Some(format!("updates.State parse: {error}"));
+                }
+            },
+            Awaiting::Diff => match telegram_api::updates_Difference::parse(data) {
+                Ok(difference) => match difference {
+                    telegram_api::updates_Difference::updates_differenceEmpty(_) => {
+                        // Caught up — live pushes carry the code from here.
+                        eprintln!("difference empty — caught up, listening");
+                    }
+                    telegram_api::updates_Difference::updates_difference(m) => {
+                        self.scan_diff_messages(&m.new_messages);
+                        if let Some(state) = &m.state {
+                            self.last_pts = Some(state.pts);
+                        }
+                        if !self.done {
+                            eprintln!("difference complete — listening");
+                        }
+                    }
+                    telegram_api::updates_Difference::updates_differenceSlice(m) => {
+                        self.scan_diff_messages(&m.new_messages);
+                        if let Some(state) = &m.intermediate_state {
+                            self.last_pts = Some(state.pts);
+                        }
+                        if !self.done {
+                            // More backlog: keep walking from the
+                            // intermediate state's pts.
+                            self.queue_diff();
+                        }
+                    }
+                    telegram_api::updates_Difference::updates_differenceTooLong(m) => {
+                        // The gap exceeds the limit — jump to the current
+                        // pts (old history is lost, fresh messages are
+                        // what the wait needs anyway).
+                        self.last_pts = Some(m.pts);
+                        if !self.done {
+                            self.queue_diff();
+                        }
+                    }
+                },
+                Err(error) => {
+                    self.fatal = Some(format!("updates.Difference parse: {error}"));
+                }
+            },
         }
         Status::ok()
     }
@@ -740,9 +953,32 @@ fn main() {
     } else {
         None
     };
-    if args.len() != 2 {
+    let password_info = if let Some(pos) = args.iter().position(|a| a == "--password-info") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+    let wait_code = if let Some(pos) = args.iter().position(|a| a == "--wait-code") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+    let wait_budget = if let Some(pos) = args.iter().position(|a| a == "--budget") {
+        let budget = args
+            .get(pos + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300);
+        args.drain(pos..=pos + 1);
+        budget
+    } else {
+        300
+    };
+    let modes = fetch as u8 + password_info as u8 + wait_code as u8 + send.is_some() as u8;
+    if args.len() != 2 || modes != 1 {
         eprintln!(
-            "usage: bot_maker <state-file> [--name <bot name>] [--username <bot username>] [--fetch] [--send <peer username> <text>]"
+            "usage: bot_maker <state-file> [--name <bot name>] [--username <bot username>] [--fetch] [--send <peer username> <text>] [--password-info] [--wait-code [--budget <secs>]]"
         );
         std::process::exit(2);
     }
@@ -815,23 +1051,48 @@ fn main() {
             send_text: send.as_ref().map(|(_, text)| text.clone()),
             send_peer: None,
             sent: std::collections::HashMap::new(),
+            wait_code,
+            login_code: None,
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i32)
+                .unwrap_or(0),
+            last_pts: None,
         };
-        let resolve_target = send
-            .as_ref()
-            .map(|(username, _)| username.clone())
-            .unwrap_or_else(|| "botfather".to_string());
-        callback.queue(
-            Awaiting::Resolve,
-            telegram_api::Function::contacts_resolveUsername(
-                telegram_api::contacts_resolveUsername {
-                    flags: 0,
-                    username: resolve_target,
-                    referer: String::new(),
-                },
-            ),
-        );
+        if password_info {
+            // No peer needed — the 2FA state is account-wide.
+            callback.queue(
+                Awaiting::PasswordInfo,
+                telegram_api::Function::account_getPassword(telegram_api::account_getPassword {}),
+            );
+        } else if wait_code {
+            // The S66 finding: a session that never queried the update
+            // state receives NO pushes — updates.getState puts this
+            // session into the account's update distribution, and the
+            // returned pts anchors any later updatesTooLong catch-up.
+            // No request otherwise: the wait listens for the 777000 code.
+            callback.queue(
+                Awaiting::State,
+                telegram_api::Function::updates_getState(telegram_api::updates_getState {}),
+            );
+        } else {
+            callback.queue(
+                Awaiting::Resolve,
+                telegram_api::Function::contacts_resolveUsername(
+                    telegram_api::contacts_resolveUsername {
+                        flags: 0,
+                        username: send
+                            .as_ref()
+                            .map(|(username, _)| username.clone())
+                            .unwrap_or_else(|| "botfather".to_string()),
+                        referer: String::new(),
+                    },
+                ),
+            );
+        }
 
-        let budget = tokio::time::Instant::now() + Duration::from_secs(240);
+        let budget =
+            tokio::time::Instant::now() + Duration::from_secs(if wait_code { wait_budget } else { 240 });
         loop {
             let _ = connection.flush(&mut callback).await;
             if let Some(query) = callback.pending.take() {
@@ -854,6 +1115,18 @@ fn main() {
                 if let Some((username, _text)) = send.as_ref() {
                     println!("SENT to {username}");
                     return;
+                }
+                if wait_code {
+                    if let Some(code) = callback.login_code.clone() {
+                        println!("LOGIN_CODE={code}");
+                    } else {
+                        eprintln!("bot_maker: no login-code push arrived");
+                        std::process::exit(3);
+                    }
+                    return;
+                }
+                if password_info {
+                    return; // printed by the answer handler
                 }
                 let token = callback.token.expect("token");
                 println!("BOT_USERNAME={}", callback.bot_username);

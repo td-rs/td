@@ -33,9 +33,38 @@ static void print_json_line(const char *kind, const char *json) {
 int main() {
   void *client = td_json_client_create();
   std::string request;
+  // Everything drained since the last real request: an @wait directive
+  // must also match updates that already arrived in the previous drain
+  // (a state can complete inside the prior request's drain window — the
+  // code-check → WaitPassword transition does this when the server is
+  // fast), not only updates that arrive while the wait is watching.
+  std::string drained_since_request;
   while (std::getline(std::cin, request)) {
     if (request.empty()) {
       break;
+    }
+    // A `{"@idle":N}` directive sends nothing: drain until the stream has
+    // been silent for N consecutive seconds (quiescence) — the config
+    // fan-out window pinner for the live user-path corpus. The drain also
+    // feeds drained_since_request: a later @wait must still match records
+    // that arrived during an idle window.
+    if (request.rfind("{\"@idle\":", 0) == 0) {
+      print_json_line("request", request.c_str());
+      double idle_secs = std::atof(request.c_str() + std::strlen("{\"@idle\":"));
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::duration<double>(std::min(idle_secs, 120.0));
+      double quiet = 0.0;
+      while (std::chrono::steady_clock::now() < deadline && quiet < idle_secs) {
+        const char *response = td_json_client_receive(client, 0.25);
+        if (response == nullptr) {
+          quiet += 0.25;
+          continue;
+        }
+        quiet = 0.0;
+        print_json_line("update", response);
+        drained_since_request += response;
+      }
+      continue;
     }
     // A `{"@wait":"<@type>"}` directive sends nothing: drain until the
     // update with the given @type arrives (then to idle), so both sides
@@ -54,16 +83,18 @@ int main() {
           cond = cond.substr(0, end);
         }
       }
-      bool matched = false;
-      for (int i = 0; i < 1200; i++) {
+      const std::string needle = std::string("\"@type\":\"") + cond + "\"";
+      bool matched = cond.empty() ||
+                     drained_since_request.find(needle) != std::string::npos;
+      for (int i = 0; !matched && i < 1200; i++) {
         const char *response = td_json_client_receive(client, 0.25);
         if (response == nullptr) {
           continue;
         }
         print_json_line("update", response);
+        drained_since_request += response;
         if (!cond.empty() &&
-            std::string(response).find(std::string("\"@type\":\"") + cond + "\"") !=
-                std::string::npos) {
+            std::string(response).find(needle) != std::string::npos) {
           matched = true;
           break;
         }
@@ -79,10 +110,12 @@ int main() {
           break;
         }
         print_json_line("update", response);
+        drained_since_request += response;
       }
       continue;
     }
     // Feed every non-blank stdin line as a request.
+    drained_since_request.clear();
     td_json_client_send(client, request.c_str());
     print_json_line("request", request.c_str());
 
@@ -94,6 +127,7 @@ int main() {
         break;
       }
       print_json_line("update", response);
+      drained_since_request += response;
     }
   }
 
