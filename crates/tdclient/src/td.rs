@@ -3513,6 +3513,7 @@ impl Td {
             is_test_dc,
             main_dc_id: Arc::new(std::sync::atomic::AtomicI32::new(main_dc_raw)),
             public_rsa_key: Arc::new(PublicRsaKeySharedMain::create(is_test_dc)),
+            redispatch: Mutex::new(None),
         });
         let (session_count, is_premium) = {
             let option_manager = self
@@ -3567,6 +3568,15 @@ impl Td {
             dispatcher.load_main_dc_id(main_dc_raw);
         }
         self.net_query_dispatcher = Some(Arc::new(dispatcher));
+        // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
+        // session pool's finished queries re-enter the dispatcher head —
+        // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
+        // flood/connection answers ride the delayer — never the callback/
+        // event delivery straight from the driver.
+        {
+            let dispatcher = self.net_query_dispatcher.as_ref().unwrap().clone();
+            *shared.redispatch.lock() = Some(Box::new(move |query| dispatcher.dispatch(query)));
+        }
         self.net_router = Some(router);
         self.net_shared = Some(shared.clone());
         let mut dc_auth_manager = DcAuthManager::new(shared, self.dc_completed_queries.clone());
@@ -5046,6 +5056,10 @@ impl Td {
         let Some(dispatcher) = self.net_query_dispatcher.as_ref() else {
             return;
         };
+        // The NetQueryDelayer pump — the C++ delayer actor re-dispatches
+        // its parked queries from timeout wakeups; the actor pump drains
+        // the due ones on every net wakeup.
+        dispatcher.retry_ready_delayed(tdutils::time::now());
         let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() else {
             return;
         };

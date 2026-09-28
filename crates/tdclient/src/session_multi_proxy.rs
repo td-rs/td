@@ -216,6 +216,10 @@ impl AuthKeyHandshakeContext for HandshakeContext {
 // The shared context
 // ---------------------------------------------------------------------------
 
+/// The `SessionCallback::on_result` re-dispatch closure — see
+/// [`NetShared::redispatch`].
+type Redispatch = Box<dyn Fn(NetQuery) + Send>;
+
 /// Everything the session drivers share with the `Td` actor — the C++
 /// `G()` surface, scoped to what the session layer reads.
 pub(crate) struct NetShared {
@@ -238,6 +242,14 @@ pub(crate) struct NetShared {
     pub main_dc_id: Arc<AtomicI32>,
     /// The `PublicRsaKeySharedMain::create(G()->is_test_dc())` key set.
     pub public_rsa_key: Arc<PublicRsaKeySharedMain>,
+    /// The `SessionCallback::on_result` hop (SessionProxy.cpp:80-85):
+    /// every session-finished query re-enters `NetQueryDispatcher::
+    /// dispatch`, whose head is where live-server 303s (USER/PHONE/
+    /// FILE_MIGRATE_) get fixed and 420/-1/500 answers ride the
+    /// delayer, before completion reaches the callback / Td. Wired by
+    /// the Td actor once the dispatcher exists; `None` (unwired tests)
+    /// keeps the direct callback/event delivery.
+    pub redispatch: Mutex<Option<Redispatch>>,
 }
 
 impl NetShared {
@@ -265,16 +277,6 @@ impl NetShared {
             raw_dc_id
         }
     }
-}
-
-/// Wall-clock epoch seconds minus `time::now()` — the re-basing anchor
-/// for the process-anchored monotonic clock (the S66 finding).
-pub(crate) fn wall_minus_monotonic() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        - tdutils::time::now()
 }
 
 /// A fresh session id per incarnation — the C++ `Session::start_up`
@@ -605,9 +607,18 @@ fn first_ctor(packet: &[u8]) -> Option<i32> {
     }
 }
 
-/// `Session::on_message_result_ok`'s completion: to the query callback,
-/// else into the event queue (the `Td::on_result` route).
+/// `Session::on_message_result_ok`'s completion — the
+/// `SessionCallback::on_result` hop (SessionProxy.cpp:80-85): the query
+/// goes back through `NetQueryDispatcher::dispatch`, never straight to
+/// its receiver. The dispatch head fixes live-server 303 migrations
+/// (USER/PHONE/FILE_MIGRATE_) and rides flood/connection answers through
+/// the delayer; terminal completions fall out of `complete_net_query` to
+/// the callback, else into the event queue (the `Td::on_result` route).
 fn complete_query(shared: &NetShared, mut query: NetQuery) {
+    if let Some(redispatch) = shared.redispatch.lock().as_ref() {
+        redispatch(query);
+        return;
+    }
     match query.move_callback() {
         Some(mut callback) => callback.on_result(query),
         None => shared.events.push(NetEvent::QueryResult(query)),
@@ -919,8 +930,14 @@ async fn open_connection(
     }
 
     auth_local.set_main_auth_key(auth_key);
-    // The C++ re-bases the persisted diff onto this process's clock.
-    let diff = auth_data.get_server_time_difference() + wall_minus_monotonic();
+    // The snapshot diff is already anchored to THIS process's clock —
+    // the Global load re-bases the persisted (system-anchored) value at
+    // init (`saved_diff + (system - now)`) and the in-process event
+    // updates carry the same anchor. A second `+ (system - now)` here
+    // doubled the diff across a restart (server time ~= 2x unix, every
+    // generated message id a century ahead -> bad_msg_notification 16
+    // livelock).
+    let diff = auth_data.get_server_time_difference();
     auth_local.reset_server_time_difference(diff);
     auth_local.set_future_salts(auth_data.get_future_salts(), now);
 
@@ -1039,7 +1056,8 @@ async fn open_connection(
     }
 
     auth_local.set_main_auth_key(auth_key);
-    let diff = auth_data.get_server_time_difference() + wall_minus_monotonic();
+    // Already anchored to this process's clock — see the restore note above.
+    let diff = auth_data.get_server_time_difference();
     auth_local.reset_server_time_difference(diff);
     auth_local.set_future_salts(auth_data.get_future_salts(), now);
 
@@ -1279,6 +1297,7 @@ mod tests {
             is_test_dc: false,
             main_dc_id: Arc::new(std::sync::atomic::AtomicI32::new(1)),
             public_rsa_key: Arc::new(PublicRsaKeySharedMain::create(false)),
+            redispatch: Mutex::new(None),
         })
     }
 
@@ -1301,6 +1320,41 @@ mod tests {
             shared.events.take().is_empty(),
             "the refusal queues nothing"
         );
+    }
+
+    #[test]
+    fn complete_query_rides_the_dispatcher_hop() {
+        // SessionProxy.cpp:80-85: a session-finished query re-enters the
+        // dispatcher instead of reaching its receiver — the dispatch head
+        // is where a live 303 (USER_MIGRATE_) gets fixed before anything
+        // else sees the error.
+        let shared = test_shared();
+        let seen = Arc::new(Mutex::new(Vec::<NetQuery>::new()));
+        let hook = seen.clone();
+        *shared.redispatch.lock() = Some(Box::new(move |query: NetQuery| hook.lock().push(query)));
+
+        let mut query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            0x2A_00_00,
+            Vec::new(),
+            u32::MAX,
+            0,
+        );
+        query.set_error(Status::error(303, "USER_MIGRATE_4"));
+        complete_query(&shared, query);
+
+        assert!(
+            shared.events.take().is_empty(),
+            "the hop bypasses the direct event delivery"
+        );
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].error().code(), 303);
+        assert_eq!(seen[0].error().message(), "USER_MIGRATE_4");
     }
 
     #[test]

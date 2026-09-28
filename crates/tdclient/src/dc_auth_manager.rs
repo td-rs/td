@@ -442,6 +442,7 @@ mod tests {
             is_test_dc: false,
             main_dc_id: Arc::new(std::sync::atomic::AtomicI32::new(1)),
             public_rsa_key: Arc::new(PublicRsaKeySharedMain::create(false)),
+            redispatch: Mutex::new(None),
         })
     }
 
