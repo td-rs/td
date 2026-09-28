@@ -59,12 +59,21 @@ pub(crate) fn downcast<A: Actor>(actor: &mut dyn Actor) -> &mut A {
 /// `td::send_closure`: run `message`'s handler on the destination actor —
 /// inline right away when the actor is idle on this scheduler, otherwise
 /// through its mailbox (the port of `Scheduler::send_closure_immediately`).
+///
+/// The inline half dispatches the message *directly* — the C++
+/// `RunFuncT`/`EventFuncT` split of `Scheduler::send_immediately_impl`:
+/// no `Event` is built unless the message is queued.
 pub fn send_closure<'a, M, R>(actor_ref: R, message: M)
 where
     M: ActorMessage,
     R: Into<ActorRef<'a>>,
 {
-    Scheduler::instance().send_closure_immediately(actor_ref.into(), make_thunk(message));
+    Scheduler::instance().send_message_immediately(
+        actor_ref.into(),
+        move |actor: &mut dyn Actor| {
+            M::dispatch(message, downcast::<M::Actor>(actor));
+        },
+    );
 }
 
 /// `td::send_closure_later`: like [`send_closure`], but always through the

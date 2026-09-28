@@ -49,6 +49,16 @@ name = "soak"
 path = "src/bin/soak.rs"
 
 [profile.release]
-# Keep the default opt-level 3; match the C++ Release build (no LTO on either
-# side) so the S37 gate compares like for like.
-lto = false
+# Thin LTO + one codegen unit: the C++ bench compiles the scheduler's
+# header-inline hot path (EventGuard, add_to_mailbox, ActorInfo methods)
+# directly into the bench translation unit — full inlining without any
+# LTO. The Rust equivalent of "compile the scheduler into the bench
+# binary" is cross-crate inlining, i.e. LTO; without it every actor hop
+# pays real cross-crate calls (the S96 measurement: the ring ran 16.4M vs
+# ~50M ops/s C++). `codegen-units = 1` stabilizes the thin-LTO codegen:
+# with the default 16 units the ECB per-block loop pessimized 2.2x (74K
+# vs 162K ops/s, an inlining artifact — the same code at parity without
+# LTO); one unit restores it to 170K, better than the no-LTO baseline.
+# Keep the default opt-level 3, like the C++ Release build.
+lto = "thin"
+codegen-units = 1

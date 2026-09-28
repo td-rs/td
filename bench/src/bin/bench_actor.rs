@@ -13,36 +13,44 @@
 //! - `QueryBench` "dummy" writes its result into a client field instead of
 //!   the C++ stack `int *res` (the C++ result is never read; carrying an
 //!   owned write target per message would add an allocation to the measured
-//!   path), and "lambda" carries its write target in an `Arc<Atomic>`
-//!   (C++ captures a stack address).
+//!   path), and "lambda" writes through a single shared `Arc<Atomic>`
+//!   created per bench, cloned per message (C++ captures a stack address —
+//!   sound there only because the idle client runs every dispatch inline;
+//!   the per-message strong reference is the safe form without a
+//!   per-message malloc).
+//! - `CreateActorBench` counts actors in a static atomic instead of the C++
+//!   plain static counter (safe Rust has no shared mutable statics; one
+//!   fetch_add/fetch_sub per lifecycle is the cheapest faithful form).
 
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use bench::benchmark::{Benchmark, bench};
-use tdactor::event::ActorThunk;
 use tdactor::{
     Actor, ActorId, ActorOwn, ConcurrentScheduler, Event, EventFull, FutureActor, FutureActorState,
     PromiseActor, PromiseFuture, Raw, Scheduler, actor_messages, create_actor, send_closure,
-    send_closure_later, send_event, send_thunk_immediately,
+    send_closure_later, send_event, send_lambda_immediately,
 };
 use tdutils::promise::{Promise, PromiseCreator};
 
 /// The `TestActor` of `CreateActorBench`: stops on start and finishes the
 /// scheduler from the last `tear_down` (the C++ static `actor_count_`).
-struct TestActor {
-    count: Arc<AtomicI32>,
-}
+/// The C++ counter is a plain static; the port is a static atomic — the
+/// cheapest faithful form in safe Rust (the earlier `Arc<AtomicI32>`
+/// paid a clone + drop per actor, two locked RMWs the C++ never pays).
+static ACTOR_COUNT: AtomicI32 = AtomicI32::new(0);
+
+struct TestActor;
 
 impl Actor for TestActor {
     fn start_up(&mut self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        ACTOR_COUNT.fetch_add(1, Ordering::Relaxed);
         self.stop();
     }
 
     fn tear_down(&mut self) {
-        if self.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+        if ACTOR_COUNT.fetch_sub(1, Ordering::Relaxed) == 1 {
             Scheduler::instance().finish();
         }
     }
@@ -71,16 +79,9 @@ impl Benchmark for CreateActorBench {
     }
 
     fn run(&mut self, n: usize) {
-        let count = Arc::new(AtomicI32::new(0));
         let sched = self.sched.as_mut().expect("start_up not called");
         for _ in 0..n {
-            let own = sched.create_actor_unsafe(
-                0,
-                "TestActor",
-                TestActor {
-                    count: count.clone(),
-                },
-            );
+            let own = sched.create_actor_unsafe(0, "TestActor", TestActor);
             let _ = own.release();
         }
         while sched.run_main(10.0) {}
@@ -144,15 +145,15 @@ impl PassActor {
             RingType::Lambda => {
                 // C++ send_lambda(next_actor, [n, ptr] { ptr->pass(n - 1); })
                 // with a blind static_cast; the checked downcast replaces it.
-                send_thunk_immediately(
-                    next,
-                    ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
-                        let any: &mut dyn std::any::Any = actor;
-                        any.downcast_mut::<PassActor>()
-                            .expect("ring lambda addressed to a non-PassActor")
-                            .pass(n - 1);
-                    })),
-                );
+                // Like the C++ template, the closure runs directly on the
+                // inline path (no allocation) — `send_lambda_immediately`
+                // is the port of that exact shape.
+                send_lambda_immediately(next, move |actor: &mut dyn Actor| {
+                    let any: &mut dyn std::any::Any = actor;
+                    any.downcast_mut::<PassActor>()
+                        .expect("ring lambda addressed to a non-PassActor")
+                        .pass(n - 1);
+                });
             }
         }
     }
@@ -242,10 +243,7 @@ impl Benchmark for RingBench {
             let _guard = sched.get_main_guard();
             for i in 0..self.actor_n {
                 let next = actors[(i + 1) % self.actor_n].get();
-                send_closure(
-                    &actors[i].get(),
-                    PassMessage::SetNext { id: i as i32, next },
-                );
+                send_closure(actors[i].get(), PassMessage::SetNext { id: i as i32, next });
             }
         }
         sched.start();
@@ -355,6 +353,13 @@ struct ServerActor {
     /// The "delayed future" RPC type keeps the future alive between the send
     /// and the delivered result (C++ member `future_`).
     future: Option<Box<FutureActor<i32>>>,
+    /// The "lambda" RPC type's write target — one allocation for the whole
+    /// bench. The C++ lambda captures a stack `int` by reference (sound only
+    /// because the idle client runs every dispatch inline); the port gives
+    /// each message a strong reference to a shared target instead — a
+    /// per-message clone, no per-message malloc (the per-iteration `Arc`
+    /// this replaces paid a malloc + free per RPC, 1.36× on the S97 run).
+    lambda_val: Arc<AtomicI32>,
 }
 
 actor_messages! {
@@ -372,6 +377,7 @@ impl ServerActor {
             client: None,
             n: 0,
             future: None,
+            lambda_val: Arc::new(AtomicI32::new(0)),
         }
     }
 
@@ -478,18 +484,17 @@ impl Actor for ServerActor {
                     send_closure(self.client(), ClientMessage::Dummy { x: self.n });
                 }
                 QueryType::Lambda => {
-                    let val = Arc::new(AtomicI32::new(0));
-                    let captured = val.clone();
+                    let captured = self.lambda_val.clone();
                     let n = self.n;
                     // C++ send_lambda(client_, [&] { val = n_ * n_; }): the
-                    // thunk may run inline (val == n * n) or later (val == 0).
-                    send_thunk_immediately(
-                        self.client(),
-                        ActorThunk::from_boxed(Box::new(move |_actor: &mut dyn Actor| {
-                            captured.store(n * n, Ordering::Relaxed);
-                        })),
-                    );
-                    let val = val.load(Ordering::Relaxed);
+                    // lambda may run inline (val == n * n) or later (val
+                    // unchanged) — unboxed either way, like the C++ template;
+                    // the write target is the shared `lambda_val` (see the
+                    // field docs) carried by one strong reference.
+                    send_lambda_immediately(self.client(), move |_actor: &mut dyn Actor| {
+                        captured.store(n * n, Ordering::Relaxed);
+                    });
+                    let val = self.lambda_val.load(Ordering::Relaxed);
                     assert!(val == 0 || val == n * n);
                 }
                 QueryType::LambdaFuture => {

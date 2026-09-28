@@ -246,7 +246,7 @@ impl<T: Send + 'static> FutureActor<T> {
     /// C++ `Actor::do_stop()` — `Scheduler::do_stop_actor(this)`: destroy this
     /// actor synchronously. Callable outside this actor's own dispatch.
     fn do_stop(&mut self) {
-        Scheduler::instance().do_stop_actor(self.self_id.clone());
+        Scheduler::instance().do_stop_actor(&self.self_id);
     }
 
     /// C++ `FutureActor::set_value` — called by [`PromiseActor::set_value`].

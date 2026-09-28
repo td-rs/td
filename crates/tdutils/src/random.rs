@@ -1,17 +1,99 @@
 //! Port of `td/utils/Random.h` + `td/utils/Random.cpp`.
 //!
-//! The secure API draws from the OS CSPRNG via `getrandom` (replacing
-//! OpenSSL's `RAND_bytes`), and the fast API uses a thread-local
-//! [`Xorshift128plus`] seeded from the OS CSPRNG (replacing the
-//! nondeterministically seeded `std::mt19937` — the sequence was never
+//! The secure API runs through the **vendored OpenSSL `RAND_bytes`** on
+//! native builds — the exact userspace ChaCha DRBG the C++
+//! `td::Random::secure_bytes` calls (S96 §1.3: the previous per-call
+//! `getrandom` design drew every byte from the kernel CSPRNG — a stricter
+//! guarantee, but the 4.7× throughput row; the C++ amortizes reseeding in
+//! userspace). **Guarantee change:** secure bytes now come from OpenSSL's
+//! fork-safe userspace DRBG (reseeded by OpenSSL from the OS entropy pool
+//! on demand), identical to tdlib, instead of directly from the kernel.
+//! emscripten keeps `getrandom` (no OpenSSL there). The fast API uses a
+//! thread-local [`Xorshift128plus`] seeded from the secure RNG (replacing
+//! the nondeterministically seeded `std::mt19937` — the sequence was never
 //! reproducible, and the distribution contract is unchanged). The seeded
 //! [`Xorshift128plus`] used throughout tdlib is a bit-exact port.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-/// `td::Random::secure_bytes(dest)`: fills `dest` from the OS CSPRNG.
+/// The thread-local secure buffer size — the C++ `BUF_SIZE = 512`
+/// (`Random.cpp`): small draws are served from it, one DRBG refill per
+/// 512 bytes; larger draws go straight to the DRBG.
+const SECURE_BUF_SIZE: usize = 512;
+
+/// The C++ `random_seed_generation`: bumped by [`add_seed`]; every
+/// thread's buffer compares its copy and discards the buffered bytes on a
+/// mismatch, so added seed entropy takes effect for already-buffered
+/// threads too.
+static RANDOM_SEED_GENERATION: AtomicI64 = AtomicI64::new(0);
+
+struct SecureBuffer {
+    buf: [u8; SECURE_BUF_SIZE],
+    /// Bytes of `buf` already served (the C++ `buf_pos`); `SECURE_BUF_SIZE`
+    /// means "empty, refill on next use".
+    pos: usize,
+    generation: i64,
+}
+
+thread_local! {
+    static SECURE_BUF: RefCell<SecureBuffer> = const {
+        RefCell::new(SecureBuffer {
+            buf: [0u8; SECURE_BUF_SIZE],
+            pos: SECURE_BUF_SIZE,
+            generation: 0,
+        })
+    };
+}
+
+/// One DRBG fill of the thread-local buffer — `RAND_bytes` on native
+/// (the vendored OpenSSL DRBG, exactly the C++), `getrandom` on emscripten.
+fn fill_secure(dest: &mut [u8]) {
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        // SAFETY: `dest` is a live writable buffer of exactly `dest.len()`
+        // bytes; RAND_bytes writes all of it or returns an error (asserted).
+        let ok = unsafe { openssl_sys::RAND_bytes(dest.as_mut_ptr(), dest.len() as i32) };
+        assert_eq!(ok, 1, "RAND_bytes failed: DRBG unavailable");
+    }
+    #[cfg(target_os = "emscripten")]
+    {
+        getrandom::fill(dest).expect("getrandom failed: OS CSPRNG unavailable");
+    }
+}
+
+/// `td::Random::secure_bytes(dest)` — the C++ `Random::secure_bytes`
+/// verbatim: serve from the thread-local 512-byte buffer (dropping it when
+/// the global seed generation moved), refill once per buffer, and pass
+/// bulk requests of a full buffer or more straight to the DRBG.
 pub fn secure_bytes(dest: &mut [u8]) {
-    getrandom::fill(dest).expect("getrandom failed: OS CSPRNG unavailable");
+    if dest.is_empty() {
+        return;
+    }
+    SECURE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let generation = RANDOM_SEED_GENERATION.load(Ordering::Acquire);
+        if buf.generation != generation {
+            buf.generation = generation;
+            buf.pos = SECURE_BUF_SIZE;
+        }
+        let ready = dest.len().min(SECURE_BUF_SIZE - buf.pos);
+        if ready != 0 {
+            dest[..ready].copy_from_slice(&buf.buf[buf.pos..buf.pos + ready]);
+            buf.pos += ready;
+            if ready == dest.len() {
+                return;
+            }
+        }
+        let rest = &mut dest[ready..];
+        if rest.len() < SECURE_BUF_SIZE {
+            fill_secure(&mut buf.buf);
+            buf.pos = rest.len();
+            rest.copy_from_slice(&buf.buf[..rest.len()]);
+        } else {
+            fill_secure(rest);
+        }
+    });
 }
 
 /// `td::Random::secure_int32`.
@@ -42,14 +124,34 @@ pub fn secure_uint64() -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// `td::Random::add_seed(bytes, entropy)`: a no-op here — `getrandom` always
-/// draws from the OS entropy pool, which cannot be reseeded from userspace
-/// (the C++ version feeds OpenSSL's internal mixer).
-pub fn add_seed(_bytes: &[u8], _entropy: f64) {}
+/// `td::Random::add_seed(bytes, entropy)`: feeds the DRBG mixer and bumps
+/// the global seed generation — every thread's buffered bytes are dropped
+/// on its next draw (the C++ `RAND_add` + `random_seed_generation++`).
+pub fn add_seed(bytes: &[u8], entropy: f64) {
+    // The mixer feed exists on native only (emscripten's getrandom path
+    // draws straight from the OS pool, which cannot be reseeded from
+    // userspace); the generation bump applies everywhere, so the buffered
+    // bytes are dropped either way.
+    #[cfg(not(target_os = "emscripten"))]
+    // SAFETY: `bytes` is a live readable buffer of exactly `bytes.len()`
+    // bytes; RAND_add only reads it.
+    unsafe {
+        openssl_sys::RAND_add(bytes.as_ptr().cast(), bytes.len() as i32, entropy);
+    }
+    #[cfg(target_os = "emscripten")]
+    let _ = (bytes, entropy);
+    RANDOM_SEED_GENERATION.fetch_add(1, Ordering::Release);
+}
 
-/// `td::Random::secure_cleanup`: a no-op — there is no thread-local secure
-/// buffer to zero (`getrandom` fills caller buffers directly).
-pub fn secure_cleanup() {}
+/// `td::Random::secure_cleanup` — the C++ `secure_bytes(nullptr, 0)`:
+/// zero the thread's buffered bytes and mark the buffer empty.
+pub fn secure_cleanup() {
+    SECURE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.buf.fill(0);
+        buf.pos = SECURE_BUF_SIZE;
+    });
+}
 
 /// `td::Random::shuffle` with the secure RNG.
 pub fn secure_shuffle<T>(v: &mut [T]) {

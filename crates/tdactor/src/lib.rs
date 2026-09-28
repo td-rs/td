@@ -119,3 +119,14 @@ pub fn send_thunk_immediately<'a>(
 pub fn send_thunk_later<'a>(actor_ref: impl Into<ActorRef<'a>>, closure: crate::event::ActorThunk) {
     Scheduler::instance().send_closure_later(actor_ref.into(), closure);
 }
+
+/// Send a lambda, running it inline when the actor is idle — the free
+/// `td::send_lambda` (`Scheduler::send_lambda_immediately`): exactly like
+/// the C++ template, the closure runs *directly* on the inline path (no
+/// allocation, no `Event`); only the queued path wraps it into one.
+pub fn send_lambda_immediately<'a, F>(actor_ref: impl Into<ActorRef<'a>>, f: F)
+where
+    F: for<'x> FnOnce(&'x mut dyn Actor) + Send + 'static,
+{
+    Scheduler::instance().send_message_immediately(actor_ref.into(), f);
+}

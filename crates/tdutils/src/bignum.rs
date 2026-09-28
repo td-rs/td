@@ -50,6 +50,93 @@ macro_rules! montgomery_modpow_fn {
 montgomery_modpow_fn!(montgomery_modpow_32, 32);
 montgomery_modpow_fn!(montgomery_modpow_64, 64);
 
+/// The vendored-OpenSSL `BN_mod_exp` bridge (S96 §1.4) — the exact call the
+/// C++ `BigNum::mod_exp` makes, which OpenSSL internally routes to
+/// `BN_mod_exp_mont_consttime` for odd moduli (the exponent is secret; the
+/// vartime-ladder concern is the reason the consttime form matters). Native
+/// only — emscripten links no OpenSSL and keeps the Montgomery path above.
+#[cfg(not(target_os = "emscripten"))]
+mod bn_openssl {
+    use num_bigint::{BigInt, BigUint, Sign};
+
+    /// `BN_mod_exp(a, p, m)` on the byte-level view of the operands.
+    /// Returns `None` on any allocation failure — the caller falls back to
+    /// the Rust path (parity with the C++ `LOG_IF(FATAL)`, softened because
+    /// the fallback exists).
+    pub(super) fn mod_exp(a: &BigInt, p: &BigInt, m: &BigInt) -> Option<BigInt> {
+        // Negative operands do not round-trip the unsigned BN_bin2bn view;
+        // tdlib never produces them here, but guard rather than silently
+        // answering a different question.
+        if matches!(a.sign(), Sign::Minus)
+            || matches!(p.sign(), Sign::Minus)
+            || matches!(m.sign(), Sign::Minus)
+        {
+            return None;
+        }
+        let to_bn = |v: &BigUint| -> Option<Vec<u8>> {
+            let bytes = v.to_bytes_be();
+            (bytes.len() <= i32::MAX as usize).then_some(bytes)
+        };
+        let a_bytes = to_bn(a.magnitude())?;
+        let p_bytes = to_bn(p.magnitude())?;
+        let m_bytes = to_bn(m.magnitude())?;
+        // SAFETY: every BN_* pointer below is either created in this scope
+        // (and freed before returning) or a valid read-only parameter; the
+        // byte slices have the exact `c_int` lengths passed alongside.
+        unsafe {
+            let ctx = openssl_sys::BN_CTX_new();
+            if ctx.is_null() {
+                return None;
+            }
+            let a_bn = openssl_sys::BN_bin2bn(
+                a_bytes.as_ptr(),
+                a_bytes.len() as i32,
+                std::ptr::null_mut(),
+            );
+            let p_bn = openssl_sys::BN_bin2bn(
+                p_bytes.as_ptr(),
+                p_bytes.len() as i32,
+                std::ptr::null_mut(),
+            );
+            let m_bn = openssl_sys::BN_bin2bn(
+                m_bytes.as_ptr(),
+                m_bytes.len() as i32,
+                std::ptr::null_mut(),
+            );
+            let r_bn = openssl_sys::BN_new();
+            let result = if a_bn.is_null() || p_bn.is_null() || m_bn.is_null() || r_bn.is_null() {
+                None
+            } else {
+                let ok = openssl_sys::BN_mod_exp(r_bn, a_bn, p_bn, m_bn, ctx);
+                (ok == 1).then(|| {
+                    // BN_num_bytes = (BN_num_bits + 7) / 8; the macro is not
+                    // in the bindings.
+                    let len = (openssl_sys::BN_num_bits(r_bn) + 7) / 8;
+                    debug_assert!(len >= 0);
+                    let mut out = vec![0u8; len.max(0) as usize];
+                    let written = openssl_sys::BN_bn2bin(r_bn, out.as_mut_ptr());
+                    debug_assert_eq!(written, len);
+                    BigUint::from_bytes_be(&out).into()
+                })
+            };
+            if !a_bn.is_null() {
+                openssl_sys::BN_clear_free(a_bn);
+            }
+            if !p_bn.is_null() {
+                openssl_sys::BN_clear_free(p_bn);
+            }
+            if !m_bn.is_null() {
+                openssl_sys::BN_clear_free(m_bn);
+            }
+            if !r_bn.is_null() {
+                openssl_sys::BN_clear_free(r_bn);
+            }
+            openssl_sys::BN_CTX_free(ctx);
+            result
+        }
+    }
+}
+
 /// `td::BigNumContext` — no-op scratch context kept for API parity.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BigNumContext;
@@ -318,6 +405,14 @@ impl BigNum {
     /// arithmetic. Everything else falls back to `modpow` verbatim. The
     /// vartime form matches the C++ (tdlib never sets `BN_FLG_CONSTTIME`).
     pub fn mod_exp(a: &BigNum, p: &BigNum, m: &BigNum, _context: &mut BigNumContext) -> Self {
+        // The vendored-OpenSSL bridge first (native): the exact `BN_mod_exp`
+        // the C++ calls, Montgomery consttime inside OpenSSL for odd
+        // moduli — the S96 §1.4 fix for the 3.1× handshake gap. Falls back
+        // to the Rust paths below on failure or on emscripten.
+        #[cfg(not(target_os = "emscripten"))]
+        if let Some(value) = bn_openssl::mod_exp(&a.value, &p.value, &m.value) {
+            return Self { value };
+        }
         let montgomery_budget = (MONT_LIMBS * crypto_bigint::Limb::BITS as usize) as u64;
         // The Montgomery path is limb-width-correct (the padding and the
         // thresholds go through `Limb::BYTES`/`Limb::BITS`, so 2,048-bit

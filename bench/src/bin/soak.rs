@@ -20,7 +20,7 @@ use tdactor::{Actor, ActorId, ConcurrentScheduler, Scheduler, actor_messages, se
 use tddb::binlog_key_value::BinlogKeyValue;
 use tddb::seq_key_value::SeqKeyValue;
 use tddb::{DbKey, sqlite_db};
-use tdutils::buffer::{BufferBuilder, BufferWriter, ChainBufferWriter};
+use tdutils::buffer::{BufferBuilder, ChainBufferWriter};
 
 fn rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
@@ -100,17 +100,17 @@ fn actor_tick(ring_n: usize, ticks: usize) {
         let _guard = sched.get_main_guard();
         for i in 0..ring_n {
             let next = actors[(i + 1) % ring_n].get();
-            send_closure(&actors[i].get(), PassMessage::SetNext { next });
+            send_closure(actors[i].get(), PassMessage::SetNext { next });
         }
     }
     sched.start();
     {
         let _guard = sched.get_main_guard();
         for _ in 0..ticks {
-            send_closure(&actors[0].get(), PassMessage::Pass { seq: 0 });
+            send_closure(actors[0].get(), PassMessage::Pass { seq: 0 });
         }
         for actor in &actors {
-            send_closure(&actor.get(), PassMessage::Stop { seq: 0 });
+            send_closure(actor.get(), PassMessage::Stop { seq: 0 });
         }
     }
     while sched.run_main(10.0) {}
@@ -153,7 +153,7 @@ impl KvChurn {
         drop(writer.extract_reader());
 
         self.i += 1;
-        if self.i % 256 == 0 {
+        if self.i.is_multiple_of(256) {
             // Reopen cycle: fd + binlog replay churn.
             self.binlog.close();
             self.binlog

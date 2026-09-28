@@ -69,9 +69,12 @@ pub(crate) struct IdSlot {
     sched: AtomicI32,
     /// Double-free detector: swapped to `true` by the last `ActorId::drop`
     /// right before the free. A second swap observing `true` is a protocol
-    /// bug (two last-references) — the assert fires in every debug build and
-    /// under the loom model, where the raw `Box::from_raw` double free would
-    /// be silent UB.
+    /// bug (two last-references) — the assert fires in every debug build
+    /// and under the loom model, where the raw `Box::from_raw` double free
+    /// would be silent UB. Compiled out of release builds: the swap is a
+    /// locked instruction on every actor death (the S97 CreateActor pass)
+    /// and the protocol it guards is verified by the model.
+    #[cfg(any(debug_assertions, feature = "loom"))]
     freed: AtomicBool,
     /// The actor's debug name, stored inline (truncated to 31 bytes) — the
     /// C++ copies the name into its pool block too; a boxed string here was
@@ -114,6 +117,71 @@ impl ActorName {
 unsafe impl Send for IdSlot {}
 unsafe impl Sync for IdSlot {}
 
+/// The port of C++ `ObjectPool<ActorInfo>`: registration blocks come from a
+/// per-thread freelist instead of the global allocator. The C++ pool has one
+/// fixed block size (the actor lives outside its `ActorInfo`); this port
+/// co-locates the actor in the block, so the pool is *size-classed* — one
+/// bucket per allocation layout, each capped so retention stays bounded.
+///
+/// Frees may land on any thread (a foreign `ActorId` copy can be the last
+/// reference); the block then joins *that* thread's bucket, which is sound —
+/// the memory is plain reusable storage, fully rewritten on the next
+/// registration.
+mod block_pool {
+    use std::alloc::Layout;
+    use std::cell::RefCell;
+
+    /// Per-bucket retention cap: at most this many idle blocks per size
+    /// class stay cached on a thread.
+    const MAX_FREE_PER_BUCKET: usize = 256;
+    /// Bucket-table cap: actor types in a process number in the dozens; the
+    /// overflow (and over-cap frees) fall back to the global allocator.
+    const MAX_BUCKETS: usize = 64;
+
+    thread_local! {
+        static POOL: RefCell<Vec<(usize, usize, Vec<*mut u8>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn alloc(layout: Layout) -> *mut u8 {
+        let pooled = POOL
+            .try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                pool.iter_mut()
+                    .find(|(size, align, _)| *size == layout.size() && *align == layout.align())
+                    .and_then(|(_, _, blocks)| blocks.pop())
+            })
+            .unwrap_or(None);
+        pooled.unwrap_or_else(|| unsafe { std::alloc::alloc(layout) })
+    }
+
+    pub(crate) fn dealloc(ptr: *mut u8, layout: Layout) {
+        let pooled = POOL
+            .try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                for (size, align, blocks) in pool.iter_mut() {
+                    if *size == layout.size() && *align == layout.align() {
+                        return blocks.len() < MAX_FREE_PER_BUCKET && {
+                            blocks.push(ptr);
+                            true
+                        };
+                    }
+                }
+                if pool.len() < MAX_BUCKETS {
+                    pool.push((layout.size(), layout.align(), vec![ptr]));
+                    return true;
+                }
+                false
+            })
+            .unwrap_or(false);
+        if !pooled {
+            // SAFETY: the layout matches the allocation (stored in the
+            // slot at registration).
+            unsafe { std::alloc::dealloc(ptr, layout) };
+        }
+    }
+}
+
 /// The single allocation behind a registered actor — the C++ ObjectPool's
 /// one block: `[IdSlot | ActorInfo | actor storage]`, carved with a raw
 /// layout so the concrete `A`'s object lives inside it too. The S37
@@ -124,8 +192,8 @@ unsafe impl Sync for IdSlot {}
 /// Lifecycle: `destroy_actor` drops the actor and the `ActorInfo` in place
 /// when the actor dies; the block itself lives until the last `ActorId`
 /// copy drops (the slot outlives the actor — sends to a dead actor are
-/// no-ops that need the atomics) and is then freed with the layout stored
-/// in the slot.
+/// no-ops that need the atomics) and is then returned to the per-thread
+/// [`block_pool`] (or freed, over cap).
 impl IdSlot {
     /// Allocate the block and write the slot (the caller writes the
     /// `ActorInfo` and the actor object into the returned pointers).
@@ -141,7 +209,7 @@ impl IdSlot {
             .expect("slot + info + actor layout");
         // SAFETY: the layout has nonzero size (IdSlot is not a ZST) and the
         // block is written before it is shared.
-        let block = unsafe { std::alloc::alloc(total) };
+        let block = block_pool::alloc(total);
         if block.is_null() {
             std::alloc::handle_alloc_error(total);
         }
@@ -154,6 +222,7 @@ impl IdSlot {
                     ref_cnt: AtomicUsize::new(1),
                     alive: AtomicBool::new(true),
                     sched: AtomicI32::new(sched_id),
+                    #[cfg(any(debug_assertions, feature = "loom"))]
                     freed: AtomicBool::new(false),
                     name: ActorName::new(name),
                     block_layout: total,
@@ -359,6 +428,7 @@ impl<A: ?Sized> Drop for ActorId<A> {
         if let Some(s) = self.slot {
             let slot = self.slot_of(s);
             if slot.ref_cnt.fetch_sub(1, Ordering::AcqRel) == 1 {
+                #[cfg(any(debug_assertions, feature = "loom"))]
                 assert!(
                     !slot.freed.swap(true, Ordering::AcqRel),
                     "IdSlot double free: two ActorId drops observed the last reference"
@@ -367,11 +437,14 @@ impl<A: ?Sized> Drop for ActorId<A> {
                 // the actor inside it) were dropped in place by
                 // `destroy_actor` if the actor died (an actor with zero id
                 // copies cannot be alive); what remains is the slot itself,
-                // dropped here, and the block, freed with its stored layout.
+                // dropped here, and the block, returned to the per-thread
+                // pool (the C++ ObjectPool release) or freed with its
+                // stored layout over cap.
                 unsafe {
                     let layout = slot.block_layout;
                     std::ptr::drop_in_place(s.as_ptr());
-                    std::alloc::dealloc(s.as_ptr() as *mut u8, layout);
+                    let block = s.as_ptr() as *mut u8;
+                    block_pool::dealloc(block, layout);
                 }
             }
         }
@@ -683,7 +756,9 @@ mod loom_tests {
         // SAFETY: freshly allocated; the info is written before the slot is
         // shared.
         unsafe {
-            std::ptr::write(info_ptr, ActorInfo::new(ActorSlot::Empty, false));
+            let mut info = ActorInfo::new(slot_ptr, ActorSlot::Empty, false);
+            info.fix_links();
+            std::ptr::write(info_ptr, info);
         }
         ActorId::from_raw_block(slot_ptr)
     }

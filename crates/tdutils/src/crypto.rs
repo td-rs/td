@@ -182,6 +182,72 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
 const AES_BLOCK_SIZE: usize = 16;
 
+/// A 16-byte XOR over fixed-size arrays — the block-width mix of the
+/// CBC/IGE chains. The fixed 16-iteration loop auto-vectorizes to one
+/// wide XOR; the earlier `u128::from_le_bytes`/`to_le_bytes` forms looked
+/// equivalent but compiled to scalar endian-shuffle sequences here, and
+/// byte-wise *slices* (`a[i] ^ b[i]` over `&[u8]`) left bounds checks on
+/// every lane.
+#[inline]
+fn xor_block(a: &[u8; AES_BLOCK_SIZE], b: &[u8; AES_BLOCK_SIZE]) -> [u8; AES_BLOCK_SIZE] {
+    let mut r = [0u8; AES_BLOCK_SIZE];
+    for i in 0..AES_BLOCK_SIZE {
+        r[i] = a[i] ^ b[i];
+    }
+    r
+}
+
+/// The CBC-encrypt EVP bridge (native) — one `EVP_EncryptUpdate` over the
+/// whole buffer with `EVP_aes_256_cbc`, padding off: the exact backend
+/// `td::aes_cbc_encrypt` runs (crypto.cpp `Evp`), the same shape as the
+/// S96 §1.1 CTR bridge. CBC encryption chains through the cipher, so the
+/// loop is latency-bound and OpenSSL's asm (the XOR folded into the round
+/// pipeline, no per-block call) is the reference; the RustCrypto per-block
+/// form topped out ~30% under it on the S97 machine.
+#[cfg(not(target_os = "emscripten"))]
+mod cbc_native {
+    use super::AES_BLOCK_SIZE;
+
+    /// CBC-encrypt `from` into `to` under `key`/`iv` (one shot, padding
+    /// off). `to.len() >= from.len()`, whole blocks.
+    pub(super) fn cbc_encrypt_oneshot(key: &[u8], iv: &[u8], from: &[u8], to: &mut [u8]) {
+        debug_assert!(from.len().is_multiple_of(AES_BLOCK_SIZE));
+        debug_assert!(to.len() >= from.len());
+        debug_assert_eq!(key.len(), 32);
+        debug_assert_eq!(iv.len(), AES_BLOCK_SIZE);
+        // SAFETY: the context is created here, used on this thread only,
+        // and freed exactly once at the end of the function.
+        unsafe {
+            let ctx = openssl_sys::EVP_CIPHER_CTX_new();
+            assert!(!ctx.is_null(), "EVP_CIPHER_CTX_new failed");
+            let ok = openssl_sys::EVP_EncryptInit_ex(
+                ctx,
+                openssl_sys::EVP_aes_256_cbc(),
+                std::ptr::null_mut(),
+                key.as_ptr(),
+                iv.as_ptr(),
+            );
+            assert_eq!(ok, 1, "EVP_EncryptInit_ex failed");
+            assert_eq!(
+                openssl_sys::EVP_CIPHER_CTX_set_padding(ctx, 0),
+                1,
+                "EVP_CIPHER_CTX_set_padding failed"
+            );
+            let mut out_len: i32 = 0;
+            let ok = openssl_sys::EVP_EncryptUpdate(
+                ctx,
+                to.as_mut_ptr(),
+                &mut out_len,
+                from.as_ptr(),
+                from.len() as i32,
+            );
+            assert_eq!(ok, 1, "EVP_EncryptUpdate failed");
+            debug_assert_eq!(out_len as usize, from.len(), "CBC wrote a partial block");
+            openssl_sys::EVP_CIPHER_CTX_free(ctx);
+        }
+    }
+}
+
 /// `td::AesState` — AES-256 in ECB mode (the MTProto building block).
 pub struct AesState {
     cipher: Aes256,
@@ -214,8 +280,10 @@ impl AesState {
         assert!(dst.len() >= src.len());
         assert!(self.encrypt, "encrypt() on a decrypt state");
         for (chunk, out) in src
-            .chunks_exact(AES_BLOCK_SIZE)
-            .zip(dst.chunks_exact_mut(AES_BLOCK_SIZE))
+            .as_chunks::<AES_BLOCK_SIZE>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<AES_BLOCK_SIZE>().0.iter_mut())
         {
             let mut block = aes::Block::clone_from_slice(chunk);
             self.cipher.encrypt_block(&mut block);
@@ -232,8 +300,10 @@ impl AesState {
         assert!(dst.len() >= src.len());
         assert!(!self.encrypt, "decrypt() on an encrypt state");
         for (chunk, out) in src
-            .chunks_exact(AES_BLOCK_SIZE)
-            .zip(dst.chunks_exact_mut(AES_BLOCK_SIZE))
+            .as_chunks::<AES_BLOCK_SIZE>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<AES_BLOCK_SIZE>().0.iter_mut())
         {
             let mut block = aes::Block::clone_from_slice(chunk);
             self.cipher.decrypt_block(&mut block);
@@ -251,6 +321,7 @@ impl Default for AesState {
 /// `dst[i] = src[i] ^ ks[i]` in 8-byte words — the word loop auto-vectorizes,
 /// where the byte-wise form dominated the profile after the bulk refill
 /// landed (the S79 CTR gate).
+#[cfg(target_os = "emscripten")]
 fn xor_keystream(src: &[u8], ks: &[u8], dst: &mut [u8]) {
     let n = src.len().min(ks.len());
     assert!(dst.len() >= n);
@@ -271,128 +342,286 @@ fn xor_keystream(src: &[u8], ks: &[u8], dst: &mut [u8]) {
 /// counter seeded by the IV. The keystream is byte-continuous across calls,
 /// like OpenSSL's EVP CTR `num` state.
 ///
-/// Keystream is generated [`KEYSTREAM_BLOCKS`] blocks at a time: the bulk
-/// `encrypt_blocks` slice call reaches the aes crate's pipelined AES-NI
-/// path, which the per-block `encrypt_block` loop cannot (the S79 CTR gate
-/// measured the per-block form at ~0.6 GB/s vs OpenSSL's ~11 GB/s).
-pub struct AesCtrState {
-    cipher: Aes256,
-    counter: [u8; AES_BLOCK_SIZE],
-    keystream: [u8; KEYSTREAM_SIZE],
-    /// Bytes of the current keystream run already consumed; the next run is
-    /// generated when this reaches `KEYSTREAM_SIZE`.
-    used: usize,
-}
+/// Native builds route the bulk path through the **vendored OpenSSL EVP**
+/// (`EVP_aes_256_ctr`) — the exact assembly the C++ `td::AesCtrState` runs,
+/// linked through `openssl-sys` already present for sqlcipher (the S96
+/// §1.1 bridge: the RustCrypto path topped out at ~2.4 GB/s vs OpenSSL's
+/// ~11 GB/s on the S96-final machine, a stable 4.7× row). emscripten keeps
+/// the RustCrypto implementation below — the wasm build links no OpenSSL.
+#[cfg(not(target_os = "emscripten"))]
+pub use crate::crypto::ctr_native::AesCtrState;
 
-/// Keystream blocks per bulk refill (32 × 16 = 512 bytes) — wide enough to
-/// amortize the refill over the CTR transport packets; the aes crate's ni
-/// backend takes its 8-block parallel path per chunk of the slice.
-const KEYSTREAM_BLOCKS: usize = 32;
-const KEYSTREAM_SIZE: usize = KEYSTREAM_BLOCKS * AES_BLOCK_SIZE;
+/// The OpenSSL EVP-backed CTR state (native). Kept as a private module so
+/// the public type and its docs live at the use site above.
+#[cfg(not(target_os = "emscripten"))]
+mod ctr_native {
+    /// `AES_BLOCK_SIZE` of the parent module — CTR's IV/counter width.
+    const AES_BLOCK_SIZE: usize = 16;
 
-impl AesCtrState {
-    pub fn new() -> Self {
-        Self {
-            cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
-            counter: [0u8; AES_BLOCK_SIZE],
-            keystream: [0u8; KEYSTREAM_SIZE],
-            used: KEYSTREAM_SIZE,
+    pub struct AesCtrState {
+        ctx: *mut openssl_sys::EVP_CIPHER_CTX,
+    }
+
+    impl AesCtrState {
+        pub fn new() -> Self {
+            let mut state = Self {
+                ctx: std::ptr::null_mut(),
+            };
+            state.init_raw(&[0u8; 32], &[0u8; AES_BLOCK_SIZE]);
+            state
         }
-    }
 
-    /// `td::AesCtrState::init(key, iv)`.
-    pub fn init(&mut self, key: &[u8], iv: &[u8]) {
-        assert_eq!(key.len(), 32, "AES key must be 256-bit");
-        assert_eq!(iv.len(), AES_BLOCK_SIZE, "CTR IV must be 128-bit");
-        self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
-        self.counter.copy_from_slice(iv);
-        self.used = KEYSTREAM_SIZE;
-    }
+        /// `td::AesCtrState::init(key, iv)`.
+        pub fn init(&mut self, key: &[u8], iv: &[u8]) {
+            assert_eq!(key.len(), 32, "AES key must be 256-bit");
+            assert_eq!(iv.len(), AES_BLOCK_SIZE, "CTR IV must be 128-bit");
+            self.init_raw(key, iv);
+        }
 
-    fn increment_counter(&mut self) {
-        // The 128-bit big-endian increment happens after use, like OpenSSL's
-        // CTR.
-        for byte in self.counter.iter_mut().rev() {
-            *byte = byte.wrapping_add(1);
-            if *byte != 0 {
-                break;
+        /// (Re)key the context. A fresh context each time (no
+        /// `EVP_CIPHER_CTX_reset` in the bindings): `init` may be called on
+        /// a mid-stream state and must restart cleanly (the C++
+        /// `AesCtrState::init` semantics, re-arming a fresh counter), and
+        /// `init` runs once per transport, not per buffer — the allocation
+        /// is off the hot path.
+        fn init_raw(&mut self, key: &[u8], iv: &[u8]) {
+            // SAFETY: the old context (if any) was created by this module
+            // and is freed exactly once, here; the new one is initialized
+            // before any use and freed by `Drop` (or the next `init_raw`).
+            unsafe {
+                if !self.ctx.is_null() {
+                    openssl_sys::EVP_CIPHER_CTX_free(self.ctx);
+                }
+                let ctx = openssl_sys::EVP_CIPHER_CTX_new();
+                assert!(!ctx.is_null(), "EVP_CIPHER_CTX_new failed");
+                self.ctx = ctx;
+                let ok = openssl_sys::EVP_EncryptInit_ex(
+                    ctx,
+                    openssl_sys::EVP_aes_256_ctr(),
+                    std::ptr::null_mut(),
+                    key.as_ptr(),
+                    iv.as_ptr(),
+                );
+                assert_eq!(ok, 1, "EVP_EncryptInit_ex failed");
             }
         }
-    }
 
-    fn refill_keystream(&mut self) {
-        let mut blocks: [aes::Block; KEYSTREAM_BLOCKS] =
-            std::array::from_fn(|_| aes::Block::clone_from_slice(&[0u8; AES_BLOCK_SIZE]));
-        for block in blocks.iter_mut() {
-            block.copy_from_slice(&self.counter);
-            self.increment_counter();
-        }
-        self.cipher.encrypt_blocks(&mut blocks);
-        for (i, block) in blocks.iter().enumerate() {
-            self.keystream[i * AES_BLOCK_SIZE..(i + 1) * AES_BLOCK_SIZE].copy_from_slice(block);
-        }
-        self.used = 0;
-    }
-
-    fn advance(&mut self, src: &[u8], dst: &mut [u8]) {
-        assert!(dst.len() >= src.len());
-        let mut offset = 0;
-        while offset < src.len() {
-            if self.used == KEYSTREAM_SIZE {
-                self.refill_keystream();
+        fn advance(&mut self, src: &[u8], dst: &mut [u8]) {
+            assert!(dst.len() >= src.len());
+            if src.is_empty() {
+                return;
             }
-            let n = (src.len() - offset).min(KEYSTREAM_SIZE - self.used);
-            xor_keystream(
-                &src[offset..offset + n],
-                &self.keystream[self.used..self.used + n],
-                &mut dst[offset..offset + n],
-            );
-            self.used += n;
-            offset += n;
+            let mut out_len: i32 = 0;
+            // SAFETY: EVP_EncryptUpdate on a CTR context writes exactly
+            // `src.len()` bytes (a stream cipher, no padding); the raw
+            // -pointer form also accepts `src == dst` (the documented
+            // in-place mode), which the safe two-slice API cannot express.
+            let ok = unsafe {
+                openssl_sys::EVP_EncryptUpdate(
+                    self.ctx,
+                    dst.as_mut_ptr(),
+                    &mut out_len,
+                    src.as_ptr(),
+                    src.len() as i32,
+                )
+            };
+            assert_eq!(ok, 1, "EVP_EncryptUpdate failed");
+            debug_assert_eq!(out_len as usize, src.len(), "CTR wrote a partial block");
+        }
+
+        /// `td::AesCtrState::encrypt`.
+        pub fn encrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+            self.advance(src, dst);
+        }
+
+        /// `td::AesCtrState::decrypt` (CTR is an involution).
+        pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+            self.advance(src, dst);
+        }
+
+        /// `encrypt(payload, payload)` — the in-place form C++ uses everywhere
+        /// (transports encrypt their buffers in place).
+        pub fn encrypt_in_place(&mut self, data: &mut [u8]) {
+            let len = data.len();
+            let ptr = data.as_mut_ptr();
+            // SAFETY: EVP_EncryptUpdate documents in-place operation
+            // (`in == out`); one buffer, lockstep, CTR writes exactly `len`.
+            unsafe {
+                let ok = openssl_sys::EVP_EncryptUpdate(self.ctx, ptr, &mut 0, ptr, len as i32);
+                assert_eq!(ok, 1, "EVP_EncryptUpdate failed");
+            }
+        }
+
+        /// `decrypt(payload, payload)` — same in-place form.
+        pub fn decrypt_in_place(&mut self, data: &mut [u8]) {
+            self.encrypt_in_place(data);
         }
     }
 
-    /// `td::AesCtrState::encrypt`.
-    pub fn encrypt(&mut self, src: &[u8], dst: &mut [u8]) {
-        self.advance(src, dst);
-    }
-
-    /// `td::AesCtrState::decrypt` (CTR is an involution).
-    pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
-        self.advance(src, dst);
-    }
-
-    /// `encrypt(payload, payload)` — the in-place form C++ uses everywhere
-    /// (transports encrypt their buffers in place). Not expressible as
-    /// `encrypt(&x, &mut x)` in safe Rust.
-    pub fn encrypt_in_place(&mut self, data: &mut [u8]) {
-        // SAFETY: `advance` reads `src[i]` and writes the same `data[i]`;
-        // both borrows target one allocation and the loop indexes them in
-        // lockstep, so aliasing is sound — the raw-pointer round trip is only
-        // needed to satisfy the borrow checker.
-        let ptr = data.as_mut_ptr();
-        let len = data.len();
-        unsafe {
-            self.advance(std::slice::from_raw_parts(ptr, len), data);
+    impl Default for AesCtrState {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
-    /// `decrypt(payload, payload)` — same in-place form.
-    pub fn decrypt_in_place(&mut self, data: &mut [u8]) {
-        self.encrypt_in_place(data);
+    impl Drop for AesCtrState {
+        fn drop(&mut self) {
+            // SAFETY: the context was created in `new` and is freed exactly
+            // once, here.
+            unsafe { openssl_sys::EVP_CIPHER_CTX_free(self.ctx) };
+        }
+    }
+
+    // SAFETY: an `EVP_CIPHER_CTX` is not used from two threads at once here
+    // — transports move the whole state between actors serialized by the
+    // actor system (the same single-threaded-use contract the RustCrypto
+    // key it replaces had by construction).
+    unsafe impl Send for AesCtrState {}
+}
+
+/// The RustCrypto CTR state — emscripten only (see [`AesCtrState`]).
+#[cfg(target_os = "emscripten")]
+mod ctr_rustcrypto {
+    use super::AES_BLOCK_SIZE;
+    use aes::cipher::{BlockEncrypt, KeyInit};
+
+    pub struct AesCtrState {
+        cipher: aes::Aes256,
+        counter: [u8; AES_BLOCK_SIZE],
+        keystream: [u8; KEYSTREAM_SIZE],
+        /// Bytes of the current keystream run already consumed; the next run is
+        /// generated when this reaches `KEYSTREAM_SIZE`.
+        used: usize,
+    }
+
+    /// Keystream blocks per bulk refill (32 × 16 = 512 bytes) — wide enough to
+    /// amortize the refill over the CTR transport packets; the aes crate's ni
+    /// backend takes its 8-block parallel path per chunk of the slice.
+    const KEYSTREAM_BLOCKS: usize = 32;
+    const KEYSTREAM_SIZE: usize = KEYSTREAM_BLOCKS * AES_BLOCK_SIZE;
+
+    impl AesCtrState {
+        pub fn new() -> Self {
+            Self {
+                cipher: aes::Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
+                counter: [0u8; AES_BLOCK_SIZE],
+                keystream: [0u8; KEYSTREAM_SIZE],
+                used: KEYSTREAM_SIZE,
+            }
+        }
+
+        /// `td::AesCtrState::init(key, iv)`.
+        pub fn init(&mut self, key: &[u8], iv: &[u8]) {
+            assert_eq!(key.len(), 32, "AES key must be 256-bit");
+            assert_eq!(iv.len(), AES_BLOCK_SIZE, "CTR IV must be 128-bit");
+            self.cipher = aes::Aes256::new_from_slice(key).expect("32-byte key checked above");
+            self.counter.copy_from_slice(iv);
+            self.used = KEYSTREAM_SIZE;
+        }
+
+        fn increment_counter(&mut self) {
+            // The 128-bit big-endian increment happens after use, like OpenSSL's
+            // CTR.
+            for byte in self.counter.iter_mut().rev() {
+                *byte = byte.wrapping_add(1);
+                if *byte != 0 {
+                    break;
+                }
+            }
+        }
+
+        fn refill_keystream(&mut self) {
+            let mut blocks: [aes::Block; KEYSTREAM_BLOCKS] =
+                std::array::from_fn(|_| aes::Block::clone_from_slice(&[0u8; AES_BLOCK_SIZE]));
+            for block in blocks.iter_mut() {
+                block.copy_from_slice(&self.counter);
+                self.increment_counter();
+            }
+            self.cipher.encrypt_blocks(&mut blocks);
+            for (i, block) in blocks.iter().enumerate() {
+                self.keystream[i * AES_BLOCK_SIZE..(i + 1) * AES_BLOCK_SIZE].copy_from_slice(block);
+            }
+            self.used = 0;
+        }
+
+        fn advance(&mut self, src: &[u8], dst: &mut [u8]) {
+            assert!(dst.len() >= src.len());
+            let mut offset = 0;
+            while offset < src.len() {
+                if self.used == KEYSTREAM_SIZE {
+                    self.refill_keystream();
+                }
+                let n = (src.len() - offset).min(KEYSTREAM_SIZE - self.used);
+                super::xor_keystream(
+                    &src[offset..offset + n],
+                    &self.keystream[self.used..self.used + n],
+                    &mut dst[offset..offset + n],
+                );
+                self.used += n;
+                offset += n;
+            }
+        }
+
+        /// `td::AesCtrState::encrypt`.
+        pub fn encrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+            self.advance(src, dst);
+        }
+
+        /// `td::AesCtrState::decrypt` (CTR is an involution).
+        pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+            self.advance(src, dst);
+        }
+
+        /// `encrypt(payload, payload)` — the in-place form C++ uses everywhere.
+        pub fn encrypt_in_place(&mut self, data: &mut [u8]) {
+            // SAFETY: `advance` reads `src[i]` and writes the same `data[i]`;
+            // both borrows target one allocation and the loop indexes them in
+            // lockstep, so aliasing is sound — the raw-pointer round trip is only
+            // needed to satisfy the borrow checker.
+            let ptr = data.as_mut_ptr();
+            let len = data.len();
+            unsafe {
+                self.advance(std::slice::from_raw_parts(ptr, len), data);
+            }
+        }
+
+        /// `decrypt(payload, payload)` — same in-place form.
+        pub fn decrypt_in_place(&mut self, data: &mut [u8]) {
+            self.encrypt_in_place(data);
+        }
+    }
+
+    impl Default for AesCtrState {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 }
 
-impl Default for AesCtrState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[cfg(target_os = "emscripten")]
+pub use crate::crypto::ctr_rustcrypto::AesCtrState;
 
 /// `td::AesIgeState` — the IGE mode of `crypto.cpp`, byte-exact port of
 /// `AesIgeStateImpl` (CBC-encrypt of XOR-chained blocks; the iv is 32 bytes:
 /// `encrypted_iv_` then `plaintext_iv_`).
+///
+/// Native encrypt runs the exact C++ shape: IGE encrypts as
+/// `c[i] = E(x[i] ^ x[i-2] ^ c[i-1])`, `y[i] = c[i] ^ x[i-1]` — a plain CBC
+/// chain plus two linear XOR passes — so each 31-block chunk (the C++
+/// `BLOCK_COUNT`) is XOR-prepared on the stack and pushed through one bulk
+/// `EVP_EncryptUpdate` with `EVP_aes_256_cbc` (padding off), the same
+/// OpenSSL asm the C++ `Evp` runs (the S97 IGE-encrypt pass; the RustCrypto
+/// per-block single-pass topped out ~40% under it — the serial chain is
+/// AES-latency-bound and OpenSSL folds the XOR into the round pipeline).
+/// Emscripten keeps that pure-Rust single-pass below (no OpenSSL there).
+/// Decrypt stays RustCrypto on every target: IGE decryption has no serial
+/// chain through the cipher and the single-pass form already runs ahead of
+/// the C++ ECB-EVP loop.
 pub struct AesIgeState {
+    /// The CBC-encrypt EVP context of the native encrypt path; created by
+    /// `init`, freed by `Drop`. Null on emscripten (field not compiled).
+    #[cfg(not(target_os = "emscripten"))]
+    evp: *mut openssl_sys::EVP_CIPHER_CTX,
     cipher: Aes256,
     decrypt: bool,
     encrypted_iv: [u8; AES_BLOCK_SIZE],
@@ -402,6 +631,8 @@ pub struct AesIgeState {
 impl AesIgeState {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_os = "emscripten"))]
+            evp: std::ptr::null_mut(),
             cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
             decrypt: true,
             encrypted_iv: [0u8; AES_BLOCK_SIZE],
@@ -413,15 +644,46 @@ impl AesIgeState {
     pub fn init(&mut self, key: &[u8], iv: &[u8], encrypt: bool) {
         assert_eq!(key.len(), 32, "AES key must be 256-bit");
         assert_eq!(iv.len(), 32, "IGE IV must be 256-bit");
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            // SAFETY: the context is created here (or reused from a
+            // previous `init` — re-`init` re-keys it), used on this thread
+            // only, and freed exactly once by `Drop`.
+            unsafe {
+                if self.evp.is_null() {
+                    self.evp = openssl_sys::EVP_CIPHER_CTX_new();
+                    assert!(!self.evp.is_null(), "EVP_CIPHER_CTX_new failed");
+                }
+                let ok = openssl_sys::EVP_EncryptInit_ex(
+                    self.evp,
+                    openssl_sys::EVP_aes_256_cbc(),
+                    std::ptr::null_mut(),
+                    key.as_ptr(),
+                    std::ptr::null(),
+                );
+                assert_eq!(ok, 1, "EVP_EncryptInit_ex failed");
+                assert_eq!(
+                    openssl_sys::EVP_CIPHER_CTX_set_padding(self.evp, 0),
+                    1,
+                    "EVP_CIPHER_CTX_set_padding failed"
+                );
+            }
+        }
         self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
         self.decrypt = !encrypt;
         self.encrypted_iv.copy_from_slice(&iv[..AES_BLOCK_SIZE]);
         self.plaintext_iv.copy_from_slice(&iv[AES_BLOCK_SIZE..]);
     }
 
-    /// `td::AesIgeStateImpl::encrypt` — standard IGE. The C++ processes
-    /// 31-block chunks, but the mode is chunk-transparent (the CBC chain
-    /// resumes from the last *output* block), so one pass is equivalent.
+    /// `td::AesIgeStateImpl::encrypt` — standard IGE:
+    /// `y[i] = E(x[i] ^ y[i-1]) ^ x[i-1]`, with `x[-1] = plaintext_iv` and
+    /// `y[-1] = encrypted_iv`. The mode is chunk-transparent (the chain
+    /// resumes from the last output block), like the C++ 31-block chunks.
+    ///
+    /// Native: the C++ CBC-equivalence transformation — XOR pass, one bulk
+    /// EVP CBC-encrypt per chunk, XOR pass (see the type docs). Emscripten:
+    /// the direct single-pass recurrence, the mirror of
+    /// [`decrypt`](Self::decrypt).
     pub fn encrypt(&mut self, from: &[u8], to: &mut [u8]) {
         assert!(
             from.len().is_multiple_of(AES_BLOCK_SIZE),
@@ -435,54 +697,106 @@ impl AesIgeState {
             return;
         }
 
-        let mut data_xored = vec![[0u8; AES_BLOCK_SIZE]; block_count];
-        for (i, chunk) in from.chunks_exact(AES_BLOCK_SIZE).enumerate() {
-            data_xored[i].copy_from_slice(chunk);
-        }
-        // The original plaintext blocks: the C++ xors the output with
-        // `data[i - 1]`, not the already-modified `data_xored[i - 1]`.
-        let data = data_xored.clone();
-        if block_count > 1 {
-            for (byte, plaintext_iv) in data_xored[1].iter_mut().zip(self.plaintext_iv) {
-                *byte ^= plaintext_iv;
-            }
-            for i in 2..block_count {
-                for j in 0..AES_BLOCK_SIZE {
-                    data_xored[i][j] ^= data[i - 2][j];
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            // The C++ `BLOCK_COUNT = 31`: stack working set, one bulk CBC
+            // call per chunk.
+            const CHUNK_BLOCKS: usize = 31;
+            let mut in_pos = 0usize;
+            let mut len = block_count;
+            while len != 0 {
+                let count = CHUNK_BLOCKS.min(len);
+                let chunk_end = in_pos + count * AES_BLOCK_SIZE;
+                let mut data = [[0u8; AES_BLOCK_SIZE]; CHUNK_BLOCKS];
+                for (i, chunk) in from[in_pos..chunk_end]
+                    .as_chunks::<AES_BLOCK_SIZE>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    data[i] = *chunk;
                 }
+                // d[0] = x[0]; d[1] = x[1] ^ plaintext_iv; d[i] = x[i] ^ x[i-2]
+                // — the inputs of the equivalent CBC chain.
+                let mut data_xored = data;
+                if count > 1 {
+                    data_xored[1] = xor_block(&data[1], &self.plaintext_iv);
+                    for i in 2..count {
+                        data_xored[i] = xor_block(&data[i], &data[i - 2]);
+                    }
+                }
+                // Chain from encrypted_iv and CBC-encrypt in place (the C++
+                // `init_iv` + one `EVP_EncryptUpdate`; the raw-pointer form
+                // accepts `in == out`).
+                let mut out_len: i32 = 0;
+                // SAFETY: `self.evp` was initialized by `init` for CBC-256
+                // with padding off; `data_xored` is `count * 16` bytes of
+                // stack, read and written in lockstep by the same call.
+                unsafe {
+                    // The C++ `init_iv`: re-init with null cipher/key keeps
+                    // both and only replaces the IV.
+                    let ok = openssl_sys::EVP_EncryptInit_ex(
+                        self.evp,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        self.encrypted_iv.as_ptr(),
+                    );
+                    assert_eq!(ok, 1, "EVP_EncryptInit_ex (iv) failed");
+                    let ok = openssl_sys::EVP_EncryptUpdate(
+                        self.evp,
+                        data_xored.as_mut_ptr().cast(),
+                        &mut out_len,
+                        data_xored.as_ptr().cast(),
+                        (count * AES_BLOCK_SIZE) as i32,
+                    );
+                    assert_eq!(ok, 1, "EVP_EncryptUpdate failed");
+                }
+                debug_assert_eq!(
+                    out_len as usize,
+                    count * AES_BLOCK_SIZE,
+                    "IGE chunk wrote a partial block"
+                );
+                // y[0] = c[0] ^ plaintext_iv; y[i] = c[i] ^ x[i-1].
+                data_xored[0] = xor_block(&data_xored[0], &self.plaintext_iv);
+                for i in 1..count {
+                    data_xored[i] = xor_block(&data_xored[i], &data[i - 1]);
+                }
+                self.plaintext_iv = data[count - 1];
+                self.encrypted_iv = data_xored[count - 1];
+                for (i, out_chunk) in out[in_pos..chunk_end]
+                    .as_chunks_mut::<AES_BLOCK_SIZE>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *out_chunk = data_xored[i];
+                }
+                in_pos = chunk_end;
+                len -= count;
             }
         }
 
-        // C++ updates plaintext_iv_ to the last *plaintext* block, so save it
-        // before the CBC pass overwrites the data.
-        let mut last_plaintext = [0u8; AES_BLOCK_SIZE];
-        last_plaintext.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
-
-        // CBC encrypt in place over data_xored, chained from encrypted_iv.
-        let mut chain = self.encrypted_iv;
-        for block in &mut data_xored {
-            for (b, c) in block.iter_mut().zip(chain) {
-                *b ^= c;
+        #[cfg(target_os = "emscripten")]
+        {
+            let mut y_prev = self.encrypted_iv;
+            let mut x_prev = self.plaintext_iv;
+            for (x, out_chunk) in from
+                .as_chunks::<AES_BLOCK_SIZE>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<AES_BLOCK_SIZE>().0.iter_mut())
+            {
+                let mut aes_block = aes::Block::clone_from_slice(&xor_block(x, &y_prev));
+                self.cipher.encrypt_block(&mut aes_block);
+                let c: [u8; AES_BLOCK_SIZE] = aes_block.as_slice().try_into().unwrap();
+                let y = xor_block(&c, &x_prev);
+                *out_chunk = y;
+                x_prev = *x;
+                y_prev = y;
             }
-            let mut aes_block = aes::Block::clone_from_slice(block);
-            self.cipher.encrypt_block(&mut aes_block);
-            block.copy_from_slice(&aes_block);
-            chain = *block;
-        }
-
-        // y[i] = C[i] ^ x[i-1], with x[-1] = plaintext_iv.
-        for (byte, plaintext_iv) in data_xored[0].iter_mut().zip(self.plaintext_iv) {
-            *byte ^= plaintext_iv;
-        }
-        for i in 1..block_count {
-            for j in 0..AES_BLOCK_SIZE {
-                data_xored[i][j] ^= data[i - 1][j];
-            }
-        }
-        self.plaintext_iv = last_plaintext;
-        self.encrypted_iv = data_xored[block_count - 1];
-        for (block, chunk) in data_xored.iter().zip(out.chunks_exact_mut(AES_BLOCK_SIZE)) {
-            chunk.copy_from_slice(block);
+            self.plaintext_iv = x_prev;
+            self.encrypted_iv = y_prev;
         }
     }
 
@@ -494,10 +808,12 @@ impl AesIgeState {
         );
         assert!(to.len() >= from.len());
         assert!(self.decrypt, "decrypt() on an encrypt state");
-        for (in_block, out_block) in from
-            .chunks_exact(AES_BLOCK_SIZE)
-            .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
-        {
+        for (in_block, out_block) in from.as_chunks::<AES_BLOCK_SIZE>().0.iter().zip(
+            to[..from.len()]
+                .as_chunks_mut::<AES_BLOCK_SIZE>()
+                .0
+                .iter_mut(),
+        ) {
             // The C++ `encrypted.load(in)` copies the ciphertext block
             // before the in-place write below; `in_block` may alias
             // `out_block`, so reading it after the write would give the
@@ -527,6 +843,25 @@ impl Default for AesIgeState {
         Self::new()
     }
 }
+
+impl Drop for AesIgeState {
+    fn drop(&mut self) {
+        // SAFETY: the context was created by `init` (if ever) and is freed
+        // exactly once, here. emscripten has no field at all.
+        #[cfg(not(target_os = "emscripten"))]
+        unsafe {
+            if !self.evp.is_null() {
+                openssl_sys::EVP_CIPHER_CTX_free(self.evp);
+            }
+        }
+    }
+}
+
+// SAFETY: an `EVP_CIPHER_CTX` is never used from two threads at once here —
+// transports move the whole state between actors serialized by the actor
+// system, the same single-threaded-use contract `ctr_native::AesCtrState`
+// documents.
+unsafe impl Send for AesIgeState {}
 
 /// `td::aes_ige_encrypt(key, iv, from, to)` — updates `iv` in place.
 pub fn aes_ige_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
@@ -563,6 +898,14 @@ pub fn aes_ige_decrypt_in_place(aes_key: &[u8], aes_iv: &mut [u8], data: &mut [u
 }
 
 /// `td::aes_cbc_encrypt(key, iv, from, to)` — updates `iv` in place.
+///
+/// CBC *encryption* chains through the cipher (block i's input depends on
+/// block i-1's output), so unlike [`aes_cbc_decrypt`] there is no wide pass
+/// to take — the loop is latency-bound on the AES chain. Native builds run
+/// one bulk EVP call (see [`cbc_native`], the exact C++ backend);
+/// emscripten keeps the RustCrypto form below — copy in once, then per
+/// block one fixed-size XOR + one in-place `encrypt_block` through the
+/// same `&mut [aes::Block]` view the decrypt path uses.
 pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
     assert!(to.len() >= from.len());
     assert!(
@@ -574,28 +917,47 @@ pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
     if from.is_empty() {
         return;
     }
-    let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
-    let mut chain = [0u8; AES_BLOCK_SIZE];
-    chain.copy_from_slice(aes_iv);
-    for (chunk, out) in from
-        .chunks_exact(AES_BLOCK_SIZE)
-        .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
+
+    #[cfg(not(target_os = "emscripten"))]
     {
-        let mut block = [0u8; AES_BLOCK_SIZE];
-        for i in 0..AES_BLOCK_SIZE {
-            block[i] = chunk[i] ^ chain[i];
-        }
-        let mut aes_block = aes::Block::clone_from_slice(&block);
-        cipher.encrypt_block(&mut aes_block);
-        block.copy_from_slice(&aes_block);
-        out.copy_from_slice(&block);
-        chain = block;
+        cbc_native::cbc_encrypt_oneshot(aes_key, aes_iv, from, to);
     }
+
+    #[cfg(target_os = "emscripten")]
+    {
+        let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
+        let n_blocks = from.len() / AES_BLOCK_SIZE;
+        let body = &mut to[..from.len()];
+        body.copy_from_slice(from);
+        // SAFETY: `aes::Block` is a 16-byte align-1 array and `body` is
+        // 16-byte chunked (asserted above); the reborrow ends before `body`
+        // is used again.
+        let blocks: &mut [aes::Block] = unsafe {
+            std::slice::from_raw_parts_mut(body.as_mut_ptr().cast::<aes::Block>(), n_blocks)
+        };
+        let mut chain: [u8; AES_BLOCK_SIZE] = [0; AES_BLOCK_SIZE];
+        chain.copy_from_slice(aes_iv);
+        for block in blocks {
+            let plain: [u8; AES_BLOCK_SIZE] = block.as_slice().try_into().unwrap();
+            block
+                .as_mut_slice()
+                .copy_from_slice(&xor_block(&plain, &chain));
+            cipher.encrypt_block(block);
+            chain = block.as_slice().try_into().unwrap();
+        }
+    }
+
     aes_iv.copy_from_slice(&to[from.len() - AES_BLOCK_SIZE..from.len()]);
 }
 
 /// `td::aes_cbc_decrypt(key, iv, from, to)` — updates `iv` in place to the
 /// last *input* block, then decrypts (the C++ saves the incoming iv first).
+///
+/// CBC *decryption* parallelizes across blocks (the block-cipher calls are
+/// independent — only the XOR chain is sequential): one wide
+/// `decrypt_blocks` pass over the whole buffer — the aes crate's pipelined
+/// AES-NI decrypt path; the per-block form was the S96 §1.2 row — followed
+/// by a vectorizable XOR with each preceding ciphertext block.
 pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
     assert!(to.len() >= from.len());
     assert!(
@@ -608,27 +970,32 @@ pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
         return;
     }
     let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
-    let mut chain = [0u8; AES_BLOCK_SIZE];
-    chain.copy_from_slice(aes_iv);
+    let n_blocks = from.len() / AES_BLOCK_SIZE;
+    // The chaining value of block 0 is the caller's iv; `aes_iv` is
+    // overwritten with the last input block below, so save it first.
+    let mut first_chain = [0u8; AES_BLOCK_SIZE];
+    first_chain.copy_from_slice(aes_iv);
     aes_iv.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
-    let mut prev_cipher = [0u8; AES_BLOCK_SIZE];
-    for (i, (chunk, out)) in from
-        .chunks_exact(AES_BLOCK_SIZE)
-        .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
-        .enumerate()
-    {
-        if i != 0 {
-            chain = prev_cipher;
+    // Copy the ciphertext in, decrypt it in place with one wide pass, then
+    // re-chain each plaintext block with its preceding ciphertext block.
+    let body = &mut to[..from.len()];
+    body.copy_from_slice(from);
+    // SAFETY: `aes::Block` is a 16-byte align-1 array and `body` is
+    // 16-byte chunked (asserted above); the reborrow ends before `body`
+    // is used again.
+    let blocks: &mut [aes::Block] =
+        unsafe { std::slice::from_raw_parts_mut(body.as_mut_ptr().cast::<aes::Block>(), n_blocks) };
+    cipher.decrypt_blocks(blocks);
+    for i in 0..n_blocks {
+        let chain: &[u8] = if i == 0 {
+            &first_chain
+        } else {
+            &from[(i - 1) * AES_BLOCK_SIZE..i * AES_BLOCK_SIZE]
+        };
+        let block = &mut body[i * AES_BLOCK_SIZE..(i + 1) * AES_BLOCK_SIZE];
+        for (b, c) in block.iter_mut().zip(chain) {
+            *b ^= c;
         }
-        let mut block = aes::Block::clone_from_slice(chunk);
-        cipher.decrypt_block(&mut block);
-        let mut plain = [0u8; AES_BLOCK_SIZE];
-        plain.copy_from_slice(&block);
-        for j in 0..AES_BLOCK_SIZE {
-            plain[j] ^= chain[j];
-        }
-        out.copy_from_slice(&plain);
-        prev_cipher.copy_from_slice(chunk);
     }
 }
 

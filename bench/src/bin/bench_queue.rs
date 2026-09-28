@@ -32,7 +32,7 @@ impl Benchmark for QueueBench2 {
 
     fn run(&mut self, n: usize) {
         let connections_n = self.connections_n;
-        let queries_n = (n + connections_n - 1) / connections_n;
+        let queries_n = n.div_ceil(connections_n);
 
         // client queue: server -> client; server queue: client -> server
         let (client_tx, client_rx) = unbounded::<i32>();
