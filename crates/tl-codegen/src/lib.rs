@@ -30,7 +30,7 @@ pub fn generate_td_api_rust() -> String {
             tostring: true,
             samples_feature: None,
             raw_strings: false,
-            source: "td_api.tl (tdlib d1085f9ce)",
+            source: "td_api.tl (tdlib 42e6a525)",
         },
     )
 }
@@ -47,7 +47,7 @@ pub fn generate_telegram_api_rust() -> String {
             tostring: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: false,
-            source: "telegram_api.tl (tdlib d1085f9ce)",
+            source: "telegram_api.tl (tdlib 42e6a525)",
         },
     )
 }
@@ -65,7 +65,7 @@ pub fn generate_secret_api_rust() -> String {
             tostring: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: true,
-            source: "secret_api.tl (tdlib d1085f9ce)",
+            source: "secret_api.tl (tdlib 42e6a525)",
         },
     )
 }
@@ -83,7 +83,7 @@ pub fn generate_mtproto_api_rust() -> String {
             tostring: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: true,
-            source: "mtproto_api.tl (tdlib d1085f9ce)",
+            source: "mtproto_api.tl (tdlib 42e6a525)",
         },
     )
 }
@@ -101,7 +101,7 @@ pub fn generate_e2e_api_rust() -> String {
             tostring: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: true,
-            source: "e2e_api.tl (tdlib d1085f9ce)",
+            source: "e2e_api.tl (tdlib 42e6a525)",
         },
     )
 }

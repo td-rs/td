@@ -168,4 +168,43 @@ mod simple_category_tests {
         assert_eq!(get_unicode_simple_category(0xD800), Unknown, "surrogate");
         assert_eq!(get_unicode_simple_category(0x10FFFF), Unknown);
     }
+
+    /// Full-range parity pin for the Unicode 18.0 tables: FNV-1a over every
+    /// code point 0..=0x110000 through each reader, matching a standalone
+    /// g++ probe compiled from the verbatim arrays + readers of
+    /// tdutils/td/utils/unicode.cpp @ 42e6a5259 (the probe lives in the
+    /// 2026-09-28 upstream-sync session notes; regenerate by extracting the
+    /// table blocks and the four functions verbatim).
+    #[test]
+    fn unicode18_tables_match_the_cpp_probe_checksums() {
+        fn fnv1a(init: u64, values: impl Iterator<Item = u64>) -> u64 {
+            values.fold(init, |h, v| (h ^ v).wrapping_mul(1099511628211))
+        }
+        const INIT: u64 = 1469598103934665603;
+
+        let cat = fnv1a(
+            INIT,
+            (0..=0x110000u32).map(|code| get_unicode_simple_category(code) as u64),
+        );
+        assert_eq!(cat, 1443554385117807666, "get_unicode_simple_category");
+
+        let prep = fnv1a(INIT, (0..=0x110000u32).map(prepare_search_character_u64));
+        assert_eq!(prep, 3098223115303020054, "prepare_search_character");
+
+        let low = fnv1a(INIT, (0..=0x110000u32).map(unicode_to_lower_u64));
+        assert_eq!(low, 8290289319935536834, "unicode_to_lower");
+
+        let dia = fnv1a(INIT, (0..=0x110000u32).map(remove_diacritics_u64));
+        assert_eq!(dia, 3213732956951812771, "remove_diacritics");
+    }
+
+    fn prepare_search_character_u64(code: u32) -> u64 {
+        prepare_search_character(code) as u64
+    }
+    fn unicode_to_lower_u64(code: u32) -> u64 {
+        unicode_to_lower(code) as u64
+    }
+    fn remove_diacritics_u64(code: u32) -> u64 {
+        remove_diacritics(code) as u64
+    }
 }

@@ -783,7 +783,12 @@ fn process_answers(
             DriverAnswer::Ok { packet, .. } => {
                 let local = session.connection.auth_data();
                 local.on_api_response();
+                // 1b4c328ed: an already-authorized session no longer
+                // steals authorization data (there is no CDN session in
+                // this port, so only the not-yet-authorized half of the
+                // upstream condition applies).
                 if sign_ins.contains(&message_id)
+                    && !local.get_auth_flag()
                     && query.tl_constructor() != telegram_api::auth_importAuthorization::ID
                 {
                     // Session.cpp:899-910 — the authorization steal.
@@ -1400,6 +1405,104 @@ mod tests {
         assert_eq!(
             SessionPoolKind::from_query_type(NetQueryType::DownloadSmall),
             SessionPoolKind::DownloadSmall
+        );
+    }
+
+    /// 1b4c328ed: a sign-in answer steals authorization only on a
+    /// not-yet-authorized session (Session.cpp:896-910) — an
+    /// already-authorized session ignores further sign-in responses. The
+    /// connection is a paired TCP socket the test never reads or writes;
+    /// `process_answers` only touches the auth data.
+    #[tokio::test]
+    async fn sign_in_answers_steal_authorization_only_on_an_unauthorized_session() {
+        fn run(auth_flag: bool) -> Vec<NetEvent> {
+            let shared = test_shared();
+            let auth_data = AuthDataShared::new(
+                DcId::internal(2),
+                AuthDataSnapshot::default(),
+                shared.events.clone(),
+            );
+
+            let mut local = AuthData::new();
+            local.set_use_pfs(false);
+            local.set_session_id(0x1234);
+            local.set_main_auth_key(AuthKey::new(0x1122334455667788, vec![0u8; 256]));
+            local.set_auth_flag(auth_flag);
+
+            // A local TCP pair; the test never reads or writes it, the
+            // connection object only has to exist.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let local_socket =
+                std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            local_socket.set_nonblocking(true).unwrap();
+            let stream = tokio::net::TcpStream::from_std(local_socket).unwrap();
+            let transport_type = TransportType::new(
+                TransportTypeEnum::Tcp,
+                2,
+                tdmtproto::proxy_secret::ProxySecret::default(),
+            );
+            let raw_connection = RawConnection::new(stream, transport_type, None);
+            let connection = SessionConnection::new(SessionMode::Tcp, raw_connection, local);
+
+            let message_id = MessageId::new(0x7700_0000_0000_0001);
+            let query = NetQuery::new(
+                7,
+                DcId::internal(2),
+                NetQueryType::Common,
+                AuthFlag::On,
+                GzipFlag::Off,
+                // anything but auth_importAuthorization (the one query
+                // type the C++ steal excludes)
+                telegram_api::auth_importAuthorization::ID + 1,
+                Vec::new(),
+                60,
+                60,
+            );
+            let mut session = Live {
+                connection,
+                pending: HashMap::from([(message_id.get(), query)]),
+            };
+
+            let mut callback = DriverCallback {
+                shared: shared.clone(),
+                raw_dc_id: 2,
+                answers: vec![DriverAnswer::Ok {
+                    message_id,
+                    packet: telegram_api::auth_authorization::ID.to_le_bytes().to_vec(),
+                }],
+                sign_ins: vec![message_id],
+                salts_updated: false,
+                time_diff_updated: None,
+                closed: false,
+            };
+
+            let query_count = Arc::new(AtomicU64::new(1));
+            process_answers(
+                &shared,
+                &auth_data,
+                &mut session,
+                &mut callback,
+                &query_count,
+            );
+            assert_eq!(session.pending.len(), 0, "the answer completed the query");
+            assert_eq!(query_count.load(Ordering::Relaxed), 0);
+            shared.events.take()
+        }
+
+        let events = run(false);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, NetEvent::SignInMainDc { .. })),
+            "the unauthorized session steals the authorization: {events:?}"
+        );
+
+        let events = run(true);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, NetEvent::SignInMainDc { .. })),
+            "the already-authorized session ignores the sign-in: {events:?}"
         );
     }
 }

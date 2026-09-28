@@ -1,11 +1,5 @@
-# Pinned TL schemes imported from upstream tdlib (S03).
-# Upstream repo: https://github.com/tdlib/td (local mirror: /home/sadiq/Projects/td)
-# Upstream commit: d1085f9cebc5a62379991ae1652673954f229c1f (2026-08-24)
-#   "Fix spelling mistakes in updateFileGenerationStart documentation."
-# Files are byte-identical copies of td/generate/scheme/ at that commit.
-# Verify: cd crates/tl-codegen/scheme && sha256sum -c sha256sums.txt
-f4d154dc8cf2b45886b21536d3f00ea19122376eb1bbdfdbccd6866d4e1d72ee  e2e_api.tl
-bde4942be06dc112dfc655e2a8aa5163a4e3aa0d859d7840cfc76ec3a00654c4  mtproto_api.tl
-e35ed375be446f531c15ed885e9fbb214b2a83f864777a44964a7e7ff947ad7e  secret_api.tl
-326b65b41442901ad6bf0ca2f7c356ae54365d6c343956a62e06a8b3cb305e87  td_api.tl
+bc998a2c6dd7e0a8a250dd732ac64d7a7d5e8efdc47760c899cf1aa4660037d0  td_api.tl
 4c44853dd138f6484281317b2a6da7e778b770014bf2d63db76d4138b33bec4f  telegram_api.tl
+e35ed375be446f531c15ed885e9fbb214b2a83f864777a44964a7e7ff947ad7e  secret_api.tl
+bde4942be06dc112dfc655e2a8aa5163a4e3aa0d859d7840cfc76ec3a00654c4  mtproto_api.tl
+f4d154dc8cf2b45886b21536d3f00ea19122376eb1bbdfdbccd6866d4e1d72ee  e2e_api.tl

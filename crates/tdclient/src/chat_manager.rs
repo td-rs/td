@@ -3038,22 +3038,23 @@ impl DialogInviteLink {
             invite_link.request_count_ = 0;
         }
 
+        // fb6203c77: primary links can carry pending join requests now, so
+        // request_count_ is no longer wiped with the other primary-only
+        // fields.
         if invite_link.is_permanent_
             && (!invite_link.title_.is_empty()
                 || invite_link.expire_date_ > 0
                 || invite_link.usage_limit_ > 0
-                || invite_link.edit_date_ > 0
-                || invite_link.request_count_ > 0)
+                || invite_link.edit_date_ > 0)
         {
-            tdutils::log_error!("Receive wrong permanent {full_source}");
+            tdutils::log_error!("Receive wrong primary {full_source}");
             invite_link.title_.clear();
             invite_link.expire_date_ = 0;
             invite_link.usage_limit_ = 0;
             invite_link.edit_date_ = 0;
-            invite_link.request_count_ = 0;
         }
         if invite_link.creates_join_request_ && invite_link.usage_limit_ > 0 {
-            tdutils::log_error!("Receive wrong permanent {full_source}");
+            tdutils::log_error!("Receive wrong {full_source}");
             invite_link.usage_limit_ = 0;
         }
         invite_link
@@ -17886,7 +17887,9 @@ mod tests {
         assert_eq!(malformed.usage_count_, 0);
         assert_eq!(malformed.request_count_, 0);
 
-        // a permanent link may carry no extra parameters
+        // a permanent link may carry no extra parameters — except a
+        // pending join request count (fb6203c77: primary links can create
+        // join requests, so request_count survives the wipe)
         let wrong_permanent = DialogInviteLink::from_telegram(
             Some(telegram_api::ExportedChatInvite::chatInviteExported(
                 telegram_api::chatInviteExported {
@@ -17908,7 +17911,7 @@ mod tests {
         assert_eq!(wrong_permanent.expire_date_, 0);
         assert_eq!(wrong_permanent.usage_limit_, 0);
         assert_eq!(wrong_permanent.edit_date_, 0);
-        assert_eq!(wrong_permanent.request_count_, 0);
+        assert_eq!(wrong_permanent.request_count_, 3);
 
         // join requests cannot coexist with a usage limit
         let join_request = DialogInviteLink::from_telegram(
@@ -18036,8 +18039,9 @@ mod tests {
         assert_eq!(object.member_limit, 0);
         assert_eq!(object.member_count, 12);
         assert_eq!(object.expired_member_count, 0);
-        // the permanent sanitizer cleared the pending-request count
-        assert_eq!(object.pending_join_request_count, 0);
+        // fb6203c77: the permanent sanitizer no longer clears the pending
+        // join request count — primary links can create join requests
+        assert_eq!(object.pending_join_request_count, 4);
         assert!(!object.creates_join_request);
         assert!(object.is_primary);
         assert!(!object.is_revoked);

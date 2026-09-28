@@ -595,6 +595,9 @@ pub struct User {
     pub stories_hidden: bool,
     pub contact_require_premium: bool,
     pub has_live_story: bool,
+    pub is_noforwards_inited: bool,
+    pub noforwards_my_enabled: bool,
+    pub noforwards_peer_enabled: bool,
 
     /// `User::photo_ids` (UserManager.h:631) — the ids of the photos
     /// registered from listings/userFull, runtime-only state in the C++
@@ -696,6 +699,9 @@ impl Default for User {
             stories_hidden: false,
             contact_require_premium: false,
             has_live_story: false,
+            is_noforwards_inited: false,
+            noforwards_my_enabled: false,
+            noforwards_peer_enabled: false,
             photo_ids: BTreeSet::new(),
             is_photo_inited: false,
             is_repaired: false,
@@ -911,6 +917,9 @@ impl User {
                     self.is_guestchat_bot,
                     self.is_guard_bot,
                     has_linked_community_id,
+                    self.is_noforwards_inited,
+                    self.noforwards_my_enabled,
+                    self.noforwards_peer_enabled,
                 ],
             );
         }
@@ -1081,10 +1090,13 @@ impl User {
             is_guestchat_bot,
             is_guard_bot,
             has_linked_community_id,
+            is_noforwards_inited,
+            noforwards_my_enabled,
+            noforwards_peer_enabled,
         ] = if has_flags2 {
             parser.parse_flags()?
         } else {
-            [false; 24]
+            [false; 27]
         };
         if legacy_has_stories {
             return Err("legacy user stories need the story subsystem");
@@ -1100,6 +1112,9 @@ impl User {
         u.can_manage_bots = can_manage_bots;
         u.is_guestchat_bot = is_guestchat_bot;
         u.is_guard_bot = is_guard_bot;
+        u.is_noforwards_inited = is_noforwards_inited;
+        u.noforwards_my_enabled = noforwards_my_enabled;
+        u.noforwards_peer_enabled = noforwards_peer_enabled;
 
         u.first_name = parser.string()?;
         if has_last_name {
@@ -5305,7 +5320,9 @@ impl UserManager {
             .as_ref()
             .map(|settings| settings.need_contacts_exception)
             .unwrap_or_default();
-        if need_phone_number_privacy_exception && (is_contact || user_id == self.my_id) {
+        if need_phone_number_privacy_exception
+            && (is_deleted_user || is_contact || user_id == self.my_id)
+        {
             need_phone_number_privacy_exception = false;
         }
         let birthdate = if flags2 & (1 << 5) != 0 {
@@ -5319,6 +5336,32 @@ impl UserManager {
         };
         let private_forward_name = std::mem::take(&mut user_full.private_forward_name);
         let linked_community_id = user_linked_community_id;
+
+        // on_update_user_full_noforwards' User cache (61e454f02,
+        // cpp:4534-4553): both update flags are set from this caller, so
+        // the User record caches the noforwards state for the
+        // has_protected_content accessors' fast path.
+        {
+            let need_save = {
+                let u = self.users.get_mut(&user_id.get()).unwrap();
+                if u.noforwards_my_enabled != noforwards_my_enabled {
+                    u.noforwards_my_enabled = noforwards_my_enabled;
+                    u.need_save_to_database = true;
+                }
+                if u.noforwards_peer_enabled != noforwards_peer_enabled {
+                    u.noforwards_peer_enabled = noforwards_peer_enabled;
+                    u.need_save_to_database = true;
+                }
+                if !u.is_noforwards_inited {
+                    u.is_noforwards_inited = true;
+                    u.need_save_to_database = true;
+                }
+                u.need_save_to_database
+            };
+            if need_save {
+                self.update_user(env, user_id, false, false);
+            }
+        }
 
         {
             let stored = self.users_full.get_mut(&user_id.get()).unwrap();
@@ -5768,8 +5811,10 @@ impl UserManager {
             }
             user_full.is_update_user_full_sent = true;
         }
-        self.update_user_full(env, user_id, "on_load_user_full_from_database 3", true);
 
+        // aa6d3aaf9 (cpp:9466-9473): the drop/reload now precede the
+        // update_user_full send, so a deleted user doesn't emit a
+        // duplicate updateUserFullInfo.
         let is_deleted = self
             .users
             .get(&user_id.get())
@@ -5784,6 +5829,39 @@ impl UserManager {
             .unwrap_or(false)
         {
             self.reload_user_full(env, user_id, "on_load_user_full_from_database 4");
+        }
+        self.update_user_full(env, user_id, "on_load_user_full_from_database 3", true);
+
+        // 61e454f02 (cpp:9478-9485): sync the User-record cache from the
+        // loaded full info — read after the branches, so a deleted user
+        // syncs the dropped record's defaults like the C++ pointer.
+        let (user_full_my, user_full_peer) = self
+            .users_full
+            .get(&user_id.get())
+            .map(|user_full| {
+                (
+                    user_full.noforwards_my_enabled,
+                    user_full.noforwards_peer_enabled,
+                )
+            })
+            .unwrap_or((false, false));
+        let user_changed = {
+            let Some(u) = self.users.get_mut(&user_id.get()) else {
+                return;
+            };
+            let changed = u.noforwards_my_enabled != user_full_my
+                || u.noforwards_peer_enabled != user_full_peer
+                || !u.is_noforwards_inited;
+            if changed {
+                u.noforwards_my_enabled = user_full_my;
+                u.noforwards_peer_enabled = user_full_peer;
+                u.is_noforwards_inited = true;
+                u.need_save_to_database = true;
+            }
+            changed
+        };
+        if user_changed {
+            self.update_user(env, user_id, false, false);
         }
     }
 
@@ -6942,12 +7020,19 @@ impl UserManager {
     }
 
     /// `UserManager::get_user_has_protected_content_force`
-    /// (UserManager.cpp:5646-5652).
+    /// (UserManager.cpp:5646-5652) — with the User-record cache consulted
+    /// first (61e454f02).
     pub fn get_user_has_protected_content_force(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
     ) -> bool {
+        self.get_user_force(env, user_id, "get_user_has_protected_content_force");
+        if let Some(u) = self.users.get(&user_id.get())
+            && u.is_noforwards_inited
+        {
+            return u.noforwards_my_enabled || u.noforwards_peer_enabled;
+        }
         if self.get_user_full_force(env, user_id, "get_user_has_protected_content_force")
             && let Some(user_full) = self.get_user_full(user_id)
         {
@@ -6957,20 +7042,33 @@ impl UserManager {
     }
 
     /// `UserManager::get_user_has_protected_content`
-    /// (UserManager.cpp:5654-5660).
+    /// (UserManager.cpp:5654-5660) — with the User-record cache consulted
+    /// first (61e454f02).
     pub fn get_user_has_protected_content_of(&self, user_id: UserId) -> bool {
+        if let Some(u) = self.get_user(user_id)
+            && u.is_noforwards_inited
+        {
+            return u.noforwards_my_enabled || u.noforwards_peer_enabled;
+        }
         self.get_user_full(user_id)
             .map(|user_full| user_full.noforwards_my_enabled || user_full.noforwards_peer_enabled)
             .unwrap_or(false)
     }
 
     /// `UserManager::get_user_has_protected_content_force_by_me`
-    /// (UserManager.cpp:5662-5668).
+    /// (UserManager.cpp:5662-5668) — with the User-record cache consulted
+    /// first (61e454f02).
     pub fn get_user_has_protected_content_force_by_me(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
     ) -> bool {
+        self.get_user_force(env, user_id, "get_user_has_protected_content_force_by_me");
+        if let Some(u) = self.users.get(&user_id.get())
+            && u.is_noforwards_inited
+        {
+            return u.noforwards_my_enabled;
+        }
         if self.get_user_full_force(env, user_id, "get_user_has_protected_content_force_by_me")
             && let Some(user_full) = self.get_user_full(user_id)
         {
@@ -6980,12 +7078,23 @@ impl UserManager {
     }
 
     /// `UserManager::get_user_has_protected_content_force_by_other`
-    /// (UserManager.cpp:5670-5676).
+    /// (UserManager.cpp:5670-5676) — with the User-record cache consulted
+    /// first (61e454f02).
     pub fn get_user_has_protected_content_force_by_other(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
     ) -> bool {
+        self.get_user_force(
+            env,
+            user_id,
+            "get_user_has_protected_content_force_by_other",
+        );
+        if let Some(u) = self.users.get(&user_id.get())
+            && u.is_noforwards_inited
+        {
+            return u.noforwards_peer_enabled;
+        }
         if self.get_user_full_force(
             env,
             user_id,
@@ -11863,6 +11972,153 @@ mod tests {
         assert!(parsed.stories_hidden);
         assert!(parsed.is_close_friend);
         assert_eq!(parsed.bot_info_version, -1);
+    }
+
+    /// 61e454f02: the noforwards cache rides the flags2 tail (bits 24-26,
+    /// after has_linked_community_id) — byte-pinned against the C++
+    /// `User::store`/`User::parse`.
+    #[test]
+    fn user_store_value_round_trips_the_noforwards_cache_flags() {
+        let (mut temp, _um) = test_env();
+        let ctx = temp.env(false).time_ctx();
+        let mut user = User::new();
+        user.first_name = "Nf".to_owned();
+        user.is_received = true;
+        user.is_bot = false;
+        user.is_deleted = false;
+        user.is_noforwards_inited = true;
+        user.noforwards_my_enabled = true;
+        user.noforwards_peer_enabled = false;
+
+        let mut bytes = Vec::new();
+        user.store_value(&mut bytes, &ctx);
+        // The second stored u32 is the flags2 word; the three new flags
+        // are its bits 24, 25 and 26.
+        let flags2 = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(flags2 >> 24 & 1, 1, "is_noforwards_inited at bit 24");
+        assert_eq!(flags2 >> 25 & 1, 1, "noforwards_my_enabled at bit 25");
+        assert_eq!(flags2 >> 26 & 1, 0, "noforwards_peer_enabled at bit 26");
+
+        let parsed = User::parse_value(&bytes, &ctx).unwrap();
+        assert!(parsed.is_noforwards_inited);
+        assert!(parsed.noforwards_my_enabled);
+        assert!(!parsed.noforwards_peer_enabled);
+
+        // A blob written by the pre-61e454f02 format (no new bits set)
+        // still parses with the cache uninited.
+        let mut legacy = User::new();
+        legacy.first_name = "Old".to_owned();
+        legacy.is_bot = false;
+        legacy.is_deleted = false;
+        let mut legacy_bytes = Vec::new();
+        legacy.store_value(&mut legacy_bytes, &ctx);
+        let parsed = User::parse_value(&legacy_bytes, &ctx).unwrap();
+        assert!(!parsed.is_noforwards_inited);
+    }
+
+    /// 61e454f02: `on_get_user_full` seeds the User-record cache and the
+    /// has_protected_content accessors answer from it, even with the
+    /// UserFull record dropped.
+    #[test]
+    fn on_get_user_full_caches_noforwards_in_the_user_record() {
+        let (mut temp, mut um) = test_env();
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+
+        let user_full = telegram_api::UserFull {
+            id: 5,
+            flags2: 1 << 23, // noforwards_my_enabled
+            ..telegram_api::UserFull::default()
+        };
+        um.on_get_user_full(&mut temp.env(false), user_full);
+        {
+            let u = um.get_user(UserId::new(5)).unwrap();
+            assert!(u.is_noforwards_inited);
+            assert!(u.noforwards_my_enabled);
+            assert!(!u.noforwards_peer_enabled);
+        }
+
+        // The accessors answer from the User cache after the UserFull
+        // record resets (drop_user_full clears the full-info side only).
+        um.drop_user_full(&mut temp.env(false), UserId::new(5));
+        assert!(um.get_user_has_protected_content_of(UserId::new(5)));
+        assert!(!um.get_user_has_protected_content_of(UserId::new(6)));
+
+        // A second delivery flips the cached bits.
+        let user_full = telegram_api::UserFull {
+            id: 5,
+            flags2: (1 << 23) | (1 << 24),
+            ..telegram_api::UserFull::default()
+        };
+        um.on_get_user_full(&mut temp.env(false), user_full);
+        {
+            let u = um.get_user(UserId::new(5)).unwrap();
+            assert!(u.noforwards_my_enabled);
+            assert!(u.noforwards_peer_enabled);
+        }
+    }
+
+    /// 61e454f02: `on_load_user_full_from_database` seeds the User-record
+    /// cache from the stored full info.
+    #[test]
+    fn on_load_user_full_from_database_syncs_the_noforwards_cache() {
+        let (mut temp, mut um) = test_env();
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+        {
+            let mut user_full = UserFull::new();
+            user_full.noforwards_peer_enabled = true;
+            let ctx = temp.env(false).time_ctx();
+            let mut bytes = Vec::new();
+            user_full.store_value(&mut bytes, &ctx);
+            let key = UserManager::get_user_full_database_key(UserId::new(5));
+            temp.env(false).global.td_db().common_kv().set(&key, &bytes);
+        }
+
+        um.get_user_full_force(&mut temp.env(false), UserId::new(5), "test");
+        let u = um.get_user(UserId::new(5)).unwrap();
+        assert!(u.is_noforwards_inited);
+        assert!(!u.noforwards_my_enabled);
+        assert!(u.noforwards_peer_enabled);
+        assert!(um.get_user_has_protected_content_of(UserId::new(5)));
+    }
+
+    /// aa6d3aaf9: a deleted user forces the phone-number privacy
+    /// exception off, like a contact or self.
+    #[test]
+    fn deleted_user_suppresses_the_phone_number_privacy_exception() {
+        let (mut temp, mut um) = test_env();
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "gone", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.users.get_mut(&5).unwrap().is_deleted = true;
+        um.take_updates();
+
+        let user_full = telegram_api::UserFull {
+            id: 5,
+            settings: Some(telegram_api::PeerSettings {
+                flags: 1 << 4,
+                need_contacts_exception: true,
+                ..telegram_api::PeerSettings::default()
+            }),
+            ..telegram_api::UserFull::default()
+        };
+        um.on_get_user_full(&mut temp.env(false), user_full);
+        assert!(
+            !um.get_user_full(UserId::new(5))
+                .unwrap()
+                .need_phone_number_privacy_exception
+        );
     }
 
     #[test]
