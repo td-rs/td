@@ -1,7 +1,7 @@
 # cargo-deny configuration (CI `deny` job, S02).
 # advisories: vulnerabilities are denied by default; also fail on yanked deps.
 # bans: duplicate crate versions only warn for now — tighten once real deps land.
-# licenses: allow-list covers BSL-1.0 (ourselves) plus the permissive set used by
+# licenses: allow-list covers MIT (ourselves) plus the permissive set used by
 # the general-purpose crates the plan allows (tokio, serde, RustCrypto, rustls).
 # sources: only crates.io; no git dependencies.
 

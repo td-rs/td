@@ -5,7 +5,7 @@
 name = "td-conformance"
 version = "0.1.0"
 edition = "2024"
-license = "BSL-1.0"
+license = "MIT"
 publish = false
 description = "Golden vectors and differential harness for the td Rust rewrite"
 

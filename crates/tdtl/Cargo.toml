@@ -6,7 +6,7 @@ edition.workspace = true
 # GPL-2.0-or-later (tgl/tlc derivative work) — a port is a derivative and must
 # carry the same license. Build-time tooling only (used by tl-codegen); never
 # linked into shipped artifacts. Replace with a clean-room lexer if that ever
-# changes. The rest of the workspace stays BSL-1.0.
+# changes. The rest of the workspace is MIT.
 license = "GPL-2.0-or-later"
 publish.workspace = true
 
