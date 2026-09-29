@@ -182,7 +182,16 @@ impl ConnectionCreator {
                         continue;
                     }
                     let mut proxy = Proxy::default();
-                    if let Err(error) = proxy.parse(&value) {
+                    // `log_event_store` framing (ConnectionCreator.cpp:202):
+                    // the log-event version prefix leads the record.
+                    let payload = value
+                        .strip_prefix(
+                            crate::store_parse::version::LOG_EVENT_STORE_VERSION
+                                .to_le_bytes()
+                                .as_slice(),
+                        )
+                        .unwrap_or(&value);
+                    if let Err(error) = proxy.parse(payload) {
                         tdutils::log_error!("Can't parse proxy {proxy_id}: {error}");
                         continue;
                     }
@@ -274,10 +283,12 @@ impl ConnectionCreator {
                             self.max_proxy_id.to_string().as_bytes(),
                         );
                     }
-                    env.binlog_pmc_set_raw(
-                        get_proxy_database_key(proxy_id).as_bytes(),
-                        &new_proxy.store(),
-                    );
+                    // `log_event_store` framing — the version prefix leads
+                    // the record.
+                    let mut value = Vec::new();
+                    crate::store_parse::store_log_event_version(&mut value);
+                    value.extend_from_slice(&new_proxy.store());
+                    env.binlog_pmc_set_raw(get_proxy_database_key(proxy_id).as_bytes(), &value);
                     let is_inserted = self
                         .proxies
                         .insert(proxy_id, (new_proxy, String::new()))

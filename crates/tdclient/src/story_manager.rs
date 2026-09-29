@@ -2592,6 +2592,8 @@ impl StoryManager {
             env.binlog_pmc_erase(Self::get_story_stealth_mode_key().as_bytes());
         } else {
             let mut out = Vec::new();
+            // `log_event_store` framing — the version prefix leads the row.
+            crate::store_parse::store_log_event_version(&mut out);
             self.stealth_mode.store(&mut out);
             env.binlog_pmc_set_raw(Self::get_story_stealth_mode_key().as_bytes(), &out);
         }
@@ -5138,7 +5140,11 @@ impl StoryManager {
         let stealth_mode_str =
             env.binlog_pmc_get_raw(Self::get_story_stealth_mode_key().as_bytes());
         if !stealth_mode_str.is_empty() {
-            match StoryStealthMode::parse(&mut Parser::new(&stealth_mode_str)) {
+            // `log_event_parse` framing — the version prefix is consumed
+            // by the parser constructor.
+            let parsed = Parser::new_log_event(&stealth_mode_str)
+                .and_then(|mut parser| StoryStealthMode::parse(&mut parser));
+            match parsed {
                 Err(status) => {
                     tdutils::log_error!("Failed to parse stealth mode from binlog: {status}");
                 }

@@ -1535,8 +1535,11 @@ impl ThemeManager {
         let log_event_string =
             env.binlog_pmc_get_raw(Self::get_chat_themes_database_key().as_bytes());
         if !log_event_string.is_empty() {
-            let mut parser = Parser::new(&log_event_string);
-            match EmojiChatThemes::parse(env, &mut parser) {
+            // `log_event_parse` framing — the version prefix is consumed
+            // by the parser constructor.
+            let parsed = Parser::new_log_event(&log_event_string)
+                .and_then(|mut parser| EmojiChatThemes::parse(env, &mut parser));
+            match parsed {
                 Result::Ok(chat_themes) => {
                     self.chat_themes = chat_themes;
                     self.send_update_chat_themes(env);
@@ -1557,8 +1560,9 @@ impl ThemeManager {
         let log_event_string =
             env.binlog_pmc_get_raw(Self::get_accent_colors_database_key().as_bytes());
         if !log_event_string.is_empty() {
-            let mut parser = Parser::new(&log_event_string);
-            match AccentColors::parse(&mut parser) {
+            let parsed = Parser::new_log_event(&log_event_string)
+                .and_then(|mut parser| AccentColors::parse(&mut parser));
+            match parsed {
                 Result::Ok(accent_colors) => {
                     self.accent_colors = accent_colors;
                     self.send_update_accent_colors(env);
@@ -1579,8 +1583,9 @@ impl ThemeManager {
         let log_event_string =
             env.binlog_pmc_get_raw(Self::get_profile_accent_colors_database_key().as_bytes());
         if !log_event_string.is_empty() {
-            let mut parser = Parser::new(&log_event_string);
-            match ProfileAccentColors::parse(&mut parser) {
+            let parsed = Parser::new_log_event(&log_event_string)
+                .and_then(|mut parser| ProfileAccentColors::parse(&mut parser));
+            match parsed {
                 Result::Ok(profile_accent_colors) => {
                     self.profile_accent_colors = profile_accent_colors;
                     self.send_update_profile_accent_colors(env);
@@ -1597,7 +1602,9 @@ impl ThemeManager {
 
     /// `ThemeManager::save_chat_themes` (ThemeManager.cpp:773-775).
     fn save_chat_themes(&self, env: &mut impl ThemeManagerEnv) {
+        // `log_event_store` framing — the version prefix leads each row.
         let mut out = Vec::new();
+        store_parse::store_log_event_version(&mut out);
         self.chat_themes.store(env, &mut out);
         env.binlog_pmc_set_raw(Self::get_chat_themes_database_key().as_bytes(), &out);
     }
@@ -1605,6 +1612,7 @@ impl ThemeManager {
     /// `ThemeManager::save_accent_colors` (ThemeManager.cpp:777-780).
     fn save_accent_colors(&self, env: &mut impl ThemeManagerEnv) {
         let mut out = Vec::new();
+        store_parse::store_log_event_version(&mut out);
         self.accent_colors.store(&mut out);
         env.binlog_pmc_set_raw(Self::get_accent_colors_database_key().as_bytes(), &out);
     }
@@ -1612,6 +1620,7 @@ impl ThemeManager {
     /// `ThemeManager::save_profile_accent_colors` (ThemeManager.cpp:782-785).
     fn save_profile_accent_colors(&self, env: &mut impl ThemeManagerEnv) {
         let mut out = Vec::new();
+        store_parse::store_log_event_version(&mut out);
         self.profile_accent_colors.store(&mut out);
         env.binlog_pmc_set_raw(
             Self::get_profile_accent_colors_database_key().as_bytes(),
@@ -2751,6 +2760,7 @@ mod tests {
         colors.min_broadcast_boost_levels = vec![3];
         colors.min_megagroup_boost_levels = vec![3];
         let mut row = Vec::new();
+        crate::store_parse::store_log_event_version(&mut row);
         colors.store(&mut row);
         env.binlog_pmc_set_raw("accent_colors".as_bytes(), &row);
 

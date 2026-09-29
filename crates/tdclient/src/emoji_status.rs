@@ -320,9 +320,11 @@ impl EmojiStatusCustomEmojisCache {
         }
     }
 
-    /// `EmojiStatusCustomEmojis::store` (EmojiStatus.cpp:44-48).
+    /// `EmojiStatusCustomEmojis::store` (EmojiStatus.cpp:44-48) under
+    /// `log_event_store` — the log-event version prefix leads the row.
     pub fn store(&self, out: &mut Vec<u8>) {
         use store_parse::*;
+        store_log_event_version(out);
         store_i64(out, self.hash);
         store_i64_vec(
             out,
@@ -334,10 +336,11 @@ impl EmojiStatusCustomEmojisCache {
         );
     }
 
-    /// `EmojiStatusCustomEmojis::parse` (EmojiStatus.cpp:50-54).
+    /// `EmojiStatusCustomEmojis::parse` (EmojiStatus.cpp:50-54) under
+    /// `log_event_parse`.
     pub fn parse(input: &[u8]) -> Result<EmojiStatusCustomEmojisCache, &'static str> {
         use store_parse::*;
-        let mut parser = Parser::new(input);
+        let mut parser = Parser::new_log_event(input)?;
         let hash = parser.i64_()?;
         let count = parser.i32_()?;
         let mut custom_emoji_ids = Vec::with_capacity(count.max(0) as usize);
@@ -374,9 +377,11 @@ impl EmojiStatusesCache {
         }
     }
 
-    /// `EmojiStatuses::store` (EmojiStatus.cpp:95-99).
+    /// `EmojiStatuses::store` (EmojiStatus.cpp:95-99) under
+    /// `log_event_store` — the log-event version prefix leads the row.
     pub fn store(&self, out: &mut Vec<u8>) {
         use store_parse::*;
+        store_log_event_version(out);
         store_i64(out, self.hash);
         store_i32(out, self.emoji_statuses.len() as i32);
         for emoji_status in &self.emoji_statuses {
@@ -384,10 +389,11 @@ impl EmojiStatusesCache {
         }
     }
 
-    /// `EmojiStatuses::parse` (EmojiStatus.cpp:101-105).
+    /// `EmojiStatuses::parse` (EmojiStatus.cpp:101-105) under
+    /// `log_event_parse`.
     pub fn parse(input: &[u8]) -> Result<EmojiStatusesCache, &'static str> {
         use store_parse::*;
-        let mut parser = Parser::new(input);
+        let mut parser = Parser::new_log_event(input)?;
         let hash = parser.i64_()?;
         let count = parser.i32_()?;
         let mut emoji_statuses = Vec::with_capacity(count.max(0) as usize);

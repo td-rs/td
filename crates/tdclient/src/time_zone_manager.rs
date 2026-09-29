@@ -201,7 +201,15 @@ impl TimeZoneManager {
         if log_event_string.is_empty() {
             return;
         }
-        match TimeZoneList::parse(&mut log_event_string.as_slice()) {
+        // `log_event_parse` framing — the version prefix is consumed first.
+        let mut payload = log_event_string
+            .strip_prefix(
+                crate::store_parse::version::LOG_EVENT_STORE_VERSION
+                    .to_le_bytes()
+                    .as_slice(),
+            )
+            .unwrap_or(&log_event_string);
+        match TimeZoneList::parse(&mut payload) {
             Ok(time_zones) => self.time_zones = time_zones,
             Err(status) => {
                 tracing::error!("Failed to parse time zones from binlog: {status}");
@@ -212,10 +220,11 @@ impl TimeZoneManager {
 
     /// `TimeZoneManager::save_time_zones`.
     pub fn save_time_zones(&mut self, global: &mut Global) {
+        // `log_event_store` framing — the version prefix leads the blob;
+        // the byte pmc accessors keep it intact.
         let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
         self.time_zones.store(&mut out);
-        // The C++ stores the binary blob through a std::string; the byte
-        // pmc accessors keep it intact.
         global
             .binlog_pmc()
             .set_raw(Self::database_key().as_bytes(), &out);

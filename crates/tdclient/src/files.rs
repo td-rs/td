@@ -18259,10 +18259,12 @@ impl StorageManager {
         }
     }
 
-    /// `save_fast_stat`/`load_fast_stat` (StorageManager.cpp:240-252) —
-    /// the binlog record is `store(size)` + `store(cnt)` (i64 + i32).
+    /// `save_fast_stat`/`load_fast_stat` (StorageManager.cpp:235-252) —
+    /// stored via `log_event_store`: the log-event version prefix, then
+    /// `store(size)` + `store(cnt)` (i64 + i32).
     pub fn save_fast_stat(&mut self, ctx: &mut dyn StorageContext) {
-        let mut out = Vec::with_capacity(12);
+        let mut out = Vec::with_capacity(16);
+        store_parse::store_log_event_version(&mut out);
         store_parse::store_i64(&mut out, self.fast_stat.size);
         store_parse::store_i32(&mut out, self.fast_stat.cnt);
         ctx.pmc_set("fast_file_stat", &out);
@@ -18270,7 +18272,14 @@ impl StorageManager {
 
     pub fn load_fast_stat(&mut self, ctx: &mut dyn StorageContext) {
         let data = ctx.pmc_get("fast_file_stat");
-        let mut parser = Parser::new(&data);
+        let payload = data
+            .strip_prefix(
+                store_parse::version::LOG_EVENT_STORE_VERSION
+                    .to_le_bytes()
+                    .as_slice(),
+            )
+            .unwrap_or(&data);
+        let mut parser = Parser::new(payload);
         self.fast_stat = match (parser.i64_(), parser.i32_()) {
             (Ok(size), Ok(cnt)) if parser.left_len() == 0 => FileTypeStat { size, cnt },
             _ => FileTypeStat::default(),
@@ -18802,8 +18811,16 @@ impl DownloadManager {
         let use_message_database = self.ctx().use_message_database();
         if use_message_database {
             let serialized_counter = self.ctx().pmc_get("dlds_counter");
+            // the log-event version prefix leads the counters
+            let payload = serialized_counter
+                .strip_prefix(
+                    store_parse::version::LOG_EVENT_STORE_VERSION
+                        .to_le_bytes()
+                        .as_slice(),
+                )
+                .unwrap_or(&serialized_counter);
             if !serialized_counter.is_empty() {
-                match DownloadCounters::parse(&serialized_counter) {
+                match DownloadCounters::parse(payload) {
                     Ok(counters) => {
                         if counters.downloaded_size == counters.total_size
                             || counters.total_size == 0
@@ -19690,7 +19707,10 @@ impl DownloadManager {
             self.ctx().pmc_erase("dlds_counter");
         } else {
             self.counters_clear_at = None;
+            // `log_event_store` framing (DownloadManager.cpp:675): the
+            // log-event version prefix leads the counters.
             let mut out = Vec::new();
+            store_parse::store_log_event_version(&mut out);
             self.counters.store(&mut out);
             self.ctx().pmc_set("dlds_counter", &out);
         }

@@ -1164,6 +1164,9 @@ impl EmojiStatusesRecord {
 /// collapsed sticker store the record carries the `(id, remote_id)`
 /// pairs, which is all the recent/favorite registries read back.
 fn store_sticker_list(out: &mut Vec<u8>, sticker_ids: &[crate::files::FileId]) {
+    // `log_event_store` framing — `parse_sticker_list` reads it back
+    // through `Parser::new_log_event`.
+    store_log_event_version(out);
     store_i32(out, sticker_ids.len() as i32);
     for sticker_id in sticker_ids {
         store_i32(out, sticker_id.get());

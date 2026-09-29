@@ -562,8 +562,17 @@ pub fn get_temp_password_state_sync(env: &mut impl PaymentsEnv) -> TempPasswordS
     let temp_password_str = env.binlog_pmc_get_raw(b"temp_password");
     let mut res = TempPasswordState::default();
     if !temp_password_str.is_empty() {
+        // `log_event_parse` framing (PasswordManager.cpp:333) — the
+        // log-event version prefix leads the row.
+        let payload = temp_password_str
+            .strip_prefix(
+                crate::store_parse::version::LOG_EVENT_STORE_VERSION
+                    .to_le_bytes()
+                    .as_slice(),
+            )
+            .unwrap_or(&temp_password_str);
         let parse = || -> std::result::Result<TempPasswordState, &'static str> {
-            let mut parser = Parser::new(&temp_password_str);
+            let mut parser = Parser::new(payload);
             let temp_password = parser.string()?.to_owned();
             let valid_until = parser.i32_()?;
             std::result::Result::Ok(TempPasswordState {

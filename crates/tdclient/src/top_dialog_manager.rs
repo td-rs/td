@@ -1032,7 +1032,10 @@ impl TopDialogManager {
                     "top_dialogs#{}",
                     get_top_dialog_category_name(top_dialog_category)
                 );
+                // `log_event_store` framing — the version prefix leads the
+                // record (TopDialogManager.cpp:598).
                 let mut value = Vec::new();
+                crate::store_parse::store_log_event_version(&mut value);
                 top_dialogs.store(&mut value);
                 env.binlog_pmc_set_raw(&key, &value);
             }
@@ -1106,8 +1109,10 @@ impl TopDialogManager {
                 if value.is_empty() {
                     continue;
                 }
-                let mut parser = Parser::new(&value);
-                *top_dialogs = TopDialogs::parse(&mut parser).expect("Failed to parse top dialogs"); // log_event_parse(...).ensure()
+                // the log-event version prefix leads the record
+                let mut parser =
+                    Parser::new_log_event(&value).expect("Failed to parse top dialogs"); // log_event_parse(...).ensure()
+                *top_dialogs = TopDialogs::parse(&mut parser).expect("Failed to parse top dialogs");
             }
             self.normalize_rating(env);
         } else {
@@ -2081,7 +2086,7 @@ mod tests {
 
         assert!(env.pmc.contains_key("top_dialogs#correspondent"));
         let saved = env.pmc.get("top_dialogs#group").unwrap();
-        let mut parser = Parser::new(saved);
+        let mut parser = Parser::new_log_event(saved.as_slice()).unwrap();
         let parsed = TopDialogs::parse(&mut parser).unwrap();
         assert_eq!(parsed.dialogs.len(), 1);
         assert_eq!(parsed.dialogs[0].dialog_id.get(), 9_001);
@@ -2105,6 +2110,7 @@ mod tests {
         };
         let mut stored = Vec::new();
         dialogs.rating_timestamp -= 0.0;
+        crate::store_parse::store_log_event_version(&mut stored);
         dialogs.store(&mut stored);
         env.pmc.insert("top_dialogs#group".to_owned(), stored);
 
