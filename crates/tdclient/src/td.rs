@@ -6609,11 +6609,12 @@ impl Td {
             database_directory: PathBuf::from(&database_directory),
         };
         let db_parameters = DbParameters {
-            encryption_key: if database_encryption_key.is_empty() {
-                tddb::db_key::DbKey::empty()
-            } else {
-                tddb::db_key::DbKey::password(database_encryption_key)
-            },
+            // `TdDb::as_db_key` (TdDb.cpp:671-676, via Td.cpp:1457): the key
+            // arrives base64-decoded and is ALWAYS a raw key — the KDF fast
+            // path (2 iterations), never the password path — with the empty
+            // key defaulting to the well-known "cucumber" raw key, so the
+            // binlog is always AesCtr-encrypted.
+            encryption_key: crate::requests::as_db_key(database_encryption_key),
             database_directory,
             files_directory,
             is_test_dc: use_test_dc,

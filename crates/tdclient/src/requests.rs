@@ -17910,7 +17910,7 @@ fn message_full_id(chat_id: i64, message_id: i64) -> crate::messages_manager::Me
 
 /// `TdDb::as_db_key` (TdDb.cpp:671-676) — the empty key becomes the
 /// well-known "cucumber" raw key.
-fn as_db_key(key: Vec<u8>) -> tddb::DbKey {
+pub(crate) fn as_db_key(key: Vec<u8>) -> tddb::DbKey {
     if key.is_empty() {
         tddb::DbKey::raw_key(b"cucumber".to_vec())
     } else {
