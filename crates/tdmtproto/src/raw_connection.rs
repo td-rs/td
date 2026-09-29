@@ -203,7 +203,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RawConnection<S> {
             self.transport.max_append_size(),
         );
 
-        tdutils::log_info!("Send handshake packet of size {}", packet.size());
+        // C++ RawConnection.cpp:95 — `LOG(INFO) << "Send handshake packet: "
+        // << format::as_hex_dump<4>(packet.as_slice())`.
+        tdutils::log_info!(
+            at "RawConnection.cpp",
+            95,
+            "Send handshake packet: {}",
+            tdutils::logging::hex_dump_4(packet.as_slice())
+        );
         self.transport.write(packet, false, &mut self.output_writer);
     }
 

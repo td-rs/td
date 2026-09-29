@@ -339,9 +339,113 @@ pub fn set_thread_id(id: i32) {
     THREAD_ID.with(|cell| cell.set(id));
 }
 
-/// `td::get_thread_id`.
+/// The C++ `detail::ThreadIdManager` counter — every thread that logs
+/// registers itself with the next id, so the first (main) thread is 1 like
+/// in TDLib.
+static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(1);
+
+/// `td::get_thread_id` — lazily registers the calling thread like the C++
+/// `ThreadIdManager::register_thread`.
 pub fn get_thread_id() -> i32 {
-    THREAD_ID.with(Cell::get)
+    THREAD_ID.with(|cell| {
+        let id = cell.get();
+        if id != 0 {
+            return id;
+        }
+        let assigned = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        cell.set(assigned);
+        assigned
+    })
+}
+
+/// The named verbosity levels, one constant per C++
+/// `int VERBOSITY_NAME(x) = VERBOSITY_NAME(DEBUG) + N;` runtime global.
+/// Sites logged through them carry `[&x]` in the header (the `VLOG(x)`
+/// comment), and the numeric level IS the tag identity, like in C++.
+pub mod verbosity {
+    use super::{DEBUG, INFO};
+
+    /// `VERBOSITY_NAME(td_requests)` (Td.cpp:125).
+    pub const TD_REQUESTS: i32 = INFO;
+    /// `VERBOSITY_NAME(notifications)` (NotificationManager.cpp:71).
+    pub const NOTIFICATIONS: i32 = INFO;
+    /// `VERBOSITY_NAME(get_difference)` (UpdatesManager.cpp:124).
+    pub const GET_DIFFERENCE: i32 = INFO;
+    /// `VERBOSITY_NAME(dns_resolver)`.
+    pub const DNS_RESOLVER: i32 = DEBUG;
+    /// `VERBOSITY_NAME(file_loader)`.
+    pub const FILE_LOADER: i32 = DEBUG;
+    /// `VERBOSITY_NAME(proxy)`.
+    pub const PROXY: i32 = DEBUG;
+    /// `VERBOSITY_NAME(dc)` — DEBUG + 2.
+    pub const DC: i32 = DEBUG + 2;
+    /// `VERBOSITY_NAME(td_init)` — DEBUG + 3.
+    pub const TD_INIT: i32 = DEBUG + 3;
+    /// `VERBOSITY_NAME(mtproto)` — DEBUG + 7.
+    pub const MTPROTO: i32 = DEBUG + 7;
+    /// `VERBOSITY_NAME(binlog)` (tddb Binlog.cpp:171) — DEBUG + 8.
+    pub const BINLOG: i32 = DEBUG + 8;
+    /// `VERBOSITY_NAME(fd)` — DEBUG + 9.
+    pub const FD: i32 = DEBUG + 9;
+    /// `VERBOSITY_NAME(actor)` (tdactor Scheduler.cpp:36) — DEBUG + 10.
+    pub const ACTOR: i32 = DEBUG + 10;
+    /// `VERBOSITY_NAME(raw_mtproto)` — DEBUG + 10.
+    pub const RAW_MTPROTO: i32 = DEBUG + 10;
+    /// `VERBOSITY_NAME(sqlite)` — DEBUG + 10.
+    pub const SQLITE: i32 = DEBUG + 10;
+    /// `VERBOSITY_NAME(waiter)` — DEBUG + 10.
+    pub const WAITER: i32 = DEBUG + 10;
+}
+
+/// Interns a dynamic log-tag string (e.g. an actor name) into `&'static
+/// str` for the `Cell<&'static str>` tag slots — bounded in practice: the
+/// tag set per process is the finite set of actor names.
+pub fn intern_log_tag(tag: &str) -> &'static str {
+    static INTERNED: Mutex<Option<std::collections::HashMap<String, &'static str>>> =
+        Mutex::new(None);
+    let mut guard = INTERNED.lock().unwrap();
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(existing) = map.get(tag) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(tag.to_string().into_boxed_str());
+    map.insert(tag.to_string(), leaked);
+    leaked
+}
+
+/// The current `LOG_TAG2` value — for save/restore around actor dispatch.
+pub fn current_log_tag2() -> &'static str {
+    LOG_TAG2.with(Cell::get)
+}
+
+/// The C++ `format::as_hex_dump<4>` (format.h): a leading newline, a
+/// partial first group of `size % 4` bytes, then 4-byte groups printed
+/// byte-reversed (the little-endian `HexDumpSize<4, true>` display), a
+/// newline every 16 groups and after the last one, a space between the
+/// rest — exactly what `LOG << ... << format::as_hex_dump<4>(slice)`
+/// appends.
+pub fn hex_dump_4(data: &[u8]) -> String {
+    fn group(bytes: &[u8]) -> String {
+        bytes.iter().rev().map(|b| format!("{b:02x}")).collect()
+    }
+    let mut out = String::from("\n");
+    let size = data.len();
+    let first = size % 4;
+    if first != 0 {
+        out.push_str(&group(&data[..first]));
+        out.push('\n');
+    }
+    let mut i = first;
+    while i < size {
+        out.push_str(&group(&data[i..i + 4]));
+        if (i / 4) & 15 == 15 || i + 4 >= size {
+            out.push('\n');
+        } else {
+            out.push(' ');
+        }
+        i += 4;
+    }
+    out
 }
 
 /// Maps a tdlib verbosity level to the `tracing` level used for the event
@@ -634,8 +738,25 @@ pub fn append_message(level: i32, message: &str, file_name: &str, line_num: u32,
 /// The `LOG(level)` stream of C++ becomes a macro with a `format!`-style
 /// message; the level is spelled out (`log_error!`, ...) and custom levels
 /// use [`crate::vlog!`].
+///
+/// The `at "File.cpp", 123` form pins the header to the C++ source
+/// location the site was ported from, so emitted lines are byte-shaped
+/// like TDLib's (`[RawConnection.cpp:323]` instead of the Rust
+/// `file!()`/`line!()`).
 #[macro_export]
 macro_rules! log_impl {
+    ($level:expr, $comment:expr, at $file:literal, $line:expr, $($arg:tt)*) => {{
+        let __log_level: i32 = $level;
+        if __log_level <= $crate::logging::get_verbosity_level() {
+            $crate::logging::append_message(
+                __log_level,
+                &::std::format!($($arg)*),
+                $file,
+                $line,
+                $comment,
+            );
+        }
+    }};
     ($level:expr, $comment:expr, $($arg:tt)*) => {{
         let __log_level: i32 = $level;
         if __log_level <= $crate::logging::get_verbosity_level() {
@@ -653,6 +774,9 @@ macro_rules! log_impl {
 /// `td::LOG(ERROR)`.
 #[macro_export]
 macro_rules! log_error {
+    (at $file:literal, $line:expr, $($arg:tt)*) => {
+        $crate::log_impl!($crate::logging::ERROR, "", at $file, $line, $($arg)*)
+    };
     ($($arg:tt)*) => {
         $crate::log_impl!($crate::logging::ERROR, "", $($arg)*)
     };
@@ -661,6 +785,9 @@ macro_rules! log_error {
 /// `td::LOG(WARNING)`.
 #[macro_export]
 macro_rules! log_warning {
+    (at $file:literal, $line:expr, $($arg:tt)*) => {
+        $crate::log_impl!($crate::logging::WARNING, "", at $file, $line, $($arg)*)
+    };
     ($($arg:tt)*) => {
         $crate::log_impl!($crate::logging::WARNING, "", $($arg)*)
     };
@@ -669,6 +796,9 @@ macro_rules! log_warning {
 /// `td::LOG(INFO)`.
 #[macro_export]
 macro_rules! log_info {
+    (at $file:literal, $line:expr, $($arg:tt)*) => {
+        $crate::log_impl!($crate::logging::INFO, "", at $file, $line, $($arg)*)
+    };
     ($($arg:tt)*) => {
         $crate::log_impl!($crate::logging::INFO, "", $($arg)*)
     };
@@ -677,6 +807,9 @@ macro_rules! log_info {
 /// `td::LOG(DEBUG)`.
 #[macro_export]
 macro_rules! log_debug {
+    (at $file:literal, $line:expr, $($arg:tt)*) => {
+        $crate::log_impl!($crate::logging::DEBUG, "", at $file, $line, $($arg)*)
+    };
     ($($arg:tt)*) => {
         $crate::log_impl!($crate::logging::DEBUG, "", $($arg)*)
     };
@@ -685,6 +818,13 @@ macro_rules! log_debug {
 /// `td::LOG(FATAL)` — appends and aborts the process.
 #[macro_export]
 macro_rules! log_fatal {
+    (at $file:literal, $line:expr, $($arg:tt)*) => {{
+        $crate::log_impl!($crate::logging::FATAL, "", at $file, $line, $($arg)*);
+        // append() handles FATAL by aborting; this is unreachable but
+        // `abort` is `!` while `append_message` returns normally, so make
+        // the contract explicit for the optimizer.
+        $crate::logging::process_fatal_error("")
+    }};
     ($($arg:tt)*) => {{
         $crate::log_impl!($crate::logging::FATAL, "", $($arg)*);
         // append() handles FATAL by aborting; this is unreachable but
@@ -695,8 +835,13 @@ macro_rules! log_fatal {
 }
 
 /// `td::VLOG(level)` — a custom verbosity level, logged at DEBUG filtering.
+/// The 4-argument form pins the C++ source location AND passes the named
+/// tag so the header carries `[&tag]` like the C++ `VLOG(tag)` comment.
 #[macro_export]
 macro_rules! vlog {
+    ($level:expr, $tag:literal, at $file:literal, $line:expr, $($arg:tt)*) => {
+        $crate::log_impl!($level, $tag, at $file, $line, $($arg)*)
+    };
     ($level:expr, $($arg:tt)*) => {
         $crate::log_impl!($level, &::std::stringify!($level).to_string(), $($arg)*)
     };

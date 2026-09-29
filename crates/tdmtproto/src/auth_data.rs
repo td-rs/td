@@ -346,6 +346,8 @@ impl AuthData {
 
     pub fn reset_server_time_difference(&mut self, diff: f64) {
         tdutils::log_debug!(
+            at "AuthData.cpp",
+            86,
             "Reset server time difference: {} -> {}",
             self.server_time_difference,
             diff
@@ -416,7 +418,7 @@ impl AuthData {
             let to_mul = ((rx >> 22) & 1023) + 1;
             result = MessageId::new(self.last_message_id.get() + 8 * to_mul as u64);
         }
-        tdutils::log_debug!("Create identifier for {result} at {now}");
+        tdutils::log_debug!(at "AuthData.cpp", 122, "Create identifier for {result} at {now}");
         self.last_message_id = result;
         result
     }
@@ -465,7 +467,11 @@ impl AuthData {
             return (status, false);
         }
 
-        tdutils::log_debug!("Receive packet in {message_id} from session {session_id} at {now}");
+        tdutils::log_debug!(
+            at "AuthData.cpp",
+            155,
+            "Receive packet in {message_id} from session {session_id} at {now}"
+        );
         let time_difference_was_updated =
             self.update_server_time_difference((message_id.get() >> 32) as u32 as f64 - now);
 

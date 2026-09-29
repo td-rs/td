@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tdactor::{
-    Actor, ActorId, ConcurrentScheduler, Event, EventFull, FutureActor, FutureBox, PromiseActor,
-    Raw, Scheduler, actor_messages, create_actor, register_actor, send_closure, send_closure_later,
+    Actor, ActorId, ConcurrentScheduler, Event, EventFull, FutureBox, PromiseActor, Raw, Scheduler,
+    actor_messages, create_actor, register_actor, send_closure, send_closure_later,
     send_promise_immediately, send_promise_later,
 };
 

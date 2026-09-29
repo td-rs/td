@@ -318,7 +318,7 @@ where
     }
 
     pub fn set_online(&mut self, online_flag: bool, is_main: bool) {
-        tdutils::log_debug!("Set online to {online_flag}");
+        tdutils::log_debug!(at "SessionConnection.cpp", 793, "Set online to {online_flag}");
         let need_ping = online_flag || !self.online_flag;
         self.online_flag = online_flag;
         self.is_main = is_main;

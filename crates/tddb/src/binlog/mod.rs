@@ -429,6 +429,24 @@ impl Binlog {
             if validate_status.is_error() {
                 panic!("Failed to validate binlog event {validate_status}");
             }
+            // Binlog.cpp:336 — the `[reindex] ` cond fires only for the
+            // replayed writes during a reindex; the Run-state writes log
+            // at their add sites (the pmc layer carries the caller's
+            // BinlogDebugInfo, BinlogKeyValue.h:196).
+            if self.state == State::Reindex {
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::BINLOG,
+                    "binlog",
+                    at "Binlog.cpp",
+                    336,
+                    "Write binlog event: [reindex] LogEvent[[id:0x{:016x}][type:{}][flags:{}][data:{}]][{}]",
+                    event.id,
+                    event.type_,
+                    event.flags,
+                    event.raw_size(),
+                    "/project/td/tddb/td/db/binlog/Binlog.cpp:613"
+                );
+            }
             self.write_bytes(event.raw_event());
         }
 

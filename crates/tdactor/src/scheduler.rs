@@ -47,6 +47,36 @@ use crate::actor::Actor;
 use crate::actor_id::{ActorId, ActorOwn, ActorRef, IdSlot};
 use crate::event::{Event, EventType};
 
+/// The actor's log name, interned for the `LOG_TAG2` slot — the C++
+/// `ActorInfo::operator<<` prints `name:info_ptr:context_ptr` at every
+/// `VLOG(actor)` site; the pointer VALUES are run-specific (they differ
+/// between C++ runs too), only the shape is pinned.
+fn slot_log_name(slot: *const IdSlot) -> &'static str {
+    // SAFETY: the caller holds a live actor id (or an in-guard info); the
+    // name is immutable after registration.
+    let name = unsafe { (*slot).name_str() };
+    tdutils::logging::intern_log_tag(name)
+}
+
+fn actor_log_name(id: &ActorId) -> &'static str {
+    slot_log_name(id.slot_ptr())
+}
+
+/// The C++ `Event::operator<<` names, as they appear in scheduler logs
+/// (`Add to mailbox: Td:H:H Event::Custom`).
+fn event_log_name(ty: EventType) -> &'static str {
+    match ty {
+        EventType::NoType => "Event::NoType",
+        EventType::Start => "Event::Start",
+        EventType::Stop => "Event::Stop",
+        EventType::Yield => "Event::Yield",
+        EventType::Timeout => "Event::Timeout",
+        EventType::Hangup => "Event::Hangup",
+        EventType::Raw => "Event::Raw",
+        EventType::Custom => "Event::Custom",
+    }
+}
+
 /// The `EventContext::Stop` flag of the C++ scheduler.
 const FLAG_STOP: u32 = 1;
 /// The `EventContext::Migrate` flag of the C++ scheduler.
@@ -540,6 +570,13 @@ pub struct SchedulerState {
     ctx: CtxPtr,
     /// A clone of this scheduler's own sender, for `wakeup()`.
     wakeup_tx: UnboundedSender<Inbound>,
+    /// The eventfd equivalent for same-scheduler sends from other tasks on
+    /// this thread: `add_to_mailbox` from a non-pump context (e.g. an
+    /// async session task running on the same runtime) cannot wake the
+    /// parked pump through the mailbox alone, so it stores a `Notify`
+    /// permit the pump's `select!` consumes (C++ wakes via the scheduler
+    /// eventfd on every foreign send).
+    notify: tokio::sync::Notify,
     /// The main scheduler's inbound sender — `finish()` wakes the main pump so
     /// `run_main` returns promptly (C++ `ConcurrentScheduler::on_finish`).
     main_wakeup: UnboundedSender<Inbound>,
@@ -572,6 +609,7 @@ impl SchedulerState {
             inbound: UnsafeCell::new(Some(inbound)),
             ctx: CtxPtr(Cell::new(std::ptr::null_mut())),
             wakeup_tx,
+            notify: tokio::sync::Notify::new(),
             main_wakeup,
             finished,
         }
@@ -865,14 +903,13 @@ impl SchedulerState {
             link_token: token,
         };
         let prev = self.install_ctx(&ctx);
-        let info = self.info(id);
-        info.is_running.set(true);
+        let saved_tag2 = self.enter_actor(id);
         {
-            let mut slot = info.actor.borrow_mut();
+            let mut slot = self.info(id).actor.borrow_mut();
             let actor = slot.as_mut().expect("dispatched to a dead actor");
             run(actor);
         }
-        let (flags, dest) = self.exit_actor(id, prev);
+        let (flags, dest) = self.exit_actor(id, prev, saved_tag2);
         self.honor_flags(id, flags, dest);
     }
 
@@ -903,6 +940,19 @@ impl SchedulerState {
                 self.add_to_mailbox(id, event);
             }
         } else {
+            // Scheduler.cpp:361 `VLOG(actor) << "Send to ... on scheduler N"`.
+            tdutils::vlog!(
+                tdutils::logging::verbosity::ACTOR,
+                "actor",
+                at "Scheduler.cpp",
+                361,
+                "Send to {}:{:p}:{:p} on scheduler {}: {}",
+                actor_log_name(id),
+                id.info_ptr(),
+                id.slot_ptr(),
+                sched,
+                event_log_name(event.ty)
+            );
             let _ = self.outbound[sched as usize].send(Inbound::Event {
                 id: id.clone(),
                 event,
@@ -946,6 +996,19 @@ impl SchedulerState {
                     .push(event);
             }
         } else {
+            // Scheduler.cpp:361 `VLOG(actor) << "Send to ... on scheduler N"`.
+            tdutils::vlog!(
+                tdutils::logging::verbosity::ACTOR,
+                "actor",
+                at "Scheduler.cpp",
+                361,
+                "Send to {}:{:p}:{:p} on scheduler {}: {}",
+                actor_log_name(id),
+                id.info_ptr(),
+                id.slot_ptr(),
+                sched,
+                event_log_name(event.ty)
+            );
             let _ = self.outbound[sched as usize].send(Inbound::Event {
                 id: id.clone(),
                 event,
@@ -964,7 +1027,23 @@ impl SchedulerState {
             self.ready.borrow_mut().push_back(info_ptr);
         }
         info.mailbox_empty.set(false);
+        // Scheduler.cpp:414 `VLOG(actor) << "Add to mailbox: " << ... `.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "Scheduler.cpp",
+            414,
+            "Add to mailbox: {}:{:p}:{:p} {}",
+            actor_log_name(id),
+            id.info_ptr(),
+            id.slot_ptr(),
+            event_log_name(event.ty)
+        );
         info.mailbox.borrow_mut().push_back(event);
+        // The foreign-send eventfd: a permit for a pump parked in its
+        // `select!` (same-thread sends from other tasks never touch the
+        // inbound channel).
+        self.notify.notify_one();
     }
 
     // ---- dispatch (EventGuard + do_event) ----
@@ -973,6 +1052,18 @@ impl SchedulerState {
     /// the guard context — the inline dispatch writes it once, with the
     /// context, instead of paying a separate thread-local write here.
     fn do_event(&self, info: &ActorInfo, event: Event) {
+        // Scheduler.cpp:269 `VLOG(actor) << *actor_info << ' ' << event`.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "Scheduler.cpp",
+            269,
+            "{}:{:p}:{:p} {}",
+            slot_log_name(info.slot),
+            info as *const ActorInfo,
+            info.slot,
+            event_log_name(event.ty)
+        );
         let mut slot = info.actor.borrow_mut();
         let actor = slot.as_mut().expect("dispatched to a dead actor");
         match event.ty {
@@ -1001,8 +1092,27 @@ impl SchedulerState {
     /// running. The list unlink happens on *exit* (the EventGuard
     /// destructor), exactly like C++; the actor stays linked wherever it
     /// was (pending, for inline dispatches) until then.
-    fn enter_actor(&self, id: &ActorId) {
-        self.info(id).is_running.set(true);
+    fn enter_actor(&self, id: &ActorId) -> &'static str {
+        let info = self.info(id);
+        info.is_running.set(true);
+        // The C++ `EventGuard` sets `LOG_TAG2` to the actor name for the
+        // whole dispatch (the `[!Name]` header column) and logs the run at
+        // `VLOG(actor)` (ActorInfo.h:175). The returned saved tag is
+        // restored by [`Self::exit_actor`].
+        let name = actor_log_name(id);
+        let saved_tag2 = tdutils::logging::current_log_tag2();
+        tdutils::logging::set_log_tag2(name);
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "ActorInfo.h",
+            175,
+            "Start run actor: {}:{:p}:{:p}",
+            name,
+            id.info_ptr(),
+            id.slot_ptr()
+        );
+        saved_tag2
     }
 
     /// The end of the C++ `EventGuard` destructor: unlink the actor and
@@ -1012,7 +1122,24 @@ impl SchedulerState {
     /// thread-local access for both). The restore must happen *before* the
     /// flags are honored — `do_stop_actor` asserts it is not stopping the
     /// dispatched actor.
-    fn exit_actor(&self, id: &ActorId, prev_ctx: *const EventContext) -> (u32, i32) {
+    fn exit_actor(
+        &self,
+        id: &ActorId,
+        prev_ctx: *const EventContext,
+        saved_tag2: &'static str,
+    ) -> (u32, i32) {
+        let name = actor_log_name(id);
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "ActorInfo.h",
+            182,
+            "Stop run actor: {}:{:p}:{:p}",
+            name,
+            id.info_ptr(),
+            id.slot_ptr()
+        );
+        tdutils::logging::set_log_tag2(saved_tag2);
         let info = self.info(id);
         let mailbox_empty = info.mailbox_empty.get();
         let info_ptr = id.info_ptr();
@@ -1060,9 +1187,9 @@ impl SchedulerState {
             link_token: event.link_token,
         };
         let prev = self.install_ctx(&ctx);
-        self.enter_actor(id);
+        let saved_tag2 = self.enter_actor(id);
         self.do_event(self.info(id), event);
-        let (flags, dest) = self.exit_actor(id, prev);
+        let (flags, dest) = self.exit_actor(id, prev, saved_tag2);
         self.honor_flags(id, flags, dest);
     }
 
@@ -1079,6 +1206,20 @@ impl SchedulerState {
             link_token: 0,
         };
         let prev = self.install_ctx(&ctx);
+        // One EventGuard for the whole drain, like the C++ `run_mailbox`.
+        let name = slot_log_name(info.slot);
+        let saved_tag2 = tdutils::logging::current_log_tag2();
+        tdutils::logging::set_log_tag2(name);
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "ActorInfo.h",
+            175,
+            "Start run actor: {}:{:p}:{:p}",
+            name,
+            info_ptr,
+            info.slot
+        );
         info.is_running.set(true);
         let mut processed = 0;
         while processed < mailbox_len {
@@ -1112,6 +1253,20 @@ impl SchedulerState {
         info.is_running.set(false);
         let dest = self.with_ctx(|ctx| ctx.dest);
         self.restore_ctx(prev);
+        // The guard's second half, after the context restore: log the end
+        // of the run and hand the enclosing actor its tag back
+        // (ActorInfo.h:182).
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "ActorInfo.h",
+            182,
+            "Stop run actor: {}:{:p}:{:p}",
+            name,
+            info_ptr,
+            info.slot
+        );
+        tdutils::logging::set_log_tag2(saved_tag2);
         if flags != 0 {
             // A *borrowed* id view for the flag handling — no refcount
             // traffic (the hot path never takes flags). `from_raw_block`
@@ -1400,11 +1555,26 @@ impl SchedulerState {
         // during the drain queue for the next `run_events` round), then
         // flush each actor in FIFO order. The batch local stays put for the
         // whole drain (the spliced sentinel must not move once placed).
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "Scheduler.cpp",
+            537,
+            "Run mailbox : begin"
+        );
         let mut batch = ActorList::new();
         self.ready.borrow_mut().take_all(&mut batch);
         while let Some(info_ptr) = batch.pop_front() {
             self.flush_mailbox(info_ptr);
         }
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "Scheduler.cpp",
+            545,
+            "Run mailbox : finish {}",
+            self.actor_count.get()
+        );
     }
 
     fn run_timeout(&self) {
@@ -1437,6 +1607,19 @@ impl SchedulerState {
 
     /// `Scheduler::run_events`.
     fn run_events(&self, deadline: Instant) {
+        // Scheduler.cpp:578 `VLOG(actor) << "Run events " << sched_id_
+        // << " " << tag("pending", ...) << tag("actors", ...)` — once per
+        // call, before the loop.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "Scheduler.cpp",
+            578,
+            "Run events {} [pending:{}][actors:{}]",
+            self.sched_id,
+            self.pending_events.borrow().len(),
+            self.actor_count.get()
+        );
         loop {
             self.run_mailbox();
             self.run_timeout();
@@ -1447,6 +1630,18 @@ impl SchedulerState {
     }
 
     fn process_inbound(&self, items: Vec<Inbound>) {
+        if !items.is_empty() {
+            // Scheduler.cpp:84 `VLOG(actor) << "Have " << ready_n << "
+            // pending events"` — the ServiceActor pump start.
+            tdutils::vlog!(
+                tdutils::logging::verbosity::ACTOR,
+                "actor",
+                at "Scheduler.cpp",
+                84,
+                "Have {} pending events",
+                items.len()
+            );
+        }
         for item in items {
             match item {
                 Inbound::Wakeup => {}
@@ -1463,6 +1658,15 @@ impl SchedulerState {
                     if !id.is_alive() {
                         continue;
                     }
+                    // Scheduler.cpp:97 `VLOG(actor) << "Receive " << event`.
+                    tdutils::vlog!(
+                        tdutils::logging::verbosity::ACTOR,
+                        "actor",
+                        at "Scheduler.cpp",
+                        97,
+                        "Receive {}",
+                        event_log_name(event.ty)
+                    );
                     let (sched, migrating) = id.sched();
                     if sched == self.sched_id {
                         if migrating {
@@ -1478,6 +1682,18 @@ impl SchedulerState {
                             self.send_immediately_impl(ActorRef::from(id).with_token(token), event);
                         }
                     } else {
+                        tdutils::vlog!(
+                            tdutils::logging::verbosity::ACTOR,
+                            "actor",
+                            at "Scheduler.cpp",
+                            361,
+                            "Send to {}:{:p}:{:p} on scheduler {}: {}",
+                            actor_log_name(&id),
+                            id.info_ptr(),
+                            id.slot_ptr(),
+                            sched,
+                            event_log_name(event.ty)
+                        );
                         let _ = self.outbound[sched as usize].send(Inbound::Event { id, event });
                     }
                 }
@@ -1498,10 +1714,27 @@ impl SchedulerState {
                 .next_timeout()
                 .unwrap_or_else(|| Instant::now() + IDLE_POLL)
                 .min(deadline);
-            tokio::select! {
-                biased;
-                item = self.recv_inbound() => self.handle_inbound(item),
-                _ = tokio::time::sleep_until(wait) => {}
+            // Park like the C++ `Scheduler::run` wait: an inbound event or
+            // the deadline ends the park, and a `Notify` wake only counts
+            // when work actually arrived (a mailbox send) — a STALE permit
+            // from an earlier `add_to_mailbox` must not end the park, or
+            // a `run_main(0.3)` test pump returns before its armed
+            // timeout fires and the outer loops spin on nothing.
+            loop {
+                // `ready` holds actors WITH events; `pending` is merely the
+                // idle-actor pool, not work.
+                if !self.ready.borrow().is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    item = self.recv_inbound() => {
+                        self.handle_inbound(item);
+                        break;
+                    }
+                    _ = self.notify.notified() => {}
+                    _ = tokio::time::sleep_until(wait) => break,
+                }
             }
             self.run_events(deadline);
         }
@@ -1896,6 +2129,9 @@ impl ConcurrentScheduler {
             "run_main before start"
         );
         let _guard = SchedulerGuard::new(&self.main, true);
+        // The main scheduler thread's instance tag, like every scheduler
+        // thread (see `scheduler_thread`).
+        tdutils::logging::set_log_tag("1");
         let deadline = Instant::now() + Duration::from_secs_f64(timeout);
         self.runtime.block_on(self.main.run_once(deadline));
         !self.finished.load(Ordering::Relaxed)
@@ -1954,16 +2190,45 @@ impl ConcurrentScheduler {
         if self.state.get() == ConcurrentSchedulerState::Start {
             return;
         }
-        self.finished.store(true, Ordering::Relaxed);
-        self.wakeup();
-        // C++ on_finish wakes every scheduler, so workers blocked on their
-        // inbound queue notice `finished` immediately instead of after the
-        // 10 s idle poll.
-        for tx in &self.worker_wakeups {
-            let _ = tx.send(Inbound::Wakeup);
-        }
+        self.shutdown_signal().signal();
         for handle in self.threads.drain(..) {
             let _ = handle.join();
+        }
+    }
+
+    /// Clone the lock-free shutdown signal (see [`ShutdownSignal`]).
+    pub fn shutdown_signal(&self) -> ShutdownSignal {
+        ShutdownSignal {
+            finished: Arc::clone(&self.finished),
+            main_wakeup: self.main.wakeup_tx.clone(),
+            worker_wakeups: self.worker_wakeups.clone(),
+        }
+    }
+}
+
+/// The wake half of `ConcurrentScheduler::finish`, cloned out of the
+/// scheduler: the `finished` flag plus the pump-wake senders. A shutdown
+/// path that cannot take the scheduler Mutex — the td client's pump
+/// thread holds it across its whole 10 s `run_main` slice (C++
+/// Client.cpp:695) and re-acquires it immediately, so a locked `finish`
+/// starves on the microscopic gap between slices (the
+/// `close_synthesizes_the_closed_update` deadlock) — signals through
+/// this instead, exactly like the C++ `finish` + eventfd wakes: the
+/// woken slice ends, `run_main` returns false and every pump exits.
+#[derive(Clone)]
+pub struct ShutdownSignal {
+    finished: Arc<AtomicBool>,
+    main_wakeup: tokio::sync::mpsc::UnboundedSender<Inbound>,
+    worker_wakeups: Vec<tokio::sync::mpsc::UnboundedSender<Inbound>>,
+}
+
+impl ShutdownSignal {
+    /// Set `finished` and wake every pump — lock-free.
+    pub fn signal(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+        let _ = self.main_wakeup.send(Inbound::Wakeup);
+        for tx in &self.worker_wakeups {
+            let _ = tx.send(Inbound::Wakeup);
         }
     }
 }
@@ -1977,6 +2242,10 @@ fn scheduler_thread(state: SchedulerState, finished: Arc<AtomicBool>) {
         .expect("failed to build a scheduler runtime");
     let ptr = Box::into_raw(Box::new(state));
     let _guard = SchedulerGuard::from_raw(ptr, true);
+    // The `[#N]` header column — the C++ Client.cpp:250 instance tag set on
+    // the Td context and inherited by every actor of the instance. One Td
+    // instance per process for now, so the constant is exact.
+    tdutils::logging::set_log_tag("1");
     runtime.block_on(async {
         let state = unsafe { &*ptr };
         while !finished.load(Ordering::Relaxed) {

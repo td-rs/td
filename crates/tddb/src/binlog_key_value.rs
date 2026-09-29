@@ -227,6 +227,20 @@ impl BinlogKeyValue {
         entry.0 = value.to_vec();
         entry.1 = event_id;
 
+        // Binlog.cpp:336 `VLOG(binlog) << "Write binlog event: " << ...` —
+        // the public_to_string form with this file's BinlogDebugInfo.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::BINLOG,
+            "binlog",
+            at "Binlog.cpp",
+            336,
+            "Write binlog event: LogEvent[[id:0x{:016x}][type:{}][flags:{}][data:{}]][{}]",
+            event_id,
+            self.magic,
+            if rewrite { BinlogEvent::FLAG_REWRITE } else { 0 },
+            event_to_bytes(key, value).len(),
+            "/project/td/tddb/td/db/BinlogKeyValue.h:196"
+        );
         binlog.add_raw_event(
             seq_no,
             BinlogEvent::create_raw(

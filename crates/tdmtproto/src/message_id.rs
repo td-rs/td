@@ -27,9 +27,10 @@ impl From<u64> for MessageId {
     }
 }
 
-/// `operator<<(StringBuilder&, MessageId)`: `message <hex>` (no `0x` prefix).
+/// `operator<<(StringBuilder&, MessageId)` (MessageId.h:66):
+/// `message 0x<hex>` via `format::as_hex`.
 impl fmt::Display for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "message {:x}", self.0)
+        write!(f, "message 0x{:x}", self.0)
     }
 }

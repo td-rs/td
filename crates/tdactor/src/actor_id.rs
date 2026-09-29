@@ -76,9 +76,11 @@ pub(crate) struct IdSlot {
     /// and the protocol it guards is verified by the model.
     #[cfg(any(debug_assertions, feature = "loom"))]
     freed: AtomicBool,
-    /// The actor's debug name, stored inline (truncated to 31 bytes) — the
-    /// C++ copies the name into its pool block too; a boxed string here was
-    /// an extra malloc per registration (the S37 CreateActor gate).
+    /// The actor's debug name, stored inline — the C++ copies the name
+    /// into its pool block too (`ActorInfo::init`'s `name_.assign` has no
+    /// truncation); the 63-byte buffer covers every name in the tree (the
+    /// longest is 37) without the boxed string's extra malloc per
+    /// registration (the S37 CreateActor gate).
     name: ActorName,
     /// The block's allocation layout — the block is freed raw by the last
     /// `ActorId` drop (see [`SlotBlock`](Self::allocate_block)).
@@ -88,15 +90,19 @@ pub(crate) struct IdSlot {
 
 /// A small inline string — [`IdSlot::name`] (see the field docs).
 pub(crate) struct ActorName {
-    buf: [u8; 31],
+    buf: [u8; 63],
     len: u8,
 }
 
 impl ActorName {
     fn new(name: &str) -> Self {
+        debug_assert!(
+            name.len() <= 63,
+            "actor name overflows the inline buffer: {name}"
+        );
         let bytes = name.as_bytes();
-        let len = bytes.len().min(31);
-        let mut buf = [0; 31];
+        let len = bytes.len().min(63);
+        let mut buf = [0; 63];
         buf[..len].copy_from_slice(&bytes[..len]);
         Self {
             buf,
@@ -107,6 +113,13 @@ impl ActorName {
     fn as_str(&self) -> &str {
         // SAFETY: the bytes were copied from a `&str` prefix.
         unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
+    }
+}
+
+impl IdSlot {
+    /// The actor's name for logging (the C++ `ActorInfo::get_name`).
+    pub(crate) fn name_str(&self) -> &str {
+        self.name.as_str()
     }
 }
 
