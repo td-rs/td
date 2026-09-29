@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use bench::benchmark::{Benchmark, bench};
 use tdactor::{
-    Actor, ActorId, ActorOwn, ConcurrentScheduler, Event, EventFull, FutureActor, FutureActorState,
+    Actor, ActorId, ActorOwn, ConcurrentScheduler, Event, EventFull, FutureActorState, FutureBox,
     PromiseActor, PromiseFuture, Raw, Scheduler, actor_messages, create_actor, send_closure,
     send_closure_later, send_event, send_lambda_immediately,
 };
@@ -352,7 +352,7 @@ struct ServerActor {
     n: i32,
     /// The "delayed future" RPC type keeps the future alive between the send
     /// and the delivered result (C++ member `future_`).
-    future: Option<Box<FutureActor<i32>>>,
+    future: Option<FutureBox<i32>>,
     /// The "lambda" RPC type's write target — one allocation for the whole
     /// bench. The C++ lambda captures a stack `int` by reference (sound only
     /// because the idle client runs every dispatch inline); the port gives

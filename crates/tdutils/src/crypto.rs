@@ -37,6 +37,20 @@ pub fn sha256_bytes(data: &[u8]) -> Vec<u8> {
 }
 
 /// `td::sha512(Slice, MutableSlice)`.
+///
+/// Native builds run the exact C++ OpenSSL-3 backend (crypto.cpp): a
+/// thread-local `EVP_MD_CTX` pre-initialized from `EVP_MD_fetch("sha512")`,
+/// and per call `EVP_MD_CTX_copy_ex` into a scratch ctx +
+/// `EVP_DigestUpdate` + `EVP_DigestFinal_ex` + reset (`make_digest`). The
+/// RustCrypto `sha2` crate measured ~1.1× under the C++ row (its SHA-512
+/// compress is slower than OpenSSL's asm); SHA-256/SHA-1 stay on `sha2`/`sha1`
+/// — those rows run ahead of C++. Emscripten keeps the RustCrypto form.
+#[cfg(not(target_os = "emscripten"))]
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    openssl_digest::sha512(data)
+}
+
+#[cfg(target_os = "emscripten")]
 pub fn sha512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(data);
@@ -69,10 +83,195 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 }
 
 /// `td::hmac_sha512(key, message, dest)`.
+///
+/// Native builds run the exact C++ OpenSSL-3 backend (crypto.cpp
+/// `hmac_impl_sha512`): a thread-local `EVP_MAC_CTX` fetched from
+/// `EVP_MAC_fetch("HMAC")` with the `digest` parameter set to "SHA512"
+/// once, and per call `EVP_MAC_init` + `EVP_MAC_update` + `EVP_MAC_final`.
+/// The `hmac` crate measured ~1.16× under the C++ row; HMAC-SHA256 stays
+/// on `hmac` — that row runs ahead of C++. Emscripten keeps RustCrypto.
+#[cfg(not(target_os = "emscripten"))]
+pub fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
+    openssl_digest::hmac_sha512(key, message)
+}
+
+#[cfg(target_os = "emscripten")]
 pub fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
     let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     mac.finalize().into_bytes().into()
+}
+
+/// The OpenSSL-3 digest/MAC bridge (native) — the exact backend the C++
+/// `td::sha512`/`td::hmac_sha512` run against this same libcrypto (the
+/// thread-local context pairs of crypto.cpp `make_digest` and
+/// `init_thread_local_evp_mac_ctx`/`hmac_impl_finish`; the C++ pre-3.0
+/// one-shot `SHA512()`/`HMAC()` forms are not mirrored — the linked
+/// libcrypto is 3.x on every native target).
+///
+/// Guarantee change, documented here like the S96 random bridge: these two
+/// functions leave the pure-Rust RustCrypto stack for the vendored OpenSSL
+/// — the digests are identical, the backend is the C++ one.
+#[cfg(not(target_os = "emscripten"))]
+mod openssl_digest {
+    use std::cell::RefCell;
+
+    /// `init_thread_local_evp_md_ctx` + `make_digest`'s scratch ctx, with
+    /// the C++ thread-local destructor as `Drop`.
+    struct Sha512Ctxs {
+        md: *mut openssl_sys::EVP_MD_CTX,
+        scratch: *mut openssl_sys::EVP_MD_CTX,
+    }
+
+    impl Sha512Ctxs {
+        fn new() -> Self {
+            // SAFETY: OpenSSL contexts are created and used on this thread
+            // only, freed exactly once by `Drop` (the thread-local
+            // destructor).
+            unsafe {
+                let name = b"sha512\0";
+                let md = openssl_sys::EVP_MD_fetch(
+                    std::ptr::null_mut(),
+                    name.as_ptr().cast(),
+                    std::ptr::null(),
+                );
+                assert!(!md.is_null(), "EVP_MD_fetch(sha512) failed");
+                let ctx = openssl_sys::EVP_MD_CTX_new();
+                assert!(!ctx.is_null(), "EVP_MD_CTX_new failed");
+                let ok = openssl_sys::EVP_DigestInit_ex(ctx, md, std::ptr::null_mut());
+                assert_eq!(ok, 1, "EVP_DigestInit_ex(sha512) failed");
+                openssl_sys::EVP_MD_free(md);
+                let scratch = openssl_sys::EVP_MD_CTX_new();
+                assert!(!scratch.is_null(), "EVP_MD_CTX_new failed");
+                Self { md: ctx, scratch }
+            }
+        }
+    }
+
+    impl Drop for Sha512Ctxs {
+        fn drop(&mut self) {
+            // SAFETY: both contexts were created by `new` on this thread.
+            unsafe {
+                openssl_sys::EVP_MD_CTX_free(self.md);
+                openssl_sys::EVP_MD_CTX_free(self.scratch);
+            }
+        }
+    }
+
+    /// `OSSL_PARAM_UTF8_STRING` — the constant behind
+    /// `OSSL_PARAM_construct_utf8_string` (openssl-sys does not bind the
+    /// constructors).
+    const OSSL_PARAM_UTF8_STRING: std::ffi::c_uint = 4;
+
+    /// `init_thread_local_evp_mac_ctx(ctx, "SHA512")`: the fetched "HMAC"
+    /// method with the digest parameter set once.
+    struct HmacSha512Mac {
+        ctx: *mut openssl_sys::EVP_MAC_CTX,
+    }
+
+    impl HmacSha512Mac {
+        fn new() -> Self {
+            // SAFETY: same single-thread, freed-once contract; the param
+            // array mirrors `OSSL_PARAM_construct_utf8_string("digest",
+            // "SHA512", 0)` + `OSSL_PARAM_construct_end()`.
+            unsafe {
+                let name = b"HMAC\0";
+                let mac = openssl_sys::EVP_MAC_fetch(
+                    std::ptr::null_mut(),
+                    name.as_ptr().cast(),
+                    std::ptr::null(),
+                );
+                assert!(!mac.is_null(), "EVP_MAC_fetch(HMAC) failed");
+                let ctx = openssl_sys::EVP_MAC_CTX_new(mac);
+                assert!(!ctx.is_null(), "EVP_MAC_CTX_new failed");
+                let digest = b"SHA512\0";
+                let params = [
+                    openssl_sys::OSSL_PARAM {
+                        key: c"digest".as_ptr(),
+                        data_type: OSSL_PARAM_UTF8_STRING,
+                        data: digest.as_ptr() as *mut std::ffi::c_void,
+                        data_size: digest.len(),
+                        return_size: 0,
+                    },
+                    openssl_sys::OSSL_PARAM {
+                        key: std::ptr::null(),
+                        data_type: 0,
+                        data: std::ptr::null_mut(),
+                        data_size: 0,
+                        return_size: 0,
+                    },
+                ];
+                let ok = openssl_sys::EVP_MAC_CTX_set_params(ctx, params.as_ptr());
+                assert_eq!(ok, 1, "EVP_MAC_CTX_set_params(digest) failed");
+                openssl_sys::EVP_MAC_free(mac);
+                Self { ctx }
+            }
+        }
+    }
+
+    impl Drop for HmacSha512Mac {
+        fn drop(&mut self) {
+            // SAFETY: the context was created by `new` on this thread.
+            unsafe { openssl_sys::EVP_MAC_CTX_free(self.ctx) }
+        }
+    }
+
+    thread_local! {
+        static SHA512: RefCell<Option<Sha512Ctxs>> = const { RefCell::new(None) };
+        static HMAC_SHA512: RefCell<Option<HmacSha512Mac>> = const { RefCell::new(None) };
+    }
+
+    /// `make_digest(data, output, evp_md_ctx)` for SHA-512.
+    pub(super) fn sha512(data: &[u8]) -> [u8; 64] {
+        SHA512.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ctxs = slot.get_or_insert_with(Sha512Ctxs::new);
+            // SAFETY: both contexts belong to this thread; the scratch is
+            // used for exactly one digest here and reset after.
+            unsafe {
+                let ok = openssl_sys::EVP_MD_CTX_copy_ex(ctxs.scratch, ctxs.md);
+                assert_eq!(ok, 1, "EVP_MD_CTX_copy_ex failed");
+                let ok =
+                    openssl_sys::EVP_DigestUpdate(ctxs.scratch, data.as_ptr().cast(), data.len());
+                assert_eq!(ok, 1, "EVP_DigestUpdate failed");
+                let mut out = [0u8; 64];
+                let ok = openssl_sys::EVP_DigestFinal_ex(
+                    ctxs.scratch,
+                    out.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(ok, 1, "EVP_DigestFinal_ex failed");
+                openssl_sys::EVP_MD_CTX_reset(ctxs.scratch);
+                out
+            }
+        })
+    }
+
+    /// `hmac_impl_finish(ctx, key, message, dest)` for SHA-512.
+    pub(super) fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
+        HMAC_SHA512.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let mac = slot.get_or_insert_with(HmacSha512Mac::new);
+            // SAFETY: the context belongs to this thread; `EVP_MAC_init`
+            // re-keys it for exactly one MAC here.
+            unsafe {
+                let ok =
+                    openssl_sys::EVP_MAC_init(mac.ctx, key.as_ptr(), key.len(), std::ptr::null());
+                assert_eq!(ok, 1, "EVP_MAC_init failed");
+                let ok = openssl_sys::EVP_MAC_update(mac.ctx, message.as_ptr(), message.len());
+                assert_eq!(ok, 1, "EVP_MAC_update failed");
+                let mut out = [0u8; 64];
+                let ok = openssl_sys::EVP_MAC_final(
+                    mac.ctx,
+                    out.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    out.len(),
+                );
+                assert_eq!(ok, 1, "EVP_MAC_final failed");
+                out
+            }
+        })
+    }
 }
 
 /// `td::pbkdf2_sha256(password, salt, iteration_count, dest)`.
@@ -246,9 +445,50 @@ mod cbc_native {
             openssl_sys::EVP_CIPHER_CTX_free(ctx);
         }
     }
+    /// CBC-decrypt `from` into `to` under `key`/`iv` (one shot, padding
+    /// off) — `td::aes_cbc_decrypt`'s exact backend (crypto.cpp: a fresh
+    /// `Evp`, `init_decrypt_cbc`, `init_iv`, one `EVP_DecryptUpdate`). The
+    /// S97 wide `decrypt_blocks` pass ran ~1.3× under it: OpenSSL's asm
+    /// decrypts whole buffers through the pipelined rounds, and unlike
+    /// encryption the S98 measurement showed the FFI amortization winning
+    /// over the extra copy the wide pass needs anyway.
+    pub(super) fn cbc_decrypt_oneshot(key: &[u8], iv: &[u8], from: &[u8], to: &mut [u8]) {
+        debug_assert!(from.len().is_multiple_of(AES_BLOCK_SIZE));
+        debug_assert!(to.len() >= from.len());
+        debug_assert_eq!(key.len(), 32);
+        debug_assert_eq!(iv.len(), AES_BLOCK_SIZE);
+        // SAFETY: the context is created here, used on this thread only,
+        // and freed exactly once at the end of the function.
+        unsafe {
+            let ctx = openssl_sys::EVP_CIPHER_CTX_new();
+            assert!(!ctx.is_null(), "EVP_CIPHER_CTX_new failed");
+            let ok = openssl_sys::EVP_DecryptInit_ex(
+                ctx,
+                openssl_sys::EVP_aes_256_cbc(),
+                std::ptr::null_mut(),
+                key.as_ptr(),
+                iv.as_ptr(),
+            );
+            assert_eq!(ok, 1, "EVP_DecryptInit_ex failed");
+            assert_eq!(
+                openssl_sys::EVP_CIPHER_CTX_set_padding(ctx, 0),
+                1,
+                "EVP_CIPHER_CTX_set_padding failed"
+            );
+            let mut out_len: i32 = 0;
+            let ok = openssl_sys::EVP_DecryptUpdate(
+                ctx,
+                to.as_mut_ptr(),
+                &mut out_len,
+                from.as_ptr(),
+                from.len() as i32,
+            );
+            assert_eq!(ok, 1, "EVP_DecryptUpdate failed");
+            debug_assert_eq!(out_len as usize, from.len(), "CBC wrote a partial block");
+            openssl_sys::EVP_CIPHER_CTX_free(ctx);
+        }
+    }
 }
-
-/// `td::AesState` — AES-256 in ECB mode (the MTProto building block).
 pub struct AesState {
     cipher: Aes256,
     encrypt: bool,
@@ -622,7 +862,12 @@ pub struct AesIgeState {
     /// `init`, freed by `Drop`. Null on emscripten (field not compiled).
     #[cfg(not(target_os = "emscripten"))]
     evp: *mut openssl_sys::EVP_CIPHER_CTX,
-    cipher: Aes256,
+    /// The RustCrypto cipher of the decrypt path (and of both emscripten
+    /// paths). `None` until `init` needs it — the native *encrypt* path
+    /// never expands a RustCrypto key (the S98 pass: `new` eagerly ran a
+    /// zero-key expansion and `init` re-ran it, a whole AES-256 key
+    /// schedule per one-shot state that the 64-byte rows measured).
+    cipher: Option<Aes256>,
     decrypt: bool,
     encrypted_iv: [u8; AES_BLOCK_SIZE],
     plaintext_iv: [u8; AES_BLOCK_SIZE],
@@ -633,7 +878,7 @@ impl AesIgeState {
         Self {
             #[cfg(not(target_os = "emscripten"))]
             evp: std::ptr::null_mut(),
-            cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
+            cipher: None,
             decrypt: true,
             encrypted_iv: [0u8; AES_BLOCK_SIZE],
             plaintext_iv: [0u8; AES_BLOCK_SIZE],
@@ -644,8 +889,14 @@ impl AesIgeState {
     pub fn init(&mut self, key: &[u8], iv: &[u8], encrypt: bool) {
         assert_eq!(key.len(), 32, "AES key must be 256-bit");
         assert_eq!(iv.len(), 32, "IGE IV must be 256-bit");
+        // Only the native encrypt path uses the EVP context; a decrypt state
+        // skips its setup entirely (the C++ initializes an ECB-decrypt `Evp`
+        // for decrypt — its own backend — while the Rust decrypt path is
+        // RustCrypto and never touches `evp`; creating and keying a CBC
+        // context per one-shot decrypt state was pure waste, the dominant
+        // cost of the 64-byte rows after the S98 pass).
         #[cfg(not(target_os = "emscripten"))]
-        {
+        if encrypt {
             // SAFETY: the context is created here (or reused from a
             // previous `init` — re-`init` re-keys it), used on this thread
             // only, and freed exactly once by `Drop`.
@@ -669,7 +920,17 @@ impl AesIgeState {
                 );
             }
         }
-        self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
+        // Only the RustCrypto paths below need the expanded key: the
+        // native encrypt path runs through the EVP context above.
+        #[cfg(not(target_os = "emscripten"))]
+        let need_cipher = !encrypt;
+        #[cfg(target_os = "emscripten")]
+        let need_cipher = true;
+        self.cipher = if need_cipher {
+            Some(Aes256::new_from_slice(key).expect("32-byte key checked above"))
+        } else {
+            None
+        };
         self.decrypt = !encrypt;
         self.encrypted_iv.copy_from_slice(&iv[..AES_BLOCK_SIZE]);
         self.plaintext_iv.copy_from_slice(&iv[AES_BLOCK_SIZE..]);
@@ -779,6 +1040,10 @@ impl AesIgeState {
 
         #[cfg(target_os = "emscripten")]
         {
+            let cipher = self
+                .cipher
+                .as_ref()
+                .expect("IGE encrypt on an uninitialized state");
             let mut y_prev = self.encrypted_iv;
             let mut x_prev = self.plaintext_iv;
             for (x, out_chunk) in from
@@ -788,7 +1053,7 @@ impl AesIgeState {
                 .zip(out.as_chunks_mut::<AES_BLOCK_SIZE>().0.iter_mut())
             {
                 let mut aes_block = aes::Block::clone_from_slice(&xor_block(x, &y_prev));
-                self.cipher.encrypt_block(&mut aes_block);
+                cipher.encrypt_block(&mut aes_block);
                 let c: [u8; AES_BLOCK_SIZE] = aes_block.as_slice().try_into().unwrap();
                 let y = xor_block(&c, &x_prev);
                 *out_chunk = y;
@@ -808,6 +1073,10 @@ impl AesIgeState {
         );
         assert!(to.len() >= from.len());
         assert!(self.decrypt, "decrypt() on an encrypt state");
+        let cipher = self
+            .cipher
+            .as_ref()
+            .expect("IGE decrypt on an uninitialized state");
         for (in_block, out_block) in from.as_chunks::<AES_BLOCK_SIZE>().0.iter().zip(
             to[..from.len()]
                 .as_chunks_mut::<AES_BLOCK_SIZE>()
@@ -820,13 +1089,12 @@ impl AesIgeState {
             // decrypted bytes instead of the ciphertext.
             let mut encrypted = [0u8; AES_BLOCK_SIZE];
             encrypted.copy_from_slice(in_block);
-
             let mut block = [0u8; AES_BLOCK_SIZE];
             for (i, byte) in block.iter_mut().enumerate() {
                 *byte = self.plaintext_iv[i] ^ encrypted[i];
             }
             let mut aes_block = aes::Block::clone_from_slice(&block);
-            self.cipher.decrypt_block(&mut aes_block);
+            cipher.decrypt_block(&mut aes_block);
             block.copy_from_slice(&aes_block);
             for (byte, encrypted_iv) in block.iter_mut().zip(self.encrypted_iv) {
                 *byte ^= encrypted_iv;
@@ -953,11 +1221,12 @@ pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
 /// `td::aes_cbc_decrypt(key, iv, from, to)` — updates `iv` in place to the
 /// last *input* block, then decrypts (the C++ saves the incoming iv first).
 ///
-/// CBC *decryption* parallelizes across blocks (the block-cipher calls are
-/// independent — only the XOR chain is sequential): one wide
-/// `decrypt_blocks` pass over the whole buffer — the aes crate's pipelined
-/// AES-NI decrypt path; the per-block form was the S96 §1.2 row — followed
-/// by a vectorizable XOR with each preceding ciphertext block.
+/// Native builds run one bulk `EVP_DecryptUpdate` with `EVP_aes_256_cbc`
+/// (padding off — see [`cbc_native`], the exact C++ backend; the S97 wide
+/// `decrypt_blocks` pass it replaces measured ~1.3× under the C++ row).
+/// Emscripten keeps the RustCrypto form below: one wide `decrypt_blocks`
+/// pass (the aes crate's pipelined AES-NI decrypt path) followed by a
+/// vectorizable XOR with each preceding ciphertext block.
 pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
     assert!(to.len() >= from.len());
     assert!(
@@ -969,32 +1238,45 @@ pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
     if from.is_empty() {
         return;
     }
-    let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
-    let n_blocks = from.len() / AES_BLOCK_SIZE;
-    // The chaining value of block 0 is the caller's iv; `aes_iv` is
-    // overwritten with the last input block below, so save it first.
-    let mut first_chain = [0u8; AES_BLOCK_SIZE];
-    first_chain.copy_from_slice(aes_iv);
-    aes_iv.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
-    // Copy the ciphertext in, decrypt it in place with one wide pass, then
-    // re-chain each plaintext block with its preceding ciphertext block.
-    let body = &mut to[..from.len()];
-    body.copy_from_slice(from);
-    // SAFETY: `aes::Block` is a 16-byte align-1 array and `body` is
-    // 16-byte chunked (asserted above); the reborrow ends before `body`
-    // is used again.
-    let blocks: &mut [aes::Block] =
-        unsafe { std::slice::from_raw_parts_mut(body.as_mut_ptr().cast::<aes::Block>(), n_blocks) };
-    cipher.decrypt_blocks(blocks);
-    for i in 0..n_blocks {
-        let chain: &[u8] = if i == 0 {
-            &first_chain
-        } else {
-            &from[(i - 1) * AES_BLOCK_SIZE..i * AES_BLOCK_SIZE]
+
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        // The C++ order: decrypt under the *incoming* iv first
+        // (`evp.init_iv`), then set the out iv to the last input block.
+        cbc_native::cbc_decrypt_oneshot(aes_key, aes_iv, from, to);
+        aes_iv.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
+    }
+
+    #[cfg(target_os = "emscripten")]
+    {
+        let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
+        let n_blocks = from.len() / AES_BLOCK_SIZE;
+        // The chaining value of block 0 is the caller's iv; `aes_iv` is
+        // overwritten with the last input block below, so save it first.
+        let mut first_chain = [0u8; AES_BLOCK_SIZE];
+        first_chain.copy_from_slice(aes_iv);
+        aes_iv.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
+        // Copy the ciphertext in, decrypt it in place with one wide pass, then
+        // re-chain each plaintext block with its preceding ciphertext block.
+        let body = &mut to[..from.len()];
+        body.copy_from_slice(from);
+        // SAFETY: `aes::Block` is a 16-byte align-1 array and `body` is
+        // 16-byte chunked (asserted above); the reborrow ends before `body`
+        // is used again.
+        let blocks: &mut [aes::Block] = unsafe {
+            std::slice::from_raw_parts_mut(body.as_mut_ptr().cast::<aes::Block>(), n_blocks)
         };
-        let block = &mut body[i * AES_BLOCK_SIZE..(i + 1) * AES_BLOCK_SIZE];
-        for (b, c) in block.iter_mut().zip(chain) {
-            *b ^= c;
+        cipher.decrypt_blocks(blocks);
+        for i in 0..n_blocks {
+            let chain: &[u8] = if i == 0 {
+                &first_chain
+            } else {
+                &from[(i - 1) * AES_BLOCK_SIZE..i * AES_BLOCK_SIZE]
+            };
+            let block = &mut body[i * AES_BLOCK_SIZE..(i + 1) * AES_BLOCK_SIZE];
+            for (b, c) in block.iter_mut().zip(chain) {
+                *b ^= c;
+            }
         }
     }
 }

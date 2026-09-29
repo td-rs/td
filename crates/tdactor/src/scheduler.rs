@@ -285,6 +285,59 @@ impl ActorList {
 // `SchedulerState` relies on (see the module docs).
 unsafe impl Send for ActorList {}
 
+/// The mailbox-buffer pool — the C++ `ObjectPool` reuse of the actor
+/// mailbox's backing storage. A fresh `VecDeque` allocates on its first
+/// push (every owned actor's queued start event), and dropping it at
+/// `destroy_actor` returned that buffer to the global allocator; a
+/// create/stop cycle (the CreateActor row) paid the malloc/free pair per
+/// actor (the S98 residual). Destroyed actors hand their empty deque —
+/// capacity retained — to this per-thread freelist; new registrations take
+/// one back. Bounded on both ends (idle deque count and retained capacity)
+/// so retention stays a few KiB per thread.
+mod mailbox_pool {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use crate::event::Event;
+
+    /// Retention: bounded, but deep — the C++ `ActorInfo` mailbox is a
+    /// `vector<Event>` whose buffer the pool's re-init frees, so C++ pays
+    /// one malloc/free per actor with queued events; any hit here is ahead
+    /// of it. The deep cap keeps batch-shaped create/destroy rounds (the
+    /// CreateActor shape: n registrations, one destroy pump) riding the
+    /// previous round's buffers.
+    const MAX_POOLED: usize = 65536;
+    const MAX_CAPACITY: usize = 64;
+
+    thread_local! {
+        static POOL: RefCell<Vec<VecDeque<Event>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// An empty deque, from the pool when one is cached.
+    pub(crate) fn take() -> VecDeque<Event> {
+        POOL.try_with(|pool| pool.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// Recycle an empty deque whose buffer is worth retaining. Clears
+    /// defensively — `destroy_actor` may hand over a mailbox that still
+    /// holds undelivered events (dropped here), and a recycled deque must
+    /// never leak contents to its next actor.
+    pub(crate) fn give_back(mut queue: VecDeque<Event>) {
+        queue.clear();
+        if queue.capacity() <= MAX_CAPACITY {
+            let _ = POOL.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < MAX_POOLED {
+                    pool.push(queue);
+                }
+            });
+        }
+    }
+}
+
 /// Port of C++ `ActorInfo` (the `mailbox_`, `is_running_` and timeout parts;
 /// the atomic `sched_id_` lives in the `IdSlot` shared with [`ActorId`]).
 pub(crate) struct ActorInfo {
@@ -329,7 +382,7 @@ impl ActorInfo {
             link: ListLink::detached(std::ptr::null_mut()),
             slot,
             actor: RefCell::new(actor),
-            mailbox: RefCell::new(VecDeque::new()),
+            mailbox: RefCell::new(mailbox_pool::take()),
             mailbox_empty: Cell::new(true),
             is_running: Cell::new(false),
             timeout_gen: Cell::new(0),
@@ -703,6 +756,13 @@ impl SchedulerState {
 
     /// `Scheduler::send_immediately` / free `send_event`: runs the handler
     /// inline when possible, otherwise queues it.
+    ///
+    /// `#[inline]` is load-bearing (the S98 ring pass): without it the
+    /// checks below live only in tdactor's out-of-line copy and every
+    /// `send_event` call site pays a call frame + the 72-byte `Event`
+    /// round-trip through it (the raw ring row measured the GOT-indirect
+    /// form ~1.2× over C++).
+    #[inline]
     pub fn send_immediately<'a>(&self, actor_ref: impl Into<ActorRef<'a>>, event: Event) {
         self.send_immediately_impl(actor_ref.into(), event);
     }
@@ -734,6 +794,17 @@ impl SchedulerState {
     /// no [`ActorThunk`] construction, the monomorphized `F` stays in
     /// registers like the C++ `RunFuncT` lambda — and the `Event` is built
     /// only when the message must be queued (the C++ `EventFuncT` half).
+    ///
+    /// The hot/cold split mirrors the C++ file layout (`Scheduler.h`
+    /// inlines the guard checks at every send site; `Scheduler.cpp` holds
+    /// the mailbox/migrate/cross-scheduler paths): with the rare branches
+    /// in [`Self::send_message_slow`], this half is small enough to inline
+    /// at every call site. The S98 ring pass measured the monolithic form
+    /// falling out-of-line for the 24-byte message-enum closures (a call
+    /// frame + register round-trip per hop, ~1.4× on send_immediate) while
+    /// the small hand lambdas still inlined — the split makes both take
+    /// the same shape.
+    #[inline]
     pub(crate) fn send_message_immediately<F>(&self, actor_ref: ActorRef, run: F)
     where
         F: for<'a> FnOnce(&'a mut dyn Actor) + Send + 'static,
@@ -743,14 +814,28 @@ impl SchedulerState {
             return;
         }
         let (sched, migrating) = id.sched();
+        if sched == self.sched_id && !migrating {
+            let info = self.info(id);
+            if !info.is_running.get() && info.mailbox_empty.get() {
+                self.run_closure_guarded(id, actor_ref.token, run);
+                return;
+            }
+        }
+        self.send_message_slow(id, run);
+    }
+
+    /// The `EventFuncT` half of [`Self::send_message_immediately`] — every
+    /// branch here is per-message cold (mailbox backlog, mid-migration,
+    /// cross-scheduler), kept out-of-line so the send checks inline.
+    #[inline(never)]
+    fn send_message_slow<F>(&self, id: &ActorId, run: F)
+    where
+        F: for<'a> FnOnce(&'a mut dyn Actor) + Send + 'static,
+    {
+        let (sched, migrating) = id.sched();
         if sched == self.sched_id {
             if !migrating {
-                let info = self.info(id);
-                if !info.is_running.get() && info.mailbox_empty.get() {
-                    self.run_closure_guarded(id, actor_ref.token, run);
-                } else {
-                    self.add_to_mailbox(id, Event::custom(crate::event::ActorThunk::new(run)));
-                }
+                self.add_to_mailbox(id, Event::custom(crate::event::ActorThunk::new(run)));
             } else {
                 self.pending_events
                     .borrow_mut()
@@ -832,19 +917,27 @@ impl SchedulerState {
             return;
         }
         let (sched, migrating) = id.sched();
+        // C++ `get_actor_sched_id_to_send_immediately`: run inline iff not
+        // running and the mailbox is empty. The rare branches live in
+        // [`Self::send_event_slow`] (the S98 hot/cold split — same reason
+        // as [`Self::send_message_immediately`]).
+        if sched == self.sched_id && !migrating {
+            let info = self.info(id);
+            if !info.is_running.get() && info.mailbox_empty.get() {
+                self.run_event_guarded(id, event);
+                return;
+            }
+        }
+        self.send_event_slow(id, event);
+    }
+
+    /// The cold half of [`Self::send_immediately_impl`] (see its docs).
+    #[inline(never)]
+    fn send_event_slow(&self, id: &ActorId, event: Event) {
+        let (sched, migrating) = id.sched();
         if sched == self.sched_id {
             if !migrating {
-                // C++ `get_actor_sched_id_to_send_immediately`: run inline iff
-                // not running and the mailbox is empty.
-                let can_immediately = {
-                    let info = self.info(id);
-                    !info.is_running.get() && info.mailbox_empty.get()
-                };
-                if can_immediately {
-                    self.run_event_guarded(id, event);
-                } else {
-                    self.add_to_mailbox(id, event);
-                }
+                self.add_to_mailbox(id, event);
             } else {
                 self.pending_events
                     .borrow_mut()
@@ -1108,7 +1201,10 @@ impl SchedulerState {
             // SAFETY: the actor is live, and dropped exactly once here.
             unsafe { drop(fat) };
         }
-        info.mailbox.borrow_mut().clear();
+        // Recycle the (now empty) mailbox buffer — `mem::take` moves the
+        // retained-capacity deque out and leaves a no-allocation one to drop
+        // with the `ActorInfo` below.
+        mailbox_pool::give_back(std::mem::take(&mut *info.mailbox.borrow_mut()));
         info.mailbox_empty.set(true);
         id.mark_dead();
         // SAFETY: `mark_dead` published alive=false; no thread dereferences

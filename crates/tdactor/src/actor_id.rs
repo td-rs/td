@@ -127,29 +127,71 @@ unsafe impl Sync for IdSlot {}
 /// reference); the block then joins *that* thread's bucket, which is sound —
 /// the memory is plain reusable storage, fully rewritten on the next
 /// registration.
-mod block_pool {
+pub(crate) mod block_pool {
     use std::alloc::Layout;
     use std::cell::RefCell;
 
-    /// Per-bucket retention cap: at most this many idle blocks per size
-    /// class stay cached on a thread.
-    const MAX_FREE_PER_BUCKET: usize = 256;
-    /// Bucket-table cap: actor types in a process number in the dozens; the
-    /// overflow (and over-cap frees) fall back to the global allocator.
-    const MAX_BUCKETS: usize = 64;
+    /// Retention is unbounded, exactly like the C++ `ObjectPool` freelist
+    /// (ObjectPool.h: `head_` is a plain lock-free stack; `get_storage`
+    /// news only when it is empty, `release_storage` always pushes — no
+    /// cap). Every earlier capped form here collapsed under batch-shaped
+    /// load: `CreateActorBench` and the promise rows register *n* actors
+    /// and destroy them in one later pump, so allocs precede frees and a
+    /// capped pool misses almost every block in the measured passes (the
+    /// S98 probe measured the 256-block cap at a ~0% hit rate — 2 global
+    /// mallocs per actor cycle — where the unbounded C++ pool rides the
+    /// calibration round at ~100%). The memory profile is the C++ one:
+    /// each thread's pool grows to its peak block usage and stays there.
+    /// This is a deliberate parity guarantee, not an oversight.
+    ///
+    /// Bucket-table cap: distinct layouts, not blocks, are bounded — the
+    /// C++ equivalent is one pool per C++ type; 256 covers the actor zoo
+    /// with room for the pooled thunk/future layouts (each bucket is one
+    /// `Vec` header). The overflow falls back to the global allocator.
+    const MAX_BUCKETS: usize = 256;
 
     thread_local! {
-        static POOL: RefCell<Vec<(usize, usize, Vec<*mut u8>)>> =
-            const { RefCell::new(Vec::new()) };
+        static POOL: RefCell<Pool> = const { RefCell::new(Pool::new()) };
+    }
+
+    /// The pool state — `IdSlot` blocks plus the other pooled payloads that
+    /// share it (the S98 pass: oversized send-closure thunks, future-actor
+    /// boxes, mailbox buffers). The last-used bucket is cached: the hot
+    /// loops alternate between a handful of layouts and the linear bucket
+    /// scan itself was measurable on the per-iteration rows.
+    struct Pool {
+        buckets: Vec<(usize, usize, Vec<*mut u8>)>, // size, align, blocks
+        last: Option<(usize, usize, usize)>,        // (size, align, bucket index)
+    }
+
+    impl Pool {
+        const fn new() -> Self {
+            Self {
+                buckets: Vec::new(),
+                last: None,
+            }
+        }
+
+        fn bucket_of(&mut self, size: usize, align: usize) -> Option<usize> {
+            if let Some((ls, la, idx)) = self.last
+                && ls == size
+                && la == align
+            {
+                return Some(idx);
+            }
+            self.buckets
+                .iter()
+                .position(|(s, a, _)| *s == size && *a == align)
+                .inspect(|&idx| self.last = Some((size, align, idx)))
+        }
     }
 
     pub(crate) fn alloc(layout: Layout) -> *mut u8 {
         let pooled = POOL
             .try_with(|pool| {
                 let mut pool = pool.borrow_mut();
-                pool.iter_mut()
-                    .find(|(size, align, _)| *size == layout.size() && *align == layout.align())
-                    .and_then(|(_, _, blocks)| blocks.pop())
+                pool.bucket_of(layout.size(), layout.align())
+                    .and_then(|idx| pool.buckets[idx].2.pop())
             })
             .unwrap_or(None);
         pooled.unwrap_or_else(|| unsafe { std::alloc::alloc(layout) })
@@ -159,24 +201,28 @@ mod block_pool {
         let pooled = POOL
             .try_with(|pool| {
                 let mut pool = pool.borrow_mut();
-                for (size, align, blocks) in pool.iter_mut() {
-                    if *size == layout.size() && *align == layout.align() {
-                        return blocks.len() < MAX_FREE_PER_BUCKET && {
-                            blocks.push(ptr);
+                match pool.bucket_of(layout.size(), layout.align()) {
+                    Some(idx) => {
+                        pool.buckets[idx].2.push(ptr);
+                        true
+                    }
+                    None => {
+                        if pool.buckets.len() < MAX_BUCKETS {
+                            pool.buckets
+                                .push((layout.size(), layout.align(), vec![ptr]));
+                            pool.last =
+                                Some((layout.size(), layout.align(), pool.buckets.len() - 1));
                             true
-                        };
+                        } else {
+                            false
+                        }
                     }
                 }
-                if pool.len() < MAX_BUCKETS {
-                    pool.push((layout.size(), layout.align(), vec![ptr]));
-                    return true;
-                }
-                false
             })
             .unwrap_or(false);
         if !pooled {
-            // SAFETY: the layout matches the allocation (stored in the
-            // slot at registration).
+            // SAFETY: the layout matches the allocation (the caller carries
+            // it alongside the pointer, as the block does).
             unsafe { std::alloc::dealloc(ptr, layout) };
         }
     }

@@ -34,7 +34,7 @@ use crate::actor::Actor;
 use crate::actor_id::{ActorId, ActorOwn};
 use crate::create_actor;
 use crate::event::{Event, Raw};
-use crate::promise::{EventFull, FutureActor, PromiseFuture, create_promise_from_promise_actor};
+use crate::promise::{EventFull, FutureBox, PromiseFuture, create_promise_from_promise_actor};
 use crate::scheduler::Scheduler;
 
 /// The port of C++ `MultiPromiseInterface`: the fan-in surface shared by the
@@ -55,7 +55,7 @@ pub trait MultiPromiseInterface: Send {
 /// by stable address (see `promise.rs` — "Rust cannot move a registered actor
 /// without breaking the registration pointer"), so they must stay boxed
 /// inside the vector.
-type Futures = Vec<Box<FutureActor<()>>>;
+type Futures = Vec<FutureBox<()>>;
 
 /// The state shared between the actor and its safe handle — the C++ object's
 /// fields.
@@ -141,7 +141,7 @@ fn deliver(promises: Vec<Promise<()>>, result: Result<()>) {
 /// Drained futures stop themselves (inside `move_as_result`); leftovers are
 /// `close()`d so their registration does not dangle (C++ `~FutureActor` did
 /// `do_stop`).
-fn drain_futures(ignore_errors: bool, futures: &mut [Box<FutureActor<()>>]) -> Result<()> {
+fn drain_futures(ignore_errors: bool, futures: &mut [FutureBox<()>]) -> Result<()> {
     let mut outcome = Result::Ok(());
     let mut drained = 0usize;
     if !ignore_errors {

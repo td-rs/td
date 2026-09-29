@@ -68,9 +68,9 @@ pub use multi_promise::{
     MultiPromise, MultiPromiseActor, MultiPromiseActorSafe, MultiPromiseInterface,
 };
 pub use promise::{
-    EventFull, FutureActor, FutureActorState, PromiseActor, PromiseFuture, create_event_promise,
-    create_event_promise_ok_fail, create_promise_from_promise_actor, promise_send_closure,
-    send_promise_immediately, send_promise_later,
+    EventFull, FutureActor, FutureActorState, FutureBox, PromiseActor, PromiseFuture,
+    create_event_promise, create_event_promise_ok_fail, create_promise_from_promise_actor,
+    promise_send_closure, send_promise_immediately, send_promise_later,
 };
 pub use scheduler::{ConcurrentScheduler, Scheduler, SchedulerGuard, SchedulerPtr, SchedulerState};
 pub use timeout::{MultiTimeout, SleepActor, Timeout};

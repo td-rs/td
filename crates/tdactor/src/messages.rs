@@ -63,6 +63,14 @@ pub(crate) fn downcast<A: Actor>(actor: &mut dyn Actor) -> &mut A {
 /// The inline half dispatches the message *directly* — the C++
 /// `RunFuncT`/`EventFuncT` split of `Scheduler::send_immediately_impl`:
 /// no `Event` is built unless the message is queued.
+///
+/// `#[inline]` is load-bearing (the S98 ring pass): the message-enum
+/// capture and the `M::dispatch` match were measured as a separate
+/// `send_closure` frame at ~30% of the whole ring's instructions — a call
+/// boundary the destination's guarded dispatch cannot fold, while the
+/// C++ `ImmediateClosure` packs its args at the send site. Inlined, the
+/// enum moves collapse into the caller's registers.
+#[inline]
 pub fn send_closure<'a, M, R>(actor_ref: R, message: M)
 where
     M: ActorMessage,

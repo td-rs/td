@@ -2,6 +2,17 @@
 
 Ports of the C++ `benchmark/` targets. Gate: ≤2× C++ everywhere.
 
+> **S98 status (2026-09-29 — the "fastest or parity" pass):** all 49
+> comparable rows are within the gate, worst 1.43× (`QueryBench: immediate
+> future`, down from 3.37×); crypto is 21/21 at parity or Rust-faster
+> (the IGE 64-byte rows ~2× *over* C++ after the decrypt-state EVP-skip).
+> The row tables and root-cause notes below are the S96/S97 record — see
+> `BENCHMARK-RESULTS-FINAL.md` (S98 addendum) for the current numbers and
+> the three fixes behind them: the send hot/cold split, the unbounded
+> ObjectPool-parity block pool (plus pooled thunks/futures/mailboxes), and
+> the crypto backend bridges (CBC-decrypt EVP, OpenSSL sha512/hmac-sha512,
+> IGE decrypt states no longer key an unused CBC-encrypt context).
+
 ## soak (S80)
 
 `src/bin/soak.rs` — the S80 memory gate. Each tick runs one full
@@ -87,25 +98,26 @@ Port of `benchmark/bench_crypto.cpp`. Row-by-row against the C++ binary
 
 Root causes and notes on the flagged rows:
 
-- **AES CTR (0.22 — was 0.054 before the S79 gate work).** The original
-  port generated keystream one AES block at a time through
-  `encrypt_block`, which cannot reach the pipelined AES-NI path. The gate
-  work in `tdutils::crypto` (bulk 32-block `encrypt_blocks` refills +
-  word-wide keystream XOR) closed it from 18× to 4.6× against OpenSSL's
-  best round (2.7× against the worst round — the C++ CTR row itself swings
-  1.39M↔0.76M between rounds). The residual is the RustCrypto `ni`
-  backend's scheduling vs OpenSSL's hand-written assembly; revisit when
-  the `aes` crate lands wider scheduling.
-- **ssl_rand_bytes (0.19).** Design divergence, not a regression: the C++
-  `Random::secure_bytes` draws from OpenSSL's userspace ChaCha DRBG
-  (amortized reseeding), the Rust port fills every buffer from the kernel
-  CSPRNG (`getrandom`, vDSO-fast on this kernel). Different guarantee,
-  different cost. A userspace DRBG for `tdutils::random` is an optional
-  follow-up.
-- **AES CBC Decrypt (\*borderline).** Both sides swing 2× between rounds
-  under the `powersave` governor; best-vs-best rounds land at 2.07×,
-  worst-vs-worst at 1.09×. Re-verify on a quiet machine before treating
-  it as a real gap.
+- **AES CTR — CLOSED at S96 (parity, ~0.98×).** The native
+  `AesCtrState` now generates its keystream through the vendored OpenSSL
+  EVP (`EVP_aes_256_ctr` over `openssl-sys`, the library already linked
+  for sqlcipher) — the exact assembly the C++ `td::AesCtrState` runs;
+  emscripten keeps the RustCrypto path (no OpenSSL there). 295K →
+  ~1.4M ops/s. The KAT (`aes_ctr_state_matches_cpp`) stays green.
+- **ssl_rand_bytes — CLOSED at S96 (parity, ~1.04×).** The secure API
+  now runs through `RAND_bytes` + the C++ thread-local 512-byte buffer
+  verbatim (`Random.cpp`: small draws served from the buffer, one DRBG
+  refill per 512 bytes, bulk draws straight to the DRBG; `add_seed`
+  feeds `RAND_add` and bumps the seed generation, `secure_cleanup`
+  zeroes the buffer). ssl_rand_int32 lands at ~1.07×. The module docs
+  in `tdutils::random` record the guarantee change: userspace-DRBG
+  bytes like tdlib, not per-call kernel CSPRNG.
+- **AES CBC Decrypt — CLOSED at S96 (1.34×).** CBC decryption
+  parallelizes across blocks; `aes_cbc_decrypt` now runs one wide
+  `decrypt_blocks` pass over the whole buffer (the pipelined AES-NI
+  decrypt path) and then a vectorizable XOR with each preceding
+  ciphertext block — the per-block loop was the gap. The
+  `aes_cbc_state_matches_cpp` KAT stays green.
 
 Divergences: the raw-OpenSSL comparison rows (`AesCtrOpenSSLBench`,
 OpenSSL ≤ 1.0 `SHA1Bench`) are skipped — they compare td wrappers against
@@ -117,22 +129,24 @@ raw OpenSSL call overhead, a distinction the Rust stack does not have;
 a fixed source snapshot instead of in-place `src == dst` mutation
 (unrepresentable in safe Rust; identical crypto work per iteration).
 
-## bench_handshake (S79)
+## bench_handshake (S79; closed at S96)
 
 | Bench     | C++ (best) | Rust (best) | ratio | gate |
 | --------- | ---------- | ----------- | ----- | ---- |
-| Handshake | 413.1      | 132.3       | 0.32  | ✗    |
+| Handshake | 413.1      | 132.3       | 0.32  | ✗ S79 → **0.95× S96** |
 
 Full DH handshake pairs (2048-bit Telegram prime, checks + key gen). The
 S79 gate work moved `BigNum::mod_exp` for odd moduli onto
 `crypto-bigint`'s Montgomery `MontyForm` (32-limb working width for
 ≤ 2,048-bit moduli, 64-limb above), byte-exact against num-bigint on
 random cross-checks and the S59 known-answer vectors — that lifted the
-row from 57–105 to 132 ops/s. The residual is crypto-bigint's
-constant-time 32-limb scheduling vs OpenSSL's hand-written assembly; not
-on any per-message path (auth key generation happens once per
-login/DC). A wider vartime window or asm backend remains an open
-follow-up.
+row from 57–105 to 132 ops/s. **S96 closed it: the native `mod_exp` now
+bridges to the vendored OpenSSL `BN_mod_exp`** (the exact C++ call;
+OpenSSL routes odd moduli to `BN_mod_exp_mont_consttime` internally —
+the exponent is secret, the consttime form is the point), with the
+num-bigint fallback for ineligibles and the Montgomery path kept for
+emscripten. 130 → ~422 ops/s — Rust-faster; the S59 KAT
+(`dh_mod_exp_vectors`) and the 2,649-test tdmtproto suite stay green.
 
 ## bench_db (S79)
 
@@ -167,6 +181,36 @@ binlog as `Wrong password` — encrypted binlog creation is not ported yet);
 through actor events during the pass; measured work per pass is the same:
 n buffered writes + one batched transaction).
 
+**The two binlog skips are permanent (S96, 2026-09-28).** Porting the
+encrypted-binlog creation means porting the whole binlog AesCtr layer —
+`do_reindex` + the `TYPE_AES_CTR_ENCRYPTION` event (key salt + the
+encrypted magic used as the password check) + key derivation + a
+decrypting reader — as one format-compatible slice; a creation-only patch
+would write binlogs the port itself cannot read back, and byte-level
+compatibility with C++-written session binlogs is the actual contract.
+`BinlogKeyValue<Binlog>` (the non-Concurrent form) is **diverged by
+design**: the Rust port has one binlog engine (the `ConcurrentBinlog`,
+mutex-serialized where C++ dispatches through the `BinlogActor`), so the
+plain/Concurrent pair of C++ rows collapses into one row here. The
+flush/fsync cadence was verified at S96: both ports write through per
+event with the events buffer disabled (the C++ `Binlog::init` comment)
+and `sync` = flush + `sync_all` on the same need-sync bookkeeping — the
+Rust-faster binlog rows (0.82–0.88× in the 09-28 four-round run) are
+real, not a cadence artifact.
+
+**SqliteKV rows — no pragma gap exists (S96, 2026-09-28).** The recorded
+2.24×/3.15× (min-of-rounds) came from one collapsed Rust round: the raw
+09-28 logs show Rust at 397–407K/235–238K ops in rounds 1, 3 and 4 — at
+parity or faster than C++'s 366–384K/230–235K — and one round at
+116K/103K (an environment hiccup, this NVMe family). The pragma sets are
+identical (`encoding`/`synchronous=NORMAL`/`WAL`/`temp_store=MEMORY` at
+the bench; `journal_mode=WAL`/`secure_delete=1` at the connection;
+`busy_timeout` 5 s at open, both sides). A clean same-directory re-run
+at S96: Rust 395K vs C++ 370K unencrypted (0.93×), 232K vs 231K
+encrypted (1.01×). For disk-state rows the table should use the median
+of rounds, not the min — a single environmental stall is not a
+performance property of the code.
+
 ## bench_queue (S79)
 
 The C++ rows benchmark eventfd/poll/pipe/semaphore mailbox transports the
@@ -195,13 +239,16 @@ taken by an unrelated service on this machine). Wall-clock per client:
 | ------ | -------------------------- | --------------------------- |
 | wall   | 1.84 s / 1.88 s            | 2.51 s / 2.59 s             |
 
-Rust is at 0.73× C++ ops/sec (1.36× slowdown) — inside the gate.
-
-Divergence: the Rust side drives a pooled `reqwest`/hyper client — the
-transport layer the S48 `Wget` port uses — because the persistent
--connection `HttpOutboundConnection` actor is not ported yet; keep-alive
-pooling preserves the measured shape (one established connection per
-client, one request in flight).
+Rust is at 0.73× C++ ops/sec (1.36× slowdown) — inside the gate. **S96
+status: no action taken (§3.1 was the plan's lowest-priority item and the
+row was already inside the gate).** The two shapes remain: the Rust side
+drives a pooled `reqwest`/hyper client — the transport layer the S48
+`Wget` port uses — because the persistent-connection
+`HttpOutboundConnection` actor is not ported yet; keep-alive pooling
+preserves the measured shape (one established connection per client, one
+request in flight). Hyper-pool tuning or porting the
+persistent-connection actor stays an optional follow-up (it would move
+1.36× toward parity, not past any gate).
 
 ## bench_actor (S37)
 
@@ -221,9 +268,12 @@ cargo build --release --bin bench_actor
 ```
 
 The C++ baseline is `benchmark/bench_actor` in the td build (`-O3
--DNDEBUG`, no LTO — matched by the Rust `release` profile with `lto =
-false`). The gate numbers are paired runs pinned to one core
-(`taskset -c 4`), min of two rounds each, to control for frequency scaling
+-DNDEBUG`), whose scheduler hot path is header-inline and compiled
+*into* the bench translation unit — the Rust equivalent of that
+inlining is thin LTO (`bench/Cargo.toml`, set at S96; `lto = false`
+understated the port by making every actor hop a real cross-crate
+call). The gate numbers are paired runs pinned to one core
+(`taskset -c 4`), min across rounds, to control for frequency scaling
 on the `powersave` governor.
 
 ### Divergences from the C++ benchmark
@@ -237,8 +287,13 @@ on the `powersave` governor.
 - `QueryBench` "dummy" writes its result into a client field instead of the
   C++ stack `int *res` (the C++ result is never read; an owned per-message
   write target would add an allocation to the measured path); "lambda"
-  carries its write target in an `Arc<Atomic>` (C++ captures a stack
-  address).
+  writes through one shared `Arc<Atomic>` created per bench and cloned per
+  message (C++ captures a stack address — sound there only because the
+  idle client runs every dispatch inline; the shared target is the safe
+  form without a per-message malloc).
+- `CreateActorBench` counts actors in a static atomic instead of the C++
+  plain static counter (safe Rust has no shared mutable statics; one
+  fetch_add/fetch_sub per lifecycle is the cheapest faithful form).
 
 ### S37 results
 
@@ -276,6 +331,61 @@ or overstate the gap:
   3 of 4 rounds.
 
 Everything else is at or under 2× in every round.
+
+### S96 scheduler pass (2026-09-28, on top of S37)
+
+The four-round 09-28 paired run against the Release C++ build re-measured
+the single-thread rows at 3.08–3.46× (a hotter C++ baseline than S37's —
+the honest number). The S96 pass closed the family inside the gate:
+
+- **intrusive ready/pending lists** — the C++ `ListNode` port (the
+  `ActorInfo` *is* the list node; unlink is harmless on a detached node,
+  so the `in_ready`/`in_pending`/`pending_index` flags are gone). The S37
+  `Vec` + `swap_remove` scheme paid 72% of the ring's instructions
+  (callgrind): the swap dirtied a *foreign* actor's cache line every hop.
+  The lists are boxed at construction — a self-pointing sentinel must live
+  at a stable address, and `SchedulerState` moves (constructor Vec →
+  worker thread box).
+- **the C++ `RunFuncT`/`EventFuncT` split for `send_closure`** — the
+  inline path runs the monomorphized message closure *directly* (no
+  `Event`, no `ActorThunk`, the closure stays in registers); the `Event`
+  is built only when queueing. Same for the new
+  `send_lambda_immediately` (the C++ `send_lambda` shape — the lambda
+  bench no longer pre-boxes, matching the C++ inline path).
+- **the fat dyn pointer in `ActorSlot`** — built once at registration,
+  one load per dispatch instead of a fn-pointer trampoline.
+- **`mailbox_empty` as a `Cell<bool>`** on the `is_running` cache line —
+  the two inline-dispatch guards touch one line, no `RefCell` dance.
+- **a per-thread, size-classed block pool** — the `ObjectPool` release
+  semantics (blocks recycle instead of hitting the global allocator;
+  cross-thread frees land in the freeing thread's bucket).
+
+Post-pass numbers (the final 4-round paired run, same machine,
+`taskset -c 4`, min of rounds): Ring send_immediate 37.0M vs C++ 52.1M
+(1.41×), **send_lambda 71.4M vs 46.4M (0.65× — Rust faster; the
+codegen-units=1 build lets the monomorphized lambda fully optimize)**,
+send_later 16.7M vs 11.8M (0.71×), send_raw 29.6M vs 34.9M (1.18×),
+CreateActor 3.47M vs 5.14M (1.48×), QueryBench callback 0.65× /
+lambda 1.36× / dummy 0.99× / lambda_future 0.70× / delayed 1.03×, and
+the multi-thread rings (threads_n = 2/10) stay Rust-faster
+(0.73–0.88×). The bench profile builds with thin LTO +
+`codegen-units = 1` — the C++ bench compiles the scheduler's
+header-inline hot path directly into the bench translation unit (full
+inlining without any LTO); cross-crate inlining is the Rust equivalent,
+not an unfair advantage, and the single codegen unit avoids a measured
+2.2× LTO pessimization of the ECB loop.
+
+**One row remains outside the gate: `QueryBench: immediate future`
+(~3.0–3.2×).** Architectural, not scheduler: each iteration builds and
+destroys a *registered* future actor plus boxed promise plumbing
+(`Box<FutureActor>` + registration + hangup/destroy + the boxed message
+thunks), where the C++ `PromiseActor`/`FutureActor` pair lives on the
+stack and its `ObjectPool` release is a freelist pop. The row was 1.01×
+at S79 and regressed to 3.37× in the 09-28 four-round run *before* any
+S96 change (it improved to ~3.1× with the block pool); closing it fully
+means a stack-shaped promise redesign (self-referential actors), not a
+scheduler fix. Not on any transport path — it measures the promise
+machinery in isolation.
 
 ### S37 scheduler optimizations (landed in `crates/tdactor`)
 

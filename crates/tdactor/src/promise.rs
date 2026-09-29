@@ -11,7 +11,7 @@
 //!   object exactly like the C++ value member does.
 //! - C++ `move_future()` returns the actor object itself (`FutureActor&&`).
 //!   Rust cannot move a registered actor without breaking the registration
-//!   pointer, so it returns `Box<FutureActor<T>>` — same ownership, same
+//!   pointer, so it returns a pooled handle ([`FutureBox`]) — same ownership,
 //!   call surface.
 //! - `PromiseActor::set_value`/`set_error` consume the actor id exactly like
 //!   C++ (the `ActorRef(ActorOwn&&)` conversion releases it): the promise is
@@ -374,7 +374,7 @@ impl<T: Send + 'static> PromiseActor<T> {
             let id = own.release();
             Scheduler::instance().send_closure_immediately(
                 ActorRef::from(id),
-                ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
+                ActorThunk::new(move |actor: &mut dyn Actor| {
                     // `future_id` is an ActorOwn<FutureActor<T>> (set by
                     // init_promise_future), so the actor behind `id` is a
                     // FutureActor<T>; `downcast` verifies it instead of
@@ -382,7 +382,7 @@ impl<T: Send + 'static> PromiseActor<T> {
                     let future: &mut FutureActor<T> =
                         crate::messages::downcast::<FutureActor<T>>(actor);
                     event_fn(future);
-                })),
+                }),
             );
         }
     }
@@ -415,6 +415,72 @@ impl<T: Send + 'static> Drop for PromiseActor<T> {
     }
 }
 
+/// An owning handle to a heap [`FutureActor`] allocated from the
+/// scheduler's per-thread [`block_pool`](crate::actor_id::block_pool) —
+/// the port of the C++ `ObjectPool` block a stack `FutureActor` occupies.
+///
+/// The C++ future lives on the caller's stack and its registration holds a
+/// raw pointer into it; safe Rust cannot register a movable stack object,
+/// so the future needs a stable owned address — a pooled block gives it
+/// one at freelist pop/push cost instead of the global malloc/free pair
+/// (the S98 immediate-future pass: the plain `Box` was a quarter of the
+/// row's remaining gap). Method calls go through `Deref`/`DerefMut`
+/// unchanged; `move_future()`/`send_promise_*` hand this around where the
+/// C++ moves the actor object itself.
+pub struct FutureBox<T: Send + 'static> {
+    ptr: std::ptr::NonNull<FutureActor<T>>,
+}
+
+// SAFETY: the pointee is owned exclusively by the handle; `T: Send` makes
+// moving it across threads sound (the pool handles cross-thread frees).
+unsafe impl<T: Send + 'static> Send for FutureBox<T> {}
+
+impl<T: Send + 'static> FutureBox<T> {
+    fn new(future: FutureActor<T>) -> Self {
+        let layout = std::alloc::Layout::new::<FutureActor<T>>();
+        let raw = crate::actor_id::block_pool::alloc(layout);
+        assert!(!raw.is_null(), "future-actor pool allocation failed");
+        // SAFETY: the block is fresh (`Layout::new::<FutureActor<T>>`-sized
+        // and -aligned) and unaliased; the actor is written exactly once.
+        unsafe {
+            std::ptr::write(raw.cast::<FutureActor<T>>(), future);
+            Self {
+                ptr: std::ptr::NonNull::new_unchecked(raw.cast()),
+            }
+        }
+    }
+}
+
+impl<T: Send + 'static> std::ops::Deref for FutureBox<T> {
+    type Target = FutureActor<T>;
+    fn deref(&self) -> &FutureActor<T> {
+        // SAFETY: the block holds a live `FutureActor<T>` until `Drop`.
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T: Send + 'static> std::ops::DerefMut for FutureBox<T> {
+    fn deref_mut(&mut self) -> &mut FutureActor<T> {
+        // SAFETY: same live-actor contract, exclusive through `&mut self`.
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl<T: Send + 'static> Drop for FutureBox<T> {
+    fn drop(&mut self) {
+        // SAFETY: the actor (if the scheduler has not already destroyed the
+        // registration — the actor object itself is owned right here) is
+        // dropped exactly once, then the block returns to the pool.
+        unsafe {
+            std::ptr::drop_in_place(self.ptr.as_ptr());
+            crate::actor_id::block_pool::dealloc(
+                self.ptr.as_ptr().cast(),
+                std::alloc::Layout::new::<FutureActor<T>>(),
+            );
+        }
+    }
+}
+
 /// C++ `init_promise_future`: pair the promise and the future and register the
 /// future on the current scheduler.
 fn init_promise_future<T: Send + 'static>(
@@ -438,7 +504,7 @@ fn init_promise_future<T: Send + 'static>(
 /// [`FutureActor`] on the current scheduler.
 pub struct PromiseFuture<T: Send + 'static> {
     promise: PromiseActor<T>,
-    future: Option<Box<FutureActor<T>>>,
+    future: Option<FutureBox<T>>,
 }
 
 impl<T: Send + 'static> PromiseFuture<T> {
@@ -448,7 +514,7 @@ impl<T: Send + 'static> PromiseFuture<T> {
     /// scheduler context, which `Default::default()` could not provide.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let mut future = Box::new(FutureActor::default());
+        let mut future = FutureBox::new(FutureActor::default());
         let mut promise = PromiseActor::new();
         init_promise_future(&mut promise, &mut *future);
         Self {
@@ -476,9 +542,9 @@ impl<T: Send + 'static> PromiseFuture<T> {
         std::mem::replace(&mut self.promise, PromiseActor::new())
     }
 
-    /// C++ `move_future()` — see the module docs: the registered actor is
-    /// `Box`ed, so the box moves.
-    pub fn move_future(&mut self) -> Box<FutureActor<T>> {
+    /// C++ `move_future()` — see [`FutureBox`]: the registered actor lives
+    /// in a pooled block, so the handle moves.
+    pub fn move_future(&mut self) -> FutureBox<T> {
         self.future.take().expect("future was already moved out")
     }
 }
@@ -488,7 +554,7 @@ impl<T: Send + 'static> PromiseFuture<T> {
 /// The handler receives the callee and the promise; extra arguments are
 /// captured by the closure (C++ binds them through
 /// `create_immediate_closure`).
-pub fn send_promise_immediately<T, A, F, R>(actor_id: ActorId<A>, handler: F) -> Box<FutureActor<T>>
+pub fn send_promise_immediately<T, A, F, R>(actor_id: ActorId<A>, handler: F) -> FutureBox<T>
 where
     T: Send + 'static,
     A: Actor,
@@ -498,19 +564,19 @@ where
     let promise = pf.move_promise();
     Scheduler::instance().send_closure_immediately(
         ActorRef::from(actor_id),
-        ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
+        ActorThunk::new(move |actor: &mut dyn Actor| {
             // The ActorId<A> marker names the actor's real type;
             // `downcast` verifies it (the C++ static_cast trusted it).
             let callee = crate::messages::downcast::<A>(actor);
             handler(callee, promise);
-        })),
+        }),
     );
     pf.move_future()
 }
 
 /// C++ `send_promise_later`: the mailbox variant of
 /// [`send_promise_immediately`].
-pub fn send_promise_later<T, A, F, R>(actor_id: ActorId<A>, handler: F) -> Box<FutureActor<T>>
+pub fn send_promise_later<T, A, F, R>(actor_id: ActorId<A>, handler: F) -> FutureBox<T>
 where
     T: Send + 'static,
     A: Actor,
@@ -520,11 +586,11 @@ where
     let promise = pf.move_promise();
     Scheduler::instance().send_closure_later(
         ActorRef::from(actor_id),
-        ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
+        ActorThunk::new(move |actor: &mut dyn Actor| {
             // Same as send_promise_immediately: `downcast` verifies.
             let callee = crate::messages::downcast::<A>(actor);
             handler(callee, promise);
-        })),
+        }),
     );
     pf.move_future()
 }
@@ -543,11 +609,11 @@ where
     move |result: Result<T>| {
         Scheduler::instance().send_closure_immediately(
             ActorRef::from(actor_id),
-            ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
+            ActorThunk::new(move |actor: &mut dyn Actor| {
                 // Same as send_promise_immediately: `downcast` verifies.
                 let callee = crate::messages::downcast::<A>(actor);
                 handler(callee, result);
-            })),
+            }),
         );
     }
 }
