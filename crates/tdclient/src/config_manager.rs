@@ -189,28 +189,35 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// The C++ `store`: two raw ints then the raw TL buffer of the JSON
-    /// value (`fetch_string_raw` + `TlBufferParser`).
+    /// The C++ `store` under `log_event_store` — the log-event version
+    /// prefix (LogEventStorerUnsafe), then two raw ints and the raw TL
+    /// buffer of the JSON value (`fetch_string_raw` + `TlBufferParser`).
     fn store(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.hash.to_le_bytes());
         self.config.store(&mut out);
         out
     }
 
-    /// The C++ `parse`; an empty or truncated value fails like the C++
-    /// `log_event_parse` on an empty pmc slice.
+    /// The C++ `parse` under `log_event_parse`; an empty, truncated or
+    /// version-mismatched value fails like the C++ `log_event_parse` on an
+    /// empty pmc slice.
     fn parse(input: &[u8]) -> Result<Self, &'static str> {
-        if input.len() < 8 {
+        if input.len() < 12 {
             return Err("Invalid config");
         }
-        let version = i32::from_le_bytes(input[0..4].try_into().expect("length checked"));
+        let prefix_version = i32::from_le_bytes(input[0..4].try_into().expect("length checked"));
+        if prefix_version != crate::store_parse::version::LOG_EVENT_STORE_VERSION {
+            return Err("Invalid config version prefix");
+        }
+        let version = i32::from_le_bytes(input[4..8].try_into().expect("length checked"));
         if version != APP_CONFIG_CURRENT_VERSION {
             return Err("Invalid config version");
         }
-        let hash = i32::from_le_bytes(input[4..8].try_into().expect("length checked"));
-        let config = Box::new(telegram_api::JSONValue::parse(&input[8..])?);
+        let hash = i32::from_le_bytes(input[8..12].try_into().expect("length checked"));
+        let config = Box::new(telegram_api::JSONValue::parse(&input[12..])?);
         Ok(Self {
             version,
             hash,
@@ -791,10 +798,13 @@ impl ConfigManager {
             pmc.erase("dc_options_update");
             return;
         }
-        pmc.set_raw(
-            b"dc_options_update",
-            &StoredDcOptions { options: stored }.store(),
-        );
+        // C++ stores this via `log_event_store` — the log-event version
+        // prefix leads the payload (unlike the plain-serialize `dc_options`
+        // of ConnectionCreator).
+        let mut value = Vec::new();
+        crate::store_parse::store_log_event_version(&mut value);
+        value.extend_from_slice(&StoredDcOptions { options: stored }.store());
+        pmc.set_raw(b"dc_options_update", &value);
     }
 
     /// `ConfigManager::request_config_from_dc_impl` (cpp:1022-1028).
@@ -2929,6 +2939,9 @@ mod tests {
         };
         let bytes = app_config.store();
         let mut expected = Vec::new();
+        // the log_event_store version prefix leads the payload
+        expected
+            .extend_from_slice(&crate::store_parse::version::LOG_EVENT_STORE_VERSION.to_le_bytes());
         expected.extend_from_slice(&APP_CONFIG_CURRENT_VERSION.to_le_bytes());
         expected.extend_from_slice(&0i32.to_le_bytes());
         expected.extend_from_slice(&telegram_api::jsonObject::ID.to_le_bytes());
@@ -3830,7 +3843,8 @@ mod tests {
             secret: Vec::new(),
         };
         manager.on_dc_options_update(&mut pmc, std::slice::from_ref(&option));
-        let stored = StoredDcOptions::parse(&pmc.get_raw(b"dc_options_update")).unwrap();
+        // the log-event version prefix leads the pmc value
+        let stored = StoredDcOptions::parse(&pmc.get_raw(b"dc_options_update")[4..]).unwrap();
         assert_eq!(stored.options.len(), 1);
         assert_eq!(
             stored.options[0].flags,
@@ -3852,7 +3866,8 @@ mod tests {
                 ..option.clone()
             }],
         );
-        let stored = StoredDcOptions::parse(&pmc.get_raw(b"dc_options_update")).unwrap();
+        // the log-event version prefix leads the pmc value
+        let stored = StoredDcOptions::parse(&pmc.get_raw(b"dc_options_update")[4..]).unwrap();
         assert_eq!(stored.options[0].raw_dc_id, 3);
         assert_ne!(stored.options[0].flags & DC_OPTION_CDN, 0);
 

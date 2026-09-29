@@ -668,10 +668,13 @@ impl RecovererDcOption {
 /// yielding the recoverer's option subset.
 pub fn load_dc_options_update(pmc: &BinlogKeyValue) -> Vec<RecovererDcOption> {
     let raw = pmc.get_raw(b"dc_options_update");
-    if raw.is_empty() {
+    if raw.len() < 4
+        || i32::from_le_bytes(raw[0..4].try_into().expect("length checked"))
+            != crate::store_parse::version::LOG_EVENT_STORE_VERSION
+    {
         return Vec::new();
     }
-    match StoredDcOptions::parse(&raw) {
+    match StoredDcOptions::parse(&raw[4..]) {
         Ok(stored) => stored
             .options()
             .iter()
@@ -2799,7 +2802,10 @@ mod tests {
                 secret: Vec::new(),
             }],
         };
-        pmc.set_raw(b"dc_options_update", &stored.store());
+        let mut prefixed = Vec::new();
+        crate::store_parse::store_log_event_version(&mut prefixed);
+        prefixed.extend_from_slice(&stored.store());
+        pmc.set_raw(b"dc_options_update", &prefixed);
 
         let mut recoverer = ConfigRecoverer::new();
         let environment = env(true);

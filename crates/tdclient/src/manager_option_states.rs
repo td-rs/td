@@ -448,6 +448,9 @@ impl ManagerOptionStates {
             .message_limits
             .get_update_group_call_message_levels_object();
         let mut blob = Vec::new();
+        // C++ stores this via `log_event_store` — the log-event version
+        // prefix leads the payload (GroupCallManager.cpp:7388).
+        crate::store_parse::store_log_event_version(&mut blob);
         self.message_limits.store(&mut blob);
         pmc.set_raw(b"group_call_message_limits", &blob);
         Some(update)
@@ -483,7 +486,16 @@ impl ManagerOptionStates {
         // corrupt or missing blob falls back to the basic level, and the
         // levels update is sent for every non-bot start.
         if !is_bot {
-            match GroupCallMessageLimits::parse(&pmc.get_raw(b"group_call_message_limits")) {
+            let raw = pmc.get_raw(b"group_call_message_limits");
+            let parsed = if raw.len() >= 4
+                && i32::from_le_bytes(raw[0..4].try_into().expect("length checked"))
+                    == crate::store_parse::version::LOG_EVENT_STORE_VERSION
+            {
+                GroupCallMessageLimits::parse(&raw[4..])
+            } else {
+                Err("Invalid log event version")
+            };
+            match parsed {
                 Ok(limits) => self.message_limits = limits,
                 Err(_) => self.message_limits = GroupCallMessageLimits::basic(),
             }

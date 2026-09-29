@@ -440,9 +440,11 @@ impl DbState {
         flags
     }
 
-    /// `AuthManager::DbState::store`.
+    /// `AuthManager::DbState::store` — under `log_event_store`, so the
+    /// log-event version prefix (LogEventStorerUnsafe) leads the payload.
     pub fn store(&self) -> Vec<u8> {
         let mut writer = BinlogWriter::new();
+        crate::store_parse::store_log_event_version(&mut writer.data);
         writer.i32(self.flags() as i32);
         writer.i32(self.state as i32);
         writer.i32(self.api_id);
@@ -481,9 +483,16 @@ impl DbState {
         writer.data
     }
 
-    /// `AuthManager::DbState::parse`.
+    /// `AuthManager::DbState::parse` — under `log_event_parse`, so the
+    /// log-event version prefix is consumed first.
     pub fn parse(data: &[u8]) -> Result<Self, String> {
-        let mut reader = BinlogReader::new(data);
+        if data.len() < 4
+            || i32::from_le_bytes(data[0..4].try_into().expect("length checked"))
+                != crate::store_parse::version::LOG_EVENT_STORE_VERSION
+        {
+            return Err("Invalid log event version".to_string());
+        }
+        let mut reader = BinlogReader::new(&data[4..]);
         let flags = reader.i32()? as u32;
         if flags & Self::FLAG_PREMIUM_PURCHASE_SUPPORT == 0 {
             return Err("Have no premium subscription purchase support".to_string());
@@ -1805,8 +1814,9 @@ mod tests {
         state.allow_apple_id = true;
         let data = state.store();
         let mut corrupted = data;
-        corrupted[0] &= !(1 << 5); // clear FLAG_PREMIUM_PURCHASE_SUPPORT's low byte bit 3? adjust: bit 11 is in byte 1
-        corrupted[1] &= !(1 << 3); // flags word byte 1, bit 11
+        // the flags word follows the 4-byte log-event version prefix
+        corrupted[4] &= !(1 << 5); // clear FLAG_PREMIUM_PURCHASE_SUPPORT's low byte bit 3? adjust: bit 11 is in byte 1
+        corrupted[5] &= !(1 << 3); // flags word byte 1, bit 11
         assert_eq!(
             DbState::parse(&corrupted).unwrap_err(),
             "Have no premium subscription purchase support"
