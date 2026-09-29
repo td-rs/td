@@ -32,6 +32,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(not(target_family = "wasm"))]
+use std::os::fd::AsRawFd as _;
 use tdactor::{ActorId, SchedulerPtr};
 use tdmtproto::auth_data::AuthData;
 use tdmtproto::auth_key::AuthKey;
@@ -49,7 +51,7 @@ use tdnet::net_query::{AuthFlag, DcId, DcInitSink, GzipFlag, NetQuery, NetQueryT
 use tdutils::buffer::BufferSlice;
 use tdutils::random;
 use tdutils::status::{Result, Status};
-#[cfg(not(target_family = "wasm"))]
+
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -667,22 +669,72 @@ async fn session_driver(
                 auth_data.update_server_time_difference(diff, force);
             }
             if callback.closed || wakeup_at == 0.0 {
+                // NativeFd.cpp:276 + PollableFd.h:127 — the fd teardown
+                // pair, on the real fd before the drop.
+                {
+                    let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                    tdutils::vlog!(
+                        tdutils::logging::verbosity::FD,
+                        "fd",
+                        at "PollableFd.h",
+                        127,
+                        "[fd:{raw_fd}] destroy PollableFdInfo"
+                    );
+                    tdutils::vlog!(
+                        tdutils::logging::verbosity::FD,
+                        "fd",
+                        at "NativeFd.cpp",
+                        276,
+                        "[fd:{raw_fd}] close"
+                    );
+                }
                 fail_pending(&shared, session, &query_count, "Failed to get answer");
                 live = None;
+                // The dropped connection releases its `ConnectionToken`
+                // (`dec_connect`) — the Td's StateManager counts it.
+                shared.events.push(NetEvent::ConnectClosed);
                 backoff_until = tdutils::time::now() + 1.0;
                 continue;
             }
             let deadline = tokio::time::Instant::now()
                 + Duration::from_secs_f64((wakeup_at - tdutils::time::now()).max(0.0));
-            tokio::select! {
-                command = rx.recv() => {
-                    match command {
-                        Some(command) => inbox.push(command),
-                        None => inbox.push(DriverCommand::Close),
+            // PollableFd.h:133 — the poll subscription before the wait.
+            // The parked interest is read-side (the flush writes inline,
+            // before this park); a pending write batch adds the W flag.
+            {
+                // PollableFd.h:133 — the poll subscription before the
+                // wait. The parked interest is read-side (the flush
+                // writes inline, before this park) — the C++ adds W only
+                // while a write batch is outstanding, which this port
+                // never parks on.
+                let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::FD,
+                    "fd",
+                    at "PollableFd.h",
+                    133,
+                    "[fd:{raw_fd}] add flags from poll [R]"
+                );
+                let observer = std::ptr::from_ref(&session.connection) as usize;
+                tokio::select! {
+                    command = rx.recv() => {
+                        match command {
+                            Some(command) => inbox.push(command),
+                            None => inbox.push(DriverCommand::Close),
+                        }
                     }
+                    _ = session.connection.raw_connection().stream().readable() => {
+                        // PollableFd.h:168 — the poller's wake.
+                        tdutils::vlog!(
+                            tdutils::logging::verbosity::FD,
+                            "fd",
+                            at "PollableFd.h",
+                            168,
+                            "[fd:{raw_fd}] notify [observer:0x{observer:x}]"
+                        );
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {}
                 }
-                _ = session.connection.raw_connection().stream().readable() => {}
-                _ = tokio::time::sleep_until(deadline) => {}
             }
         } else {
             match rx.recv().await {
@@ -706,6 +758,36 @@ async fn session_driver(
                         }
                         match open_connection(&shared, &auth_data, raw_dc_id, &is_main).await {
                             Ok(connection) => {
+                                // `set_connection_token` on the hand-over
+                                // (ConnectionCreator.cpp:956) — `inc_connect`.
+                                shared.events.push(NetEvent::ConnectOpened);
+                                // NativeFd.cpp:118 — the fd construction
+                                // log; PollableFd.h:73 the pollable
+                                // extraction. The observer is the
+                                // connection's own address (the C++ prints
+                                // its observer object's).
+                                let mut connection = connection;
+                                // NativeFd.cpp:118 — the fd construction
+                                // log; PollableFd.h:73 the pollable
+                                // extraction. The observer is the
+                                // connection's own address (the C++ prints
+                                // its observer object's).
+                                let raw_fd = connection.raw_connection().stream().as_raw_fd();
+                                let observer = std::ptr::from_ref(&connection) as usize;
+                                tdutils::vlog!(
+                                    tdutils::logging::verbosity::FD,
+                                    "fd",
+                                    at "NativeFd.cpp",
+                                    118,
+                                    "[fd:{raw_fd}] create"
+                                );
+                                tdutils::vlog!(
+                                    tdutils::logging::verbosity::FD,
+                                    "fd",
+                                    at "PollableFd.h",
+                                    73,
+                                    "[fd:{raw_fd}] extract pollable fd [observer:0x{observer:x}]"
+                                );
                                 live = Some(Live {
                                     connection,
                                     pending: HashMap::new(),
@@ -746,6 +828,25 @@ async fn session_driver(
                             time_diff_updated: None,
                             closed: false,
                         };
+                        // The shutdown teardown pair (PollableFd.h:127 +
+                        // NativeFd.cpp:276), like the drop path.
+                        {
+                            let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                            tdutils::vlog!(
+                                tdutils::logging::verbosity::FD,
+                                "fd",
+                                at "PollableFd.h",
+                                127,
+                                "[fd:{raw_fd}] destroy PollableFdInfo"
+                            );
+                            tdutils::vlog!(
+                                tdutils::logging::verbosity::FD,
+                                "fd",
+                                at "NativeFd.cpp",
+                                276,
+                                "[fd:{raw_fd}] close"
+                            );
+                        }
                         session.connection.force_close(&mut callback);
                         fail_pending(&shared, &mut session, &query_count, "Request aborted");
                     }

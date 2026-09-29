@@ -35,6 +35,7 @@
 //!   dropped).
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::telegram_api;
@@ -322,15 +323,17 @@ impl StoredDcOption {
         if !option.secret.is_empty() {
             flags |= DC_OPTION_HAS_SECRET;
         }
-        // `is_valid`: a valid ip address and an exact dc id (the ip parse
-        // itself lands with the net step — an empty address is dropped).
-        if option.ip_address.is_empty() {
-            return None;
-        }
+        // `DcOption(telegram_api::dcOption &&)`'s `is_valid` gate: the C++
+        // PARSES the address into an `IPAddress` and stores
+        // `ip_address_.get_ip_str()` — its own canonical rendering
+        // (inet_ntop: compressed IPv6, plain dotted IPv4), NOT the raw
+        // server string. The 2026-09-29 byte compare caught the Rust
+        // storing the server's expanded IPv6 form.
+        let ip = canonical_ip_string(&option.ip_address)?;
         Some(Self {
             flags,
             raw_dc_id: option.id,
-            ip: option.ip_address.as_bytes().to_vec(),
+            ip: ip.into_bytes(),
             port: option.port,
             secret: option.secret.clone(),
         })
@@ -339,20 +342,20 @@ impl StoredDcOption {
     pub fn store(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.flags.to_le_bytes());
         out.extend_from_slice(&self.raw_dc_id.to_le_bytes());
-        store_log_event_string(out, &self.ip);
+        store_tl_padded_string(out, &self.ip);
         out.extend_from_slice(&self.port.to_le_bytes());
         if self.flags & DC_OPTION_HAS_SECRET != 0 {
-            store_log_event_string(out, &self.secret);
+            store_tl_padded_string(out, &self.secret);
         }
     }
 
     pub fn parse(input: &[u8], pos: &mut usize) -> Result<Self, &'static str> {
         let flags = fetch_i32(input, pos)?;
         let raw_dc_id = fetch_i32(input, pos)?;
-        let ip = fetch_log_event_string(input, pos)?;
+        let ip = fetch_tl_padded_string(input, pos)?;
         let port = fetch_i32(input, pos)?;
         let secret = if flags & DC_OPTION_HAS_SECRET != 0 {
-            fetch_log_event_string(input, pos)?
+            fetch_tl_padded_string(input, pos)?
         } else {
             Vec::new()
         };
@@ -366,6 +369,86 @@ impl StoredDcOption {
     }
 }
 
+/// `TlStorerUnsafe::store_string` (tl_storers.h:53-83) — the storer the
+/// plain `td::serialize` AND `log_event_store` share (LogEventStorerUnsafe
+/// is a `WithContext<TlStorerUnsafe>`): the TL length prefix, the bytes,
+/// then zero padding so the prefix+data total is a multiple of four. The
+/// pmc-level key/value framing is the UNPADDED [`store_log_event_string`]
+/// — the two layers were swapped for the inner dc-options blob until the
+/// 2026-09-29 byte-level compare caught it (the C++ carries a stray `00`
+/// after every 14-byte IPv4).
+fn store_tl_padded_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = bytes.len();
+    let mut padded_len = len;
+    if len < 254 {
+        out.push(len as u8);
+        padded_len += 1;
+    } else if len < (1 << 24) {
+        out.push(254);
+        out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+        padded_len += 4;
+    } else {
+        out.push(255);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0]);
+        padded_len += 8;
+    }
+    out.extend_from_slice(bytes);
+    while !padded_len.is_multiple_of(4) {
+        out.push(0);
+        padded_len += 1;
+    }
+}
+
+/// `TlParser::fetch_string` — the inverse of [`store_tl_padded_string`],
+/// padding skip included.
+fn fetch_tl_padded_string(input: &[u8], pos: &mut usize) -> Result<Vec<u8>, &'static str> {
+    if *pos >= input.len() {
+        return Err("Invalid string");
+    }
+    let first = input[*pos];
+    *pos += 1;
+    let (len, consumed) = match first {
+        0..=253 => (first as usize, 1usize),
+        254 => {
+            if *pos + 3 > input.len() {
+                return Err("Invalid string");
+            }
+            let mut bytes = [0u8; 4];
+            bytes[..3].copy_from_slice(&input[*pos..*pos + 3]);
+            (u32::from_le_bytes(bytes) as usize, 4)
+        }
+        255 => {
+            if *pos + 7 > input.len() {
+                return Err("Invalid string");
+            }
+            let len = u32::from_le_bytes(input[*pos..*pos + 4].try_into().expect("length checked"));
+            (len as usize, 8)
+        }
+    };
+    if *pos + len > input.len() {
+        return Err("Invalid string");
+    }
+    let bytes = input[*pos..*pos + len].to_vec();
+    *pos += len;
+    // the symmetric padding skip: the prefix+data total rounds up to four
+    let total = consumed + len;
+    *pos += (4 - total % 4) % 4;
+    Ok(bytes)
+}
+
+/// `IPAddress::init(ip, port)` + `get_ip_str()` — the canonical address
+/// rendering the C++ persists: parse, then print (inet_ntop semantics —
+/// std's `Display` matches: lowercase, no leading zeros, the longest zero
+/// run compressed to `::`). An unparseable address drops the option, the
+/// `DcOption::is_valid` gate.
+fn canonical_ip_string(ip: &str) -> Option<String> {
+    if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+        return Some(v4.to_string());
+    }
+    ip.parse::<Ipv6Addr>().ok().map(|v6| v6.to_string())
+}
+
 /// A raw little-endian int32 at `pos`.
 fn fetch_i32(input: &[u8], pos: &mut usize) -> Result<i32, &'static str> {
     if *pos + 4 > input.len() {
@@ -376,60 +459,6 @@ fn fetch_i32(input: &[u8], pos: &mut usize) -> Result<i32, &'static str> {
     Ok(value)
 }
 
-/// `td::store(Slice)` in `tl_helpers.h` — the TL string length prefix
-/// rules (1 byte under 254, `254` + 3 LE bytes under 2^24, else `255` +
-/// 4 LE bytes + 3 zero bytes) followed by the raw bytes.
-fn store_log_event_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = bytes.len();
-    if len < 254 {
-        out.push(len as u8);
-    } else if len < (1 << 24) {
-        out.push(254);
-        out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
-    } else {
-        out.push(255);
-        out.extend_from_slice(&(len as u32).to_le_bytes());
-        out.extend_from_slice(&[0, 0, 0]);
-    }
-    out.extend_from_slice(bytes);
-}
-
-/// `parser.fetch_string<Slice>()` — the inverse of [`store_log_event_string`].
-fn fetch_log_event_string(input: &[u8], pos: &mut usize) -> Result<Vec<u8>, &'static str> {
-    if *pos >= input.len() {
-        return Err("Invalid string");
-    }
-    let first = input[*pos];
-    *pos += 1;
-    let len = match first {
-        0..=253 => first as usize,
-        254 => {
-            if *pos + 3 > input.len() {
-                return Err("Invalid string");
-            }
-            let mut bytes = [0u8; 4];
-            bytes[..3].copy_from_slice(&input[*pos..*pos + 3]);
-            *pos += 3;
-            u32::from_le_bytes(bytes) as usize
-        }
-        255 => {
-            if *pos + 7 > input.len() {
-                return Err("Invalid string");
-            }
-            let len = u32::from_le_bytes(input[*pos..*pos + 4].try_into().expect("length checked"));
-            *pos += 7;
-            len as usize
-        }
-    };
-    if *pos + len > input.len() {
-        return Err("Invalid string");
-    }
-    let bytes = input[*pos..*pos + len].to_vec();
-    *pos += len;
-    Ok(bytes)
-}
-
-/// The persisted `dc_options_update` — the C++ `DcOptions::store`:
 /// an int32 count followed by the stored options.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredDcOptions {
@@ -949,7 +978,15 @@ impl ConfigManager {
         main_dc_id: i32,
     ) -> ConfigActions {
         let is_from_main_dc = main_dc_id == config.this_dc;
-        tracing::info!("{config:?}");
+        // ConfigManager.cpp:1176 — `LOG(INFO) << to_string(config)`: the
+        // full telegram_api TL-text dump (the ip strings stay raw here;
+        // the canonical rendering is only for the stored dc_options).
+        tdutils::log_info!(
+            at "ConfigManager.cpp",
+            1176,
+            "{}",
+            config.to_debug_string()
+        );
         let reload_in = (config.expires - config.date).clamp(60, 86400);
         save_config_expire(pmc, tdutils::time::now() + f64::from(reload_in));
         let reload_in = reload_in - tdutils::random::fast(0, reload_in / 5);

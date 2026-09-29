@@ -105,6 +105,14 @@ impl TdReceiver {
     }
 
     fn receive(&self, timeout: f64, from_manager: bool) -> Response {
+        // Client.cpp:281/294 — the td_requests wait bookends.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::TD_REQUESTS,
+            "td_requests",
+            at "Client.cpp",
+            281,
+            "Begin to wait for updates with timeout {timeout:.6}"
+        );
         if self.receive_lock.swap(true, Ordering::AcqRel) {
             let message = if from_manager {
                 "Receive must not be called simultaneously from two different threads, but this has just \
@@ -120,6 +128,19 @@ impl TdReceiver {
         // receive in the S68 oracle run).
         let was_locked = self.receive_lock.swap(false, Ordering::AcqRel);
         assert!(was_locked, "receive lock released twice");
+        tdutils::vlog!(
+            tdutils::logging::verbosity::TD_REQUESTS,
+            "td_requests",
+            at "Client.cpp",
+            294,
+            "End to wait for updates, returning object {} {:p}",
+            response.request_id,
+            response.object.as_ref().map_or(std::ptr::null::<()>(), |_| {
+                // The C++ prints the object's heap pointer; any stable
+                // non-null address gives the same line shape.
+                &response as *const _ as *const ()
+            })
+        );
         response
     }
 
@@ -228,6 +249,13 @@ pub struct MultiImpl {
     send_ptr: SchedulerPtr,
     multi_td: Option<ActorOwn<MultiTd>>,
     scheduler_thread: Option<std::thread::JoinHandle<()>>,
+    /// The lock-free shutdown signal (the wake half of
+    /// `ConcurrentScheduler::finish`): the pump thread holds the scheduler
+    /// Mutex across its whole 10 s `run_main` slice and re-acquires it
+    /// immediately, so a shutdown that needs the same Mutex starves on the
+    /// gap between slices — the close_synthesizes deadlock. Signalled
+    /// lock-free, exactly like the C++ finish + eventfd wakes.
+    shutdown: tdactor::ShutdownSignal,
 }
 
 /// `MultiImpl::current_id_` — the process-wide client id counter.
@@ -250,6 +278,7 @@ impl MultiImpl {
             (actor, scheduler.send_scheduler())
         };
         scheduler.start();
+        let shutdown = scheduler.shutdown_signal();
         let scheduler = Arc::new(Mutex::new(scheduler));
         let thread_scheduler = Arc::clone(&scheduler);
         // the run_main pump rides the same 8 MiB actor-thread stack as the
@@ -257,14 +286,18 @@ impl MultiImpl {
         let scheduler_thread = std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                // The C++ `while (concurrent_scheduler->run_main(10)) {}` — 10 ms
-                // slices; inbound events wake the idle pump immediately.
-                while thread_scheduler.lock().unwrap().run_main(0.01) {}
+                // The C++ `while (concurrent_scheduler->run_main(10)) {}` —
+                // 10 SECONDS per slice (Client.cpp:695); inbound events wake
+                // the idle pump immediately through the wakeup channel. The
+                // port first read `10` as 10 ms and spun the Td scheduler at
+                // ~100 Hz idle — the 1024-log parity run caught it.
+                while thread_scheduler.lock().unwrap().run_main(10.0) {}
             })
             .expect("the scheduler pump thread spawn");
         Self {
             scheduler,
             send_ptr,
+            shutdown,
             multi_td: Some(multi_td),
             scheduler_thread: Some(scheduler_thread),
         }
@@ -317,7 +350,11 @@ impl Drop for MultiImpl {
             // destructor posts the close notification.
             self.multi_td.take();
         }
-        self.scheduler.lock().unwrap().finish();
+        // Signal the shutdown BEFORE any locked finish: the pump thread
+        // holds the scheduler Mutex across its 10 s slice, and the signal
+        // ends the woken slice (run_main returns false) so the joins and
+        // the locked finish below run uncontended.
+        self.shutdown.signal();
         if let Some(thread) = self.scheduler_thread.take() {
             let _ = thread.join();
         }

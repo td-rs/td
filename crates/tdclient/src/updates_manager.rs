@@ -501,6 +501,17 @@ impl PendingUpdate {
             PendingUpdate::SentMessage { .. } => "updateSentMessage",
         }
     }
+
+    /// `to_string(update)` for the `Receive from … pending …` logs
+    /// (UpdatesManager.cpp:2705/:3038) — the TL-text dump for wire updates;
+    /// the synthetic arms never reach the C++ log sites.
+    pub fn dump_string(&self) -> String {
+        match self {
+            PendingUpdate::Wire(update) => update.to_debug_string(),
+            PendingUpdate::Dummy => "dummyUpdate".to_string(),
+            PendingUpdate::SentMessage { .. } => "updateSentMessage".to_string(),
+        }
+    }
 }
 
 impl From<telegram_api::Update> for PendingUpdate {
@@ -936,12 +947,27 @@ pub trait UpdatesManagerEnv {
 /// `td::PtsManager` — the db/mem pts pair plus the ordered in-flight
 /// changes (`ChangesProcessor<int32>`: a `BTreeMap` keyed by the add id;
 /// `finish` folds every finished prefix into `db_pts`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PtsManager {
     db_pts: i32,
     mem_pts: i32,
     changes: BTreeMap<u64, i32>,
     next_id: u64,
+}
+
+impl PtsManager {
+    /// C++ `db_pts_ = -1; mem_pts_ = -1;` (PtsManager.h:53-54) — -1 is the
+    /// "unknown" sentinel that routes `get_difference` through the
+    /// getState-first init; a 0 default sent `getDifference(pts=0)` on
+    /// fresh sessions (PERSISTENT_TIMESTAMP_EMPTY, the fill-gap loop).
+    fn new_unknown() -> Self {
+        Self {
+            db_pts: -1,
+            mem_pts: -1,
+            changes: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
 }
 
 impl PtsManager {
@@ -1163,8 +1189,8 @@ pub struct UpdatesManager<S: UpdatesSink> {
 impl<S: UpdatesSink> UpdatesManager<S> {
     pub fn new(sink: S) -> Self {
         Self {
-            pts_manager: PtsManager::default(),
-            qts_manager: PtsManager::default(),
+            pts_manager: PtsManager::new_unknown(),
+            qts_manager: PtsManager::new_unknown(),
             date: 0,
             seq: 0,
             date_source: "nowhere".to_string(),
@@ -1899,6 +1925,16 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         // The 11 immediately-applied short updates (they carry no pts
         // state and need no promise).
         for update in updates.iter_mut() {
+            // UpdatesManager.cpp:2705 — the per-update Receive dump.
+            if let Some(update) = update.as_ref() {
+                tdutils::log_info!(
+                    at "UpdatesManager.cpp",
+                    2705,
+                    "Receive from {} pending {}",
+                    source,
+                    update.dump_string()
+                );
+            }
             let is_short = update
                 .as_ref()
                 .is_some_and(|update| is_immediately_applied_update(update.get_id()));
@@ -2704,10 +2740,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     ) {
         // do not try to run getDifference from this function
         tdutils::log_info!(
+            at "UpdatesManager.cpp",
+            3038,
             "Receive from {} with pts_count = {} pending {}",
             source,
             pts_count,
-            update.name()
+            update.dump_string()
         );
         if pts_count < 0 || new_pts <= pts_count {
             tdutils::log_error!(
@@ -7272,6 +7310,14 @@ mod tests {
         }
     }
 
+    /// Seed a known pts baseline the way the C++ constructor restores it
+    /// from the pmc — the fresh manager now carries the -1 unknown
+    /// sentinel (PtsManager.h:53-54), which routes through getState.
+    fn seed_pts<S: UpdatesSink>(manager: &mut UpdatesManager<S>, pts: i32) {
+        manager.pts_manager.init(pts);
+        manager.qts_manager.init(0);
+    }
+
     fn user(id: i64) -> telegram_api::User {
         telegram_api::User::user(telegram_api::user {
             id,
@@ -7315,8 +7361,36 @@ mod tests {
     }
 
     #[test]
+    fn wire_update_dump_matches_the_cpp_tl_text() {
+        // The oracle is the C++ 1024-log line from the h2h-pip run,
+        // byte-for-byte (UpdatesManager.cpp:2705's `to_string(update)`).
+        let update = telegram_api::updateNewMessage {
+            message: Some(telegram_api::Message::message(telegram_api::message {
+                flags: 0,
+                id: 361,
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 2202815082,
+                })),
+                date: 1790672705,
+                message: "h2h message one".to_owned(),
+                ..telegram_api::message::default()
+            })),
+            pts: 362,
+            pts_count: 1,
+        };
+        let pending = PendingUpdate::Wire(telegram_api::Update::updateNewMessage(update));
+        assert_eq!(
+            pending.dump_string(),
+            "updateNewMessage {\n  message = message {\n    flags = 0\n    flags2 = 0\n    id = 361\n    peer_id = peerUser {\n      user_id = 2202815082\n    }\n    date = 1790672705\n    message = \"h2h message one\"\n  }\n  pts = 362\n  pts_count = 1\n}\n"
+        );
+    }
+
+    #[test]
     fn pts_manager_tracks_mem_and_db() {
-        let mut manager = PtsManager::default();
+        let mut manager = PtsManager::new_unknown();
+        // The unknown sentinel (PtsManager.h:53-54) until `init`.
+        assert_eq!(manager.mem_pts(), -1);
+        assert_eq!(manager.db_pts(), -1);
         manager.init(10);
         assert_eq!(manager.mem_pts(), 10);
         assert_eq!(manager.db_pts(), 10);
@@ -7569,7 +7643,9 @@ mod tests {
         manager.tick_timeouts(&mut env);
         assert_eq!(
             env.sent_difference,
-            [(10, 0, 0)],
+            // QTS rides its -1 unknown sentinel (PtsManager.h:53-54) —
+            // only PTS is clamped (UpdatesManager.cpp:506-508).
+            [(10, 0, -1)],
             "retried with the stored state"
         );
     }
@@ -7597,7 +7673,7 @@ mod tests {
             telegram_api::Updates::updatesTooLong(telegram_api::updatesTooLong),
             Promise::default(),
         );
-        assert_eq!(env.sent_difference, [(10, 0, 0)]);
+        assert_eq!(env.sent_difference, [(10, 0, -1)]);
     }
 
     #[test]
@@ -8105,7 +8181,7 @@ mod tests {
         assert_eq!(env.pmc.get("updates.pts").map(String::as_str), Some("1"));
         assert_eq!(
             env.sent_difference,
-            [(1, 0, 0)],
+            [(1, 0, -1)],
             "get_difference(updatePtsChanged)"
         );
     }
@@ -8114,6 +8190,7 @@ mod tests {
     fn unsupported_updates_are_enumerated_drops() {
         let mut env = authorized_env();
         let mut manager = UpdatesManager::new(RecordingSink::default());
+        seed_pts(&mut manager, 0);
         manager.on_get_updates(
             &mut env,
             updates_container(
@@ -8325,7 +8402,7 @@ mod tests {
             ),
         );
         assert_eq!(manager.get_pts(), 50);
-        assert_eq!(env.sent_difference, [(50, 0, 0)]);
+        assert_eq!(env.sent_difference, [(50, 0, -1)]);
     }
 
     #[test]
@@ -8355,7 +8432,7 @@ mod tests {
         );
         assert_eq!(
             env.sent_difference,
-            [(10, 0, 0)],
+            [(10, 0, -1)],
             "reget difference with the same state"
         );
         assert!(manager.running_get_difference());
@@ -9088,6 +9165,7 @@ mod tests {
         let mut sink = RecordingSink::default();
         sink.deny_users.insert(100);
         let mut manager = UpdatesManager::new(sink);
+        seed_pts(&mut manager, 0);
 
         let update =
             telegram_api::Update::updateNewChannelMessage(telegram_api::updateNewChannelMessage {

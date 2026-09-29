@@ -193,6 +193,131 @@ pub(crate) struct TdSink {
     /// the `updateSentMessage` synthetic (MessagesManager.cpp:5837-5843) —
     /// the send-ack pts path; the drain runs `on_send_message_success`.
     pub(crate) sent_messages: Vec<(i64, i32, i32, i32)>,
+    /// `StateManager::on_synchronized` — the Updates half of the
+    /// connection state (before/after_get_difference, UpdatesManager.cpp
+    /// :534/:2366); the drain applies them to the reducer.
+    pub(crate) connection_sync: Vec<bool>,
+}
+
+/// The real `ConnectionState` order (ConnectionState.h) — the reducer's
+/// UP/DOWN hysteresis compares these.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RealConnectionState {
+    WaitingForNetwork,
+    Connecting,
+    Updating,
+    Ready,
+}
+
+/// `StateManager` (StateManager.h/cpp) — the connection-state reducer the
+/// ConnectionStateManager callback flushes: the mtproto connection-token
+/// count (`inc/dec_connect` via the session drivers), the Updates sync
+/// flag and the network flag. The C++ debounce — UP_DELAY 0.05s toward a
+/// better state, DOWN_DELAY 0.3s toward a worse one, no delay from Empty
+/// — suppresses get-difference flapping; the flush deadline joins the Td
+/// timeout slot so delayed transitions fire during idle exactly like the
+/// C++ actor's `set_timeout_at`.
+#[derive(Debug)]
+struct StateManagerState {
+    connect_cnt: i32,
+    sync_flag: bool,
+    network_flag: bool,
+    pending: Option<RealConnectionState>,
+    pending_timestamp: Option<f64>,
+    flushed: Option<RealConnectionState>,
+    /// The armed flush deadline (0 = none) — mirrors the actor timeout.
+    flush_at: f64,
+}
+
+impl Default for StateManagerState {
+    fn default() -> Self {
+        // `sync_flag_ = true`, `network_flag_ = true`,
+        // `connect_cnt_ = 0` — the initial real state is Connecting.
+        Self {
+            connect_cnt: 0,
+            sync_flag: true,
+            network_flag: true,
+            pending: None,
+            pending_timestamp: None,
+            flushed: None,
+            flush_at: 0.0,
+        }
+    }
+}
+
+impl StateManagerState {
+    /// `UP_DELAY`/`DOWN_DELAY` (StateManager.h:68-69).
+    const UP_DELAY: f64 = 0.05;
+    const DOWN_DELAY: f64 = 0.3;
+
+    /// `StateManager::get_real_state`.
+    fn real_state(&self) -> RealConnectionState {
+        if !self.network_flag {
+            return RealConnectionState::WaitingForNetwork;
+        }
+        if self.connect_cnt == 0 {
+            return RealConnectionState::Connecting;
+        }
+        if !self.sync_flag {
+            return RealConnectionState::Updating;
+        }
+        RealConnectionState::Ready
+    }
+
+    /// `StateManager::loop` — returns the flushed state when the
+    /// debounced transition is due NOW, and arms `flush_at` otherwise.
+    fn loop_(&mut self, now: f64) -> Option<RealConnectionState> {
+        let state = self.real_state();
+        if Some(state) != self.pending {
+            self.pending = Some(state);
+            if self.pending_timestamp.is_none() {
+                self.pending_timestamp = Some(now);
+            }
+        }
+        if self.pending != self.flushed {
+            let delay = match self.flushed {
+                // From Empty the C++ delay stays 0 (StateManager.cpp loop).
+                None => 0.0,
+                Some(flushed) => {
+                    if (self.pending? as i32) > (flushed as i32) {
+                        Self::UP_DELAY
+                    } else {
+                        Self::DOWN_DELAY
+                    }
+                }
+            };
+            let timestamp = self.pending_timestamp.unwrap_or(now);
+            if now >= timestamp + delay {
+                self.pending_timestamp = None;
+                self.flushed = self.pending;
+                self.flush_at = 0.0;
+                self.flushed
+            } else {
+                self.flush_at = timestamp + delay;
+                None
+            }
+        } else {
+            self.pending_timestamp = None;
+            self.flush_at = 0.0;
+            None
+        }
+    }
+
+    /// `ConnectionManager::inc_connect`/`dec_connect` + `loop`.
+    fn on_connect_changed(&mut self, opened: bool, now: f64) -> Option<RealConnectionState> {
+        if opened {
+            self.connect_cnt += 1;
+        } else if self.connect_cnt > 0 {
+            self.connect_cnt -= 1;
+        }
+        self.loop_(now)
+    }
+
+    /// `StateManager::on_synchronized` + `loop`.
+    fn on_synchronized(&mut self, sync: bool, now: f64) -> Option<RealConnectionState> {
+        self.sync_flag = sync;
+        self.loop_(now)
+    }
 }
 
 impl UpdatesSink for TdSink {
@@ -201,6 +326,16 @@ impl UpdatesSink for TdSink {
     }
     fn on_chat(&mut self, chat: tdmtproto::telegram_api::Chat) {
         self.chats.push(chat);
+    }
+    /// `StateManager::on_synchronized(false)` — the
+    /// `before_get_difference` head (UpdatesManager.cpp:534).
+    fn on_before_get_difference(&mut self) {
+        self.connection_sync.push(false);
+    }
+    /// `StateManager::on_synchronized(true)` — the
+    /// `after_get_difference` tail (UpdatesManager.cpp:2366).
+    fn on_after_get_difference(&mut self) {
+        self.connection_sync.push(true);
     }
     /// `MessagesManager::process_pts_update` — the applied update switch:
     /// the new-message and delete kinds collect for the drain (the
@@ -2186,7 +2321,6 @@ impl crate::messages_manager::DialogReactionsContext for Td {
 enum PendingNetKind {
     Auth(AuthPendingKind),
     GetMe,
-    GetState,
     /// The PhoneNumberManager plane (the glue slice): the change-phone /
     /// verify-phone / confirm-ownership queries.
     Phone(PhonePendingKind),
@@ -2406,6 +2540,10 @@ pub struct Td {
     /// single Td timeout slot with the config expire time — the earliest
     /// wins, and the fired timeout re-loops both state machines).
     recoverer_wakeup_at: f64,
+    /// The `StateManager` reducer — the connection-token count, the
+    /// Updates sync flag and the debounced flush whose deadline joins the
+    /// same Td timeout slot (the C++ actor carries its own timer).
+    state_manager: StateManagerState,
     /// Tests pin the recoverer's clocks here (the production driver reads
     /// the process clock; the loop's gates are real-time seconds).
     #[cfg(test)]
@@ -3029,6 +3167,7 @@ impl Td {
             config_recoverer: None,
             pending_recoverer_fetches: Vec::new(),
             recoverer_wakeup_at: 0.0,
+            state_manager: StateManagerState::default(),
             #[cfg(test)]
             recoverer_clock: None,
             global: Global::new(),
@@ -3372,16 +3511,50 @@ impl Td {
             self.option_manager = Some(option_manager);
         }
         // The option storm starts with unix_time (the C++ ctor broadcasts
-        // it before utc_time_offset and the store entries).
-        self.send_update(Object::updateOption(td_api::updateOption {
-            name: "unix_time".to_string(),
-            value: Some(td_api::OptionValue::optionValueInteger(
-                td_api::optionValueInteger {
-                    value: tdutils::time::now() as i64,
-                },
-            )),
-        }));
+        // it before utc_time_offset and the store entries) — the queued
+        // `attach_pmc` emission carries it with the corrected clock; a
+        // second manual one used to leak the process-monotonic ~0.
         self.flush_option_updates();
+
+        // `NetStatsManager::start_up`'s `net_stats_since` bookkeeping
+        // (NetStatsManager.cpp:210-230): the C++ creates the manager at
+        // Td.cpp:875-876 when the option is still at its init-time default
+        // (a client sets disable_network_statistics later), and start_up
+        // seeds the marker on a fresh install or repairs it against the
+        // authorization date on reopen. The stats collection itself is the
+        // net step; this is the on-disk parity half.
+        if !self
+            .option_manager
+            .as_ref()
+            .map(|options| options.get_option_boolean("disable_network_statistics", false))
+            .unwrap_or(false)
+        {
+            let unix_time = self.global.unix_time();
+            let since_str = self.global.binlog_pmc().get("net_stats_since");
+            if since_str.is_empty() {
+                // approximate since_total by first run date for new users
+                self.global
+                    .binlog_pmc()
+                    .set("net_stats_since", &unix_time.to_string());
+            } else {
+                let since = since_str.trim().parse::<i64>().unwrap_or(0);
+                let authorization_date = self
+                    .option_manager
+                    .as_ref()
+                    .map(|options| options.get_option_integer("authorization_date", 0))
+                    .unwrap_or(0);
+                if (unix_time as i64) < since {
+                    self.global
+                        .binlog_pmc()
+                        .set("net_stats_since", &(unix_time as i64).to_string());
+                } else if since < authorization_date - 3600 {
+                    let repaired = authorization_date.clamp(i32::MIN as i64, i32::MAX as i64);
+                    self.global
+                        .binlog_pmc()
+                        .set("net_stats_since", &repaired.to_string());
+                }
+            }
+        }
 
         // VLOG "Create ConnectionCreator" (Td.cpp:1049, before the
         // ConfigManager): the `start_up` dc-options pmc replay runs now —
@@ -4090,13 +4263,51 @@ impl Td {
         // pinned.
         self.drain_file_shared();
 
-        // ConnectionStateManager::start_up: the initial real state.
+        // ConnectionStateManager::start_up: the StateManager's initial
+        // flush (Empty → Connecting, no delay — the live gate pinned this
+        // slot; the reducer owns the state from here on).
+        if let Some(state) = self.state_manager.loop_(tdutils::time::now()) {
+            self.send_real_connection_state(state);
+        }
+    }
+
+    /// `ConnectionStateManager::on_connection_state_changed` →
+    /// `get_update_connection_state_object` — the debounced flush's
+    /// emission; skipped under the close flag exactly like the C++
+    /// (ConnectionStateManager.cpp:31-33). The flush also feeds the
+    /// ConfigRecoverer's `StateCallback::on_state` leg
+    /// (ConfigManager.cpp:804-807) — a sustained Connecting problem is
+    /// what drives its full-config fetch, whose handshake stores the
+    /// `config_recovery_auth<N>` key.
+    fn send_real_connection_state(&mut self, state: RealConnectionState) {
+        if self.close_flag != 0 {
+            return;
+        }
+        let recoverer_state = match state {
+            RealConnectionState::WaitingForNetwork => RecovererConnectionState::WaitingForNetwork,
+            RealConnectionState::Connecting => RecovererConnectionState::Connecting,
+            RealConnectionState::Updating => RecovererConnectionState::Updating,
+            RealConnectionState::Ready => RecovererConnectionState::Ready,
+        };
+        self.on_recoverer_connection_state(recoverer_state);
+        let state = match state {
+            RealConnectionState::WaitingForNetwork => {
+                td_api::ConnectionState::connectionStateWaitingForNetwork(
+                    td_api::connectionStateWaitingForNetwork,
+                )
+            }
+            RealConnectionState::Connecting => td_api::ConnectionState::connectionStateConnecting(
+                td_api::connectionStateConnecting,
+            ),
+            RealConnectionState::Updating => {
+                td_api::ConnectionState::connectionStateUpdating(td_api::connectionStateUpdating)
+            }
+            RealConnectionState::Ready => {
+                td_api::ConnectionState::connectionStateReady(td_api::connectionStateReady)
+            }
+        };
         self.send_update(Object::updateConnectionState(
-            td_api::updateConnectionState {
-                state: Some(td_api::ConnectionState::connectionStateConnecting(
-                    td_api::connectionStateConnecting,
-                )),
-            },
+            td_api::updateConnectionState { state: Some(state) },
         ));
     }
 
@@ -4382,6 +4593,68 @@ impl Td {
             // just in case (updateAuthorizationState still passes)
             if !matches!(object, Object::updateAuthorizationState(_)) {
                 return;
+            }
+        }
+        // The per-update `Sending update:` logs (Td.cpp:1365-1393): a
+        // nine-id whitelist collapses to one line, `updateOption` logs
+        // its full pretty form for non-bots only, and the default branch
+        // logs the pretty form (the C++ `updateDefaultReactionType::ID/2`
+        // case is an integer-division pun that never matches — skipped).
+        match &object {
+            Object::updateAccentColors(_)
+            | Object::updateEmojiChatThemes(_)
+            | Object::updateFavoriteStickers(_)
+            | Object::updateInstalledStickerSets(_)
+            | Object::updateProfileAccentColors(_)
+            | Object::updateRecentStickers(_)
+            | Object::updateSavedAnimations(_)
+            | Object::updateSavedNotificationSounds(_)
+            | Object::updateUserStatus(_) => {
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::TD_REQUESTS,
+                    "td_requests",
+                    at "Td.cpp",
+                    1374,
+                    "Sending update: {}",
+                    oneline(&object.to_debug_string())
+                );
+            }
+            Object::updateTrendingStickerSets(update) => {
+                let sticker_sets = update.sticker_sets.as_ref();
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::TD_REQUESTS,
+                    "td_requests",
+                    at "Td.cpp",
+                    1379,
+                    "Sending update: updateTrendingStickerSets {{ {}, total_count = {}, count = {} }}",
+                    update
+                        .sticker_type
+                        .as_ref()
+                        .map(|ty| oneline(&ty.to_debug_string()))
+                        .unwrap_or_default(),
+                    sticker_sets.map(|sets| sets.total_count).unwrap_or(0),
+                    sticker_sets.map(|sets| sets.sets.len()).unwrap_or(0)
+                );
+            }
+            Object::updateOption(_) if !self.auth_manager.is_bot() => {
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::TD_REQUESTS,
+                    "td_requests",
+                    at "Td.cpp",
+                    1386,
+                    "Sending update: {}",
+                    object.to_debug_string()
+                );
+            }
+            _ => {
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::TD_REQUESTS,
+                    "td_requests",
+                    at "Td.cpp",
+                    1393,
+                    "Sending update: {}",
+                    object.to_debug_string()
+                );
             }
         }
         let Some(callback) = self.callback.as_mut() else {
@@ -4670,6 +4943,13 @@ impl Td {
         {
             expire_time = storage_gc_deadline;
         }
+        // The StateManager's debounced flush deadline joins it too — the
+        // C++ actor's own `set_timeout_at` (StateManager.cpp loop).
+        if self.state_manager.flush_at != 0.0
+            && (expire_time == 0.0 || self.state_manager.flush_at < expire_time)
+        {
+            expire_time = self.state_manager.flush_at;
+        }
         if expire_time == 0.0 {
             self.cancel_timeout();
         } else {
@@ -4777,9 +5057,12 @@ impl Td {
         if let Some(dc_options) = &actions.connection_creator_dc_options {
             self.send_connection_creator_dc_options(dc_options);
         }
-        if let Some(at) = actions.wakeup_at {
-            self.recoverer_wakeup_at = at;
-        }
+        // `None` means the recoverer's actor timer is unset — the C++
+        // `set_timeout_at(Timestamp::at(0))` cancel. A stale past value
+        // left here re-armed an already-expired deadline through the
+        // shared Td timeout slot in a microsecond hot loop (the
+        // 100k-Event::Timeout storm in the s10+ live logs).
+        self.recoverer_wakeup_at = actions.wakeup_at.unwrap_or(0.0);
         self.sync_config_timeout();
     }
 
@@ -5030,6 +5313,17 @@ impl Td {
                         dc_auth_manager.update_auth_key_state(raw_dc_id);
                     }
                 }
+                NetEvent::ConnectOpened | NetEvent::ConnectClosed => {
+                    // `ConnectionManager::inc/dec_connect` + `loop` —
+                    // the token-count half of the connection state.
+                    let opened = matches!(event, NetEvent::ConnectOpened);
+                    if let Some(state) = self
+                        .state_manager
+                        .on_connect_changed(opened, tdutils::time::now())
+                    {
+                        self.send_real_connection_state(state);
+                    }
+                }
                 NetEvent::SignInMainDc { raw_dc_id } => {
                     // Session.cpp:902-904 — the sign-in answers set the
                     // main DC (the dispatcher dedups).
@@ -5224,41 +5518,15 @@ impl Td {
                     ),
                 }
             }
-            PendingNetKind::GetState => {
-                if let Some(data) = answer
-                    && let Ok(m) = telegram_api::updates_State::parse(data)
-                {
-                    // The M.7 engine: `updates.getState` replays through
-                    // on_get_updates_state (the C++ get_difference chain);
-                    // the S72 set_pts/set_qts/set_seq calls are superseded.
-                    let net = self.updates_net();
-                    let global = &mut self.global;
-                    let options = self
-                        .option_manager
-                        .as_mut()
-                        .expect("option manager exists after init");
-                    let mut env = TdUpdatesEnv {
-                        global,
-                        options,
-                        auth_is_authorized: self.auth_manager.is_authorized(),
-                        auth_is_bot: self.auth_manager.is_bot(),
-                        my_id: self.user_manager.get_my_id().get(),
-                        can_ignore_background_updates: self.can_ignore_background_updates,
-                        net,
-                    };
-                    self.updates_manager
-                        .on_get_updates_state(&mut env, m, "updates.getState");
-                    self.drain_sink();
-                }
-            }
         }
     }
 
     /// The `SendMessageQuery::on_result`/`on_error` (MessagesManager.cpp:1251-1290)
     /// over the collapsed actor shape: the short-sent arm feeds the
-    /// sent-text update + the `updateSentMessage` pts synthetic; the
-    /// updates arm runs `check_send_message_result` + the difference
-    /// pump; the error arm runs the fail ladder.
+    /// sent-text content swap, then the pts synthetic (the channel arm
+    /// rides the channel-pts machine); the updates arm runs
+    /// `check_send_message_result` + the difference pump; the error arm
+    /// runs the fail ladder.
     fn on_send_message_answer(
         &mut self,
         random_id: i64,
@@ -5519,6 +5787,12 @@ impl Td {
                 self.send_result(request_id, ok_object());
             }
             tdutils::status::Result::Err(status) => {
+                // A failed bot-token query still completes it — the C++
+                // `on_result` clears `net_query_type_` on errors too
+                // (AuthManager.cpp:1571).
+                if matches!(kind, AuthPendingKind::BotToken) {
+                    self.auth_manager.abort_bot_token_query();
+                }
                 self.send_error_impl(request_id, 400, status.message())
             }
         }
@@ -6518,6 +6792,16 @@ impl Td {
         }
 
         if self.request_set.remove(&id) {
+            // Td.cpp:1409 — the td_requests result log (pretty form).
+            tdutils::vlog!(
+                tdutils::logging::verbosity::TD_REQUESTS,
+                "td_requests",
+                at "Td.cpp",
+                1409,
+                "Sending result for request {}: {}",
+                id,
+                object.to_debug_string()
+            );
             let Some(callback) = self.callback.as_mut() else {
                 return;
             };
@@ -6534,6 +6818,22 @@ impl Td {
                     self.close_flag
                 );
             }
+            // Td.cpp:1424 — the td_requests error log (oneline).
+            tdutils::vlog!(
+                tdutils::logging::verbosity::TD_REQUESTS,
+                "td_requests",
+                at "Td.cpp",
+                1424,
+                "Sending error for request {}: {}",
+                id,
+                oneline(
+                    &td_api::Error {
+                        code,
+                        message: message.to_string(),
+                    }
+                    .to_debug_string()
+                )
+            );
             let Some(callback) = self.callback.as_mut() else {
                 return;
             };
@@ -6957,62 +7257,63 @@ impl Td {
     /// ok, `connectionStateUpdating`, the default reaction type and
     /// `connectionStateReady`.
     fn complete_authorization(&mut self, request_id: u64, user: Option<&telegram_api::user>) {
-        self.send_update(Object::updateOption(td_api::updateOption {
-            name: "unix_time".to_string(),
-            value: Some(td_api::OptionValue::optionValueInteger(
-                td_api::optionValueInteger {
-                    value: tdutils::time::now() as i64,
-                },
-            )),
-        }));
-
-        // The config-derived options arrive from the ConfigManager's own
-        // `help.getConfig` fetch (dispatched at init — the M.3.8 wiring);
-        // the recorder pins their position, the manager their order.
-        self.send_update(Object::updateOption(td_api::updateOption {
-            name: "authorization_date".to_string(),
-            value: Some(td_api::OptionValue::optionValueInteger(
-                td_api::optionValueInteger {
-                    value: tdutils::time::now() as i64,
-                },
-            )),
-        }));
+        // `AuthManager::on_get_authorization` (AuthManager.cpp:1499-1507):
+        // `authorization_date` persists through the option manager with the
+        // server-corrected clock (the stream position matches the old manual
+        // emission), then the reopen markers land on the binlog pmc —
+        // `auth`/`auth_is_bot` are what a restart reads to skip
+        // re-authorization.
+        let authorization_date = self.global.unix_time() as i64;
+        if let Some(option_manager) = self.option_manager.as_mut() {
+            option_manager.set_option_integer("authorization_date", authorization_date);
+        }
+        self.flush_option_updates();
+        if self.auth_manager.is_bot() {
+            self.global.binlog_pmc().set("auth_is_bot", "true");
+        }
+        self.global.binlog_pmc().set("auth", "ok");
         if let Some(user) = user {
             self.apply_self_user(user, true);
         }
         self.flush_auth_updates();
         self.send_result(request_id, ok_object());
 
-        self.send_update(Object::updateConnectionState(
-            td_api::updateConnectionState {
-                state: Some(td_api::ConnectionState::connectionStateUpdating(
-                    td_api::connectionStateUpdating,
-                )),
-            },
-        ));
-        self.send_update(Object::updateDefaultReactionType(
-            td_api::updateDefaultReactionType {
-                reaction_type: Some(td_api::ReactionType::reactionTypeEmoji(
-                    td_api::reactionTypeEmoji {
-                        emoji: "❤".to_string(),
-                    },
-                )),
-            },
-        ));
-        self.send_update(Object::updateConnectionState(
-            td_api::updateConnectionState {
-                state: Some(td_api::ConnectionState::connectionStateReady(
-                    td_api::connectionStateReady,
-                )),
-            },
-        ));
+        // `updateConnectionState` Updating/Ready need no manual emission
+        // here — the C++'s pair comes from the get-difference sync flag
+        // (`before_get_difference`/`after_get_difference` →
+        // StateManager::on_synchronized), which the reducer now carries;
+        // the query below starts that chain.
+        // `updateDefaultReactionType` needs no manual emission either — the
+        // C++ emits it from `process_config`'s `default_reaction` write
+        // (ConfigManager.cpp:1280-1285) when the config answer arrives,
+        // which also persists the option for the reopen replay.
 
-        // The post-Ready position: `updates.getState` seeds the pts (the
-        // C++ get_difference chain; the skeleton parks the query — the
-        // answer replays through the M.7 engine on the drain side).
-        let function = telegram_api::Function::updates_getState(telegram_api::updates_getState);
-        let token = self.park_net(0, PendingNetKind::GetState);
-        self.dispatch_walking_query(token, function, AuthFlag::On);
+        // The post-Ready get-difference entry — AuthManager.cpp:1555's
+        // `updates_manager_->get_difference("on_get_authorization")`:
+        // with unknown pts it runs the initial sync chain
+        // (`before_get_difference(true)` + `updates.getState` over the
+        // env), whose answer finishes through `after_get_difference` —
+        // the sync-flag pair drives the reducer's Updating/Ready.
+        {
+            let net = self.updates_net();
+            let global = &mut self.global;
+            let options = self
+                .option_manager
+                .as_mut()
+                .expect("option manager exists after init");
+            let mut env = TdUpdatesEnv {
+                global,
+                options,
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                my_id: self.user_manager.get_my_id().get(),
+                can_ignore_background_updates: self.can_ignore_background_updates,
+                net,
+            };
+            self.updates_manager
+                .get_difference(&mut env, "on_get_authorization");
+        }
+        self.drain_sink();
 
         // the live `on_get_authorization` init (AuthManager.cpp:1545); the
         // C++ fires it after every manager init above — the notification
@@ -7022,6 +7323,20 @@ impl Td {
         self.on_web_browser_authorization_success();
         self.init_theme_manager();
         self.init_story_manager();
+        // AuthManager.cpp:1557-1559 — user logins mark the read-mark sweep
+        // done; bots never fetch them.
+        if !self.auth_manager.is_bot() {
+            self.global.binlog_pmc().set("fetched_marks_as_unread", "1");
+        }
+        // AuthManager.cpp:1560 — `request_config(false)` at authorization
+        // success; a no-op while the start_up fetch is still in flight
+        // (the `config_sent_cnt` gate).
+        let config_actions = self
+            .config_manager
+            .as_mut()
+            .map(|config_manager| config_manager.request_config(false, self.close_flag != 0))
+            .unwrap_or_default();
+        self.apply_config_actions(config_actions);
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -7187,6 +7502,18 @@ impl Td {
     /// Converts and emits what the sink collected.
     fn drain_sink(&mut self) {
         let sink = std::mem::take(self.updates_manager.sink());
+        // `StateManager::on_synchronized` — the get-difference sync half
+        // of the connection state, applied as the C++ fires it inside
+        // before/after_get_difference.
+        for sync in sink.connection_sync {
+            if let Some(state) = self
+                .state_manager
+                .on_synchronized(sync, tdutils::time::now())
+            {
+                self.send_real_connection_state(state);
+            }
+            self.sync_config_timeout();
+        }
         // the users feed the UserManager container first — the C++
         // `process_updates_users_and_chats` tail (`td_->user_manager_->
         // on_get_user`, UpdatesManager.cpp:1594-1600); the send path's
@@ -9735,6 +10062,13 @@ impl Actor for Td {
             .unwrap_or_default();
         self.apply_config_actions(actions);
 
+        // The StateManager's debounced flush (the C++ actor's own
+        // `set_timeout_at`): the armed deadline fires the pending state.
+        if let Some(state) = self.state_manager.loop_(tdutils::time::now()) {
+            self.send_real_connection_state(state);
+        }
+        self.sync_config_timeout();
+
         let environment = self.recoverer_env();
         let actions = self
             .config_recoverer
@@ -11274,6 +11608,31 @@ impl FunctionKind {
 
 fn ok_object() -> Object {
     Object::ok(td_api::Ok)
+}
+
+/// `td::oneline` (misc.cpp:69-86): newlines collapse to single spaces
+/// (dropping the indentation that follows them) and trailing spaces trim.
+fn oneline(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut after_new_line = true;
+    for c in s.chars() {
+        if c != '\n' && c != '\r' {
+            if after_new_line {
+                if c == ' ' {
+                    continue;
+                }
+                after_new_line = false;
+            }
+            result.push(c);
+        } else if !after_new_line {
+            after_new_line = true;
+            result.push(' ');
+        }
+    }
+    while result.ends_with(' ') {
+        result.pop();
+    }
+    result
 }
 
 /// `td::trim` — C `isspace` semantics (space, \t, \n, \v, \f, \r); Rust's
@@ -20856,6 +21215,177 @@ mod tests {
     }
 
     #[test]
+    fn complete_authorization_writes_the_reopen_markers() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(complete_authorization_writes_the_reopen_markers_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn state_manager_reducer_follows_the_cpp_lifecycle() {
+        // The C++ fresh-login lifecycle (StateManager.cpp): the initial
+        // Connecting flush from Empty, Ready on the first connection,
+        // Connecting again when it drops, and the Updating/Ready pair from
+        // the get-difference sync flag — with the UP/DOWN hysteresis.
+        let mut reducer = StateManagerState::default();
+        let t = 100.0;
+
+        // start_up → loop: Empty → Connecting, no delay.
+        assert_eq!(reducer.loop_(t), Some(RealConnectionState::Connecting));
+
+        // First connection up → Ready after the UP_DELAY.
+        assert_eq!(reducer.on_connect_changed(true, t), None);
+        assert_eq!(
+            reducer.loop_(t + StateManagerState::UP_DELAY),
+            Some(RealConnectionState::Ready)
+        );
+
+        // Connection dropped → Connecting after the DOWN_DELAY.
+        assert_eq!(reducer.on_connect_changed(false, t + 1.0), None);
+        assert_eq!(
+            reducer.loop_(t + 1.0 + StateManagerState::DOWN_DELAY),
+            Some(RealConnectionState::Connecting)
+        );
+
+        // Reconnected, then the get-difference pair: before → Updating,
+        // after → Ready.
+        assert_eq!(reducer.on_connect_changed(true, t + 2.0), None);
+        assert_eq!(
+            reducer.loop_(t + 2.0 + StateManagerState::UP_DELAY),
+            Some(RealConnectionState::Ready)
+        );
+        assert_eq!(
+            reducer.on_synchronized(false, t + 3.0),
+            None,
+            "Ready → Updating rides the DOWN_DELAY"
+        );
+        assert_eq!(
+            reducer.loop_(t + 3.0 + StateManagerState::DOWN_DELAY),
+            Some(RealConnectionState::Updating)
+        );
+        assert_eq!(
+            reducer.on_synchronized(true, t + 4.0),
+            None,
+            "Updating → Ready rides the UP_DELAY"
+        );
+        assert_eq!(
+            reducer.loop_(t + 4.0 + StateManagerState::UP_DELAY),
+            Some(RealConnectionState::Ready)
+        );
+
+        // A sync flap shorter than the DOWN_DELAY never flushes — the
+        // hysteresis that suppresses get-difference flapping.
+        assert_eq!(reducer.on_synchronized(false, t + 5.0), None);
+        assert_eq!(reducer.on_synchronized(true, t + 5.01), None);
+        assert_eq!(reducer.loop_(t + 6.0), None, "the blip was superseded");
+    }
+
+    fn complete_authorization_writes_the_reopen_markers_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("auth-markers");
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+        // completion parks the post-Ready `updates.getState` on the
+        // dispatcher — the recording sink keeps it off the wire.
+        let rec = Arc::new(RecNetSession {
+            sent: parking_lot::Mutex::new(Vec::new()),
+        });
+        let dispatcher = NetQueryDispatcher::new(
+            Box::new(RecNetSessionHandle(rec.clone())),
+            Box::new(NullConfigSink),
+            Box::new(AcceptingDcInitSink),
+        );
+        dispatcher.mark_dc_inited(1);
+        td.net_query_dispatcher = Some(Arc::new(dispatcher));
+
+        // the bot-token arm settles `is_bot` before completion — the
+        // `was_check_bot_token_` marker follows it (AuthManager.cpp:1503-1507)
+        td.auth_manager
+            .on_bot_token_result(crate::auth_manager::AuthNetResult::Authorization {
+                user_id: Some(7000000001),
+                terms_of_service: None,
+            })
+            .unwrap();
+        td.complete_authorization(
+            21,
+            Some(&telegram_api::user {
+                id: 7000000001,
+                self_: true,
+                bot: true,
+                first_name: "TestBot".to_owned(),
+                ..telegram_api::user::default()
+            }),
+        );
+
+        // the reopen markers on the binlog pmc — what a restart reads to
+        // skip re-authorization
+        assert_eq!(td.global.binlog_pmc().get("auth"), "ok");
+        assert_eq!(td.global.binlog_pmc().get("auth_is_bot"), "true");
+        // `UserManager::set_my_id` mirrors my_id onto the same pmc
+        assert_eq!(td.global.binlog_pmc().get("my_id"), "7000000001");
+        // bots never mark the read-mark sweep done (AuthManager.cpp:1557)
+        assert_eq!(td.global.binlog_pmc().get("fetched_marks_as_unread"), "");
+
+        // authorization_date persists through the option manager with the
+        // server-corrected clock — unix-scale, not the process-monotonic ~0
+        let authorization_date = td
+            .option_manager
+            .as_ref()
+            .expect("the initialized option manager")
+            .get_option_integer("authorization_date", -1);
+        assert!(
+            authorization_date > 1_600_000_000,
+            "unix-scale authorization_date, got {authorization_date}"
+        );
+
+        // the completion stream: authorization_date exactly once, and no
+        // unix_time emission of its own — the remaining unix_time updates
+        // (init + server-time shifts) are C++-parity; completion used to
+        // add one carrying the process-monotonic ~0
+        let option_updates = callback
+            .responses
+            .lock()
+            .iter()
+            .filter(|(id, _)| *id == 0)
+            .filter_map(|(_, object)| match object {
+                Object::updateOption(update) => {
+                    let value = match update.value.as_ref() {
+                        Some(td_api::OptionValue::optionValueInteger(v)) => v.value,
+                        _ => 0,
+                    };
+                    Some((update.name.clone(), value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            option_updates
+                .iter()
+                .filter(|(name, _)| name == "authorization_date")
+                .count(),
+            1
+        );
+        for (name, value) in &option_updates {
+            if name == "unix_time" {
+                assert!(
+                    *value > 1_600_000_000,
+                    "unix-scale unix_time, got {value} — the process-monotonic clock leaked"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn message_dialog_requests_dispatch() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -21344,8 +21874,24 @@ mod tests {
     fn get_updates_state_then_get_difference_rides_the_dispatcher_impl() {
         let (mut td, rec) = netted_td("netfix-gus-gd");
 
-        // 1. The engine's pts starts at 0 after the parameters restore, so
-        //    the first get_difference dispatches the real query.
+        // 1. The engine's pts starts at the unknown sentinel
+        //    (PtsManager.h:53-54), so the first get_difference dispatches
+        //    getState — the initial sync chain (the C++ init_state route).
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "one getState dispatch");
+        assert_eq!(sent[0].tl_constructor(), telegram_api::updates_getState::ID);
+        // A pts-0 answer would leave the unknown sentinel in place
+        // (`add_pts` only moves on pts > 0, exactly like the C++) — seed
+        // a real baseline.
+        net_complete(sent.into_iter().next().unwrap(), state_answer(1, 0, 0));
+        td.dispatch_completed_updates_net();
+
+        // 2. With the pts known, the next get_difference dispatches the
+        //    real query.
         {
             let mut env = mk_env!(td);
             td.updates_manager.get_difference(&mut env, "test");
@@ -21413,6 +21959,21 @@ mod tests {
 
     fn get_difference_failure_ladder_reroutes_impl() {
         let (mut td, rec) = netted_td("netfix-gd-fail");
+
+        // The fresh engine's pts is the unknown sentinel — run the initial
+        // getState chain first (the C++ init_state route), so the ladder
+        // below exercises the real getDifference failure path.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        // A pts-0 answer would leave the unknown sentinel in place
+        // (`add_pts` only moves on pts > 0, exactly like the C++) — seed
+        // a real baseline.
+        net_complete(sent.into_iter().next().unwrap(), state_answer(1, 0, 0));
+        td.dispatch_completed_updates_net();
 
         {
             let mut env = mk_env!(td);

@@ -683,6 +683,16 @@ pub struct AuthManager {
     api_id: i32,
     api_hash: String,
     is_bot: bool,
+    /// The `net_query_type_ == NetQueryType::BotAuthentication` half of
+    /// C++ `is_bot()` (AuthManager.h:31-32): true while the bot-token
+    /// query is in flight, i.e. from its dispatch
+    /// (`start_net_query(BotAuthentication)`, AuthManager.cpp:477-480)
+    /// until its result resets the type (AuthManager.cpp:1571). Without
+    /// it every is_bot gate — the ConfigManager app-config pair included —
+    /// sees false in the window where the config answer beats the token
+    /// answer, and a bot processes app config (the 2026-09-29 parity
+    /// compare found the resulting option wave).
+    bot_authentication_in_flight: bool,
     phone_number: String,
     send_code_helper: SendCodeHelper,
     wait_password_state: WaitPasswordState,
@@ -763,9 +773,10 @@ impl AuthManager {
         )
     }
 
-    /// `AuthManager::is_bot`.
+    /// `AuthManager::is_bot` (AuthManager.h:31-32): the settled flag OR a
+    /// bot-token query still in flight.
     pub fn is_bot(&self) -> bool {
-        self.is_bot
+        self.is_bot || self.bot_authentication_in_flight
     }
 
     /// `AuthManager::get_state`.
@@ -1079,10 +1090,17 @@ impl AuthManager {
         if token.is_empty() {
             return Err("Bot token must be non-empty".to_string());
         }
+        // `start_net_query(NetQueryType::BotAuthentication, …)`
+        // (AuthManager.cpp:477-480) — the dispatch that makes `is_bot()`
+        // true until the query's result arrives.
+        self.bot_authentication_in_flight = true;
         Ok(AuthNetQuery::BotToken { token })
     }
 
     pub fn on_bot_token_result(&mut self, result: AuthNetResult) -> Result<(), String> {
+        // `net_query_type_ = NetQueryType::None` (AuthManager.cpp:1571) —
+        // the in-flight half of `is_bot()` ends with the result.
+        self.bot_authentication_in_flight = false;
         match result {
             AuthNetResult::Authorization {
                 user_id: Some(_), ..
@@ -1102,6 +1120,15 @@ impl AuthManager {
                 std::mem::discriminant(&other)
             )),
         }
+    }
+
+    /// The error-answer half of the in-flight reset: a failed bot-token
+    /// query completes it too — the C++ `on_result` clears
+    /// `net_query_type_` on errors before the handler runs
+    /// (AuthManager.cpp:1571); without the clear `is_bot()` would stay
+    /// true for the rest of the session.
+    pub fn abort_bot_token_query(&mut self) {
+        self.bot_authentication_in_flight = false;
     }
 
     pub fn check_authentication_bot_token(
@@ -1395,10 +1422,20 @@ impl AuthManager {
         self.destroy_auth_keys_impl();
     }
 
-    /// `AuthManager::on_closing(destroy_flag)` (cpp:996-1001).
-    pub fn on_closing(&mut self, _destroy_flag: bool) {
-        if !self.was_authorized() {
-            self.update_state(State::Closing);
+    /// `AuthManager::on_closing(destroy_flag)` (cpp:996-1001): the close
+    /// transition emits `authorizationStateClosing` from ANY prior state —
+    /// authorized sessions included (destroy maps to LoggingOut instead).
+    /// The old `!was_authorized()` guard here was inverted: it silenced
+    /// Closing exactly for real sessions (the 2026-09-29 parity report's
+    /// finding #5).
+    pub fn on_closing(&mut self, destroy_flag: bool) {
+        let new_state = if destroy_flag {
+            State::LoggingOut
+        } else {
+            State::Closing
+        };
+        if new_state != self.state {
+            self.update_state(new_state);
         }
     }
 
@@ -1691,6 +1728,88 @@ mod tests {
                 update,
                 Object::updateAuthorizationState(u)
                     if matches!(u.authorization_state, Some(td_api::AuthorizationState::authorizationStateReady(_)))
+            )
+        }));
+    }
+
+    #[test]
+    fn bot_token_query_makes_is_bot_true_while_in_flight() {
+        let mut manager = AuthManager::new();
+        manager.restore_from_pmc("", false, String::new());
+        assert!(!manager.is_bot());
+
+        // The dispatch half (AuthManager.h:31-32): a bot-token query in
+        // flight counts as is_bot — the ConfigManager app-config gates
+        // rely on it in the window where the config answer beats the
+        // token answer (the 2026-09-29 parity compare).
+        manager
+            .prepare_check_authentication_bot_token("42:abc".to_string())
+            .unwrap();
+        assert!(manager.is_bot());
+
+        // The result half (AuthManager.cpp:1571): any answer — error or
+        // authorization — resets the in-flight type; the settled flag
+        // carries is_bot from there.
+        manager
+            .on_bot_token_result(AuthNetResult::Authorization {
+                user_id: Some(42),
+                terms_of_service: None,
+            })
+            .unwrap();
+        assert!(manager.is_bot());
+        assert!(manager.is_authorized());
+
+        // On a fresh manager an errored answer leaves the settled flag
+        // untouched — only the in-flight half clears.
+        let mut fresh = AuthManager::new();
+        fresh.restore_from_pmc("", false, String::new());
+        fresh
+            .prepare_check_authentication_bot_token("43:def".to_string())
+            .unwrap();
+        assert!(fresh.is_bot());
+        assert!(fresh.on_bot_token_result(AuthNetResult::LoggedOut).is_err());
+        assert!(
+            !fresh.is_bot(),
+            "an answered query clears the in-flight half"
+        );
+    }
+
+    #[test]
+    fn on_closing_emits_closing_from_any_state() {
+        // finding #5 of the 2026-09-29 parity report: an AUTHORIZED session
+        // must still emit authorizationStateClosing on close — the old
+        // `!was_authorized()` guard silenced exactly the real sessions.
+        let mut manager = AuthManager::new();
+        manager.restore_from_pmc("", false, String::new());
+        manager
+            .prepare_check_authentication_bot_token("42:abc".to_string())
+            .unwrap();
+        manager
+            .on_bot_token_result(AuthNetResult::Authorization {
+                user_id: Some(42),
+                terms_of_service: None,
+            })
+            .unwrap();
+        assert!(manager.is_authorized());
+
+        manager.on_closing(false);
+        assert!(manager.take_updates().iter().any(|update| {
+            matches!(
+                update,
+                Object::updateAuthorizationState(a)
+                    if matches!(a.authorization_state, Some(td_api::AuthorizationState::authorizationStateClosing(_)))
+            )
+        }));
+
+        // destroy maps to LoggingOut instead (AuthManager.cpp:997)
+        let mut fresh = AuthManager::new();
+        fresh.restore_from_pmc("", false, String::new());
+        fresh.on_closing(true);
+        assert!(fresh.take_updates().iter().any(|update| {
+            matches!(
+                update,
+                Object::updateAuthorizationState(a)
+                    if matches!(a.authorization_state, Some(td_api::AuthorizationState::authorizationStateLoggingOut(_)))
             )
         }));
     }

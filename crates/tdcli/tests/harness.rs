@@ -81,6 +81,27 @@ fn normalize(stderr: &str) -> Vec<String> {
             in_failed_send = true;
             continue;
         }
+        // The td_requests receive bookends (Client.cpp:281/294) race the
+        // command processing and print raw object pointers — the same
+        // racy-startup class as the blocks below.
+        if line.contains("Begin to wait for updates with timeout")
+            || line.contains("End to wait for updates, returning object")
+        {
+            continue;
+        }
+        // The `Sending update:` dumps (Td.cpp:1374-1393) and the oneline
+        // `Sending error/result` lines (:1409/:1424) carry the same race
+        // against the CMD stream; the multi-line body ends at the bare
+        // `}` like the request dumps above.
+        if line.contains("Sending update: ") {
+            in_failed_send = true;
+            continue;
+        }
+        if line.contains("Sending error for request ")
+            || line.contains("Sending result for request ")
+        {
+            continue;
+        }
         if skip_lines > 0 {
             skip_lines -= 1;
             continue;

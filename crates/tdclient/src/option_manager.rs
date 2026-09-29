@@ -73,11 +73,16 @@ pub fn is_synchronous_option(name: &str) -> bool {
     get_synchronous_options().contains(&name)
 }
 
-/// `td::get_git_commit_hash` — a non-cmake build reports "unknown"; the
-/// Rust port's build commit can be injected here once a build-script git
-/// probe exists (S79 packaging).
+/// `td::get_git_commit_hash` — the C++ bakes its td checkout's
+/// `git rev-parse HEAD` into the generated `git_version.h` at build time;
+/// the port reports the tracked upstream td commit instead (the same pin
+/// the tl-codegen schemes carry — update both in the sync step). The
+/// build-d1 C++ oracle reports its own older commit (`d1085f9c…`), so the
+/// values legitimately differ; the shape must not.
+const UPSTREAM_TD_COMMIT: &str = "42e6a5259551178d1dab54a22ad96d14bd906e20";
+
 pub fn get_git_commit_hash() -> &'static str {
-    "unknown"
+    UPSTREAM_TD_COMMIT
 }
 
 /// `OptionManager::get_option_synchronously` (the C++ `UNREACHABLE` on an

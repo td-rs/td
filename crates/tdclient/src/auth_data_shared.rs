@@ -80,9 +80,13 @@ pub(crate) enum NetEvent {
     },
     /// `AuthDataShared::set_auth_key`'s pmc write, for the raw DC (the
     /// `DcAuthManager` listeners fire separately).
-    PersistAuthKey { raw_dc_id: i32 },
+    PersistAuthKey {
+        raw_dc_id: i32,
+    },
     /// `AuthDataShared::set_future_salts`'s pmc write, for the raw DC.
-    PersistSalts { raw_dc_id: i32 },
+    PersistSalts {
+        raw_dc_id: i32,
+    },
     /// `NetQueryDispatcher::set_main_dc_id`'s binlog half
     /// (NetQueryDispatcher.cpp:444).
     PersistMainDc(i32),
@@ -91,19 +95,34 @@ pub(crate) enum NetEvent {
     MainDcChanged(i32),
     /// `NetQueryDispatcher::wait_dc_init`'s `DcAuthManager::add_dc`
     /// (NetQueryDispatcher.cpp:264-266), for the raw DC.
-    DcAdded { raw_dc_id: i32 },
+    DcAdded {
+        raw_dc_id: i32,
+    },
     /// An `AuthDataShared` listener ping — `DcAuthManager::
     /// update_auth_key_state`, for the raw DC.
-    AuthKeyChanged { raw_dc_id: i32 },
+    AuthKeyChanged {
+        raw_dc_id: i32,
+    },
+    /// The mtproto `ConnectionManager` token pair: `inc_connect` when a
+    /// raw connection is handed to its session (ConnectionCreator.cpp:956,
+    /// `set_connection_token`) and `dec_connect` when the connection
+    /// drops. The Td's `StateManager` port counts them — `Ready` iff the
+    /// count is positive.
+    ConnectOpened,
+    ConnectClosed,
     /// `Session::on_message_result_ok`'s sign-in tail: the response was
     /// `auth.authorization`/`auth.loginTokenSuccess`/`auth.sentCodeSuccess`
     /// (Session.cpp:899-910) — `set_main_dc_id(raw_dc_id_)` on the
     /// dispatcher.
-    SignInMainDc { raw_dc_id: i32 },
+    SignInMainDc {
+        raw_dc_id: i32,
+    },
     /// `Session::on_message_result_error`'s 401 main-DC tail
     /// (Session.cpp:963-967): `auth_data_.set_auth_flag(false)` +
     /// `G()->log_out(message)`.
-    Unauthorized { message: String },
+    Unauthorized {
+        message: String,
+    },
     /// A callback-less completed query — the C++ `Td::on_result` route
     /// (NetQueryDispatcher.cpp:38-46) through the parked-completions
     /// convention of the M.3.8 stand-in.
@@ -151,6 +170,8 @@ impl std::fmt::Debug for NetEvent {
                 .debug_struct("AuthKeyChanged")
                 .field("raw_dc_id", raw_dc_id)
                 .finish(),
+            NetEvent::ConnectOpened => f.debug_struct("ConnectOpened").finish(),
+            NetEvent::ConnectClosed => f.debug_struct("ConnectClosed").finish(),
             NetEvent::SignInMainDc { raw_dc_id } => f
                 .debug_struct("SignInMainDc")
                 .field("raw_dc_id", raw_dc_id)
