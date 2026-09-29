@@ -28,6 +28,7 @@ pub fn generate_td_api_rust() -> String {
             serde: true,
             json: true,
             tostring: true,
+            tostring_golden: true,
             samples_feature: None,
             raw_strings: false,
             source: "td_api.tl (tdlib 42e6a525)",
@@ -44,7 +45,8 @@ pub fn generate_telegram_api_rust() -> String {
             umbrella: "Function",
             serde: false,
             json: false,
-            tostring: false,
+            tostring: true,
+            tostring_golden: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: false,
             source: "telegram_api.tl (tdlib 42e6a525)",
@@ -63,6 +65,7 @@ pub fn generate_secret_api_rust() -> String {
             serde: false,
             json: false,
             tostring: false,
+            tostring_golden: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: true,
             source: "secret_api.tl (tdlib 42e6a525)",
@@ -81,6 +84,7 @@ pub fn generate_mtproto_api_rust() -> String {
             serde: false,
             json: false,
             tostring: false,
+            tostring_golden: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: true,
             source: "mtproto_api.tl (tdlib 42e6a525)",
@@ -99,6 +103,7 @@ pub fn generate_e2e_api_rust() -> String {
             serde: false,
             json: false,
             tostring: false,
+            tostring_golden: false,
             samples_feature: Some("conformance-samples"),
             raw_strings: true,
             source: "e2e_api.tl (tdlib 42e6a525)",
@@ -231,9 +236,11 @@ mod tests {
                 .map(|(_, t)| t.constructors.len())
                 .sum();
             let json_enums = if scheme == "td_api" { 2 } else { 0 };
-            // The td_api `TlStorerToString` (the C++ debug `to_string` storer,
-            // M.14.2) adds one more support struct alongside `tl::Reader`.
-            let tostring_struct = if scheme == "td_api" { 1 } else { 0 };
+            // The `TlStorerToString` support struct (the C++ debug
+            // `to_string` storer, M.14.2) adds one more struct alongside
+            // `tl::Reader` in every scheme generated with tostring (td_api
+            // and — since the receive-pipeline dumps — telegram_api).
+            let tostring_struct = usize::from(matches!(scheme, "td_api" | "telegram_api"));
             assert_eq!(
                 code.matches("pub struct ").count(),
                 (program.total_ctors - builtin_ctors) + program.total_funcs + 1 + tostring_struct,

@@ -95,10 +95,12 @@ pub struct WriterOpts {
     /// only; the other schemes have no JSON surface.
     pub json: bool,
     /// Emit the C++ `to_string` debug surface (`store_debug` +
-    /// `to_debug_string`, M.14.2) — td_api only: the CLI prints responses
-    /// through td's `TlStorerToString` format, so the port needs the same
-    /// dynamic `to_string(const BaseObject&)` surface the C++ CLI reads.
+    /// `to_debug_string`, M.14.2). td_api uses it for the CLI responses;
+    /// telegram_api for the UpdatesManager `Receive from …` log dumps.
     pub tostring: bool,
+    /// Emit the td_api-typed tostring golden test (the format pins) —
+    /// only valid for the td_api scheme.
+    pub tostring_golden: bool,
     /// Also compile the sample synthesizers outside `cfg(test)`, behind this
     /// cargo feature of the including crate — the S15 replay oracle bins
     /// build with it (`conformance-samples`).
@@ -428,7 +430,7 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
         }
     }
 
-    if opts.tostring {
+    if opts.tostring_golden {
         emit_tostring_golden_test(out);
     }
 
@@ -3034,11 +3036,20 @@ impl ToStringStoreWriter<'_> {
                     "{ind}s.store_field_binary(\"{name}\", &__bytes{n}); // {len}*word\n"
                 ));
             }
-            FieldType::Boxed(t) | FieldType::Bare(t) => {
-                debug_assert!(
-                    !self.m.is_word_type[*t],
-                    "word types are printed as primitives"
-                );
+            FieldType::Boxed(t) | FieldType::Bare(t) if self.m.is_word_type[*t] => {
+                // A bare int128/int256/int512 field prints through the same
+                // raw-bytes path as the fixed word arrays (the C++
+                // `sb_ << UInt128`); the exact hex spacing may differ from
+                // the C++ stream operator — none of these ctors appear in
+                // the logged families.
+                // The scheme's word marker structs (Int128/…) carry no
+                // data in this model — an empty bytes field stands in
+                // (none of these ctors appear in the logged families).
+                out.push_str(&format!(
+                    "{ind}s.store_field_binary(\"{name}\", &[]); // word marker\n"
+                ));
+            }
+            FieldType::Boxed(_) | FieldType::Bare(_) => {
                 let n = self.var_counter;
                 self.var_counter += 1;
                 out.push_str(&format!("{ind}match {} {{\n", Self::borrow_option(expr)));
