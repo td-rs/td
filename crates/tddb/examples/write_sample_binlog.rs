@@ -1,20 +1,27 @@
 //! Writes the same binlog scenario as conformance/cpp/binlog_write_sample.cpp
 //! so the C++ reader tool can verify the Rust-written file.
 //!
-//! Usage: cargo run -p tddb --example write_sample_binlog -- <output_path>
+//! Usage: cargo run -p tddb --example write_sample_binlog -- <output_path> [password]
+//! With a password the binlog is AesCtr-encrypted (same scenario as
+//! conformance/cpp/binlog_encrypted_sample.cpp write mode).
 
 use tddb::binlog::Binlog;
 use tddb::db_key::DbKey;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: write_sample_binlog <output_path>");
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
+        .expect("usage: write_sample_binlog <output_path> [password]");
+    let key = match args.next() {
+        Some(password) => DbKey::password(password),
+        None => DbKey::empty(),
+    };
     let _ = tddb::binlog::destroy(&path);
 
     let mut binlog = Binlog::new();
     binlog
-        .init(&path, &mut |_| {}, DbKey::empty(), DbKey::empty())
+        .init(&path, &mut |_| {}, key.clone(), DbKey::empty())
         .ensure();
 
     let id_a = binlog.add(1, b"AAAA");
@@ -41,7 +48,7 @@ fn main() {
                     String::from_utf8_lossy(e.get_data())
                 );
             },
-            DbKey::empty(),
+            key,
             DbKey::empty(),
         )
         .ensure();
