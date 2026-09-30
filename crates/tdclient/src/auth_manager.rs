@@ -1446,6 +1446,17 @@ impl AuthManager {
         self.terms_of_service = None;
     }
 
+    /// The constructor half of the binlog `"auth"` restore
+    /// (AuthManager.cpp:336-366): only the bot flag, read before the
+    /// option replay so `is_bot()` answers true while the persisted
+    /// options re-emit (Td::send_update's bot gate, Td.cpp:1386). The
+    /// state half — with the client-visible Ready emission — is
+    /// [`Self::restore_from_pmc`], which runs later like the C++
+    /// deferred authorization-state flush.
+    pub fn restore_is_bot(&mut self, is_bot: bool) {
+        self.is_bot = is_bot;
+    }
+
     /// The binlog `"auth"` key restore (constructor, cpp:336-366). Every
     /// branch lands in `update_state`, i.e. queues the matching
     /// `updateAuthorizationState` exactly like the C++ constructor.

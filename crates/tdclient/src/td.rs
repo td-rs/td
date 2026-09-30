@@ -3502,12 +3502,29 @@ impl Td {
         // `global.init` above already loaded the server time difference, so
         // the constructor's opening `unix_time` update (OptionManager.cpp:59)
         // is corrected.
+        //
+        // The C++ AuthManager is CONSTRUCTED at Td.cpp:924 — its
+        // constructor (AuthManager.cpp:336-366) reads the auth markers —
+        // long before OptionManager exists (Td.cpp:1046), so `is_bot()` is
+        // already true while the persisted options replay and
+        // send_update's bot gate (Td.cpp:1386) suppresses their
+        // `Sending update:` logs. Restore just the flag here; the full
+        // state restore (with the client-visible Ready emission) keeps its
+        // place below, mirroring the C++ constructor/state-flush split.
+        {
+            let binlog_pmc = self.global.binlog_pmc();
+            if binlog_pmc.get("auth") == "ok" {
+                self.auth_manager
+                    .restore_is_bot(binlog_pmc.get("auth_is_bot") == "true");
+            }
+        }
         {
             let config_pmc = self.global.td_db().take_config_pmc();
             let is_test_dc = self.global.is_test_dc();
             let unix_time = self.global.unix_time();
+            let server_time_difference = self.global.get_server_time_difference();
             let mut option_manager = OptionManager::new(is_test_dc);
-            option_manager.attach_pmc(config_pmc, unix_time);
+            option_manager.attach_pmc(config_pmc, unix_time, server_time_difference);
             self.option_manager = Some(option_manager);
         }
         // The option storm starts with unix_time (the C++ ctor broadcasts
@@ -4646,6 +4663,11 @@ impl Td {
                     object.to_debug_string()
                 );
             }
+            // The bot half of the C++ case (Td.cpp:1385-1387): the inner
+            // `if` fails and the case breaks WITHOUT logging — without
+            // this arm the match would fall to the pretty default and a
+            // bot's option sends would all be logged.
+            Object::updateOption(_) => {}
             _ => {
                 tdutils::vlog!(
                     tdutils::logging::verbosity::TD_REQUESTS,

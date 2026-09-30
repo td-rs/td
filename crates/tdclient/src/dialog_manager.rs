@@ -4403,7 +4403,11 @@ mod tests {
         let config_pmc = database.take_config_pmc();
         td.global.init(database);
         let mut option_manager = crate::option_manager::OptionManager::new(is_test_dc);
-        option_manager.attach_pmc(config_pmc, td.global.unix_time());
+        option_manager.attach_pmc(
+            config_pmc,
+            td.global.unix_time(),
+            td.global.get_server_time_difference(),
+        );
         td.option_manager = Some(option_manager);
         dir
     }

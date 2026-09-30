@@ -295,20 +295,46 @@ impl OptionManager {
     }
 
     /// `OptionManager` constructor pmc replay (the C++
-    /// `option_pmc_->for_each` over `get_config_pmc()`): replay persisted
-    /// options into the store, then keep the pmc handle for future writes.
-    /// Skips `utc_time_offset`, which is always recomputed. `unix_time` is
-    /// the Global-corrected time for the constructor's opening
-    /// `send_unix_time_update()` (OptionManager.cpp:59).
-    pub fn attach_pmc(&mut self, pmc: BinlogKeyValue, unix_time: i32) {
-        self.send_unix_time_update(unix_time);
+    /// `option_pmc_->for_each` over `get_config_pmc()`, OptionManager.cpp
+    /// :59-160): rebuild in the C++ constructor's exact order — the
+    /// opening `unix_time` update, the pmc replay (each persisted option
+    /// re-emitted directly), `utc_time_offset`, then the default table
+    /// with its isset skip — so a persisted value suppresses its ctor
+    /// default exactly like the C++ (a reopen never re-emits the defaults
+    /// the earlier run overrode, and a fresh run persists the applied
+    /// defaults to the pmc like the C++ default lambda's
+    /// `option_pmc_->set`). The `new()`-time defaults were premature:
+    /// they ran before the replay could fill the store, so both the
+    /// store and the pending queue start over here. `unix_time` is the
+    /// Global-corrected time for the opening update.
+    pub fn attach_pmc(&mut self, pmc: BinlogKeyValue, unix_time: i32, server_time_difference: f64) {
+        self.options = SeqKeyValue::default();
+        self.pending_updates.clear();
+        self.send_unix_time_update(unix_time, server_time_difference);
         for (name, value) in pmc.get_all() {
             if name == "utc_time_offset" {
                 continue;
             }
-            self.set_option(&name, &value);
+            self.options.set(&name, &value);
+            if !is_internal_option(&name) {
+                self.pending_updates
+                    .push(td_api::Object::updateOption(td_api::updateOption {
+                        name,
+                        value: Some(Self::get_option_value_object(&value)),
+                    }));
+            } else if let Some(update) = self.get_internal_option_update(&name) {
+                self.pending_updates.push(update.into());
+            }
         }
+        let utc_time_offset = format!("I{}", tz_offset() as i64);
+        self.options.set("utc_time_offset", &utc_time_offset);
+        self.pending_updates
+            .push(td_api::Object::updateOption(td_api::updateOption {
+                name: "utc_time_offset".to_string(),
+                value: Some(Self::get_option_value_object(&utc_time_offset)),
+            }));
         self.option_pmc = Some(pmc);
+        self.apply_defaults();
     }
 
     /// `OptionManager::on_update_server_time_difference`
@@ -322,12 +348,17 @@ impl OptionManager {
         if (server_time_difference - self.last_sent_server_time_difference).abs() < 0.5 {
             return;
         }
-        self.send_unix_time_update(unix_time);
+        self.send_unix_time_update(unix_time, server_time_difference);
     }
 
-    /// `OptionManager::send_unix_time_update` (OptionManager.cpp:426-429);
-    /// the corrected time arrives from the Global instead of `G()`.
-    fn send_unix_time_update(&mut self, unix_time: i32) {
+    /// `OptionManager::send_unix_time_update` (OptionManager.cpp:426-429):
+    /// every send re-anchors `last_sent_server_time_difference_` — without
+    /// it the constructor's opening update doesn't count, and the first
+    /// post-init time-diff notification re-sends `unix_time` no matter how
+    /// small the move. The corrected time arrives from the Global instead
+    /// of `G()`.
+    fn send_unix_time_update(&mut self, unix_time: i32, server_time_difference: f64) {
+        self.last_sent_server_time_difference = server_time_difference;
         self.pending_updates
             .push(td_api::Object::updateOption(td_api::updateOption {
                 name: "unix_time".to_string(),
