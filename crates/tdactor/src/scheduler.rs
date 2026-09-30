@@ -674,6 +674,94 @@ impl SchedulerState {
         self.register_actor_impl(name, RegisterActor::Owned(actor), self.sched_id)
     }
 
+    /// Create a *bridge* actor — the Rust port of the C++ externally-owned
+    /// manager actor (`Td.cpp:1320`
+    /// `register_actor("UpdatesManager", updates_manager_.get())`): a
+    /// fully normal actor (own mailbox, own context tag, own dispatch
+    /// slices) whose handlers reach the *owner actor's* state through a
+    /// raw pointer captured at creation, because C++ reaches it through
+    /// the member `unique_ptr` — the manager code is written against the
+    /// owner's world.
+    ///
+    /// The raw-pointer reach is what [`IdSlot::set_owner`] + the
+    /// inline-dispatch guard are for: the scheduler never dispatches the
+    /// bridge and its owner at the same time (sends that would re-enter
+    /// the pair take the mailbox instead), so the handlers' `&mut` into
+    /// the owner is exclusive for the whole slice. Dropping the returned
+    /// `ActorOwn` sends the bridge a hangup and unregisters it; the
+    /// owner's own destruction order must guarantee the bridge is dead
+    /// before the owner's state disappears (drop the `ActorOwn` in the
+    /// owner's `tear_down`, like the C++ `reset_actor` sequence at
+    /// `Td.cpp:757`).
+    pub fn create_bridge_actor<A: Actor>(
+        &self,
+        name: &str,
+        actor: A,
+        owner: &ActorId,
+    ) -> ActorOwn<A> {
+        let own = self.register_actor_impl(name, RegisterActor::Owned(actor), self.sched_id);
+        // SAFETY: the bridge slot was allocated above and no dispatch of
+        // it can run until this frame returns (registration only queues
+        // the Start event); the owner slot is pinned by the caller's id.
+        unsafe { (*own.get().slot_ptr().cast_mut()).set_owner(owner.slot_ptr()) };
+        own
+    }
+
+    /// Run `f` under the dispatch identity of `id` **nested in the current
+    /// frame** — the C++ `send_closure` inline path for a bridge target
+    /// (`send_immediately_impl`'s EventGuard): the handler runs down this
+    /// same stack (the caller already holds the owner's `&mut`, which the
+    /// handler needs) with the target's context installed — the Start
+    /// line, the tag swap, the `EventContext` — and the Stop line +
+    /// restore after. Only the owner may nest into its bridge (the
+    /// closure reaches the owner's state through the caller's borrow);
+    /// everything else goes through the mailbox.
+    pub fn run_nested<A: ?Sized, F>(&self, id: &ActorId<A>, f: F)
+    where
+        F: FnOnce(),
+    {
+        let ctx = EventContext {
+            actor: id.slot_ptr(),
+            dest: 0,
+            flags: 0,
+            link_token: 0,
+        };
+        let prev = self.install_ctx(&ctx);
+        debug_assert!(
+            !self.info(id.erase_ref()).is_running.get(),
+            "run_nested on a running actor would double-borrow it"
+        );
+        let saved_tags = self.enter_actor(id.erase_ref());
+        f();
+        let (flags, dest) = self.exit_actor(id.erase_ref(), prev, saved_tags);
+        self.honor_flags(id.erase_ref(), flags, dest);
+    }
+
+    /// Queue `run` on `id`'s mailbox as a typed thunk — the mailbox half of
+    /// the bridge send path (the C++ `send_closure_later` self-bounce): the
+    /// event carries a closure receiving the concrete actor, so a bridge
+    /// message derefs its owner inside the bridge's own dispatch slice.
+    pub fn send_typed_later<A, F>(&self, id: &ActorId<A>, run: F)
+    where
+        A: Actor,
+        F: FnOnce(&mut A) + Send + 'static,
+    {
+        let thunk = crate::event::ActorThunk::new(move |actor: &mut dyn Actor| {
+            run(crate::messages::downcast::<A>(actor));
+        });
+        self.send_closure_later(id.into(), thunk);
+    }
+
+    /// Whether a `send_closure`-style send to `id` would run inline right
+    /// now (the C++ `get_actor_sched_id_to_send_immediately` predicate:
+    /// not running, empty mailbox). The bridge owner consults this to
+    /// choose its nested-vs-mailbox path; the owner itself always nests,
+    /// so the scheduler's owner guard never sees that direction.
+    pub fn can_run_inline<A: ?Sized>(&self, id: &ActorId<A>) -> bool {
+        let info = self.info(id.erase_ref());
+        !info.is_running.get() && info.mailbox_empty.get()
+    }
+
     /// `Scheduler::create_actor_on_scheduler`.
     pub fn create_actor_on_scheduler<A: Actor>(
         &self,
@@ -744,6 +832,7 @@ impl SchedulerState {
         // C++ sends Event::start to owned actors only (need_start_up is false
         // for borrowed ones; see `register_actor_ptr`). The flag is recorded
         // on the ActorInfo: `do_stop_actor` tears down only what started.
+        let need_context = matches!(actor, RegisterActor::Owned(_));
         let (actor_slot, need_start_up) = match actor {
             RegisterActor::Owned(a) => {
                 // SAFETY: `actor_storage` is fresh block memory, unaliased;
@@ -779,6 +868,34 @@ impl SchedulerState {
         // plan); the typed `ActorId<A>` is a pure marker added on the way out.
         let id: ActorId = ActorId::from_raw_block(slot_ptr);
         self.actor_count.set(self.actor_count.get() + 1);
+        // The C++ registration pair: `ActorInfo::init`'s context
+        // inheritance line (ActorInfo.h:42 — need_context actors only; the
+        // FutureActor class opts out, our Borrowed arm likewise) and the
+        // pool's create line (Scheduler.h:108). The C++ prints the
+        // inherited `ActorContext` pointer as the third field; ours prints
+        // the slot — masked alike.
+        if need_context {
+            tdutils::vlog!(
+                tdutils::logging::verbosity::ACTOR,
+                "actor",
+                at "ActorInfo.h",
+                42,
+                "Set context {:p} for {}",
+                slot_ptr,
+                name
+            );
+        }
+        tdutils::vlog!(
+            tdutils::logging::verbosity::ACTOR,
+            "actor",
+            at "Scheduler.h",
+            108,
+            "Create actor {}:{:p}:{:p} (actor_count = {})",
+            name,
+            info_ptr,
+            slot_ptr,
+            self.actor_count.get()
+        );
 
         if sched_id != self.sched_id {
             self.send_later(id.clone(), Event::start());
@@ -800,6 +917,39 @@ impl SchedulerState {
     }
 
     // ---- sending (Scheduler.cpp send paths) ----
+
+    /// Whether an inline dispatch of `id` is forbidden right now because it
+    /// would alias a bridge/owner pair: the target is the owner of the
+    /// actor running in this dispatch frame, or the running actor is the
+    /// target's owner (see [`IdSlot::set_owner`]). C++ runs such sends
+    /// inline-reentrantly and stays correct because the manager object is
+    /// distinct from the owner; the Rust bridge derefs the owner through a
+    /// raw pointer, so two simultaneous `&mut` into one object are UB —
+    /// these sends take the mailbox instead, which lands the event in a
+    /// later slice (the same observable outcome as the C++ queueing when
+    /// the target is busy).
+    fn inline_forbidden(&self, id: &ActorId) -> bool {
+        let ctx_ptr = self.ctx.0.get();
+        if ctx_ptr.is_null() {
+            // No dispatch frame on this thread — no bridge can be running.
+            return false;
+        }
+        // SAFETY: the pointer is non-null and owned by this scheduler
+        // thread (see `CtxPtr`).
+        let current = unsafe { (*ctx_ptr).actor };
+        if current.is_null() {
+            return false;
+        }
+        let target = id.slot_ptr();
+        if current == target {
+            // A send to the running actor itself is already routed to the
+            // mailbox by the `is_running` check before this call.
+            return false;
+        }
+        // SAFETY: both slots are alive — `current` is pinned by the running
+        // dispatch frame, `target` by this `ActorId` borrow.
+        unsafe { (*current).owner() == target || (*target).owner() == current }
+    }
 
     /// `Scheduler::send_immediately` / free `send_event`: runs the handler
     /// inline when possible, otherwise queues it.
@@ -863,7 +1013,7 @@ impl SchedulerState {
         let (sched, migrating) = id.sched();
         if sched == self.sched_id && !migrating {
             let info = self.info(id);
-            if !info.is_running.get() && info.mailbox_empty.get() {
+            if !info.is_running.get() && info.mailbox_empty.get() && !self.inline_forbidden(id) {
                 self.run_closure_guarded(id, actor_ref.token, run);
                 return;
             }
@@ -982,7 +1132,7 @@ impl SchedulerState {
         // as [`Self::send_message_immediately`]).
         if sched == self.sched_id && !migrating {
             let info = self.info(id);
-            if !info.is_running.get() && info.mailbox_empty.get() {
+            if !info.is_running.get() && info.mailbox_empty.get() && !self.inline_forbidden(id) {
                 self.run_event_guarded(id, event);
                 return;
             }
@@ -1104,19 +1254,20 @@ impl SchedulerState {
     fn enter_actor(&self, id: &ActorId) -> (&'static str, &'static str) {
         let info = self.info(id);
         info.is_running.set(true);
-        // The C++ `EventGuard` swaps BOTH log context tags for the whole
-        // dispatch: `LOG_TAG2` to the actor name (the `[!Name]` column)
-        // and `LOG_TAG` to the actor-context tag (the `[#N]` client
-        // instance id — empty for scheduler-internal actors; the fresh
-        // shape-compare caught the thread-wide `[#1]` divergence). The
-        // saved pair is restored by [`Self::exit_actor`].
+        // The C++ `EventGuard` constructor order is load-bearing for the
+        // trace: `ActorInfo::start_run` prints "Start run actor" BEFORE
+        // `swap_context` installs the actor's tags, so the Start line
+        // carries the PARENT's context (nested dispatches show
+        // `[#N][!Parent]`, idle-loop dispatches show none) while the
+        // body lines carry the actor's own. The saved pair is restored
+        // by [`Self::exit_actor`], whose Stop line prints before the
+        // restore — with the actor's tags — matching the C++
+        // destructor's swap order.
         let name = actor_log_name(id);
         let saved_tags = (
             tdutils::logging::current_log_tag(),
             tdutils::logging::current_log_tag2(),
         );
-        tdutils::logging::set_log_tag(actor_log_tag1(id));
-        tdutils::logging::set_log_tag2(name);
         tdutils::vlog!(
             tdutils::logging::verbosity::ACTOR,
             "actor",
@@ -1127,6 +1278,8 @@ impl SchedulerState {
             id.info_ptr(),
             id.slot_ptr()
         );
+        tdutils::logging::set_log_tag(actor_log_tag1(id));
+        tdutils::logging::set_log_tag2(name);
         saved_tags
     }
 
@@ -1223,17 +1376,14 @@ impl SchedulerState {
         };
         let prev = self.install_ctx(&ctx);
         // One EventGuard for the whole drain, like the C++ `run_mailbox`.
+        // The Start line prints before the tag swap (the parent's context),
+        // matching the C++ EventGuard constructor order — see
+        // [`Self::enter_actor`].
         let name = slot_log_name(info.slot);
         let saved_tags = (
             tdutils::logging::current_log_tag(),
             tdutils::logging::current_log_tag2(),
         );
-        tdutils::logging::set_log_tag(
-            // SAFETY: the caller holds the in-guard info; immutable after
-            // registration.
-            unsafe { (*info.slot).tag1_str() },
-        );
-        tdutils::logging::set_log_tag2(name);
         tdutils::vlog!(
             tdutils::logging::verbosity::ACTOR,
             "actor",
@@ -1244,6 +1394,12 @@ impl SchedulerState {
             info_ptr,
             info.slot
         );
+        tdutils::logging::set_log_tag(
+            // SAFETY: the caller holds the in-guard info; immutable after
+            // registration.
+            unsafe { (*info.slot).tag1_str() },
+        );
+        tdutils::logging::set_log_tag2(name);
         info.is_running.set(true);
         let mut processed = 0;
         while processed < mailbox_len {
@@ -1359,6 +1515,27 @@ impl SchedulerState {
         }
         self.destroy_actor(id);
         self.restore_ctx(prev);
+    }
+
+    /// Synchronously stop + unregister an actor from inside its owner's
+    /// teardown — the C++ `Td::clear` sequence resets the manager actors
+    /// before the Td object dies (`Td.cpp:757`), and a queued hangup would
+    /// run a bridge slice after the owner is gone. Unlike the `ActorOwn`
+    /// drop (an async hangup event), this tears the registration down in
+    /// the caller's frame: the actor's `tear_down` runs here, then
+    /// [`Self::destroy_actor`] unregisters it. The actor must not be the
+    /// one currently being dispatched.
+    pub fn destroy_actor_sync<A: ?Sized>(&self, id: &ActorId<A>) {
+        if !id.is_alive() {
+            // Already gone (a scheduler-wide teardown may have stopped it
+            // first) — idempotent, like the C++ clear loops.
+            return;
+        }
+        debug_assert!(
+            !self.info(id.erase_ref()).is_running.get(),
+            "destroy_actor_sync on the dispatched actor"
+        );
+        self.do_stop_actor(id.erase_ref());
     }
 
     /// `Scheduler::destroy_actor` + the pool release: drop the actor and free

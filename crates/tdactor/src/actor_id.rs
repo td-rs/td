@@ -90,6 +90,22 @@ pub(crate) struct IdSlot {
     /// Td actor inherits it while scheduler-internal actors keep it
     /// empty. Immutable after creation, like `name`.
     tag1: &'static str,
+    /// The owner link of a *bridge* actor — the port of the C++
+    /// externally-owned manager actor whose object lives inside another
+    /// actor's state (`Td.cpp`'s `register_actor("UpdatesManager",
+    /// updates_manager_.get())`). The Rust port bridges to the owner
+    /// through a raw pointer (the `UmBridge`-style actor), so the
+    /// scheduler must never dispatch the owner and the bridge at the
+    /// same time: two simultaneous `&mut` into one object would be
+    /// aliasing UB. The guard is mechanical — the inline-dispatch paths
+    /// (`send_immediately_impl` / `send_message_immediately`) refuse to
+    /// run inline when the target is this slot's owner or when the
+    /// running actor is the target's owner — such sends take the
+    /// mailbox instead, which the C++ semantics treat identically from
+    /// the observer's point of view (the event lands in a later slice).
+    /// Zero for regular actors. Written once at registration, before
+    /// the id is shared; read on scheduler threads only.
+    owner: AtomicUsize,
     /// The block's allocation layout — the block is freed raw by the last
     /// `ActorId` drop (see [`SlotBlock`](Self::allocate_block)).
     block_layout: Layout,
@@ -135,6 +151,23 @@ impl IdSlot {
     /// scheduler-internal actors).
     pub(crate) fn tag1_str(&self) -> &'static str {
         self.tag1
+    }
+
+    /// The owner-slot pointer of a bridge actor (0 for regular actors);
+    /// see the field docs for the dispatch-guard contract.
+    pub(crate) fn owner(&self) -> *const IdSlot {
+        let v = self.owner.load(Ordering::Relaxed);
+        if v == 0 {
+            std::ptr::null()
+        } else {
+            v as *const IdSlot
+        }
+    }
+
+    /// Set the owner link — called once at bridge registration, before
+    /// any other thread can see the slot.
+    pub(crate) fn set_owner(&self, owner: *const IdSlot) {
+        self.owner.store(owner as usize, Ordering::Relaxed);
     }
 }
 
@@ -300,6 +333,7 @@ impl IdSlot {
                     freed: AtomicBool::new(false),
                     name: ActorName::new(name),
                     tag1: tdutils::logging::current_log_tag(),
+                    owner: AtomicUsize::new(0),
                     block_layout: total,
                     info: UnsafeCell::new(block.add(info_offset).cast()),
                 },
@@ -469,7 +503,7 @@ impl<A: ?Sized> ActorId<A> {
         }
     }
 
-    fn slot(&self) -> &IdSlot {
+    pub(crate) fn slot(&self) -> &IdSlot {
         self.slot_of(self.slot.expect("empty ActorId"))
     }
 
