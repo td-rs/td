@@ -1299,9 +1299,15 @@ impl crate::message_content::MessageContentContext for Td {
     }
     fn get_shared_dialog_from_peer(
         &mut self,
-        _peer: telegram_api::RequestedPeer,
+        peer: telegram_api::RequestedPeer,
     ) -> Option<SharedDialog> {
-        None
+        // MessageContent.cpp:10978-10982 keeps only the valid SharedDialogs.
+        let shared_dialog = SharedDialog::from_requested_peer(peer);
+        if shared_dialog.is_valid() {
+            Some(shared_dialog)
+        } else {
+            None
+        }
     }
     fn get_background_info(
         &mut self,
@@ -1488,11 +1494,36 @@ impl crate::message_content::MessageContentContext for Td {
     fn get_paid_media_object(&self, _extended_media: &MessageExtendedMedia) -> td_api::PaidMedia {
         td_api::PaidMedia::default()
     }
-    fn get_shared_user_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedUser {
-        td_api::SharedUser::default()
+    fn get_shared_user_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedUser {
+        // SharedDialog.cpp:54-60 — bots answer the raw id, users the
+        // UserManager object id.
+        let user_id = if MessageContentContext::is_bot(self) {
+            shared_dialog.dialog_id.get_user_id().get()
+        } else {
+            self.get_user_id_object(shared_dialog.dialog_id.get_user_id(), "sharedUser")
+        };
+        td_api::SharedUser {
+            user_id,
+            first_name: shared_dialog.first_name.clone(),
+            last_name: shared_dialog.last_name.clone(),
+            username: shared_dialog.username.clone(),
+            photo: crate::photo::get_photo_object(&shared_dialog.photo),
+        }
     }
-    fn get_shared_chat_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedChat {
-        td_api::SharedChat::default()
+    fn get_shared_chat_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedChat {
+        // SharedDialog.cpp:62-68 — bots answer the raw id, users the
+        // DialogManager object id.
+        let chat_id = if MessageContentContext::is_bot(self) {
+            shared_dialog.dialog_id.get()
+        } else {
+            self.get_chat_id_object(shared_dialog.dialog_id, "sharedChat")
+        };
+        td_api::SharedChat {
+            chat_id,
+            title: shared_dialog.first_name.clone(),
+            username: shared_dialog.username.clone(),
+            photo: crate::photo::get_photo_object(&shared_dialog.photo),
+        }
     }
     fn get_giveaway_parameters_object(
         &self,

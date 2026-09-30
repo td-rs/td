@@ -1960,8 +1960,10 @@ impl CommunityId {
 
 /// `td::SharedDialog` (SharedDialog.h:21-60) — a dialog shared through a
 /// `messageActionRequestedDialog`; `first_name`/`last_name`/`username`/
-/// `photo` are filled only for shared users. The wire constructor,
-/// `store`/`parse` and the td_api objects land with their slices.
+/// `photo` are filled only for shared users. The wire constructor is
+/// [`SharedDialog::from_requested_peer`], `store`/`parse` live at the
+/// binlog plane, and the td_api objects at the `MessageContentContext`
+/// builders.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SharedDialog {
     pub dialog_id: DialogId,
@@ -1990,6 +1992,49 @@ impl SharedDialog {
             crate::messages_manager::DialogType::Chat
                 | crate::messages_manager::DialogType::Channel
         )
+    }
+
+    /// `SharedDialog::SharedDialog(Td *, RequestedPeer &&)`
+    /// (SharedDialog.cpp:16-49) — the wire constructor. An out-of-range id
+    /// collapses to the zero `DialogId`, i.e. `!is_valid()`, which the
+    /// `messageActionRequestedPeerSentMe` arm drops; the C++ `get_photo`
+    /// file registration rides the pure [`crate::photo::get_photo`] the
+    /// way the `SuggestProfilePhoto` arm does.
+    pub fn from_requested_peer(peer: telegram_api::RequestedPeer) -> SharedDialog {
+        let mut shared_dialog = SharedDialog::default();
+        match peer {
+            telegram_api::RequestedPeer::requestedPeerUser(requested_peer) => {
+                shared_dialog.dialog_id =
+                    DialogId::from_user_id(UserId::new(requested_peer.user_id));
+                shared_dialog.first_name = requested_peer.first_name;
+                shared_dialog.last_name = requested_peer.last_name;
+                shared_dialog.username = requested_peer.username;
+                shared_dialog.photo = requested_peer
+                    .photo
+                    .map(crate::photo::get_photo)
+                    .unwrap_or_default();
+            }
+            telegram_api::RequestedPeer::requestedPeerChat(requested_peer) => {
+                shared_dialog.dialog_id =
+                    DialogId::from_chat_id(ChatId::new(requested_peer.chat_id));
+                shared_dialog.first_name = requested_peer.title;
+                shared_dialog.photo = requested_peer
+                    .photo
+                    .map(crate::photo::get_photo)
+                    .unwrap_or_default();
+            }
+            telegram_api::RequestedPeer::requestedPeerChannel(requested_peer) => {
+                shared_dialog.dialog_id =
+                    DialogId::from_channel_id(ChannelId::new(requested_peer.channel_id));
+                shared_dialog.first_name = requested_peer.title;
+                shared_dialog.username = requested_peer.username;
+                shared_dialog.photo = requested_peer
+                    .photo
+                    .map(crate::photo::get_photo)
+                    .unwrap_or_default();
+            }
+        }
+        shared_dialog
     }
 }
 
@@ -7979,7 +8024,8 @@ pub trait MessageContentContext {
         secure_values: Vec<telegram_api::SecureValue>,
     ) -> Vec<EncryptedSecureValue>;
     /// `SharedDialog(Td *, RequestedPeer &&)` (SharedDialog.cpp) — the
-    /// manager intake; the stand-in answers `None`.
+    /// manager intake over [`SharedDialog::from_requested_peer`];
+    /// out-of-range ids answer `None`.
     fn get_shared_dialog_from_peer(
         &mut self,
         peer: telegram_api::RequestedPeer,
@@ -22896,9 +22942,10 @@ mod tests {
 
         fn get_shared_dialog_from_peer(
             &mut self,
-            _peer: telegram_api::RequestedPeer,
+            peer: telegram_api::RequestedPeer,
         ) -> Option<SharedDialog> {
-            None
+            let shared_dialog = SharedDialog::from_requested_peer(peer);
+            shared_dialog.is_valid().then_some(shared_dialog)
         }
 
         fn get_background_info(
@@ -23138,13 +23185,19 @@ mod tests {
         fn get_shared_user_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedUser {
             td_api::SharedUser {
                 user_id: shared_dialog.dialog_id.get_user_id().get(),
-                ..Default::default()
+                first_name: shared_dialog.first_name.clone(),
+                last_name: shared_dialog.last_name.clone(),
+                username: shared_dialog.username.clone(),
+                photo: crate::photo::get_photo_object(&shared_dialog.photo),
             }
         }
 
-        fn get_shared_chat_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedChat {
+        fn get_shared_chat_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedChat {
             td_api::SharedChat {
-                ..Default::default()
+                chat_id: shared_dialog.dialog_id.get(),
+                title: shared_dialog.first_name.clone(),
+                username: shared_dialog.username.clone(),
+                photo: crate::photo::get_photo_object(&shared_dialog.photo),
             }
         }
 
@@ -29334,6 +29387,143 @@ mod tests {
             replied_message_info,
             false,
         )
+    }
+
+    #[test]
+    fn action_requested_peer_arms() {
+        let mut td = TestContext::default();
+        let no_reply = RepliedMessageInfo::default();
+
+        // a single valid shared user keeps the button id and the peer data
+        let action = telegram_api::MessageAction::messageActionRequestedPeerSentMe(
+            telegram_api::messageActionRequestedPeerSentMe {
+                button_id: 3,
+                peers: vec![telegram_api::RequestedPeer::requestedPeerUser(
+                    telegram_api::requestedPeerUser {
+                        flags: 0,
+                        user_id: 6265134600,
+                        first_name: "Shared".to_string(),
+                        last_name: "User".to_string(),
+                        username: "shared_user".to_string(),
+                        photo: None,
+                    },
+                )],
+            },
+        );
+        match action_content(&mut td, Some(action), &no_reply) {
+            MessageContent::DialogShared(m) => {
+                assert_eq!(m.button_id, 3);
+                assert_eq!(m.shared_dialogs.len(), 1);
+                assert!(m.shared_dialogs[0].is_user());
+                assert_eq!(m.shared_dialogs[0].dialog_id.get(), 6265134600);
+                assert_eq!(m.shared_dialogs[0].first_name, "Shared");
+                assert_eq!(m.shared_dialogs[0].last_name, "User");
+                assert_eq!(m.shared_dialogs[0].username, "shared_user");
+            }
+            content => panic!("unexpected content {content:?}"),
+        }
+
+        // a single shared chat maps the wire title onto first_name
+        let action = telegram_api::MessageAction::messageActionRequestedPeerSentMe(
+            telegram_api::messageActionRequestedPeerSentMe {
+                button_id: -1,
+                peers: vec![telegram_api::RequestedPeer::requestedPeerChat(
+                    telegram_api::requestedPeerChat {
+                        flags: 0,
+                        chat_id: 42,
+                        title: "Chat".to_string(),
+                        photo: None,
+                    },
+                )],
+            },
+        );
+        match action_content(&mut td, Some(action), &no_reply) {
+            MessageContent::DialogShared(m) => {
+                assert_eq!(m.button_id, -1);
+                assert_eq!(m.shared_dialogs.len(), 1);
+                assert!(m.shared_dialogs[0].is_dialog());
+                assert_eq!(m.shared_dialogs[0].dialog_id.get(), -42);
+                assert_eq!(m.shared_dialogs[0].first_name, "Chat");
+            }
+            content => panic!("unexpected content {content:?}"),
+        }
+
+        // a single shared channel keeps title and username
+        let action = telegram_api::MessageAction::messageActionRequestedPeerSentMe(
+            telegram_api::messageActionRequestedPeerSentMe {
+                button_id: 7,
+                peers: vec![telegram_api::RequestedPeer::requestedPeerChannel(
+                    telegram_api::requestedPeerChannel {
+                        flags: 0,
+                        channel_id: 1005,
+                        title: "Chan".to_string(),
+                        username: "ch".to_string(),
+                        photo: None,
+                    },
+                )],
+            },
+        );
+        match action_content(&mut td, Some(action), &no_reply) {
+            MessageContent::DialogShared(m) => {
+                assert!(m.shared_dialogs[0].is_dialog());
+                assert_eq!(m.shared_dialogs[0].dialog_id.get(), -1000000001005);
+                assert_eq!(m.shared_dialogs[0].first_name, "Chan");
+                assert_eq!(m.shared_dialogs[0].username, "ch");
+            }
+            content => panic!("unexpected content {content:?}"),
+        }
+
+        // more than one dialog with a non-user among them drops the action
+        let action = telegram_api::MessageAction::messageActionRequestedPeerSentMe(
+            telegram_api::messageActionRequestedPeerSentMe {
+                button_id: 9,
+                peers: vec![
+                    telegram_api::RequestedPeer::requestedPeerUser(
+                        telegram_api::requestedPeerUser {
+                            flags: 0,
+                            user_id: 7,
+                            first_name: "U".to_string(),
+                            last_name: String::new(),
+                            username: String::new(),
+                            photo: None,
+                        },
+                    ),
+                    telegram_api::RequestedPeer::requestedPeerChat(
+                        telegram_api::requestedPeerChat {
+                            flags: 0,
+                            chat_id: 42,
+                            title: "Chat".to_string(),
+                            photo: None,
+                        },
+                    ),
+                ],
+            },
+        );
+        assert!(matches!(
+            action_content(&mut td, Some(action), &no_reply),
+            MessageContent::Text(t) if t.text.text.is_empty()
+        ));
+
+        // an out-of-range user id is dropped, not wrapped
+        let action = telegram_api::MessageAction::messageActionRequestedPeerSentMe(
+            telegram_api::messageActionRequestedPeerSentMe {
+                button_id: 5,
+                peers: vec![telegram_api::RequestedPeer::requestedPeerUser(
+                    telegram_api::requestedPeerUser {
+                        flags: 0,
+                        user_id: 0,
+                        first_name: String::new(),
+                        last_name: String::new(),
+                        username: String::new(),
+                        photo: None,
+                    },
+                )],
+            },
+        );
+        assert!(matches!(
+            action_content(&mut td, Some(action), &no_reply),
+            MessageContent::Text(t) if t.text.text.is_empty()
+        ));
     }
 
     #[test]
