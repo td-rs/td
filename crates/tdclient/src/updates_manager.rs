@@ -1369,7 +1369,13 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     /// module docs).
     fn set_pts(&mut self, env: &mut impl UpdatesManagerEnv, pts: i32, source: &str) {
         if pts == i32::MAX {
-            tdutils::log_warning!("Update PTS from {} to -1 from {}", self.get_pts(), source);
+            tdutils::log_warning!(
+                at "UpdatesManager.cpp",
+                639,
+                "Update PTS from {} to -1 from {}",
+                self.get_pts(),
+                source
+            );
             self.save_pts(env, pts); // drop saved PTS value
             self.add_pts(env, pts);
             self.init_state(env);
@@ -1379,9 +1385,23 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         if pts > old_pts || (0 < pts && pts < old_pts.wrapping_sub(1_000_009)) {
             // PTS can only go up or drop cardinally
             if pts < old_pts.wrapping_sub(1_000_009) {
-                tdutils::log_warning!("PTS decreases from {} to {} from {}", old_pts, pts, source);
+                tdutils::log_warning!(
+                    at "UpdatesManager.cpp",
+                    649,
+                    "PTS decreases from {} to {} from {}",
+                    old_pts,
+                    pts,
+                    source
+                );
             } else {
-                tdutils::log_info!("Update PTS from {} to {} from {}", old_pts, pts, source);
+                tdutils::log_info!(
+                    at "UpdatesManager.cpp",
+                    651,
+                    "Update PTS from {} to {} from {}",
+                    old_pts,
+                    pts,
+                    source
+                );
                 if old_pts > 0 {
                     self.pts_diff += pts - old_pts;
                     if self.pts_diff >= 1_000_000 {
@@ -1429,7 +1449,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         date_source: String,
     ) {
         if date > self.date {
-            tdutils::log_info!("Update date to {}", date);
+            tdutils::log_info!(
+                at "UpdatesManager.cpp",
+                679,
+                "Update date to {}",
+                date
+            );
             // C++ keeps a dead `if (from_update && false)` branch here —
             // the date in updates is never decreased by the server.
             let now = env.unix_time();
@@ -1575,11 +1600,18 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         updates: telegram_api::Updates,
         promise: &mut Promise<()>,
     ) {
+        // UpdatesManager.cpp:1192-1194: the whole container, TL-text dump
+        // (skipped for updateShort — the single-update kind).
         if !matches!(updates, telegram_api::Updates::updateShort(_)) {
-            tdutils::log_info!("Receive {}", update_umbrella_name(&updates));
+            tdutils::log_info!(
+                at "UpdatesManager.cpp",
+                1193,
+                "Receive {}",
+                updates.to_debug_string()
+            );
         }
         if !env.is_authorized() {
-            if let telegram_api::Updates::updateShort(short) = updates
+            if let telegram_api::Updates::updateShort(short) = &updates
                 && !env.close_flag()
             {
                 let update = short.update.clone().unwrap_or_default();
@@ -1612,7 +1644,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     return;
                 }
             }
-            tdutils::log_info!("Ignore received before authorization or after logout");
+            tdutils::log_info!(
+                at "UpdatesManager.cpp",
+                1222,
+                "Ignore received before authorization or after logout {}",
+                updates.to_debug_string()
+            );
             return;
         }
 
@@ -1737,11 +1774,11 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 );
             }
             telegram_api::Updates::updates(updates) => {
-                let source: String = if updates.updates.len() == 1 {
-                    format!("update {}", update_id_and_name(&updates.updates[0]).0)
-                } else {
-                    "updates".to_string()
-                };
+                // UpdatesManager.cpp:1288-1295: TWO sources here — the
+                // user/chat intake gets "update <ctor_id>" (single-update
+                // containers) or "updates"; the pending feed always gets
+                // the container ctor name. (The intake source rides the
+                // UserManager-intake log family.)
                 for user in updates.users {
                     self.sink.on_user(user);
                 }
@@ -1762,7 +1799,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     updates.date,
                     now,
                     Some(std::mem::take(promise)),
-                    &source,
+                    "telegram_api::updates",
                 );
             }
             telegram_api::Updates::updateShortSentMessage(_) => {
@@ -1835,7 +1872,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         state: telegram_api::updates_State,
         source: &str,
     ) {
-        tdutils::log_debug!("Receive updates.state from {}", source);
+        // UpdatesManager.cpp:1357 — the intake dump rides the
+        // get_difference verbosity family with the oneline TL text.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::GET_DIFFERENCE,
+            "get_difference",
+            at "UpdatesManager.cpp",
+            1357,
+            "Receive {} from {}",
+            crate::td::oneline(&state.to_debug_string()),
+            source
+        );
 
         if self.get_pts() == i32::MAX {
             tdutils::log_warning!("Restore PTS to {}", state.pts);
@@ -1850,7 +1897,13 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             self.last_pts_save_time = env.now() - 2.0 * MAX_PTS_SAVE_DELAY;
             self.save_pts(env, state.pts);
         } else {
-            let full_source = format!("on_get_updates_state from {}", source);
+            // UpdatesManager.cpp:1374: the source carries the oneline
+            // state dump into both the PTS and date logs.
+            let full_source = format!(
+                "on_get_updates_state {} from {}",
+                crate::td::oneline(&state.to_debug_string()),
+                source
+            );
             self.set_pts(env, state.pts, &full_source);
             self.set_date(env, state.date, false, full_source.clone());
             self.add_qts(env, state.qts);
@@ -6040,6 +6093,28 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     // M.7.17 — the data reloaders (cpp:2373-2534)
     // ------------------------------------------------------------------
 
+    /// `UpdatesManager::start_up`'s tail (cpp:308-310): anchor both data
+    /// reload timers one second into the past, so the first online tick
+    /// fires them (the C++ constructor zero value never passes the
+    /// `now < next_data_reload_time_` gate).
+    pub(crate) fn init_reload_times(&mut self, env: &mut impl UpdatesManagerEnv) {
+        let now = env.now();
+        self.next_data_reload_time = now - 1.0;
+        self.next_often_data_reload_time = now - 1.0;
+    }
+
+    /// `UpdatesManager::hangup`'s queue half (cpp:305-311): the close path
+    /// drops every pending update batch before the actor stops. The pmc
+    /// flush is `timeout_expired`'s business (the close path calls it
+    /// separately); this only clears the in-memory backlog.
+    pub(crate) fn clear_pending_queues(&mut self) {
+        self.pending_pts_updates.clear();
+        self.postponed_pts_updates.clear();
+        self.postponed_updates.clear();
+        self.pending_seq_updates.clear();
+        self.pending_qts_updates.clear();
+    }
+
     /// `UpdatesManager::schedule_data_reload` (cpp:2373).
     fn schedule_data_reload(&mut self, env: &mut impl UpdatesManagerEnv) {
         if self.data_reload_timeout.has_timeout() {
@@ -7382,6 +7457,39 @@ mod tests {
         assert_eq!(
             pending.dump_string(),
             "updateNewMessage {\n  message = message {\n    flags = 0\n    flags2 = 0\n    id = 361\n    peer_id = peerUser {\n      user_id = 2202815082\n    }\n    date = 1790672705\n    message = \"h2h message one\"\n  }\n  pts = 362\n  pts_count = 1\n}\n"
+        );
+    }
+
+    #[test]
+    fn umbrella_dump_matches_the_cpp_receive_updates_text() {
+        // The oracle is the C++ 1024-log body at UpdatesManager.cpp:1193
+        // (`Receive ` + `to_string(updates_ptr)`): the container fields in
+        // scheme order — updates, users, chats, date, seq — with the same
+        // vector/ctor text the h2h log shows.
+        let update = telegram_api::updateNewMessage {
+            message: Some(telegram_api::Message::message(telegram_api::message {
+                flags: 0,
+                id: 361,
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 2202815082,
+                })),
+                date: 1790672705,
+                message: "h2h message one".to_owned(),
+                ..telegram_api::message::default()
+            })),
+            pts: 362,
+            pts_count: 1,
+        };
+        let umbrella = telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![telegram_api::Update::updateNewMessage(update)],
+            users: vec![],
+            chats: vec![],
+            date: 1790672705,
+            seq: 0,
+        });
+        assert_eq!(
+            umbrella.to_debug_string(),
+            "updates {\n  updates = vector[1] {\n    updateNewMessage {\n      message = message {\n        flags = 0\n        flags2 = 0\n        id = 361\n        peer_id = peerUser {\n          user_id = 2202815082\n        }\n        date = 1790672705\n        message = \"h2h message one\"\n      }\n      pts = 362\n      pts_count = 1\n    }\n  }\n  users = vector[0] {\n  }\n  chats = vector[0] {\n  }\n  date = 1790672705\n  seq = 0\n}\n"
         );
     }
 

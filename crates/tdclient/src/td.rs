@@ -343,24 +343,49 @@ impl UpdatesSink for TdSink {
     fn process_pts_update(&mut self, update: PendingUpdate) {
         match update {
             PendingUpdate::Wire(telegram_api::Update::updateNewMessage(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5833,
+                    "Process updateNewMessage"
+                );
                 if let Some(message) = update.message {
                     self.new_messages.push((message, "updateNewMessage"));
                 }
             }
             PendingUpdate::Wire(telegram_api::Update::updateNewChannelMessage(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5923,
+                    "Process updateNewChannelMessage"
+                );
                 if let Some(message) = update.message {
                     self.new_messages.push((message, "updateNewChannelMessage"));
                 }
             }
             PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5863,
+                    "Process updateDeleteMessages"
+                );
                 self.deletions.push(update.messages);
             }
             PendingUpdate::Wire(telegram_api::Update::updateEditMessage(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5854,
+                    "Process updateEditMessage"
+                );
                 if let Some(message) = update.message {
                     self.edits.push((message, update.pts));
                 }
             }
             PendingUpdate::Wire(telegram_api::Update::updateEditChannelMessage(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5951,
+                    "Process updateEditChannelMessage"
+                );
                 // the channel twin of `updateEditMessage` — the same
                 // channel-pts machine applies it (the C++
                 // `add_pending_channel_update` routing)
@@ -369,15 +394,30 @@ impl UpdatesSink for TdSink {
                 }
             }
             PendingUpdate::Wire(telegram_api::Update::updateDeleteChannelMessages(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5929,
+                    "Process updateDeleteChannelMessages"
+                );
                 self.deletions.push(update.messages);
             }
             PendingUpdate::Wire(telegram_api::Update::updateReadHistoryInbox(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5873,
+                    "Process updateReadHistoryInbox"
+                );
                 if let Some(peer) = update.peer {
                     self.reads_inbox
                         .push((peer, update.max_id, update.top_msg_id));
                 }
             }
             PendingUpdate::Wire(telegram_api::Update::updateReadHistoryOutbox(update)) => {
+                tdutils::log_info!(
+                    at "MessagesManager.cpp",
+                    5888,
+                    "Process updateReadHistoryOutbox"
+                );
                 if let Some(peer) = update.peer {
                     self.reads_outbox.push((peer, update.max_id));
                 }
@@ -2860,6 +2900,19 @@ pub struct Td {
     /// through `timeout_expired` exactly like the C++ actor's
     /// `MAX_PTS_SAVE_DELAY` throttle.
     pub(crate) updates_manager: UpdatesManager<TdSink>,
+    /// The UpdatesManager's actor identity — the port of the C++
+    /// externally-owned manager registration (`Td.cpp:1320`
+    /// `register_actor("UpdatesManager", updates_manager_.get())`): the
+    /// bridge is a real actor (own mailbox, own context tag, own dispatch
+    /// slices) whose handlers reach this `Td` through a raw pointer,
+    /// where the C++ manager reaches it through `td_`. The
+    /// `send_closure`-routed C++ entries (the `on_get_updates` self-bounce,
+    /// the query answers, the pong, the timeouts) run in the bridge's
+    /// slices; the C++ direct entries (`get_difference`, the
+    /// `add_pending_pts_update` call sites) stay direct. Created in
+    /// [`Td::emit_start_up`], destroyed in [`Td::tear_down`] (the C++
+    /// `reset_actor` order at `Td.cpp:757`).
+    pub(crate) updates_manager_bridge: ActorOwn<UmBridge>,
     /// `Td::storage_manager_` (`Td::Td`, Td.cpp:940) — created with Td.
     pub(crate) storage_manager: StorageManager,
     /// `Td::file_manager_` (`Td::init_file_manager`, Td.cpp:1080) — behind
@@ -3303,6 +3356,7 @@ impl Td {
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
             updates_manager: UpdatesManager::new(TdSink::default()),
+            updates_manager_bridge: ActorOwn::default(),
             storage_manager: StorageManager::default(),
             file_manager,
             file_reference_manager: crate::files::FileReferenceManager::new(),
@@ -5445,6 +5499,87 @@ impl Td {
         })
     }
 
+    /// Run `f` with the [`TdUpdatesEnv`] over this Td — the shared
+    /// construction of the `send_closure`-routed UpdatesManager arms (the
+    /// C++ manager reads the same world through `td_`/`G()`). The field
+    /// split happens here so the callee's `&mut` into the updates manager
+    /// stays a disjoint borrow; the sink drains after (the C++ sends its
+    /// updates synchronously inside the slice).
+    fn with_updates_env(&mut self, f: impl FnOnce(&mut UpdatesManager<TdSink>, &mut TdUpdatesEnv)) {
+        let net = self.updates_net();
+        let global = &mut self.global;
+        let Some(options) = self.option_manager.as_mut() else {
+            return;
+        };
+        let mut env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+            net,
+        };
+        f(&mut self.updates_manager, &mut env);
+        drop(env);
+        self.drain_sink();
+    }
+
+    /// One `send_closure(G()->updates_manager(), ...)` hop — the C++
+    /// inline-when-idle semantics: nested in this frame under the bridge's
+    /// identity (the C++ inline `EventGuard`) when the bridge is idle,
+    /// through its mailbox (a later slice) otherwise.
+    fn um_send(&mut self, message: UmMessage) {
+        if self.updates_manager_bridge.empty() {
+            // No bridge yet — a Td that never ran start_up (the
+            // direct-drive tests): run in this frame, the pre-actorization
+            // behavior. In C++ the manager actor exists from Td::start_up.
+            message.run(self);
+            return;
+        }
+        let id = self.updates_manager_bridge.get();
+        if Scheduler::instance().can_run_inline(&id) {
+            Scheduler::instance().run_nested(&id, move || message.run(self));
+        } else {
+            Scheduler::instance().send_typed_later(&id, move |bridge: &mut UmBridge| {
+                bridge.run(message);
+            });
+        }
+    }
+
+    /// One `send_closure_later(actor_id(this), ...)` self-bounce — the C++
+    /// always-queued form (the `on_get_updates` public entry, the timeout
+    /// hops): always through the bridge's mailbox.
+    fn um_send_later(&mut self, message: UmMessage) {
+        if self.updates_manager_bridge.empty() {
+            // No bridge yet — see `um_send`.
+            message.run(self);
+            return;
+        }
+        let id = self.updates_manager_bridge.get();
+        Scheduler::instance().send_typed_later(&id, move |bridge: &mut UmBridge| {
+            bridge.run(message);
+        });
+    }
+
+    /// `UpdatesManager::start_up` (UpdatesManager.cpp:284-310), run in the
+    /// bridge's Start slice.
+    fn um_start_up(&mut self) {
+        if self.auth_manager.is_bot() {
+            return;
+        }
+        // The StateManager online callback (`try_reload_data` on the
+        // online transition) rides the user-side online machinery; the
+        // reload anchors are the observable part of the C++ tail.
+        self.with_updates_env(|um, env| um.init_reload_times(env));
+    }
+
+    /// `UpdatesManager::hangup`'s queue half (cpp:305-311), run in the
+    /// bridge's Hangup slice.
+    fn um_hangup(&mut self) {
+        self.updates_manager.clear_pending_queues();
+    }
+
     /// Drain the callback-parked UpdatesManager answers — the C++
     /// promise lambdas of the five query classes (UpdatesManager.cpp:143,
     /// 159, 202, 222, 253) rerouted through the parked kinds.
@@ -5460,28 +5595,17 @@ impl Td {
     /// hop and drains the sink afterwards (the difference/state intakes
     /// may apply updates into the collectors).
     fn on_updates_net_answer(&mut self, kind: UpdatesNetKind, query: NetQuery) {
-        let net = self.updates_net();
-        let global = &mut self.global;
-        let Some(options) = self.option_manager.as_mut() else {
-            return;
-        };
-        let mut env = TdUpdatesEnv {
-            global,
-            options,
-            auth_is_authorized: self.auth_manager.is_authorized(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            my_id: self.user_manager.get_my_id().get(),
-            can_ignore_background_updates: self.can_ignore_background_updates,
-            net,
-        };
+        // Each arm is the C++ `send_closure(G()->updates_manager(), ...)`
+        // hop (UpdatesManager.cpp:364, :522-524, :1875-1878, :1934): the
+        // parse stays in this frame (the promise continuation's), the
+        // intake hops into the manager's context.
         match kind {
             UpdatesNetKind::GetDifference | UpdatesNetKind::GetPtsUpdate => {
                 if query.is_error() {
                     let status = query.error().clone();
-                    self.updates_manager
-                        .on_failed_get_difference(&mut env, status);
+                    self.um_send(UmMessage::OnFailedGetDifference { error: status });
                 } else if let Ok(difference) = telegram_api::updates_Difference::parse(query.ok()) {
-                    self.updates_manager.on_get_difference(&mut env, difference);
+                    self.um_send(UmMessage::OnGetDifference { difference });
                 } else {
                     tdutils::log_error!("Failed to parse the getDifference answer");
                 }
@@ -5489,14 +5613,9 @@ impl Td {
             UpdatesNetKind::GetUpdatesState => {
                 if query.is_error() {
                     let status = query.error().clone();
-                    self.updates_manager
-                        .on_failed_get_updates_state(&mut env, status);
+                    self.um_send(UmMessage::OnFailedGetUpdatesState { error: status });
                 } else if let Ok(state) = telegram_api::updates_State::parse(query.ok()) {
-                    self.updates_manager.on_get_updates_state(
-                        &mut env,
-                        state,
-                        "GetUpdatesStateQuery",
-                    );
+                    self.um_send(UmMessage::OnGetUpdatesState { state });
                 } else {
                     tdutils::log_error!("Failed to parse the updates.getState answer");
                 }
@@ -5515,10 +5634,9 @@ impl Td {
                 } else {
                     telegram_api::updates_State::parse(query.ok()).ok()
                 };
-                self.updates_manager.on_server_pong(&mut env, state);
+                self.um_send(UmMessage::OnServerPong { state });
             }
         }
-        drop(env);
         self.drain_sink();
     }
 
@@ -5672,28 +5790,14 @@ impl Td {
             return;
         }
         // the full-updates arm (MessagesManager.cpp:1260-1262):
-        // check_send_message_result, then the difference pump.
+        // check_send_message_result, then the difference pump. The C++
+        // public entry self-bounces through the manager's mailbox
+        // (UpdatesManager.cpp:1176-1178) — a separate slice.
         self.check_send_message_result(random_id, dialog_id, &updates);
-        let net = self.updates_net();
-        let global = &mut self.global;
-        let options = self
-            .option_manager
-            .as_mut()
-            .expect("option manager exists after init");
-        let mut env = TdUpdatesEnv {
-            global,
-            options,
-            auth_is_authorized: self.auth_manager.is_authorized(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            my_id: self.user_manager.get_my_id().get(),
-            can_ignore_background_updates: self.can_ignore_background_updates,
-            net,
-        };
-        self.updates_manager.on_get_updates(
-            &mut env,
-            updates,
-            tdutils::promise::Promise::default(),
-        );
+        self.um_send_later(UmMessage::OnGetUpdates {
+            updates: Box::new(updates),
+            promise: Promise::default(),
+        });
         self.drain_sink();
     }
 
@@ -6845,12 +6949,12 @@ impl Td {
         }
 
         if self.request_set.remove(&id) {
-            // Td.cpp:1409 — the td_requests result log (pretty form).
+            // Td.cpp:1410 — the td_requests result log (pretty form).
             tdutils::vlog!(
                 tdutils::logging::verbosity::TD_REQUESTS,
                 "td_requests",
                 at "Td.cpp",
-                1409,
+                1410,
                 "Sending result for request {}: {}",
                 id,
                 object.to_debug_string()
@@ -7010,6 +7114,17 @@ impl Td {
     /// `Td::start_up` (Td.cpp:438-461): the endianness guard is a compile
     /// error here; the common state + the fake auth state follow.
     fn emit_start_up(&mut self) {
+        // The UpdatesManager bridge — the C++ externally-owned manager
+        // actor (`Td.cpp:1319-1321`): registered in start_up, under this
+        // actor, so the `send_closure`-routed UM entries run in the
+        // manager's slices with its context tag.
+        let td_ptr: *mut Td = self;
+        let me = self.actor_id();
+        self.updates_manager_bridge = Scheduler::instance().create_bridge_actor(
+            "UpdatesManager",
+            UmBridge { td: td_ptr },
+            &me,
+        );
         // The Requests instance and the Global are plain Rust structures —
         // no actor creation needed (the C++ actor bookkeeping in start_up
         // guards its async teardown).
@@ -7534,21 +7649,13 @@ impl Td {
         let Ok(umbrella) = telegram_api::Updates::parse(&data) else {
             return;
         };
-        let net = self.updates_net();
-        let Some(options) = self.option_manager.as_mut() else {
-            return;
-        };
-        let mut env = TdUpdatesEnv {
-            global: &mut self.global,
-            options,
-            auth_is_authorized: self.auth_manager.is_authorized(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            my_id: self.user_manager.get_my_id().get(),
-            can_ignore_background_updates: self.can_ignore_background_updates,
-            net,
-        };
-        self.updates_manager
-            .on_get_updates(&mut env, umbrella, Promise::default());
+        // `Td::on_new_update`'s public entry (Td.cpp:408) — the manager's
+        // `send_closure_later` self-bounce (UpdatesManager.cpp:1176-1178)
+        // runs the intake in the UpdatesManager's own slice.
+        self.um_send_later(UmMessage::OnGetUpdates {
+            updates: Box::new(umbrella),
+            promise: Promise::default(),
+        });
         self.drain_sink();
     }
 
@@ -7755,6 +7862,15 @@ impl Td {
     /// M.9.18 flip (wire media through `get_message_content`) now lives at
     /// its C++ call position inside `parse_telegram_api_message`.
     fn apply_new_message(&mut self, message: &telegram_api::Message, source: &str) {
+        // `MessagesManager::parse_telegram_api_message`'s intake dump
+        // (MessagesManager.cpp:11375).
+        tdutils::log_debug!(
+            at "MessagesManager.cpp",
+            11375,
+            "Receive from {} {}",
+            source,
+            message.to_debug_string()
+        );
         // The complete receive head (MessagesManager.cpp:11921-12107) over
         // the M.10.2c manager: parse → create → add_message_to_dialog with
         // the ordered insert, the counter maintenance and the
@@ -9967,6 +10083,140 @@ fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
     Some(users)
 }
 
+/// The `UpdatesManager` bridge actor — the Rust port of the C++
+/// externally-owned manager registration (`Td.cpp:1320`
+/// `register_actor("UpdatesManager", updates_manager_.get())`).
+///
+/// C++ gives each manager a second actor identity around the very same
+/// object: `send_closure`-routed entries land in the manager's own
+/// mailbox and run in a scheduler slice whose log context is the
+/// manager's (`[!UpdatesManager]`), while direct `td_->updates_manager_->`
+/// calls stay in the caller's context. The bridge reproduces exactly
+/// that: a fully normal actor (own mailbox, own Start slice, own
+/// `Add to mailbox`/`Start run actor`/`Run mailbox` trace lines) whose
+/// handlers reach the owner `Td` through a raw pointer, the way the C++
+/// manager reaches it through `td_`.
+///
+/// The exclusivity that C++ gets for free (distinct objects) is
+/// mechanical here: the scheduler's owner-link guard
+/// ([`tdactor::Scheduler::create_bridge_actor`]) never dispatches the
+/// bridge and its owner in the same frame — sends that would re-enter
+/// the pair take the mailbox instead.
+pub(crate) struct UmBridge {
+    /// The owning Td actor. Created us; we are destroyed synchronously
+    /// in its `tear_down` (the C++ `reset_actor` order), so the pointer
+    /// is valid for every deref. Dereferenced only inside our dispatch
+    /// slices, which the owner-link guard keeps exclusive with the
+    /// owner's.
+    td: *mut Td,
+}
+
+impl Actor for UmBridge {
+    /// `UpdatesManager::start_up` (UpdatesManager.cpp:284).
+    fn start_up(&mut self) {
+        // SAFETY: the owner-link exclusivity contract — no owner borrow
+        // is live inside a bridge slice.
+        unsafe { (*self.td).um_start_up() }
+    }
+
+    /// `UpdatesManager::hangup` (cpp:305-313): drop the pending update
+    /// backlog, then stop.
+    fn hangup(&mut self) {
+        // SAFETY: see `start_up`.
+        unsafe { (*self.td).um_hangup() };
+        self.stop();
+    }
+}
+
+impl UmBridge {
+    /// The mailbox dispatch arm: run one message against the owner.
+    fn run(&mut self, message: UmMessage) {
+        // SAFETY: see `start_up`.
+        let td = unsafe { &mut *self.td };
+        message.run(td);
+    }
+}
+
+// SAFETY: the raw owner pointer is dereferenced only inside the bridge's
+// dispatch slices, which the scheduler's owner-link guard keeps exclusive
+// with the owner's own dispatch; the owner destroys the bridge (and so
+// outlives every deref) in its `tear_down`. The pointer itself crosses
+// threads only inside queued events on the owner's scheduler — the same
+// single-scheduler contract as every actor id.
+unsafe impl Send for UmBridge {}
+
+/// One `send_closure`-class entry into the UpdatesManager — the payloads
+/// of the C++ hops (`send_closure(G()->updates_manager(), ...)`) that run
+/// in the manager's context. The C++ direct entries
+/// (`get_difference`, `schedule_get_difference`,
+/// `on_update_from_auth_key_id`, the `add_pending_pts_update` call sites)
+/// do not ride this enum; they stay direct calls, in the caller's
+/// context, like the C++.
+pub(crate) enum UmMessage {
+    /// `on_get_updates` — the public entry's
+    /// `send_closure_later(actor_id(this), ...)` self-bounce
+    /// (UpdatesManager.cpp:1176-1178): always a separate slice.
+    OnGetUpdates {
+        updates: Box<telegram_api::Updates>,
+        promise: Promise<()>,
+    },
+    /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
+    /// (cpp:522, :364).
+    OnGetDifference {
+        difference: telegram_api::updates_Difference,
+    },
+    /// `on_failed_get_difference` (cpp:524).
+    OnFailedGetDifference { error: Status },
+    /// `on_get_updates_state` (cpp:1875).
+    OnGetUpdatesState { state: telegram_api::updates_State },
+    /// `on_failed_get_updates_state` (cpp:1878).
+    OnFailedGetUpdatesState { error: Status },
+    /// `on_server_pong` (cpp:1934).
+    OnServerPong {
+        state: Option<telegram_api::updates_State>,
+    },
+    /// The timeout fixpoint — the C++ AlarmTimeout hops
+    /// (`retry_timeout_`/`ping_timeout_`/the save timers wake the
+    /// manager's slice; the `Timeout`-event machinery itself is the
+    /// later timeout-actor step).
+    TickTimeouts,
+}
+
+impl UmMessage {
+    /// Run the entry against the owner — the env is built exactly like
+    /// the C++ manager reads its `td_` world, and the sink drains
+    /// afterwards (the C++ sends updates to the client synchronously
+    /// inside the slice; the drain flush is the sink's batching
+    /// boundary).
+    fn run(self, td: &mut Td) {
+        match self {
+            UmMessage::OnGetUpdates { updates, promise } => {
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, promise));
+            }
+            UmMessage::OnGetDifference { difference } => {
+                td.with_updates_env(|um, env| um.on_get_difference(env, difference));
+            }
+            UmMessage::OnFailedGetDifference { error } => {
+                td.with_updates_env(|um, env| um.on_failed_get_difference(env, error));
+            }
+            UmMessage::OnGetUpdatesState { state } => {
+                td.with_updates_env(|um, env| {
+                    um.on_get_updates_state(env, state, "GetUpdatesStateQuery")
+                });
+            }
+            UmMessage::OnFailedGetUpdatesState { error } => {
+                td.with_updates_env(|um, env| um.on_failed_get_updates_state(env, error));
+            }
+            UmMessage::OnServerPong { state } => {
+                td.with_updates_env(|um, env| um.on_server_pong(env, state));
+            }
+            UmMessage::TickTimeouts => {
+                td.with_updates_env(|um, env| um.tick_timeouts(env));
+            }
+        }
+    }
+}
+
 actor_messages! {
     pub enum TdMessage for Td {
         Request { request_id: u64, function: Function, } => request(request_id, function),
@@ -10153,20 +10403,27 @@ impl Actor for Td {
 
         // The update engine's timers (the gap fills, the throttled pmc
         // saves, the getDifference retry and the data reloaders; M.7.18).
-        // Pre-init the ticks skip — the tail flush below must still run:
-        // a pre-init alarm settles its parked promise through it.
-        let net = self.updates_net();
-        if let Some(options) = self.option_manager.as_mut() {
-            let mut env = TdUpdatesEnv {
-                global: &mut self.global,
-                options,
-                auth_is_authorized: self.auth_manager.is_authorized(),
-                auth_is_bot: self.auth_manager.is_bot(),
-                my_id: self.user_manager.get_my_id().get(),
-                can_ignore_background_updates: self.can_ignore_background_updates,
-                net,
-            };
-            self.updates_manager.tick_timeouts(&mut env);
+        // The C++ timers are the manager's own AlarmTimeouts whose fires
+        // hop into the manager's slice — the fixpoint rides the bridge.
+        // Pre-init the ticks skip (no bridge yet) — the tail flush below
+        // must still run: a pre-init alarm settles its parked promise
+        // through it.
+        if !self.updates_manager_bridge.empty() {
+            self.um_send_later(UmMessage::TickTimeouts);
+        } else {
+            let net = self.updates_net();
+            if let Some(options) = self.option_manager.as_mut() {
+                let mut env = TdUpdatesEnv {
+                    global: &mut self.global,
+                    options,
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    my_id: self.user_manager.get_my_id().get(),
+                    can_ignore_background_updates: self.can_ignore_background_updates,
+                    net,
+                };
+                self.updates_manager.tick_timeouts(&mut env);
+            }
         }
         // The driver events (salts persists, key changes, updates) pump
         // through the same slot when no DrainNetEvents nudge beat it.
@@ -10177,6 +10434,14 @@ impl Actor for Td {
     }
 
     fn tear_down(&mut self) {
+        // The C++ reset_actor sequence (Td.cpp:757): the manager actors
+        // are destroyed before the Td state they reach into — a queued
+        // hangup would run a bridge slice past the owner's death, so the
+        // registration goes down synchronously here.
+        if !self.updates_manager_bridge.empty() {
+            Scheduler::instance().destroy_actor_sync(&self.updates_manager_bridge.get());
+        }
+        self.updates_manager_bridge = ActorOwn::default();
         self.close();
     }
 
@@ -11665,7 +11930,7 @@ fn ok_object() -> Object {
 
 /// `td::oneline` (misc.cpp:69-86): newlines collapse to single spaces
 /// (dropping the indentation that follows them) and trailing spaces trim.
-fn oneline(s: &str) -> String {
+pub(crate) fn oneline(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut after_new_line = true;
     for c in s.chars() {
@@ -14844,25 +15109,12 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
     }
 
     fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
-        let net = self.td.updates_net();
-        let options = self
-            .td
-            .option_manager
-            .as_mut()
-            .expect("option manager exists after init");
-        let global = &mut self.td.global;
-        let mut env = TdUpdatesEnv {
-            global,
-            options,
-            auth_is_authorized: self.td.auth_manager.is_authorized(),
-            auth_is_bot: self.td.auth_manager.is_bot(),
-            my_id: self.td.user_manager.get_my_id().get(),
-            can_ignore_background_updates: self.td.can_ignore_background_updates,
-            net,
-        };
-        self.td
-            .updates_manager
-            .on_get_updates(&mut env, updates, promise);
+        // The public entry's self-bounce (UpdatesManager.cpp:1176-1178) —
+        // the manager's own slice, like every `on_get_updates` caller.
+        self.td.um_send_later(UmMessage::OnGetUpdates {
+            updates: Box::new(updates),
+            promise,
+        });
     }
 }
 
