@@ -507,6 +507,72 @@ mod tests {
         BinlogKeyValue::destroy(&path);
     }
 
+    /// Env-gated live tool: builds a td-rs database directory from a raw
+    /// external session (Pyrogram-style auth key + dc + user id) so a
+    /// client opens it already authorized — no phone/code round, no
+    /// FloodWait. Skips instantly when `IMPORT_SESSION_DB` is unset, so
+    /// the normal suite is unaffected; the auth key arrives via env and
+    /// is never printed.
+    #[test]
+    fn import_session_from_env() {
+        let Some(db_dir) = std::env::var_os("IMPORT_SESSION_DB").map(std::path::PathBuf::from)
+        else {
+            return;
+        };
+        let key_hex = std::env::var("IMPORT_SESSION_AUTH_KEY").expect("IMPORT_SESSION_AUTH_KEY");
+        let raw_dc: i32 = std::env::var("IMPORT_SESSION_DC")
+            .expect("IMPORT_SESSION_DC")
+            .parse()
+            .expect("dc number");
+        let user_id = std::env::var("IMPORT_SESSION_USER_ID").expect("IMPORT_SESSION_USER_ID");
+        let is_bot = std::env::var("IMPORT_SESSION_IS_BOT").map(|v| v == "true") == Ok(true);
+        let is_test = std::env::var("IMPORT_SESSION_TEST_DC").map(|v| v != "false") != Ok(false);
+
+        let database_dir = db_dir.join("database");
+        std::fs::create_dir_all(&database_dir).expect("create database dir");
+        // `TdDb::get_binlog_path`: {database_directory}td{_test}.binlog.
+        let path = database_dir
+            .join(if is_test {
+                "td_test.binlog"
+            } else {
+                "td.binlog"
+            })
+            .to_string_lossy()
+            .into_owned();
+        let _ = BinlogKeyValue::destroy(&path);
+        let mut pmc = BinlogKeyValue::new();
+        // The runtime's binlog pmc consumes only its own magic's events
+        // (`TdDb::BINLOG_PMC_MAGIC`), and `TdDb::as_db_key` maps an empty
+        // client key to the raw "cucumber" default.
+        pmc.set_magic(tddb::td_db::BINLOG_PMC_MAGIC);
+        pmc.init(&path, tddb::db_key::DbKey::raw_key(b"cucumber".to_vec()))
+            .ensure();
+
+        let key_bytes = (0..key_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16).expect("hex auth key"))
+            .collect::<Vec<u8>>();
+        assert_eq!(key_bytes.len(), 256, "auth key must be 256 bytes");
+        let key_id = tdmtproto::dh_handshake::DhHandshake::calc_key_id(&key_bytes);
+        let mut auth_key = AuthKey::new(key_id as u64, key_bytes);
+        auth_key.set_auth_flag(true);
+        let dc_id = DcId::internal(raw_dc);
+        save_auth_key_to_pmc(&mut pmc, dc_id, &auth_key);
+
+        // The AuthManager restore markers (td.rs reads `auth`/`auth_is_bot`,
+        // `UserManager::load_my_id` reads `my_id`).
+        pmc.set("auth", "ok");
+        pmc.set("auth_is_bot", if is_bot { "true" } else { "false" });
+        pmc.set("my_id", &user_id);
+
+        // Round-trip proof before the pmc goes out of scope.
+        let reloaded = load_auth_key_from_pmc(&mut pmc, dc_id);
+        assert!(reloaded.auth_flag());
+        assert_eq!(reloaded.id(), key_id as u64);
+        assert_eq!(pmc.get("auth"), "ok");
+        eprintln!("imported dc={raw_dc} user={user_id} -> {path}");
+    }
+
     #[test]
     #[should_panic(expected = "Failed to unserialize future salts")]
     fn hostile_salt_count_is_rejected() {
