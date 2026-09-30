@@ -330,6 +330,13 @@ pub fn set_log_tag(tag: &'static str) {
     LOG_TAG.with(|cell| cell.set(tag));
 }
 
+/// The current `#` tag (the C++ `Log::tag_`): the actor-context instance
+/// tag while an actor dispatch is running, empty on bare scheduler
+/// machinery.
+pub fn current_log_tag() -> &'static str {
+    LOG_TAG.with(|cell| cell.get())
+}
+
 pub fn set_log_tag2(tag: &'static str) {
     LOG_TAG2.with(|cell| cell.set(tag));
 }

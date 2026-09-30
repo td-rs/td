@@ -62,6 +62,15 @@ fn actor_log_name(id: &ActorId) -> &'static str {
     slot_log_name(id.slot_ptr())
 }
 
+/// The actor's `#` instance tag (the C++ `ActorContext::tag_`) — the
+/// creating context's tag, copied at registration; empty for
+/// scheduler-internal actors.
+fn actor_log_tag1(id: &ActorId) -> &'static str {
+    // SAFETY: the caller holds a live actor id; the tag is immutable after
+    // registration.
+    unsafe { (*id.slot_ptr()).tag1_str() }
+}
+
 /// The C++ `Event::operator<<` names, as they appear in scheduler logs
 /// (`Add to mailbox: Td:H:H Event::Custom`).
 fn event_log_name(ty: EventType) -> &'static str {
@@ -903,13 +912,13 @@ impl SchedulerState {
             link_token: token,
         };
         let prev = self.install_ctx(&ctx);
-        let saved_tag2 = self.enter_actor(id);
+        let saved_tags = self.enter_actor(id);
         {
             let mut slot = self.info(id).actor.borrow_mut();
             let actor = slot.as_mut().expect("dispatched to a dead actor");
             run(actor);
         }
-        let (flags, dest) = self.exit_actor(id, prev, saved_tag2);
+        let (flags, dest) = self.exit_actor(id, prev, saved_tags);
         self.honor_flags(id, flags, dest);
     }
 
@@ -1092,15 +1101,21 @@ impl SchedulerState {
     /// running. The list unlink happens on *exit* (the EventGuard
     /// destructor), exactly like C++; the actor stays linked wherever it
     /// was (pending, for inline dispatches) until then.
-    fn enter_actor(&self, id: &ActorId) -> &'static str {
+    fn enter_actor(&self, id: &ActorId) -> (&'static str, &'static str) {
         let info = self.info(id);
         info.is_running.set(true);
-        // The C++ `EventGuard` sets `LOG_TAG2` to the actor name for the
-        // whole dispatch (the `[!Name]` header column) and logs the run at
-        // `VLOG(actor)` (ActorInfo.h:175). The returned saved tag is
-        // restored by [`Self::exit_actor`].
+        // The C++ `EventGuard` swaps BOTH log context tags for the whole
+        // dispatch: `LOG_TAG2` to the actor name (the `[!Name]` column)
+        // and `LOG_TAG` to the actor-context tag (the `[#N]` client
+        // instance id — empty for scheduler-internal actors; the fresh
+        // shape-compare caught the thread-wide `[#1]` divergence). The
+        // saved pair is restored by [`Self::exit_actor`].
         let name = actor_log_name(id);
-        let saved_tag2 = tdutils::logging::current_log_tag2();
+        let saved_tags = (
+            tdutils::logging::current_log_tag(),
+            tdutils::logging::current_log_tag2(),
+        );
+        tdutils::logging::set_log_tag(actor_log_tag1(id));
         tdutils::logging::set_log_tag2(name);
         tdutils::vlog!(
             tdutils::logging::verbosity::ACTOR,
@@ -1112,7 +1127,7 @@ impl SchedulerState {
             id.info_ptr(),
             id.slot_ptr()
         );
-        saved_tag2
+        saved_tags
     }
 
     /// The end of the C++ `EventGuard` destructor: unlink the actor and
@@ -1126,7 +1141,7 @@ impl SchedulerState {
         &self,
         id: &ActorId,
         prev_ctx: *const EventContext,
-        saved_tag2: &'static str,
+        saved_tags: (&'static str, &'static str),
     ) -> (u32, i32) {
         let name = actor_log_name(id);
         tdutils::vlog!(
@@ -1139,7 +1154,8 @@ impl SchedulerState {
             id.info_ptr(),
             id.slot_ptr()
         );
-        tdutils::logging::set_log_tag2(saved_tag2);
+        tdutils::logging::set_log_tag(saved_tags.0);
+        tdutils::logging::set_log_tag2(saved_tags.1);
         let info = self.info(id);
         let mailbox_empty = info.mailbox_empty.get();
         let info_ptr = id.info_ptr();
@@ -1187,9 +1203,9 @@ impl SchedulerState {
             link_token: event.link_token,
         };
         let prev = self.install_ctx(&ctx);
-        let saved_tag2 = self.enter_actor(id);
+        let saved_tags = self.enter_actor(id);
         self.do_event(self.info(id), event);
-        let (flags, dest) = self.exit_actor(id, prev, saved_tag2);
+        let (flags, dest) = self.exit_actor(id, prev, saved_tags);
         self.honor_flags(id, flags, dest);
     }
 
@@ -1208,7 +1224,15 @@ impl SchedulerState {
         let prev = self.install_ctx(&ctx);
         // One EventGuard for the whole drain, like the C++ `run_mailbox`.
         let name = slot_log_name(info.slot);
-        let saved_tag2 = tdutils::logging::current_log_tag2();
+        let saved_tags = (
+            tdutils::logging::current_log_tag(),
+            tdutils::logging::current_log_tag2(),
+        );
+        tdutils::logging::set_log_tag(
+            // SAFETY: the caller holds the in-guard info; immutable after
+            // registration.
+            unsafe { (*info.slot).tag1_str() },
+        );
         tdutils::logging::set_log_tag2(name);
         tdutils::vlog!(
             tdutils::logging::verbosity::ACTOR,
@@ -1266,7 +1290,8 @@ impl SchedulerState {
             info_ptr,
             info.slot
         );
-        tdutils::logging::set_log_tag2(saved_tag2);
+        tdutils::logging::set_log_tag(saved_tags.0);
+        tdutils::logging::set_log_tag2(saved_tags.1);
         if flags != 0 {
             // A *borrowed* id view for the flag handling — no refcount
             // traffic (the hot path never takes flags). `from_raw_block`
@@ -2129,9 +2154,6 @@ impl ConcurrentScheduler {
             "run_main before start"
         );
         let _guard = SchedulerGuard::new(&self.main, true);
-        // The main scheduler thread's instance tag, like every scheduler
-        // thread (see `scheduler_thread`).
-        tdutils::logging::set_log_tag("1");
         let deadline = Instant::now() + Duration::from_secs_f64(timeout);
         self.runtime.block_on(self.main.run_once(deadline));
         !self.finished.load(Ordering::Relaxed)
@@ -2242,10 +2264,6 @@ fn scheduler_thread(state: SchedulerState, finished: Arc<AtomicBool>) {
         .expect("failed to build a scheduler runtime");
     let ptr = Box::into_raw(Box::new(state));
     let _guard = SchedulerGuard::from_raw(ptr, true);
-    // The `[#N]` header column — the C++ Client.cpp:250 instance tag set on
-    // the Td context and inherited by every actor of the instance. One Td
-    // instance per process for now, so the constant is exact.
-    tdutils::logging::set_log_tag("1");
     runtime.block_on(async {
         let state = unsafe { &*ptr };
         while !finished.load(Ordering::Relaxed) {

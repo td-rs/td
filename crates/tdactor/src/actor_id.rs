@@ -82,6 +82,14 @@ pub(crate) struct IdSlot {
     /// longest is 37) without the boxed string's extra malloc per
     /// registration (the S37 CreateActor gate).
     name: ActorName,
+    /// The actor-context `#` tag (C++ `ActorContext::tag_`, the client
+    /// instance id): copied from the CREATOR's tag at registration
+    /// (`ActorInfo::set_context`'s `if (Scheduler::context()->tag_)
+    /// context->set_tag(...)` — the thread-local holds the running
+    /// actor's tag during a dispatch), so every actor created under the
+    /// Td actor inherits it while scheduler-internal actors keep it
+    /// empty. Immutable after creation, like `name`.
+    tag1: &'static str,
     /// The block's allocation layout — the block is freed raw by the last
     /// `ActorId` drop (see [`SlotBlock`](Self::allocate_block)).
     block_layout: Layout,
@@ -121,10 +129,17 @@ impl IdSlot {
     pub(crate) fn name_str(&self) -> &str {
         self.name.as_str()
     }
+
+    /// The actor-context `#` tag for logging (the C++
+    /// `ActorContext::tag_` — the client instance id, or empty for
+    /// scheduler-internal actors).
+    pub(crate) fn tag1_str(&self) -> &'static str {
+        self.tag1
+    }
 }
 
-// SAFETY: `ref_cnt`, `alive` and `sched` are atomics, `name` is immutable
-// after creation; `info` is written once at creation and only dereferenced on
+// SAFETY: `ref_cnt`, `alive` and `sched` are atomics, `name` and `tag1`
+// are immutable after creation; `info` is written once at creation and only dereferenced on
 // the actor's current scheduler thread (never from a foreign thread), so no
 // data race on the pointee is possible through shared access to the slot.
 unsafe impl Send for IdSlot {}
@@ -284,6 +299,7 @@ impl IdSlot {
                     #[cfg(any(debug_assertions, feature = "loom"))]
                     freed: AtomicBool::new(false),
                     name: ActorName::new(name),
+                    tag1: tdutils::logging::current_log_tag(),
                     block_layout: total,
                     info: UnsafeCell::new(block.add(info_offset).cast()),
                 },

@@ -221,8 +221,16 @@ actor_messages! {
 impl MultiTd {
     fn create(&mut self, td_id: i32, callback: Box<dyn TdCallback>) {
         debug_assert!(!self.tds.contains_key(&td_id), "double client create");
-        self.tds
-            .insert(td_id, create_actor("Td", Td::new(callback)));
+        // `MultiTd::create` (Client.cpp:246-254): the instance tag
+        // (`to_string(td_id)`, the `[#N]` header column) is installed
+        // around the `create_actor<Td>` call so the new Td actor's
+        // context inherits it, and every actor it later creates inherits
+        // it in turn; scheduler-internal actors keep the tag empty.
+        let saved_tag = tdutils::logging::current_log_tag();
+        tdutils::logging::set_log_tag(tdutils::logging::intern_log_tag(&td_id.to_string()));
+        let td = create_actor("Td", Td::new(callback));
+        tdutils::logging::set_log_tag(saved_tag);
+        self.tds.insert(td_id, td);
     }
 
     fn send(&mut self, client_id: i32, request_id: u64, request: Function) {
