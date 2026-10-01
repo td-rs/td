@@ -259,6 +259,21 @@ where
         }
     }
 
+    /// `SessionConnection::get_elapsed_time` (SessionConnection.cpp:414-423):
+    /// "never" for the zero timestamp, "Xus/ms/s ago" for the past,
+    /// "in X" for the future.
+    fn get_elapsed_time(&self, time_at: f64) -> String {
+        if time_at <= 0.0 {
+            return "never".to_string();
+        }
+        let elapsed_time = time::now() - time_at;
+        if elapsed_time > 0.0 {
+            format!("{} ago", tdutils::format::as_time(elapsed_time))
+        } else {
+            format!("in {}", tdutils::format::as_time(-elapsed_time))
+        }
+    }
+
     fn http_max_wait(&self) -> f64 {
         25.0 // 25s. Longer could be closed by proxy
     }
@@ -1124,6 +1139,22 @@ where
         );
         relax(&mut wakeup_at, self.flush_packet_at);
 
+        // SessionConnection.cpp:1149-1154 — the per-flush timeout dump.
+        tdutils::log_debug!(
+            at "SessionConnection.cpp",
+            1150,
+            "Last pong was {}/{}, last read was {}/{}, RTT = {}, ping timeout = {}, read timeout = {}, flush packet {}, wakeup {}",
+            self.get_elapsed_time(self.last_pong_at),
+            self.get_elapsed_time(self.real_last_pong_at),
+            self.get_elapsed_time(self.last_read_at),
+            self.get_elapsed_time(self.real_last_read_at),
+            tdutils::format::fixed_double(self.rtt()),
+            tdutils::format::fixed_double(self.ping_disconnect_delay()),
+            tdutils::format::fixed_double(self.read_disconnect_delay()),
+            self.get_elapsed_time(self.flush_packet_at),
+            self.get_elapsed_time(wakeup_at),
+        );
+
         wakeup_at
     }
 
@@ -1197,6 +1228,27 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     fn on_raw_packet(&mut self, packet_info: &PacketInfo, packet: BufferSlice) -> Status {
+        // SessionConnection.cpp:590-593 — the raw/mtproto receive pair.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::RAW_MTPROTO,
+            "raw_mtproto",
+            at "SessionConnection.cpp",
+            590,
+            "Receive packet of size {}:{}",
+            packet.length(),
+            tdutils::logging::hex_dump_4(packet.as_slice())
+        );
+        tdutils::vlog!(
+            tdutils::logging::verbosity::MTPROTO,
+            "mtproto",
+            at "SessionConnection.cpp",
+            591,
+            "Receive packet with {} and seq_no {} of size {}",
+            packet_info.message_id,
+            packet_info.seq_no,
+            packet.length()
+        );
+
         let old_main_message_id = self.main_message_id;
         self.main_message_id = packet_info.message_id;
 

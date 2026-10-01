@@ -8,6 +8,12 @@
 #   wasm-ld rejects --shared-memory. The pthread link needs a nightly
 #   toolchain (or -Zbuild-std) with +atomics,+bulk-memory,+mutable-globals
 #   — recorded as the follow-up; until then threads error at runtime.
+# The tdclient close-path tests overflow the default 2 MiB test-thread
+# stack in debug builds (the bridge-actor intake deepened the close
+# machine). Applies to every process cargo spawns in this workspace.
+[env]
+RUST_MIN_STACK = "33554432"
+
 [target.wasm32-unknown-emscripten]
 linker = "emcc"
 rustflags = [

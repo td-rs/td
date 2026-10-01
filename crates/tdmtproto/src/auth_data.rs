@@ -324,8 +324,8 @@ impl AuthData {
                 at "AuthData.cpp",
                 72,
                 "Set server time difference: {} -> {}",
-                self.server_time_difference,
-                diff
+                tdutils::format::fixed_double(self.server_time_difference),
+                tdutils::format::fixed_double(diff)
             );
             self.server_time_difference_was_updated = true;
             self.server_time_difference = diff;
@@ -334,8 +334,8 @@ impl AuthData {
                 at "AuthData.cpp",
                 76,
                 "Update server time difference: {} -> {}",
-                self.server_time_difference,
-                diff
+                tdutils::format::fixed_double(self.server_time_difference),
+                tdutils::format::fixed_double(diff)
             );
             self.server_time_difference = diff;
         } else {
@@ -345,7 +345,7 @@ impl AuthData {
             at "AuthData.cpp",
             81,
             "New server time: {}",
-            self.get_server_time(time::now_cached())
+            tdutils::format::fixed_double(self.get_server_time(time::now_cached()))
         );
         true
     }
@@ -355,8 +355,8 @@ impl AuthData {
             at "AuthData.cpp",
             86,
             "Reset server time difference: {} -> {}",
-            self.server_time_difference,
-            diff
+            tdutils::format::fixed_double(self.server_time_difference),
+            tdutils::format::fixed_double(diff)
         );
         self.server_time_difference_was_updated = false;
         self.server_time_difference = diff;
@@ -424,7 +424,7 @@ impl AuthData {
             let to_mul = ((rx >> 22) & 1023) + 1;
             result = MessageId::new(self.last_message_id.get() + 8 * to_mul as u64);
         }
-        tdutils::log_debug!(at "AuthData.cpp", 122, "Create identifier for {result} at {now}");
+        tdutils::log_debug!(at "AuthData.cpp", 122, "Create identifier for {result} at {}", tdutils::format::fixed_double(now));
         self.last_message_id = result;
         result
     }
@@ -476,7 +476,8 @@ impl AuthData {
         tdutils::log_debug!(
             at "AuthData.cpp",
             155,
-            "Receive packet in {message_id} from session {session_id} at {now}"
+            "Receive packet in {message_id} from session {session_id} at {}",
+            tdutils::format::fixed_double(now)
         );
         let time_difference_was_updated =
             self.update_server_time_difference((message_id.get() >> 32) as u32 as f64 - now);

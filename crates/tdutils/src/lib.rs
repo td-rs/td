@@ -8,6 +8,7 @@ pub mod crc32;
 pub mod crypto;
 pub mod ed25519;
 pub mod emoji;
+pub mod format;
 pub mod gzip;
 pub mod hash;
 pub mod hex_encode;
