@@ -10,6 +10,7 @@ pub mod ed25519;
 pub mod emoji;
 pub mod gzip;
 pub mod hash;
+pub mod hex_encode;
 pub mod hints;
 pub mod http_date;
 pub mod http_url;

@@ -2308,10 +2308,10 @@ impl UserManager {
         }
     }
 
-    /// `UserManager::get_my_id`.
+    /// `UserManager::get_my_id` (UserManager.cpp:2994-2997).
     pub fn get_my_id(&self) -> UserId {
         if !self.my_id.is_valid() {
-            tdutils::log_error!("Wrong or unknown my ID returned");
+            tdutils::log_error!(at "UserManager.cpp", 2995, "Wrong or unknown my ID returned");
         }
         self.my_id
     }

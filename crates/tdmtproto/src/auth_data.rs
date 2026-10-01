@@ -321,6 +321,8 @@ impl AuthData {
     pub fn update_server_time_difference(&mut self, diff: f64) -> bool {
         if !self.server_time_difference_was_updated {
             tdutils::log_debug!(
+                at "AuthData.cpp",
+                72,
                 "Set server time difference: {} -> {}",
                 self.server_time_difference,
                 diff
@@ -329,6 +331,8 @@ impl AuthData {
             self.server_time_difference = diff;
         } else if self.server_time_difference + 1e-4 < diff {
             tdutils::log_debug!(
+                at "AuthData.cpp",
+                76,
                 "Update server time difference: {} -> {}",
                 self.server_time_difference,
                 diff
@@ -338,6 +342,8 @@ impl AuthData {
             return false;
         }
         tdutils::log_debug!(
+            at "AuthData.cpp",
+            81,
             "New server time: {}",
             self.get_server_time(time::now_cached())
         );

@@ -224,6 +224,31 @@ impl BinlogKeyValue {
         let seq_no = binlog.next_event_id();
         let rewrite = entry.1 != 0;
         let event_id = if rewrite { entry.1 } else { seq_no };
+        // BinlogKeyValue.h:147/:150 `VLOG(binlog)` — the Change/Set value
+        // lines, logged before the event is added (the key streams raw,
+        // the value hex-encoded).
+        if rewrite {
+            tdutils::vlog!(
+                tdutils::logging::verbosity::BINLOG,
+                "binlog",
+                at "BinlogKeyValue.h",
+                147,
+                "Change value of key {} from {} to {}",
+                String::from_utf8_lossy(key),
+                tdutils::hex_encode::hex_encode(&entry.0),
+                tdutils::hex_encode::hex_encode(value)
+            );
+        } else {
+            tdutils::vlog!(
+                tdutils::logging::verbosity::BINLOG,
+                "binlog",
+                at "BinlogKeyValue.h",
+                150,
+                "Set value of key {} to {}",
+                String::from_utf8_lossy(key),
+                tdutils::hex_encode::hex_encode(value)
+            );
+        }
         entry.0 = value.to_vec();
         entry.1 = event_id;
 
@@ -262,9 +287,19 @@ impl BinlogKeyValue {
         let Some(binlog) = self.binlog.clone() else {
             panic!("BinlogKeyValue is not initialized");
         };
-        let Some((_, event_id)) = self.map.remove(key.as_bytes()) else {
+        let Some((value, event_id)) = self.map.remove(key.as_bytes()) else {
             return 0;
         };
+        // BinlogKeyValue.h:168 `VLOG(binlog)` — before the empty-event add.
+        tdutils::vlog!(
+            tdutils::logging::verbosity::BINLOG,
+            "binlog",
+            at "BinlogKeyValue.h",
+            168,
+            "Remove value of key {}, which is {}",
+            key,
+            tdutils::hex_encode::hex_encode(&value)
+        );
         let seq_no = binlog.next_event_id();
         binlog.add_raw_event(
             seq_no,
