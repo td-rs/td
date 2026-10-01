@@ -49,9 +49,34 @@ impl fmt::Display for Time {
     }
 }
 
+/// `td::Timer` (tdutils/td/utils/Timer.h) — the pause/resume machinery is
+/// unused by the log sites; the `<< timer` suffix renders as
+/// `" in " + as_time(elapsed)` (Timer.cpp:45-47).
+pub struct Timer {
+    start_at: f64,
+}
+
+impl Timer {
+    pub fn start() -> Self {
+        Timer {
+            start_at: crate::time::now_cached(),
+        }
+    }
+
+    pub fn elapsed(&self) -> f64 {
+        crate::time::now_cached() - self.start_at
+    }
+}
+
+impl fmt::Display for Timer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, " in {}", as_time(self.elapsed()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FixedDouble, as_time, fixed_double};
+    use super::{FixedDouble, Timer, as_time, fixed_double};
 
     /// The C++ samples from the SessionConnection.cpp:1150 /
     /// Td.cpp:666-671 log lines (cmp7-cpp run, 2026-09-30).
@@ -71,5 +96,27 @@ mod tests {
         assert_eq!(fixed_double(136.962929).to_string(), "136.962929");
         assert_eq!(fixed_double(0.0).to_string(), "0.000000");
         assert_eq!(FixedDouble(1.5, 1).to_string(), "1.5");
+    }
+
+    /// The `<< timer` suffix renders as " in " + as_time(elapsed)
+    /// (Timer.cpp:45-47) — the Td.cpp close-path shapes
+    /// ("StateManager was cleared in 138.0us"). The exact human
+    /// rendering is as_time's tested territory; here we pin the wiring.
+    #[test]
+    fn timer_suffix() {
+        let timer = Timer {
+            start_at: super::super::time::now_cached() - 0.000138,
+        };
+        let rendered = timer.to_string();
+        assert!(rendered.starts_with(" in "));
+        let body = &rendered[4..];
+        assert!(
+            body.ends_with("ns")
+                || body.ends_with("us")
+                || body.ends_with("ms")
+                || body.ends_with('s'),
+            "unexpected timer render: {rendered}"
+        );
+        assert!(timer.elapsed() >= 0.0);
     }
 }

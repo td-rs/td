@@ -4452,6 +4452,14 @@ impl Td {
         if self.close_flag != 0 {
             return;
         }
+        // Td.cpp:782 — the close/destroy announcement (LOG(WARNING)).
+        tdutils::log_warning!(
+            at "Td.cpp",
+            782,
+            "{} Td in state {}",
+            if destroy_flag { "Destroy" } else { "Close" },
+            self.state as i32
+        );
 
         if self.state == State::WaitParameters {
             self.state = State::Close;
@@ -4510,6 +4518,9 @@ impl Td {
         if self.close_flag < 2 {
             self.close_flag = 2;
         }
+        // `Td::clear` (Td.cpp:651) — the close-path timer all the
+        // `<< timer` log lines below share.
+        let timer = tdutils::format::Timer::start();
 
         // `Td::clear` (Td.cpp:653-658): flush or destroy the active
         // notifications before the managers reset
@@ -4530,6 +4541,10 @@ impl Td {
             self.flush_user_updates();
         }
 
+        // Td.cpp:662 — after `result_handlers_.clear()` (the Rust marks
+        // this same step with the stop_check/result_handlers comment).
+        tdutils::log_debug!(at "Td.cpp", 662, "Handlers were cleared{timer}");
+
         // G()->net_query_creator().stop_check() / result_handlers_ /
         // StateManager — with the net step.
         self.clear_requests();
@@ -4539,6 +4554,7 @@ impl Td {
         // with the aborted error. `clear_requests` already untracked the
         // ids, so the settled errors re-enter for untracked ids and drop —
         // the C++ promise-actor hangups after `clear` behave the same.
+        tdutils::log_debug!(at "Td.cpp", 671, "Start clearing AlarmManager{timer}");
         for (_, (_, mut promise)) in std::mem::take(&mut self.pending_alarms) {
             promise.set_error(tdutils::status::Status::error(
                 crate::request_actor::REQUEST_ABORTED_CODE,
@@ -4560,6 +4576,11 @@ impl Td {
         if let Some(dispatcher) = self.net_query_dispatcher.take() {
             dispatcher.stop();
         }
+        // Td.cpp:664-666 — the dispatcher stop and the StateManager reset.
+        // The C++ resets the StateManager actor here; the Rust
+        // StateManagerState is inline state with no actor to reset.
+        tdutils::log_debug!(at "Td.cpp", 664, "NetQueryDispatcher was stopped{timer}");
+        tdutils::log_debug!(at "Td.cpp", 666, "StateManager was cleared{timer}");
         // The pool shutdown: every session driver fails its in-flight
         // queries with "Request aborted" (the C++ per-DC
         // SessionMultiProxy resets in `stop`, NetQueryDispatcher.cpp:290-295).
@@ -4575,10 +4596,15 @@ impl Td {
         // The files cluster's hangup half (the C++ resets the manager
         // actors in `Td::clear`, Td.cpp:707-712): the stored planes drop
         // so the shared-cell cycle cannot outlive the Td.
+        tdutils::log_debug!(at "Td.cpp", 671, "Start clearing FileManager{timer}");
         self.file_manager.lock().teardown();
+        tdutils::log_debug!(at "Td.cpp", 671, "Start clearing DownloadManager{timer}");
         self.download_manager.lock().teardown();
 
         self.global.close_all(self.destroy_flag);
+        // `reset_manager(option_manager_, "OptionManager")` (Td.cpp:510
+        // wave — the direct-member resets after "All actors were closed").
+        tdutils::log_debug!(at "Td.cpp", 510, "OptionManager was cleared{timer}");
         self.option_manager = None;
         // The C++ close clears the ConnectionCreator early
         // (`G()->set_connection_creator({})`, Td.cpp:690) and the
@@ -4586,13 +4612,14 @@ impl Td {
         // Td.cpp:547) — the component slices drop with them.
         self.connection_creator = None;
         self.link_manager = None;
-        self.connection_creator = None;
-        self.link_manager = None;
+        // Td.cpp:691.
+        tdutils::log_debug!(at "Td.cpp", 691, "ConnectionCreator was cleared{timer}");
         // `reset_manager(bot_info_manager_, "BotInfoManager")`
         // (Td.cpp:520): the manager's `hangup` fails the pending bot-info
         // fan-ins and the parked query promises with
         // `Global::request_aborted_error()` (BotInfoManager.cpp:784-796)
         // before the reset drops the state.
+        tdutils::log_debug!(at "Td.cpp", 671, "Start clearing BotInfoManager{timer}");
         self.bot_info_manager.hangup();
         self.bot_info_manager = crate::bot_info_manager::BotInfoManager::new();
         self.config_manager = None;
@@ -4605,7 +4632,13 @@ impl Td {
         }
         self.pending_recoverer_fetches.clear();
         self.recoverer_wakeup_at = 0.0;
+        // `reset_actor(std::move(config_manager_))` (the Td.cpp:671 wave).
+        tdutils::log_debug!(at "Td.cpp", 671, "Start clearing ConfigManager{timer}");
+        self.config_manager = None;
 
+        // Td.cpp:765 — the actor waves end; the Rust managers drop with
+        // the Td itself.
+        tdutils::log_debug!(at "Td.cpp", 765, "All actors were cleared{timer}");
         self.close_flag = 4;
         self.on_closed();
     }

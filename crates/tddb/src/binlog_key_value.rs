@@ -140,7 +140,11 @@ impl BinlogKeyValue {
         match Self::parse_event(event.get_data()) {
             Result::Ok((key, value)) => {
                 if key.is_empty() {
-                    tracing::error!("Have event with empty key");
+                    tdutils::log_error!(
+                        at "BinlogKeyValue.h",
+                        120,
+                        "Have external event with empty key"
+                    );
                     return;
                 }
                 self.map.insert(key, (value, event.id));
