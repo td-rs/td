@@ -203,7 +203,7 @@ pub mod webpage;
     clippy::large_enum_variant
 )]
 pub mod td_api {
-    include!(concat!(env!("OUT_DIR"), "/td_api.rs"));
+    include!("generated/td_api.rs");
 }
 
 #[cfg(test)]

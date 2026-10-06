@@ -56,7 +56,7 @@ pub mod utils;
     clippy::large_enum_variant
 )]
 pub mod telegram_api {
-    include!(concat!(env!("OUT_DIR"), "/telegram_api.rs"));
+    include!("generated/telegram_api.rs");
 }
 
 #[allow(
@@ -66,7 +66,7 @@ pub mod telegram_api {
     clippy::large_enum_variant
 )]
 pub mod secret_api {
-    include!(concat!(env!("OUT_DIR"), "/secret_api.rs"));
+    include!("generated/secret_api.rs");
 }
 
 #[allow(
@@ -76,7 +76,7 @@ pub mod secret_api {
     clippy::large_enum_variant
 )]
 pub mod mtproto_api {
-    include!(concat!(env!("OUT_DIR"), "/mtproto_api.rs"));
+    include!("generated/mtproto_api.rs");
 }
 
 #[cfg(test)]

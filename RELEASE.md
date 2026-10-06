@@ -24,7 +24,10 @@ CI running nightly (landed on the `track-h` branch) and the S76 gate.
 ## 2. Regenerate + differential gates
 
 ```sh
-cargo build --workspace           # build.rs regenerates all schemes
+cargo run -p tl-codegen --bin sync-generated  # regenerate the committed
+                                  # src/generated/ modules (the
+                                  # generated_drift test gates drift)
+cargo build --workspace
 cargo test --workspace --locked   # round-trips, vectors, ctor-id parity
 conformance/tl_oracle/verify_scheme.sh <td-checkout>   # S07 counts/dump
 conformance/tl_store_oracle/verify.sh <td-checkout>    # S10 binary store

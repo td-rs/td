@@ -10,7 +10,7 @@
     clippy::large_enum_variant
 )]
 pub mod e2e_api {
-    include!(concat!(env!("OUT_DIR"), "/e2e_api.rs"));
+    include!("generated/e2e_api.rs");
 }
 
 #[cfg(test)]

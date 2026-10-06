@@ -1743,7 +1743,6 @@ dependencies = [
  "tdmtproto",
  "tdnet",
  "tdutils",
- "tl-codegen",
  "tokio",
  "tracing",
 ]
@@ -1762,9 +1761,6 @@ dependencies = [
 [[package]]
 name = "tde2e"
 version = "0.1.0"
-dependencies = [
- "tl-codegen",
-]
 
 [[package]]
 name = "tdjson"
@@ -1781,7 +1777,6 @@ dependencies = [
  "base64",
  "tdnet",
  "tdutils",
- "tl-codegen",
  "tokio",
 ]
 

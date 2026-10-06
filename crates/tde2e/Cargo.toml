@@ -11,6 +11,3 @@ publish.workspace = true
 conformance-samples = []
 
 [dependencies]
-
-[build-dependencies]
-tl-codegen = { path = "../tl-codegen" }
