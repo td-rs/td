@@ -15898,6 +15898,43 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 Err(status) => td.send_error_impl(id, status.code(), status.message()),
             }
         }
+        Function::addBotSecondaryUsername(request) => {
+            // Requests.cpp (fd04a96d4): CHECK_IS_USER,
+            // CLEAN_INPUT_STRING, then UserManager::add_bot_username
+            // (the bots.addUsername send rides the net step).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let bot_user_id = crate::user_manager::UserId::new(request.bot_user_id);
+            let mut env = user_env!(td);
+            match td
+                .user_manager
+                .add_bot_username_local(&mut env, bot_user_id, &username)
+            {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::deleteBotSecondaryUsername(request) => {
+            // Requests.cpp (10ee532bb): CHECK_IS_USER, then
+            // UserManager::delete_bot_username — a bot with no secondary
+            // username answers OK directly.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let bot_user_id = crate::user_manager::UserId::new(request.bot_user_id);
+            let mut env = user_env!(td);
+            match td
+                .user_manager
+                .delete_bot_username_local(&mut env, bot_user_id)
+            {
+                Ok(_) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
 
         // --- the Misc arm group (2026-09-24): the TD-local glue +
         // pure-server query remainder, in Requests.cpp function order.
@@ -18445,12 +18482,13 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            996,
+            998,
             "dispatched count"
         );
         // the c15d3f5a sync: the TON wallet / TonConnect / On-ramp
         // surface + the community write family land as interim arms
-        // (43 functions; the TonWalletManager plane is unported)
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 43, "interim count");
+        // (41 functions; the TonWalletManager plane is unported — the
+        // bot secondary-username pair went dispatched with its flow)
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 41, "interim count");
     }
 }

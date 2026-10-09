@@ -7489,6 +7489,71 @@ impl UserManager {
         Ok(())
     }
 
+    /// `UserManager::add_bot_username` (UserManager.cpp:6710-6726) —
+    /// the gates and the optimistic apply; the `AddBotUsernameQuery`
+    /// (bots.addUsername) send rides the net step.
+    pub fn add_bot_username_local(
+        &mut self,
+        env: &mut UserEnv,
+        bot_user_id: UserId,
+        username: &str,
+    ) -> Result<(), Status> {
+        let bot_data = self.get_bot_data(bot_user_id)?;
+        if !bot_data.can_be_edited {
+            return Err(Status::error(400, "The bot can't be edited"));
+        }
+        if !env.options.get_option_boolean("is_premium", false) {
+            return Err(Status::error(
+                400,
+                "The method is available only to Telegram Premium users",
+            ));
+        }
+        let new_usernames = {
+            let u = self
+                .get_user(bot_user_id)
+                .expect("get_bot_data forced the bot");
+            if !u.usernames.can_add_secondary(username) {
+                return Err(Status::error(400, "Can't add secondary username"));
+            }
+            u.usernames.add_secondary(username)
+        };
+        self.on_update_user_usernames(env, bot_user_id, new_usernames);
+        self.update_user(env, bot_user_id, false, false);
+        Ok(())
+    }
+
+    /// `UserManager::delete_bot_username` (UserManager.cpp:6728-6746) —
+    /// deletes the first secondary username; the `RemoveBotUsernameQuery`
+    /// (bots.removeUsername) send rides the net step.
+    pub fn delete_bot_username_local(
+        &mut self,
+        env: &mut UserEnv,
+        bot_user_id: UserId,
+    ) -> Result<bool, Status> {
+        let bot_data = self.get_bot_data(bot_user_id)?;
+        if !bot_data.can_be_edited {
+            return Err(Status::error(400, "The bot can't be edited"));
+        }
+        let new_usernames = {
+            let u = self
+                .get_user(bot_user_id)
+                .expect("get_bot_data forced the bot");
+            let deletable_usernames = u.usernames.get_deletable_usernames();
+            if deletable_usernames.is_empty() {
+                // the C++ promise.set_value(Unit()) — nothing to delete
+                return Ok(false);
+            }
+            let username = deletable_usernames[0].clone();
+            if !u.usernames.can_delete_secondary(&username) {
+                return Err(Status::error(400, "Can't delete secondary username"));
+            }
+            u.usernames.delete_secondary(&username)
+        };
+        self.on_update_user_usernames(env, bot_user_id, new_usernames);
+        self.update_user(env, bot_user_id, false, false);
+        Ok(true)
+    }
+
     /// `UserManager::reorder_bot_usernames`
     /// (UserManager.cpp:6739-6754) — the gates and the optimistic apply;
     /// the `ReorderBotUsernamesQuery` send rides the net step.

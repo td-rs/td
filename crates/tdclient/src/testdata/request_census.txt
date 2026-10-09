@@ -3,7 +3,7 @@ acceptOauthRequest	dispatched
 acceptTermsOfService	dispatched
 activateStoryStealthMode	dispatched
 addBotMediaPreview	dispatched
-addBotSecondaryUsername	interim
+addBotSecondaryUsername	dispatched
 addChatFolderByInviteLink	dispatched
 addChatMember	dispatched
 addChatMembers	dispatched
@@ -160,7 +160,7 @@ deleteAllChatWelcomeMessages	dispatched
 deleteAllRecentMessageReactionsFromSender	dispatched
 deleteAllRevokedChatInviteLinks	dispatched
 deleteBotMediaPreviews	dispatched
-deleteBotSecondaryUsername	interim
+deleteBotSecondaryUsername	dispatched
 deleteBusinessChatLink	dispatched
 deleteBusinessConnectedBot	dispatched
 deleteBusinessMessages	dispatched
