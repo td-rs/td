@@ -722,7 +722,12 @@ impl NotificationType {
                     sender_name: sender_name.clone(),
                     is_outgoing: *is_outgoing,
                     content: Some(get_push_message_content_object(
-                        env, key, arg, photo, document,
+                        env,
+                        key,
+                        arg,
+                        *sender_user_id,
+                        photo,
+                        document,
                     )),
                 },
             )),
@@ -986,6 +991,7 @@ fn get_push_message_content_object(
     env: &impl NotificationTypeEnv,
     key: &str,
     arg: &str,
+    sender_user_id: UserId,
     photo: &Photo,
     document: &Document,
 ) -> td_api::PushMessageContent {
@@ -1295,6 +1301,28 @@ fn get_push_message_content_object(
                     },
                 );
             }
+            if key == "MESSAGE_GRAM_TRANSFER" {
+                // NotificationType.cpp:309-318 — the amount and the
+                // (possibly empty) comment ride one \xFF-separated arg.
+                let (amount, comment) = match arg.split_once('\u{FF}') {
+                    Some((amount, comment)) => (amount.to_string(), comment.to_string()),
+                    None => (arg.to_string(), String::new()),
+                };
+                let sender_user_id = if sender_user_id
+                    == crate::user_manager::UserManager::get_service_notifications_user_id()
+                {
+                    UserId::default()
+                } else {
+                    sender_user_id
+                };
+                return td_api::PushMessageContent::pushMessageContentTonWalletTransfer(
+                    td_api::pushMessageContentTonWalletTransfer {
+                        sender_user_id: sender_user_id.get(),
+                        amount,
+                        comment,
+                    },
+                );
+            }
         }
         b'I' if key == "MESSAGE_INVOICE" => {
             return td_api::PushMessageContent::pushMessageContentInvoice(
@@ -1571,10 +1599,19 @@ fn get_push_message_content_object(
                 );
             }
         }
-        b'W' if key == "MESSAGE_WALLPAPER" => {
-            return td_api::PushMessageContent::pushMessageContentChatSetBackground(
-                td_api::pushMessageContentChatSetBackground { is_same: false },
-            );
+        b'W' => {
+            if key == "MESSAGE_WALLET_TONCONNECT_REQUEST" {
+                return td_api::PushMessageContent::pushMessageContentTonConnectRequest(
+                    td_api::pushMessageContentTonConnectRequest {
+                        dapp_name: arg.to_string(),
+                    },
+                );
+            }
+            if key == "MESSAGE_WALLPAPER" {
+                return td_api::PushMessageContent::pushMessageContentChatSetBackground(
+                    td_api::pushMessageContentChatSetBackground { is_same: false },
+                );
+            }
         }
         _ => {}
     }
@@ -1778,14 +1815,21 @@ mod tests {
         let empty_photo = Photo::default();
         let document = Document::default();
 
-        let content =
-            get_push_message_content_object(&TestEnv, "MESSAGE", "", &empty_photo, &document);
+        let content = get_push_message_content_object(
+            &TestEnv,
+            "MESSAGE",
+            "",
+            UserId::default(),
+            &empty_photo,
+            &document,
+        );
         assert!(matches!(content, pushMessageContentHidden(_)));
 
         let content = get_push_message_content_object(
             &TestEnv,
             "PINNED_MESSAGE_TEXT",
             "hi",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1801,6 +1845,7 @@ mod tests {
             &TestEnv,
             "MESSAGE_TEXT",
             "hi",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1816,6 +1861,7 @@ mod tests {
             &TestEnv,
             "MESSAGE_GAME_SCORE",
             "42 win",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1833,6 +1879,7 @@ mod tests {
             &TestEnv,
             "PINNED_MESSAGE_GAME_SCORE",
             "42 win",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1849,6 +1896,7 @@ mod tests {
             &TestEnv,
             "MESSAGE_GIVEAWAY",
             "10 3",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1870,6 +1918,7 @@ mod tests {
             &TestEnv,
             "MESSAGE_GIVEAWAY_STARS",
             "2 500",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1891,6 +1940,7 @@ mod tests {
             &TestEnv,
             "MESSAGE_SECRET_PHOTO",
             "cap",
+            UserId::default(),
             &empty_photo,
             &document,
         );
@@ -1909,6 +1959,7 @@ mod tests {
             &TestEnv,
             "MESSAGE_STICKER",
             "  emoji  ",
+            UserId::default(),
             &empty_photo,
             &document,
         );
