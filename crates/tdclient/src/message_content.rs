@@ -16162,7 +16162,9 @@ pub fn get_message_content_object(
                 amount: m.amount,
                 cryptocurrency: m.crypto_currency.clone(),
                 cryptocurrency_amount: m.crypto_amount,
-                month_count: if get_premium_duration_day_count(month_count) == m.days {
+                month_count: if get_premium_duration_day_count(month_count) == m.days
+                    || m.days % 30 == 0
+                {
                     month_count
                 } else {
                     0
@@ -16284,7 +16286,9 @@ pub fn get_message_content_object(
                 amount: m.amount,
                 cryptocurrency: m.crypto_currency.clone(),
                 cryptocurrency_amount: m.crypto_amount,
-                month_count: if get_premium_duration_day_count(month_count) == m.days {
+                month_count: if get_premium_duration_day_count(month_count) == m.days
+                    || m.days % 30 == 0
+                {
                     month_count
                 } else {
                     0
