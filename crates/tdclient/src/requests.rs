@@ -2678,6 +2678,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             else {
                 return;
             };
+            let Some(tone) = clean_or_utf8_error(td, id, &request.tone) else {
+                return;
+            };
             let promise =
                 td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
             let (mut env, mq_manager) = crate::td::message_query_env_split(td);
@@ -2688,7 +2691,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     crate::messages_manager::MessageId::new(request.message_id),
                 ),
                 translate_to_language_code,
-                request.tone,
+                tone,
                 promise,
             );
         }
@@ -5874,6 +5877,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getMessageLink(request) => {
             // Requests.cpp:2771-2782 — the local link builder.
+            let Some(poll_option_id) = clean_or_utf8_error(td, id, &request.poll_option_id) else {
+                return;
+            };
             let dialog_id = MmDialogId::new(request.chat_id);
             let message_id = MessageId::new(request.message_id);
             match crate::messages_manager::get_message_link(
@@ -5883,7 +5889,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 message_id,
                 request.media_timestamp,
                 request.checklist_task_id,
-                &request.poll_option_id,
+                &poll_option_id,
                 request.for_album,
                 request.in_message_thread,
             ) {
@@ -15662,9 +15668,12 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
         Function::setChatClientData(request) => {
+            let Some(client_data) = clean_or_utf8_error(td, id, &request.client_data) else {
+                return;
+            };
             let dialog_id = MmDialogId::new(request.chat_id);
             if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
-                d.client_data = request.client_data;
+                d.client_data = client_data;
             }
             td.send_result(id, ok_object());
         }
@@ -15897,6 +15906,9 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
         Function::getPollOptionProperties(request) => {
             // Requests.cpp:2666-2670 → MessagesManager.cpp:15499-15516
             // (no CHECK_IS_USER in the C++)
+            let Some(poll_option_id) = clean_or_utf8_error(td, id, &request.poll_option_id) else {
+                return;
+            };
             let promise = td.deferred_promise::<td_api::PollOptionProperties, _>(
                 id,
                 Object::pollOptionProperties,
@@ -15912,7 +15924,7 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 &manager,
                 MmDialogId::new(request.chat_id),
                 MessageId::new(request.message_id),
-                &request.poll_option_id,
+                &poll_option_id,
                 promise,
             );
             td.messages_manager = manager;
