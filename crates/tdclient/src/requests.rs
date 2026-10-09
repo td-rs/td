@@ -15628,11 +15628,16 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             }
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
-        Function::loadCommunityFullInfo(_) => {
+        Function::getCommunityFullInfo(_) => {
+            // Requests.cpp:3415-3419 — CHECK_IS_USER then
+            // CommunityManager::get_community_full (the load variant is
+            // gone upstream; the full-info answer rides the manager's
+            // reload plane).
             if !check_is_user(td, id) {
                 return;
             }
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let _promise =
+                td.deferred_promise::<td_api::CommunityFullInfo, _>(id, Object::communityFullInfo);
         }
         Function::reportChatPhoto(request) => {
             if !check_is_user(td, id) {

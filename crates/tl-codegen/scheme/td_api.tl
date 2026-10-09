@@ -11799,8 +11799,8 @@ toggleSavedMessagesTopicIsPinned saved_messages_topic_id:int53 is_pinned:Bool = 
 setPinnedSavedMessagesTopics saved_messages_topic_ids:vector<int53> = Ok;
 
 
-//@description Returns full information about a community. The data will be sent through update. @community_id Community identifier
-loadCommunityFullInfo community_id:int53 = Ok;
+//@description Returns full information about a community @community_id Community identifier
+getCommunityFullInfo community_id:int53 = CommunityFullInfo;
 
 //@description Creates a new community for the given chat. Returns identifier of the created community
 //@name Name of the new community

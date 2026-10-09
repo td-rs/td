@@ -322172,6 +322172,99 @@ impl getCommands {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getCommunityFullInfo")]
+pub struct getCommunityFullInfo {
+    pub community_id: i64,
+}
+
+impl getCommunityFullInfo {
+    pub const ID: i32 = -2128198899;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        Result::Ok(Self { community_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getCommunityFullInfo\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getCommunityFullInfo");
+        s.store_field_int("community_id", self.community_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getConnectedAffiliateProgram")]
 pub struct getConnectedAffiliateProgram {
     pub affiliate: Option<AffiliateType>,
@@ -348339,99 +348432,6 @@ impl loadChats {
             None => s.store_null("chat_list"),
         }
         s.store_field_int("limit", self.limit as i64);
-        s.store_class_end();
-    }
-
-    /// td's `to_string(const BaseObject&)` for this constructor.
-    pub fn to_debug_string(&self) -> String {
-        let mut out = String::new();
-        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
-        self.store_debug(&mut storer, "");
-        out
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename = "loadCommunityFullInfo")]
-pub struct loadCommunityFullInfo {
-    pub community_id: i64,
-}
-
-impl loadCommunityFullInfo {
-    pub const ID: i32 = -913011971;
-
-    pub fn store_boxed(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&Self::ID.to_le_bytes());
-        self.store(out);
-    }
-
-    pub fn store(&self, out: &mut Vec<u8>) {
-        tl::__i64(out, self.community_id);
-    }
-
-    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read(&mut r)
-    }
-
-    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read_bare(&mut r)
-    }
-
-    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        if r.i32()? != Self::ID {
-            return Result::Err("Wrong constructor");
-        }
-        Self::read_bare(r)
-    }
-
-    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let community_id: i64 = r.i64()?;
-        Result::Ok(Self { community_id })
-    }
-
-    pub fn to_json(&self) -> String {
-        let mut out = String::new();
-        self.to_json_into(&mut out);
-        out
-    }
-
-    pub fn to_json_into(&self, out: &mut String) {
-        out.push_str("{\"@type\":\"loadCommunityFullInfo\"");
-        out.push_str(",\"community_id\":");
-        tl_json::num64(out, self.community_id);
-        out.push('}');
-    }
-
-    pub fn from_json(input: &str) -> Result<Self, String> {
-        let root = tl_json::parse_json(input)?;
-        Self::from_json_value(&root)
-    }
-
-    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
-    /// object is accepted and `@type` is ignored — only the fields read.
-    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
-        match v {
-            tl_json::Json::Null => Result::Ok(Self::default()),
-            tl_json::Json::Object(o) => Self::from_json_object(o),
-            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
-        }
-    }
-
-    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
-        let mut value = Self::default();
-        if let Some(__j0) = tl_json::field(o, "community_id") {
-            value.community_id = tl_json::read_i64(__j0)?;
-        }
-        Result::Ok(value)
-    }
-
-    /// td's generated `Class::store(TlStorerToString&, const char*)`
-    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
-    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
-        s.store_class_begin(field_name, "loadCommunityFullInfo");
-        s.store_field_int("community_id", self.community_id);
         s.store_class_end();
     }
 
@@ -396336,6 +396336,8 @@ pub enum Function {
     getCollectibleItemInfo(getCollectibleItemInfo),
     #[serde(rename = "getCommands")]
     getCommands(getCommands),
+    #[serde(rename = "getCommunityFullInfo")]
+    getCommunityFullInfo(getCommunityFullInfo),
     #[serde(rename = "getConnectedAffiliateProgram")]
     getConnectedAffiliateProgram(getConnectedAffiliateProgram),
     #[serde(rename = "getConnectedAffiliatePrograms")]
@@ -396856,8 +396858,6 @@ pub enum Function {
     loadChatWelcomeMessages(loadChatWelcomeMessages),
     #[serde(rename = "loadChats")]
     loadChats(loadChats),
-    #[serde(rename = "loadCommunityFullInfo")]
-    loadCommunityFullInfo(loadCommunityFullInfo),
     #[serde(rename = "loadDirectMessagesChatTopics")]
     loadDirectMessagesChatTopics(loadDirectMessagesChatTopics),
     #[serde(rename = "loadGroupCallParticipants")]
@@ -398045,6 +398045,7 @@ impl Function {
             Self::getCloseFriends(v) => v.store_boxed(out),
             Self::getCollectibleItemInfo(v) => v.store_boxed(out),
             Self::getCommands(v) => v.store_boxed(out),
+            Self::getCommunityFullInfo(v) => v.store_boxed(out),
             Self::getConnectedAffiliateProgram(v) => v.store_boxed(out),
             Self::getConnectedAffiliatePrograms(v) => v.store_boxed(out),
             Self::getConnectedWebsites(v) => v.store_boxed(out),
@@ -398305,7 +398306,6 @@ impl Function {
             Self::loadActiveStories(v) => v.store_boxed(out),
             Self::loadChatWelcomeMessages(v) => v.store_boxed(out),
             Self::loadChats(v) => v.store_boxed(out),
-            Self::loadCommunityFullInfo(v) => v.store_boxed(out),
             Self::loadDirectMessagesChatTopics(v) => v.store_boxed(out),
             Self::loadGroupCallParticipants(v) => v.store_boxed(out),
             Self::loadQuickReplyShortcutMessages(v) => v.store_boxed(out),
@@ -399077,6 +399077,7 @@ impl Function {
             self::getCloseFriends::ID => Result::Ok(Self::getCloseFriends(self::getCloseFriends::read_bare(r)?)),
             self::getCollectibleItemInfo::ID => Result::Ok(Self::getCollectibleItemInfo(self::getCollectibleItemInfo::read_bare(r)?)),
             self::getCommands::ID => Result::Ok(Self::getCommands(self::getCommands::read_bare(r)?)),
+            self::getCommunityFullInfo::ID => Result::Ok(Self::getCommunityFullInfo(self::getCommunityFullInfo::read_bare(r)?)),
             self::getConnectedAffiliateProgram::ID => Result::Ok(Self::getConnectedAffiliateProgram(self::getConnectedAffiliateProgram::read_bare(r)?)),
             self::getConnectedAffiliatePrograms::ID => Result::Ok(Self::getConnectedAffiliatePrograms(self::getConnectedAffiliatePrograms::read_bare(r)?)),
             self::getConnectedWebsites::ID => Result::Ok(Self::getConnectedWebsites(self::getConnectedWebsites::read_bare(r)?)),
@@ -399337,7 +399338,6 @@ impl Function {
             self::loadActiveStories::ID => Result::Ok(Self::loadActiveStories(self::loadActiveStories::read_bare(r)?)),
             self::loadChatWelcomeMessages::ID => Result::Ok(Self::loadChatWelcomeMessages(self::loadChatWelcomeMessages::read_bare(r)?)),
             self::loadChats::ID => Result::Ok(Self::loadChats(self::loadChats::read_bare(r)?)),
-            self::loadCommunityFullInfo::ID => Result::Ok(Self::loadCommunityFullInfo(self::loadCommunityFullInfo::read_bare(r)?)),
             self::loadDirectMessagesChatTopics::ID => Result::Ok(Self::loadDirectMessagesChatTopics(self::loadDirectMessagesChatTopics::read_bare(r)?)),
             self::loadGroupCallParticipants::ID => Result::Ok(Self::loadGroupCallParticipants(self::loadGroupCallParticipants::read_bare(r)?)),
             self::loadQuickReplyShortcutMessages::ID => Result::Ok(Self::loadQuickReplyShortcutMessages(self::loadQuickReplyShortcutMessages::read_bare(r)?)),
@@ -400111,6 +400111,7 @@ impl Function {
             Self::getCloseFriends(v) => v.to_json_into(out),
             Self::getCollectibleItemInfo(v) => v.to_json_into(out),
             Self::getCommands(v) => v.to_json_into(out),
+            Self::getCommunityFullInfo(v) => v.to_json_into(out),
             Self::getConnectedAffiliateProgram(v) => v.to_json_into(out),
             Self::getConnectedAffiliatePrograms(v) => v.to_json_into(out),
             Self::getConnectedWebsites(v) => v.to_json_into(out),
@@ -400371,7 +400372,6 @@ impl Function {
             Self::loadActiveStories(v) => v.to_json_into(out),
             Self::loadChatWelcomeMessages(v) => v.to_json_into(out),
             Self::loadChats(v) => v.to_json_into(out),
-            Self::loadCommunityFullInfo(v) => v.to_json_into(out),
             Self::loadDirectMessagesChatTopics(v) => v.to_json_into(out),
             Self::loadGroupCallParticipants(v) => v.to_json_into(out),
             Self::loadQuickReplyShortcutMessages(v) => v.to_json_into(out),
@@ -401821,6 +401821,9 @@ impl Function {
     fn __json_new_getCommands(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getCommands(self::getCommands::from_json_object(o)?))
     }
+    fn __json_new_getCommunityFullInfo(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getCommunityFullInfo(self::getCommunityFullInfo::from_json_object(o)?))
+    }
     fn __json_new_getConnectedAffiliateProgram(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getConnectedAffiliateProgram(self::getConnectedAffiliateProgram::from_json_object(o)?))
     }
@@ -402600,9 +402603,6 @@ impl Function {
     }
     fn __json_new_loadChats(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::loadChats(self::loadChats::from_json_object(o)?))
-    }
-    fn __json_new_loadCommunityFullInfo(o: &tl_json::Object) -> Result<Self, String> {
-        Result::Ok(Self::loadCommunityFullInfo(self::loadCommunityFullInfo::from_json_object(o)?))
     }
     fn __json_new_loadDirectMessagesChatTopics(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::loadDirectMessagesChatTopics(self::loadDirectMessagesChatTopics::from_json_object(o)?))
@@ -404222,6 +404222,7 @@ impl Function {
                 "getCloseFriends" => Self::__json_new_getCloseFriends(o),
                 "getCollectibleItemInfo" => Self::__json_new_getCollectibleItemInfo(o),
                 "getCommands" => Self::__json_new_getCommands(o),
+                "getCommunityFullInfo" => Self::__json_new_getCommunityFullInfo(o),
                 "getConnectedAffiliateProgram" => Self::__json_new_getConnectedAffiliateProgram(o),
                 "getConnectedAffiliatePrograms" => Self::__json_new_getConnectedAffiliatePrograms(o),
                 "getConnectedWebsites" => Self::__json_new_getConnectedWebsites(o),
@@ -404482,7 +404483,6 @@ impl Function {
                 "loadActiveStories" => Self::__json_new_loadActiveStories(o),
                 "loadChatWelcomeMessages" => Self::__json_new_loadChatWelcomeMessages(o),
                 "loadChats" => Self::__json_new_loadChats(o),
-                "loadCommunityFullInfo" => Self::__json_new_loadCommunityFullInfo(o),
                 "loadDirectMessagesChatTopics" => Self::__json_new_loadDirectMessagesChatTopics(o),
                 "loadGroupCallParticipants" => Self::__json_new_loadGroupCallParticipants(o),
                 "loadQuickReplyShortcutMessages" => Self::__json_new_loadQuickReplyShortcutMessages(o),
@@ -405247,6 +405247,7 @@ impl Function {
                 self::getCloseFriends::ID => Self::__json_new_getCloseFriends(o),
                 self::getCollectibleItemInfo::ID => Self::__json_new_getCollectibleItemInfo(o),
                 self::getCommands::ID => Self::__json_new_getCommands(o),
+                self::getCommunityFullInfo::ID => Self::__json_new_getCommunityFullInfo(o),
                 self::getConnectedAffiliateProgram::ID => Self::__json_new_getConnectedAffiliateProgram(o),
                 self::getConnectedAffiliatePrograms::ID => Self::__json_new_getConnectedAffiliatePrograms(o),
                 self::getConnectedWebsites::ID => Self::__json_new_getConnectedWebsites(o),
@@ -405507,7 +405508,6 @@ impl Function {
                 self::loadActiveStories::ID => Self::__json_new_loadActiveStories(o),
                 self::loadChatWelcomeMessages::ID => Self::__json_new_loadChatWelcomeMessages(o),
                 self::loadChats::ID => Self::__json_new_loadChats(o),
-                self::loadCommunityFullInfo::ID => Self::__json_new_loadCommunityFullInfo(o),
                 self::loadDirectMessagesChatTopics::ID => Self::__json_new_loadDirectMessagesChatTopics(o),
                 self::loadGroupCallParticipants::ID => Self::__json_new_loadGroupCallParticipants(o),
                 self::loadQuickReplyShortcutMessages::ID => Self::__json_new_loadQuickReplyShortcutMessages(o),
@@ -406277,6 +406277,7 @@ impl Function {
             Self::getCloseFriends(v) => v.store_debug(s, field_name),
             Self::getCollectibleItemInfo(v) => v.store_debug(s, field_name),
             Self::getCommands(v) => v.store_debug(s, field_name),
+            Self::getCommunityFullInfo(v) => v.store_debug(s, field_name),
             Self::getConnectedAffiliateProgram(v) => v.store_debug(s, field_name),
             Self::getConnectedAffiliatePrograms(v) => v.store_debug(s, field_name),
             Self::getConnectedWebsites(v) => v.store_debug(s, field_name),
@@ -406537,7 +406538,6 @@ impl Function {
             Self::loadActiveStories(v) => v.store_debug(s, field_name),
             Self::loadChatWelcomeMessages(v) => v.store_debug(s, field_name),
             Self::loadChats(v) => v.store_debug(s, field_name),
-            Self::loadCommunityFullInfo(v) => v.store_debug(s, field_name),
             Self::loadDirectMessagesChatTopics(v) => v.store_debug(s, field_name),
             Self::loadGroupCallParticipants(v) => v.store_debug(s, field_name),
             Self::loadQuickReplyShortcutMessages(v) => v.store_debug(s, field_name),
@@ -425050,6 +425050,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getCloseFriends",
     "getCollectibleItemInfo",
     "getCommands",
+    "getCommunityFullInfo",
     "getConnectedAffiliateProgram",
     "getConnectedAffiliatePrograms",
     "getConnectedWebsites",
@@ -425310,7 +425311,6 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "loadActiveStories",
     "loadChatWelcomeMessages",
     "loadChats",
-    "loadCommunityFullInfo",
     "loadDirectMessagesChatTopics",
     "loadGroupCallParticipants",
     "loadQuickReplyShortcutMessages",
@@ -448933,6 +448933,13 @@ pub mod samples {
         }
     }
 
+    pub fn s_getCommunityFullInfo(depth: u32) -> getCommunityFullInfo {
+        let _ = depth;
+        getCommunityFullInfo {
+            community_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
     pub fn s_getConnectedAffiliateProgram(depth: u32) -> getConnectedAffiliateProgram {
         let _ = depth;
         getConnectedAffiliateProgram {
@@ -450852,13 +450859,6 @@ pub mod samples {
         loadChats {
             chat_list: Some(t_ChatList((depth).saturating_sub(1))),
             limit: 0x1234_5678i32,
-        }
-    }
-
-    pub fn s_loadCommunityFullInfo(depth: u32) -> loadCommunityFullInfo {
-        let _ = depth;
-        loadCommunityFullInfo {
-            community_id: 0x1234_5678_9abc_def0i64,
         }
     }
 
@@ -496877,6 +496877,22 @@ fn __rt_getCommands() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_getCommunityFullInfo() {
+    samples::__stack(move || {
+        let v = Function::getCommunityFullInfo(samples::s_getCommunityFullInfo(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getCommunityFullInfo parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getCommunityFullInfo json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_getConnectedAffiliateProgram() {
     samples::__stack(move || {
         let v = Function::getConnectedAffiliateProgram(samples::s_getConnectedAffiliateProgram(3));
@@ -501030,22 +501046,6 @@ fn __rt_loadChats() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("loadChats json parse");
-        assert_eq!(v, w);
-    });
-}
-
-#[cfg(test)]
-#[test]
-#[allow(non_snake_case)]
-fn __rt_loadCommunityFullInfo() {
-    samples::__stack(move || {
-        let v = Function::loadCommunityFullInfo(samples::s_loadCommunityFullInfo(3));
-        let mut out = Vec::new();
-        v.store(&mut out);
-        let w = Function::parse(&out).expect("loadCommunityFullInfo parse");
-        assert_eq!(v, w);
-        let j = v.to_json();
-        let w = Function::from_json(&j).expect("loadCommunityFullInfo json parse");
         assert_eq!(v, w);
     });
 }

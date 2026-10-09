@@ -338,6 +338,7 @@ getChatsToPostStories	dispatched
 getCloseFriends	dispatched
 getCollectibleItemInfo	dispatched
 getCommands	dispatched
+getCommunityFullInfo	dispatched
 getConnectedAffiliateProgram	dispatched
 getConnectedAffiliatePrograms	dispatched
 getConnectedWebsites	dispatched
@@ -598,7 +599,6 @@ listenToAudio	dispatched
 loadActiveStories	dispatched
 loadChatWelcomeMessages	dispatched
 loadChats	dispatched
-loadCommunityFullInfo	dispatched
 loadDirectMessagesChatTopics	dispatched
 loadGroupCallParticipants	dispatched
 loadQuickReplyShortcutMessages	dispatched

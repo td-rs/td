@@ -7957,9 +7957,9 @@ impl CliClient {
                 chat_id: self.as_chat_id(args),
             }));
             true
-        } else if op == "lcfi" {
-            self.send_request(Function::loadCommunityFullInfo(
-                td_api::loadCommunityFullInfo {
+        } else if op == "gcfi" {
+            self.send_request(Function::getCommunityFullInfo(
+                td_api::getCommunityFullInfo {
                     community_id: tokenizer::to_integer_i64(trim_td(args)),
                 },
             ));
@@ -16176,7 +16176,7 @@ mod tests {
             ("gtcse", 6),
             ("guf", 6),
             ("gvma", 6),
-            ("lcfi", 6),
+            ("gcfi", 6),
             ("open", 6),
             ("osc", 6),
             ("raffd", 6),
