@@ -15848,6 +15848,10 @@ pub fn send_update_unread_chat_count(
 /// `MessagesManager::save_unread_chat_count`
 /// (MessagesManager.cpp:27386-27393).
 pub fn save_unread_chat_count(ctx: &mut dyn ReadStateContext, list: &DialogList) {
+    // 63799ed45: no message database — nothing to persist.
+    if !ctx.use_message_database() {
+        return;
+    }
     ctx.binlog_pmc_set(
         &format!("unread_dialog_count{}", list.dialog_list_id.get()),
         &format!(
