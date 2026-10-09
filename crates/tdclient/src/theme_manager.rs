@@ -1188,6 +1188,7 @@ impl ProfileAccentColors {
 pub struct ThemeSettings {
     accent_color: i32,
     message_accent_color: i32,
+    has_message_accent_color: bool,
     background_info: Option<BackgroundInfo>,
     base_theme: BaseTheme,
     message_colors: Vec<i32>,
@@ -1210,8 +1211,8 @@ impl ThemeSettings {
             return ThemeSettings::default();
         }
         let accent_color = settings.accent_color;
-        let has_outbox_accent_color = settings.flags & (1 << 3) != 0; // OUTBOX_ACCENT_COLOR_MASK
-        let message_accent_color = if has_outbox_accent_color {
+        let has_message_accent_color = settings.flags & (1 << 3) != 0; // OUTBOX_ACCENT_COLOR_MASK
+        let message_accent_color = if has_message_accent_color {
             settings.outbox_accent_color
         } else {
             accent_color
@@ -1225,6 +1226,7 @@ impl ThemeSettings {
         ThemeSettings {
             accent_color,
             message_accent_color,
+            has_message_accent_color,
             background_info,
             base_theme,
             message_colors: settings.message_colors,
@@ -1248,6 +1250,7 @@ impl ThemeSettings {
                 &self.message_colors,
             ),
             animate_outgoing_message_fill: self.animate_message_colors,
+            has_outgoing_message_accent_color: self.has_message_accent_color,
             outgoing_message_accent_color: self.message_accent_color,
         }
     }
@@ -1266,7 +1269,7 @@ impl ThemeSettings {
     /// `background_info_.is_valid()` gate ANDs the env row resolvability
     /// until the M.16 row store lands (see the module divergences).
     pub(crate) fn store_inner(&self, env: &mut impl ThemeManagerEnv, out: &mut Vec<u8>) {
-        let has_message_accent_color = self.message_accent_color != self.accent_color;
+        let has_message_accent_color = self.has_message_accent_color;
         let mut background_stored = false;
         let mut background_bytes = Vec::new();
         if let Some(info) = &self.background_info
@@ -1308,6 +1311,7 @@ impl ThemeSettings {
         result.animate_message_colors = animate_message_colors;
         result.accent_color = parser.i32_()?;
         if has_message_accent_color {
+            result.has_message_accent_color = true;
             result.message_accent_color = parser.i32_()?;
         } else {
             result.message_accent_color = result.accent_color;
@@ -2456,6 +2460,8 @@ mod tests {
         theme.light_theme.base_theme = BaseTheme::Day;
         theme.light_theme.message_colors = vec![0x101010, 0x202020];
         theme.light_theme.message_accent_color = 0xEEEEEE;
+        // the explicit flag gates the stored color (6dc3a1eb0)
+        theme.light_theme.has_message_accent_color = true;
         theme.dark_theme.accent_color = 0x00FF00;
         theme.dark_theme.base_theme = BaseTheme::Night;
         theme
@@ -2475,6 +2481,16 @@ mod tests {
         themes.store(&mut env, &mut out);
         let mut parser = Parser::new(&out);
         let parsed = EmojiChatThemes::parse(&mut env, &mut parser).expect("parse");
+        // The parse normalizes an un-flagged `message_accent_color` to the
+        // accent color (ThemeSettings.hpp:47-50).
+        for theme in &mut themes.themes {
+            if !theme.dark_theme.has_message_accent_color {
+                theme.dark_theme.message_accent_color = theme.dark_theme.accent_color;
+            }
+            if !theme.light_theme.has_message_accent_color {
+                theme.light_theme.message_accent_color = theme.light_theme.accent_color;
+            }
+        }
         assert_eq!(parsed, themes);
     }
 
@@ -2738,7 +2754,13 @@ mod tests {
         settings.store_inner(&mut env, &mut out);
         let mut parser = Parser::new(&out);
         let parsed = ThemeSettings::parse_inner(&mut env, &mut parser).expect("parse");
-        assert_eq!(parsed, settings);
+        // The parse normalizes `message_accent_color` to `accent_color`
+        // when the explicit flag is absent (ThemeSettings.hpp:47-50) —
+        // the C++ round trip has the same shape.
+        let mut expected = settings.clone();
+        expected.has_message_accent_color = false;
+        expected.message_accent_color = expected.accent_color;
+        assert_eq!(parsed, expected);
     }
 
     #[test]

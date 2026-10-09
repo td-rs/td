@@ -243411,11 +243411,12 @@ pub struct ThemeSettings {
     pub background: Option<Background>,
     pub outgoing_message_fill: Option<BackgroundFill>,
     pub animate_outgoing_message_fill: bool,
+    pub has_outgoing_message_accent_color: bool,
     pub outgoing_message_accent_color: i32,
 }
 
 impl ThemeSettings {
-    pub const ID: i32 = 1935106938;
+    pub const ID: i32 = -68123817;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -243434,6 +243435,7 @@ impl ThemeSettings {
         let __m2 = self.outgoing_message_fill.as_ref().unwrap_or(&__d2);
         __m2.store(out);
         tl::__bool(out, self.animate_outgoing_message_fill);
+        tl::__bool(out, self.has_outgoing_message_accent_color);
         tl::__i32(out, self.outgoing_message_accent_color);
     }
 
@@ -243460,8 +243462,9 @@ impl ThemeSettings {
         let background: Option<Background> = Some(Background::read_bare(r)?);
         let outgoing_message_fill: Option<BackgroundFill> = Some(BackgroundFill::read(r)?);
         let animate_outgoing_message_fill: bool = r.bool()?;
+        let has_outgoing_message_accent_color: bool = r.bool()?;
         let outgoing_message_accent_color: i32 = r.i32()?;
-        Result::Ok(Self { base_theme, accent_color, background, outgoing_message_fill, animate_outgoing_message_fill, outgoing_message_accent_color })
+        Result::Ok(Self { base_theme, accent_color, background, outgoing_message_fill, animate_outgoing_message_fill, has_outgoing_message_accent_color, outgoing_message_accent_color })
     }
 
     pub fn to_json(&self) -> String {
@@ -243488,6 +243491,8 @@ impl ThemeSettings {
         }
         out.push_str(",\"animate_outgoing_message_fill\":");
         tl_json::boolean(out, self.animate_outgoing_message_fill);
+        out.push_str(",\"has_outgoing_message_accent_color\":");
+        tl_json::boolean(out, self.has_outgoing_message_accent_color);
         out.push_str(",\"outgoing_message_accent_color\":");
         tl_json::num32(out, self.outgoing_message_accent_color);
         out.push('}');
@@ -243525,8 +243530,11 @@ impl ThemeSettings {
         if let Some(__j8) = tl_json::field(o, "animate_outgoing_message_fill") {
             value.animate_outgoing_message_fill = tl_json::read_bool(__j8)?;
         }
-        if let Some(__j10) = tl_json::field(o, "outgoing_message_accent_color") {
-            value.outgoing_message_accent_color = tl_json::read_i32(__j10)?;
+        if let Some(__j10) = tl_json::field(o, "has_outgoing_message_accent_color") {
+            value.has_outgoing_message_accent_color = tl_json::read_bool(__j10)?;
+        }
+        if let Some(__j12) = tl_json::field(o, "outgoing_message_accent_color") {
+            value.outgoing_message_accent_color = tl_json::read_i32(__j12)?;
         }
         Result::Ok(value)
     }
@@ -243549,6 +243557,7 @@ impl ThemeSettings {
             None => s.store_null("outgoing_message_fill"),
         }
         s.store_field_bool("animate_outgoing_message_fill", self.animate_outgoing_message_fill);
+        s.store_field_bool("has_outgoing_message_accent_color", self.has_outgoing_message_accent_color);
         s.store_field_int("outgoing_message_accent_color", self.outgoing_message_accent_color as i64);
         s.store_class_end();
     }
@@ -443433,6 +443442,7 @@ pub mod samples {
             background: Some(t_Background((depth).saturating_sub(1))),
             outgoing_message_fill: Some(t_BackgroundFill((depth).saturating_sub(1))),
             animate_outgoing_message_fill: true,
+            has_outgoing_message_accent_color: true,
             outgoing_message_accent_color: 0x1234_5678i32,
         }
     }
