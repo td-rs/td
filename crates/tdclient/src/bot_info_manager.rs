@@ -1326,7 +1326,12 @@ impl BotInfoManager {
             None,
             false,
         ) {
-            Ok(description) => description,
+            Ok(mut description) => {
+                // aa9d73d18: only TextUrl entities survive in the
+                // verification description.
+                crate::message_entity::keep_only_text_url(&mut description);
+                description
+            }
             Err(error) => return promise.set_error(error),
         };
         self.pending_set_custom_verification_replies

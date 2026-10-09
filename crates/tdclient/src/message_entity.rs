@@ -1346,6 +1346,15 @@ pub fn keep_only_custom_emoji(text: &mut FormattedText) -> bool {
     before != text.entities.len()
 }
 
+/// `keep_only_text_url` (MessageEntity.cpp:4894-4896, aa9d73d18):
+/// returns whether anything was removed.
+pub fn keep_only_text_url(text: &mut FormattedText) -> bool {
+    let before = text.entities.len();
+    text.entities
+        .retain(|entity| entity.r#type == Some(Type::TextUrl));
+    before != text.entities.len()
+}
+
 /// `remove_unallowed_quote_entities` (MessageEntity.cpp:4901-4903).
 pub fn remove_unallowed_quote_entities(text: &mut FormattedText) -> bool {
     let before = text.entities.len();
