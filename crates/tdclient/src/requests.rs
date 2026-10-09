@@ -8877,13 +8877,16 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
             let promise = td
                 .deferred_promise::<String, _>(id, |url| Object::httpUrl(td_api::HttpUrl { url }));
             let mut env = star_gift_env!(td);
             td.star_gift_manager.get_star_gift_withdrawal_url(
                 &mut env,
                 StarGiftId::from_string(&request.received_gift_id),
-                &request.password,
+                &password,
                 promise,
             );
         }
@@ -14266,6 +14269,9 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                     }
                 }
             };
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
             let promise =
                 td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
             let (mut env, manager) = crate::td::star_env_split(td);
@@ -14273,7 +14279,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 &mut env,
                 dialog_id,
                 request.star_count,
-                request.password,
+                password,
                 promise,
             );
         }
@@ -14314,10 +14320,13 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
             let promise =
                 td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
             let (mut env, manager) = crate::td::star_env_split(td);
-            manager.get_ton_withdrawal_url(&mut env, request.password, promise);
+            manager.get_ton_withdrawal_url(&mut env, password, promise);
         }
         Function::getPaidMessageRevenue(request) => {
             if !check_is_user(td, id) {
