@@ -6877,7 +6877,7 @@ impl ChatManager {
         if old_status.is_member() != new_status.is_member() || new_status.is_banned() {
             // td_->dialog_invite_link_manager_->remove_dialog_access_by_invite_link
             // — the wave-2 stub.
-            if new_status.is_member() || new_status.is_creator() {
+            if (new_status.is_member() || new_status.is_creator()) && have_channel_full {
                 self.reload_channel_full(
                     env,
                     channel_id,
