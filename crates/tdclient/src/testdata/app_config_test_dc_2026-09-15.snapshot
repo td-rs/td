@@ -14,6 +14,7 @@ animation_search_provider	Snone
 anti_spam_bot_user_id	I2200583762
 authorization_autoconfirm_period	I604800
 bio_length_max	I70
+bot_allowed_suffixes	S
 bot_media_preview_count_max	I12
 bot_verification_custom_description_length_max	I70
 bots_create_limit_default	I20
@@ -161,9 +162,11 @@ saved_dialogs_pinned_limit_default	I4
 saved_dialogs_pinned_limit_premium	I6
 saved_gifs_limit_default	I25
 saved_gifs_limit_premium	I50
+secondary_bot_username_count_max	I2
 show_message_edit_date_by_default	Btrue
 stake_dice_stake_amount_max	I50000000000
 stake_dice_stake_amount_min	I100000000
+star_top_up_disabled	Btrue
 star_withdrawal_count_max	I100
 star_withdrawal_count_min	I10
 stargifts_craft_attribute_permilles	S100,80,400,70,350,700,60,300,600,1000
@@ -213,6 +216,10 @@ thousand_star_to_usd_rate	I1300
 ton_blockchain_explorer_url	Shttps://tonviewer.com/
 ton_proxy_address	Smagic.org
 ton_stakedice_stake_suggested_amounts	S100000000,1000000000,2000000000,5000000000,10000000000,20000000000
+ton_wallet_gasless_transfer_amount_min	I100000000
+ton_wallet_gasless_transfer_daily_count	I0
+ton_wallet_gasless_transfer_daily_count_max	I0
+ton_wallet_transfer_amount_min	I100000000
 upload_premium_speedup_notify_period	I30
 usd_to_thousand_star_rate	I1410
 user_note_text_length_max	I128

@@ -134,6 +134,7 @@ fn is_internal_option(name: &str) -> bool {
         "animation_search_provider",
         "authorization_autoconfirm_period",
         "base_language_pack_version",
+        "bot_allowed_suffixes",
         "bots_create_limit_default",
         "bots_create_limit_premium",
         "business_features",
@@ -411,6 +412,19 @@ impl OptionManager {
     /// SetPassword suggested action for a positive `otherwise_relogin_days`.
     fn get_internal_option_update(&self, name: &str) -> Option<td_api::Update> {
         match name {
+            "bot_allowed_suffixes" => {
+                // OptionManager.cpp:574-577 — full_split on the space-
+                // joined option (an empty option answers no suffixes).
+                let suffixes: Vec<String> = self
+                    .get_option_string(name, "")
+                    .split(' ')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                Some(td_api::Update::updateAllowedBotUsernamePremiumSuffixes(
+                    td_api::updateAllowedBotUsernamePremiumSuffixes { suffixes },
+                ))
+            }
             "default_reaction" => {
                 crate::reaction_type::ReactionType::new(self.get_option_string(name, ""))
                     .get_update_default_reaction_type()
@@ -1237,6 +1251,11 @@ impl OptionManager {
             if is_test_dc { 10 } else { 100 },
         );
         set_default_integer_option("community_bot_count_max", if is_test_dc { 10 } else { 100 });
+        set_default_integer_option("ton_wallet_transfer_amount_min", 100000000);
+        set_default_integer_option("ton_wallet_gasless_transfer_amount_min", 100000000);
+        set_default_integer_option("ton_wallet_gasless_transfer_daily_count_max", 0);
+        set_default_integer_option("ton_wallet_gasless_transfer_daily_count", 0);
+        set_default_integer_option("secondary_bot_username_count_max", 2);
 
         if self.options.isset("my_phone_number") || !self.options.isset("my_id") {
             self.update_premium_options();

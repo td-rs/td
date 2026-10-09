@@ -1703,7 +1703,9 @@ impl ConfigManager {
             ("stars_gifts_enabled", "can_gift_stars"),
             ("stars_paid_messages_available", "can_enable_paid_messages"),
             ("story_weather_preload", "can_preload_weather"),
+            ("stars_spend_topup_invoice_disabled", "star_top_up_disabled"),
             ("video_ignore_alt_documents", ""),
+            ("wallet_available", "can_use_ton_wallet"),
         ];
         const INTEGER_KEYS: &[(&str, &str)] = &[
             (
@@ -2029,6 +2031,8 @@ impl ConfigManager {
         let mut whitelisted_bots = String::new();
         let mut ton_stakedice_stake_suggested_amounts = String::new();
         let mut gift_craft_probabilities = String::new();
+        let mut wallet_gasless_daily_transfers = 0i64;
+        let mut bot_allowed_suffixes: Vec<String> = Vec::new();
         let mut actions = ConfigActions::default();
 
         if let telegram_api::JSONValue::jsonObject(object) = config.as_ref() {
@@ -2588,6 +2592,29 @@ impl ConfigManager {
                             ));
                         continue;
                     }
+                    "wallet_gasless_daily_transfers" => {
+                        wallet_gasless_daily_transfers =
+                            get_json_value_long_option(key_value.value.as_deref(), key);
+                        continue;
+                    }
+                    "bot_allowed_suffixes" => {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
+                            for suffix in &array.value {
+                                let mut suffix_text = get_json_value_string(suffix, key);
+                                suffix_text.make_ascii_lowercase();
+                                if !suffix_text.is_empty() && !suffix_text.contains(' ') {
+                                    bot_allowed_suffixes.push(suffix_text);
+                                } else {
+                                    tdutils::log_error!("Receive an invalid bot suffix");
+                                }
+                            }
+                        } else {
+                            tdutils::log_error!(
+                                "Receive unexpected bot_allowed_suffixes {value:?}"
+                            );
+                        }
+                        continue;
+                    }
                     "ton_stakedice_stake_suggested_amounts" => {
                         if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for amount in &array.value {
@@ -2745,6 +2772,12 @@ impl ConfigManager {
                 &implode(&starref_start_param_prefixes, ' '),
             );
         }
+
+        options.set_option_string("bot_allowed_suffixes", &implode(&bot_allowed_suffixes, ' '));
+        options.set_option_integer(
+            "ton_wallet_gasless_transfer_daily_count",
+            wallet_gasless_daily_transfers,
+        );
 
         options.set_option_string("emoji_sounds", &implode(&emoji_sounds, ','));
 
@@ -4157,7 +4190,6 @@ mod tests {
                 "premium_playmarket_direct_currency_list",
                 "rich_message_posting",
                 "small_queue_max_active_operations_count",
-                "stars_spend_topup_invoice_disabled",
                 "stickers_emoji_suggest_only_api",
                 "stories_all_hidden",
                 "translations_auto_enabled",
@@ -4170,7 +4202,7 @@ mod tests {
         else {
             panic!("answer not an object");
         };
-        assert_eq!(answer_object.members.len(), 14);
+        assert_eq!(answer_object.members.len(), 13);
     }
 
     /// The recorded store drives the version-bump and NotModified paths:
@@ -4226,7 +4258,7 @@ mod tests {
         let td_api::JsonValue::jsonValueObject(object) = &actions.app_config_answers[0].1 else {
             panic!("answer not an object");
         };
-        assert_eq!(object.members.len(), 14);
+        assert_eq!(object.members.len(), 13);
 
         // A version bump (the stored layout is one commit behind) resets
         // the store — the query goes out with hash 0 and a NotModified
