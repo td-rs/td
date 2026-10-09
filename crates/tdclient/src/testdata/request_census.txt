@@ -212,7 +212,6 @@ editBusinessMessageMedia	dispatched
 editBusinessMessageReplyMarkup	dispatched
 editBusinessMessageText	dispatched
 editBusinessStory	dispatched
-editCallbackQueryMessage	dispatched
 editChatFolder	dispatched
 editChatFolderInviteLink	dispatched
 editChatInviteLink	dispatched
@@ -896,6 +895,7 @@ setPollAnswer	dispatched
 setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
 setProfilePhoto	dispatched
+replyToCallbackQueryWithEphemeralMessage	dispatched
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	dispatched

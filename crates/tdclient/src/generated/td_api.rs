@@ -308618,140 +308618,6 @@ impl editBusinessStory {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename = "editCallbackQueryMessage")]
-pub struct editCallbackQueryMessage {
-    pub callback_query_id: i64,
-    pub protect_content: bool,
-    pub reply_markup: Option<ReplyMarkup>,
-    pub input_message_content: Option<Box<InputMessageContent>>,
-}
-
-impl editCallbackQueryMessage {
-    pub const ID: i32 = 403509242;
-
-    pub fn store_boxed(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&Self::ID.to_le_bytes());
-        self.store(out);
-    }
-
-    pub fn store(&self, out: &mut Vec<u8>) {
-        tl::__i64(out, self.callback_query_id);
-        tl::__bool(out, self.protect_content);
-        let __d0 = Default::default();
-        let __m0 = self.reply_markup.as_ref().unwrap_or(&__d0);
-        __m0.store(out);
-        let __d1 = Default::default();
-        let __m1 = self.input_message_content.as_ref().unwrap_or(&__d1);
-        __m1.store(out);
-    }
-
-    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read(&mut r)
-    }
-
-    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read_bare(&mut r)
-    }
-
-    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        if r.i32()? != Self::ID {
-            return Result::Err("Wrong constructor");
-        }
-        Self::read_bare(r)
-    }
-
-    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let callback_query_id: i64 = r.i64()?;
-        let protect_content: bool = r.bool()?;
-        let reply_markup: Option<ReplyMarkup> = Some(ReplyMarkup::read(r)?);
-        let input_message_content: Option<Box<InputMessageContent>> = Some(Box::new(InputMessageContent::read(r)?));
-        Result::Ok(Self { callback_query_id, protect_content, reply_markup, input_message_content })
-    }
-
-    pub fn to_json(&self) -> String {
-        let mut out = String::new();
-        self.to_json_into(&mut out);
-        out
-    }
-
-    pub fn to_json_into(&self, out: &mut String) {
-        out.push_str("{\"@type\":\"editCallbackQueryMessage\"");
-        out.push_str(",\"callback_query_id\":");
-        tl_json::num64q(out, self.callback_query_id);
-        out.push_str(",\"protect_content\":");
-        tl_json::boolean(out, self.protect_content);
-        if let Some(__o0) = &self.reply_markup {
-            out.push_str(",\"reply_markup\":");
-            __o0.to_json_into(out);
-        }
-        if let Some(__o1) = &self.input_message_content {
-            out.push_str(",\"input_message_content\":");
-            __o1.to_json_into(out);
-        }
-        out.push('}');
-    }
-
-    pub fn from_json(input: &str) -> Result<Self, String> {
-        let root = tl_json::parse_json(input)?;
-        Self::from_json_value(&root)
-    }
-
-    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
-    /// object is accepted and `@type` is ignored — only the fields read.
-    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
-        match v {
-            tl_json::Json::Null => Result::Ok(Self::default()),
-            tl_json::Json::Object(o) => Self::from_json_object(o),
-            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
-        }
-    }
-
-    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
-        let mut value = Self::default();
-        if let Some(__j0) = tl_json::field(o, "callback_query_id") {
-            value.callback_query_id = tl_json::read_i64(__j0)?;
-        }
-        if let Some(__j2) = tl_json::field(o, "protect_content") {
-            value.protect_content = tl_json::read_bool(__j2)?;
-        }
-        if let Some(__j4) = tl_json::field(o, "reply_markup") && !matches!(__j4, tl_json::Json::Null) {
-            value.reply_markup = Some(ReplyMarkup::from_json_value(__j4)?);
-        }
-        if let Some(__j6) = tl_json::field(o, "input_message_content") && !matches!(__j6, tl_json::Json::Null) {
-            value.input_message_content = Some(Box::new(InputMessageContent::from_json_value(__j6)?));
-        }
-        Result::Ok(value)
-    }
-
-    /// td's generated `Class::store(TlStorerToString&, const char*)`
-    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
-    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
-        s.store_class_begin(field_name, "editCallbackQueryMessage");
-        s.store_field_int("callback_query_id", self.callback_query_id);
-        s.store_field_bool("protect_content", self.protect_content);
-        match &self.reply_markup {
-            Some(__m0) => __m0.store_debug(s, "reply_markup"),
-            None => s.store_null("reply_markup"),
-        }
-        match &self.input_message_content {
-            Some(__m1) => __m1.store_debug(s, "input_message_content"),
-            None => s.store_null("input_message_content"),
-        }
-        s.store_class_end();
-    }
-
-    /// td's `to_string(const BaseObject&)` for this constructor.
-    pub fn to_debug_string(&self) -> String {
-        let mut out = String::new();
-        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
-        self.store_debug(&mut storer, "");
-        out
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "editChatFolder")]
 pub struct editChatFolder {
     pub chat_folder_id: i32,
@@ -358730,6 +358596,149 @@ impl replaceVideoChatRtmpUrl {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "replyToCallbackQueryWithEphemeralMessage")]
+pub struct replyToCallbackQueryWithEphemeralMessage {
+    pub callback_query_id: i64,
+    pub replace_callback_query_message: bool,
+    pub protect_content: bool,
+    pub reply_markup: Option<ReplyMarkup>,
+    pub input_message_content: Option<Box<InputMessageContent>>,
+}
+
+impl replyToCallbackQueryWithEphemeralMessage {
+    pub const ID: i32 = -77034825;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.callback_query_id);
+        tl::__bool(out, self.replace_callback_query_message);
+        tl::__bool(out, self.protect_content);
+        let __d0 = Default::default();
+        let __m0 = self.reply_markup.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        let __d1 = Default::default();
+        let __m1 = self.input_message_content.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let callback_query_id: i64 = r.i64()?;
+        let replace_callback_query_message: bool = r.bool()?;
+        let protect_content: bool = r.bool()?;
+        let reply_markup: Option<ReplyMarkup> = Some(ReplyMarkup::read(r)?);
+        let input_message_content: Option<Box<InputMessageContent>> = Some(Box::new(InputMessageContent::read(r)?));
+        Result::Ok(Self { callback_query_id, replace_callback_query_message, protect_content, reply_markup, input_message_content })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"replyToCallbackQueryWithEphemeralMessage\"");
+        out.push_str(",\"callback_query_id\":");
+        tl_json::num64q(out, self.callback_query_id);
+        out.push_str(",\"replace_callback_query_message\":");
+        tl_json::boolean(out, self.replace_callback_query_message);
+        out.push_str(",\"protect_content\":");
+        tl_json::boolean(out, self.protect_content);
+        if let Some(__o0) = &self.reply_markup {
+            out.push_str(",\"reply_markup\":");
+            __o0.to_json_into(out);
+        }
+        if let Some(__o1) = &self.input_message_content {
+            out.push_str(",\"input_message_content\":");
+            __o1.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "callback_query_id") {
+            value.callback_query_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "replace_callback_query_message") {
+            value.replace_callback_query_message = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "protect_content") {
+            value.protect_content = tl_json::read_bool(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "reply_markup") && !matches!(__j6, tl_json::Json::Null) {
+            value.reply_markup = Some(ReplyMarkup::from_json_value(__j6)?);
+        }
+        if let Some(__j8) = tl_json::field(o, "input_message_content") && !matches!(__j8, tl_json::Json::Null) {
+            value.input_message_content = Some(Box::new(InputMessageContent::from_json_value(__j8)?));
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "replyToCallbackQueryWithEphemeralMessage");
+        s.store_field_int("callback_query_id", self.callback_query_id);
+        s.store_field_bool("replace_callback_query_message", self.replace_callback_query_message);
+        s.store_field_bool("protect_content", self.protect_content);
+        match &self.reply_markup {
+            Some(__m0) => __m0.store_debug(s, "reply_markup"),
+            None => s.store_null("reply_markup"),
+        }
+        match &self.input_message_content {
+            Some(__m1) => __m1.store_debug(s, "input_message_content"),
+            None => s.store_null("input_message_content"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "reportAuthenticationCodeMissing")]
 pub struct reportAuthenticationCodeMissing {
     pub mobile_network_code: String,
@@ -396075,8 +396084,6 @@ pub enum Function {
     editBusinessMessageText(editBusinessMessageText),
     #[serde(rename = "editBusinessStory")]
     editBusinessStory(editBusinessStory),
-    #[serde(rename = "editCallbackQueryMessage")]
-    editCallbackQueryMessage(editCallbackQueryMessage),
     #[serde(rename = "editChatFolder")]
     editChatFolder(editChatFolder),
     #[serde(rename = "editChatFolderInviteLink")]
@@ -397033,6 +397040,8 @@ pub enum Function {
     replaceStickerInSet(replaceStickerInSet),
     #[serde(rename = "replaceVideoChatRtmpUrl")]
     replaceVideoChatRtmpUrl(replaceVideoChatRtmpUrl),
+    #[serde(rename = "replyToCallbackQueryWithEphemeralMessage")]
+    replyToCallbackQueryWithEphemeralMessage(replyToCallbackQueryWithEphemeralMessage),
     #[serde(rename = "reportAuthenticationCodeMissing")]
     reportAuthenticationCodeMissing(reportAuthenticationCodeMissing),
     #[serde(rename = "reportChat")]
@@ -397910,7 +397919,6 @@ impl Function {
             Self::editBusinessMessageReplyMarkup(v) => v.store_boxed(out),
             Self::editBusinessMessageText(v) => v.store_boxed(out),
             Self::editBusinessStory(v) => v.store_boxed(out),
-            Self::editCallbackQueryMessage(v) => v.store_boxed(out),
             Self::editChatFolder(v) => v.store_boxed(out),
             Self::editChatFolderInviteLink(v) => v.store_boxed(out),
             Self::editChatInviteLink(v) => v.store_boxed(out),
@@ -398389,6 +398397,7 @@ impl Function {
             Self::replacePrimaryChatInviteLink(v) => v.store_boxed(out),
             Self::replaceStickerInSet(v) => v.store_boxed(out),
             Self::replaceVideoChatRtmpUrl(v) => v.store_boxed(out),
+            Self::replyToCallbackQueryWithEphemeralMessage(v) => v.store_boxed(out),
             Self::reportAuthenticationCodeMissing(v) => v.store_boxed(out),
             Self::reportChat(v) => v.store_boxed(out),
             Self::reportChatPhoto(v) => v.store_boxed(out),
@@ -398942,7 +398951,6 @@ impl Function {
             self::editBusinessMessageReplyMarkup::ID => Result::Ok(Self::editBusinessMessageReplyMarkup(self::editBusinessMessageReplyMarkup::read_bare(r)?)),
             self::editBusinessMessageText::ID => Result::Ok(Self::editBusinessMessageText(self::editBusinessMessageText::read_bare(r)?)),
             self::editBusinessStory::ID => Result::Ok(Self::editBusinessStory(self::editBusinessStory::read_bare(r)?)),
-            self::editCallbackQueryMessage::ID => Result::Ok(Self::editCallbackQueryMessage(self::editCallbackQueryMessage::read_bare(r)?)),
             self::editChatFolder::ID => Result::Ok(Self::editChatFolder(self::editChatFolder::read_bare(r)?)),
             self::editChatFolderInviteLink::ID => Result::Ok(Self::editChatFolderInviteLink(self::editChatFolderInviteLink::read_bare(r)?)),
             self::editChatInviteLink::ID => Result::Ok(Self::editChatInviteLink(self::editChatInviteLink::read_bare(r)?)),
@@ -399421,6 +399429,7 @@ impl Function {
             self::replacePrimaryChatInviteLink::ID => Result::Ok(Self::replacePrimaryChatInviteLink(self::replacePrimaryChatInviteLink::read_bare(r)?)),
             self::replaceStickerInSet::ID => Result::Ok(Self::replaceStickerInSet(self::replaceStickerInSet::read_bare(r)?)),
             self::replaceVideoChatRtmpUrl::ID => Result::Ok(Self::replaceVideoChatRtmpUrl(self::replaceVideoChatRtmpUrl::read_bare(r)?)),
+            self::replyToCallbackQueryWithEphemeralMessage::ID => Result::Ok(Self::replyToCallbackQueryWithEphemeralMessage(self::replyToCallbackQueryWithEphemeralMessage::read_bare(r)?)),
             self::reportAuthenticationCodeMissing::ID => Result::Ok(Self::reportAuthenticationCodeMissing(self::reportAuthenticationCodeMissing::read_bare(r)?)),
             self::reportChat::ID => Result::Ok(Self::reportChat(self::reportChat::read_bare(r)?)),
             self::reportChatPhoto::ID => Result::Ok(Self::reportChatPhoto(self::reportChatPhoto::read_bare(r)?)),
@@ -399976,7 +399985,6 @@ impl Function {
             Self::editBusinessMessageReplyMarkup(v) => v.to_json_into(out),
             Self::editBusinessMessageText(v) => v.to_json_into(out),
             Self::editBusinessStory(v) => v.to_json_into(out),
-            Self::editCallbackQueryMessage(v) => v.to_json_into(out),
             Self::editChatFolder(v) => v.to_json_into(out),
             Self::editChatFolderInviteLink(v) => v.to_json_into(out),
             Self::editChatInviteLink(v) => v.to_json_into(out),
@@ -400455,6 +400463,7 @@ impl Function {
             Self::replacePrimaryChatInviteLink(v) => v.to_json_into(out),
             Self::replaceStickerInSet(v) => v.to_json_into(out),
             Self::replaceVideoChatRtmpUrl(v) => v.to_json_into(out),
+            Self::replyToCallbackQueryWithEphemeralMessage(v) => v.to_json_into(out),
             Self::reportAuthenticationCodeMissing(v) => v.to_json_into(out),
             Self::reportChat(v) => v.to_json_into(out),
             Self::reportChatPhoto(v) => v.to_json_into(out),
@@ -401433,9 +401442,6 @@ impl Function {
     }
     fn __json_new_editBusinessStory(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editBusinessStory(self::editBusinessStory::from_json_object(o)?))
-    }
-    fn __json_new_editCallbackQueryMessage(o: &tl_json::Object) -> Result<Self, String> {
-        Result::Ok(Self::editCallbackQueryMessage(self::editCallbackQueryMessage::from_json_object(o)?))
     }
     fn __json_new_editChatFolder(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editChatFolder(self::editChatFolder::from_json_object(o)?))
@@ -402871,6 +402877,9 @@ impl Function {
     fn __json_new_replaceVideoChatRtmpUrl(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::replaceVideoChatRtmpUrl(self::replaceVideoChatRtmpUrl::from_json_object(o)?))
     }
+    fn __json_new_replyToCallbackQueryWithEphemeralMessage(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::replyToCallbackQueryWithEphemeralMessage(self::replyToCallbackQueryWithEphemeralMessage::from_json_object(o)?))
+    }
     fn __json_new_reportAuthenticationCodeMissing(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::reportAuthenticationCodeMissing(self::reportAuthenticationCodeMissing::from_json_object(o)?))
     }
@@ -404087,7 +404096,6 @@ impl Function {
                 "editBusinessMessageReplyMarkup" => Self::__json_new_editBusinessMessageReplyMarkup(o),
                 "editBusinessMessageText" => Self::__json_new_editBusinessMessageText(o),
                 "editBusinessStory" => Self::__json_new_editBusinessStory(o),
-                "editCallbackQueryMessage" => Self::__json_new_editCallbackQueryMessage(o),
                 "editChatFolder" => Self::__json_new_editChatFolder(o),
                 "editChatFolderInviteLink" => Self::__json_new_editChatFolderInviteLink(o),
                 "editChatInviteLink" => Self::__json_new_editChatInviteLink(o),
@@ -404566,6 +404574,7 @@ impl Function {
                 "replacePrimaryChatInviteLink" => Self::__json_new_replacePrimaryChatInviteLink(o),
                 "replaceStickerInSet" => Self::__json_new_replaceStickerInSet(o),
                 "replaceVideoChatRtmpUrl" => Self::__json_new_replaceVideoChatRtmpUrl(o),
+                "replyToCallbackQueryWithEphemeralMessage" => Self::__json_new_replyToCallbackQueryWithEphemeralMessage(o),
                 "reportAuthenticationCodeMissing" => Self::__json_new_reportAuthenticationCodeMissing(o),
                 "reportChat" => Self::__json_new_reportChat(o),
                 "reportChatPhoto" => Self::__json_new_reportChatPhoto(o),
@@ -405112,7 +405121,6 @@ impl Function {
                 self::editBusinessMessageReplyMarkup::ID => Self::__json_new_editBusinessMessageReplyMarkup(o),
                 self::editBusinessMessageText::ID => Self::__json_new_editBusinessMessageText(o),
                 self::editBusinessStory::ID => Self::__json_new_editBusinessStory(o),
-                self::editCallbackQueryMessage::ID => Self::__json_new_editCallbackQueryMessage(o),
                 self::editChatFolder::ID => Self::__json_new_editChatFolder(o),
                 self::editChatFolderInviteLink::ID => Self::__json_new_editChatFolderInviteLink(o),
                 self::editChatInviteLink::ID => Self::__json_new_editChatInviteLink(o),
@@ -405591,6 +405599,7 @@ impl Function {
                 self::replacePrimaryChatInviteLink::ID => Self::__json_new_replacePrimaryChatInviteLink(o),
                 self::replaceStickerInSet::ID => Self::__json_new_replaceStickerInSet(o),
                 self::replaceVideoChatRtmpUrl::ID => Self::__json_new_replaceVideoChatRtmpUrl(o),
+                self::replyToCallbackQueryWithEphemeralMessage::ID => Self::__json_new_replyToCallbackQueryWithEphemeralMessage(o),
                 self::reportAuthenticationCodeMissing::ID => Self::__json_new_reportAuthenticationCodeMissing(o),
                 self::reportChat::ID => Self::__json_new_reportChat(o),
                 self::reportChatPhoto::ID => Self::__json_new_reportChatPhoto(o),
@@ -406142,7 +406151,6 @@ impl Function {
             Self::editBusinessMessageReplyMarkup(v) => v.store_debug(s, field_name),
             Self::editBusinessMessageText(v) => v.store_debug(s, field_name),
             Self::editBusinessStory(v) => v.store_debug(s, field_name),
-            Self::editCallbackQueryMessage(v) => v.store_debug(s, field_name),
             Self::editChatFolder(v) => v.store_debug(s, field_name),
             Self::editChatFolderInviteLink(v) => v.store_debug(s, field_name),
             Self::editChatInviteLink(v) => v.store_debug(s, field_name),
@@ -406621,6 +406629,7 @@ impl Function {
             Self::replacePrimaryChatInviteLink(v) => v.store_debug(s, field_name),
             Self::replaceStickerInSet(v) => v.store_debug(s, field_name),
             Self::replaceVideoChatRtmpUrl(v) => v.store_debug(s, field_name),
+            Self::replyToCallbackQueryWithEphemeralMessage(v) => v.store_debug(s, field_name),
             Self::reportAuthenticationCodeMissing(v) => v.store_debug(s, field_name),
             Self::reportChat(v) => v.store_debug(s, field_name),
             Self::reportChatPhoto(v) => v.store_debug(s, field_name),
@@ -424915,7 +424924,6 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "editBusinessMessageReplyMarkup",
     "editBusinessMessageText",
     "editBusinessStory",
-    "editCallbackQueryMessage",
     "editChatFolder",
     "editChatFolderInviteLink",
     "editChatInviteLink",
@@ -425394,6 +425402,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "replacePrimaryChatInviteLink",
     "replaceStickerInSet",
     "replaceVideoChatRtmpUrl",
+    "replyToCallbackQueryWithEphemeralMessage",
     "reportAuthenticationCodeMissing",
     "reportChat",
     "reportChatPhoto",
@@ -447911,16 +447920,6 @@ pub mod samples {
         }
     }
 
-    pub fn s_editCallbackQueryMessage(depth: u32) -> editCallbackQueryMessage {
-        let _ = depth;
-        editCallbackQueryMessage {
-            callback_query_id: 0x1234_5678_9abc_def0i64,
-            protect_content: true,
-            reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
-            input_message_content: Some(Box::new(t_InputMessageContent((depth).saturating_sub(1)))),
-        }
-    }
-
     pub fn s_editChatFolder(depth: u32) -> editChatFolder {
         let _ = depth;
         editChatFolder {
@@ -451590,6 +451589,17 @@ pub mod samples {
         let _ = depth;
         replaceVideoChatRtmpUrl {
             chat_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_replyToCallbackQueryWithEphemeralMessage(depth: u32) -> replyToCallbackQueryWithEphemeralMessage {
+        let _ = depth;
+        replyToCallbackQueryWithEphemeralMessage {
+            callback_query_id: 0x1234_5678_9abc_def0i64,
+            replace_callback_query_message: true,
+            protect_content: true,
+            reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
+            input_message_content: Some(Box::new(t_InputMessageContent((depth).saturating_sub(1)))),
         }
     }
 
@@ -494851,22 +494861,6 @@ fn __rt_editBusinessStory() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
-fn __rt_editCallbackQueryMessage() {
-    samples::__stack(move || {
-        let v = Function::editCallbackQueryMessage(samples::s_editCallbackQueryMessage(3));
-        let mut out = Vec::new();
-        v.store(&mut out);
-        let w = Function::parse(&out).expect("editCallbackQueryMessage parse");
-        assert_eq!(v, w);
-        let j = v.to_json();
-        let w = Function::from_json(&j).expect("editCallbackQueryMessage json parse");
-        assert_eq!(v, w);
-    });
-}
-
-#[cfg(test)]
-#[test]
-#[allow(non_snake_case)]
 fn __rt_editChatFolder() {
     samples::__stack(move || {
         let v = Function::editChatFolder(samples::s_editChatFolder(3));
@@ -502508,6 +502502,22 @@ fn __rt_replaceVideoChatRtmpUrl() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("replaceVideoChatRtmpUrl json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_replyToCallbackQueryWithEphemeralMessage() {
+    samples::__stack(move || {
+        let v = Function::replyToCallbackQueryWithEphemeralMessage(samples::s_replyToCallbackQueryWithEphemeralMessage(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("replyToCallbackQueryWithEphemeralMessage parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("replyToCallbackQueryWithEphemeralMessage json parse");
         assert_eq!(v, w);
     });
 }

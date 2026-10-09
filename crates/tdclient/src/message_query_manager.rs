@@ -412,6 +412,24 @@ pub trait MessageQueryManagerEnv {
         _promise: Promise<()>,
     ) {
     }
+    /// the media-content leg of `edit_callback_query_message` — the
+    /// `create_upload_message_content_query` +
+    /// `edit_ephemeral_message_queries_` plane keyed by the callback
+    /// query id (M.12 upload + net); the promise lands unanswered
+    /// offline.
+    #[allow(clippy::too_many_arguments)]
+    fn start_edit_callback_query_message_upload(
+        &mut self,
+        _callback_query_id: i64,
+        _anchor: bool,
+        _noforwards: bool,
+        _disable_web_page_preview: bool,
+        _reply_markup: Option<crate::reply_markup::ReplyMarkup>,
+        _content: crate::message_content::MessageContent,
+        _invert_media: bool,
+        _promise: Promise<()>,
+    ) {
+    }
     /// `DeleteParticipantReactionsQuery::send`
     /// (MessageQueryManager.cpp:4800 payload).
     fn send_delete_participant_reactions_query(
@@ -2927,6 +2945,84 @@ impl MessageQueryManager {
             dialog_id,
             receiver_user_id,
             ephemeral_message_id,
+            new_reply_markup,
+            *content.content,
+            content.invert_media,
+            promise,
+        );
+    }
+
+    /// `edit_callback_query_message`
+    /// (MessageQueryManager.cpp:4208-4236) — the
+    /// `replyToCallbackQueryWithEphemeralMessage` flow: the content
+    /// parses against the empty dialog, then the upload stages with the
+    /// callback-query key (anchor/noforwards carried in the query).
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_callback_query_message(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        callback_query_id: i64,
+        anchor: bool,
+        noforwards: bool,
+        reply_markup: Option<td_api::ReplyMarkup>,
+        input_message_content: Option<td_api::InputMessageContent>,
+        mut promise: Promise<()>,
+    ) {
+        let is_bot = env.auth_is_bot();
+        assert!(is_bot);
+
+        let new_reply_markup = match crate::reply_markup::get_inline_reply_markup(
+            reply_markup,
+            is_bot,
+            true,
+            env.is_test_dc(),
+        ) {
+            Ok(new_reply_markup) => new_reply_markup,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        let Some(input_message_content) = input_message_content else {
+            // `get_input_message_content` (MessageContent.cpp:5298-5300).
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Input message content must be non-empty",
+            ));
+            return;
+        };
+        let content =
+            match env.parse_input_message_content(DialogId::default(), input_message_content) {
+                Ok(content) => content,
+                Err(error) => {
+                    promise.set_error(error);
+                    return;
+                }
+            };
+        let content_type = content.content.get_type();
+        if !crate::messages_manager::is_editable_media_message_content(content_type)
+            && content_type != crate::message_content::MessageContentType::RichText
+            && content_type != crate::message_content::MessageContentType::Text
+        {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Unsupported input message content type",
+            ));
+            return;
+        }
+        if !content.ttl.is_empty() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Can't enable self-destruction for media",
+            ));
+            return;
+        }
+
+        env.start_edit_callback_query_message_upload(
+            callback_query_id,
+            anchor,
+            noforwards,
+            content.disable_web_page_preview,
             new_reply_markup,
             *content.content,
             content.invert_media,

@@ -5811,15 +5811,25 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
-        // editCallbackQueryMessage (Requests.cpp:4405-4411): CHECK_IS_BOT,
-        // then MessageQueryManager::edit_callback_query_message answers
-        // 500 "Unsupported" unconditionally
-        // (MessageQueryManager.cpp:4200-4203) — the fully local band.
-        Function::editCallbackQueryMessage(_) => {
+        // replyToCallbackQueryWithEphemeralMessage (Requests.cpp:4424-4431):
+        // CHECK_IS_BOT, then MessageQueryManager::edit_callback_query_message
+        // runs the real ephemeral-reply flow (the old unconditional 500
+        // "Unsupported" band is gone upstream).
+        Function::replyToCallbackQueryWithEphemeralMessage(request) => {
             if !check_is_bot(td, id) {
                 return;
             }
-            td.send_error_impl(id, 500, "Unsupported");
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.edit_callback_query_message(
+                &mut env,
+                request.callback_query_id,
+                request.replace_callback_query_message,
+                request.protect_content,
+                request.reply_markup,
+                request.input_message_content.map(|content| *content),
+                promise,
+            );
         }
 
         // --- messages, read family (Requests.cpp:2626-2800) ---
