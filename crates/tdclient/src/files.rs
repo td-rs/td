@@ -10908,6 +10908,9 @@ impl FileDownloader {
                 if self.cdn_file_token == *file_token {
                     return Ok(true);
                 }
+                if !DcId::is_valid_raw(dc_id) {
+                    return Err(Status::error_message("Wrong CDN DC identifier"));
+                }
                 self.use_cdn = true;
                 self.need_check = true;
                 self.cdn_file_token_generation += 1;
@@ -10917,7 +10920,7 @@ impl FileDownloader {
                 self.cdn_encryption_iv = encryption_iv.clone();
                 self.add_hash_info(&file_hashes);
                 if self.cdn_encryption_iv.len() != 16 || self.cdn_encryption_key.len() != 32 {
-                    return Err(Status::error_message("Wrong ctr key or iv size"));
+                    return Err(Status::error_message("Wrong CTR key or IV size"));
                 }
                 Ok(true)
             }
