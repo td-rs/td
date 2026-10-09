@@ -303,6 +303,90 @@ impl Usernames {
         unreachable!("toggle of a username not owned by the user");
     }
 
+    /// `Usernames::can_add_secondary` (Usernames.cpp:217-225).
+    pub fn can_add_secondary(&self, username: &str) -> bool {
+        if !self.deletable_usernames.is_empty() {
+            return false;
+        }
+        if username.is_empty() {
+            return false;
+        }
+        if self.active_usernames.iter().any(|name| name == username)
+            || self.disabled_usernames.iter().any(|name| name == username)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// `Usernames::add_secondary` (Usernames.cpp:227-238) — the secondary
+    /// lands at the head of the active list (a new bot's regular username
+    /// keeps the primary position).
+    pub fn add_secondary(&self, username: &str) -> Usernames {
+        let mut result = self.clone();
+        if !self.can_add_secondary(username) {
+            return result;
+        }
+        result.deletable_usernames.push(username.to_owned());
+        result.active_usernames.insert(0, username.to_owned());
+        if result.has_editable_username() && !result.is_editable_username_disabled {
+            result.editable_username_pos += 1;
+        }
+        result.check_validness();
+        result
+    }
+
+    /// `Usernames::can_delete_secondary` (Usernames.cpp:241-242).
+    pub fn can_delete_secondary(&self, username: &str) -> bool {
+        self.deletable_usernames.iter().any(|name| name == username)
+            && self.get_editable_username() != username
+    }
+
+    /// `Usernames::delete_secondary` (Usernames.cpp:244-269).
+    pub fn delete_secondary(&self, username: &str) -> Usernames {
+        let mut result = self.clone();
+        if !self.can_delete_secondary(username) {
+            return result;
+        }
+        result.deletable_usernames.retain(|name| name != username);
+        for i in 0..self.active_usernames.len() {
+            if self.active_usernames[i] == username {
+                result.active_usernames.remove(i);
+                if self.has_editable_username()
+                    && !self.is_editable_username_disabled
+                    && i <= result.editable_username_pos as usize
+                {
+                    assert!(i < result.editable_username_pos as usize);
+                    result.editable_username_pos -= 1;
+                }
+            }
+        }
+        for i in 0..self.disabled_usernames.len() {
+            if self.disabled_usernames[i] == username {
+                result.disabled_usernames.remove(i);
+                if self.has_editable_username()
+                    && self.is_editable_username_disabled
+                    && i <= result.editable_username_pos as usize
+                {
+                    assert!(i < result.editable_username_pos as usize);
+                    result.editable_username_pos -= 1;
+                }
+            }
+        }
+        result.check_validness();
+        if result.active_usernames.is_empty() && result.has_editable_username() {
+            let editable_username = result.get_editable_username().to_owned();
+            result = result.toggle(true, &editable_username, true);
+        }
+        result
+    }
+
+    /// `Usernames::get_deletable_usernames` — the secondary-username view
+    /// of the delete flow.
+    pub fn get_deletable_usernames(&self) -> &[String] {
+        &self.deletable_usernames
+    }
+
     /// `Usernames::deactivate_all`.
     pub fn deactivate_all(&self) -> Usernames {
         let mut result = Usernames::default();
@@ -611,6 +695,42 @@ mod tests {
     }
 
     #[test]
+    fn secondary_username_add_and_delete_round_trip() {
+        let base = Usernames::from_telegram(
+            String::new(),
+            vec![
+                username("main_bot", true, true),
+                username("first", false, true),
+            ],
+        );
+        // can_add: no existing secondary, non-empty, not already owned
+        assert!(base.can_add_secondary("secondary"));
+        assert!(!base.can_add_secondary(""));
+        assert!(!base.can_add_secondary("first"));
+        assert!(!base.can_add_secondary("main_bot"));
+
+        let added = base.add_secondary("secondary");
+        // the secondary lands at the head; the editable position shifts
+        assert_eq!(
+            *added.get_active_usernames(),
+            ["secondary", "main_bot", "first"]
+        );
+        assert_eq!(added.deletable_usernames, ["secondary"]);
+        assert_eq!(added.get_usernames_object().secondary_username, "secondary");
+        // a second secondary is rejected
+        assert!(!added.can_add_secondary("another"));
+
+        // can_delete: a deletable, non-editable username
+        assert!(added.can_delete_secondary("secondary"));
+        assert!(!added.can_delete_secondary("main_bot"));
+        assert!(!base.can_delete_secondary("secondary"));
+
+        let deleted = added.delete_secondary("secondary");
+        assert_eq!(*deleted.get_active_usernames(), ["main_bot", "first"]);
+        assert!(deleted.deletable_usernames.is_empty());
+        assert_eq!(deleted, base);
+    }
+
     fn toggle_disables_and_reenables() {
         let usernames = Usernames::from_telegram("main".to_owned(), Vec::new());
         let disabled = usernames.toggle(false, "main", false);
