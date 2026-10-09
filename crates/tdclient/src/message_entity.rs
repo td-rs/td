@@ -6729,9 +6729,51 @@ fn find_splittable_entities_v3(text: &str, entities: &[MessageEntity]) -> Vec<Me
         }
     }
 
+    // URLs and email addresses absorb adjacent markup like "~~t.me/a~~",
+    // so markup at their beginning can only open an entity and markup at
+    // their end can only close one, while markup inside them isn't parsed
+    // (MessageEntity.cpp:2638-2665, e931b131f).
+    let mut opening_only_positions: std::collections::HashSet<i32> =
+        std::collections::HashSet::new();
+    let mut closing_only_positions: std::collections::HashSet<i32> =
+        std::collections::HashSet::new();
+    let is_markup_character = |c: u8| matches!(c, b'_' | b'*' | b'~' | b'|');
     let mut found_entities = find_entities(text, false, true);
-    found_entities.retain(|entity| !matches!(entity_type(entity), Type::EmailAddress | Type::Url));
-    for entity in &found_entities {
+    let mut left_text = text;
+    let mut left_text_offset = 0i32;
+    for entity in &mut found_entities {
+        if matches!(entity_type(entity), Type::EmailAddress | Type::Url) {
+            debug_assert!(entity.offset >= left_text_offset);
+            left_text = tdutils::utf8::utf8_utf16_substr(
+                left_text,
+                (entity.offset - left_text_offset) as usize,
+            );
+            let entity_text =
+                tdutils::utf8::utf8_utf16_substr_range(left_text, 0, entity.length as usize);
+            left_text = &left_text[entity_text.len()..];
+            left_text_offset = entity.offset + entity.length;
+            let entity_bytes = entity_text.as_bytes();
+            let mut prefix_length = 0i32;
+            while prefix_length < entity.length
+                && is_markup_character(entity_bytes[prefix_length as usize])
+            {
+                opening_only_positions.insert(entity.offset + prefix_length + 1);
+                prefix_length += 1;
+            }
+            let mut suffix_length = 0i32;
+            while prefix_length + suffix_length < entity.length
+                && is_markup_character(
+                    entity_bytes[entity_bytes.len() - suffix_length as usize - 1],
+                )
+            {
+                suffix_length += 1;
+                closing_only_positions.insert(entity.offset + entity.length - suffix_length + 1);
+            }
+            for i in prefix_length + 1..entity.length - suffix_length {
+                unallowed_boundaries.insert(entity.offset + i + 1);
+            }
+            continue;
+        }
         for i in 0..=entity.length {
             unallowed_boundaries.insert(entity.offset + i + 1);
         }
@@ -6768,16 +6810,18 @@ fn find_splittable_entities_v3(text: &str, entities: &[MessageEntity]) -> Vec<Me
                 };
                 let index = splittable_entity_type_index(r#type);
                 if splittable_entity_offset[index] != 0 {
-                    let length = utf16_offset - splittable_entity_offset[index] - 1;
-                    if length > 0 {
-                        result.push(MessageEntity::new(
-                            r#type,
-                            splittable_entity_offset[index],
-                            length,
-                        ));
+                    if !opening_only_positions.contains(&utf16_offset) {
+                        let length = utf16_offset - splittable_entity_offset[index] - 1;
+                        if length > 0 {
+                            result.push(MessageEntity::new(
+                                r#type,
+                                splittable_entity_offset[index],
+                                length,
+                            ));
+                        }
+                        splittable_entity_offset[index] = 0;
                     }
-                    splittable_entity_offset[index] = 0;
-                } else {
+                } else if !closing_only_positions.contains(&utf16_offset) {
                     splittable_entity_offset[index] = utf16_offset + 1;
                 }
             }
@@ -10275,6 +10319,50 @@ mod tests {
             let markdown = get_markdown_v3(parsed.clone());
             let reparsed = parse_markdown_v3(markdown);
             assert_eq!(reparsed, parsed, "round-trip fixed point for {text:?}");
+        }
+    }
+
+    /// The e931b131f/02f4aa5de vectors — markdown inside URLs and
+    /// email addresses is not parsed; only edge markup can open/close
+    /// (check_parse_markdown_v3, test/message_entities.cpp).
+    #[test]
+    fn markdown_v3_url_and_email_absorption() {
+        let cases: &[(&str, &str, &[(Type, i32, i32)])] = &[
+            (
+                "🏟 https://a.com/__b__ 🏟 a__b__c@test.com __c.com/d__",
+                "🏟 https://a.com/__b__ 🏟 a__b__c@test.com c.com/d",
+                &[(Type::Italic, 43, 7)],
+            ),
+            ("__ a__b.com __", " ab.com __", &[(Type::Italic, 0, 2)]),
+            ("a__d.bc.com __", "a__d.bc.com __", &[]),
+            (
+                "~~ ~~test.com/a~~",
+                " ~~test.com/a",
+                &[(Type::Strikethrough, 0, 13)],
+            ),
+            (
+                "|| ||test.com/a||",
+                " test.com/a||",
+                &[(Type::Spoiler, 0, 1)],
+            ),
+            (
+                "test.com/a~~ ~~b~~",
+                "test.com/a~~ b",
+                &[(Type::Strikethrough, 13, 1)],
+            ),
+        ];
+        for (input, expected_text, expected_entities) in cases {
+            let parsed = parse_markdown_v3(FormattedText {
+                text: (*input).to_owned(),
+                entities: Vec::new(),
+            });
+            assert_eq!(parsed.text, *expected_text, "text for {input:?}");
+            let got: Vec<(Type, i32, i32)> = parsed
+                .entities
+                .iter()
+                .map(|e| (entity_type(e), e.offset, e.length))
+                .collect();
+            assert_eq!(&got, expected_entities, "entities for {input:?}");
         }
     }
 
