@@ -232095,6 +232095,90 @@ impl suggestedActionViewChecksHint {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "suggestedActionViewFirstTonWalletTransferHint")]
+pub struct suggestedActionViewFirstTonWalletTransferHint;
+
+impl suggestedActionViewFirstTonWalletTransferHint {
+    pub const ID: i32 = 734140787;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"suggestedActionViewFirstTonWalletTransferHint\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "suggestedActionViewFirstTonWalletTransferHint");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "suggestedActionConvertToBroadcastGroup")]
 pub struct suggestedActionConvertToBroadcastGroup {
     pub supergroup_id: i64,
@@ -233283,6 +233367,8 @@ pub enum SuggestedAction {
     suggestedActionCheckPhoneNumber(suggestedActionCheckPhoneNumber),
     #[serde(rename = "suggestedActionViewChecksHint")]
     suggestedActionViewChecksHint(suggestedActionViewChecksHint),
+    #[serde(rename = "suggestedActionViewFirstTonWalletTransferHint")]
+    suggestedActionViewFirstTonWalletTransferHint(suggestedActionViewFirstTonWalletTransferHint),
     #[serde(rename = "suggestedActionConvertToBroadcastGroup")]
     suggestedActionConvertToBroadcastGroup(suggestedActionConvertToBroadcastGroup),
     #[serde(rename = "suggestedActionSetPassword")]
@@ -233318,6 +233404,7 @@ impl SuggestedAction {
             Self::suggestedActionCheckPassword(v) => v.store_boxed(out),
             Self::suggestedActionCheckPhoneNumber(v) => v.store_boxed(out),
             Self::suggestedActionViewChecksHint(v) => v.store_boxed(out),
+            Self::suggestedActionViewFirstTonWalletTransferHint(v) => v.store_boxed(out),
             Self::suggestedActionConvertToBroadcastGroup(v) => v.store_boxed(out),
             Self::suggestedActionSetPassword(v) => v.store_boxed(out),
             Self::suggestedActionUpgradePremium(v) => v.store_boxed(out),
@@ -233345,6 +233432,7 @@ impl SuggestedAction {
             self::suggestedActionCheckPassword::ID => Result::Ok(Self::suggestedActionCheckPassword(self::suggestedActionCheckPassword::read_bare(r)?)),
             self::suggestedActionCheckPhoneNumber::ID => Result::Ok(Self::suggestedActionCheckPhoneNumber(self::suggestedActionCheckPhoneNumber::read_bare(r)?)),
             self::suggestedActionViewChecksHint::ID => Result::Ok(Self::suggestedActionViewChecksHint(self::suggestedActionViewChecksHint::read_bare(r)?)),
+            self::suggestedActionViewFirstTonWalletTransferHint::ID => Result::Ok(Self::suggestedActionViewFirstTonWalletTransferHint(self::suggestedActionViewFirstTonWalletTransferHint::read_bare(r)?)),
             self::suggestedActionConvertToBroadcastGroup::ID => Result::Ok(Self::suggestedActionConvertToBroadcastGroup(self::suggestedActionConvertToBroadcastGroup::read_bare(r)?)),
             self::suggestedActionSetPassword::ID => Result::Ok(Self::suggestedActionSetPassword(self::suggestedActionSetPassword::read_bare(r)?)),
             self::suggestedActionUpgradePremium::ID => Result::Ok(Self::suggestedActionUpgradePremium(self::suggestedActionUpgradePremium::read_bare(r)?)),
@@ -233374,6 +233462,7 @@ impl SuggestedAction {
             Self::suggestedActionCheckPassword(v) => v.to_json_into(out),
             Self::suggestedActionCheckPhoneNumber(v) => v.to_json_into(out),
             Self::suggestedActionViewChecksHint(v) => v.to_json_into(out),
+            Self::suggestedActionViewFirstTonWalletTransferHint(v) => v.to_json_into(out),
             Self::suggestedActionConvertToBroadcastGroup(v) => v.to_json_into(out),
             Self::suggestedActionSetPassword(v) => v.to_json_into(out),
             Self::suggestedActionUpgradePremium(v) => v.to_json_into(out),
@@ -233406,6 +233495,9 @@ impl SuggestedAction {
     }
     fn __json_new_suggestedActionViewChecksHint(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::suggestedActionViewChecksHint(self::suggestedActionViewChecksHint::from_json_object(o)?))
+    }
+    fn __json_new_suggestedActionViewFirstTonWalletTransferHint(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::suggestedActionViewFirstTonWalletTransferHint(self::suggestedActionViewFirstTonWalletTransferHint::from_json_object(o)?))
     }
     fn __json_new_suggestedActionConvertToBroadcastGroup(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::suggestedActionConvertToBroadcastGroup(self::suggestedActionConvertToBroadcastGroup::from_json_object(o)?))
@@ -233465,6 +233557,7 @@ impl SuggestedAction {
                 "suggestedActionCheckPassword" => Self::__json_new_suggestedActionCheckPassword(o),
                 "suggestedActionCheckPhoneNumber" => Self::__json_new_suggestedActionCheckPhoneNumber(o),
                 "suggestedActionViewChecksHint" => Self::__json_new_suggestedActionViewChecksHint(o),
+                "suggestedActionViewFirstTonWalletTransferHint" => Self::__json_new_suggestedActionViewFirstTonWalletTransferHint(o),
                 "suggestedActionConvertToBroadcastGroup" => Self::__json_new_suggestedActionConvertToBroadcastGroup(o),
                 "suggestedActionSetPassword" => Self::__json_new_suggestedActionSetPassword(o),
                 "suggestedActionUpgradePremium" => Self::__json_new_suggestedActionUpgradePremium(o),
@@ -233485,6 +233578,7 @@ impl SuggestedAction {
                 self::suggestedActionCheckPassword::ID => Self::__json_new_suggestedActionCheckPassword(o),
                 self::suggestedActionCheckPhoneNumber::ID => Self::__json_new_suggestedActionCheckPhoneNumber(o),
                 self::suggestedActionViewChecksHint::ID => Self::__json_new_suggestedActionViewChecksHint(o),
+                self::suggestedActionViewFirstTonWalletTransferHint::ID => Self::__json_new_suggestedActionViewFirstTonWalletTransferHint(o),
                 self::suggestedActionConvertToBroadcastGroup::ID => Self::__json_new_suggestedActionConvertToBroadcastGroup(o),
                 self::suggestedActionSetPassword::ID => Self::__json_new_suggestedActionSetPassword(o),
                 self::suggestedActionUpgradePremium::ID => Self::__json_new_suggestedActionUpgradePremium(o),
@@ -233510,6 +233604,7 @@ impl SuggestedAction {
             Self::suggestedActionCheckPassword(v) => v.store_debug(s, field_name),
             Self::suggestedActionCheckPhoneNumber(v) => v.store_debug(s, field_name),
             Self::suggestedActionViewChecksHint(v) => v.store_debug(s, field_name),
+            Self::suggestedActionViewFirstTonWalletTransferHint(v) => v.store_debug(s, field_name),
             Self::suggestedActionConvertToBroadcastGroup(v) => v.store_debug(s, field_name),
             Self::suggestedActionSetPassword(v) => v.store_debug(s, field_name),
             Self::suggestedActionUpgradePremium(v) => v.store_debug(s, field_name),
@@ -233548,6 +233643,7 @@ impl From<SuggestedAction> for Object {
             SuggestedAction::suggestedActionCheckPassword(v) => Object::suggestedActionCheckPassword(v),
             SuggestedAction::suggestedActionCheckPhoneNumber(v) => Object::suggestedActionCheckPhoneNumber(v),
             SuggestedAction::suggestedActionViewChecksHint(v) => Object::suggestedActionViewChecksHint(v),
+            SuggestedAction::suggestedActionViewFirstTonWalletTransferHint(v) => Object::suggestedActionViewFirstTonWalletTransferHint(v),
             SuggestedAction::suggestedActionConvertToBroadcastGroup(v) => Object::suggestedActionConvertToBroadcastGroup(v),
             SuggestedAction::suggestedActionSetPassword(v) => Object::suggestedActionSetPassword(v),
             SuggestedAction::suggestedActionUpgradePremium(v) => Object::suggestedActionUpgradePremium(v),
@@ -408646,6 +408742,7 @@ pub enum Object {
     suggestedActionCheckPassword(suggestedActionCheckPassword),
     suggestedActionCheckPhoneNumber(suggestedActionCheckPhoneNumber),
     suggestedActionViewChecksHint(suggestedActionViewChecksHint),
+    suggestedActionViewFirstTonWalletTransferHint(suggestedActionViewFirstTonWalletTransferHint),
     suggestedActionConvertToBroadcastGroup(suggestedActionConvertToBroadcastGroup),
     suggestedActionSetPassword(suggestedActionSetPassword),
     suggestedActionUpgradePremium(suggestedActionUpgradePremium),
@@ -410841,6 +410938,7 @@ impl Object {
             Self::suggestedActionCheckPassword(v) => v.to_json_into(out),
             Self::suggestedActionCheckPhoneNumber(v) => v.to_json_into(out),
             Self::suggestedActionViewChecksHint(v) => v.to_json_into(out),
+            Self::suggestedActionViewFirstTonWalletTransferHint(v) => v.to_json_into(out),
             Self::suggestedActionConvertToBroadcastGroup(v) => v.to_json_into(out),
             Self::suggestedActionSetPassword(v) => v.to_json_into(out),
             Self::suggestedActionUpgradePremium(v) => v.to_json_into(out),
@@ -416579,6 +416677,9 @@ impl Object {
     fn __json_new_suggestedActionViewChecksHint(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::suggestedActionViewChecksHint(self::suggestedActionViewChecksHint::from_json_object(o)?))
     }
+    fn __json_new_suggestedActionViewFirstTonWalletTransferHint(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::suggestedActionViewFirstTonWalletTransferHint(self::suggestedActionViewFirstTonWalletTransferHint::from_json_object(o)?))
+    }
     fn __json_new_suggestedActionConvertToBroadcastGroup(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::suggestedActionConvertToBroadcastGroup(self::suggestedActionConvertToBroadcastGroup::from_json_object(o)?))
     }
@@ -419595,6 +419696,7 @@ impl Object {
                 "suggestedActionCheckPassword" => Self::__json_new_suggestedActionCheckPassword(o),
                 "suggestedActionCheckPhoneNumber" => Self::__json_new_suggestedActionCheckPhoneNumber(o),
                 "suggestedActionViewChecksHint" => Self::__json_new_suggestedActionViewChecksHint(o),
+                "suggestedActionViewFirstTonWalletTransferHint" => Self::__json_new_suggestedActionViewFirstTonWalletTransferHint(o),
                 "suggestedActionConvertToBroadcastGroup" => Self::__json_new_suggestedActionConvertToBroadcastGroup(o),
                 "suggestedActionSetPassword" => Self::__json_new_suggestedActionSetPassword(o),
                 "suggestedActionUpgradePremium" => Self::__json_new_suggestedActionUpgradePremium(o),
@@ -421781,6 +421883,7 @@ impl Object {
                 self::suggestedActionCheckPassword::ID => Self::__json_new_suggestedActionCheckPassword(o),
                 self::suggestedActionCheckPhoneNumber::ID => Self::__json_new_suggestedActionCheckPhoneNumber(o),
                 self::suggestedActionViewChecksHint::ID => Self::__json_new_suggestedActionViewChecksHint(o),
+                self::suggestedActionViewFirstTonWalletTransferHint::ID => Self::__json_new_suggestedActionViewFirstTonWalletTransferHint(o),
                 self::suggestedActionConvertToBroadcastGroup::ID => Self::__json_new_suggestedActionConvertToBroadcastGroup(o),
                 self::suggestedActionSetPassword::ID => Self::__json_new_suggestedActionSetPassword(o),
                 self::suggestedActionUpgradePremium::ID => Self::__json_new_suggestedActionUpgradePremium(o),
@@ -423980,6 +424083,7 @@ impl Object {
             Self::suggestedActionCheckPassword(v) => v.store_debug(s, field_name),
             Self::suggestedActionCheckPhoneNumber(v) => v.store_debug(s, field_name),
             Self::suggestedActionViewChecksHint(v) => v.store_debug(s, field_name),
+            Self::suggestedActionViewFirstTonWalletTransferHint(v) => v.store_debug(s, field_name),
             Self::suggestedActionConvertToBroadcastGroup(v) => v.store_debug(s, field_name),
             Self::suggestedActionSetPassword(v) => v.store_debug(s, field_name),
             Self::suggestedActionUpgradePremium(v) => v.store_debug(s, field_name),
@@ -424594,7 +424698,7 @@ impl Update {
 }
 
 pub const SCHEME_TYPES: usize = 753;
-pub const SCHEME_CTORS: usize = 2192;
+pub const SCHEME_CTORS: usize = 2193;
 pub const SCHEME_FUNCTIONS: usize = 1022;
 pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "acceptCall",
@@ -425620,7 +425724,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "viewVideoMessageAdvertisement",
     "writeGeneratedFilePart",
 ];
-pub const GENERATED_STRUCTS: usize = 3205;
+pub const GENERATED_STRUCTS: usize = 3206;
 pub const GENERATED_ENUMS: usize = 211;
 #[cfg(test)]
 #[allow(non_snake_case, dead_code)]
@@ -442748,6 +442852,11 @@ pub mod samples {
     pub fn s_suggestedActionViewChecksHint(depth: u32) -> suggestedActionViewChecksHint {
         let _ = depth;
         suggestedActionViewChecksHint
+    }
+
+    pub fn s_suggestedActionViewFirstTonWalletTransferHint(depth: u32) -> suggestedActionViewFirstTonWalletTransferHint {
+        let _ = depth;
+        suggestedActionViewFirstTonWalletTransferHint
     }
 
     pub fn s_suggestedActionConvertToBroadcastGroup(depth: u32) -> suggestedActionConvertToBroadcastGroup {
@@ -484435,6 +484544,22 @@ fn __rt_suggestedActionViewChecksHint() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = SuggestedAction::from_json(&j).expect("suggestedActionViewChecksHint json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_suggestedActionViewFirstTonWalletTransferHint() {
+    samples::__stack(move || {
+        let v = SuggestedAction::suggestedActionViewFirstTonWalletTransferHint(samples::s_suggestedActionViewFirstTonWalletTransferHint(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = SuggestedAction::parse(&out).expect("suggestedActionViewFirstTonWalletTransferHint parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = SuggestedAction::from_json(&j).expect("suggestedActionViewFirstTonWalletTransferHint json parse");
         assert_eq!(v, w);
     });
 }

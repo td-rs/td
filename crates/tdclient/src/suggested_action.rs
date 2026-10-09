@@ -33,6 +33,7 @@ pub enum SuggestedActionType {
     SetupLoginEmail,
     SetupLoginEmailNoskip,
     SetupPasskey,
+    WalletFirstIncomingTransfer,
 }
 
 impl SuggestedActionType {
@@ -57,6 +58,7 @@ impl SuggestedActionType {
             16 => SuggestedActionType::SetupLoginEmail,
             17 => SuggestedActionType::SetupLoginEmailNoskip,
             18 => SuggestedActionType::SetupPasskey,
+            19 => SuggestedActionType::WalletFirstIncomingTransfer,
             _ => unreachable!("invalid suggested action type {value}"),
         }
     }
@@ -142,6 +144,7 @@ impl SuggestedAction {
             "SETUP_LOGIN_EMAIL" => SuggestedActionType::SetupLoginEmail,
             "SETUP_LOGIN_EMAIL_NOSKIP" => SuggestedActionType::SetupLoginEmailNoskip,
             "SETUP_PASSKEY" => SuggestedActionType::SetupPasskey,
+            "WALLET_FIRST_INCOMING_TRANSFER" => SuggestedActionType::WalletFirstIncomingTransfer,
             _ => SuggestedActionType::Empty,
         };
         SuggestedAction {
@@ -274,6 +277,9 @@ impl SuggestedAction {
             td_api::SuggestedAction::suggestedActionAddLoginPasskey(_) => {
                 result.init(SuggestedActionType::SetupPasskey);
             }
+            td_api::SuggestedAction::suggestedActionViewFirstTonWalletTransferHint(_) => {
+                result.init(SuggestedActionType::WalletFirstIncomingTransfer);
+            }
         }
         result
     }
@@ -313,6 +319,9 @@ impl SuggestedAction {
             SuggestedActionType::SetupLoginEmail => "SETUP_LOGIN_EMAIL".to_string(),
             SuggestedActionType::SetupLoginEmailNoskip => "SETUP_LOGIN_EMAIL_NOSKIP".to_string(),
             SuggestedActionType::SetupPasskey => "SETUP_PASSKEY".to_string(),
+            SuggestedActionType::WalletFirstIncomingTransfer => {
+                "WALLET_FIRST_INCOMING_TRANSFER".to_string()
+            }
             SuggestedActionType::Empty => String::new(),
         }
     }
@@ -345,6 +354,11 @@ impl SuggestedAction {
             SuggestedActionType::ViewChecksHint => {
                 td_api::SuggestedAction::suggestedActionViewChecksHint(
                     td_api::suggestedActionViewChecksHint,
+                )
+            }
+            SuggestedActionType::WalletFirstIncomingTransfer => {
+                td_api::SuggestedAction::suggestedActionViewFirstTonWalletTransferHint(
+                    td_api::suggestedActionViewFirstTonWalletTransferHint,
                 )
             }
             SuggestedActionType::ConvertToGigagroup => {
