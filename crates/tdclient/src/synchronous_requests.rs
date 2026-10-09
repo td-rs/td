@@ -759,7 +759,7 @@ mod tests {
         let response = run_request(function);
         assert_eq!(
             response.to_json(),
-            r#"{"@type":"optionValueString","value":"1.8.67"}"#
+            r#"{"@type":"optionValueString","value":"1.8.68"}"#
         );
     }
 

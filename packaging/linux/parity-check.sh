@@ -23,7 +23,7 @@ if cmp -s "$TD_CPP/build-d1/td/telegram/tdjson_export.h" "$DIST/include/td/teleg
 
 # 3. layout + soname + symlink
 SON=$(readelf -d "$DIST/lib/libtdjson.so" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
-[ "$SON" = "libtdjson.so.1.8.67" ] && echo "PARITY_SONAME_OK $SON" || { echo "PARITY_SONAME_BAD '$SON'"; fail=1; }
-[ "$(readlink "$DIST/lib/libtdjson.so")" = "libtdjson.so.1.8.67" ] && echo "PARITY_SYMLINK_OK" || { echo "PARITY_SYMLINK_BAD"; fail=1; }
+[ "$SON" = "libtdjson.so.1.8.68" ] && echo "PARITY_SONAME_OK $SON" || { echo "PARITY_SONAME_BAD '$SON'"; fail=1; }
+[ "$(readlink "$DIST/lib/libtdjson.so")" = "libtdjson.so.1.8.68" ] && echo "PARITY_SYMLINK_OK" || { echo "PARITY_SYMLINK_BAD"; fail=1; }
 
 exit $fail

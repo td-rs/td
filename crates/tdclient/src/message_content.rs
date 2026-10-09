@@ -239,6 +239,8 @@ pub enum MessageContentType {
     RichText,
     ChangeCommunity,
     ChatJoinedViaCommunity,
+    GramTransfer,
+    WalletTonConnectRequest,
 }
 
 /// `can_be_secret_message_content` (MessageContentType.cpp) — the C++
@@ -252,7 +254,7 @@ pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
 }
 
 /// `is_service_message_content` (MessageContentType.cpp:623-731) — the C++
-/// switch enumerates all 97 types (28 returning false, the rest true), so
+/// switch enumerates all 99 types (28 returning false, the rest true), so
 /// the `default: UNREACHABLE()` arm covers nothing. The two unmodeled
 /// members keep their C++ answers recorded here: `RichText` is a
 /// non-service type and `ChatSetTheme` is a service type; both land with
@@ -324,6 +326,7 @@ pub fn can_send_message_content_to_secret_chat(content_type: MessageContentType)
         | Text | Venue | Video | VideoNote | VoiceNote => true,
         Dice | Game | Giveaway | GiveawayWinners | Invoice | PaidMedia | Poll | Story
         | ToDoList => false,
+        GramTransfer | WalletTonConnectRequest => false,
         _ => unreachable!(),
     }
 }
@@ -443,6 +446,8 @@ impl TryFrom<i32> for MessageContentType {
             93 => Ok(MessageContentType::RichText),
             94 => Ok(MessageContentType::ChangeCommunity),
             95 => Ok(MessageContentType::ChatJoinedViaCommunity),
+            96 => Ok(MessageContentType::GramTransfer),
+            97 => Ok(MessageContentType::WalletTonConnectRequest),
             _ => Err(()),
         }
     }
@@ -2342,7 +2347,7 @@ pub struct MessageUnsupported {
 impl MessageUnsupported {
     /// `MessageUnsupported::CURRENT_VERSION` (MessageContent.cpp:554) —
     /// bumped each time a new message content type is added.
-    pub const CURRENT_VERSION: i32 = 62;
+    pub const CURRENT_VERSION: i32 = 63;
 }
 
 impl Default for MessageUnsupported {
@@ -2953,6 +2958,28 @@ pub struct MessageChatJoinedViaCommunity {
     pub community_id: CommunityId,
 }
 
+/// `MessageGramTransfer` (MessageContent.cpp:1832-1852).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageGramTransfer {
+    pub amount: i64,
+    pub peer_address: String,
+    pub transaction_id: String,
+    pub comment: String,
+    pub is_comment_encrypted: bool,
+}
+
+/// `MessageWalletTonConnectRequest` (MessageContent.cpp:1855-1881).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageWalletTonConnectRequest {
+    pub session_id: i64,
+    pub expire_date: i32,
+    pub topic: String,
+    pub trace_id: String,
+    pub dapp_name: String,
+    pub is_accepted: bool,
+    pub is_declined: bool,
+}
+
 /// `td::MessageContent` (MessageContent.h:62-72) — the C++ class hierarchy
 /// flattened into an enum of structs. The C++ header comment applies to
 /// every inheritor: do not forget to update `merge_message_contents` and
@@ -3060,6 +3087,8 @@ pub enum MessageContent {
     ToDoList(MessageToDoList),
     ChangeCommunity(MessageChangeCommunity),
     ChatJoinedViaCommunity(MessageChatJoinedViaCommunity),
+    GramTransfer(MessageGramTransfer),
+    WalletTonConnectRequest(MessageWalletTonConnectRequest),
 }
 
 impl MessageContent {
@@ -3163,6 +3192,10 @@ impl MessageContent {
             MessageContent::ToDoList(_) => MessageContentType::ToDoList,
             MessageContent::ChangeCommunity(_) => MessageContentType::ChangeCommunity,
             MessageContent::ChatJoinedViaCommunity(_) => MessageContentType::ChatJoinedViaCommunity,
+            MessageContent::GramTransfer(_) => MessageContentType::GramTransfer,
+            MessageContent::WalletTonConnectRequest(_) => {
+                MessageContentType::WalletTonConnectRequest
+            }
         }
     }
 }
@@ -5912,6 +5945,46 @@ pub fn store_message_content(
             store_flags::<0>(out, []);
             m.community_id.store(out);
         }
+        MessageContent::GramTransfer(m) => {
+            // MessageContent.cpp:3067-3081 — the has_comment flag makes
+            // the comment string optional on the binlog.
+            let has_comment = !m.comment.is_empty();
+            store_flags(out, [has_comment, m.is_comment_encrypted]);
+            out.extend_from_slice(&m.amount.to_le_bytes());
+            store_string(out, &m.peer_address);
+            store_string(out, &m.transaction_id);
+            if has_comment {
+                store_string(out, &m.comment);
+            }
+        }
+        MessageContent::WalletTonConnectRequest(m) => {
+            // MessageContent.cpp:3082-3102 — the three optional strings
+            // ride the flags word.
+            let has_topic = !m.topic.is_empty();
+            let has_trace_id = !m.trace_id.is_empty();
+            let has_dapp_name = !m.dapp_name.is_empty();
+            store_flags(
+                out,
+                [
+                    has_topic,
+                    has_trace_id,
+                    m.is_accepted,
+                    m.is_declined,
+                    has_dapp_name,
+                ],
+            );
+            out.extend_from_slice(&m.session_id.to_le_bytes());
+            out.extend_from_slice(&m.expire_date.to_le_bytes());
+            if has_topic {
+                store_string(out, &m.topic);
+            }
+            if has_trace_id {
+                store_string(out, &m.trace_id);
+            }
+            if has_dapp_name {
+                store_string(out, &m.dapp_name);
+            }
+        }
     }
 }
 
@@ -7219,6 +7292,55 @@ pub fn parse_message_content(
             parser.parse_flags::<0>()?;
             let community_id = CommunityId::new(parser.i64_()?);
             MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity { community_id })
+        }
+        MessageContentType::GramTransfer => {
+            // MessageContent.cpp:4581-4596.
+            let flags = parser.parse_flags::<2>()?;
+            let amount = parser.i64_()?;
+            let peer_address = parser.string()?;
+            let transaction_id = parser.string()?;
+            let comment = if flags[0] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            MessageContent::GramTransfer(MessageGramTransfer {
+                amount,
+                peer_address,
+                transaction_id,
+                comment,
+                is_comment_encrypted: flags[1],
+            })
+        }
+        MessageContentType::WalletTonConnectRequest => {
+            // MessageContent.cpp:4597-4619.
+            let flags = parser.parse_flags::<5>()?;
+            let session_id = parser.i64_()?;
+            let expire_date = parser.i32_()?;
+            let topic = if flags[0] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let trace_id = if flags[1] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let dapp_name = if flags[4] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            MessageContent::WalletTonConnectRequest(MessageWalletTonConnectRequest {
+                session_id,
+                expire_date,
+                topic,
+                trace_id,
+                dapp_name,
+                is_accepted: flags[2],
+                is_declined: flags[3],
+            })
         }
         // The unmodeled six: StarGift/StarGiftUnique/StarGiftPurchaseOffer/
         // StarGiftPurchaseOfferDeclined/ChatSetTheme/RichText.
@@ -11138,6 +11260,33 @@ pub fn compare_message_contents(
                 *need_update = true;
             }
         }
+        (MessageContent::GramTransfer(lhs), MessageContent::GramTransfer(rhs)) => {
+            // MessageContent.cpp:835-844.
+            if lhs.amount != rhs.amount
+                || lhs.peer_address != rhs.peer_address
+                || lhs.transaction_id != rhs.transaction_id
+                || lhs.comment != rhs.comment
+                || lhs.is_comment_encrypted != rhs.is_comment_encrypted
+            {
+                *need_update = true;
+            }
+        }
+        (
+            MessageContent::WalletTonConnectRequest(lhs),
+            MessageContent::WalletTonConnectRequest(rhs),
+        ) => {
+            // MessageContent.cpp:845-855.
+            if lhs.session_id != rhs.session_id
+                || lhs.expire_date != rhs.expire_date
+                || lhs.topic != rhs.topic
+                || lhs.trace_id != rhs.trace_id
+                || lhs.dapp_name != rhs.dapp_name
+                || lhs.is_accepted != rhs.is_accepted
+                || lhs.is_declined != rhs.is_declined
+            {
+                *need_update = true;
+            }
+        }
         // The C++ no-op arm list (ChatDeletePhoto, ChatDeleteHistory,
         // ScreenshotTaken, ContactRegistered, ExpiredPhoto, ExpiredVideo,
         // ExpiredVideoNote, ExpiredVoiceNote, WriteAccessAllowed,
@@ -13347,7 +13496,9 @@ pub fn can_message_content_have_input_media(
         | MessageContentType::PollAppendAnswer
         | MessageContentType::PollDeleteAnswer
         | MessageContentType::ChangeCommunity
-        | MessageContentType::ChatJoinedViaCommunity => false,
+        | MessageContentType::ChatJoinedViaCommunity
+        | MessageContentType::GramTransfer
+        | MessageContentType::WalletTonConnectRequest => false,
         MessageContentType::Animation
         | MessageContentType::Audio
         | MessageContentType::Contact
@@ -16572,6 +16723,59 @@ pub fn get_message_content_object(
                 },
             )
         }
+        MessageContent::GramTransfer(m) => {
+            // MessageContent.cpp:12345-12364 — the sender is derived from
+            // the user dialog exactly like MessageGiftPremium.
+            let mut sender_user_id = UserId::default();
+            if dialog_id.get_type() == DialogType::User {
+                if is_outgoing {
+                    sender_user_id = td.get_my_id();
+                } else {
+                    let user_id = dialog_id.get_user_id();
+                    if user_id != td.get_service_notifications_user_id() {
+                        sender_user_id = user_id;
+                    }
+                }
+            } else {
+                tdutils::log_error!(
+                    "Receive TON wallet transfer in {} in {dialog_id} from {source}",
+                    message_id.get()
+                );
+            }
+            td_api::MessageContent::messageTonWalletTransfer(td_api::messageTonWalletTransfer {
+                sender_user_id: td.get_user_id_object(sender_user_id, "messageTonWalletTransfer"),
+                transaction_id: m.transaction_id.clone(),
+                peer_address: m.peer_address.clone(),
+                amount: m.amount,
+                comment: m.comment.clone(),
+                is_comment_encrypted: m.is_comment_encrypted,
+            })
+        }
+        MessageContent::WalletTonConnectRequest(m) => {
+            // MessageContent.cpp:12365-12380.
+            let state = if m.is_accepted {
+                td_api::TonConnectRequestState::tonConnectRequestStateAccepted(
+                    td_api::tonConnectRequestStateAccepted {},
+                )
+            } else if m.is_declined {
+                td_api::TonConnectRequestState::tonConnectRequestStateRejected(
+                    td_api::tonConnectRequestStateRejected {},
+                )
+            } else {
+                td_api::TonConnectRequestState::tonConnectRequestStatePending(
+                    td_api::tonConnectRequestStatePending {
+                        expiration_date: m.expire_date,
+                    },
+                )
+            };
+            td_api::MessageContent::messageTonConnectRequest(td_api::messageTonConnectRequest {
+                session_id: m.session_id,
+                state: Some(state),
+                dapp_name: m.dapp_name.clone(),
+                topic: m.topic.clone(),
+                trace_id: m.trace_id.clone(),
+            })
+        }
     }
 }
 
@@ -17879,6 +18083,7 @@ fn check_business_message_action(
             | telegram_api::MessageAction::messageActionNewCreatorPending(_)
             | telegram_api::MessageAction::messageActionChangeCreator(_)
             | telegram_api::MessageAction::messageActionChatJoinedViaCommunity(_)
+            | telegram_api::MessageAction::messageActionWalletTonConnectRequest(_)
     );
     if disallowed {
         tdutils::log_error!("Receive business {action:?}");
@@ -18947,6 +19152,36 @@ pub fn get_action_message_content(
             }
             MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity { community_id })
         }
+        telegram_api::MessageAction::messageActionGramTransfer(action) => {
+            // MessageContent.cpp:11525-11537 — the two sanity clamps.
+            let mut amount = action.amount;
+            if amount <= 0 {
+                tdutils::log_error!("Receive {action:?}");
+                amount = 0;
+            }
+            if action.peer_address.is_empty() || action.transaction_id.is_empty() {
+                tdutils::log_error!("Receive {action:?}");
+            }
+            MessageContent::GramTransfer(MessageGramTransfer {
+                amount,
+                peer_address: action.peer_address,
+                transaction_id: action.transaction_id,
+                comment: action.comment,
+                is_comment_encrypted: action.comment_encrypted,
+            })
+        }
+        telegram_api::MessageAction::messageActionWalletTonConnectRequest(action) => {
+            // MessageContent.cpp:11538-11548.
+            MessageContent::WalletTonConnectRequest(MessageWalletTonConnectRequest {
+                session_id: action.session_id,
+                expire_date: action.expires,
+                topic: action.topic,
+                trace_id: action.trace_id,
+                dapp_name: action.dapp_name,
+                is_accepted: action.accepted,
+                is_declined: action.declined,
+            })
+        }
     }
 }
 
@@ -19992,7 +20227,7 @@ mod tests {
     /// the default instance.
     #[test]
     fn unsupported_defaults_to_the_current_version() {
-        assert_eq!(MessageUnsupported::CURRENT_VERSION, 62);
+        assert_eq!(MessageUnsupported::CURRENT_VERSION, 63);
         let unsupported = MessageUnsupported::default();
         assert_eq!(unsupported.version, MessageUnsupported::CURRENT_VERSION);
         let downgraded = MessageUnsupported { version: 3 };

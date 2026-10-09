@@ -31,7 +31,7 @@ if cmp -s "$GEN_EXPORT" "$DIST/include/td/telegram/tdjson_export.h"; then echo "
 
 # 3. layout + install-id + symlink
 ID=$(otool -D "$DIST/lib/libtdjson.dylib" | tail -1 | sed 's@.*/@@')
-[ "$ID" = "libtdjson.1.8.67.dylib" ] && echo "PARITY_INSTALL_ID_OK $ID" || { echo "PARITY_INSTALL_ID_BAD '$ID'"; fail=1; }
-[ "$(readlink "$DIST/lib/libtdjson.dylib")" = "libtdjson.1.8.67.dylib" ] && echo "PARITY_SYMLINK_OK" || { echo "PARITY_SYMLINK_BAD"; fail=1; }
+[ "$ID" = "libtdjson.1.8.68.dylib" ] && echo "PARITY_INSTALL_ID_OK $ID" || { echo "PARITY_INSTALL_ID_BAD '$ID'"; fail=1; }
+[ "$(readlink "$DIST/lib/libtdjson.dylib")" = "libtdjson.1.8.68.dylib" ] && echo "PARITY_SYMLINK_OK" || { echo "PARITY_SYMLINK_BAD"; fail=1; }
 
 exit $fail

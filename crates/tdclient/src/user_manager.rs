@@ -14138,7 +14138,7 @@ mod tests {
         // C++ JSON plane.
         assert_eq!(
             json,
-            r#"{"@type":"user","id":5,"first_name":"Alice","last_name":"Liddell","usernames":{"@type":"usernames","active_usernames":["alice"],"disabled_usernames":[],"editable_username":"alice","collectible_usernames":[]},"phone_number":"42777","status":{"@type":"userStatusEmpty"},"accent_color_id":5,"background_custom_emoji_id":"0","profile_accent_color_id":-1,"profile_background_custom_emoji_id":"0","is_contact":false,"is_mutual_contact":false,"is_close_friend":false,"is_premium":false,"is_support":false,"restricts_new_chats":false,"paid_message_star_count":0,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":"","added_to_attachment_menu":false}"#
+            r#"{"@type":"user","id":5,"first_name":"Alice","last_name":"Liddell","usernames":{"@type":"usernames","active_usernames":["alice"],"disabled_usernames":[],"editable_username":"alice","collectible_usernames":[],"secondary_username":""},"phone_number":"42777","status":{"@type":"userStatusEmpty"},"accent_color_id":5,"background_custom_emoji_id":"0","profile_accent_color_id":-1,"profile_background_custom_emoji_id":"0","is_contact":false,"is_mutual_contact":false,"is_close_friend":false,"is_premium":false,"is_support":false,"restricts_new_chats":false,"paid_message_star_count":0,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":"","added_to_attachment_menu":false}"#
         );
     }
 
@@ -14585,12 +14585,16 @@ mod tests {
                 flags: 0,
                 editable: true,
                 active: true,
+                deletable: false,
+                expired: false,
                 username: "alice".to_owned(),
             },
             telegram_api::Username {
                 flags: 0,
                 editable: false,
                 active: true,
+                deletable: false,
+                expired: false,
                 username: "wonder".to_owned(),
             },
         ];
@@ -14659,12 +14663,16 @@ mod tests {
                 flags: 0,
                 editable: true,
                 active: true,
+                deletable: false,
+                expired: false,
                 username: "helper_bot".to_owned(),
             },
             telegram_api::Username {
                 flags: 0,
                 editable: false,
                 active: true,
+                deletable: false,
+                expired: false,
                 username: "wonder_bot".to_owned(),
             },
         ];

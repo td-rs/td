@@ -454,6 +454,22 @@ fn update_id_and_name(update: &telegram_api::Update) -> (i32, &'static str) {
         Update::updateBotStarsSubscription(_t) => {
             (updateBotStarsSubscription::ID, "updateBotStarsSubscription")
         }
+        Update::updateWalletState(_t) => (updateWalletState::ID, "updateWalletState"),
+        Update::updateWalletTonConnectSession(_t) => (
+            updateWalletTonConnectSession::ID,
+            "updateWalletTonConnectSession",
+        ),
+        Update::updateWalletTonConnectPendingDisconnect(_t) => (
+            updateWalletTonConnectPendingDisconnect::ID,
+            "updateWalletTonConnectPendingDisconnect",
+        ),
+        Update::updateSentWalletTransaction(_t) => (
+            updateSentWalletTransaction::ID,
+            "updateSentWalletTransaction",
+        ),
+        Update::updateWalletGaslessInfo(_t) => {
+            (updateWalletGaslessInfo::ID, "updateWalletGaslessInfo")
+        }
     }
 }
 
@@ -4808,6 +4824,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 // the unsupported-updates tail (cpp:5146)
                 promise.set_value(());
             }
+            PendingUpdate::Wire(telegram_api::Update::updateWalletState(_))
+            | PendingUpdate::Wire(telegram_api::Update::updateWalletGaslessInfo(_))
+            | PendingUpdate::Wire(telegram_api::Update::updateSentWalletTransaction(_))
+            | PendingUpdate::Wire(telegram_api::Update::updateWalletTonConnectSession(_))
+            | PendingUpdate::Wire(telegram_api::Update::updateWalletTonConnectPendingDisconnect(
+                _,
+            )) => {
+                // the TON wallet family — no-op overloads until the
+                // TonWalletManager plane lands (cpp:5124-5151)
+                promise.set_value(());
+            }
 
             // ---- Wave-2/3 enumerated trace drops ----------------------
             PendingUpdate::Wire(telegram_api::Update::updateAttachMenuBots(_)) => {
@@ -5897,7 +5924,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             | MA::messageActionNoForwardsRequest(_)
             | MA::messageActionPollAppendAnswer(_)
             | MA::messageActionPollDeleteAnswer(_)
-            | MA::messageActionManagedBotCreated(_) => true,
+            | MA::messageActionManagedBotCreated(_)
+            | MA::messageActionGramTransfer(_)
+            | MA::messageActionWalletTonConnectRequest(_) => true,
             MA::messageActionChatCreate(action) => action
                 .users
                 .iter()

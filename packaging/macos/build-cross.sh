@@ -28,7 +28,7 @@ set -euo pipefail
 
 ARCH="${1:?usage: build-cross.sh <x86_64|aarch64> <out-dist-dir>}"
 DIST="${2:?usage: build-cross.sh <x86_64|aarch64> <out-dist-dir>}"
-VER=1.8.67
+VER=1.8.68
 TD_CPP=${TD_CPP:-$HOME/Projects/td}
 TOOLCHAIN=${TOOLCHAIN:-1.95.0}
 RS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)

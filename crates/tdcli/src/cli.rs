@@ -14298,10 +14298,27 @@ impl CliClient {
                 ));
             }
             true
-        } else if op == "cbun" {
+        } else if op == "cbun" || op == "cbun2" {
             self.send_request(Function::checkBotUsername(td_api::checkBotUsername {
                 username: args.to_owned(),
+                is_secondary: op == "cbun2",
             }));
+            true
+        } else if op == "absun" {
+            let (bot_user_id, username) = tokenizer::split(args, ' ');
+            self.send_request(Function::addBotSecondaryUsername(
+                td_api::addBotSecondaryUsername {
+                    bot_user_id: self.as_user_id(&bot_user_id),
+                    username: username.to_owned(),
+                },
+            ));
+            true
+        } else if op == "dbsun" {
+            self.send_request(Function::deleteBotSecondaryUsername(
+                td_api::deleteBotSecondaryUsername {
+                    bot_user_id: self.as_user_id(args),
+                },
+            ));
             true
         } else if op == "cb" || op == "cbl" {
             let (manager_bot_user_id, rest0) = tokenizer::split(args, ' ');
@@ -14449,7 +14466,7 @@ impl CliClient {
                 td_api::setMessageSenderBotVerification {
                     bot_user_id: self.as_user_id(&bot_user_id),
                     verified_id: self.as_message_sender(&sender_id),
-                    custom_description,
+                    custom_description: Some(self.as_formatted_text(&custom_description)),
                 },
             ));
             true

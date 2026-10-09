@@ -46,7 +46,7 @@ function send(mod, s) {
           api_hash: 'a3406de8d171bb422bb6ddf3bbd800e2',
           system_language_code: 'en',
           device_model: 'WebAssembly TDLib',
-          application_version: '1.8.67',
+          application_version: '1.8.68',
         })));
       }
       if (s.includes('authorizationStateWaitPhoneNumber')) { final = s; break; }

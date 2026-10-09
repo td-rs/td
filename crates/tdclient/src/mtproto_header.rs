@@ -133,7 +133,7 @@ mod tests {
             system_language_code: "en-US".to_string(),
             device_model: "test-model".to_string(),
             system_version: "test-system".to_string(),
-            application_version: "1.8.67".to_string(),
+            application_version: "1.8.68".to_string(),
             language_pack: String::new(),
             language_code: String::new(),
             parameters: String::new(),

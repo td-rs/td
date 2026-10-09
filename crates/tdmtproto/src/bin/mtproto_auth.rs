@@ -182,12 +182,12 @@ impl AuthCallback {
 }
 
 /// Every API query rides in `invokeWithLayer{initConnection{...}}` — without
-/// it the DC answers RPC_ERROR CONNECTION_NOT_INITED. Layer 229 = td 1.8.67
+/// it the DC answers RPC_ERROR CONNECTION_NOT_INITED. Layer 230 = td 1.8.68
 /// (`td/telegram/Version.h` MTPROTO_LAYER).
 fn wrap_query(api_id: i32, query: telegram_api::Function) -> Vec<u8> {
     let mut out = Vec::new();
     telegram_api::invokeWithLayer {
-        layer: 229,
+        layer: 230,
         query: Some(Box::new(telegram_api::Function::initConnection(
             telegram_api::initConnection {
                 flags: 0,

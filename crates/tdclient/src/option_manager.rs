@@ -57,12 +57,12 @@ pub enum SetOptionAction {
     SetContentSettings { value: bool },
 }
 
-/// The API version, hardcoded like `OptionManager.cpp` ("1.8.67" — pinned
+/// The API version, hardcoded like `OptionManager.cpp` ("1.8.68" — pinned
 /// to the reference C++ version for JSON parity).
-pub const API_VERSION: &str = "1.8.67";
+pub const API_VERSION: &str = "1.8.68";
 
 /// `OptionManager::get_synchronous_options`: `{"version", "commit_hash"}`.
-pub const VERSION: &str = "1.8.67";
+pub const VERSION: &str = "1.8.68";
 
 pub fn get_synchronous_options() -> &'static [&'static str] {
     &["version", "commit_hash"]
@@ -79,7 +79,7 @@ pub fn is_synchronous_option(name: &str) -> bool {
 /// the tl-codegen schemes carry — update both in the sync step). The
 /// build-d1 C++ oracle reports its own older commit (`d1085f9c…`), so the
 /// values legitimately differ; the shape must not.
-const UPSTREAM_TD_COMMIT: &str = "42e6a5259551178d1dab54a22ad96d14bd906e20";
+const UPSTREAM_TD_COMMIT: &str = "c15d3f5a5de6e3ba5839822c451152e5e18bb700";
 
 pub fn get_git_commit_hash() -> &'static str {
     UPSTREAM_TD_COMMIT

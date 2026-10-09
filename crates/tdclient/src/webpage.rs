@@ -245,6 +245,7 @@ pub enum RichTextType {
     MentionName,
     Diff,
     Button,
+    TonAddress,
 }
 
 impl RichTextType {
@@ -288,6 +289,7 @@ impl TryFrom<i32> for RichTextType {
             27 => Ok(RichTextType::MentionName),
             28 => Ok(RichTextType::Diff),
             29 => Ok(RichTextType::Button),
+            30 => Ok(RichTextType::TonAddress),
             _ => Err(()),
         }
     }
@@ -537,7 +539,8 @@ impl RichText {
             | RichTextType::AutoUrl
             | RichTextType::AutoEmailAddress
             | RichTextType::AutoPhoneNumber
-            | RichTextType::BankCardNumber => self.texts[0].get_input_rich_text(context),
+            | RichTextType::BankCardNumber
+            | RichTextType::TonAddress => self.texts[0].get_input_rich_text(context),
             RichTextType::FormattedDate => telegram_api::RichText::textDate(
                 self.date
                     .get_input_text_date(Box::new(self.texts[0].get_input_rich_text(context))),
@@ -795,6 +798,12 @@ impl RichText {
                 td_api::RichText::richTextBankCardNumber(td_api::richTextBankCardNumber {
                     text: self.texts[0].get_rich_text_object(context, false),
                     bank_card_number: self.texts[0].get_full_text(),
+                })
+            }
+            RichTextType::TonAddress => {
+                td_api::RichText::richTextTonAddress(td_api::richTextTonAddress {
+                    text: self.texts[0].get_rich_text_object(context, false),
+                    address: self.texts[0].get_full_text(),
                 })
             }
             RichTextType::MentionName => {
@@ -1060,6 +1069,12 @@ pub fn get_rich_text_from_telegram(
             result.r#type = RichTextType::BankCardNumber;
             push_wire_text(&mut result.texts, rich_text.text, documents);
         }
+        telegram_api::RichText::textTonAddress(rich_text) => {
+            // WebPageBlock.cpp:381-385 — its own type since richTextTonAddress
+            // (43c09497a), no longer folded into BankCardNumber.
+            result.r#type = RichTextType::TonAddress;
+            push_wire_text(&mut result.texts, rich_text.text, documents);
+        }
         telegram_api::RichText::textMentionName(rich_text) => {
             result.r#type = RichTextType::MentionName;
             push_wire_text(&mut result.texts, rich_text.text, documents);
@@ -1222,6 +1237,9 @@ pub fn get_rich_text_from_td_api(
             return get_rich_text_from_td_api(env, text.text);
         }
         td_api::RichText::richTextBankCardNumber(text) => {
+            return get_rich_text_from_td_api(env, text.text);
+        }
+        td_api::RichText::richTextTonAddress(text) => {
             return get_rich_text_from_td_api(env, text.text);
         }
         td_api::RichText::richTextBotCommand(text) => {

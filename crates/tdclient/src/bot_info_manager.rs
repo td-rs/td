@@ -102,6 +102,10 @@ pub trait BotInfoManagerEnv {
     /// `td_->option_manager_->get_option_integer(name)` (the C++ default 0).
     fn get_option_integer(&mut self, name: &str) -> i64;
 
+    /// `G()->get_option_boolean(name, false)` — the always-parse-markdown
+    /// flag of the description entity conversion.
+    fn get_option_boolean(&mut self, name: &str) -> bool;
+
     /// `send_closure(G()->td(), &Td::send_update, ...)`.
     fn send_update(&mut self, update: td_api::Update);
 
@@ -437,7 +441,7 @@ pub trait BotInfoManagerEnv {
         dialog_id: DialogId,
         bot: Option<telegram_api::InputUser>,
         is_verified: bool,
-        custom_description: &str,
+        custom_description: crate::message_entity::FormattedText,
     ) {
         let _ = (dialog_id, bot, is_verified, custom_description);
         tdutils::log_info!("Send bots.setCustomVerification — [blocked: net]");
@@ -1275,14 +1279,14 @@ impl BotInfoManager {
     }
 
     /// `BotInfoManager::set_custom_bot_verification`
-    /// (BotInfoManager.cpp:1221-1232).
+    /// (BotInfoManager.cpp:1221-1236).
     pub fn set_custom_bot_verification(
         &mut self,
         env: &mut impl BotInfoManagerEnv,
         bot_user_id: UserId,
         dialog_id: DialogId,
         is_verified: bool,
-        custom_description: &str,
+        custom_description: Option<td_api::FormattedText>,
         mut promise: Promise<()>,
     ) {
         let mut bot_input_user: Option<telegram_api::InputUser> = None;
@@ -1305,14 +1309,29 @@ impl BotInfoManager {
             promise.set_error(Status::error(400, "Can't access the verified entity"));
             return;
         }
+        // get_formatted_text(td, get_my_dialog_id(), ...)
+        // (BotInfoManager.cpp:1231-1233).
+        let my_dialog_id = crate::message_entity::DialogId::User(env.get_my_id());
+        let description = match crate::message_entity::get_formatted_text_of_input::<()>(
+            None,
+            my_dialog_id,
+            custom_description,
+            env.is_bot(),
+            true,
+            true,
+            true,
+            None,
+            env.get_option_boolean("always_parse_markdown"),
+            env.get_option_integer("session_count").try_into().unwrap(),
+            None,
+            false,
+        ) {
+            Ok(description) => description,
+            Err(error) => return promise.set_error(error),
+        };
         self.pending_set_custom_verification_replies
             .push(PendingSetCustomVerificationReply { dialog_id, promise });
-        env.send_set_custom_verification_query(
-            dialog_id,
-            bot_input_user,
-            is_verified,
-            custom_description,
-        );
+        env.send_set_custom_verification_query(dialog_id, bot_input_user, is_verified, description);
     }
 
     /// `get_bot_input_user` (BotInfoManager.cpp:575-588): `Ok(None)` is the
@@ -1778,6 +1797,13 @@ pub(crate) mod test_env {
                 .unwrap_or(0)
         }
 
+        fn get_option_boolean(&mut self, name: &str) -> bool {
+            self.options
+                .as_deref()
+                .map(|options| options.get_option_boolean(name, false))
+                .unwrap_or(false)
+        }
+
         fn send_update(&mut self, update: td_api::Update) {
             self.updates.push(update);
         }
@@ -2136,7 +2162,7 @@ pub(crate) mod test_env {
             _dialog_id: DialogId,
             _bot: Option<telegram_api::InputUser>,
             _is_verified: bool,
-            _custom_description: &str,
+            _custom_description: crate::message_entity::FormattedText,
         ) {
             self.queries
                 .push("Send bots.setCustomVerification — [blocked: net]".to_owned());
@@ -2187,6 +2213,13 @@ mod tests {
         fn set_error(&mut self, error: Status) {
             *self.recorded.0.lock().unwrap() = Some(Result::Err(error));
         }
+    }
+
+    fn formatted(text: &str) -> Option<td_api::FormattedText> {
+        Some(td_api::FormattedText {
+            text: text.to_owned(),
+            entities: Vec::new(),
+        })
     }
 
     fn recording_promise<T: Send + 'static>() -> (Promise<T>, Recorded<T>) {
@@ -2804,7 +2837,7 @@ mod tests {
             UserId::new(31),
             DialogId::new(1),
             true,
-            "desc",
+            formatted("desc"),
             promise,
         );
         let recorded = recorded.0.lock().unwrap().clone();
@@ -2818,7 +2851,7 @@ mod tests {
             UserId::default(),
             DialogId::new(2),
             false,
-            "",
+            None,
             promise,
         );
         let recorded = recorded.0.lock().unwrap().clone();
@@ -2834,7 +2867,7 @@ mod tests {
             UserId::default(),
             DialogId::new(1),
             true,
-            "desc",
+            formatted("desc"),
             promise,
         );
         assert!(recorded.0.lock().unwrap().is_none());

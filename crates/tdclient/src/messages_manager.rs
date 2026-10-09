@@ -7394,6 +7394,7 @@ pub fn get_default_service_message_content_reactions_are_possible(
             | MessageContentType::GiftCode
             | MessageContentType::GiftPremium
             | MessageContentType::GiftStars
+            | MessageContentType::GramTransfer
             | MessageContentType::GiveawayResults
             | MessageContentType::GroupCall
             | MessageContentType::InviteToGroupCall
@@ -11205,7 +11206,7 @@ const HIDDEN_AUTHOR_DIALOG_ID: i64 = 2666000;
 
 /// `MTPROTO_LAYER` (Version.h:13) — the layer constant the legacy flag
 /// encodes.
-const MTPROTO_LAYER: i32 = 229;
+const MTPROTO_LAYER: i32 = 230;
 
 /// `SavedMessagesTopicId::SavedMessagesTopicId(DialogId, const
 /// MessageForwardInfo *, DialogId)` (SavedMessagesTopicId.cpp:22-58) — the
@@ -32561,6 +32562,8 @@ mod tests {
         assert_eq!(MessageContentType::VideoNote as i32, 31);
         assert_eq!(MessageContentType::Poll as i32, 40);
         assert_eq!(MessageContentType::ChatJoinedViaCommunity as i32, 95);
+        assert_eq!(MessageContentType::GramTransfer as i32, 96);
+        assert_eq!(MessageContentType::WalletTonConnectRequest as i32, 97);
         assert_eq!(MessageContentType::default(), MessageContentType::Text);
     }
 

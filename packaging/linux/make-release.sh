@@ -3,12 +3,12 @@
 # Layout mirrors the official tdlib binary zip (include/ + lib/, versioned
 # soname + symlink) — the JSON-interface install set of the C++ build:
 #   include/td/telegram/{td_json_client.h,td_log.h,tdjson_export.h}
-#   lib/libtdjson.so.1.8.67 (SONAME patched) + lib/libtdjson.so -> it
+#   lib/libtdjson.so.1.8.68 (SONAME patched) + lib/libtdjson.so -> it
 # Usage: make-release.sh <release-cdylib> <out-dir>
 set -euo pipefail
 SRC_SO="$1"
 OUT="$2"
-VER=1.8.67
+VER=1.8.68
 TD_CPP=${TD_CPP:-/home/sadiq/Projects/td}
 GEN_EXPORT=${GEN_EXPORT:-$TD_CPP/build-d1/td/telegram/tdjson_export.h}
 

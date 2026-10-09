@@ -1785,7 +1785,7 @@ impl SessionConnectionCallback for FullConfigCallback {
 }
 
 /// `MTPROTO_LAYER` (Version.h:13) — the layer the pinned scheme carries.
-pub(crate) const MTPROTO_LAYER: i32 = 229;
+pub(crate) const MTPROTO_LAYER: i32 = 230;
 
 /// The `GetConfigActor::set_timeout_in(10)` budget (ConfigManager.cpp:466)
 /// — the whole mini-session, handshake included, fails with
@@ -3650,7 +3650,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         telegram_api::invokeWithLayer {
-            layer: 229,
+            layer: MTPROTO_LAYER,
             query: Some(Box::new(telegram_api::Function::initConnection(
                 telegram_api::initConnection {
                     flags,
@@ -3696,7 +3696,7 @@ mod tests {
         let header = gen_recovery_header(&recovery_header_fixture()).expect("the header builds");
         // `invokeWithLayer` (0xda9b0d0d) + `MTPROTO_LAYER` (Version.h:13).
         assert_eq!(&header[0..4], &0xda9b_0d0du32.to_le_bytes());
-        assert_eq!(&header[4..8], &229i32.to_le_bytes());
+        assert_eq!(&header[4..8], &MTPROTO_LAYER.to_le_bytes());
 
         // flags = 1 << 1 only (the params box; no proxy, no emulator), the
         // options' fields verbatim, and the empty parameters carrying just

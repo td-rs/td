@@ -139,11 +139,12 @@ pub enum Type {
     CustomEmoji = 20,
     ExpandableBlockQuote = 21,
     FormattedDate = 22,
+    TonAddress = 23,
 }
 
 impl Type {
     /// The `Type::Size` sentinel value.
-    pub const SIZE: i32 = 23;
+    pub const SIZE: i32 = 24;
 
     /// From the stored `int32` discriminant; out-of-range values become
     /// the `Size` sentinel (there is no `Size` variant to hold).
@@ -172,6 +173,7 @@ impl Type {
             20 => Some(Type::CustomEmoji),
             21 => Some(Type::ExpandableBlockQuote),
             22 => Some(Type::FormattedDate),
+            23 => Some(Type::TonAddress),
             _ => None,
         }
     }
@@ -204,6 +206,7 @@ impl std::fmt::Display for Type {
             Type::CustomEmoji => "CustomEmoji",
             Type::ExpandableBlockQuote => "ExpandableBlockQuote",
             Type::FormattedDate => "Date",
+            Type::TonAddress => "TonAddress",
         };
         f.write_str(name)
     }
@@ -314,7 +317,7 @@ impl MessageEntity {
 
     /// `MessageEntity::get_type_priority` (MessageEntity.cpp:38-64).
     pub fn type_priority(r#type: Type) -> i32 {
-        const PRIORITIES: [i32; 23] = [
+        const PRIORITIES: [i32; 24] = [
             50, // Mention
             50, // Hashtag
             50, // BotCommand
@@ -338,6 +341,7 @@ impl MessageEntity {
             99, // CustomEmoji
             0,  // ExpandableBlockQuote
             30, // FormattedDate
+            50, // TonAddress
         ];
         PRIORITIES[r#type as usize]
     }
@@ -425,6 +429,9 @@ impl MessageEntity {
                     unix_time: self.date.get_date(),
                     formatting_type,
                 })
+            }
+            Type::TonAddress => {
+                TextEntityType::textEntityTypeTonAddress(textEntityTypeTonAddress {})
             }
         }
     }
@@ -705,6 +712,7 @@ fn continuous_entities_mask() -> i32 {
         | entity_type_mask(BankCardNumber)
         | entity_type_mask(MediaTimestamp)
         | entity_type_mask(CustomEmoji)
+        | entity_type_mask(TonAddress)
 }
 
 /// `get_pre_entities_mask` (MessageEntity.cpp:1518-1522).
@@ -820,6 +828,9 @@ pub fn get_message_entities<U: UserManagerLike + ?Sized>(
             }
             td_api::TextEntityType::textEntityTypeBankCardNumber(_) => {
                 entities.push(MessageEntity::new(Type::BankCardNumber, offset, length));
+            }
+            td_api::TextEntityType::textEntityTypeTonAddress(_) => {
+                entities.push(MessageEntity::new(Type::TonAddress, offset, length));
             }
             td_api::TextEntityType::textEntityTypeBold(_) => {
                 entities.push(MessageEntity::new(Type::Bold, offset, length));
@@ -996,6 +1007,13 @@ pub fn get_server_message_entities<U: UserManagerLike + ?Sized>(
             telegram_api::MessageEntity::messageEntityBankCard(entity) => {
                 entities.push(MessageEntity::new(
                     Type::BankCardNumber,
+                    entity.offset,
+                    entity.length,
+                ));
+            }
+            telegram_api::MessageEntity::messageEntityTonAddress(entity) => {
+                entities.push(MessageEntity::new(
+                    Type::TonAddress,
                     entity.offset,
                     entity.length,
                 ));
@@ -2029,6 +2047,44 @@ pub fn find_bank_card_numbers(s: &str) -> Vec<&str> {
         .into_iter()
         .filter(|bank_card| is_valid_bank_card(bank_card))
         .collect()
+}
+
+/// `find_ton_addresses` (MessageEntity.cpp:1426-1428 →
+/// match_ton_addresses:641-671): the regex
+/// `/(?<![A-Za-z0-9_\-+\/])[EUk0][A-Za-z0-9_\-+\/]{47}(?![A-Za-z0-9_\-+\/])/`
+/// — a maximal base64any run starting with E, U, k or 0 and validated by
+/// [`crate::ton_wallet::check_ton_address`] (which enforces the
+/// 48-character length, the checksum and the first-byte bits).
+pub fn find_ton_addresses(s: &str) -> Vec<&str> {
+    let is_base64any_character =
+        |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/' | b'+');
+    let bytes = s.as_bytes();
+    let mut result = Vec::new();
+    let mut ptr = 0usize;
+
+    loop {
+        while ptr < bytes.len() && !is_base64any_character(bytes[ptr]) {
+            ptr += 1;
+        }
+        if ptr == bytes.len() {
+            break;
+        }
+        let address_begin = ptr;
+        while ptr < bytes.len() && is_base64any_character(bytes[ptr]) {
+            ptr += 1;
+        }
+
+        // The maximal-run walk is the lookbehind/lookahead; the leading
+        // byte + validator chain is the character class and the body.
+        let candidate = &s[address_begin..ptr];
+        let first = bytes[address_begin];
+        if matches!(first, b'E' | b'U' | b'k' | b'0')
+            && crate::ton_wallet::check_ton_address(candidate).is_ok()
+        {
+            result.push(candidate);
+        }
+    }
+    result
 }
 
 /// `find_media_timestamps` (MessageEntity.cpp:1408-1442): the slice plus
@@ -4389,7 +4445,8 @@ pub fn is_found_entity_type(
         | Type::PhoneNumber
         | Type::BankCardNumber
         | Type::Url
-        | Type::EmailAddress => true,
+        | Type::EmailAddress
+        | Type::TonAddress => true,
         Type::BotCommand => !skip_bot_commands,
         Type::MediaTimestamp => !skip_media_timestamps,
         _ => false,
@@ -4428,6 +4485,7 @@ pub fn find_entities(
     add_entities(Type::Cashtag, find_cashtags(text));
     // TODO find_phone_numbers
     add_entities(Type::BankCardNumber, find_bank_card_numbers(text));
+    add_entities(Type::TonAddress, find_ton_addresses(text));
     add_entities(Type::Url, find_tg_urls(text));
     for (url, is_email) in find_urls(text) {
         let r#type = if is_email {
@@ -5629,6 +5687,7 @@ pub fn get_input_secret_message_entities(
                 }
             }
             Type::FormattedDate => {}
+            Type::TonAddress => {}
         }
     }
 
@@ -6662,6 +6721,7 @@ fn find_splittable_entities_v3(text: &str, entities: &[MessageEntity]) -> Vec<Me
                 | Type::Cashtag
                 | Type::PhoneNumber
                 | Type::BankCardNumber
+                | Type::TonAddress
         ) {
             for i in 1..entity.length {
                 unallowed_boundaries.insert(entity.offset + i + 1);
@@ -8099,7 +8159,7 @@ mod tests {
 
     #[test]
     fn type_priority_table() {
-        // MessageEntity.cpp:38-64 — the full 23-entry table, in C++ order.
+        // MessageEntity.cpp:38-64 — the full 24-entry table, in C++ order.
         const PRIORITIES: [(Type, i32); Type::SIZE as usize] = [
             (Type::Mention, 50),
             (Type::Hashtag, 50),
@@ -8124,6 +8184,7 @@ mod tests {
             (Type::CustomEmoji, 99),
             (Type::ExpandableBlockQuote, 0),
             (Type::FormattedDate, 30),
+            (Type::TonAddress, 50),
         ];
         for (r#type, priority) in PRIORITIES {
             assert_eq!(MessageEntity::type_priority(r#type), priority, "{type:?}");

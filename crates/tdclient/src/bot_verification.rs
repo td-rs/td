@@ -17,11 +17,11 @@ use crate::user_manager::UserId;
 use tdmtproto::telegram_api;
 
 /// `td::BotVerification` (BotVerification.h:22-53).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BotVerification {
     bot_user_id: UserId,
     icon: CustomEmojiId,
-    description: String,
+    description: crate::message_entity::FormattedText,
 }
 
 impl BotVerification {
@@ -36,7 +36,13 @@ impl BotVerification {
         };
         result.bot_user_id = UserId::new(bot_verification.bot_id);
         result.icon = CustomEmojiId::new(bot_verification.icon);
-        result.description = bot_verification.description;
+        result.description = crate::message_entity::get_formatted_text_of_text_with_entities::<()>(
+            None,
+            bot_verification.description,
+            true,
+            false,
+            "BotVerification",
+        );
         result
     }
 
@@ -62,11 +68,12 @@ impl BotVerification {
         if !self.is_valid() {
             return None;
         }
-        let mut text = crate::message_entity::FormattedText::default();
-        text.text = self.description.clone();
-        text.entities = crate::message_entity::find_entities(&text.text, true, true);
-        let description =
-            crate::message_entity::get_formatted_text_object::<()>(None, &text, true, -1);
+        let description = crate::message_entity::get_formatted_text_object::<()>(
+            None,
+            &self.description,
+            true,
+            -1,
+        );
         Some(td_api::BotVerification {
             bot_user_id: env.get_user_id_object(self.bot_user_id, "botVerification"),
             icon_custom_emoji_id: self.icon.get(),
@@ -79,21 +86,39 @@ impl BotVerification {
         self.bot_user_id.is_valid() && self.icon.is_valid()
     }
 
-    /// `BotVerification::store` (BotVerification.hpp:15-22).
+    /// `BotVerification::store` (BotVerification.hpp:15-29).
     pub fn store(&self, out: &mut Vec<u8>) {
-        store_parse::store_flags::<0>(out, []);
+        let has_description_entities = !self.description.entities.is_empty();
+        store_parse::store_flags(out, [has_description_entities]);
         store_parse::store_i64(out, self.bot_user_id.get());
         store_parse::store_i64(out, self.icon.get());
-        store_parse::store_string(out, &self.description);
+        store_parse::store_string(out, &self.description.text);
+        if has_description_entities {
+            for entity in &self.description.entities {
+                entity.store(out);
+            }
+        }
     }
 
-    /// `BotVerification::parse` (BotVerification.hpp:24-31).
+    /// `BotVerification::parse` (BotVerification.hpp:24-41).
     pub fn parse(parser: &mut Parser) -> Result<BotVerification, &'static str> {
         let mut result = BotVerification::default();
-        parser.parse_flags::<0>()?;
+        let [has_description_entities] = parser.parse_flags()?;
         result.bot_user_id = UserId::new(parser.i64_()?);
         result.icon = CustomEmojiId::new(parser.i64_()?);
-        result.description = parser.string()?;
+        result.description.text = parser.string()?;
+        if has_description_entities {
+            let len = parser.i32_()?;
+            if len < 0 || parser.left_len() < len as usize {
+                return Err("Wrong vector length");
+            }
+            for _ in 0..len {
+                result
+                    .description
+                    .entities
+                    .push(crate::message_entity::MessageEntity::parse(parser)?);
+            }
+        }
         Result::Ok(result)
     }
 }
@@ -128,7 +153,10 @@ mod tests {
         telegram_api::BotVerification {
             bot_id: 42,
             icon,
-            description: "Visit https://t.me/example and https://example.org".to_owned(),
+            description: Some(telegram_api::TextWithEntities {
+                text: "Visit https://t.me/example and https://example.org".to_owned(),
+                entities: Vec::new(),
+            }),
         }
     }
 
@@ -144,17 +172,17 @@ mod tests {
         assert!(BotVerification::get_bot_verification(None).is_none());
 
         let verification = BotVerification::get_bot_verification(Some(sample(7))).expect("valid");
+        assert_eq!(verification.bot_user_id, UserId::new(42));
+        assert_eq!(verification.icon, CustomEmojiId::new(7));
         assert_eq!(
-            verification,
-            BotVerification {
-                bot_user_id: UserId::new(42),
-                icon: CustomEmojiId::new(7),
-                description: "Visit https://t.me/example and https://example.org".to_owned(),
-            }
+            verification.description.text,
+            "Visit https://t.me/example and https://example.org"
         );
+        // the server-provided entities ride through unchanged (dcd58751d)
+        assert!(verification.description.entities.is_empty());
         assert_eq!(
             format!("{verification}"),
-            "verified by 42 with 7 and Visit https://t.me/example and https://example.org"
+            "verified by 42 with 7 and \"Visit https://t.me/example and https://example.org\" with entities []"
         );
     }
 
@@ -172,7 +200,9 @@ mod tests {
         assert_eq!(object.icon_custom_emoji_id, 7);
         let description = object.custom_description.expect("description");
         assert!(description.text.contains("https://t.me/example"));
-        assert!(!description.entities.is_empty(), "urls are extracted");
+        // no client-side entity search since dcd58751d — the server
+        // entities (here none) are used verbatim
+        assert!(description.entities.is_empty());
 
         // the invalid verification converts to the C++ nullptr
         assert!(

@@ -87,7 +87,7 @@ const dirSnapshot = mod => {
           api_hash: 'a3406de8d171bb422bb6ddf3bbd800e2',
           system_language_code: 'en',
           device_model: 'WebAsm TDLib (td-rs S82)',
-          application_version: '1.8.67',
+          application_version: '1.8.68',
         })));
       }
       if (s.includes('authorizationStateWaitPhoneNumber') && !milestone) {

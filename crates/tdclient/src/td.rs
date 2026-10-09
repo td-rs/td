@@ -14458,6 +14458,13 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
             .unwrap_or(0)
     }
 
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        self.options
+            .as_deref()
+            .map(|options| options.get_option_boolean(name, false))
+            .unwrap_or(false)
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         // the C++ BotInfoManager never sends updates; the outbox lands in
         // the Td's own send path if a future slice needs it
@@ -19694,7 +19701,7 @@ mod tests {
                 }),
             );
             assert!(responses_of(callback, 7).iter().any(
-                |object| matches!(object, Object::optionValueString(v) if v.value == "1.8.67")
+                |object| matches!(object, Object::optionValueString(v) if v.value == "1.8.68")
             ));
         });
     }

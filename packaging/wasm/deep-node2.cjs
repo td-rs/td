@@ -33,7 +33,7 @@ const yieldLoop = () => new Promise(r => setTimeout(r, 0));
           api_hash: 'a3406de8d171bb422bb6ddf3bbd800e2',
           system_language_code: 'en',
           device_model: 'NodeWasm TDLib',
-          application_version: '1.8.67',
+          application_version: '1.8.68',
         })));
       }
       if (s.includes('authorizationStateWaitPhoneNumber')) { console.log('DEEP_MILESTONE_WAIT_PHONE'); process.exit(0); }

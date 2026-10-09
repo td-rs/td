@@ -3,7 +3,7 @@
 # the Rust cdylib. Layout mirrors the official tdlib binary zip for macOS —
 # the JSON-interface install set of the C++ build:
 #   include/td/telegram/{td_json_client.h, td_log.h, tdjson_export.h}
-#   lib/libtdjson.1.8.67.dylib (install-id patched) + lib/libtdjson.dylib -> it
+#   lib/libtdjson.1.8.68.dylib (install-id patched) + lib/libtdjson.dylib -> it
 #
 # ⚠ UNTESTED-ON-MAC (written from the linux twin on 2026-09-28 — the S83
 # audit documents macOS as the toolchain gap; this script exists so the
@@ -16,7 +16,7 @@
 set -euo pipefail
 SRC_DYLIB="${1:?usage: make-release.sh <release-cdylib> <out-dir>}"
 OUT="${2:?usage: make-release.sh <release-cdylib> <out-dir>}"
-VER=1.8.67
+VER=1.8.68
 TD_CPP=${TD_CPP:-$HOME/Projects/td}
 # The cmake build dir carrying the generated tdjson_export.h (any configured
 # build of the pinned tree — the header is target-canonical for macOS).

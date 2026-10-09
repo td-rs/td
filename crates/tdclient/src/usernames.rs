@@ -21,6 +21,8 @@ pub struct Usernames {
     editable_username_pos: i32,
     is_editable_username_disabled: bool,
     other_editable_usernames: Vec<String>,
+    deletable_usernames: Vec<String>,
+    expired_usernames: Vec<String>,
 }
 
 impl Default for Usernames {
@@ -34,17 +36,23 @@ impl Default for Usernames {
             editable_username_pos: -1,
             is_editable_username_disabled: false,
             other_editable_usernames: Vec::new(),
+            deletable_usernames: Vec::new(),
+            expired_usernames: Vec::new(),
         }
     }
 }
 
 impl PartialEq for Usernames {
-    /// `operator==` — the other_editable_usernames are not compared (the
-    /// C++ deliberately leaves them out).
+    /// `operator==` (Usernames.cpp:329-333) — the C++ compares the
+    /// active/disabled lists, the editable position, the other-editable,
+    /// deletable and expired lists.
     fn eq(&self, other: &Self) -> bool {
         self.active_usernames == other.active_usernames
             && self.disabled_usernames == other.disabled_usernames
             && self.editable_username_pos == other.editable_username_pos
+            && self.other_editable_usernames == other.other_editable_usernames
+            && self.deletable_usernames == other.deletable_usernames
+            && self.expired_usernames == other.expired_usernames
     }
 }
 
@@ -81,6 +89,13 @@ impl Usernames {
             if !received_usernames.insert(username.username.clone()) {
                 tdutils::log_error!("Receive duplicate username");
                 continue;
+            }
+            if username.deletable {
+                username.editable = false;
+                result.deletable_usernames.push(username.username.clone());
+            }
+            if username.expired {
+                result.expired_usernames.push(username.username.clone());
             }
             if username.editable {
                 if was_editable {
@@ -124,9 +139,15 @@ impl Usernames {
                 .filter(|username| {
                     *username != self.get_editable_username()
                         && !self.other_editable_usernames.contains(username)
+                        && !self.deletable_usernames.contains(username)
                 })
                 .cloned()
                 .collect(),
+            secondary_username: self
+                .deletable_usernames
+                .first()
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 
@@ -192,6 +213,9 @@ impl Usernames {
 
     /// `Usernames::can_toggle`.
     pub fn can_toggle(&self, for_bot: bool, username: &str) -> bool {
+        if self.deletable_usernames.iter().any(|name| name == username) {
+            return false;
+        }
         if self.active_usernames.iter().any(|name| name == username) {
             if !self.has_editable_username()
                 || self.is_editable_username_disabled
@@ -396,6 +420,8 @@ impl Usernames {
         let has_editable_username = self.has_editable_username();
         let has_active_usernames = !self.active_usernames.is_empty();
         let has_other_editable_usernames = !self.other_editable_usernames.is_empty();
+        let has_deletable_usernames = !self.deletable_usernames.is_empty();
+        let has_expired_usernames = !self.expired_usernames.is_empty();
         store_flags(
             out,
             [
@@ -405,6 +431,8 @@ impl Usernames {
                 has_active_usernames,
                 self.is_editable_username_disabled,
                 has_other_editable_usernames,
+                has_deletable_usernames,
+                has_expired_usernames,
             ],
         );
         if self.is_editable_username_disabled {
@@ -427,6 +455,12 @@ impl Usernames {
         if has_other_editable_usernames {
             store_string_vec(out, &self.other_editable_usernames);
         }
+        if has_deletable_usernames {
+            store_string_vec(out, &self.deletable_usernames);
+        }
+        if has_expired_usernames {
+            store_string_vec(out, &self.expired_usernames);
+        }
     }
 
     /// `Usernames::parse` (Usernames.h).
@@ -447,6 +481,8 @@ impl Usernames {
             has_active_usernames,
             is_editable_username_disabled,
             has_other_editable_usernames,
+            has_deletable_usernames,
+            has_expired_usernames,
         ] = parser.parse_flags()?;
         let mut result = Usernames {
             is_editable_username_disabled,
@@ -474,6 +510,12 @@ impl Usernames {
         if has_other_editable_usernames {
             result.other_editable_usernames = parser.string_vec()?;
         }
+        if has_deletable_usernames {
+            result.deletable_usernames = parser.string_vec()?;
+        }
+        if has_expired_usernames {
+            result.expired_usernames = parser.string_vec()?;
+        }
         result.check_validness();
         Ok(result)
     }
@@ -488,6 +530,8 @@ mod tests {
             flags: 0,
             editable,
             active,
+            deletable: false,
+            expired: false,
             username: name.to_owned(),
         }
     }

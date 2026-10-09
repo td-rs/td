@@ -8,7 +8,7 @@ the example's own TdExample binding code (its ctypes signatures, its log
 callback setup, its send/receive/execute wrappers) through a bounded smoke
 over exactly the surface the shipped example uses (the ClientManager API):
 
-  1. td_execute(getOption version)       -> optionValueString "1.8.67"
+  1. td_execute(getOption version)       -> optionValueString "1.8.68"
   2. td_create_client_id + td_receive    -> updateAuthorizationState
                                             (waitTdlibParameters at minimum)
   3. td_send(close)                      -> authorizationStateClosed,
@@ -71,9 +71,9 @@ def main():
     if not (
         isinstance(version, dict)
         and version.get("@type") == "optionValueString"
-        and version.get("value") == "1.8.67"
+        and version.get("value") == "1.8.68"
     ):
-        print("FAIL: version parity — expected optionValueString 1.8.67")
+        print("FAIL: version parity — expected optionValueString 1.8.68")
         sys.exit(1)
 
     # 2. the async ClientManager path reaches its first authorization state.

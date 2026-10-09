@@ -424,6 +424,65 @@ fn is_valid_premium_referrer(referrer: &str) -> bool {
     tdutils::utf8::check_utf8(referrer.as_bytes())
 }
 
+/// `is_valid_gram_receiver` (LinkManager.cpp:177-185).
+fn is_valid_gram_receiver(receiver: &str) -> bool {
+    if receiver.is_empty() {
+        return true;
+    }
+    if let Some(username) = receiver.strip_prefix('@') {
+        return receiver.len() >= 5 && crate::misc::is_valid_username(username);
+    }
+    crate::misc::is_base64url_characters(receiver.as_bytes())
+}
+
+/// `is_valid_gram_amount` (LinkManager.cpp:187-212).
+fn is_valid_gram_amount(amount: &str) -> bool {
+    if amount.is_empty() {
+        return true;
+    }
+    let dot_pos = amount.find('.').unwrap_or(amount.len());
+    let integer_part = &amount[..dot_pos];
+    if integer_part.len() > 7 || (integer_part.len() == 7 && integer_part.starts_with('9')) {
+        return false;
+    }
+    if !integer_part.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let fractional_part = if dot_pos != amount.len() {
+        &amount[dot_pos + 1..]
+    } else {
+        ""
+    };
+    if fractional_part.len() > 9 {
+        return false;
+    }
+    fractional_part.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// `get_gram_amount` (LinkManager.cpp:214-233) — the nano-TON multiplier
+/// is 10^9; the caller has validated the digits.
+fn get_gram_amount(amount: &str) -> i64 {
+    debug_assert!(is_valid_gram_amount(amount));
+    let dot_pos = amount.find('.').unwrap_or(amount.len());
+    let integer_part = &amount[..dot_pos];
+    let mut result: i64 = 0;
+    for c in integer_part.bytes() {
+        result = result * 10 + (c - b'0') as i64;
+    }
+    result *= 1_000_000_000;
+    let fractional_part = if dot_pos != amount.len() {
+        &amount[dot_pos + 1..]
+    } else {
+        ""
+    };
+    let mut multiplier: i64 = 100_000_000;
+    for c in fractional_part.bytes() {
+        result += multiplier * (c - b'0') as i64;
+        multiplier /= 10;
+    }
+    result
+}
+
 /// `is_valid_proxy_server` (cpp:134-136).
 fn is_valid_proxy_server(server: &str) -> bool {
     !server.is_empty() && server.len() <= 255 && tdutils::utf8::check_utf8(server.as_bytes())
@@ -1045,6 +1104,8 @@ pub enum InternalLink {
     Search,
     /// `InternalLinkSettings`.
     Settings { path: Vec<String> },
+    /// `InternalLinkSendGrams` (LinkManager.cpp:1227-1246).
+    SendGrams { receiver: String, gram_amount: i64 },
     /// `InternalLinkStickerSet`.
     StickerSet {
         sticker_set_name: String,
@@ -1067,6 +1128,15 @@ pub enum InternalLink {
     },
     /// `InternalLinkTextCompositionStyle`.
     TextCompositionStyle { style_name: String },
+    /// `InternalLinkTonConnect` (LinkManager.cpp:1533-1556).
+    TonConnect {
+        version: i32,
+        dapp_client_id: String,
+        connect_request: String,
+        return_strategy: String,
+        rpc_request: String,
+        trace_id: String,
+    },
     /// `InternalLinkTheme`.
     Theme { theme_name: String },
     /// `InternalLinkUnknownDeepLink`.
@@ -1518,15 +1588,22 @@ impl InternalLink {
                 bot_username,
                 bot_name,
             } => {
-                // cpp:1131-1138: a username that doesn't already end in
-                // "bot" (case-insensitive) gets the suffix appended.
-                let size = bot_username.len();
-                let ends_in_bot = size >= 3
-                    && bot_username.as_bytes()[size - 3..]
-                        .iter()
-                        .map(|c| c.to_ascii_lowercase())
-                        .eq(b"bot".iter().copied());
-                let suggested = if ends_in_bot {
+                // cpp:1223-1236 (230f87181): a username that ends in
+                // "bot" or in one of the Premium-granted
+                // `bot_allowed_suffixes` is taken as-is; otherwise the
+                // "bot" suffix is appended.
+                let username = bot_username.to_ascii_lowercase();
+                let mut is_found = username.ends_with("bot");
+                let suffixes = env.get_option_string("bot_allowed_suffixes");
+                // `td::full_split`: an empty option yields no parts.
+                if !is_found && !suffixes.is_empty() {
+                    for suffix in suffixes.split(' ') {
+                        if username.ends_with(suffix) {
+                            is_found = true;
+                        }
+                    }
+                }
+                let suggested = if is_found {
                     bot_username.clone()
                 } else {
                     format!("{bot_username}bot")
@@ -1554,6 +1631,37 @@ impl InternalLink {
                 let section = get_settings_section_object(path);
                 td_api::InternalLinkType::internalLinkTypeSettings(
                     td_api::internalLinkTypeSettings { section },
+                )
+            }
+            InternalLink::SendGrams {
+                receiver,
+                gram_amount,
+            } => {
+                // LinkManager.cpp:1231-1244.
+                let receiver_object = if receiver.is_empty() {
+                    None
+                } else if receiver.starts_with('@') {
+                    Some(
+                        td_api::TonWalletTransferReceiver::tonWalletTransferReceiverUser(
+                            td_api::tonWalletTransferReceiverUser {
+                                username: receiver[1..].to_owned(),
+                            },
+                        ),
+                    )
+                } else {
+                    Some(
+                        td_api::TonWalletTransferReceiver::tonWalletTransferReceiverAddress(
+                            td_api::tonWalletTransferReceiverAddress {
+                                address: receiver.clone(),
+                            },
+                        ),
+                    )
+                };
+                td_api::InternalLinkType::internalLinkTypeTonWalletTransfer(
+                    td_api::internalLinkTypeTonWalletTransfer {
+                        receiver: receiver_object,
+                        gram_amount: *gram_amount,
+                    },
                 )
             }
             InternalLink::StickerSet {
@@ -1594,6 +1702,29 @@ impl InternalLink {
                 td_api::InternalLinkType::internalLinkTypeTextCompositionStyle(
                     td_api::internalLinkTypeTextCompositionStyle {
                         style_name: style_name.clone(),
+                    },
+                )
+            }
+            InternalLink::TonConnect {
+                version,
+                dapp_client_id,
+                connect_request,
+                return_strategy,
+                rpc_request,
+                trace_id,
+            } => {
+                // LinkManager.cpp:1551 — the connect request re-validates
+                // on conversion (a parse-time-valid request stays valid).
+                let request = get_ton_connect_connect_request_object(connect_request)
+                    .expect("a validated connect request");
+                td_api::InternalLinkType::internalLinkTypeTonConnect(
+                    td_api::internalLinkTypeTonConnect {
+                        version: *version,
+                        dapp_client_id: dapp_client_id.clone(),
+                        connect_request: Some(request),
+                        return_strategy: return_strategy.clone(),
+                        rpc_request: rpc_request.clone(),
+                        trace_id: trace_id.clone(),
                     },
                 )
             }
@@ -2310,6 +2441,7 @@ enum LinkType {
     TMe,
     Tg,
     Telegraph,
+    TonConnect,
 }
 
 /// The `LinkInfo` (LinkManager.h:200-203).
@@ -2342,6 +2474,15 @@ fn get_link_info(env: &impl LinkEnv, link: &str) -> LinkInfo {
             link = &link[2..];
         }
         is_tg = true;
+    } else if tolower_begins_with(link, "tc:") {
+        // 53449a3a9: the tc: scheme carries a TonConnect query directly.
+        let mut link = &link[3..];
+        if link.starts_with("//") {
+            link = &link[2..];
+        }
+        result.link_type = LinkType::TonConnect;
+        result.query = link.to_owned();
+        return result;
     }
 
     let http_url = match parse_url(link) {
@@ -2486,6 +2627,7 @@ pub fn parse_internal_link(
             url: format!("https://telegra.ph{}", info.query),
             fallback_url: link.to_owned(),
         }),
+        LinkType::TonConnect => parse_ton_connect_link_query(&info.query),
     }
 }
 
@@ -2521,6 +2663,103 @@ fn copy_arg_to_string(url_query: &HttpUrlQuery, is_first: &mut bool, name: &str)
 }
 
 /// `LinkManager::get_internal_link_message_draft` (cpp:2923-2953).
+/// `get_ton_connect_connect_request_object` (LinkManager.cpp:619-649) —
+/// the JSON connect-request contract of the TonConnect deep links.
+fn get_ton_connect_connect_request_object(
+    r: &str,
+) -> std::result::Result<td_api::TonConnectConnectRequest, Status> {
+    use tdutils::json::{JsonValue, JsonValueType, json_decode};
+    let mut value = match json_decode(r) {
+        tdutils::status::Result::Ok(value) => value,
+        tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+    };
+    if value.ty() != JsonValueType::Object {
+        return Err(Status::error(400, "Request must be an Object"));
+    }
+    let mut request = std::mem::replace(&mut value, JsonValue::Null);
+    let JsonValue::Object(ref mut request) = request else {
+        unreachable!()
+    };
+    let manifest_url = match request.get_required_string_field("manifestUrl") {
+        tdutils::status::Result::Ok(url) => url,
+        tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+    };
+    let checked_manifest_url = check_link(&manifest_url, false, false)?;
+    let mut connect_items = Vec::new();
+    let items = match request.extract_optional_field("items", JsonValueType::Array) {
+        tdutils::status::Result::Ok(items) => items,
+        tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+    };
+    if items.ty() == JsonValueType::Array {
+        for item_value in items.get_array() {
+            if item_value.ty() != JsonValueType::Object {
+                return Err(Status::error(400, "Item must be an Object"));
+            }
+            let JsonValue::Object(item) = item_value else {
+                unreachable!()
+            };
+            let item_name = match item.get_required_string_field("name") {
+                tdutils::status::Result::Ok(name) => name,
+                tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+            };
+            if item_name == "ton_addr" {
+                let network = match item.get_optional_string_field("network", "") {
+                    tdutils::status::Result::Ok(network) => network,
+                    tdutils::status::Result::Err(e) => {
+                        return Err(Status::error(400, &e.message()));
+                    }
+                };
+                connect_items.push(td_api::TonConnectConnectItem::tonConnectConnectItemAddress(
+                    td_api::tonConnectConnectItemAddress { network },
+                ));
+            } else if item_name == "ton_proof" {
+                let payload = match item.get_required_string_field("payload") {
+                    tdutils::status::Result::Ok(payload) => payload,
+                    tdutils::status::Result::Err(e) => {
+                        return Err(Status::error(400, &e.message()));
+                    }
+                };
+                connect_items.push(td_api::TonConnectConnectItem::tonConnectConnectItemProof(
+                    td_api::tonConnectConnectItemProof { payload },
+                ));
+            } else {
+                return Err(Status::error(400, "Invalid connect item"));
+            }
+        }
+    }
+    Ok(td_api::TonConnectConnectRequest {
+        manifest_url: checked_manifest_url,
+        items: connect_items,
+    })
+}
+
+/// `get_internal_link_ton_connect` (LinkManager.cpp:3157-3172).
+fn get_internal_link_ton_connect(query: &str, check_path: bool) -> Option<InternalLink> {
+    let url_query = parse_url_query(query);
+    if check_path && !url_query.path.is_empty() {
+        return None;
+    }
+    let version = url_query.get_arg("v").unwrap_or("").parse::<i32>().ok()?;
+    let r = url_query.get_arg("r").unwrap_or("").to_owned();
+    if let Err(error) = get_ton_connect_connect_request_object(&r) {
+        tdutils::log_info!("{error}");
+        return None;
+    }
+    Some(InternalLink::TonConnect {
+        version,
+        dapp_client_id: url_query.get_arg("id").unwrap_or("").to_owned(),
+        connect_request: r,
+        return_strategy: url_query.get_arg("ret").unwrap_or("").to_owned(),
+        rpc_request: url_query.get_arg("e").unwrap_or("").to_owned(),
+        trace_id: url_query.get_arg("trace_id").unwrap_or("").to_owned(),
+    })
+}
+
+/// `parse_ton_connect_link_query` (LinkManager.cpp:2743-2745).
+fn parse_ton_connect_link_query(query: &str) -> Option<InternalLink> {
+    get_internal_link_ton_connect(query, true)
+}
+
 fn get_internal_link_message_draft(url: &str, text: &str) -> Option<InternalLink> {
     if url.is_empty() && text.is_empty() {
         return None;
@@ -3030,6 +3269,23 @@ fn parse_tg_link_query(
         if is_valid_phone_number_hash(&hash) && is_valid_phone_number(&phone_number) {
             // confirmphone?phone=<phone>&hash=<hash>
             return Some(InternalLink::ConfirmPhone { hash, phone_number });
+        }
+    } else if path.len() == 1 && path[0] == "sendgrams" {
+        // sendgrams?to=<receiver>&amount=<amount>
+        // sendgrams?v=... (23d3991c4)
+        if let Some(link) = get_internal_link_ton_connect(query, false) {
+            return Some(link);
+        }
+        let receiver = get_arg("to");
+        let amount = get_arg("amount");
+        if is_valid_gram_receiver(&receiver) && is_valid_gram_amount(&amount) {
+            let gram_amount = get_gram_amount(&amount);
+            if gram_amount == 0 || !receiver.is_empty() {
+                return Some(InternalLink::SendGrams {
+                    receiver,
+                    gram_amount,
+                });
+            }
         }
     } else if path.len() == 1 && path[0] == "socks" {
         // socks?server=<server>&port=<port>&user=<user>&pass=<pass>
@@ -3971,6 +4227,44 @@ fn parse_t_me_link_query(
             // /confirmphone?phone=<phone>&hash=<hash>
             return Some(InternalLink::ConfirmPhone { hash, phone_number });
         }
+    } else if path[0] == "sendgrams" {
+        // /sendgrams?to=<receiver>&amount=<amount>
+        // /sendgrams?startapp=tonconnect-... (23d3991c4)
+        let startapp = get_arg("startapp");
+        if let Some(stripped) = startapp.strip_prefix("tonconnect-") {
+            let mut connect_query: Vec<u8> = b"?".to_vec();
+            let bytes = stripped.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
+                    i += 1;
+                    connect_query.push(b'=');
+                } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                    i += 1;
+                    connect_query.push(b'%');
+                } else if bytes[i] == b'-' {
+                    connect_query.push(b'&');
+                } else {
+                    connect_query.push(bytes[i]);
+                }
+                i += 1;
+            }
+            let connect_query = String::from_utf8_lossy(&connect_query).into_owned();
+            if let Some(link) = get_internal_link_ton_connect(&connect_query, true) {
+                return Some(link);
+            }
+        }
+        let receiver = get_arg("to");
+        let amount = get_arg("amount");
+        if is_valid_gram_receiver(&receiver) && is_valid_gram_amount(&amount) {
+            let gram_amount = get_gram_amount(&amount);
+            if gram_amount == 0 || !receiver.is_empty() {
+                return Some(InternalLink::SendGrams {
+                    receiver,
+                    gram_amount,
+                });
+            }
+        }
     } else if path[0] == "socks" {
         // /socks?server=<server>&port=<port>&user=<user>&pass=<pass>
         let server = get_arg("server");
@@ -4048,6 +4342,24 @@ fn parse_t_me_link_query(
                 invoice_name: path[1].clone(),
             });
         }
+    } else if path[0].to_ascii_lowercase() == "getpremium" {
+        // /GetPremium?ref=<ref> (940933af7)
+        let mut ref_ = get_arg("ref").to_ascii_lowercase();
+        if !is_valid_premium_referrer(&ref_) || ref_.len() > 32 {
+            ref_.clear();
+        }
+        if !ref_
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        {
+            ref_.clear();
+        }
+        if !ref_.is_empty() {
+            ref_ = format!("tme_getpremium_{ref_}");
+        } else {
+            ref_ = "tme_getpremium".to_string();
+        }
+        return Some(InternalLink::PremiumFeatures { referrer: ref_ });
     } else if path[0] == "giftcode" {
         if path.len() >= 2 && is_valid_gift_code(&path[1]) {
             // /giftcode/<code>
@@ -4795,7 +5107,7 @@ fn get_internal_link_impl(
             let info = get_link_info(env, &link.url);
             let fallback_info = get_link_info(env, &link.fallback_url);
             match info.link_type {
-                LinkType::External | LinkType::Tg => {
+                LinkType::External | LinkType::Tg | LinkType::TonConnect => {
                     Err(Status::error_message("Invalid instant view URL provided"))
                 }
                 LinkType::Telegraph => {
@@ -5068,13 +5380,38 @@ fn get_internal_link_impl(
             }
         }
         T::internalLinkTypePremiumFeaturesPage(link) => {
-            if !is_internal {
-                return Err(Status::error_message(
-                    "HTTP link is unavailable for the link type",
-                ));
-            }
             if !is_valid_premium_referrer(&link.referrer) {
                 return Err(Status::error_message("Invalid referrer specified"));
+            }
+            if !is_internal {
+                // 940933af7: t.me/GetPremium links for the page form.
+                let mut ref_ = String::new();
+                let mut is_valid = true;
+                if link.referrer != "tme_getpremium" {
+                    // ok
+                    is_valid = link.referrer.starts_with("tme_getpremium_");
+                    if is_valid {
+                        let referrer = &link.referrer["tme_getpremium_".len()..];
+                        if referrer.is_empty() || referrer.len() > 32 {
+                            is_valid = false;
+                        }
+                        for c in referrer.bytes() {
+                            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != b'_' {
+                                is_valid = false;
+                                break;
+                            }
+                        }
+                        if is_valid {
+                            ref_ = format!("?ref={referrer}");
+                        }
+                    }
+                }
+                if !is_valid {
+                    return Err(Status::error_message(
+                        "HTTP link is unavailable for the link type",
+                    ));
+                }
+                return Ok(format!("{}GetPremium{ref_}", get_t_me_url(env)));
             }
             Ok(format!(
                 "tg://premium_offer?ref={}",
@@ -5330,6 +5667,68 @@ fn get_internal_link_impl(
                     url_encode(&link.theme_name)
                 ))
             }
+        }
+        T::internalLinkTypeTonConnect(_) => {
+            // TON Connect links are unsupported as HTTP links
+            // (LinkManager.cpp:4076-4077).
+            Err(Status::error(
+                400,
+                "HTTP link is unavailable for the link type",
+            ))
+        }
+        T::internalLinkTypeTonWalletTransfer(link) => {
+            // LinkManager.cpp:3974-4028.
+            let receiver = match link.receiver.as_ref() {
+                None => String::new(),
+                Some(td_api::TonWalletTransferReceiver::tonWalletTransferReceiverUser(user)) => {
+                    format!("@{}", user.username)
+                }
+                Some(td_api::TonWalletTransferReceiver::tonWalletTransferReceiverAddress(
+                    address,
+                )) => {
+                    if address.address.is_empty() || address.address.starts_with('@') {
+                        "!invalid!".to_string()
+                    } else {
+                        address.address.clone()
+                    }
+                }
+            };
+            if !is_valid_gram_receiver(&receiver) {
+                return Err(Status::error(400, "Invalid receiver specified"));
+            }
+            if !(0..9_000_000_000_000_000).contains(&link.gram_amount) {
+                return Err(Status::error(400, "Invalid amount specified"));
+            }
+            if receiver.is_empty() && link.gram_amount != 0 {
+                return Err(Status::error(
+                    400,
+                    "Amount must not be specified without the receiver",
+                ));
+            }
+            let mut result = if is_internal {
+                "tg://sendgrams".to_string()
+            } else {
+                format!("{}sendgrams", get_t_me_url(env))
+            };
+            if !receiver.is_empty() {
+                result += "?to=";
+                result += &receiver;
+                if link.gram_amount != 0 {
+                    result += "&amount=";
+                    result += &(link.gram_amount / 1_000_000_000).to_string();
+                    let mut fractional_part = link.gram_amount % 1_000_000_000;
+                    if fractional_part != 0 {
+                        result.push('.');
+                        let mut multiplier = 100_000_000;
+                        while fractional_part != 0 {
+                            result.push((b'0' + (fractional_part / multiplier) as u8) as char);
+                            fractional_part %= multiplier;
+                            multiplier /= 10;
+                        }
+                    }
+                }
+            }
+            Ok(result)
         }
         T::internalLinkTypeUnknownDeepLink(link) => {
             if !is_internal {

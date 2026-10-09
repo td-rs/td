@@ -10401,11 +10401,9 @@ fn run_bot_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::setMessageSenderBotVerification(request) => {
             // Requests.cpp:7067-7074: get_message_sender_dialog_id with
-            // check_access = true
-            let Some(custom_description) = clean_or_utf8_error(td, id, &request.custom_description)
-            else {
-                return;
-            };
+            // check_access = true; the custom description is a
+            // formattedText (CLEAN_INPUT_STRING is gone — the entity
+            // conversion runs in the manager).
             let dialog_id = {
                 let (_manager, mut env) = bot_env_split(td);
                 match crate::message_sender::get_message_sender_dialog_id(
@@ -10427,7 +10425,7 @@ fn run_bot_requests(td: &mut Td, id: u64, function: Function) {
                 crate::user_manager::UserId::new(request.bot_user_id),
                 dialog_id,
                 true,
-                &custom_description,
+                request.custom_description,
                 promise,
             );
         }
@@ -10454,7 +10452,7 @@ fn run_bot_requests(td: &mut Td, id: u64, function: Function) {
                 crate::user_manager::UserId::new(request.bot_user_id),
                 dialog_id,
                 false,
-                "",
+                None,
                 promise,
             );
         }
@@ -18429,6 +18427,9 @@ mod request_census_tests {
             996,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 0, "interim count");
+        // the c15d3f5a sync: the TON wallet / TonConnect / On-ramp
+        // surface + the community write family land as interim arms
+        // (43 functions; the TonWalletManager plane is unported)
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 43, "interim count");
     }
 }

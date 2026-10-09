@@ -7,7 +7,7 @@ replacement for the C++ `libtdjson` shared library**: it exports exactly the
 same 14-function C JSON interface under the same names, ships byte-identical
 copies of the official headers, and answers the same JSON — so existing TDLib
 applications and bindings work unmodified. Currently tracking TDLib
-**1.8.67**.
+**1.8.68**.
 
 ## Features
 
@@ -53,7 +53,7 @@ int main(void) {
 
     /* asynchronous request — the answer (and updates) arrive via receive */
     td_json_client_send(client, "{\"@type\":\"getOption\",\"name\":\"version\"}");
-    const char *answer = td_json_client_receive(client, 10.0); /* 1.8.67 */
+    const char *answer = td_json_client_receive(client, 10.0); /* 1.8.68 */
 
     td_json_client_destroy(client);
 }

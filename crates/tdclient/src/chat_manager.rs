@@ -3679,7 +3679,7 @@ impl ProfileTab {
 pub struct BotVerification {
     bot_user_id_: UserId,
     icon_: CustomEmojiId,
-    description_: String,
+    description_: crate::message_entity::FormattedText,
 }
 
 impl BotVerification {
@@ -3689,7 +3689,13 @@ impl BotVerification {
         BotVerification {
             bot_user_id_: UserId::new(bot_verification.bot_id),
             icon_: CustomEmojiId::new(bot_verification.icon),
-            description_: bot_verification.description,
+            description_: crate::message_entity::get_formatted_text_of_text_with_entities::<()>(
+                None,
+                bot_verification.description,
+                true,
+                false,
+                "BotVerification",
+            ),
         }
     }
 
@@ -3722,31 +3728,52 @@ impl BotVerification {
     ) -> td_api::BotVerification {
         let bot_user_id =
             user_manager.get_user_id_object(env, self.bot_user_id_, "botVerification");
+        let description = crate::message_entity::get_formatted_text_object::<()>(
+            None,
+            &self.description_,
+            true,
+            -1,
+        );
         td_api::BotVerification {
             bot_user_id,
             icon_custom_emoji_id: self.icon_.get(),
-            custom_description: Some(td_api::FormattedText {
-                text: self.description_.clone(),
-                entities: Vec::new(),
-            }),
+            custom_description: Some(description),
         }
     }
 
-    /// `store` (BotVerification.hpp:17-23) — the (empty) flag block, then
-    /// the bot user id, the icon and the description.
+    /// `store` (BotVerification.hpp:17-29) — the entity-presence flag,
+    /// then the bot user id, the icon and the description text (+entities).
     pub fn store(&self, out: &mut Vec<u8>) {
-        store_flags(out, []);
+        let has_description_entities = !self.description_.entities.is_empty();
+        store_flags(out, [has_description_entities]);
         store_i64(out, self.bot_user_id_.get());
         store_i64(out, self.icon_.get());
-        store_string(out, &self.description_);
+        store_string(out, &self.description_.text);
+        if has_description_entities {
+            for entity in &self.description_.entities {
+                entity.store(out);
+            }
+        }
     }
 
-    /// `parse` (BotVerification.hpp:25-31).
+    /// `parse` (BotVerification.hpp:31-48).
     pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Self, &'static str> {
-        parser.parse_flags::<0>()?;
+        let [has_description_entities] = parser.parse_flags()?;
         let bot_user_id_ = parse_user_id(parser)?;
         let icon_ = CustomEmojiId::new(parser.i64_()?);
-        let description_ = parser.string()?;
+        let mut description_ = crate::message_entity::FormattedText::default();
+        description_.text = parser.string()?;
+        if has_description_entities {
+            let len = parser.i32_()?;
+            if len < 0 || parser.left_len() < len as usize {
+                return Err("Wrong vector length");
+            }
+            for _ in 0..len {
+                description_
+                    .entities
+                    .push(crate::message_entity::MessageEntity::parse(parser)?);
+            }
+        }
         Ok(BotVerification {
             bot_user_id_,
             icon_,
@@ -14190,6 +14217,7 @@ impl ChatManager {
                     disabled_usernames: Vec::new(),
                     editable_username: String::new(),
                     collectible_usernames: Vec::new(),
+                    secondary_username: String::new(),
                 }),
                 date: 0,
                 status: Some(
@@ -18450,7 +18478,10 @@ mod tests {
             BotVerification::from_telegram(telegram_api::BotVerification {
                 bot_id: 3000000008,
                 icon: 99,
-                description: "stamp".to_owned(),
+                description: Some(telegram_api::TextWithEntities {
+                    text: "stamp".to_owned(),
+                    entities: Vec::new(),
+                }),
             })
             .into();
         channel_full.guard_bot_user_id = UserId::new(3000000009);
@@ -18572,14 +18603,17 @@ mod tests {
         let verification = BotVerification::from_telegram(telegram_api::BotVerification {
             bot_id: 3000000008,
             icon: 99,
-            description: "stamp".to_owned(),
+            description: Some(telegram_api::TextWithEntities {
+                text: "stamp".to_owned(),
+                entities: Vec::new(),
+            }),
         });
         assert!(verification.is_valid());
         assert!(
             !BotVerification::from_telegram(telegram_api::BotVerification {
                 bot_id: 0,
                 icon: 99,
-                description: String::new(),
+                description: None,
             })
             .is_valid()
         );
@@ -18588,7 +18622,7 @@ mod tests {
             BotVerification::get_bot_verification(Some(telegram_api::BotVerification {
                 bot_id: 0,
                 icon: 0,
-                description: String::new(),
+                description: None,
             }))
             .is_none()
         );

@@ -12,11 +12,11 @@ use crate::td_api;
 use tdmtproto::telegram_api;
 
 /// `td::BotVerifierSettings` (BotVerifierSettings.h:20-50).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BotVerifierSettings {
     icon: CustomEmojiId,
     company: String,
-    description: String,
+    description: crate::message_entity::FormattedText,
     can_modify_custom_description: bool,
 }
 
@@ -33,7 +33,13 @@ impl BotVerifierSettings {
         };
         result.icon = CustomEmojiId::new(bot_verifier_settings.icon);
         result.company = bot_verifier_settings.company;
-        result.description = bot_verifier_settings.custom_description;
+        result.description = crate::message_entity::get_formatted_text_of_text_with_entities::<()>(
+            None,
+            bot_verifier_settings.custom_description,
+            true,
+            false,
+            "BotVerifierSettings",
+        );
         result.can_modify_custom_description = bot_verifier_settings.can_modify_custom_description;
         result
     }
@@ -60,12 +66,12 @@ impl BotVerifierSettings {
             return None;
         }
         let mut description: Option<td_api::FormattedText> = None;
-        if !self.description.is_empty() || self.can_modify_custom_description {
-            let mut text = crate::message_entity::FormattedText::default();
-            text.text = self.description.clone();
-            text.entities = crate::message_entity::find_entities(&text.text, true, true);
+        if !self.description.text.is_empty() || self.can_modify_custom_description {
             description = Some(crate::message_entity::get_formatted_text_object::<()>(
-                None, &text, true, -1,
+                None,
+                &self.description,
+                true,
+                -1,
             ));
         }
         Some(td_api::BotVerificationParameters {
@@ -81,27 +87,56 @@ impl BotVerifierSettings {
         self.icon.is_valid()
     }
 
-    /// `BotVerifierSettings::store` (BotVerifierSettings.hpp:15-27): the
-    /// description presence flag gates the optional string.
+    /// `BotVerifierSettings::store` (BotVerifierSettings.hpp:15-31): the
+    /// description presence flags gate the optional text and entities.
     pub fn store(&self, out: &mut Vec<u8>) {
-        let has_description = !self.description.is_empty();
-        store_parse::store_flags(out, [has_description, self.can_modify_custom_description]);
+        let has_description = !self.description.text.is_empty();
+        let has_description_entities = !self.description.entities.is_empty();
+        store_parse::store_flags(
+            out,
+            [
+                has_description,
+                self.can_modify_custom_description,
+                has_description_entities,
+            ],
+        );
         store_parse::store_i64(out, self.icon.get());
         store_parse::store_string(out, &self.company);
         if has_description {
-            store_parse::store_string(out, &self.description);
+            store_parse::store_string(out, &self.description.text);
+        }
+        if has_description_entities {
+            for entity in &self.description.entities {
+                entity.store(out);
+            }
         }
     }
 
-    /// `BotVerifierSettings::parse` (BotVerifierSettings.hpp:29-41).
+    /// `BotVerifierSettings::parse` (BotVerifierSettings.hpp:33-49).
     pub fn parse(parser: &mut Parser) -> Result<BotVerifierSettings, &'static str> {
         let mut result = BotVerifierSettings::default();
-        let [has_description, can_modify_custom_description] = parser.parse_flags()?;
+        let [
+            has_description,
+            can_modify_custom_description,
+            has_description_entities,
+        ] = parser.parse_flags()?;
         result.can_modify_custom_description = can_modify_custom_description;
         result.icon = CustomEmojiId::new(parser.i64_()?);
         result.company = parser.string()?;
         if has_description {
-            result.description = parser.string()?;
+            result.description.text = parser.string()?;
+        }
+        if has_description_entities {
+            let len = parser.i32_()?;
+            if len < 0 || parser.left_len() < len as usize {
+                return Err("Wrong vector length");
+            }
+            for _ in 0..len {
+                result
+                    .description
+                    .entities
+                    .push(crate::message_entity::MessageEntity::parse(parser)?);
+            }
         }
         Result::Ok(result)
     }
@@ -130,7 +165,10 @@ mod tests {
             can_modify_custom_description: true,
             icon,
             company: "ACME".to_owned(),
-            custom_description: "We verify things".to_owned(),
+            custom_description: Some(tdmtproto::telegram_api::TextWithEntities {
+                text: "We verify things".to_owned(),
+                entities: Vec::new(),
+            }),
         }
     }
 
@@ -162,7 +200,7 @@ mod tests {
         // an empty description with the modify flag still builds the
         // (empty-text) description object (BotVerifierSettings.cpp:45-51)
         let mut bare = sample(9);
-        bare.custom_description = String::new();
+        bare.custom_description = None;
         let settings = BotVerifierSettings::get_bot_verifier_settings(Some(bare)).expect("valid");
         let object = settings
             .get_bot_verification_parameters_object()
@@ -175,7 +213,7 @@ mod tests {
 
         // without the modify flag the description stays null
         let mut bare = sample(9);
-        bare.custom_description = String::new();
+        bare.custom_description = None;
         bare.can_modify_custom_description = false;
         let settings = BotVerifierSettings::get_bot_verifier_settings(Some(bare)).expect("valid");
         let object = settings
@@ -188,9 +226,13 @@ mod tests {
     #[test]
     fn verifier_settings_store_parse_round_trip() {
         // both description-presence halves
-        for custom_description in ["We verify things".to_owned(), String::new()] {
+        for custom_description in [Some("We verify things".to_owned()), None] {
             let mut raw = sample(1 << 40);
-            raw.custom_description = custom_description;
+            raw.custom_description =
+                custom_description.map(|text| tdmtproto::telegram_api::TextWithEntities {
+                    text,
+                    entities: Vec::new(),
+                });
             let settings = BotVerifierSettings::from_telegram(Some(raw));
             let mut out = Vec::new();
             store_parse::store_log_event_version(&mut out);

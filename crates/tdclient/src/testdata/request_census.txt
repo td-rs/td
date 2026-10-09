@@ -3,6 +3,7 @@ acceptOauthRequest	dispatched
 acceptTermsOfService	dispatched
 activateStoryStealthMode	dispatched
 addBotMediaPreview	dispatched
+addBotSecondaryUsername	interim
 addChatFolderByInviteLink	dispatched
 addChatMember	dispatched
 addChatMembers	dispatched
@@ -45,6 +46,7 @@ answerGuestQuery	dispatched
 answerInlineQuery	dispatched
 answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
+answerTonConnectRequest	interim
 answerWebAppQuery	dispatched
 applyPremiumGiftCode	dispatched
 approveSuggestedPost	dispatched
@@ -89,7 +91,9 @@ checkPremiumGiftCode	dispatched
 checkQuickReplyShortcutName	sync
 checkRecoveryEmailAddressCode	dispatched
 checkStickerSetName	dispatched
+checkWalletBotBalance	interim
 checkWebAppFileDownload	dispatched
+claimTonConnectRequest	interim
 cleanFileName	sync
 clearAllDraftMessages	dispatched
 clearAutosaveSettingsExceptions	dispatched
@@ -135,6 +139,7 @@ createNewBasicGroupChat	dispatched
 createNewSecretChat	dispatched
 createNewStickerSet	dispatched
 createNewSupergroupChat	dispatched
+createOnRampPaymentSession	interim
 createPrivateChat	dispatched
 createRichMessageWithAi	dispatched
 createSecretChat	dispatched
@@ -142,6 +147,8 @@ createStoryAlbum	dispatched
 createSupergroupChat	dispatched
 createTemporaryPassword	dispatched
 createTextCompositionStyle	dispatched
+createTonConnectSession	interim
+createUserTonWallet	interim
 createVideoChat	dispatched
 declineGroupCallInvitation	dispatched
 declineOauthRequest	dispatched
@@ -153,6 +160,7 @@ deleteAllChatWelcomeMessages	dispatched
 deleteAllRecentMessageReactionsFromSender	dispatched
 deleteAllRevokedChatInviteLinks	dispatched
 deleteBotMediaPreviews	dispatched
+deleteBotSecondaryUsername	interim
 deleteBusinessChatLink	dispatched
 deleteBusinessConnectedBot	dispatched
 deleteBusinessMessages	dispatched
@@ -167,6 +175,7 @@ deleteChatMessagesBySender	dispatched
 deleteChatReplyMarkup	dispatched
 deleteChatWelcomeMessage	dispatched
 deleteCommands	dispatched
+deleteCommunity	interim
 deleteDefaultBackground	dispatched
 deleteDirectMessagesChatTopicHistory	dispatched
 deleteDirectMessagesChatTopicMessagesByDate	dispatched
@@ -194,13 +203,18 @@ deleteStickerSet	dispatched
 deleteStory	dispatched
 deleteStoryAlbum	dispatched
 deleteTextCompositionStyle	dispatched
+deleteTonWallet	interim
 destroy	dispatched
 disableAllSupergroupUsernames	dispatched
 disableProxy	dispatched
+disableTonWalletBackup	interim
+disableTonWalletBackupWithProof	interim
 discardCall	dispatched
 disconnectAffiliateProgram	dispatched
 disconnectAllWebsites	dispatched
+disconnectTonConnectSession	interim
 disconnectWebsite	dispatched
+dismissWebToken	interim
 downloadFile	dispatched
 dropGiftOriginalDetails	dispatched
 editBotMediaPreview	dispatched
@@ -241,6 +255,7 @@ editStoryCover	dispatched
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
 enableProxy	dispatched
+enableTonWalletBackup	interim
 encryptGroupCallData	dispatched
 endGroupCall	dispatched
 endGroupCallRecording	dispatched
@@ -251,6 +266,7 @@ fixTextWithAi	dispatched
 forwardMessages	dispatched
 getAccountTtl	dispatched
 getActiveSessions	dispatched
+getAddressTonWallet	interim
 getAllPassportElements	dispatched
 getAllStickerEmojis	dispatched
 getAnimatedEmoji	dispatched
@@ -348,6 +364,7 @@ getCountry	dispatched
 getCountryCode	dispatched
 getCountryFlagEmoji	sync
 getCreatedPublicChats	dispatched
+getCurrencyExchangeRates	interim
 getCurrentState	dispatched
 getCurrentWeather	dispatched
 getCustomEmojiReactionAnimations	dispatched
@@ -456,6 +473,11 @@ getMessages	dispatched
 getNetworkStatistics	dispatched
 getNewChatPrivacySettings	dispatched
 getOauthLinkInfo	dispatched
+getOnRampPaymentAvailability	interim
+getOnRampPaymentLimits	interim
+getOnRampPaymentQuote	interim
+getOnRampProviderBaseCurrencies	interim
+getOnRampProviders	interim
 getOption	dispatched
 getOwnedBots	dispatched
 getOwnedStickerSets	dispatched
@@ -552,7 +574,18 @@ getThemeParametersJsonString	sync
 getThemedChatEmojiStatuses	dispatched
 getThemedEmojiStatuses	dispatched
 getTimeZones	dispatched
+getTonCenterStreamingApiUrl	interim
+getTonConnectDAppPendingRequests	interim
+getTonConnectSessionNextEventId	interim
+getTonConnectSessionPendingRequests	interim
+getTonConnectSessions	interim
 getTonTransactions	dispatched
+getTonWalletNfts	interim
+getTonWalletOwnershipProofChallenge	interim
+getTonWalletSecretPhrase	interim
+getTonWalletTransaction	interim
+getTonWalletTransactionByMsgHash	interim
+getTonWalletTransactions	interim
 getTopChats	dispatched
 getTrendingStickerSets	dispatched
 getUpgradedGift	dispatched
@@ -569,6 +602,7 @@ getUserPrivacySettingRules	dispatched
 getUserProfileAudios	dispatched
 getUserProfilePhotos	dispatched
 getUserSupportInfo	dispatched
+getUserTonWalletAddresses	interim
 getVideoChatAvailableParticipants	dispatched
 getVideoChatInviteLink	dispatched
 getVideoChatRtmpUrl	dispatched
@@ -604,6 +638,8 @@ loadGroupCallParticipants	dispatched
 loadQuickReplyShortcutMessages	dispatched
 loadQuickReplyShortcuts	dispatched
 loadSavedMessagesTopics	dispatched
+loadTonWalletGaslessTransfersInfo	interim
+loadTonWalletState	interim
 logOut	dispatched
 markChecklistTasksAsDone	dispatched
 openBotSimilarBot	dispatched
@@ -689,7 +725,9 @@ reorderSupergroupActiveUsernames	dispatched
 replaceLiveStoryRtmpUrl	dispatched
 replacePrimaryChatInviteLink	dispatched
 replaceStickerInSet	dispatched
+replaceTonWallet	interim
 replaceVideoChatRtmpUrl	dispatched
+replyToCallbackQueryWithEphemeralMessage	dispatched
 reportAuthenticationCodeMissing	dispatched
 reportChat	dispatched
 reportChatPhoto	dispatched
@@ -785,6 +823,9 @@ sendQuickReplyShortcutMessages	dispatched
 sendResoldGift	dispatched
 sendRichMessageDraft	dispatched
 sendTextMessageDraft	dispatched
+sendTonCenterApiRequest	interim
+sendTonConnectSessionConnectResult	interim
+sendTonWalletTransfer	interim
 sendWebAppCustomRequest	dispatched
 sendWebAppData	dispatched
 setAccentColor	dispatched
@@ -844,6 +885,8 @@ setChatTitle	dispatched
 setCloseFriends	dispatched
 setCommands	dispatched
 setCommunityName	dispatched
+setCommunityPermissions	interim
+setCommunityPhoto	interim
 setCustomEmojiStickerSetThumbnail	dispatched
 setCustomLanguagePack	dispatched
 setCustomLanguagePackString	dispatched
@@ -895,7 +938,6 @@ setPollAnswer	dispatched
 setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
 setProfilePhoto	dispatched
-replyToCallbackQueryWithEphemeralMessage	dispatched
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	dispatched
@@ -917,6 +959,7 @@ setSupergroupStickerSet	dispatched
 setSupergroupUnrestrictBoostCount	dispatched
 setSupergroupUsername	dispatched
 setTdlibParameters	dispatched
+setTonConnectSessionWalletClientId	interim
 setUpgradedGiftColors	dispatched
 setUserEmojiStatus	dispatched
 setUserNote	dispatched
