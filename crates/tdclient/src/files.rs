@@ -2957,7 +2957,7 @@ impl FileEncryptionKey {
         key_iv.extend_from_slice(key);
         key_iv.extend_from_slice(iv);
         if key.len() != 32 || iv.len() != 32 {
-            tdutils::log_info!("Wrong key/iv sizes: {} {}", key.len(), iv.len());
+            tdutils::log_info!("Wrong key/IV sizes: {} {}", key.len(), iv.len());
             return FileEncryptionKey::default();
         }
         assert_eq!(key_iv.len(), 64);
