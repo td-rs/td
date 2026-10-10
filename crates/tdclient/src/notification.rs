@@ -983,6 +983,228 @@ fn trim_ascii(s: &str) -> &str {
     s.trim_matches(|c: char| (c as u32) <= 0x20)
 }
 
+/// `NotificationManager::convert_loc_key` (NotificationManager.cpp:2818-2931,
+/// c842a55f5 + the c15d3f5a TON rows) — the push loc-key normalization
+/// table of the payload plane (the port's push-decrypt seam parks before
+/// the call; the pure table lands for the net step).
+pub fn convert_loc_key(loc_key: &str) -> &'static str {
+    match loc_key {
+        "CHAT_ADD_MEMBER" => "MESSAGE_CHAT_ADD_MEMBERS",
+        "CHAT_ADD_YOU" => "MESSAGE_CHAT_ADD_MEMBERS_YOU",
+        "CHAT_CREATED" => "MESSAGE_BASIC_GROUP_CHAT_CREATE",
+        "CHAT_DELETE_MEMBER" => "MESSAGE_CHAT_DELETE_MEMBER",
+        "CHAT_DELETE_YOU" => "MESSAGE_CHAT_DELETE_MEMBER_YOU",
+        "CHAT_JOINED" => "MESSAGE_CHAT_JOIN_BY_LINK",
+        "CHAT_LEFT" => "MESSAGE_CHAT_DELETE_MEMBER_LEFT",
+        "CHAT_LIVESTREAM_END" => "MESSAGE_CHAT_LIVESTREAM_END",
+        "CHAT_LIVESTREAM_START" => "MESSAGE_CHAT_LIVESTREAM_START",
+        "CHAT_PHOTO_EDITED" => "MESSAGE_CHAT_CHANGE_PHOTO",
+        "CHAT_REQ_JOINED" => "MESSAGE_CHAT_JOIN_BY_REQUEST",
+        "CHAT_RETURNED" => "MESSAGE_CHAT_ADD_MEMBERS_RETURNED",
+        "CHAT_TITLE_EDITED" => "MESSAGE_CHAT_CHANGE_TITLE",
+        "CHAT_VOICECHAT_END" => "MESSAGE_CHAT_VOICECHAT_END",
+        "CHAT_VOICECHAT_INVITE" => "MESSAGE_CHAT_VOICECHAT_INVITE",
+        "CHAT_VOICECHAT_INVITE_YOU" => "MESSAGE_CHAT_VOICECHAT_INVITE_YOU",
+        "CHAT_VOICECHAT_START" => "MESSAGE_CHAT_VOICECHAT_START",
+        "CONTACT_JOINED" => "MESSAGE_CONTACT_REGISTERED",
+        "CONTACT_JOINED_PREMIUM" => "MESSAGE_CONTACT_REGISTERED_PREMIUM",
+        "ENCRYPTED_MESSAGE" => "MESSAGE",
+        "MESSAGES" => "MESSAGES",
+        "MESSAGE_AUDIO" => "MESSAGE_VOICE_NOTE",
+        "MESSAGE_CONTACT" => "MESSAGE_CONTACT",
+        "MESSAGE_DOC" => "MESSAGE_DOCUMENT",
+        "MESSAGE_DOCS" => "MESSAGE_DOCUMENTS",
+        "MESSAGE_FWDS" => "MESSAGE_FORWARDS",
+        "MESSAGE_GAME" => "MESSAGE_GAME",
+        "MESSAGE_GAME_SCORE" => "MESSAGE_GAME_SCORE",
+        "MESSAGE_GEO" => "MESSAGE_LOCATION",
+        "MESSAGE_GEOLIVE" => "MESSAGE_LIVE_LOCATION",
+        "MESSAGE_GIF" => "MESSAGE_ANIMATION",
+        "MESSAGE_GIFTCODE" => "MESSAGE_GIFTCODE",
+        "MESSAGE_GIFT_THEME" => "MESSAGE_CHAT_CHANGE_THEME",
+        "MESSAGE_GIVEAWAY" => "MESSAGE_GIVEAWAY",
+        "MESSAGE_GIVEAWAY_STARS" => "MESSAGE_GIVEAWAY_STARS",
+        "MESSAGE_GRAM_TRANSFER" => "MESSAGE_GRAM_TRANSFER",
+        "MESSAGE_GRAM_TRANSFER_COMMENT" => "MESSAGE_GRAM_TRANSFER",
+        "MESSAGE_GRAM_TRANSFER_UNKNOWN" => "MESSAGE_GRAM_TRANSFER",
+        "MESSAGE_GRAM_TRANSFER_UNKNOWN_COMMENT" => "MESSAGE_GRAM_TRANSFER",
+        "MESSAGE_INVOICE" => "MESSAGE_INVOICE",
+        "MESSAGE_NOTEXT" => "MESSAGE",
+        "MESSAGE_NOTHEME" => "MESSAGE_CHAT_CHANGE_THEME",
+        "MESSAGE_PAID_MEDIA" => "MESSAGE_PAID_MEDIA",
+        "MESSAGE_PHOTO" => "MESSAGE_PHOTO",
+        "MESSAGE_PHOTOS" => "MESSAGE_PHOTOS",
+        "MESSAGE_PHOTO_SECRET" => "MESSAGE_SECRET_PHOTO",
+        "MESSAGE_PLAYLIST" => "MESSAGE_AUDIOS",
+        "MESSAGE_POLL" => "MESSAGE_POLL",
+        "MESSAGE_POLL_APPEND" => "MESSAGE_POLL_APPEND",
+        "MESSAGE_PROXIMITY" => "MESSAGE_PROXIMITY",
+        "MESSAGE_QUIZ" => "MESSAGE_QUIZ",
+        "MESSAGE_RECURRING_PAY" => "MESSAGE_RECURRING_PAYMENT",
+        "MESSAGE_ROUND" => "MESSAGE_VIDEO_NOTE",
+        "MESSAGE_SAME_WALLPAPER" => "MESSAGE_SAME_WALLPAPER",
+        "MESSAGE_SCREENSHOT" => "MESSAGE_SCREENSHOT_TAKEN",
+        "MESSAGE_STARGIFT" => "MESSAGE_STARGIFT",
+        "MESSAGE_STARGIFT_PREPAID_UPGRADE" => "MESSAGE_STARGIFT_PREPAID_UPGRADE",
+        "MESSAGE_STARGIFT_UNPACK_UPGRADE" => "MESSAGE_STARGIFT_UNPACK_UPGRADE",
+        "MESSAGE_STARGIFT_UPGRADE" => "MESSAGE_STARGIFT_UPGRADE",
+        "MESSAGE_STICKER" => "MESSAGE_STICKER",
+        "MESSAGE_STORY" => "MESSAGE_STORY",
+        "MESSAGE_STORY_MENTION" => "MESSAGE_STORY_MENTION",
+        "MESSAGE_SUGGEST_BIRTHDAY" => "MESSAGE_SUGGEST_BIRTHDAY",
+        "MESSAGE_SUGGEST_USERPIC" => "MESSAGE_SUGGEST_PHOTO",
+        "MESSAGE_TEXT" => "MESSAGE_TEXT",
+        "MESSAGE_THEME" => "MESSAGE_CHAT_CHANGE_THEME",
+        "MESSAGE_TODO" => "MESSAGE_TODO",
+        "MESSAGE_TODO_APPEND" => "MESSAGE_TODO_APPEND",
+        "MESSAGE_TODO_DONE" => "MESSAGE_TODO_DONE",
+        "MESSAGE_UNIQUE_STARGIFT" => "MESSAGE_STARGIFT_TRANSFER",
+        "MESSAGE_VIDEO" => "MESSAGE_VIDEO",
+        "MESSAGE_VIDEOS" => "MESSAGE_VIDEOS",
+        "MESSAGE_VIDEO_SECRET" => "MESSAGE_SECRET_VIDEO",
+        "MESSAGE_WALLET_TONCONNECT_REQUEST" => "MESSAGE_WALLET_TONCONNECT_REQUEST",
+        "MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP" => "MESSAGE_WALLET_TONCONNECT_REQUEST",
+        "MESSAGE_WALLPAPER" => "MESSAGE_WALLPAPER",
+        "PINNED_AUDIO" => "PINNED_MESSAGE_VOICE_NOTE",
+        "PINNED_CONTACT" => "PINNED_MESSAGE_CONTACT",
+        "PINNED_DOC" => "PINNED_MESSAGE_DOCUMENT",
+        "PINNED_GAME" => "PINNED_MESSAGE_GAME",
+        "PINNED_GAME_SCORE" => "PINNED_MESSAGE_GAME_SCORE",
+        "PINNED_GEO" => "PINNED_MESSAGE_LOCATION",
+        "PINNED_GEOLIVE" => "PINNED_MESSAGE_LIVE_LOCATION",
+        "PINNED_GIF" => "PINNED_MESSAGE_ANIMATION",
+        "PINNED_GIVEAWAY" => "PINNED_MESSAGE_GIVEAWAY",
+        "PINNED_GIVEAWAY_STARS" => "PINNED_MESSAGE_GIVEAWAY_STARS",
+        "PINNED_INVOICE" => "PINNED_MESSAGE_INVOICE",
+        "PINNED_NOTEXT" => "PINNED_MESSAGE",
+        "PINNED_PAID_MEDIA" => "PINNED_MESSAGE_PAID_MEDIA",
+        "PINNED_PHOTO" => "PINNED_MESSAGE_PHOTO",
+        "PINNED_POLL" => "PINNED_MESSAGE_POLL",
+        "PINNED_QUIZ" => "PINNED_MESSAGE_QUIZ",
+        "PINNED_ROUND" => "PINNED_MESSAGE_VIDEO_NOTE",
+        "PINNED_STICKER" => "PINNED_MESSAGE_STICKER",
+        "PINNED_STORY" => "PINNED_MESSAGE_STORY",
+        "PINNED_TEXT" => "PINNED_MESSAGE_TEXT",
+        "PINNED_TODO" => "PINNED_MESSAGE_TODO",
+        "PINNED_VIDEO" => "PINNED_MESSAGE_VIDEO",
+        _ => "",
+    }
+}
+
+/// The loc-key-specific `loc_args` rewriting of
+/// `process_push_notification_payload` (NotificationManager.cpp:3414-3493,
+/// the c15d3f5a GRAM_TRANSFER/WALLET_TONCONNECT rows) — the payload
+/// plane's pure tail: folds `loc_args` into the single `arg` the content
+/// object builder takes. The decrypt seam parks before the call.
+pub fn rewrite_push_notification_args(
+    loc_key: &str,
+    original_loc_key: &str,
+    mut loc_args: Vec<String>,
+) -> std::result::Result<(String, Vec<String>), (i32, String)> {
+    let error = |message: &str| (400, message.to_owned());
+    let mut arg = String::new();
+    if loc_key == "MESSAGE_GAME_SCORE" {
+        if loc_args.len() != 2 {
+            return Err(error("Expected 2 arguments for MESSAGE_GAME_SCORE"));
+        }
+        let score: i32 = loc_args[1].parse().map_err(|_| error("Invalid score"))?;
+        if score < 0 {
+            return Err(error("Expected score to be non-negative"));
+        }
+        arg = format!("{} {}", loc_args[1], loc_args[0]);
+        loc_args.clear();
+    }
+    if loc_key == "MESSAGE_GIVEAWAY" {
+        if loc_args.len() != 2 {
+            return Err(error("Expected 2 arguments for MESSAGE_GIVEAWAY"));
+        }
+        let user_count: i32 = loc_args[0]
+            .parse()
+            .map_err(|_| error("Invalid user count"))?;
+        if user_count <= 0 {
+            return Err(error("Expected user count to be non-negative"));
+        }
+        let month_count: i32 = loc_args[1]
+            .parse()
+            .map_err(|_| error("Invalid month count"))?;
+        if month_count <= 0 {
+            return Err(error("Expected month count to be non-negative"));
+        }
+        arg = format!("{user_count} {month_count}");
+        loc_args.clear();
+    }
+    if loc_key == "MESSAGE_GIVEAWAY_STARS" {
+        if loc_args.len() != 2 {
+            return Err(error("Expected 2 arguments for MESSAGE_GIVEAWAY_STARS"));
+        }
+        let user_count: i32 = loc_args[0]
+            .parse()
+            .map_err(|_| error("Invalid user count"))?;
+        if user_count <= 0 {
+            return Err(error("Expected user count to be non-negative"));
+        }
+        let star_count: i64 = loc_args[1]
+            .parse()
+            .map_err(|_| error("Invalid star count"))?;
+        arg = format!(
+            "{} {}",
+            user_count,
+            crate::star_manager::get_star_count(star_count, false)
+        );
+        loc_args.clear();
+    }
+    if loc_key == "MESSAGE_GRAM_TRANSFER" {
+        let mut comment = String::new();
+        if original_loc_key == "MESSAGE_GRAM_TRANSFER_COMMENT"
+            || original_loc_key == "MESSAGE_GRAM_TRANSFER_UNKNOWN_COMMENT"
+        {
+            if loc_args.len() != 2 {
+                return Err(error(
+                    "Expected 2 arguments for MESSAGE_GRAM_TRANSFER_COMMENT",
+                ));
+            }
+            comment = loc_args.pop().unwrap_or_default();
+        }
+        if loc_args.len() != 1 {
+            return Err(error("Expected 1 argument for MESSAGE_GRAM_TRANSFER"));
+        }
+        arg = format!("{}\u{FF}{}", loc_args[0], comment);
+        loc_args.clear();
+    }
+    if loc_key == "MESSAGE_PAID_MEDIA" {
+        if loc_args.len() != 1 {
+            return Err(error("Expected 1 argument for MESSAGE_PAID_MEDIA"));
+        }
+        let star_count: i64 = loc_args[0]
+            .parse()
+            .map_err(|_| error("Invalid star count"))?;
+        arg = crate::star_manager::get_star_count(star_count, false).to_string();
+        loc_args.clear();
+    }
+    if loc_key == "MESSAGE_WALLET_TONCONNECT_REQUEST" {
+        if original_loc_key == "MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP" {
+            if loc_args.len() != 1 {
+                return Err(error(
+                    "Expected 1 argument for MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP",
+                ));
+            }
+            arg = loc_args.pop().unwrap_or_default();
+        }
+        if !loc_args.is_empty() {
+            return Err(error(
+                "Expected no arguments for MESSAGE_WALLET_TONCONNECT_REQUEST",
+            ));
+        }
+    }
+    if loc_args.len() > 1 {
+        return Err(error("Receive too many arguments"));
+    }
+    if loc_args.len() == 1 {
+        arg = loc_args.pop().unwrap_or_default();
+    }
+    Ok((arg, loc_args))
+}
+
 /// `NotificationTypePushMessage::get_push_message_content_object`
 /// (NotificationType.cpp:151-449) — the loc-key → td_api push content
 /// mapping. Manager-backed sub-objects come from the env seam.
@@ -1616,6 +1838,148 @@ fn get_push_message_content_object(
         _ => {}
     }
     panic!("Have unsupported push notification key {key}");
+}
+
+#[cfg(test)]
+mod push_loc_key_tests {
+    use super::*;
+
+    #[test]
+    fn convert_loc_key_table() {
+        // The c15d3f5a rows: the four GRAM_TRANSFER forms collapse and the
+        // TonConnect dApp form maps onto the base key.
+        assert_eq!(
+            convert_loc_key("MESSAGE_GRAM_TRANSFER"),
+            "MESSAGE_GRAM_TRANSFER"
+        );
+        assert_eq!(
+            convert_loc_key("MESSAGE_GRAM_TRANSFER_COMMENT"),
+            "MESSAGE_GRAM_TRANSFER"
+        );
+        assert_eq!(
+            convert_loc_key("MESSAGE_GRAM_TRANSFER_UNKNOWN"),
+            "MESSAGE_GRAM_TRANSFER"
+        );
+        assert_eq!(
+            convert_loc_key("MESSAGE_GRAM_TRANSFER_UNKNOWN_COMMENT"),
+            "MESSAGE_GRAM_TRANSFER"
+        );
+        assert_eq!(
+            convert_loc_key("MESSAGE_WALLET_TONCONNECT_REQUEST"),
+            "MESSAGE_WALLET_TONCONNECT_REQUEST"
+        );
+        assert_eq!(
+            convert_loc_key("MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP"),
+            "MESSAGE_WALLET_TONCONNECT_REQUEST"
+        );
+        assert_eq!(convert_loc_key("MESSAGE_GIF"), "MESSAGE_ANIMATION");
+        assert_eq!(convert_loc_key("PINNED_NOTEXT"), "PINNED_MESSAGE");
+        assert_eq!(
+            convert_loc_key("CONTACT_JOINED"),
+            "MESSAGE_CONTACT_REGISTERED"
+        );
+        assert_eq!(
+            convert_loc_key("MESSAGE_UNIQUE_STARGIFT"),
+            "MESSAGE_STARGIFT_TRANSFER"
+        );
+        assert_eq!(convert_loc_key("UNKNOWN_KEY"), "");
+    }
+
+    #[test]
+    fn rewrite_args_gram_transfer_rows() {
+        // The comment form folds amount + comment into one \xFF arg.
+        let (arg, rest) = rewrite_push_notification_args(
+            "MESSAGE_GRAM_TRANSFER",
+            "MESSAGE_GRAM_TRANSFER_COMMENT",
+            vec!["5.5".to_owned(), "hi there".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(arg, "5.5\u{FF}hi there");
+        assert!(rest.is_empty());
+        // The plain form keeps the \xFF separator with the empty comment
+        // (the C++ PSTRING always appends it).
+        let (arg, _) = rewrite_push_notification_args(
+            "MESSAGE_GRAM_TRANSFER",
+            "MESSAGE_GRAM_TRANSFER",
+            vec!["5.5".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(arg, "5.5\u{FF}");
+        // The argument-count bands.
+        assert_eq!(
+            rewrite_push_notification_args(
+                "MESSAGE_GRAM_TRANSFER",
+                "MESSAGE_GRAM_TRANSFER_COMMENT",
+                vec!["5.5".to_owned()]
+            )
+            .unwrap_err()
+            .1,
+            "Expected 2 arguments for MESSAGE_GRAM_TRANSFER_COMMENT"
+        );
+        assert_eq!(
+            rewrite_push_notification_args(
+                "MESSAGE_GRAM_TRANSFER",
+                "MESSAGE_GRAM_TRANSFER",
+                vec![]
+            )
+            .unwrap_err()
+            .1,
+            "Expected 1 argument for MESSAGE_GRAM_TRANSFER"
+        );
+    }
+
+    #[test]
+    fn rewrite_args_tonconnect_and_paid_media_rows() {
+        // The dApp name rides the single arg.
+        let (arg, rest) = rewrite_push_notification_args(
+            "MESSAGE_WALLET_TONCONNECT_REQUEST",
+            "MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP",
+            vec!["MyDapp".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(arg, "MyDapp");
+        assert!(rest.is_empty());
+        assert_eq!(
+            rewrite_push_notification_args(
+                "MESSAGE_WALLET_TONCONNECT_REQUEST",
+                "MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP",
+                vec![]
+            )
+            .unwrap_err()
+            .1,
+            "Expected 1 argument for MESSAGE_WALLET_TONCONNECT_REQUEST_DAPP"
+        );
+        assert_eq!(
+            rewrite_push_notification_args(
+                "MESSAGE_WALLET_TONCONNECT_REQUEST",
+                "MESSAGE_WALLET_TONCONNECT_REQUEST",
+                vec!["extra".to_owned()]
+            )
+            .unwrap_err()
+            .1,
+            "Expected no arguments for MESSAGE_WALLET_TONCONNECT_REQUEST"
+        );
+        // The star-count rows clamp through get_star_count.
+        let (arg, _) = rewrite_push_notification_args(
+            "MESSAGE_GIVEAWAY_STARS",
+            "MESSAGE_GIVEAWAY_STARS",
+            vec!["2".to_owned(), "500".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(arg, "2 500");
+        let (arg, _) = rewrite_push_notification_args(
+            "MESSAGE_PAID_MEDIA",
+            "MESSAGE_PAID_MEDIA",
+            vec!["42".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(arg, "42");
+        // The generic tail: a single leftover arg becomes the arg.
+        let (arg, _) =
+            rewrite_push_notification_args("MESSAGE_TEXT", "MESSAGE_TEXT", vec!["body".to_owned()])
+                .unwrap();
+        assert_eq!(arg, "body");
+    }
 }
 
 #[cfg(test)]
