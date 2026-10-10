@@ -21586,7 +21586,8 @@ pub fn add_message_to_dialog(
             on_dialog_updated(manager, dialog_id, source);
             *need_update_dialog_pos = false;
             on_dialog_updated(manager, dialog_id, "do delete last message");
-            // `load_last_dialog_message_later` — the M.10.15 history seam
+            // 2e2734e37 — the only-if-unknown re-entry form.
+            load_last_dialog_message_later(global, manager, dialog_id, true);
         }
 
         // the ordered-container insert (31088) — from_update drives the
@@ -25001,6 +25002,59 @@ pub fn delete_message(
 /// the file-source removal ride their manager seams; the memory container
 /// walks are the port.
 #[allow(clippy::too_many_arguments)]
+/// `MessagesManager::load_last_dialog_message_later(dialog_id,
+/// only_if_last_message_is_unknown)` (MessagesManager.cpp:19810-19821, the
+/// 2e2734e37 shape) — the deferred re-entry; the actor hop collapses to
+/// the direct call (the C++ `CHECK(d != nullptr)` tolerates the not-found
+/// case in the collapsed form — the deferred hop always follows an add).
+pub fn load_last_dialog_message_later(
+    global: &crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    only_if_last_message_is_unknown: bool,
+) {
+    if global.close_flag() {
+        return;
+    }
+    let is_bot = manager.bot_mode;
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return;
+    };
+    if only_if_last_message_is_unknown && d.last_message_id != MessageId::default() {
+        return;
+    }
+    load_last_dialog_message(d, is_bot, "load_last_dialog_message_later");
+}
+
+/// `MessagesManager::load_last_dialog_message(d, source)`
+/// (MessagesManager.cpp:19823-19835, the 17dc1e79f/a8c935dff/2e2734e37
+/// final shape) — the bot/sponsored gate first, the being-added re-entry
+/// second (the actor hop with `only_if_last_message_is_unknown = true`
+/// collapses to the skip — the seam records the later retry), then the
+/// last-message history load. `get_history_impl` is the [blocked:
+/// net/history] seam (the port has no dialog-history load yet); the
+/// sponsored-dialog read answers the local band (no sponsored dialogs are
+/// tracked).
+pub fn load_last_dialog_message(d: &mut Dialog, is_bot: bool, source: &str) {
+    // `d->order == DEFAULT_ORDER && !is_dialog_sponsored(d)` — the port
+    // tracks no sponsored dialogs, so the default-order arm is the whole
+    // gate.
+    if is_bot || d.order == DEFAULT_ORDER {
+        return;
+    }
+    // `being_added_dialog_id_`/`being_added_by_new_message_dialog_id_`/
+    // `being_added_dialog_ids_` — the being-added tracking is the receive
+    // plane seam (17dc1e79f); offline nothing is being added, the C++
+    // re-schedules load_last_dialog_message_later(dialog_id, true).
+    let _ = source;
+    // `get_history_impl(d, MessageId::max(), 0, -1, true, false, ...)` —
+    // the net/history seam.
+    tdutils::log_info!(
+        "Load last dialog message for {} from {source} — [blocked: net/history]",
+        d.dialog_id.get()
+    );
+}
+
 pub fn do_delete_message(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
@@ -25268,8 +25322,8 @@ pub fn do_delete_message(
     };
 
     if need_get_history {
-        // `load_last_dialog_message_later` — the net/history seam
-        // (M.10.15)
+        // 2e2734e37 — the do_delete_message tail carries the plain form.
+        load_last_dialog_message_later(global, manager, dialog_id, false);
     }
 
     if let Some(result) = &result {
