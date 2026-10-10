@@ -62,13 +62,16 @@ A release is parity-clean when **all** of the following are green:
 - [ ] cargo-deny advisories clean (or every exception explicitly signed
       off — see the open `rsa` RUSTSEC-2023-0071 decision)
 
-Current status (2026-09-23, Track J audit): **633 / 1,022 (61.9%)** —
-`td-api-parity` counts `Function::<name>` handler references across the
-crate sources; the request census pins the same tree at
-20 sync / 558 dispatched / 444 interim of 1,022 arms
-(`crates/tdclient/src/testdata/request_census.txt`). The number is the
-release-blocking metric, not a quality one (the implemented subset is
-oracle-verified).
+Current status (2026-10-09, after the c15d3f5a completion pass over
+`docs/UPSTREAM_SYNC_C15D3F5A_REMAINING_20261009.md`): **the interim set is
+empty** — the request census pins the tree at
+26 sync / 1,039 dispatched / 0 interim of 1,065 arms
+(`crates/tdclient/src/testdata/request_census.txt`; the TonWalletManager
+plane, the community write family, dismissWebToken and the tde2e keychain
+subset landed over the `[blocked: net]` query seams). The count is the
+release-blocking metric, not a quality one; the net/db tails still park at
+their seams and the S07/S04 oracle gates need the C++ c15d3f5a build
+(§2 below) before the 1.8.68 release entry.
 
 ## 4. Changelog + version
 
