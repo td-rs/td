@@ -11688,8 +11688,12 @@ impl ChatManager {
     }
 
     /// `can_get_channel_message_statistics` (ChatManager.cpp:3895-3906).
-    pub fn can_get_channel_message_statistics(&self, env: &UserEnv, channel_id: ChannelId) -> bool {
-        debug_assert!(!env.auth_is_bot);
+    pub fn can_get_channel_message_statistics(
+        &self,
+        auth_is_bot: bool,
+        channel_id: ChannelId,
+    ) -> bool {
+        debug_assert!(!auth_is_bot);
         let Some(c) = self.get_channel(channel_id) else {
             return false;
         };
@@ -11704,8 +11708,12 @@ impl ChatManager {
 
     /// `can_get_channel_story_statistics` (ChatManager.cpp:3909-3921) — a
     /// verbatim duplicate of the message-statistics predicate in the C++.
-    pub fn can_get_channel_story_statistics(&self, env: &UserEnv, channel_id: ChannelId) -> bool {
-        debug_assert!(!env.auth_is_bot);
+    pub fn can_get_channel_story_statistics(
+        &self,
+        auth_is_bot: bool,
+        channel_id: ChannelId,
+    ) -> bool {
+        debug_assert!(!auth_is_bot);
         let Some(c) = self.get_channel(channel_id) else {
             return false;
         };
@@ -12500,7 +12508,7 @@ impl ChatManager {
     }
 
     /// `is_channel_public` (ChatManager.cpp:8601-8603).
-    fn is_channel_public(c: &Channel) -> bool {
+    pub(crate) fn is_channel_public(c: &Channel) -> bool {
         c.usernames.has_first_username() || c.has_location
     }
 
@@ -12785,6 +12793,29 @@ impl ChatManager {
     }
 
     /// `get_channel_full_const` (ChatManager.cpp:8958-8960).
+    /// `get_channel_effective_has_hidden_participants`
+    /// (ChatManager.cpp:8827-8845) — the unloaded channel and the missing
+    /// full answer `true` (the force-load legs are the net/db seams);
+    /// administrators always see the participants.
+    pub(crate) fn get_channel_effective_has_hidden_participants(
+        &self,
+        channel_id: ChannelId,
+    ) -> bool {
+        let Some(c) = self.get_channel(channel_id) else {
+            return true;
+        };
+        if c.is_monoforum {
+            return true;
+        }
+        if c.status.is_administrator() {
+            return false;
+        }
+        match self.get_channel_full_const(channel_id) {
+            Some(f) => f.has_hidden_participants || !f.can_get_participants,
+            None => true,
+        }
+    }
+
     fn get_channel_full_const(&self, channel_id: ChannelId) -> Option<&ChannelFull> {
         self.channels_full.get(&channel_id.get())
     }

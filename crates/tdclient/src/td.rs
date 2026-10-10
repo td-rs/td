@@ -2173,6 +2173,76 @@ impl crate::messages_manager::SendMessageContext for Td {
         self.global.unix_time()
     }
 
+    // -- the message-properties read probes (get_message_properties)
+
+    fn get_channel_permissions(
+        &self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager
+            .get_channel_permissions_id(&self.global, channel_id)
+    }
+
+    fn can_get_channel_message_statistics(
+        &self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> bool {
+        self.chat_manager
+            .can_get_channel_message_statistics(self.auth_manager.is_bot(), channel_id)
+    }
+
+    fn is_channel_public(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager
+            .get_channel(channel_id)
+            .is_some_and(crate::chat_manager::ChatManager::is_channel_public)
+    }
+
+    fn get_channel_first_username(&self, channel_id: crate::chat_manager::ChannelId) -> String {
+        self.chat_manager
+            .get_channel(channel_id)
+            .map(|c| c.usernames.get_first_username().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_integer(name, default_value)
+            })
+    }
+
+    fn is_user_bot(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_bot_of(user_id)
+    }
+
+    fn is_user_support(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_support_of(user_id)
+    }
+
+    fn get_secret_chat_state(
+        &self,
+        secret_chat_id: crate::user_manager::SecretChatId,
+    ) -> crate::user_manager::SecretChatState {
+        self.user_manager.get_secret_chat_state(secret_chat_id)
+    }
+
+    fn is_appointed_chat_administrator(&self, chat_id: crate::chat_manager::ChatId) -> bool {
+        self.chat_manager.is_appointed_chat_administrator(chat_id)
+    }
+
+    fn get_chat_is_active(&self, chat_id: crate::chat_manager::ChatId) -> bool {
+        self.chat_manager.get_chat_is_active(chat_id)
+    }
+
+    fn get_chat_participant_count(&self, chat_id: crate::chat_manager::ChatId) -> i32 {
+        self.chat_manager.get_chat_participant_count(chat_id)
+    }
+
+    fn get_channel_participant_count(&self, channel_id: crate::chat_manager::ChannelId) -> i32 {
+        self.chat_manager.get_channel_field_snapshot(channel_id).1
+    }
+
     fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool {
         dialog_id.get_type() == crate::messages_manager::DialogType::Channel
             && crate::message_content::MessageContentContext::is_broadcast_channel(
@@ -19212,6 +19282,65 @@ pub(crate) fn star_env_split(
 impl crate::messages_manager::MmRequestContext for Td {
     fn as_message_object(&self) -> &dyn crate::messages_manager::MessageObjectContext {
         self
+    }
+
+    // -- the message-properties mutable reads
+
+    fn get_user_read_dates_private(&mut self, user_id: crate::user_manager::UserId) -> bool {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("the properties plane runs with the option manager"),
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        self.user_manager
+            .get_user_read_dates_private(&mut env, user_id)
+    }
+
+    fn get_channel_effective_has_hidden_participants(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> bool {
+        self.chat_manager
+            .get_channel_effective_has_hidden_participants(channel_id)
+    }
+
+    fn can_report_dialog(&mut self, dialog_id: crate::messages_manager::DialogId) -> bool {
+        crate::dialog_manager::can_report_dialog(self, dialog_id)
+    }
+
+    fn get_user_has_protected_content_force_by_me(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> bool {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("the properties plane runs with the option manager"),
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        self.user_manager
+            .get_user_has_protected_content_force_by_me(&mut env, user_id)
+    }
+
+    fn get_user_has_protected_content_force_by_other(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> bool {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("the properties plane runs with the option manager"),
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        self.user_manager
+            .get_user_has_protected_content_force_by_other(&mut env, user_id)
     }
 
     fn as_send_message_context(&self) -> &dyn crate::messages_manager::SendMessageContext {

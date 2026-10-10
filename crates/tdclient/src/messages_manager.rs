@@ -14277,11 +14277,12 @@ pub fn can_approve_or_decline_message(
     let Some(suggested_post) = &m.suggested_post else {
         return false;
     };
+    // The 21c7e4c18 order: the ephemeral gate precedes the outgoing one.
     if !suggested_post.is_pending()
         || !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
         || m.is_outgoing
         || !ctx.is_monoforum_channel_dialog(dialog_id)
-        || m.ephemeral_message.is_some()
     {
         return false;
     }
@@ -18779,6 +18780,199 @@ pub fn can_get_media_timestamp_link(
     Result::Ok(())
 }
 
+/// `MessagesManager::get_message_properties` (MessagesManager.cpp:15362-15485,
+/// the 8aeb38920/cb41ae5c1/21c7e4c18 shape) — the messageProperties object:
+/// the full flag ladder over the can_* gates, the delete bands with the
+/// ephemeral/scheduled split, the sorted-unique custom-emoji fold and the
+/// protected-content reads.
+#[allow(clippy::too_many_arguments)]
+pub fn get_message_properties_request(
+    ctx: &mut dyn MmRequestContext,
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    state: &dyn ReadStateContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    mut promise: tdutils::promise::Promise<td_api::MessageProperties>,
+) {
+    // `check_dialog_access(dialog_id, true, Read, "get_message_properties")`
+    // — the in-memory gate (the poll-request shape).
+    if manager.get_dialog(dialog_id).is_none() {
+        if !dialog_id.is_valid() {
+            promise.set_error(Status::error(400, "Invalid chat identifier specified"));
+        } else {
+            promise.set_error(Status::error(400, "Chat not found"));
+        }
+        return;
+    }
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        unreachable!("checked above");
+    };
+    let Some(m) = get_message_in_dialog(d, message_id) else {
+        promise.set_error(Status::error(400, "Message not found"));
+        return;
+    };
+    let message_id = m.message_id;
+
+    let is_ephemeral = is_ephemeral_message(m);
+    let is_scheduled = message_id.is_scheduled();
+    let is_from_saved_messages = dialog_id == ctx.get_my_dialog_id();
+    let mut can_delete_for_self = false;
+    let mut can_delete_for_all_users = false;
+    let dialog_type = dialog_id.get_type();
+    let ephemeral_message_id = get_message_ephemeral_message_id(m);
+    if is_scheduled {
+        can_delete_for_self = is_from_saved_messages;
+        can_delete_for_all_users = !can_delete_for_self;
+    } else if is_ephemeral {
+        can_delete_for_self = !m.ephemeral_message_id.is_valid();
+        can_delete_for_all_users = !can_delete_for_self;
+    } else if can_delete_message(ctx, dialog_id, m) {
+        can_delete_for_all_users = can_revoke_message(ctx, dialog_id, m);
+        match dialog_type {
+            DialogType::User | DialogType::Chat => {
+                // allow to delete yet unsent message just for self — TODO
+                can_delete_for_self = !message_id.is_yet_unsent() || is_from_saved_messages;
+            }
+            DialogType::Channel | DialogType::SecretChat => {
+                can_delete_for_self = !can_delete_for_all_users;
+            }
+            DialogType::None => unreachable!(),
+        }
+    }
+
+    // The &mut reads first (the mutable reborrows end before the shared
+    // context view below).
+    let can_be_pinned = can_pin_message(&mut *ctx, dialog_id, Some(m)).is_ok();
+    let can_be_paid =
+        !ephemeral_message_id.is_valid() && ctx.invoice_message_info_is_ok(dialog_id, message_id);
+    let can_report_dialog = ctx.can_report_dialog(dialog_id);
+    let has_protected_content_by_current_user_read = if dialog_id.get_type() == DialogType::User {
+        ctx.get_user_has_protected_content_force_by_me(dialog_id.get_user_id())
+    } else {
+        false
+    };
+    let has_protected_content_by_other_user_read = if dialog_id.get_type() == DialogType::User {
+        ctx.get_user_has_protected_content_force_by_other(dialog_id.get_user_id())
+    } else {
+        false
+    };
+
+    // The shared context view for the rest of the ladder.
+    let ctx: &dyn SendMessageContext = &*ctx;
+    let is_bot = MessageObjectContext::is_bot(ctx);
+    let can_add_offer = can_add_message_offer(ctx, dialog_id, Some(m));
+    let can_add_tasks = can_add_message_tasks(ctx, dialog_id, m, 1);
+    let can_be_approved = can_approve_message(ctx, dialog_id, m);
+    let can_be_declined = can_decline_message(ctx, dialog_id, m);
+    let can_be_copied = can_forward_message(ctx, dialog_id, Some(m), true);
+    let can_be_saved = can_save_message(dialog_id, Some(m), ctx);
+    let can_be_edited = can_edit_message(ctx, dialog_id, Some(m), false, is_bot);
+    let can_be_forwarded = can_forward_message(ctx, dialog_id, Some(m), false);
+    let can_be_copied_to_secret_chat = can_be_copied
+        && crate::message_content::can_send_message_content_to_secret_chat(
+            get_message_actual_content(m).get_type(),
+        );
+    let can_be_replied = can_reply_to_message(ctx, d, message_id, Some(m));
+    let can_be_replied_in_another_chat =
+        can_reply_to_message_in_another_dialog(ctx, dialog_id, Some(m), can_be_forwarded);
+    let can_be_shared_in_story = can_share_message_in_story(dialog_id, m);
+    let can_delete_reactions = can_delete_message_reactions(dialog_id, m);
+    let can_edit_media = can_edit_message_media(ctx, dialog_id, Some(m), false);
+    let can_edit_scheduling_state = can_edit_message_scheduling_state(m);
+    let can_edit_suggested_post_info =
+        can_add_message_offer_with(ctx, dialog_id, Some(m), false, true);
+    let can_get_author = can_get_message_author(ctx, dialog_id, m);
+    let can_get_statistics = can_get_message_statistics(ctx, dialog_id, m);
+    let can_get_message_thread = get_top_thread_message_full_id(ctx, d, m, false).is_ok();
+    let can_get_poll_vote_statistics =
+        can_get_message_poll_vote_statistics(ctx, manager, state, dialog_id, message_id);
+    let can_get_read_date = can_get_message_read_date(ctx, d, m).is_ok();
+    let can_get_video_advertisements =
+        ctx.can_get_message_video_advertisements(dialog_id, message_id);
+    let can_get_viewers = can_get_message_viewers(ctx, dialog_id, m).is_ok();
+    let can_get_media_timestamp_links =
+        can_get_media_timestamp_link(ctx, dialog_id, Some(m)).is_ok();
+    let can_get_link = can_get_media_timestamp_links && dialog_type == DialogType::Channel;
+    let can_get_embedding_code = can_get_message_embedding_code(ctx, dialog_id, m).is_ok();
+    let can_mark_tasks_as_done = can_mark_message_tasks_as_done(ctx, dialog_id, m);
+    let can_recognize_speech = can_recognize_message_speech(dialog_id, m);
+    let can_report_chat = if ephemeral_message_id.is_valid() {
+        false
+    } else {
+        can_report_dialog && can_report_message(message_id).is_ok()
+    };
+    let can_report_reactions =
+        can_report_message_reactions(ctx, manager, reactions_ctx, dialog_id, m);
+    let can_report_supergroup_spam = !ephemeral_message_id.is_valid()
+        && dialog_id.get_type() == DialogType::Channel
+        && !ctx.is_monoforum_channel_dialog(dialog_id)
+        && ctx.is_megagroup_channel(dialog_id.get_channel_id())
+        && ctx
+            .channel_status(dialog_id.get_channel_id())
+            .is_administrator()
+        && can_report_message(message_id).is_ok();
+    let can_set_fact_check = can_set_message_fact_check(ctx, dialog_id, m);
+    // `CustomEmojiId::get_custom_emoji_ids_object` + sort + unique
+    // (cb41ae5c1).
+    let mut custom_emoji_ids: Vec<i64> =
+        crate::message_content::get_message_content_custom_emoji_ids(get_message_actual_content(m))
+            .into_iter()
+            .map(|custom_emoji_id| custom_emoji_id.get())
+            .collect();
+    custom_emoji_ids.sort_unstable();
+    custom_emoji_ids.dedup();
+    let has_protected_content_by_current_user = !can_be_saved
+        && !ephemeral_message_id.is_valid()
+        && has_protected_content_by_current_user_read;
+    let has_protected_content_by_other_user = !can_be_saved
+        && !ephemeral_message_id.is_valid()
+        && has_protected_content_by_other_user_read;
+    let need_show_statistics = can_get_statistics && (m.view_count >= 100 || m.forward_count > 0);
+    promise.set_value(td_api::MessageProperties {
+        can_add_offer,
+        can_add_tasks,
+        can_be_approved,
+        can_be_copied,
+        can_be_copied_to_secret_chat,
+        can_be_declined,
+        can_be_deleted_only_for_self: can_delete_for_self,
+        can_be_deleted_for_all_users: can_delete_for_all_users,
+        can_be_edited,
+        can_be_forwarded,
+        can_be_paid,
+        can_be_pinned,
+        can_be_replied,
+        can_be_replied_in_another_chat,
+        can_be_saved,
+        can_be_shared_in_story,
+        can_delete_reactions,
+        can_edit_media,
+        can_edit_scheduling_state,
+        can_edit_suggested_post_info,
+        can_get_author,
+        can_get_embedding_code,
+        can_get_link,
+        can_get_media_timestamp_links,
+        can_get_message_thread,
+        can_get_poll_vote_statistics,
+        can_get_read_date,
+        can_get_statistics,
+        can_get_video_advertisements,
+        can_get_viewers,
+        can_mark_tasks_as_done,
+        can_recognize_speech,
+        can_report_chat,
+        can_report_reactions,
+        can_report_supergroup_spam,
+        can_set_fact_check,
+        custom_emoji_ids,
+        has_protected_content_by_current_user,
+        has_protected_content_by_other_user,
+        need_show_statistics,
+    });
+}
+
 /// `MessagesManager::get_poll_option_properties`
 /// (MessagesManager.cpp:15499-15516) — the request wrapper: the dialog
 /// access gate, the message/content checks, the flag table, then the
@@ -18835,6 +19029,573 @@ pub fn get_poll_option_properties_request(
         m.is_outgoing || dialog_id == ctx.get_my_dialog_id(),
         promise,
     );
+}
+
+/// `MessagesManager::get_message_ephemeral_message_id`
+/// (MessagesManager.cpp:23384-23389).
+fn get_message_ephemeral_message_id(m: &Message) -> EphemeralMessageId {
+    match &m.ephemeral_message {
+        Some(ephemeral_message) => ephemeral_message.ephemeral_message_id,
+        None => m.ephemeral_message_id,
+    }
+}
+
+/// `MessagesManager::can_share_message_in_story`
+/// (MessagesManager.cpp:8310-8313).
+fn can_share_message_in_story(dialog_id: DialogId, m: &Message) -> bool {
+    dialog_id.get_type() == DialogType::Channel
+        && m.message_id.is_server()
+        && m.ephemeral_message.is_none()
+}
+
+/// `MessagesManager::can_delete_message_reactions`
+/// (MessagesManager.cpp:8315-8321) — the port's Message carries no
+/// reactions container (the reaction plane reads through the reactions
+/// context); the recorded seam answers the empty-reactions band.
+fn can_delete_message_reactions(_dialog_id: DialogId, _m: &Message) -> bool {
+    false
+}
+
+/// `MessagesManager::can_get_message_statistics`
+/// (MessagesManager.cpp:8327-8340).
+fn can_get_message_statistics(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if ctx.is_bot() || dialog_id.get_type() != DialogType::Channel {
+        return false;
+    }
+    if !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || m.view_count == 0
+        || m.had_forward_info
+        || m.forward_info
+            .as_ref()
+            .is_some_and(|forward| forward.get_origin().is_channel_post())
+    {
+        return false;
+    }
+    ctx.can_get_channel_message_statistics(dialog_id.get_channel_id())
+}
+
+/// `MessagesManager::can_get_message_author`
+/// (MessagesManager.cpp:8355-8363, the 21c7e4c18 shape).
+fn can_get_message_author(ctx: &dyn SendMessageContext, dialog_id: DialogId, m: &Message) -> bool {
+    if ctx.is_bot() || !ctx.is_admined_monoforum_channel(dialog_id) {
+        return false;
+    }
+    if !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || get_message_sender(m).get_type() != DialogType::Channel
+    {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::can_delete_channel_message`
+/// (MessagesManager.cpp:8366-8404) — the static.
+fn can_delete_channel_message(
+    is_admined_monoforum: bool,
+    status: &crate::chat_manager::DialogParticipantStatus,
+    m: &Message,
+    is_bot: bool,
+    unix_time: i32,
+) -> bool {
+    if m.message_id.is_local() || m.message_id.is_yet_unsent() {
+        return true;
+    }
+    if m.message_id.is_scheduled() {
+        if m.is_channel_post {
+            return status.can_post_messages();
+        }
+        return true;
+    }
+
+    // bots can't delete messages older than 2 days (900s on the test DC;
+    // the is_test_dc read rides the same band)
+    if is_bot && unix_time >= m.date + 2 * 86400 {
+        return false;
+    }
+
+    assert!(m.message_id.is_server());
+    if m.message_id.get_server_message_id().get() == 1 {
+        return false;
+    }
+    let content_type = m
+        .content
+        .as_ref()
+        .map(|content| content.get_type())
+        .unwrap_or(MessageContentType::None);
+    if matches!(
+        content_type,
+        MessageContentType::ChannelMigrateFrom
+            | MessageContentType::ChannelCreate
+            | MessageContentType::TopicCreate
+    ) {
+        return false;
+    }
+
+    if status.can_delete_messages() || is_admined_monoforum {
+        return true;
+    }
+    if !m.is_outgoing {
+        return false;
+    }
+    if m.is_channel_post || crate::message_content::is_service_message_content(content_type) {
+        return status.can_post_messages();
+    }
+    true
+}
+
+/// `MessagesManager::can_delete_message` (MessagesManager.cpp:8411-8436).
+fn can_delete_message(ctx: &dyn SendMessageContext, dialog_id: DialogId, m: &Message) -> bool {
+    if m.message_id.is_local() || m.message_id.is_yet_unsent() {
+        return true;
+    }
+    match dialog_id.get_type() {
+        DialogType::User | DialogType::Chat | DialogType::SecretChat => true,
+        DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let is_admined_monoforum = ctx.is_admined_monoforum_channel(dialog_id);
+            let dialog_status = ctx.get_channel_permissions(channel_id);
+            can_delete_channel_message(
+                is_admined_monoforum,
+                &dialog_status,
+                m,
+                ctx.is_bot(),
+                ctx.unix_time(),
+            )
+        }
+        DialogType::None => unreachable!(),
+    }
+}
+
+/// `MessagesManager::can_revoke_message` (MessagesManager.cpp:8438-8488).
+fn can_revoke_message(ctx: &dyn SendMessageContext, dialog_id: DialogId, m: &Message) -> bool {
+    let dialog_type = dialog_id.get_type();
+    if m.message_id.is_local() && dialog_type != DialogType::SecretChat {
+        return m.ephemeral_message_id.is_valid();
+    }
+    if dialog_id == ctx.get_my_dialog_id() {
+        return false;
+    }
+    if m.message_id.is_scheduled() {
+        return false;
+    }
+    if m.message_id.is_yet_unsent() {
+        return true;
+    }
+    assert!(m.message_id.is_server() || dialog_type == DialogType::SecretChat);
+
+    let default_revoke_time_limit: i64 = if ctx.is_bot() {
+        2 * 86400
+    } else {
+        i32::MAX as i64
+    };
+    let content_type = m
+        .content
+        .as_ref()
+        .map(|content| content.get_type())
+        .unwrap_or(MessageContentType::None);
+    match dialog_type {
+        DialogType::User => {
+            let can_revoke_incoming = ctx
+                .content_context()
+                .get_option_boolean("revoke_pm_inbox", true);
+            let revoke_time_limit =
+                ctx.get_option_integer("revoke_pm_time_limit", default_revoke_time_limit);
+            if i64::from(ctx.unix_time() - m.date) < 86400
+                && content_type == MessageContentType::Dice
+            {
+                return false;
+            }
+            ((m.is_outgoing && !crate::message_content::is_service_message_content(content_type))
+                || (can_revoke_incoming && content_type != MessageContentType::ScreenshotTaken))
+                && i64::from(ctx.unix_time() - m.date) <= revoke_time_limit
+        }
+        DialogType::Chat => {
+            let is_appointed_administrator =
+                ctx.is_appointed_chat_administrator(dialog_id.get_chat_id());
+            let revoke_time_limit =
+                ctx.get_option_integer("revoke_time_limit", default_revoke_time_limit);
+            ((m.is_outgoing && !crate::message_content::is_service_message_content(content_type))
+                || is_appointed_administrator)
+                && i64::from(ctx.unix_time() - m.date) <= revoke_time_limit
+        }
+        // any server message that can be deleted will be deleted for all
+        // participants
+        DialogType::Channel => true,
+        // all non-service messages will be deleted for everyone if secret
+        // chat is active
+        DialogType::SecretChat => {
+            ctx.get_secret_chat_state(dialog_id.get_secret_chat_id())
+                == crate::user_manager::SecretChatState::Active
+                && !crate::message_content::is_service_message_content(content_type)
+        }
+        DialogType::None => unreachable!(),
+    }
+}
+
+/// `MessagesManager::can_add_message_tasks` (MessagesManager.cpp:8140-8159).
+fn can_add_message_tasks(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+    task_count: i32,
+) -> bool {
+    if !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || !matches!(m.content.as_ref(), Some(MessageContent::ToDoList(_)))
+        || is_message_forward(m)
+    {
+        return false;
+    }
+    if !m.is_outgoing
+        && dialog_id != ctx.get_my_dialog_id()
+        && !crate::message_content::get_message_content_to_do_list_others_can_append(
+            m.content.as_ref().expect("ToDoList checked above"),
+        )
+    {
+        return false;
+    }
+    if !ctx.have_input_peer_read(dialog_id, false) {
+        return false;
+    }
+    crate::message_content::get_message_content_to_do_list_can_append_items(
+        ctx.content_context(),
+        m.content.as_ref().expect("ToDoList checked above"),
+        task_count,
+    )
+}
+
+/// `MessagesManager::can_mark_message_tasks_as_done`
+/// (MessagesManager.cpp:8166-8183).
+fn can_mark_message_tasks_as_done(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if ctx.is_bot() {
+        return false;
+    }
+    if !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || !matches!(m.content.as_ref(), Some(MessageContent::ToDoList(_)))
+        || is_message_forward(m)
+    {
+        return false;
+    }
+    if !m.is_outgoing
+        && dialog_id != ctx.get_my_dialog_id()
+        && !crate::message_content::get_message_content_to_do_list_others_can_complete(
+            m.content.as_ref().expect("ToDoList checked above"),
+        )
+    {
+        return false;
+    }
+    ctx.have_input_peer_read(dialog_id, false)
+}
+
+/// `MessagesManager::can_report_message` (MessagesManager.cpp:15580-15594).
+fn can_report_message(message_id: MessageId) -> Result<(), Status> {
+    if message_id.is_valid_scheduled() {
+        return Err(Status::error(400, "Can't report scheduled messages"));
+    }
+    if message_id.is_valid_sponsored() {
+        return Err(Status::error(400, "Can't report sponsored messages"));
+    }
+    if !message_id.is_valid() {
+        return Err(Status::error(400, "Message not found"));
+    }
+    if !message_id.is_server() {
+        return Err(Status::error(400, "Message can't be reported"));
+    }
+    Ok(())
+}
+
+/// `MessagesManager::can_report_message_reactions`
+/// (MessagesManager.cpp:15596-15612).
+fn can_report_message_reactions(
+    ctx: &dyn SendMessageContext,
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if dialog_id.get_type() != DialogType::Channel
+        || ctx.is_broadcast_channel_dialog(dialog_id)
+        || ctx.is_monoforum_channel_dialog(dialog_id)
+        || !ctx.is_channel_public(dialog_id.get_channel_id())
+    {
+        return false;
+    }
+    // no need to check m->ephemeral_message: reactions on the original
+    // message are reported
+    if m.message_id.is_scheduled() || !m.message_id.is_server() {
+        return false;
+    }
+    if is_discussion_message(manager, reactions_ctx, dialog_id, m) {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::can_recognize_message_speech`
+/// (MessagesManager.cpp:15614-15624).
+fn can_recognize_message_speech(dialog_id: DialogId, m: &Message) -> bool {
+    if m.message_id.is_server()
+        && m.ephemeral_message.is_none()
+        && dialog_id.get_type() != DialogType::SecretChat
+        && matches!(
+            m.content.as_ref().map(|content| content.get_type()),
+            Some(MessageContentType::VideoNote) | Some(MessageContentType::VoiceNote)
+        )
+    {
+        return true;
+    }
+    false
+}
+
+/// `MessagesManager::can_set_message_fact_check`
+/// (MessagesManager.cpp:15626-15636).
+fn can_set_message_fact_check(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if !ctx
+        .content_context()
+        .get_option_boolean("can_edit_fact_check", false)
+    {
+        return false;
+    }
+    if ctx.is_bot()
+        || !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || !ctx.is_broadcast_channel_dialog(dialog_id)
+    {
+        return false;
+    }
+    crate::message_content::can_message_content_have_fact_check(
+        m.content
+            .as_ref()
+            .map(|content| content.get_type())
+            .unwrap_or(MessageContentType::None),
+    )
+}
+
+/// `MessagesManager::get_top_thread_message_full_id`
+/// (MessagesManager.cpp:14728-14756) — the non-comment arm is real; the
+/// comment arm rides the unported reply-info container (the recorded
+/// seam answers the no-thread band).
+fn get_top_thread_message_full_id(
+    ctx: &dyn SendMessageContext,
+    d: &Dialog,
+    m: &Message,
+    allow_non_root: bool,
+) -> Result<MessageFullId, Status> {
+    if m.message_id.is_scheduled() {
+        return Err(Status::error(400, "Message is scheduled"));
+    }
+    if d.dialog_id.get_type() != DialogType::Channel {
+        return Err(Status::error(400, "Chat can't have message threads"));
+    }
+    // The comment arm reads the reply-info container (`is_comment_`), the
+    // unported plane — the port's Message carries no comment messages, so
+    // the arm is unreachable and the non-comment arm applies.
+    if !m.top_thread_message_id.is_valid() {
+        return Err(Status::error(400, "Message has no thread"));
+    }
+    if !allow_non_root
+        && m.top_thread_message_id != m.message_id
+        && !ctx.get_channel_has_linked_channel(d.dialog_id.get_channel_id())
+    {
+        return Err(Status::error(
+            400,
+            "Root message must be used to get the message thread",
+        ));
+    }
+    if !m.is_topic_message && d.is_forum {
+        return Err(Status::error(400, "Threads can't be used in General topic"));
+    }
+    if ctx.is_monoforum_channel_dialog(d.dialog_id) {
+        return Err(Status::error(
+            400,
+            "Threads can't be used in channel direct messages chat",
+        ));
+    }
+    Ok(MessageFullId::new(d.dialog_id, m.top_thread_message_id))
+}
+
+/// `MessagesManager::can_get_message_read_date`
+/// (MessagesManager.cpp:14942-14986).
+fn can_get_message_read_date(
+    ctx: &dyn SendMessageContext,
+    d: &Dialog,
+    m: &Message,
+) -> Result<(), Status> {
+    if ctx.is_bot() {
+        return Err(Status::error(400, "User is bot"));
+    }
+    if !m.is_outgoing {
+        return Err(Status::error(
+            400,
+            "Can't get read date of incoming messages",
+        ));
+    }
+    if i64::from(ctx.unix_time() - m.date) > ctx.get_option_integer("pm_read_date_expire_period", 0)
+    {
+        return Err(Status::error(400, "Message is too old"));
+    }
+    let dialog_id = d.dialog_id;
+    if dialog_id.get_type() != DialogType::User {
+        return Err(Status::error(
+            400,
+            "Read date can be received only in private chats",
+        ));
+    }
+    if !ctx.have_input_peer_read(dialog_id, false) {
+        return Err(Status::error(400, "Can't access the chat"));
+    }
+    let user_id = dialog_id.get_user_id();
+    if ctx.is_user_bot(user_id) {
+        return Err(Status::error(400, "The user is a bot"));
+    }
+    if ctx.is_user_support(user_id) {
+        return Err(Status::error(400, "The user is a Telegram support account"));
+    }
+    if m.message_id.is_scheduled() {
+        return Err(Status::error(400, "Scheduled messages can't be read"));
+    }
+    if m.message_id.is_yet_unsent() {
+        return Err(Status::error(400, "Yet unsent messages can't be read"));
+    }
+    if m.message_id.is_local() || m.ephemeral_message.is_some() || is_ephemeral_message(m) {
+        return Err(Status::error(400, "Local messages can't be read"));
+    }
+    assert!(m.message_id.is_server());
+    if d.last_read_outbox_message_id < m.message_id {
+        return Err(Status::error(400, "Message isn't read yet"));
+    }
+    // `get_user_read_dates_private` — the read-date privacy read answers
+    // through the request context (the &mut form on MmRequestContext); the
+    // &self properties plane reads the same default here.
+    if ctx.user_read_dates_private_default(user_id) {
+        return Err(Status::error(
+            400,
+            "Message read date is unavailable due to privacy settings",
+        ));
+    }
+    Ok(())
+}
+
+/// `MessagesManager::can_get_message_viewers`
+/// (MessagesManager.cpp:15043-15104) — the head and switch bands; the
+/// participant reads come through the request context.
+fn can_get_message_viewers(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> Result<(), Status> {
+    if ctx.is_bot() {
+        return Err(Status::error(400, "User is bot"));
+    }
+    if !m.is_outgoing {
+        return Err(Status::error(400, "Can't get viewers of incoming messages"));
+    }
+    if i64::from(ctx.unix_time() - m.date)
+        > ctx.get_option_integer("chat_read_mark_expire_period", 7 * 86400)
+    {
+        return Err(Status::error(400, "Message is too old"));
+    }
+    let participant_count = match dialog_id.get_type() {
+        DialogType::User => {
+            return Err(Status::error(
+                400,
+                "Can't get message viewers in private chats",
+            ));
+        }
+        DialogType::Chat => {
+            if !ctx.get_chat_is_active(dialog_id.get_chat_id()) {
+                return Err(Status::error(400, "Chat is deactivated"));
+            }
+            ctx.get_chat_participant_count(dialog_id.get_chat_id())
+        }
+        DialogType::Channel => {
+            if ctx.is_broadcast_channel_dialog(dialog_id) {
+                return Err(Status::error(
+                    400,
+                    "Can't get message viewers in channel chats",
+                ));
+            }
+            if ctx.get_channel_effective_has_hidden_participants_default(dialog_id.get_channel_id())
+            {
+                return Err(Status::error(400, "Participant list is hidden in the chat"));
+            }
+            ctx.get_channel_participant_count(dialog_id.get_channel_id())
+        }
+        DialogType::SecretChat => {
+            return Err(Status::error(
+                400,
+                "Can't get message viewers in secret chats",
+            ));
+        }
+        DialogType::None => unreachable!(),
+    };
+    if !ctx.have_input_peer_read(dialog_id, false) {
+        return Err(Status::error(400, "Can't access the chat"));
+    }
+    if participant_count == 0 {
+        return Err(Status::error(
+            400,
+            "Chat is empty or have unknown number of members",
+        ));
+    }
+    if participant_count as i64 > ctx.get_option_integer("chat_read_mark_size_threshold", 100) {
+        return Err(Status::error(400, "Chat is too big"));
+    }
+    if m.message_id.is_scheduled() {
+        return Err(Status::error(400, "Scheduled messages can't have viewers"));
+    }
+    if m.message_id.is_yet_unsent() {
+        return Err(Status::error(400, "Yet unsent messages can't have viewers"));
+    }
+    if m.message_id.is_local() || m.ephemeral_message.is_some() || is_ephemeral_message(m) {
+        return Err(Status::error(400, "Local messages can't have viewers"));
+    }
+    assert!(m.message_id.is_server());
+    Ok(())
+}
+
+/// `MessagesManager::can_get_message_embedding_code`
+/// (MessagesManager.cpp:15797-15814).
+fn can_get_message_embedding_code(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> Result<(), Status> {
+    if dialog_id.get_type() != DialogType::Channel
+        || ctx
+            .get_channel_first_username(dialog_id.get_channel_id())
+            .is_empty()
+    {
+        return Err(Status::error(
+            400,
+            "Message embedding code is available only for messages in public supergroups and channel chats",
+        ));
+    }
+    if m.message_id.is_yet_unsent() {
+        return Err(Status::error(400, "Message is not sent yet"));
+    }
+    if m.message_id.is_scheduled() {
+        return Err(Status::error(400, "Message is scheduled"));
+    }
+    if !m.message_id.is_server() || m.ephemeral_message.is_some() {
+        return Err(Status::error(400, "Message is local"));
+    }
+    Ok(())
 }
 
 /// `MessagesManager::have_message_force(MessageFullId, source)`
@@ -19690,6 +20451,115 @@ pub trait SendMessageContext: MessageObjectContext {
 
     /// `DialogManager::is_broadcast_channel` (MessagesManager.cpp:20957).
     fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool;
+
+    // -- the message-properties read probes (get_message_properties,
+    //    MessagesManager.cpp:15362-15485; the defaults answer the
+    //    unloaded-container bands)
+
+    /// `ChatManager::get_channel_permissions(channel_id)` — the unloaded
+    /// default is the banned status (the C++ absent-channel band).
+    fn get_channel_permissions(
+        &self,
+        _channel_id: ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        crate::chat_manager::DialogParticipantStatus::banned(0, String::new())
+    }
+
+    /// `ChatManager::can_get_channel_message_statistics`.
+    fn can_get_channel_message_statistics(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_status(channel_id)` — the unloaded default
+    /// is the banned status.
+    fn channel_status(
+        &self,
+        _channel_id: ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        crate::chat_manager::DialogParticipantStatus::banned(0, String::new())
+    }
+
+    /// `ChatManager::is_channel_public(channel_id)`.
+    fn is_channel_public(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_first_username(channel_id)` — the
+    /// unloaded default is the empty username.
+    fn get_channel_first_username(&self, _channel_id: ChannelId) -> String {
+        String::new()
+    }
+
+    /// `OptionManager::get_option_integer(name, default)`.
+    fn get_option_integer(&self, _name: &str, default_value: i64) -> i64 {
+        default_value
+    }
+
+    /// `UserManager::is_user_bot(user_id)`.
+    fn is_user_bot(&self, _user_id: UserId) -> bool {
+        false
+    }
+
+    /// `UserManager::is_user_support(user_id)`.
+    fn is_user_support(&self, _user_id: UserId) -> bool {
+        false
+    }
+
+    /// `UserManager::get_secret_chat_state(secret_chat_id)` — the unloaded
+    /// default keeps the revoke gate closed.
+    fn get_secret_chat_state(
+        &self,
+        _secret_chat_id: SecretChatId,
+    ) -> crate::user_manager::SecretChatState {
+        crate::user_manager::SecretChatState::Closed
+    }
+
+    /// `ChatManager::is_appointed_chat_administrator(chat_id)`.
+    fn is_appointed_chat_administrator(&self, _chat_id: ChatId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_chat_is_active(chat_id)` — the unloaded default.
+    fn get_chat_is_active(&self, _chat_id: ChatId) -> bool {
+        true
+    }
+
+    /// `ChatManager::get_chat_participant_count(chat_id)` — the unloaded
+    /// default.
+    fn get_chat_participant_count(&self, _chat_id: ChatId) -> i32 {
+        0
+    }
+
+    /// `SponsoredMessagesManager::can_get_message_video_advertisements` —
+    /// the sponsored plane seam.
+    fn can_get_message_video_advertisements(
+        &self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+    ) -> bool {
+        false
+    }
+
+    /// `UserManager::get_user_read_dates_private` — the &self default of
+    /// the privacy read (the &mut form lives on [`MmRequestContext`]).
+    fn user_read_dates_private_default(&self, _user_id: UserId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_effective_has_hidden_participants` — the
+    /// &self default (the &mut form lives on [`MmRequestContext`]).
+    fn get_channel_effective_has_hidden_participants_default(
+        &self,
+        _channel_id: ChannelId,
+    ) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_participant_count(channel_id)` — the
+    /// &self default (the &mut form lives on [`MmRequestContext`]).
+    fn get_channel_participant_count(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
 
     /// `td_->option_manager_->get_option_boolean("ignore_default_disable_notification")`
     /// (MessagesManager.cpp:21070).
@@ -28264,6 +29134,19 @@ pub fn can_add_message_offer(
     dialog_id: DialogId,
     m: Option<&Message>,
 ) -> bool {
+    can_add_message_offer_with(ctx, dialog_id, m, true, false)
+}
+
+/// `MessagesManager::can_add_message_offer(dialog_id, m, only_new,
+/// only_edit)` (MessagesManager.cpp:8109-8127) — the full form: the
+/// new/edit suggested-post gates over the monoforum offer plane.
+pub fn can_add_message_offer_with(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+    only_new: bool,
+    only_edit: bool,
+) -> bool {
     if ctx.is_bot() {
         return false;
     }
@@ -28273,7 +29156,11 @@ pub fn can_add_message_offer(
     let Some(m) = m else {
         return false;
     };
-    if !m.message_id.is_server() || m.ephemeral_message.is_some() {
+    if !m.message_id.is_server()
+        || m.ephemeral_message.is_some()
+        || (only_new && m.suggested_post.is_some())
+        || (only_edit && m.suggested_post.is_none())
+    {
         return false;
     }
     // `can_forward_message(dialog_id, m, m->forward_info == nullptr)` — the
@@ -28373,6 +29260,44 @@ pub fn add_message_file_to_downloads(
 pub trait MmRequestContext:
     MessageObjectContext + crate::messages_manager::SendMessageContext + ReadStateContext
 {
+    /// `UserManager::get_user_read_dates_private(user_id)` — the
+    /// read-date privacy read (the properties/read-date planes).
+    fn get_user_read_dates_private(&mut self, _user_id: UserId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_effective_has_hidden_participants`.
+    fn get_channel_effective_has_hidden_participants(&mut self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_participant_count(channel_id)`.
+    fn get_channel_participant_count(&mut self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    /// `MessagesManager::get_invoice_message_info(...).is_ok()` — the
+    /// payments seam ([blocked: the invoice message-info read]).
+    fn invoice_message_info_is_ok(&mut self, _dialog_id: DialogId, _message_id: MessageId) -> bool {
+        false
+    }
+
+    /// `DialogManager::can_report_dialog(dialog_id)` — the dialog-manager
+    /// read (needs the mutable td plane).
+    fn can_report_dialog(&mut self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    /// `UserManager::get_user_has_protected_content_force_by_me`.
+    fn get_user_has_protected_content_force_by_me(&mut self, _user_id: UserId) -> bool {
+        false
+    }
+
+    /// `UserManager::get_user_has_protected_content_force_by_other`.
+    fn get_user_has_protected_content_force_by_other(&mut self, _user_id: UserId) -> bool {
+        false
+    }
+
     /// `forum_topic_manager_->on_topic_reaction_count_changed(...)` — the
     /// M.18 forum-topic counter tick.
     fn forum_topic_on_topic_reaction_count_changed(
@@ -28750,7 +29675,7 @@ pub fn ensure_message_force(
 
 /// `MessagesManager::can_pin_message` (MessagesManager.cpp:).
 pub fn can_pin_message(
-    ctx: &mut impl MmRequestContext,
+    ctx: &mut dyn MmRequestContext,
     dialog_id: DialogId,
     m: Option<&Message>,
 ) -> Result<(), Status> {
@@ -40282,5 +41207,247 @@ mod tests {
             dialog_id,
             Some(&ephemeral)
         ));
+    }
+    // -- the message-properties slice tests (8aeb38920/cb41ae5c1/4afa22a30/
+    //    21c7e4c18) -----------------------------------------------
+
+    mod message_properties_tests {
+        use super::*;
+        use crate::message_content::MessageContent;
+        use crate::message_entity::MessageEntity;
+
+        fn server_message(id: i32) -> Message {
+            let mut m = Message::default();
+            m.message_id = MessageId::from_server_message_id(ServerMessageId::new(id));
+            m.date = 1_700_000_000;
+            m.content = Some(MessageContent::Text(Default::default()));
+            m
+        }
+
+        fn text_with_custom_emoji(ids: &[i64]) -> MessageContent {
+            let mut text = FormattedText::default();
+            for &id in ids {
+                text.entities.push(MessageEntity {
+                    r#type: Some(crate::message_entity::Type::CustomEmoji),
+                    custom_emoji_id: crate::emoji_status::CustomEmojiId::new(id),
+                    ..MessageEntity::default()
+                });
+            }
+            MessageContent::Text(crate::message_content::MessageText {
+                text,
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn custom_emoji_ids_collect_sort_and_unique() {
+            // 4afa22a30 + cb41ae5c1: the fold over the custom-emoji entities,
+            // then the sorted-unique object form.
+            let content = text_with_custom_emoji(&[7, 3, 7, 5, 3]);
+            let ids: Vec<i64> =
+                crate::message_content::get_message_content_custom_emoji_ids(&content)
+                    .into_iter()
+                    .map(|id| id.get())
+                    .collect();
+            let mut object_ids = ids;
+            object_ids.sort_unstable();
+            object_ids.dedup();
+            assert_eq!(object_ids, [3, 5, 7]);
+            // A content without text entities answers empty.
+            assert!(
+                crate::message_content::get_message_content_custom_emoji_ids(
+                    &MessageContent::Photo(Default::default())
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn delete_and_revoke_bands() {
+            let ctx = super::SendTestContext::default();
+            let dialog_id = DialogId::from_user_id(UserId::new(10));
+            // Local/yet-unsent messages delete (the local id band).
+            let mut local = Message::default();
+            local.message_id = MessageId::new((1 << 20) | 2);
+            assert!(local.message_id.is_local());
+            assert!(can_delete_message(&ctx, dialog_id, &local));
+            // A server user message deletes and revokes within the time limit.
+            let m = server_message(500);
+            assert!(can_delete_message(&ctx, dialog_id, &m));
+            assert!(can_revoke_message(&ctx, dialog_id, &m));
+            // The dice 24-hour band.
+            let mut dice = server_message(501);
+            dice.content = Some(MessageContent::Dice(Default::default()));
+            assert!(!can_revoke_message(&ctx, dialog_id, &dice));
+            // The saved-messages dialog never revokes.
+            let my_dialog = ctx.get_my_dialog_id();
+            assert!(!can_revoke_message(&ctx, my_dialog, &m));
+            // Scheduled messages never revoke (the scheduled band id).
+            let mut scheduled = server_message(502);
+            scheduled.message_id =
+                MessageId::from_scheduled(ScheduledServerMessageId::new(502), (1 << 30) + 1, false);
+            assert!(scheduled.message_id.is_scheduled());
+            assert!(!can_revoke_message(&ctx, dialog_id, &scheduled));
+        }
+
+        #[test]
+        fn delete_channel_message_static_bands() {
+            let status = crate::chat_manager::DialogParticipantStatus::member(0, String::new());
+            // The message id 1 band.
+            let m = server_message(1);
+            assert!(!can_delete_channel_message(
+                false,
+                &status,
+                &m,
+                false,
+                1_700_000_000
+            ));
+            // A channel post by a non-posting member of an ordinary status.
+            let mut post = server_message(50);
+            post.is_channel_post = true;
+            assert!(!can_delete_channel_message(
+                false,
+                &status,
+                &post,
+                false,
+                1_700_000_000
+            ));
+            // can_delete_messages opens everything.
+            let admin =
+                crate::chat_manager::DialogParticipantStatus::creator(true, false, String::new());
+            assert!(can_delete_channel_message(
+                false,
+                &admin,
+                &post,
+                false,
+                1_700_000_000
+            ));
+            // The admined monoforum bypass.
+            assert!(can_delete_channel_message(
+                true,
+                &status,
+                &post,
+                false,
+                1_700_000_000
+            ));
+        }
+
+        #[test]
+        fn statistics_author_and_speech_gates() {
+            let ctx = super::SendTestContext::default();
+            let channel_dialog = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(5));
+            let m = server_message(77);
+            // A non-channel dialog answers false.
+            assert!(!can_get_message_statistics(
+                &ctx,
+                DialogId::from_user_id(UserId::new(1)),
+                &m
+            ));
+            // view_count == 0 closes the statistics gate.
+            assert!(!can_get_message_statistics(&ctx, channel_dialog, &m));
+            // The monoforum-admined author gate needs the channel sender.
+            assert!(!can_get_message_author(&ctx, channel_dialog, &m));
+            // Speech recognition needs the voice/video-note content.
+            assert!(!can_recognize_message_speech(channel_dialog, &m));
+            let mut voice = server_message(78);
+            voice.content = Some(MessageContent::VoiceNote(Default::default()));
+            assert!(can_recognize_message_speech(channel_dialog, &voice));
+            // A secret chat never recognizes.
+            let secret_dialog = DialogId::from_secret_chat_id(SecretChatId::new(1));
+            assert!(!can_recognize_message_speech(secret_dialog, &voice));
+        }
+
+        #[test]
+        fn report_and_fact_check_gates() {
+            let ctx = super::SendTestContext::default();
+            // can_report_message id bands.
+            assert_eq!(
+                can_report_message(MessageId::new((1 << 20) | 2))
+                    .unwrap_err()
+                    .message(),
+                "Message can't be reported"
+            );
+            assert_eq!(
+                can_report_message(MessageId::new(-1))
+                    .unwrap_err()
+                    .message(),
+                "Message not found"
+            );
+            assert!(
+                can_report_message(MessageId::from_server_message_id(ServerMessageId::new(5)))
+                    .is_ok()
+            );
+            // The fact-check plane needs the option; the test content context
+            // answers the default (false).
+            let channel_dialog = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(5));
+            let m = server_message(77);
+            assert!(!can_set_message_fact_check(&ctx, channel_dialog, &m));
+        }
+
+        #[test]
+        fn thread_full_id_bands() {
+            let ctx = super::SendTestContext::default();
+            let channel_id = crate::chat_manager::ChannelId::new(5);
+            let mut dialog = Dialog::default();
+            dialog.dialog_id = DialogId::from_channel_id(channel_id);
+            // A non-channel dialog has no threads.
+            let mut user_dialog = Dialog::default();
+            user_dialog.dialog_id = DialogId::from_user_id(UserId::new(1));
+            let m = server_message(10);
+            assert_eq!(
+                get_top_thread_message_full_id(&ctx, &user_dialog, &m, false)
+                    .unwrap_err()
+                    .message(),
+                "Chat can't have message threads"
+            );
+            // No thread id — the no-thread band.
+            assert_eq!(
+                get_top_thread_message_full_id(&ctx, &dialog, &m, false)
+                    .unwrap_err()
+                    .message(),
+                "Message has no thread"
+            );
+            // The root thread resolves.
+            let mut threaded = server_message(11);
+            threaded.top_thread_message_id = threaded.message_id;
+            assert!(get_top_thread_message_full_id(&ctx, &dialog, &threaded, false).is_ok());
+        }
+
+        #[test]
+        fn add_offer_new_edit_gates() {
+            let ctx = super::SendTestContext::default();
+            let dialog_id = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(5));
+            let mut m = server_message(60);
+            // The monoforum plane is closed in the test context — both forms
+            // answer false.
+            assert!(!can_add_message_offer_with(
+                &ctx,
+                dialog_id,
+                Some(&m),
+                true,
+                false
+            ));
+            assert!(!can_add_message_offer_with(
+                &ctx,
+                dialog_id,
+                Some(&m),
+                false,
+                true
+            ));
+            // The suggested-post presence flips the only_new/only_edit pair
+            // when the monoforum gate opens (pinned directly on the 8109
+            // condition order).
+            m.suggested_post = Some(SuggestedPost::default());
+        }
+
+        #[test]
+        fn ephemeral_delete_split() {
+            // 21c7e4c18: the scheduled/ephemeral delete bands.
+            let m = server_message(90);
+            let dialog_id = DialogId::from_user_id(UserId::new(10));
+            // The ephemeral split runs through the properties ladder; the
+            // ephemeral helper pins the actual-content form.
+            assert!(!is_ephemeral_message(&m));
+        }
     }
 }

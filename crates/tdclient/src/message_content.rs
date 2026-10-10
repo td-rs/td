@@ -314,6 +314,15 @@ pub fn get_expired_message_content_type(content_type: MessageContentType) -> Mes
     }
 }
 
+/// `can_message_content_have_fact_check` (MessageContentType.cpp:402-414).
+pub fn can_message_content_have_fact_check(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    matches!(
+        content_type,
+        Animation | Audio | Document | Photo | RichText | Text | Video
+    )
+}
+
 /// `can_send_message_content_to_secret_chat` (MessageContentType.cpp:1019-1121).
 /// The C++ third group — `None`, the service types, `Unsupported` and the
 /// expired types — is `default: UNREACHABLE()`: those contents are never
@@ -9180,6 +9189,25 @@ pub fn get_message_content_group_call_info(content: &MessageContent) -> (InputGr
         MessageContent::GroupCall(m) => (m.input_group_call_id, m.duration >= 0),
         _ => unreachable!(),
     }
+}
+
+/// `get_message_content_custom_emoji_ids` (MessageContent.cpp:7018-7033,
+/// 4afa22a30) — the custom-emoji entities of the content's text; the
+/// RichMessage arm rides the unmodeled RichMessage machinery (the
+/// recorded Wave-2 seam — a non-rich content answers the text arm only,
+/// and the rich types carry no text arm either way).
+pub fn get_message_content_custom_emoji_ids(
+    content: &MessageContent,
+) -> Vec<crate::emoji_status::CustomEmojiId> {
+    let mut custom_emoji_ids = Vec::new();
+    if let Some(text) = get_message_content_text(content) {
+        for entity in &text.entities {
+            if entity.r#type == Some(crate::message_entity::Type::CustomEmoji) {
+                custom_emoji_ids.push(entity.custom_emoji_id);
+            }
+        }
+    }
+    custom_emoji_ids
 }
 
 /// `get_formatted_text_user_ids` (MessageContent.cpp:6883-6895).

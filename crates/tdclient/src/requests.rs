@@ -14617,10 +14617,6 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let _promise =
                 td.deferred_promise::<td_api::FoundMessages, _>(id, Object::foundMessages);
         }
-        Function::getMessageProperties(_) => {
-            let _promise =
-                td.deferred_promise::<td_api::MessageProperties, _>(id, Object::messageProperties);
-        }
         Function::getMessageReadDate(_) => {
             if !check_is_user(td, id) {
                 return;
@@ -16016,6 +16012,35 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
         // pure-server query remainder, in Requests.cpp function order.
         // The validation halves answer byte-parity offline; the net/db
         // tails stay [blocked: net] / seam per arm ---
+        Function::getMessageProperties(request) => {
+            // Requests.cpp:2662-2665 → MessagesManager.cpp:15362-15485 (no
+            // CHECK_IS_USER in the C++) — the full flag ladder over the
+            // can_* gates, the delete bands and the sorted-unique
+            // custom-emoji fold (8aeb38920/cb41ae5c1/21c7e4c18).
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            let promise =
+                td.deferred_promise::<td_api::MessageProperties, _>(id, Object::messageProperties);
+            let manager = std::mem::take(&mut td.messages_manager);
+            let td_ptr = std::ptr::from_mut(td);
+            // SAFETY: the ctx/state/reactions views alias one Td and are
+            // used strictly sequentially inside the callee (the
+            // split_context_alias contract).
+            let ctx: &mut dyn crate::messages_manager::MmRequestContext = unsafe { &mut *td_ptr };
+            let state: &dyn crate::messages_manager::ReadStateContext = unsafe { &*td_ptr };
+            let reactions_ctx =
+                crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
+            crate::messages_manager::get_message_properties_request(
+                ctx,
+                &manager,
+                &reactions_ctx,
+                state,
+                dialog_id,
+                message_id,
+                promise,
+            );
+            td.messages_manager = manager;
+        }
         Function::getPollOptionProperties(request) => {
             // Requests.cpp:2666-2670 → MessagesManager.cpp:15499-15516
             // (no CHECK_IS_USER in the C++)
