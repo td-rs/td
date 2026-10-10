@@ -636,7 +636,9 @@ impl NetQueryDispatcher {
         for prefix in ["PHONE_MIGRATE_", "NETWORK_MIGRATE_", "USER_MIGRATE_"] {
             if let Some(new_main_dc_id) = parse_suffix(&error_message, prefix) {
                 self.set_main_dc_id(new_main_dc_id);
-                if !net_query.dc_id().is_main() {
+                // 6354c9897 — an invalid new main DC keeps the query on its
+                // current DC (the resend-to-self branch).
+                if !net_query.dc_id().is_main() && DcId::is_valid_raw(new_main_dc_id) {
                     net_query.resend(DcId::internal(new_main_dc_id));
                 } else {
                     net_query.resend(net_query.dc_id());
@@ -795,4 +797,88 @@ fn parse_suffix(message: &str, prefix: &str) -> Option<i32> {
         .split(|c: char| !c.is_ascii_digit())
         .next()
         .and_then(|digits| digits.parse::<i32>().ok())
+}
+
+#[cfg(test)]
+mod try_fix_migrate_tests {
+    use super::*;
+
+    struct NoopTdSink;
+    impl TdSink for NoopTdSink {
+        fn on_result(&mut self, _query: NetQuery) {}
+    }
+    struct NoopDcInit;
+    impl DcInitSink for NoopDcInit {
+        fn init_dc(&mut self, _dc_id: DcId) -> bool {
+            true
+        }
+        fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+    }
+
+    fn migrate_query(error_message: &str) -> NetQuery {
+        let mut query = NetQuery::new(
+            1,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::On,
+            0,
+            Vec::new(),
+            2,
+            60,
+        );
+        query.set_error(Status::error(303, error_message));
+        query
+    }
+
+    /// 6354c9897 — an invalid `new_main_dc_id` keeps the query on its
+    /// current DC instead of resending into the bogus band; the valid
+    /// band resends to the migrated DC.
+    #[test]
+    fn invalid_new_main_dc_resends_to_self() {
+        use std::sync::{Arc, Mutex};
+        // The invalid band: the query leaves through the session sink on
+        // its own DC (the resend-to-self of 6354c9897).
+        struct RecordingSink(Arc<Mutex<Vec<(i32, u32)>>>);
+        impl SessionSink for RecordingSink {
+            fn send(&mut self, dc_id: DcId, _query_type: NetQueryType, query: NetQuery) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((dc_id.get_raw_id(), query.resend_count()));
+            }
+        }
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = NetQueryDispatcher::new(
+            Box::new(RecordingSink(recorded.clone())),
+            Box::new(NoopTdSink),
+            Box::new(NoopDcInit),
+        );
+        let mut query = migrate_query("PHONE_MIGRATE_999999");
+        // Pin the query to DC 1 so the invalid new-main DC would otherwise
+        // drag it into the bogus band.
+        query.resend(DcId::internal(1));
+        query.set_error(Status::error(303, "PHONE_MIGRATE_999999"));
+        dispatcher.dispatch(query);
+        let sent = recorded.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 1, "the invalid DC keeps the query on DC 1");
+        assert_eq!(sent[0].1, 2, "the resend-to-self counted");
+
+        // The valid band: the query migrates to DC 2.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = NetQueryDispatcher::new(
+            Box::new(RecordingSink(recorded.clone())),
+            Box::new(NoopTdSink),
+            Box::new(NoopDcInit),
+        );
+        let mut query = migrate_query("PHONE_MIGRATE_2");
+        query.resend(DcId::internal(1));
+        query.set_error(Status::error(303, "PHONE_MIGRATE_2"));
+        dispatcher.dispatch(query);
+        let sent = recorded.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 2, "the query migrates to DC 2");
+        assert_eq!(sent[0].1, 2, "the resend counted");
+    }
 }
