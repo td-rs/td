@@ -13,6 +13,9 @@ pub mod e2e_api {
     include!("generated/e2e_api.rs");
 }
 
+/// The `tde2e_core` key-management subset (see the module docs).
+pub mod keychain;
+
 #[cfg(test)]
 mod tests {
     use super::e2e_api;
