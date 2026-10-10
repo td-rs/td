@@ -2543,7 +2543,7 @@ enum PendingNetKind {
 /// `on_failed_get_difference`/`on_get_updates_state`/
 /// `on_failed_get_updates_state`/`on_server_pong`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpdatesNetKind {
+pub(crate) enum UpdatesNetKind {
     GetDifference,
     GetUpdatesState,
     ConfirmPtsQts,
@@ -2554,30 +2554,41 @@ enum UpdatesNetKind {
     Ping,
 }
 
-/// The cloned dispatch surface the [`TdUpdatesEnv`] senders use (the env
-/// is a field-split view over `&mut Td`, so the trio rides as owned
-/// Arcs). The C++ shape is `td_->create_handler<…>()->send(...)`: the
-/// query serializes onto the main-DC auth dispatch and the answer comes
-/// back through the callback.
+/// The kind tag riding a per-family dispatcher callback — the completed
+/// answers park under their kind and the `Td` drain routes them.
+pub(crate) trait NetAnswerKind: Copy + Send + 'static {}
+
+impl<T: Copy + Send + 'static> NetAnswerKind for T {}
+
+/// The cloned per-kind dispatch surface the env senders use (the env is
+// a view over `&mut Td`, so the trio rides as owned Arcs). The C++ shape
+/// is `td_->create_handler<…>()->send(...)`: the query serializes onto
+/// the main-DC auth dispatch and the answer comes back through the
+/// callback into the per-kind completed queue.
 #[derive(Clone)]
-pub(crate) struct UpdatesNetHandle {
+pub(crate) struct NetKindHandle<K: NetAnswerKind> {
     dispatcher: Arc<NetQueryDispatcher>,
-    completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
+    completed: Arc<Mutex<Vec<(K, NetQuery)>>>,
     /// The actor wake — `None` in the net-inert tests.
     shared: Option<Arc<NetShared>>,
 }
 
-impl UpdatesNetHandle {
-    /// Serialize + dispatch one updates query (the session prepends the
-    /// shared `MtprotoHeader`; the NetQueryCreator defaults ride like the
+impl<K: NetAnswerKind> NetKindHandle<K> {
+    /// Serialize + dispatch one query (the session prepends the shared
+    /// `MtprotoHeader`; the NetQueryCreator defaults ride like the
     /// walking-skeleton dispatch — DcId::main, the 24-hour budget).
-    fn dispatch(&self, kind: UpdatesNetKind, function: telegram_api::Function) {
+    fn dispatch(&self, kind: K, function: telegram_api::Function) {
+        self.dispatch_dc(kind, function, DcId::main());
+    }
+
+    /// The per-DC form — `create(function, {}, dc_id)`.
+    fn dispatch_dc(&self, kind: K, function: telegram_api::Function, dc_id: DcId) {
         let mut bytes = Vec::new();
         function.store(&mut bytes);
         let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
         let net_query = NetQuery::new(
             0,
-            DcId::main(),
+            dc_id,
             NetQueryType::Common,
             AuthFlag::On,
             GzipFlag::Off,
@@ -2588,7 +2599,7 @@ impl UpdatesNetHandle {
         );
         self.dispatcher.dispatch_with_callback(
             net_query,
-            Box::new(UpdatesNetDispatchCallback {
+            Box::new(NetKindDispatchCallback {
                 kind,
                 completed: Arc::clone(&self.completed),
                 shared: self.shared.clone(),
@@ -2597,17 +2608,17 @@ impl UpdatesNetHandle {
     }
 }
 
-/// The dispatcher callback for the updates queries: files the completed
+/// The dispatcher callback for the per-kind queries: files the completed
 /// `NetQuery` under its kind and nudges the `Td` actor; the nudge drains
-/// the answers through [`Td::dispatch_completed_updates_net`].
-struct UpdatesNetDispatchCallback {
-    kind: UpdatesNetKind,
-    completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
+/// the answers through the per-family `dispatch_completed_*` method.
+struct NetKindDispatchCallback<K: NetAnswerKind> {
+    kind: K,
+    completed: Arc<Mutex<Vec<(K, NetQuery)>>>,
     /// The actor wake — `None` in the net-inert tests.
     shared: Option<Arc<NetShared>>,
 }
 
-impl NetQueryCallback for UpdatesNetDispatchCallback {
+impl<K: NetAnswerKind> NetQueryCallback for NetKindDispatchCallback<K> {
     fn on_result(&mut self, query: NetQuery) {
         self.completed.lock().push((self.kind, query));
         if let Some(shared) = &self.shared {
@@ -2615,6 +2626,11 @@ impl NetQueryCallback for UpdatesNetDispatchCallback {
         }
     }
 }
+
+/// The cloned dispatch surface the [`TdUpdatesEnv`] senders use — the
+/// per-kind handle over the UpdatesManager query kinds; the answers
+/// drain through [`Td::dispatch_completed_updates_net`].
+type UpdatesNetHandle = NetKindHandle<UpdatesNetKind>;
 
 /// The TonWalletManager in-flight query kinds — the C++ ResultHandler
 /// classes of TonWalletManager.cpp:47-1240. The payload-carrying
@@ -2704,68 +2720,36 @@ enum TonWalletNetKind {
 }
 
 /// The cloned ton-wallet dispatch surface the [`TonWalletEnv`] senders
-/// use — the C++ `td_->create_handler<…>()->send(...)` shape: the query
-/// serializes onto the dispatch and the answer comes back through the
-/// callback into [`Td::on_ton_wallet_net_answer`].
-struct TonWalletNetHandle {
-    dispatcher: Arc<NetQueryDispatcher>,
-    completed: Arc<Mutex<Vec<(TonWalletNetKind, NetQuery)>>>,
-    /// The actor wake — `None` in the net-inert tests.
-    shared: Option<Arc<NetShared>>,
+/// use — the per-kind handle over the TonWalletManager query kinds; the
+/// answers drain through [`Td::on_ton_wallet_net_answer`].
+type TonWalletNetHandle = NetKindHandle<TonWalletNetKind>;
+
+/// The CommunityManager in-flight query kinds — the C++ ResultHandler
+/// classes of CommunityManager.cpp:48-260.
+#[derive(Clone, Copy)]
+enum CommunityNetKind {
+    /// `GetCommunitiesQuery` (cpp:48) — reserved for the get-community
+    /// cache-load plane (no ported flow dispatches it yet).
+    #[allow(dead_code)]
+    GetCommunities,
+    /// `GetFullCommunityQuery` (cpp:83) — reserved for the community-full
+    /// cache-load plane (no ported flow dispatches it yet).
+    #[allow(dead_code)]
+    GetFullCommunity,
+    /// `CreateCommunityQuery` (cpp:120) — the error ladder's
+    /// `on_get_dialog_error` keys on the request dialog.
+    CreateCommunity { dialog_id: DialogId },
+    /// `EditCommunityTitleQuery` (cpp:163).
+    EditTitle,
+    /// `EditCommunityDefaultBannedRightsQuery` (cpp:197).
+    EditDefaultBannedRights,
+    /// `DeleteCommunityQuery` (cpp:231).
+    DeleteCommunity,
 }
 
-impl TonWalletNetHandle {
-    /// Serialize + dispatch one ton-wallet query on the main DC (the
-    /// NetQueryCreator defaults ride like the updates dispatch).
-    fn dispatch(&self, kind: TonWalletNetKind, function: telegram_api::Function) {
-        self.dispatch_dc(kind, function, DcId::main());
-    }
-
-    /// The per-DC form — `create(function, {}, dc_id)` (the secret-phrase
-    /// part fetch) and the webfile-DC toncenter request.
-    fn dispatch_dc(&self, kind: TonWalletNetKind, function: telegram_api::Function, dc_id: DcId) {
-        let mut bytes = Vec::new();
-        function.store(&mut bytes);
-        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let net_query = NetQuery::new(
-            0,
-            dc_id,
-            NetQueryType::Common,
-            AuthFlag::On,
-            GzipFlag::Off,
-            tl_constructor,
-            bytes,
-            u32::MAX,
-            60 * 60 * 24,
-        );
-        self.dispatcher.dispatch_with_callback(
-            net_query,
-            Box::new(TonWalletNetDispatchCallback {
-                kind,
-                completed: Arc::clone(&self.completed),
-                shared: self.shared.clone(),
-            }),
-        );
-    }
-}
-
-/// The dispatcher callback for the ton-wallet queries: files the
-/// completed `NetQuery` under its kind and nudges the `Td` actor.
-struct TonWalletNetDispatchCallback {
-    kind: TonWalletNetKind,
-    completed: Arc<Mutex<Vec<(TonWalletNetKind, NetQuery)>>>,
-    /// The actor wake — `None` in the net-inert tests.
-    shared: Option<Arc<NetShared>>,
-}
-
-impl NetQueryCallback for TonWalletNetDispatchCallback {
-    fn on_result(&mut self, query: NetQuery) {
-        self.completed.lock().push((self.kind, query));
-        if let Some(shared) = &self.shared {
-            shared.wake_td();
-        }
-    }
-}
+/// The cloned community dispatch surface the [`CommunityEnv`] senders
+/// use — the answers drain through [`Td::on_community_net_answer`].
+type CommunityNetHandle = NetKindHandle<CommunityNetKind>;
 
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
@@ -2786,6 +2770,45 @@ impl tdutils::promise::PromiseInterface<()> for TransferResultChain {
     fn set_error(&mut self, error: Status) {
         if let Some(mut promise) = self.promise.take() {
             promise.set_error(error);
+        }
+    }
+}
+
+/// The `finish_create_community` re-entry queue — the promise chain
+/// parks the (community id, popped create promise) pair for the routing
+/// frame's manager hop.
+type FinishCreateQueue = Arc<
+    Mutex<
+        Vec<(
+            crate::community_id::CommunityId,
+            Promise<td_api::CommunityId>,
+        )>,
+    >,
+>;
+
+/// The `CreateCommunityQuery` promise chain (CommunityManager.cpp:146-153):
+/// the updates processing completes into the queued
+/// `finish_create_community` re-entry with the popped create promise
+/// (the C++ `send_closure` hop — the queue decouples the promise
+/// interface from the manager borrow).
+struct FinishCreateCommunityChain {
+    community_id: crate::community_id::CommunityId,
+    promise: Option<Promise<td_api::CommunityId>>,
+    finish_queue: FinishCreateQueue,
+}
+
+impl tdutils::promise::PromiseInterface<()> for FinishCreateCommunityChain {
+    fn set_value(&mut self, _value: ()) {
+        if let Some(promise) = self.promise.take() {
+            self.finish_queue.lock().push((self.community_id, promise));
+        }
+    }
+
+    fn set_error(&mut self, _error: Status) {
+        // The C++ lambda ignores the updates-processing error and still
+        // finishes with the community id.
+        if let Some(promise) = self.promise.take() {
+            self.finish_queue.lock().push((self.community_id, promise));
         }
     }
 }
@@ -3330,6 +3353,9 @@ pub struct Td {
     /// The callback-parked TonWalletManager query answers, parked by
     /// kind (the `Td::on_ton_wallet_net_answer` drain).
     ton_wallet_net_completed: Arc<Mutex<Vec<(TonWalletNetKind, NetQuery)>>>,
+    /// The callback-parked CommunityManager query answers, parked by
+    /// kind (the `Td::on_community_net_answer` drain).
+    community_net_completed: Arc<Mutex<Vec<(CommunityNetKind, NetQuery)>>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -3747,6 +3773,7 @@ impl Td {
             net_completed: Arc::new(Mutex::new(Vec::new())),
             updates_net_completed: Arc::new(Mutex::new(Vec::new())),
             ton_wallet_net_completed: Arc::new(Mutex::new(Vec::new())),
+            community_net_completed: Arc::new(Mutex::new(Vec::new())),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -5889,6 +5916,7 @@ impl Td {
     pub(crate) fn dispatch_completed_walking(&mut self) {
         self.dispatch_completed_updates_net();
         self.dispatch_completed_ton_wallet_net();
+        self.dispatch_completed_community_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -5916,6 +5944,16 @@ impl Td {
         Some(TonWalletNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.ton_wallet_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned community dispatch surface for the [`CommunityEnv`]
+    /// senders — `None` keeps the net-inert posture.
+    fn community_net(&self) -> Option<CommunityNetHandle> {
+        Some(CommunityNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.community_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -6955,6 +6993,196 @@ impl Td {
                 let mut env = TonWalletEnv { td: &mut *self };
                 manager.on_get_backup_holder_dcs(&mut env, dcs);
                 self.ton_wallet_manager = manager;
+            }
+        }
+    }
+
+    /// Drain the callback-parked CommunityManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves (CommunityManager.cpp:
+    /// 48-260).
+    fn dispatch_completed_community_net(&mut self) {
+        let completed = std::mem::take(&mut *self.community_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_community_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one CommunityManager net answer by kind (the C++ query
+    /// handler halves of CommunityManager.cpp:48-260).
+    fn on_community_net_answer(&mut self, kind: CommunityNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        /// The `CHAT_NOT_MODIFIED && !is_bot` value band the rename and
+        /// permissions error arms share (CommunityManager.cpp:189-196,
+        /// 224-229).
+        fn chat_not_modified(promise: &mut Promise<()>, status: &Status, is_bot: bool) -> bool {
+            if status.message() == "CHAT_NOT_MODIFIED" && !is_bot {
+                promise.set_value(());
+                return true;
+            }
+            false
+        }
+        match kind {
+            // `CreateCommunityQuery` (cpp:120-161): the Updates answer's
+            // community id chains behind `on_get_updates` into
+            // `finish_create_community`.
+            CommunityNetKind::CreateCommunity { dialog_id } => {
+                let promise = self
+                    .community_manager
+                    .parked_create_promises
+                    .drain(..)
+                    .next();
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        dialog_id,
+                        &status,
+                        "CreateCommunityQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => {
+                        let community_id = crate::updates_manager::get_community_id(&updates)
+                            .filter(|id| crate::community_id::CommunityId::new(*id).is_valid());
+                        let Some(community_id) = community_id else {
+                            // The C++ `set_value(nullptr)` band — the
+                            // zero id is the null object form.
+                            return promise.set_value(td_api::CommunityId { id: 0 });
+                        };
+                        let community_id = crate::community_id::CommunityId::new(community_id);
+                        // The `send_closure(G()->community_manager(),
+                        // finish_create_community)` chain — the finish
+                        // runs after the updates processing (the same
+                        // actor slice; the queue decouples the promise
+                        // interface from the manager borrow).
+                        let finish_queue = Arc::new(Mutex::new(Vec::<(
+                            crate::community_id::CommunityId,
+                            Promise<td_api::CommunityId>,
+                        )>::new()));
+                        let queue = Arc::clone(&finish_queue);
+                        let chained = Promise::from_interface(FinishCreateCommunityChain {
+                            community_id,
+                            promise: Some(promise),
+                            finish_queue: queue,
+                        });
+                        self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise: chained,
+                        });
+                        for (community_id, promise) in std::mem::take(&mut *finish_queue.lock()) {
+                            let mut manager = std::mem::take(&mut self.community_manager);
+                            let mut env = CommunityEnv { td: &mut *self };
+                            manager.finish_create_community(&mut env, community_id, promise);
+                            self.community_manager = manager;
+                        }
+                    }
+                    Err(_) => promise.set_error(parse_error("communities_create")),
+                }
+            }
+            // `GetCommunitiesQuery` (cpp:48-81) — no ported flow drives
+            // the kind yet; the arm routes the chats intake for the
+            // future cache-load plane.
+            CommunityNetKind::GetCommunities => {
+                if !query.is_error()
+                    && let Ok(chats) = telegram_api::messages_Chats::parse(query.ok())
+                {
+                    match chats {
+                        telegram_api::messages_Chats::messages_chats(chats) => {
+                            self.intake_chats(chats.chats, "GetCommunitiesQuery");
+                        }
+                        telegram_api::messages_Chats::messages_chatsSlice(chats) => {
+                            self.intake_chats(chats.chats, "GetCommunitiesQuery");
+                        }
+                    }
+                }
+            }
+            // `GetFullCommunityQuery` (cpp:83-118) — the users/chats
+            // intakes, the communityFull gate, `on_get_community_full`.
+            CommunityNetKind::GetFullCommunity => {
+                if query.is_error() {
+                    tdutils::log_debug!(
+                        "GetFullCommunityQuery failed: {}",
+                        query.error().message()
+                    );
+                    return;
+                }
+                match telegram_api::messages_ChatFull::parse(query.ok()) {
+                    Ok(full) => {
+                        self.intake_users(full.users.clone(), "GetFullCommunityQuery");
+                        self.intake_chats(full.chats.clone(), "GetFullCommunityQuery");
+                        match full.full_chat {
+                            Some(telegram_api::ChatFull::communityFull(community)) => {
+                                let mut manager = std::mem::take(&mut self.community_manager);
+                                let mut env = CommunityEnv { td: &mut *self };
+                                manager.on_get_community_full(&mut env, &community);
+                                self.community_manager = manager;
+                            }
+                            _ => {
+                                tdutils::log_error!("Receive a non-community chatFull");
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tdutils::log_error!("Failed to parse the channels_getFullChannel answer")
+                    }
+                }
+            }
+            // `EditCommunityTitleQuery` (cpp:163-195) and
+            // `EditCommunityDefaultBannedRightsQuery` (cpp:197-229) — the
+            // Updates answer re-enters `on_get_updates` with the popped
+            // promise; the shared CHAT_NOT_MODIFIED value band.
+            CommunityNetKind::EditTitle | CommunityNetKind::EditDefaultBannedRights => {
+                let slot: for<'a> fn(
+                    &'a mut crate::community_manager::CommunityManager,
+                ) -> &'a mut Vec<Promise<()>> = match kind {
+                    CommunityNetKind::EditTitle => |m| &mut m.pending_rename,
+                    _ => |m| &mut m.pending_permissions,
+                };
+                if let Some(mut promise) = self.community_manager.take_promise(slot) {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        if !chat_not_modified(&mut promise, &status, self.auth_manager.is_bot()) {
+                            promise.set_error(status);
+                        }
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => promise.set_error(parse_error("the community edit answer")),
+                        }
+                    }
+                }
+            }
+            // `DeleteCommunityQuery` (cpp:231-260).
+            CommunityNetKind::DeleteCommunity => {
+                if let Some(mut promise) = self.community_manager.take_promise(
+                    |m: &mut crate::community_manager::CommunityManager| &mut m.pending_delete,
+                ) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => promise.set_error(parse_error("channels_deleteChannel")),
+                        }
+                    }
+                }
             }
         }
     }
@@ -13632,23 +13860,21 @@ impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'
     }
 }
 
-/// The community-plane env over the `Td` fields — built per call with the
-/// field-split borrows (the `NotificationEnv` convention).
+/// The community-plane env over the whole `Td` — the manager is always
+/// `std::mem::take`n out for the call (the `TonWalletEnv` convention), so
+/// the env may hold the full `&mut Td` (the send seams reach the
+/// dispatcher, the dialog peer resolver and the updates buffer).
 pub(crate) struct CommunityEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) dialog_manager: &'a mut DialogManager,
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
-    /// `AuthManager::is_bot()` — the bots-tolerant `get_input_peer` arm.
-    pub(crate) auth_is_bot: bool,
+    pub(crate) td: &'a mut Td,
 }
 
 impl CommunityManagerEnv for CommunityEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.community_updates.push(update);
     }
 
     fn check_dialog_access(
@@ -13666,12 +13892,99 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
     }
 
     fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId) -> i64 {
-        let _ = self.dialog_manager;
         dialog_id.get()
     }
 
     fn auth_is_bot(&self) -> bool {
-        self.auth_is_bot
+        self.td.auth_manager.is_bot()
+    }
+
+    // ---- The net query senders — the C++ ResultHandler send legs
+    // (CommunityManager.cpp:120-260). ----
+
+    /// `CreateCommunityQuery::send` (cpp:129-136) — the read-access input
+    /// peer of the dialog.
+    fn send_create_community_query(&mut self, name: &str, dialog_id: DialogId, is_hidden: bool) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities.create(name = {name}, is_hidden = {is_hidden}) — [net-inert]"
+            );
+        };
+        // `DialogManager::get_input_peer(dialog_id, Read)` — the C++
+        // CHECK band; the None arm answers the query-family error.
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("CreateCommunityQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        net.dispatch(
+            CommunityNetKind::CreateCommunity { dialog_id },
+            telegram_api::Function::communities_create(telegram_api::communities_create {
+                flags: 0,
+                hidden: is_hidden,
+                title: name.to_owned(),
+                about: String::new(),
+                peer: Some(Box::new(peer)),
+            }),
+        )
+    }
+
+    /// `EditCommunityTitleQuery::send` (cpp:163-194).
+    fn send_set_community_name_query(
+        &mut self,
+        input_community: telegram_api::InputChannel,
+        name: &str,
+    ) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::EditTitle,
+                telegram_api::Function::channels_editTitle(telegram_api::channels_editTitle {
+                    channel: Some(input_community),
+                    title: name.to_owned(),
+                }),
+            ),
+            None => tdutils::log_info!("Send channels.editTitle to {name:?} — [net-inert]"),
+        }
+    }
+
+    /// `EditCommunityDefaultBannedRightsQuery::send` (cpp:197-229).
+    fn send_set_community_permissions_query(
+        &mut self,
+        input_peer: telegram_api::InputPeer,
+        permissions: &RestrictedRights,
+    ) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::EditDefaultBannedRights,
+                telegram_api::Function::messages_editChatDefaultBannedRights(
+                    telegram_api::messages_editChatDefaultBannedRights {
+                        peer: Some(Box::new(input_peer)),
+                        banned_rights: Some(permissions.get_chat_banned_rights()),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.editChatDefaultBannedRights — [net-inert]")
+            }
+        }
+    }
+
+    /// `DeleteCommunityQuery::send` (cpp:231-260).
+    fn send_delete_community_query(&mut self, input_community: telegram_api::InputChannel) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::DeleteCommunity,
+                telegram_api::Function::channels_deleteChannel(
+                    telegram_api::channels_deleteChannel {
+                        channel: Some(input_community),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send channels.deleteChannel — [net-inert]"),
+        }
     }
 }
 
@@ -24983,6 +25296,142 @@ mod tests {
             Some(tdutils::status::Result::Err(status)) if status.message() == "WALLET_KEY_MISMATCH"
         ));
         assert!(td.ton_wallet_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the community net slice: the create chain and the edit
+    // families ride the dispatcher (CommunityManager.cpp:120-260). ----
+
+    fn with_community_manager(
+        td: &mut Td,
+        f: impl FnOnce(&mut crate::community_manager::CommunityManager, &mut CommunityEnv<'_>),
+    ) {
+        let mut manager = std::mem::take(&mut td.community_manager);
+        let mut env = CommunityEnv { td: &mut *td };
+        f(&mut manager, &mut env);
+        td.community_manager = manager;
+    }
+
+    #[test]
+    fn community_create_and_rename_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_create_and_rename_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_create_and_rename_ride_the_dispatcher_impl() {
+        use crate::community_id::CommunityId;
+        use crate::dialog_id::DialogId;
+        use crate::user_manager::UserId;
+
+        let (mut td, rec) = netted_td("netfix-cm-create");
+        // Seed the own id for the create flow's read-access input peer
+        // (the Saved Messages self dialog).
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            UserId::new(700000001),
+        );
+
+        // 1. create_community dispatches communities.create with the
+        //    dialog's read-access input peer.
+        type IdSlot =
+            std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::CommunityId>>>>;
+        struct Rec(IdSlot);
+        impl tdutils::promise::PromiseInterface<td_api::CommunityId> for Rec {
+            fn set_value(&mut self, value: td_api::CommunityId) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: IdSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(Rec(slot.clone()));
+        let self_dialog = DialogId::from_user_id(UserId::new(700000001));
+        with_community_manager(&mut td, |manager, env| {
+            manager.create_community(env, "My community", self_dialog, false, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::communities_create::ID
+        );
+        // The Updates answer with a non-regular updateChannel chains
+        // through on_get_updates into finish_create_community.
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![telegram_api::Update::updateChannel(
+                telegram_api::updateChannel {
+                    channel_id: 9_000_000_000_000,
+                },
+            )],
+            chats: vec![],
+            users: vec![],
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(community_id)) if community_id.id == 9_000_000_000_000
+        ));
+
+        // 2. The rename family: cache a creator community, drive the
+        //    rights-gated rename, complete with CHAT_NOT_MODIFIED —
+        //    the !bot value band.
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        let (promise, recorded) = record_ton_unit();
+        with_community_manager(&mut td, |manager, env| {
+            manager.set_community_name(env, CommunityId::new(7), "new name", promise);
+        });
+        // The crafted create-answer container carries no pts — the
+        // updates engine rides a getDifference repair first; the rename
+        // dispatch follows it.
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 2, "the difference repair + the rename");
+        assert_eq!(
+            sent[1].tl_constructor(),
+            telegram_api::channels_editTitle::ID
+        );
+        net_fail(sent.into_iter().nth(1).unwrap(), 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]

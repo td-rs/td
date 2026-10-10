@@ -55,7 +55,6 @@ use crate::td::AutosaveEnv;
 use crate::td::BackgroundEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
-use crate::td::CommunityEnv;
 use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
@@ -6829,19 +6828,15 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |community_id: td_api::CommunityId| {
                 Object::communityId(community_id)
             });
-            let mut env = CommunityEnv {
-                global: &mut td.global,
-                dialog_manager: &mut td.dialog_manager,
-                updates: &mut td.community_updates,
-                auth_is_bot: td.auth_manager.is_bot(),
-            };
-            td.community_manager.create_community(
+            let (mut manager, mut env) = community_split(td);
+            manager.create_community(
                 &mut env,
                 &name,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.is_chat_hidden,
                 promise,
             );
+            td.community_manager = manager;
         }
         Function::setCommunityName(request) => {
             if !check_is_user(td, id) {
@@ -6851,18 +6846,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = CommunityEnv {
-                global: &mut td.global,
-                dialog_manager: &mut td.dialog_manager,
-                updates: &mut td.community_updates,
-                auth_is_bot: td.auth_manager.is_bot(),
-            };
-            td.community_manager.set_community_name(
+            let (mut manager, mut env) = community_split(td);
+            manager.set_community_name(
                 &mut env,
                 CommunityId::new(request.community_id),
                 &name,
                 promise,
             );
+            td.community_manager = manager;
         }
         Function::setCommunityPhoto(request) => {
             // Requests.cpp:3436-3440 (fb05f53c2) — CHECK_IS_USER, then
@@ -6895,18 +6886,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
-            let mut env = CommunityEnv {
-                global: &mut td.global,
-                dialog_manager: &mut td.dialog_manager,
-                updates: &mut td.community_updates,
-                auth_is_bot: td.auth_manager.is_bot(),
-            };
-            td.community_manager.set_community_permissions(
+            let (mut manager, mut env) = community_split(td);
+            manager.set_community_permissions(
                 &mut env,
                 CommunityId::new(request.community_id),
                 request.permissions.as_ref(),
                 promise,
             );
+            td.community_manager = manager;
         }
         Function::deleteCommunity(request) => {
             // Requests.cpp:3449-3453 (f5f7fe5fd) — CHECK_IS_USER, then
@@ -6916,17 +6903,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
-            let mut env = CommunityEnv {
-                global: &mut td.global,
-                dialog_manager: &mut td.dialog_manager,
-                updates: &mut td.community_updates,
-                auth_is_bot: td.auth_manager.is_bot(),
-            };
-            td.community_manager.delete_community(
-                &mut env,
-                CommunityId::new(request.community_id),
-                promise,
-            );
+            let (mut manager, mut env) = community_split(td);
+            manager.delete_community(&mut env, CommunityId::new(request.community_id), promise);
+            td.community_manager = manager;
         }
 
         // -- the payments set (M.43): Requests.cpp:8372-8436, 8757-8771,
@@ -18819,6 +18798,19 @@ fn ton_wallet_split(
 ) {
     let manager = std::mem::take(&mut td.ton_wallet_manager);
     let env = crate::td::TonWalletEnv { td: &mut *td };
+    (manager, env)
+}
+
+/// The community take-out split (the `ton_wallet_split` convention):
+/// the manager comes out for the call, the env wraps the whole Td.
+fn community_split(
+    td: &mut Td,
+) -> (
+    crate::community_manager::CommunityManager,
+    crate::td::CommunityEnv<'_>,
+) {
+    let manager = std::mem::take(&mut td.community_manager);
+    let env = crate::td::CommunityEnv { td: &mut *td };
     (manager, env)
 }
 

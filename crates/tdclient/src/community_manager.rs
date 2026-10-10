@@ -5,8 +5,13 @@
 //! byte-exact store/parse + the sqlite-pmc persistence join when the
 //! Photo/DialogPhoto store/parse land on master (they live on the unmerged
 //! M.9/M.10 lines); the photo object legs answer `None`; the
-//! CreateCommunity/GetFullCommunity queries are `[blocked: net]` env seams
-//! with parked promises; the full dialog-access plane is the env seam.
+//! create/rename/permissions/delete queries ride the client-side
+//! dispatcher under their `CommunityNetKind` (the answer routing lives in
+//! `Td::on_community_net_answer`; the create answer chains behind
+//! `on_get_updates` into `finish_create_community`); the full
+//! dialog-access plane is the env seam; the dispatch-dependency argument
+//! of the C++ `net_query_creator().create` calls collapses (the port's
+//! NetQuery carries no dependency set).
 
 use crate::chat_manager::{AdministratorRights, DialogParticipantStatus, RestrictedRights};
 use crate::community_id::CommunityId;
@@ -28,22 +33,37 @@ pub trait CommunityManagerEnv {
     /// `DialogManager::get_chat_id_object` — the collapsed sync form.
     fn get_chat_id_object(&mut self, dialog_id: DialogId) -> i64;
 
-    /// `CreateCommunityQuery::send` — `[blocked: net]`.
+    /// `CreateCommunityQuery::send` (CommunityManager.cpp:129-136) —
+    /// `communities.create` over the read-access input peer of the
+    /// dialog; the answer routes through `on_get_updates` with the
+    /// `finish_create_community` chain. The dispatch-dependency argument
+    /// of the C++ `net_query_creator().create` collapses (the port's
+    /// NetQuery carries no dependency set).
     fn send_create_community_query(&mut self, name: &str, dialog_id: DialogId, is_hidden: bool) {
         tdutils::log_info!(
-            "Send channels.createCommunity(name = {name}, is_hidden = {is_hidden}) — [blocked: net]"
+            "Send communities.create(name = {name}, is_hidden = {is_hidden}) for {dialog_id:?} — [net-inert]"
         );
         let _ = dialog_id;
     }
 
-    /// `GetFullCommunityQuery::send` — `[blocked: net]`.
+    /// `GetFullCommunityQuery::send` — the community-full cache load
+    /// (no ported flow drives it yet; the seam stays for the
+    /// get-community plane).
     fn send_get_full_community_query(&mut self, community_id: CommunityId) {
-        tdutils::log_info!("Send channels.getFullCommunity for {community_id:?} — [blocked: net]");
+        tdutils::log_info!("Send channels.getFullCommunity for {community_id:?} — [net-inert]");
     }
 
-    /// `channels.editTitle`-shaped rename query — `[blocked: net]`.
-    fn send_set_community_name_query(&mut self, community_id: CommunityId, name: &str) {
-        tdutils::log_info!("Send rename of {community_id:?} to {name} — [blocked: net]");
+    /// `EditCommunityTitleQuery::send` (CommunityManager.cpp:163-194) —
+    /// `channels.editTitle` over `get_input_community`; the resolved
+    /// input channel rides the seam (the manager is taken out under the
+    /// env).
+    fn send_set_community_name_query(
+        &mut self,
+        input_community: telegram_api::InputChannel,
+        name: &str,
+    ) {
+        tdutils::log_info!("Send channels.editTitle to {name:?} — [net-inert]");
+        let _ = input_community;
     }
 
     /// Whether the AuthorizationManager reports a bot — the
@@ -54,24 +74,25 @@ pub trait CommunityManagerEnv {
     }
 
     /// `EditCommunityDefaultBannedRightsQuery::send` (d55f0a694,
-    /// CommunityManager.cpp:197-210) — `messages_editChatDefaultBannedRights`
-    /// over `get_input_peer` — `[blocked: net]`.
+    /// CommunityManager.cpp:197-229) — `messages_editChatDefaultBannedRights`
+    /// over `get_input_peer` (the resolved peer rides the seam).
     fn send_set_community_permissions_query(
         &mut self,
-        community_id: CommunityId,
+        input_peer: telegram_api::InputPeer,
         permissions: &RestrictedRights,
     ) {
         tdutils::log_info!(
-            "Send messages.editChatDefaultBannedRights for {community_id:?}, rights = {:?} — [blocked: net]",
+            "Send messages.editChatDefaultBannedRights, rights = {:?} — [net-inert]",
             permissions.get_chat_banned_rights()
         );
+        let _ = input_peer;
     }
 
-    /// `DeleteCommunityQuery::send` (f5f7fe5fd, CommunityManager.cpp:231-245)
-    /// — `channels.deleteChannel` over `get_input_community` —
-    /// `[blocked: net]`.
-    fn send_delete_community_query(&mut self, community_id: CommunityId) {
-        tdutils::log_info!("Send channels.deleteChannel for {community_id:?} — [blocked: net]");
+    /// `DeleteCommunityQuery::send` (f5f7fe5fd, CommunityManager.cpp:231-260)
+    /// — `channels.deleteChannel` over `get_input_community`.
+    fn send_delete_community_query(&mut self, input_community: telegram_api::InputChannel) {
+        tdutils::log_info!("Send channels.deleteChannel — [net-inert]");
+        let _ = input_community;
     }
 }
 
@@ -143,13 +164,33 @@ pub struct CommunityManager {
     communities: std::collections::BTreeMap<i64, Community>,
     communities_full: std::collections::BTreeMap<i64, CommunityFull>,
     /// The `td_api::CommunityId`-typed promises parked at the create
-    /// seam.
+    /// seam (the answer chains behind `on_get_updates` into
+    /// `finish_create_community`).
     pub parked_create_promises: Vec<Promise<td_api::CommunityId>>,
-    /// The `()`-typed promises parked at the rename seam.
-    pub net_blocked_promises: Vec<Promise<()>>,
+    /// The `()`-typed promises parked at the rename seam (the
+    /// `channels.editTitle` answer family).
+    pub pending_rename: Vec<Promise<()>>,
+    /// The `EditCommunityDefaultBannedRightsQuery` promise lot.
+    pub pending_permissions: Vec<Promise<()>>,
+    /// The `DeleteCommunityQuery` promise lot.
+    pub pending_delete: Vec<Promise<()>>,
 }
 
 impl CommunityManager {
+    /// Pop the head promise of a family lot — the answer-routing half of
+    /// a query family (the C++ handler's own promise).
+    pub(crate) fn take_promise<T: std::marker::Send>(
+        &mut self,
+        slot: for<'a> fn(&'a mut CommunityManager) -> &'a mut Vec<Promise<T>>,
+    ) -> Option<Promise<T>> {
+        let lot = slot(self);
+        if lot.is_empty() {
+            None
+        } else {
+            Some(lot.remove(0))
+        }
+    }
+
     pub fn new() -> CommunityManager {
         CommunityManager::default()
     }
@@ -342,8 +383,13 @@ impl CommunityManager {
                 "Not enough rights to change community name",
             ));
         }
-        env.send_set_community_name_query(community_id, name);
-        self.net_blocked_promises.push(promise);
+        // `EditCommunityTitleQuery::send` resolves `get_input_community`
+        // (the C++ CHECK band is the cached-community invariant above).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_set_community_name_query(input_community, name);
+        self.pending_rename.push(promise);
     }
 
     /// `set_community_photo` gates (fb05f53c2,
@@ -383,11 +429,16 @@ impl CommunityManager {
         if !community.status.can_restrict_members() {
             return promise.set_error(Status::error(400, "Have not enough rights"));
         }
+        // `EditCommunityDefaultBannedRightsQuery::send` resolves the
+        // community's input peer.
+        let Some(input_peer) = self.get_input_peer(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
         env.send_set_community_permissions_query(
-            community_id,
+            input_peer,
             &RestrictedRights::from_community_permissions(Some(permissions)),
         );
-        self.net_blocked_promises.push(promise);
+        self.pending_permissions.push(promise);
     }
 
     /// `delete_community` (f5f7fe5fd, CommunityManager.cpp:1268-1278).
@@ -403,8 +454,12 @@ impl CommunityManager {
         if !community.status.is_creator() {
             return promise.set_error(Status::error(400, "Have not enough rights"));
         }
-        env.send_delete_community_query(community_id);
-        self.net_blocked_promises.push(promise);
+        // `DeleteCommunityQuery::send` resolves `get_input_community`.
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_delete_community_query(input_community);
+        self.pending_delete.push(promise);
     }
 
     /// `get_input_community` (1118a50df, CommunityManager.cpp:1373-1385).
@@ -580,23 +635,38 @@ mod tests {
                 .push(format!("createCommunity {name} {is_hidden}"));
         }
 
-        fn send_set_community_name_query(&mut self, community_id: CommunityId, name: &str) {
+        fn send_set_community_name_query(
+            &mut self,
+            input_community: telegram_api::InputChannel,
+            name: &str,
+        ) {
+            let channel_id = match &input_community {
+                telegram_api::InputChannel::inputChannel(channel) => channel.channel_id,
+                _ => 0,
+            };
             self.queries
-                .push(format!("setCommunityName {} {name}", community_id.get()));
+                .push(format!("setCommunityName {channel_id} {name}"));
         }
 
         fn send_set_community_permissions_query(
             &mut self,
-            community_id: CommunityId,
+            input_peer: telegram_api::InputPeer,
             _permissions: &RestrictedRights,
         ) {
+            let community_id = match &input_peer {
+                telegram_api::InputPeer::inputPeerChannel(peer) => peer.channel_id,
+                _ => 0,
+            };
             self.queries
-                .push(format!("setCommunityPermissions {}", community_id.get()));
+                .push(format!("setCommunityPermissions {community_id}"));
         }
 
-        fn send_delete_community_query(&mut self, community_id: CommunityId) {
-            self.queries
-                .push(format!("deleteCommunity {}", community_id.get()));
+        fn send_delete_community_query(&mut self, input_community: telegram_api::InputChannel) {
+            let channel_id = match &input_community {
+                telegram_api::InputChannel::inputChannel(channel) => channel.channel_id,
+                _ => 0,
+            };
+            self.queries.push(format!("deleteCommunity {channel_id}"));
         }
     }
 
@@ -696,7 +766,7 @@ mod tests {
                 .iter()
                 .any(|q| q == "setCommunityName 7 new name")
         );
-        assert_eq!(manager.net_blocked_promises.len(), 1);
+        assert_eq!(manager.pending_rename.len(), 1);
         assert!(
             !recorded.0.lock().unwrap().is_some(),
             "the rename promise parks"
@@ -901,12 +971,12 @@ mod tests {
                 .iter()
                 .any(|q| q.starts_with("setCommunityPermissions 7"))
         );
-        assert_eq!(manager.net_blocked_promises.len(), 1);
+        assert_eq!(manager.pending_permissions.len(), 1);
 
         let (promise, recorded) = record();
         manager.delete_community(&mut env, CommunityId::new(7), promise);
         assert!(env.queries.iter().any(|q| q == "deleteCommunity 7"));
-        assert_eq!(manager.net_blocked_promises.len(), 2);
+        assert_eq!(manager.pending_delete.len(), 1);
         assert!(!recorded.0.lock().unwrap().is_some(), "the promise parks");
 
         manager.on_get_community(&mut env, &wire_member_community(9), "test");
