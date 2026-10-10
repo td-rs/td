@@ -5,7 +5,7 @@
 //! Center request/cache plane. Every `td_->create_handler<...>->send(...)`
 //! query is a `[blocked: net]` seam on [`TonWalletManagerEnv`] — the send
 //! logs the query name and the promise parks in the manager's per-family
-//! vectors (or the shared [`TonWalletManager::pending`] lot) until the net
+//! vectors (or the shared `TonWalletManager::pending` lot) until the net
 //! step lands the answer halves:
 //! `GetWalletStateQuery`, `GetExistingWalletBalanceQuery`,
 //! `GetUserWalletAddressesQuery` (the addresses/create/address forms),

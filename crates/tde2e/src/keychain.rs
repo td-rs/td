@@ -4,9 +4,9 @@
 //! the pinned td). The full e2e surface (mnemonics, the blockchain, the
 //! QR handshake, the encrypted storage) stays unported; only the six
 //! entry points the wallet manager calls exist:
-//! [`key_generate_temporary_private_key`], [`key_to_public_key`],
-//! [`key_from_public_key`], [`key_from_ecdh`],
-//! [`encrypt_message_for_one`], [`decrypt_message_for_one`].
+//! `key_generate_temporary_private_key`, `key_to_public_key`,
+//! `key_from_public_key`, `key_from_ecdh`, `encrypt_message_for_one`,
+//! `decrypt_message_for_one`.
 //!
 //! The container semantics are the C++ ones: ids are process-local
 //! sequential handles, deduplicated by `to_hash` — the first 32 bytes of
