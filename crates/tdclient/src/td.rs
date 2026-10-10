@@ -206,6 +206,12 @@ pub(crate) struct TdSink {
     /// applies the bot/authorized gates (the postponed-container walks
     /// are the unported receive planes).
     pub(crate) after_get_difference_marks_load: bool,
+    /// `MessagesManager::on_update_channel_too_long`
+    /// (MessagesManager.cpp:4667-4685, the b4d436d2e shape) — the hops
+    /// record here; the drain runs the collapsed ladder (no immediate
+    /// dialog creation — the pts read and the difference send are the
+    /// db/net seams).
+    pub(crate) channel_too_long: Vec<tdmtproto::telegram_api::updateChannelTooLong>,
 }
 
 /// One `on_update(updateWallet...)` hop — the C++ arm set routed to the
@@ -342,6 +348,14 @@ impl StateManagerState {
 impl UpdatesSink for TdSink {
     fn on_update_wallet_state(&mut self, state: tdmtproto::telegram_api::WalletState) {
         self.wallet_updates.push(WalletIntake::State(state));
+    }
+
+    fn on_update_channel_too_long(
+        &mut self,
+        update: tdmtproto::telegram_api::updateChannelTooLong,
+        _force: bool,
+    ) {
+        self.channel_too_long.push(update);
     }
 
     fn on_update_wallet_gasless_info(
@@ -505,7 +519,13 @@ impl UpdatesSink for TdSink {
         self.new_messages.push((message, "get_difference"));
     }
     /// `MessagesManager::add_pending_channel_update` — the channel-pts
-    /// machine's applied updates ride the same collector.
+    /// machine's applied updates ride the same collector. The port's
+    /// collapsed receive path already creates the dialog for a new
+    /// channel message (`add_dialog_for_new_message` in `create_message`,
+    /// the 03ba555d1 behavior); the pts-gap ladder (the `pts < new_pts`
+    /// advancing check, `get_channel_difference` and the
+    /// `need_update_dialog_pos` form of the case-4 add) is the [blocked:
+    /// net] channel-pts seam.
     fn add_pending_channel_update(
         &mut self,
         _peer: Option<tdmtproto::telegram_api::Peer>,
@@ -7871,6 +7891,25 @@ impl Td {
             && self.auth_manager.is_authorized()
         {
             crate::dialog_manager::load_dialog_marks_as_unread(self);
+        }
+        // `MessagesManager::on_update_channel_too_long`
+        // (MessagesManager.cpp:4667-4685, b4d436d2e) — no immediate chat
+        // creation: the dialog's pts when known, else the `load_channel_pts`
+        // dialog-db seam (0 offline); the advancing-pts band fires the
+        // `get_channel_difference` net seam.
+        for too_long in sink.channel_too_long {
+            let channel_id = crate::chat_manager::ChannelId::new(too_long.channel_id);
+            let dialog_id = crate::messages_manager::DialogId::from_channel_id(channel_id);
+            let pts = match self.messages_manager.get_dialog(dialog_id) {
+                Some(d) => d.pts,
+                None => 0, // `load_channel_pts` — the dialog-db receive seam
+            };
+            if pts != 0 && (too_long.pts == 0 || too_long.pts > pts) {
+                tdutils::log_info!(
+                    "Get channel difference for {channel_id:?} from {pts} to {} — [blocked: net]",
+                    too_long.pts
+                );
+            }
         }
         // the users feed the UserManager container first — the C++
         // `process_updates_users_and_chats` tail (`td_->user_manager_->
