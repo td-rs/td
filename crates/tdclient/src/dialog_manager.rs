@@ -782,8 +782,13 @@ pub fn on_get_dialog_error(
         | crate::dialog_id::DialogType::None => false,
         // ChatManager::on_get_channel_error — `CHANNEL_MONOFORUM_UNSUPPORTED`
         // answers `true` before any channel lookup; the channel-registry
-        // remainder is the unloaded `false` (stub inventory).
-        crate::dialog_id::DialogType::Channel => message == "CHANNEL_MONOFORUM_UNSUPPORTED",
+        // remainder is the unloaded `false` (stub inventory). Only regular
+        // channels process errors (e962a0799) — a community (the
+        // monoforum id band) breaks out to `false`.
+        crate::dialog_id::DialogType::Channel => {
+            dialog_id.get_channel_id().is_regular_channel()
+                && message == "CHANNEL_MONOFORUM_UNSUPPORTED"
+        }
     }
 }
 
@@ -2639,12 +2644,15 @@ pub fn set_dialog_title(td: &mut Td, dialog_id: DialogId, title: &str, mut promi
     promise_unimplemented(&mut promise);
 }
 
-/// `DialogManager::set_dialog_photo` (DialogManager.cpp:2385-2497) — the
-/// gates and the input-photo shape dispatch are faithful; the FileManager
-/// upload halves are [blocked: files] and the `EditDialogPhotoQuery` send is
-/// [blocked: net] (stub inventory). The Chat/Channel rights gates answer the
-/// unloaded defaults, so the dispatch is unreachable until the ChatManager
-/// read surface lands.
+/// `DialogManager::set_dialog_photo` (DialogManager.cpp:2385-2412, the
+/// fb05f53c2 shape) — the dialog-type gates, then the
+/// `do_set_dialog_photo` ladder. The FileManager upload halves are
+/// [blocked: files] and the `EditDialogPhotoQuery` send is [blocked: net]
+/// (stub inventory); for a non-regular channel (a community) the arm
+/// answers "Can't change chat photo" after the rights gate. The
+/// Chat/Channel rights gates answer the unloaded defaults, so the
+/// is_regular_channel dispatch is unreachable until the ChatManager read
+/// surface lands.
 #[allow(unreachable_code, unused_variables)]
 pub fn set_dialog_photo(
     td: &mut Td,
@@ -2652,7 +2660,6 @@ pub fn set_dialog_photo(
     input_photo: Option<&crate::td_api::InputChatPhoto>,
     mut promise: Promise<()>,
 ) {
-    use crate::td_api;
     if !have_dialog_force(td, dialog_id, "set_dialog_photo") {
         promise.set_error(Status::error(400, "Chat not found"));
         return;
@@ -2663,11 +2670,19 @@ pub fn set_dialog_photo(
             promise.set_error(Status::error(400, "Can't change private chat photo"));
             return;
         }
-        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
-            // get_chat_permissions / get_channel_permissions — the unloaded
-            // defaults (stub inventory).
+        crate::dialog_id::DialogType::Chat => {
+            // get_chat_permissions — the unloaded default (stub
+            // inventory).
             promise.set_error(Status::error(400, "Not enough rights to change chat photo"));
             return;
+        }
+        crate::dialog_id::DialogType::Channel => {
+            // get_channel_permissions — the unloaded default (stub
+            // inventory).
+            promise.set_error(Status::error(400, "Not enough rights to change chat photo"));
+            return;
+            // `if (!channel_id.is_regular_channel())` — "Can't change chat
+            // photo" (fb05f53c2); unreachable over the unloaded rights.
         }
         crate::dialog_id::DialogType::SecretChat => {
             promise.set_error(Status::error(400, "Can't change secret chat photo"));
@@ -2677,6 +2692,26 @@ pub fn set_dialog_photo(
             unreachable!("set_dialog_photo on DialogType::None passed have_dialog_force")
         }
     }
+
+    do_set_dialog_photo(td, dialog_id, dialog_id, input_photo, promise);
+}
+
+/// `DialogManager::do_set_dialog_photo` (6ccfd7660,
+/// DialogManager.cpp:2414-2497) — the input-photo shape ladder shared by
+/// the request plane and the community photo flow; `owner_dialog_id` is
+/// the file-upload owner (the community's fake dialog id carries the
+/// DialogId() owner). The upload/query tails park at the [blocked:
+/// files]/[blocked: net] seams (stub inventory).
+#[allow(unreachable_code, unused_variables)]
+pub fn do_set_dialog_photo(
+    td: &mut Td,
+    dialog_id: DialogId,
+    owner_dialog_id: DialogId,
+    input_photo: Option<&crate::td_api::InputChatPhoto>,
+    mut promise: Promise<()>,
+) {
+    use crate::td_api;
+    let _ = (td, owner_dialog_id);
 
     let mut input_file_present = false;
     let mut main_frame_timestamp = 0.0;

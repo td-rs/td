@@ -175,7 +175,7 @@ deleteChatMessagesBySender	dispatched
 deleteChatReplyMarkup	dispatched
 deleteChatWelcomeMessage	dispatched
 deleteCommands	dispatched
-deleteCommunity	interim
+deleteCommunity	dispatched
 deleteDefaultBackground	dispatched
 deleteDirectMessagesChatTopicHistory	dispatched
 deleteDirectMessagesChatTopicMessagesByDate	dispatched
@@ -885,8 +885,8 @@ setChatTitle	dispatched
 setCloseFriends	dispatched
 setCommands	dispatched
 setCommunityName	dispatched
-setCommunityPermissions	interim
-setCommunityPhoto	interim
+setCommunityPermissions	dispatched
+setCommunityPhoto	dispatched
 setCustomEmojiStickerSetThumbnail	dispatched
 setCustomLanguagePack	dispatched
 setCustomLanguagePackString	dispatched

@@ -8,7 +8,7 @@
 //! CreateCommunity/GetFullCommunity queries are `[blocked: net]` env seams
 //! with parked promises; the full dialog-access plane is the env seam.
 
-use crate::chat_manager::{AdministratorRights, DialogParticipantStatus};
+use crate::chat_manager::{AdministratorRights, DialogParticipantStatus, RestrictedRights};
 use crate::community_id::CommunityId;
 use crate::dialog_id::DialogId;
 use crate::td_api;
@@ -44,6 +44,34 @@ pub trait CommunityManagerEnv {
     /// `channels.editTitle`-shaped rename query — `[blocked: net]`.
     fn send_set_community_name_query(&mut self, community_id: CommunityId, name: &str) {
         tdutils::log_info!("Send rename of {community_id:?} to {name} — [blocked: net]");
+    }
+
+    /// Whether the AuthorizationManager reports a bot — the
+    /// `get_input_peer`/`get_input_community` bots-tolerant arm
+    /// (CommunityManager.cpp:1375-1398).
+    fn auth_is_bot(&self) -> bool {
+        false
+    }
+
+    /// `EditCommunityDefaultBannedRightsQuery::send` (d55f0a694,
+    /// CommunityManager.cpp:197-210) — `messages_editChatDefaultBannedRights`
+    /// over `get_input_peer` — `[blocked: net]`.
+    fn send_set_community_permissions_query(
+        &mut self,
+        community_id: CommunityId,
+        permissions: &RestrictedRights,
+    ) {
+        tdutils::log_info!(
+            "Send messages.editChatDefaultBannedRights for {community_id:?}, rights = {:?} — [blocked: net]",
+            permissions.get_chat_banned_rights()
+        );
+    }
+
+    /// `DeleteCommunityQuery::send` (f5f7fe5fd, CommunityManager.cpp:231-245)
+    /// — `channels.deleteChannel` over `get_input_community` —
+    /// `[blocked: net]`.
+    fn send_delete_community_query(&mut self, community_id: CommunityId) {
+        tdutils::log_info!("Send channels.deleteChannel for {community_id:?} — [blocked: net]");
     }
 }
 
@@ -318,6 +346,113 @@ impl CommunityManager {
         self.net_blocked_promises.push(promise);
     }
 
+    /// `set_community_photo` gates (fb05f53c2,
+    /// CommunityManager.cpp:1170-1183) — the rights half of the manager
+    /// method; the `DialogManager::do_set_dialog_photo` ladder over
+    /// `community_id.get_fake_dialog_id()` runs from the request arm (the
+    /// port's Td-level photo plane).
+    pub fn set_community_photo_gates(
+        &self,
+        community_id: CommunityId,
+    ) -> std::result::Result<(), Status> {
+        let Some(community) = self.get_community(community_id) else {
+            return Err(Status::error(400, "Community not found"));
+        };
+        if !community.status.is_administrator() || !community.status.can_change_info_and_settings()
+        {
+            return Err(Status::error(400, "Have not enough rights"));
+        }
+        Ok(())
+    }
+
+    /// `set_community_permissions` (d55f0a694,
+    /// CommunityManager.cpp:1219-1236).
+    pub fn set_community_permissions(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        permissions: Option<&td_api::CommunityPermissions>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(permissions) = permissions else {
+            return promise.set_error(Status::error(400, "New permissions must be non-empty"));
+        };
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community.status.can_restrict_members() {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        env.send_set_community_permissions_query(
+            community_id,
+            &RestrictedRights::from_community_permissions(Some(permissions)),
+        );
+        self.net_blocked_promises.push(promise);
+    }
+
+    /// `delete_community` (f5f7fe5fd, CommunityManager.cpp:1268-1278).
+    pub fn delete_community(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community.status.is_creator() {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        env.send_delete_community_query(community_id);
+        self.net_blocked_promises.push(promise);
+    }
+
+    /// `get_input_community` (1118a50df, CommunityManager.cpp:1373-1385).
+    pub fn get_input_community(
+        &self,
+        env: &impl CommunityManagerEnv,
+        community_id: CommunityId,
+    ) -> Option<telegram_api::InputChannel> {
+        let mut access_hash = 0;
+        match self.get_community(community_id) {
+            Some(community) => access_hash = community.access_hash,
+            None => {
+                if !env.auth_is_bot() || !community_id.is_valid() {
+                    return None;
+                }
+            }
+        }
+        Some(telegram_api::InputChannel::inputChannel(
+            telegram_api::inputChannel {
+                channel_id: community_id.get(),
+                access_hash,
+            },
+        ))
+    }
+
+    /// `get_input_peer` (1118a50df, CommunityManager.cpp:1387-1398).
+    pub fn get_input_peer(
+        &self,
+        env: &impl CommunityManagerEnv,
+        community_id: CommunityId,
+    ) -> Option<telegram_api::InputPeer> {
+        let mut access_hash = 0;
+        match self.get_community(community_id) {
+            Some(community) => access_hash = community.access_hash,
+            None => {
+                if !env.auth_is_bot() || !community_id.is_valid() {
+                    return None;
+                }
+            }
+        }
+        Some(telegram_api::InputPeer::inputPeerChannel(
+            telegram_api::inputPeerChannel {
+                channel_id: community_id.get(),
+                access_hash,
+            },
+        ))
+    }
+
     /// `get_community_object` (CommunityManager.cpp) — the td_api form
     /// (the photo leg answers `None` — recorded).
     pub fn get_community_object(&self, community_id: CommunityId) -> Option<td_api::Community> {
@@ -448,6 +583,20 @@ mod tests {
         fn send_set_community_name_query(&mut self, community_id: CommunityId, name: &str) {
             self.queries
                 .push(format!("setCommunityName {} {name}", community_id.get()));
+        }
+
+        fn send_set_community_permissions_query(
+            &mut self,
+            community_id: CommunityId,
+            _permissions: &RestrictedRights,
+        ) {
+            self.queries
+                .push(format!("setCommunityPermissions {}", community_id.get()));
+        }
+
+        fn send_delete_community_query(&mut self, community_id: CommunityId) {
+            self.queries
+                .push(format!("deleteCommunity {}", community_id.get()));
         }
     }
 
@@ -628,5 +777,189 @@ mod tests {
             Promise::from_interface(RecordingId(recorded.clone())),
             RecordedId(recorded),
         )
+    }
+
+    /// A non-creator member wire community (on_get_community derives the
+    /// member status when creator/left/admin_rights are all unset).
+    fn wire_member_community(id: i64) -> telegram_api::community {
+        telegram_api::community {
+            creator: false,
+            left: false,
+            admin_rights: None,
+            ..wire_community(id, "My community")
+        }
+    }
+
+    #[test]
+    fn photo_gates_mirror_the_manager() {
+        // CommunityManager.cpp:1170-1183 (fb05f53c2): not found → 400,
+        // a non-admin member → "Have not enough rights".
+        let mut env = TestEnv {
+            updates: Vec::new(),
+            queries: Vec::new(),
+        };
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        assert!(
+            manager
+                .set_community_photo_gates(CommunityId::new(7))
+                .is_ok()
+        );
+        assert_eq!(
+            manager
+                .set_community_photo_gates(CommunityId::new(8))
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+        assert_eq!(
+            manager
+                .set_community_photo_gates(CommunityId::new(9))
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+    }
+
+    #[test]
+    fn permissions_and_delete_gates() {
+        // CommunityManager.cpp:1219-1236 (d55f0a694) and 1268-1278
+        // (f5f7fe5fd): the null-permissions band, the restrict/creator
+        // gates, and the parked query sends.
+        let mut env = TestEnv {
+            updates: Vec::new(),
+            queries: Vec::new(),
+        };
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+
+        let (promise, recorded) = record();
+        manager.set_community_permissions(&mut env, CommunityId::new(7), None, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "New permissions must be non-empty"
+        );
+
+        let (promise, recorded) = record();
+        manager.set_community_permissions(&mut env, CommunityId::new(8), None, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "New permissions must be non-empty"
+        );
+
+        let (promise, recorded) = record();
+        manager.set_community_permissions(
+            &mut env,
+            CommunityId::new(8),
+            Some(&td_api::CommunityPermissions {
+                can_edit_chat_list: true,
+            }),
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        let (promise, _recorded) = record();
+        manager.set_community_permissions(
+            &mut env,
+            CommunityId::new(7),
+            Some(&td_api::CommunityPermissions {
+                can_edit_chat_list: true,
+            }),
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q.starts_with("setCommunityPermissions 7"))
+        );
+        assert_eq!(manager.net_blocked_promises.len(), 1);
+
+        let (promise, recorded) = record();
+        manager.delete_community(&mut env, CommunityId::new(7), promise);
+        assert!(env.queries.iter().any(|q| q == "deleteCommunity 7"));
+        assert_eq!(manager.net_blocked_promises.len(), 2);
+        assert!(!recorded.0.lock().unwrap().is_some(), "the promise parks");
+
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+        let (promise, recorded) = record();
+        manager.delete_community(&mut env, CommunityId::new(9), promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+    }
+
+    #[test]
+    fn input_peer_builders() {
+        // CommunityManager.cpp:1373-1398 (1118a50df): the cached access
+        // hash rides, unknown communities answer None unless a bot asks
+        // for a valid id.
+        let mut env = TestEnv {
+            updates: Vec::new(),
+            queries: Vec::new(),
+        };
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        let input_channel = manager
+            .get_input_community(&env, CommunityId::new(7))
+            .unwrap();
+        match input_channel {
+            telegram_api::InputChannel::inputChannel(c) => {
+                assert_eq!(c.channel_id, 7);
+                assert_eq!(c.access_hash, 5);
+            }
+            other => panic!("unexpected input channel {other:?}"),
+        }
+        let input_peer = manager.get_input_peer(&env, CommunityId::new(7)).unwrap();
+        match input_peer {
+            telegram_api::InputPeer::inputPeerChannel(p) => {
+                assert_eq!(p.channel_id, 7);
+                assert_eq!(p.access_hash, 5);
+            }
+            other => panic!("unexpected input peer {other:?}"),
+        }
+        assert!(
+            manager
+                .get_input_community(&env, CommunityId::new(8))
+                .is_none()
+        );
+        assert!(manager.get_input_peer(&env, CommunityId::new(0)).is_none());
     }
 }

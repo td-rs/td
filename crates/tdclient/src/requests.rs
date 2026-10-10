@@ -6823,6 +6823,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 dialog_manager: &mut td.dialog_manager,
                 updates: &mut td.community_updates,
+                auth_is_bot: td.auth_manager.is_bot(),
             };
             td.community_manager.create_community(
                 &mut env,
@@ -6844,11 +6845,76 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 dialog_manager: &mut td.dialog_manager,
                 updates: &mut td.community_updates,
+                auth_is_bot: td.auth_manager.is_bot(),
             };
             td.community_manager.set_community_name(
                 &mut env,
                 CommunityId::new(request.community_id),
                 &name,
+                promise,
+            );
+        }
+        Function::setCommunityPhoto(request) => {
+            // Requests.cpp:3436-3440 (fb05f53c2) — CHECK_IS_USER, then
+            // CommunityManager::set_community_photo: the manager gates,
+            // then DialogManager::do_set_dialog_photo over the community's
+            // fake dialog id with the null owner (the upload owner ids
+            // ride the file plane).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let community_id = CommunityId::new(request.community_id);
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            if let Err(status) = td.community_manager.set_community_photo_gates(community_id) {
+                return promise.set_error(status);
+            }
+            crate::dialog_manager::do_set_dialog_photo(
+                td,
+                community_id.get_fake_dialog_id(),
+                crate::dialog_id::DialogId::default(),
+                request.photo.as_ref(),
+                promise,
+            );
+        }
+        Function::setCommunityPermissions(request) => {
+            // Requests.cpp:3442-3447 (d55f0a694) — CHECK_IS_USER, then
+            // CommunityManager::set_community_permissions (the
+            // messages_editChatDefaultBannedRights send rides the net
+            // step).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = CommunityEnv {
+                global: &mut td.global,
+                dialog_manager: &mut td.dialog_manager,
+                updates: &mut td.community_updates,
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.community_manager.set_community_permissions(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.permissions.as_ref(),
+                promise,
+            );
+        }
+        Function::deleteCommunity(request) => {
+            // Requests.cpp:3449-3453 (f5f7fe5fd) — CHECK_IS_USER, then
+            // CommunityManager::delete_community (the
+            // channels.deleteChannel send rides the net step).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = CommunityEnv {
+                global: &mut td.global,
+                dialog_manager: &mut td.dialog_manager,
+                updates: &mut td.community_updates,
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.community_manager.delete_community(
+                &mut env,
+                CommunityId::new(request.community_id),
                 promise,
             );
         }
@@ -18482,13 +18548,16 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            998,
+            1001,
             "dispatched count"
         );
         // the c15d3f5a sync: the TON wallet / TonConnect / On-ramp
-        // surface + the community write family land as interim arms
-        // (41 functions; the TonWalletManager plane is unported — the
-        // bot secondary-username pair went dispatched with its flow)
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 41, "interim count");
+        // surface lands as interim arms (38 functions; the
+        // TonWalletManager plane is unported — the bot secondary-username
+        // pair and the community write family
+        // (setCommunityPhoto/setCommunityPermissions/deleteCommunity,
+        // fb05f53c2/d55f0a694/f5f7fe5fd) went dispatched with their
+        // flows)
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 38, "interim count");
     }
 }

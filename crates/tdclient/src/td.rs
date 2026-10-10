@@ -12289,6 +12289,8 @@ pub(crate) struct CommunityEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) dialog_manager: &'a mut DialogManager,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// `AuthManager::is_bot()` — the bots-tolerant `get_input_peer` arm.
+    pub(crate) auth_is_bot: bool,
 }
 
 impl CommunityManagerEnv for CommunityEnv<'_> {
@@ -12317,6 +12319,10 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
     fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId) -> i64 {
         let _ = self.dialog_manager;
         dialog_id.get()
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
     }
 }
 
