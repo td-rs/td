@@ -2616,6 +2616,237 @@ impl NetQueryCallback for UpdatesNetDispatchCallback {
     }
 }
 
+/// The TonWalletManager in-flight query kinds — the C++ ResultHandler
+/// classes of TonWalletManager.cpp:47-1240. The payload-carrying
+/// variants keep the handler's own closure state (the create-form
+/// user id, the per-DC fetch's query id + temporary key, the transfer's
+/// random id).
+#[derive(Clone, Copy)]
+enum TonWalletNetKind {
+    /// `GetWalletStateQuery` (cpp:47).
+    GetWalletState,
+    /// `GetExistingWalletBalanceQuery` (cpp:73).
+    GetExistingWalletBalance,
+    /// `GetUserWalletAddressesQuery` (cpp:101) — the get form.
+    GetUserWalletAddresses,
+    /// `CreateUserWalletAddressQuery` (cpp:144) — the request user id
+    /// rides the answer conversion.
+    CreateUserWalletAddress { user_id: i64 },
+    /// `GetAddressWalletQuery` (cpp:187).
+    GetAddressWallet,
+    /// `ExportWalletSecretPhraseQuery` (cpp:230).
+    ExportSecretPhrase,
+    /// `FetchWalletEncryptedSecretPhrasePartQuery` (cpp:264) — the
+    /// per-holder-DC dispatch with the closure state.
+    FetchSecretPhrasePart {
+        query_id: u64,
+        private_key_id: tde2e::keychain::PrivateKeyId,
+    },
+    /// `EnableWalletBackupQuery` (cpp:294).
+    EnableBackup,
+    /// `DisableWalletBackupQuery` (cpp:324) — both forms.
+    DisableBackup,
+    /// `ReplaceWalletQuery` (cpp:419) — the delete and replace flows.
+    ReplaceWallet,
+    /// `GetWalletGaslessInfoQuery` (cpp:363) — the answer re-enters
+    /// through `UpdatesManager::on_get_updates`.
+    GetWalletGaslessInfo,
+    /// `GetWalletProofChallengeQuery` (cpp:390).
+    GetWalletProofChallenge,
+    /// `GetTonWalletTransactionsQuery` (cpp:452).
+    GetTransactions,
+    /// `GetTonWalletTransactionQuery` (cpp:504) — the by-ids and
+    /// by-msg-hash forms share the parse.
+    GetTransactionsByIds,
+    /// `SendWalletTransferQuery` (cpp:551) — the WALLET_KEY_MISMATCH /
+    /// on_send_message_fail error ladder keys on the random id.
+    SendTransfer { random_id: i64 },
+    /// `GetCurrencyRatesQuery` (cpp:604).
+    GetCurrencyRates,
+    /// `TonWalletManager::GetTonNftsQuery` (cpp:628).
+    GetTonNfts,
+    /// `GetTonConnectSessionsQuery` (cpp:657).
+    TonConnectGetSessions,
+    /// `CreateTonConnectSessionQuery` (cpp:681).
+    TonConnectCreateSession,
+    /// `RegisterTonConnectKeyQuery` (cpp:712).
+    TonConnectRegisterKey,
+    /// `SubmitTonConnectResultQuery` (cpp:753).
+    TonConnectSubmitConnectResult,
+    /// `GetTonConnectPendingQuery` (cpp:781).
+    TonConnectGetPending,
+    /// `ClaimTonConnectRequestQuery` (cpp:816).
+    TonConnectClaimRequest,
+    /// `SubmitTonConnectResponseQuery` (cpp:842).
+    TonConnectSubmitResponse,
+    /// `GetTonConnectNextEventIdQuery` (cpp:872).
+    TonConnectNextEventId,
+    /// `CloseTonConnectSessionQuery` (cpp:899).
+    TonConnectCloseSession,
+    /// `GetOnRampProvidersQuery` (cpp:929).
+    GetOnRampProviders,
+    /// `GetOnRampBaseCurrenciesQuery` (cpp:961).
+    GetOnRampBaseCurrencies,
+    /// `GetOnRampAvailabilityQuery` (cpp:989).
+    GetOnRampAvailability,
+    /// `GetOnRampLimitsQuery` (cpp:1017).
+    GetOnRampLimits,
+    /// `GetOnRampQuoteQuery` (cpp:1055).
+    GetOnRampQuote,
+    /// `CreateOnRampSessionQuery` (cpp:1094).
+    CreateOnRampSession,
+    /// `PerformTonCenterApiRequestQuery` (cpp:1154).
+    TonCenterPerformApiRequest,
+    /// `GetTonCenterStreamingApiUrlQuery` (cpp:1189).
+    TonCenterGetStreamingUrl,
+    /// `GetWalletBackupHolderDcsQuery` (cpp:1217).
+    GetWalletBackupHolderDcs,
+}
+
+/// The cloned ton-wallet dispatch surface the [`TonWalletEnv`] senders
+/// use — the C++ `td_->create_handler<…>()->send(...)` shape: the query
+/// serializes onto the dispatch and the answer comes back through the
+/// callback into [`Td::on_ton_wallet_net_answer`].
+struct TonWalletNetHandle {
+    dispatcher: Arc<NetQueryDispatcher>,
+    completed: Arc<Mutex<Vec<(TonWalletNetKind, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl TonWalletNetHandle {
+    /// Serialize + dispatch one ton-wallet query on the main DC (the
+    /// NetQueryCreator defaults ride like the updates dispatch).
+    fn dispatch(&self, kind: TonWalletNetKind, function: telegram_api::Function) {
+        self.dispatch_dc(kind, function, DcId::main());
+    }
+
+    /// The per-DC form — `create(function, {}, dc_id)` (the secret-phrase
+    /// part fetch) and the webfile-DC toncenter request.
+    fn dispatch_dc(&self, kind: TonWalletNetKind, function: telegram_api::Function, dc_id: DcId) {
+        let mut bytes = Vec::new();
+        function.store(&mut bytes);
+        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let net_query = NetQuery::new(
+            0,
+            dc_id,
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        self.dispatcher.dispatch_with_callback(
+            net_query,
+            Box::new(TonWalletNetDispatchCallback {
+                kind,
+                completed: Arc::clone(&self.completed),
+                shared: self.shared.clone(),
+            }),
+        );
+    }
+}
+
+/// The dispatcher callback for the ton-wallet queries: files the
+/// completed `NetQuery` under its kind and nudges the `Td` actor.
+struct TonWalletNetDispatchCallback {
+    kind: TonWalletNetKind,
+    completed: Arc<Mutex<Vec<(TonWalletNetKind, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl NetQueryCallback for TonWalletNetDispatchCallback {
+    fn on_result(&mut self, query: NetQuery) {
+        self.completed.lock().push((self.kind, query));
+        if let Some(shared) = &self.shared {
+            shared.wake_td();
+        }
+    }
+}
+
+/// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
+/// transfer result rides the `on_get_updates` completion — the value
+/// arm answers the parked promise with the carried object, the error
+/// arm forwards.
+struct TransferResultChain {
+    promise: Option<Promise<td_api::TonWalletTransferResult>>,
+    result: Option<td_api::TonWalletTransferResult>,
+}
+
+impl tdutils::promise::PromiseInterface<()> for TransferResultChain {
+    fn set_value(&mut self, _value: ()) {
+        if let (Some(mut promise), Some(result)) = (self.promise.take(), self.result.take()) {
+            promise.set_value(result);
+        }
+    }
+
+    fn set_error(&mut self, error: Status) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_error(error);
+        }
+    }
+}
+
+/// The `Bool` answer parse — `boolTrue#997275b5`/`boolFalse#bc799737`
+/// (telegram_api.tl:11-12; the generator emits no structs for the
+/// bootstrap Bool type — the config plane parses the ids the same way).
+fn parse_wire_bool(data: &[u8]) -> Option<()> {
+    const BOOL_TRUE_ID: i32 = 0x9972_75b5u32 as i32;
+    const BOOL_FALSE_ID: i32 = 0xbc79_9737u32 as i32;
+    let constructor = i32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    if constructor == BOOL_TRUE_ID || constructor == BOOL_FALSE_ID {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// `Vector<onrampProviderInfo>` — the `payments_getOnrampProviders`
+/// answer.
+fn parse_onramp_providers(data: &[u8]) -> Option<Vec<telegram_api::OnrampProviderInfo>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut providers = Vec::with_capacity(count);
+    for _ in 0..count {
+        providers.push(telegram_api::OnrampProviderInfo::read(&mut reader).ok()?);
+    }
+    Some(providers)
+}
+
+/// `Vector<string>` — the `payments_getOnrampBaseCurrencies` answer.
+fn parse_string_vector(data: &[u8]) -> Option<Vec<String>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut strings = Vec::with_capacity(count);
+    for _ in 0..count {
+        strings.push(reader.string().ok()?);
+    }
+    Some(strings)
+}
+
+/// `Vector<wallet.HolderDc>` — the `wallet_getBackupHolderDcs` answer.
+fn parse_holder_dcs(data: &[u8]) -> Option<Vec<telegram_api::wallet_HolderDc>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut dcs = Vec::with_capacity(count);
+    for _ in 0..count {
+        dcs.push(telegram_api::wallet_HolderDc::read(&mut reader).ok()?);
+    }
+    Some(dcs)
+}
+
 /// The dispatcher callback for the `SendMessageQuery`: files the completed
 /// `NetQuery` under the message's send identity and nudges the `Td`
 /// actor; the answer drains through [`Td::on_send_message_answer`].
@@ -3096,6 +3327,9 @@ pub struct Td {
     /// The callback-parked updates-engine answers (the GetDifference
     /// family), parked by kind.
     updates_net_completed: Arc<Mutex<Vec<(UpdatesNetKind, NetQuery)>>>,
+    /// The callback-parked TonWalletManager query answers, parked by
+    /// kind (the `Td::on_ton_wallet_net_answer` drain).
+    ton_wallet_net_completed: Arc<Mutex<Vec<(TonWalletNetKind, NetQuery)>>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -3512,6 +3746,7 @@ impl Td {
             pending_net: HashMap::new(),
             net_completed: Arc::new(Mutex::new(Vec::new())),
             updates_net_completed: Arc::new(Mutex::new(Vec::new())),
+            ton_wallet_net_completed: Arc::new(Mutex::new(Vec::new())),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -5653,6 +5888,7 @@ impl Td {
     /// driver threads park them; the actor pump routes them here).
     pub(crate) fn dispatch_completed_walking(&mut self) {
         self.dispatch_completed_updates_net();
+        self.dispatch_completed_ton_wallet_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -5669,6 +5905,17 @@ impl Td {
         Some(UpdatesNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.updates_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned ton-wallet dispatch surface for the [`TonWalletEnv`]
+    /// senders — `None` keeps the net-inert posture (the pre-init
+    /// windows).
+    fn ton_wallet_net(&self) -> Option<TonWalletNetHandle> {
+        Some(TonWalletNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.ton_wallet_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -5812,6 +6059,904 @@ impl Td {
             }
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked TonWalletManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the ~35 query
+    /// classes (TonWalletManager.cpp:47-1240).
+    fn dispatch_completed_ton_wallet_net(&mut self) {
+        let completed = std::mem::take(&mut *self.ton_wallet_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_ton_wallet_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// `td_->user_manager_->on_get_users` — the take/env/restore shape of
+    /// the drain_sink users tail, shared by the ton-wallet answer arms.
+    fn intake_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        if users.is_empty() {
+            return;
+        }
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let is_bot = self.auth_manager.is_bot();
+        let Some(options) = self.option_manager.as_mut() else {
+            self.user_manager = user_manager;
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: is_bot,
+        };
+        user_manager.on_get_users(&mut env, users, source);
+        self.user_manager = user_manager;
+    }
+
+    /// `td_->chat_manager_->on_get_chats` — the same shape over the chat
+    /// manager (the basic-group intake needs the user manager too).
+    fn intake_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        if chats.is_empty() {
+            return;
+        }
+        let mut chat_manager = std::mem::take(&mut self.chat_manager);
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let is_bot = self.auth_manager.is_bot();
+        let Some(options) = self.option_manager.as_mut() else {
+            self.chat_manager = chat_manager;
+            self.user_manager = user_manager;
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: is_bot,
+        };
+        chat_manager.on_get_chats(&mut user_manager, &mut env, chats, source);
+        self.chat_manager = chat_manager;
+        self.user_manager = user_manager;
+    }
+
+    /// `G()->get_webfile_dc_id()` (Global.cpp:254-264) — the toncenter
+    /// perform request rides the webfile DC like the C++; the config
+    /// seam answers the empty id until the option lands (the dispatcher
+    /// refuses it with the C++ "No such dc" error offline).
+    fn webfile_dc_id(&self) -> DcId {
+        DcId::invalid()
+    }
+
+    /// Route one TonWalletManager net answer by kind — each arm is the
+    /// C++ query handler's `on_result`/`on_error` (TonWalletManager.cpp:
+    /// 47-1240): the parse stays in this frame, the intakes hop into
+    /// the manager's context through the taken-manager env.
+    fn on_ton_wallet_net_answer(&mut self, kind: TonWalletNetKind, query: NetQuery) {
+        /// The status form of a parse failure — the C++ `fetch_result`
+        /// error passes to `on_error` and completes the promise with it.
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetWalletStateQuery` (cpp:47-70): the wire state feeds
+            // `on_update_wallet_state`, then the promise value.
+            TonWalletNetKind::GetWalletState => {
+                let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                if query.is_error() {
+                    manager
+                        .on_get_wallet_state(tdutils::status::Result::Err(query.error().clone()));
+                } else {
+                    match telegram_api::WalletState::parse(query.ok()) {
+                        Ok(wallet_state) => {
+                            let mut env = TonWalletEnv { td: &mut *self };
+                            manager.on_update_wallet_state(&mut env, wallet_state);
+                            manager.on_get_wallet_state(tdutils::status::Result::Ok(()));
+                        }
+                        Err(_) => manager.on_get_wallet_state(tdutils::status::Result::Err(
+                            parse_error("wallet_getState"),
+                        )),
+                    }
+                }
+                self.ton_wallet_manager = manager;
+            }
+            // `GetExistingWalletBalanceQuery` (cpp:73-99).
+            TonWalletNetKind::GetExistingWalletBalance => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_existing_balance)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_ExistingBalance::parse(query.ok()) {
+                            Ok(balance) => promise.set_value(td_api::WalletBotBalance {
+                                has_balance: balance.has_balance,
+                                url: balance.url,
+                            }),
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_getExistingWaltBalance"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetUserWalletAddressesQuery` (cpp:101-142) — the users feed
+            // the UserManager first, then the address mapping.
+            TonWalletNetKind::GetUserWalletAddresses => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_user_addresses)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                        return;
+                    }
+                    match telegram_api::wallet_UserAddresses::parse(query.ok()) {
+                        Ok(addresses) => {
+                            self.intake_users(addresses.users, "GetUserWalletAddressesQuery");
+                            let mut env = TonWalletEnv { td: &mut *self };
+                            let object = td_api::UserTonWalletAddresses {
+                                addresses: addresses
+                                    .addresses
+                                    .iter()
+                                    .filter_map(|address| {
+                                        if address.user_id <= 0 {
+                                            tdutils::log_error!(
+                                                "Receive invalid user {}",
+                                                address.user_id
+                                            );
+                                            return None;
+                                        }
+                                        Some(td_api::UserTonWalletAddress {
+                                            user_id:
+                                                crate::ton_wallet::TonWalletManagerEnv::get_user_id_object(
+                                                    &mut env,
+                                                    address.user_id,
+                                                    "userTonWalletAddress",
+                                                ),
+                                            wallet_address: address.address.clone(),
+                                            public_key: address.public_key.clone(),
+                                        })
+                                    })
+                                    .collect(),
+                            };
+                            promise.set_value(object);
+                        }
+                        Err(_) => {
+                            promise.set_error(parse_error("wallet_getUserAddresses"));
+                        }
+                    }
+                }
+            }
+            // `CreateUserWalletAddressQuery` (cpp:144-185) — the request
+            // user id answers the object.
+            TonWalletNetKind::CreateUserWalletAddress { user_id } => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_create_user_address)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                        return;
+                    }
+                    match telegram_api::wallet_UserAddresses::parse(query.ok()) {
+                        Ok(addresses) => {
+                            self.intake_users(addresses.users, "CreateUserWalletAddressQuery");
+                            if addresses.addresses.len() != 1 {
+                                return promise.set_error(Status::error(
+                                    400,
+                                    "Failed to create TON wallet address",
+                                ));
+                            }
+                            let mut env = TonWalletEnv { td: &mut *self };
+                            let address = &addresses.addresses[0];
+                            let object = td_api::UserTonWalletAddress {
+                                user_id: crate::ton_wallet::TonWalletManagerEnv::get_user_id_object(
+                                    &mut env,
+                                    user_id,
+                                    "userTonWalletAddress",
+                                ),
+                                wallet_address: address.address.clone(),
+                                public_key: address.public_key.clone(),
+                            };
+                            promise.set_value(object);
+                        }
+                        Err(_) => {
+                            promise.set_error(parse_error("wallet_getUserAddresses"));
+                        }
+                    }
+                }
+            }
+            // `GetAddressWalletQuery` (cpp:187-228) — the answer's user
+            // id (invalid → 0) answers the object.
+            TonWalletNetKind::GetAddressWallet => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_address_wallet)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                        return;
+                    }
+                    match telegram_api::wallet_UserAddresses::parse(query.ok()) {
+                        Ok(addresses) => {
+                            self.intake_users(addresses.users, "GetAddressWalletQuery");
+                            if addresses.addresses.len() != 1 {
+                                return promise.set_error(Status::error(400, "Address not found"));
+                            }
+                            let address = addresses.addresses.into_iter().next().unwrap();
+                            let mut user_id = address.user_id;
+                            if user_id <= 0 {
+                                user_id = 0;
+                            }
+                            let mut env = TonWalletEnv { td: &mut *self };
+                            let mapped = crate::ton_wallet::TonWalletManagerEnv::get_user_id_object(
+                                &mut env,
+                                user_id,
+                                "userTonWalletAddress",
+                            );
+                            promise.set_value(td_api::UserTonWalletAddress {
+                                user_id: mapped,
+                                wallet_address: address.address,
+                                public_key: address.public_key,
+                            });
+                        }
+                        Err(_) => {
+                            promise.set_error(parse_error("wallet_getUserAddresses"));
+                        }
+                    }
+                }
+            }
+            // `ExportWalletSecretPhraseQuery` (cpp:230-262) — the parts
+            // re-enter the per-DC fan-out with the popped promise.
+            TonWalletNetKind::ExportSecretPhrase => {
+                if let Some(promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_secret_phrase)
+                {
+                    if query.is_error() {
+                        let mut promise = promise;
+                        promise.set_error(query.error().clone());
+                        return;
+                    }
+                    match telegram_api::wallet_SecretPhraseParts::parse(query.ok()) {
+                        Ok(parts) => {
+                            let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                            let mut env = TonWalletEnv { td: &mut *self };
+                            manager.do_get_ton_wallet_secret_phrase_with_parts(
+                                &mut env, parts, promise,
+                            );
+                            self.ton_wallet_manager = manager;
+                        }
+                        Err(_) => {
+                            let mut promise = promise;
+                            promise.set_error(parse_error("wallet_exportSecretPhrase"));
+                        }
+                    }
+                }
+            }
+            // `FetchWalletEncryptedSecretPhrasePartQuery` (cpp:264-291).
+            TonWalletNetKind::FetchSecretPhrasePart {
+                query_id,
+                private_key_id,
+            } => {
+                let part = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::wallet_EncryptedSecretPhrasePart::parse(query.ok()) {
+                        Ok(part) => tdutils::status::Result::Ok(part.data),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "wallet_fetchEncryptedSecretPhrasePart",
+                        )),
+                    }
+                };
+                self.ton_wallet_manager
+                    .on_get_ton_wallet_secret_phrase_part(part, query_id, private_key_id);
+            }
+            // `EnableWalletBackupQuery` (cpp:294-322),
+            // `DisableWalletBackupQuery` (cpp:324-361) and
+            // `ReplaceWalletQuery` (cpp:419-450) — the WalletState answer
+            // feeds `on_update_wallet_state`, then the promise value.
+            TonWalletNetKind::EnableBackup
+            | TonWalletNetKind::DisableBackup
+            | TonWalletNetKind::ReplaceWallet => {
+                let slot: for<'a> fn(
+                    &'a mut crate::ton_wallet::TonWalletManager,
+                ) -> &'a mut Vec<Promise<()>> = match kind {
+                    TonWalletNetKind::EnableBackup => |m| &mut m.pending_enable_backup,
+                    TonWalletNetKind::DisableBackup => |m| &mut m.pending_disable_backup,
+                    _ => |m| &mut m.pending_replace_wallet,
+                };
+                if let Some(mut promise) = self.ton_wallet_manager.take_promise(slot) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::WalletState::parse(query.ok()) {
+                            Ok(wallet_state) => {
+                                let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                                let mut env = TonWalletEnv { td: &mut *self };
+                                manager.on_update_wallet_state(&mut env, wallet_state);
+                                self.ton_wallet_manager = manager;
+                                promise.set_value(());
+                            }
+                            Err(_) => promise.set_error(parse_error("the wallet backup answer")),
+                        }
+                    }
+                }
+            }
+            // `GetWalletGaslessInfoQuery` (cpp:363-388) — the Updates
+            // answer re-enters `on_get_updates` with the popped promise.
+            TonWalletNetKind::GetWalletGaslessInfo => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_gasless_info)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => promise.set_error(parse_error("wallet_getGaslessInfo")),
+                        }
+                    }
+                }
+            }
+            // `GetWalletProofChallengeQuery` (cpp:390-417).
+            TonWalletNetKind::GetWalletProofChallenge => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_proof_challenge)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_ProofChallenge::parse(query.ok()) {
+                            Ok(challenge) => {
+                                promise.set_value(td_api::TonWalletOwnershipProofChallenge {
+                                    payload: challenge.payload,
+                                    domain: challenge.domain,
+                                })
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_getProofChallenge"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetTonWalletTransactionsQuery` (cpp:452-502).
+            TonWalletNetKind::GetTransactions => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_transactions)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                        return;
+                    }
+                    match telegram_api::wallet_Transactions::parse(query.ok()) {
+                        Ok(transactions) => {
+                            self.intake_users(
+                                transactions.users.clone(),
+                                "GetTonWalletTransactionsQuery",
+                            );
+                            self.intake_chats(
+                                transactions.chats.clone(),
+                                "GetTonWalletTransactionsQuery",
+                            );
+                            let manager = std::mem::take(&mut self.ton_wallet_manager);
+                            let mut env = TonWalletEnv { td: &mut *self };
+                            let objects = transactions
+                                .transactions
+                                .into_iter()
+                                .map(|transaction| {
+                                    manager.get_ton_wallet_transaction_object_env(
+                                        &mut env,
+                                        transaction,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            self.ton_wallet_manager = manager;
+                            promise.set_value(td_api::TonWalletTransactions {
+                                gram_amount: transactions.balance,
+                                transactions: objects,
+                                next_offset: transactions.next_offset,
+                            });
+                        }
+                        Err(_) => promise.set_error(parse_error("wallet_getTransactions")),
+                    }
+                }
+            }
+            // `GetTonWalletTransactionQuery` (cpp:504-549) — the empty
+            // answer is a null object; two is the C++ 500 (the verbatim
+            // "respomse" typo).
+            TonWalletNetKind::GetTransactionsByIds => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_transaction)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                        return;
+                    }
+                    match telegram_api::wallet_Transactions::parse(query.ok()) {
+                        Ok(transactions) => {
+                            self.intake_users(
+                                transactions.users.clone(),
+                                "GetTonWalletTransactionQuery",
+                            );
+                            self.intake_chats(
+                                transactions.chats.clone(),
+                                "GetTonWalletTransactionQuery",
+                            );
+                            if transactions.transactions.len() > 1 {
+                                tdutils::log_error!("Receive {}", transactions.to_debug_string());
+                                return promise
+                                    .set_error(Status::error(500, "Receive invalid respomse"));
+                            }
+                            let object = if transactions.transactions.is_empty() {
+                                None
+                            } else {
+                                let manager = std::mem::take(&mut self.ton_wallet_manager);
+                                let mut env = TonWalletEnv { td: &mut *self };
+                                let object = Some(manager.get_ton_wallet_transaction_object_env(
+                                    &mut env,
+                                    transactions.transactions.into_iter().next().unwrap(),
+                                ));
+                                self.ton_wallet_manager = manager;
+                                object
+                            };
+                            promise.set_value(object);
+                        }
+                        Err(_) => promise.set_error(parse_error("wallet_getTransactionsByIDs")),
+                    }
+                }
+            }
+            // `SendWalletTransferQuery` (cpp:551-602) — the error ladder
+            // and the `on_get_updates` chain over the extracted sent
+            // transaction.
+            TonWalletNetKind::SendTransfer { random_id } => {
+                let promise = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_transfer);
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "WALLET_KEY_MISMATCH" {
+                        let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                        let mut env = TonWalletEnv { td: &mut *self };
+                        manager.reload_wallet_state(&mut env, Promise::default());
+                        self.ton_wallet_manager = manager;
+                    }
+                    self.run_send_message_fail(random_id, status.code(), status.message());
+                    promise.set_error(status);
+                    return;
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(mut updates) => {
+                        let sent =
+                            crate::updates_manager::extract_sent_wallet_transaction(&mut updates);
+                        let Some(sent) = sent else {
+                            tdutils::log_error!("Receive {}", updates.to_debug_string());
+                            return promise.set_error(Status::error(
+                                500,
+                                "Receive no sent wallet transaction",
+                            ));
+                        };
+                        let manager = std::mem::take(&mut self.ton_wallet_manager);
+                        let mut env = TonWalletEnv { td: &mut *self };
+                        let transaction = sent.transaction.map(|transaction| {
+                            manager.get_ton_wallet_transaction_object_env(&mut env, transaction)
+                        });
+                        self.ton_wallet_manager = manager;
+                        let transfer_result = td_api::TonWalletTransferResult {
+                            is_gasless: sent.gasless,
+                            msg_hash: sent.msg_hash.into_bytes(),
+                            transaction,
+                        };
+                        // The C++ chains the transfer result behind the
+                        // `on_get_updates` promise lambda.
+                        let chained = Promise::from_interface(TransferResultChain {
+                            promise: Some(promise),
+                            result: Some(transfer_result),
+                        });
+                        self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise: chained,
+                        });
+                    }
+                    Err(_) => promise.set_error(parse_error("wallet_sendTransfer")),
+                }
+            }
+            // `GetCurrencyRatesQuery` (cpp:604-626).
+            TonWalletNetKind::GetCurrencyRates => {
+                let rates = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_CurrencyRates::parse(query.ok()) {
+                        Ok(rates) => tdutils::status::Result::Ok(rates),
+                        Err(_) => {
+                            tdutils::status::Result::Err(parse_error("payments_getCurrencyRates"))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                let env = TonWalletEnv { td: &mut *self };
+                manager.on_get_currency_rates(&env, rates);
+                self.ton_wallet_manager = manager;
+            }
+            // `GetTonNftsQuery` (cpp:628-655) — the NFT mapping (the
+            // photo/document legs stay the files seams).
+            TonWalletNetKind::GetTonNfts => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_nfts)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_NftItems::parse(query.ok()) {
+                            Ok(items) => promise.set_value(td_api::TonNfts {
+                                nfts: items
+                                    .items
+                                    .iter()
+                                    .map(crate::ton_wallet::get_ton_nft_object)
+                                    .collect(),
+                                next_offset: items.next_offset,
+                            }),
+                            Err(_) => promise.set_error(parse_error("wallet_getNfts")),
+                        }
+                    }
+                }
+            }
+            // `GetTonConnectSessionsQuery` (cpp:657-679).
+            TonWalletNetKind::TonConnectGetSessions => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_ton_connect_sessions)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_TonConnectSessions::parse(query.ok()) {
+                            Ok(sessions) => promise.set_value(td_api::TonConnectSessions {
+                                sessions: sessions
+                                    .sessions
+                                    .iter()
+                                    .map(crate::ton_wallet::get_ton_connect_session_object)
+                                    .collect(),
+                            }),
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_tonConnectGetSessions"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `CreateTonConnectSessionQuery` (cpp:681-710) — the session
+            // update emission rides the value.
+            TonWalletNetKind::TonConnectCreateSession => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_ton_connect_session)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::TonConnectSession::parse(query.ok()) {
+                            Ok(session) => {
+                                let object =
+                                    crate::ton_wallet::get_ton_connect_session_object(&session);
+                                self.send_update(td_api::Object::updateTonWalletTonConnectSession(
+                                    td_api::updateTonWalletTonConnectSession {
+                                        session: Some(
+                                            crate::ton_wallet::get_ton_connect_session_object(
+                                                &session,
+                                            ),
+                                        ),
+                                    },
+                                ));
+                                promise.set_value(object);
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_tonConnectCreateSession"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `RegisterTonConnectKeyQuery` (cpp:712-740).
+            TonWalletNetKind::TonConnectRegisterKey => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_ton_connect_challenge)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_TonConnectChallenge::parse(query.ok()) {
+                            Ok(challenge) => promise.set_value(
+                                crate::ton_wallet::get_ton_connect_challenge_object(&challenge),
+                            ),
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_tonConnectRegisterKey"));
+                            }
+                        }
+                    }
+                }
+            }
+            // The four Bool-answered TonConnect queries (cpp:753-927):
+            // `SubmitTonConnectResultQuery`, `ClaimTonConnectRequestQuery`,
+            // `SubmitTonConnectResponseQuery`, `CloseTonConnectSessionQuery`
+            // — the C++ discards the answer once fetched.
+            TonWalletNetKind::TonConnectSubmitConnectResult
+            | TonWalletNetKind::TonConnectClaimRequest
+            | TonWalletNetKind::TonConnectSubmitResponse
+            | TonWalletNetKind::TonConnectCloseSession => {
+                let slot: for<'a> fn(
+                    &'a mut crate::ton_wallet::TonWalletManager,
+                ) -> &'a mut Vec<Promise<()>> = match kind {
+                    TonWalletNetKind::TonConnectSubmitConnectResult => {
+                        |m| &mut m.pending_ton_connect_submit_result
+                    }
+                    TonWalletNetKind::TonConnectClaimRequest => {
+                        |m| &mut m.pending_ton_connect_claim
+                    }
+                    TonWalletNetKind::TonConnectSubmitResponse => {
+                        |m| &mut m.pending_ton_connect_submit_response
+                    }
+                    _ => |m| &mut m.pending_ton_connect_close_session,
+                };
+                if let Some(mut promise) = self.ton_wallet_manager.take_promise(slot) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_wire_bool(query.ok()) {
+                            Some(()) => promise.set_value(()),
+                            None => promise.set_error(parse_error("the tonConnect answer")),
+                        }
+                    }
+                }
+            }
+            // `GetTonConnectPendingQuery` (cpp:781-815).
+            TonWalletNetKind::TonConnectGetPending => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_ton_connect_requests)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_TonConnectPending::parse(query.ok()) {
+                            Ok(pending) => promise.set_value(
+                                crate::ton_wallet::get_ton_connect_requests_object(&pending),
+                            ),
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_tonConnectGetPending"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetTonConnectNextEventIdQuery` (cpp:872-897).
+            TonWalletNetKind::TonConnectNextEventId => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_ton_connect_next_event_id)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::TonConnectNextEventId::parse(query.ok()) {
+                            Ok(next) => promise.set_value(td_api::TonConnectSessionEventId {
+                                event_id: next.event_id,
+                            }),
+                            Err(_) => {
+                                promise.set_error(parse_error("wallet_tonConnectNextEventId"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetOnRampProvidersQuery` (cpp:929-958 + the 2193
+            // conversion lambda) — `ignore_result_if_closing` drops the
+            // answer on a closing Td.
+            TonWalletNetKind::GetOnRampProviders => {
+                if self.global.close_flag() {
+                    return;
+                }
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_on_ramp_providers)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_onramp_providers(query.ok()) {
+                            Some(providers) => promise.set_value(td_api::OnRampProviders {
+                                providers: providers
+                                    .iter()
+                                    .map(crate::ton_wallet::get_on_ramp_provider_object)
+                                    .collect(),
+                            }),
+                            None => promise.set_error(parse_error("payments_getOnrampProviders")),
+                        }
+                    }
+                }
+            }
+            // `GetOnRampBaseCurrenciesQuery` (cpp:961-987).
+            TonWalletNetKind::GetOnRampBaseCurrencies => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_on_ramp_base_currencies)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_string_vector(query.ok()) {
+                            Some(currencies) => {
+                                promise.set_value(td_api::Currencies { currencies })
+                            }
+                            None => {
+                                promise.set_error(parse_error("payments_getOnrampBaseCurrencies"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetOnRampAvailabilityQuery` (cpp:989-1015).
+            TonWalletNetKind::GetOnRampAvailability => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_on_ramp_availability)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::OnrampAvailability::parse(query.ok()) {
+                            Ok(availability) => {
+                                promise.set_value(td_api::OnRampPaymentAvailability {
+                                    is_allowed: availability.allowed,
+                                    is_purchase_allowed: availability.buy_allowed,
+                                    methods: availability
+                                        .methods
+                                        .iter()
+                                        .map(|method| td_api::OnRampPaymentMethod {
+                                            name: method.payment_method.clone(),
+                                            is_available: method.available,
+                                        })
+                                        .collect(),
+                                    country_code: availability.country_code,
+                                    state: availability.state,
+                                })
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_getOnrampAvailability"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetOnRampLimitsQuery` (cpp:1017-1053).
+            TonWalletNetKind::GetOnRampLimits => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_on_ramp_limits)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::OnrampLimits::parse(query.ok()) {
+                            Ok(limits) => promise.set_value(
+                                crate::ton_wallet::get_on_ramp_payment_limits_object(limits),
+                            ),
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_getOnrampLimits"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetOnRampQuoteQuery` (cpp:1055-1092).
+            TonWalletNetKind::GetOnRampQuote => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_on_ramp_quote)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::OnrampQuote::parse(query.ok()) {
+                            Ok(quote) => promise.set_value(
+                                crate::ton_wallet::get_on_ramp_payment_quote_object(quote),
+                            ),
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_getOnrampQuote"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `CreateOnRampSessionQuery` (cpp:1094-1146).
+            TonWalletNetKind::CreateOnRampSession => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_on_ramp_session)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::OnrampSession::parse(query.ok()) {
+                            Ok(session) => promise.set_value(
+                                crate::ton_wallet::get_on_ramp_payment_session_object(session),
+                            ),
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_createOnrampSession"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `PerformTonCenterApiRequestQuery` (cpp:1154-1186).
+            TonWalletNetKind::TonCenterPerformApiRequest => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_toncenter_request)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::toncenter_ApiResponse::parse(query.ok()) {
+                            Ok(response) => promise.set_value(
+                                response.response.map(|data| data.data).unwrap_or_default(),
+                            ),
+                            Err(_) => {
+                                promise.set_error(parse_error("toncenter_performApiRequest"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetTonCenterStreamingApiUrlQuery` (cpp:1189-1215).
+            TonWalletNetKind::TonCenterGetStreamingUrl => {
+                let url = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::toncenter_StreamingUrl::parse(query.ok()) {
+                        Ok(url) => tdutils::status::Result::Ok(url),
+                        Err(_) => {
+                            tdutils::status::Result::Err(parse_error("toncenter_getStreamingUrl"))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                let env = TonWalletEnv { td: &mut *self };
+                manager.on_get_ton_center_streaming_api_url(&env, url);
+                self.ton_wallet_manager = manager;
+            }
+            // `GetWalletBackupHolderDcsQuery` (cpp:1217-1240).
+            TonWalletNetKind::GetWalletBackupHolderDcs => {
+                let dcs = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_holder_dcs(query.ok()) {
+                        Some(dcs) => tdutils::status::Result::Ok(dcs),
+                        None => {
+                            tdutils::status::Result::Err(parse_error("wallet_getBackupHolderDcs"))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                let mut env = TonWalletEnv { td: &mut *self };
+                manager.on_get_backup_holder_dcs(&mut env, dcs);
+                self.ton_wallet_manager = manager;
+            }
+        }
     }
 
     /// Route one walking-skeleton answer by kind.
@@ -12658,6 +13803,775 @@ impl crate::ton_wallet::TonWalletManagerEnv for TonWalletEnv<'_> {
             is_comment_encrypted,
             sending_id,
         )
+    }
+
+    // ---- The net query senders — the `send_query(G()->net_query_creator()
+    // .create(...))` legs of the C++ query classes (TonWalletManager.cpp:
+    // 47-1240). The pre-init windows (no dispatcher) keep the net-inert
+    // log. ----
+
+    /// `GetWalletStateQuery::send` (cpp:52-54).
+    fn send_wallet_get_state_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetWalletState,
+                telegram_api::Function::wallet_getState(telegram_api::wallet_getState),
+            ),
+            None => tdutils::log_info!("Send wallet_getState — [net-inert]"),
+        }
+    }
+
+    /// `GetWalletGaslessInfoQuery::send` (cpp:367-369).
+    fn send_wallet_get_gasless_info_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetWalletGaslessInfo,
+                telegram_api::Function::wallet_getGaslessInfo(telegram_api::wallet_getGaslessInfo),
+            ),
+            None => tdutils::log_info!("Send wallet_getGaslessInfo — [net-inert]"),
+        }
+    }
+
+    /// `GetExistingWalletBalanceQuery::send` (cpp:78-80).
+    fn send_wallet_get_existing_balance_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetExistingWalletBalance,
+                telegram_api::Function::wallet_getExistingWaltBalance(
+                    telegram_api::wallet_getExistingWaltBalance,
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_getExistingWaltBalance — [net-inert]"),
+        }
+    }
+
+    /// `GetUserWalletAddressesQuery::send`/`CreateUserWalletAddressQuery::
+    /// send`/`GetAddressWalletQuery::send` (cpp:106-108, 155-158,
+    /// 193-195) — the three `wallet_getUserAddresses` forms.
+    fn send_wallet_get_user_addresses_query(
+        &mut self,
+        create: bool,
+        user_id: i64,
+        input_users: Vec<telegram_api::InputUser>,
+        addresses: Vec<String>,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => {
+                let kind = if create {
+                    TonWalletNetKind::CreateUserWalletAddress { user_id }
+                } else if addresses.is_empty() {
+                    TonWalletNetKind::GetUserWalletAddresses
+                } else {
+                    TonWalletNetKind::GetAddressWallet
+                };
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::wallet_getUserAddresses(
+                        telegram_api::wallet_getUserAddresses {
+                            flags: 0,
+                            force: create,
+                            id: input_users,
+                            addresses,
+                        },
+                    ),
+                )
+            }
+            None => tdutils::log_info!("Send wallet_getUserAddresses — [net-inert]"),
+        }
+    }
+
+    /// `GetWalletProofChallengeQuery::send` (cpp:395-397).
+    fn send_wallet_get_proof_challenge_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetWalletProofChallenge,
+                telegram_api::Function::wallet_getProofChallenge(
+                    telegram_api::wallet_getProofChallenge,
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_getProofChallenge — [net-inert]"),
+        }
+    }
+
+    /// `EnableWalletBackupQuery::send` (cpp:299-305) — the fixed
+    /// NEW_PUBLIC_KEY_MASK | PROOF_MASK flags.
+    fn send_wallet_enable_backup_query(
+        &mut self,
+        parts: Vec<Vec<u8>>,
+        public_key: Vec<u8>,
+        proof: telegram_api::WalletOwnershipProof,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::EnableBackup,
+                telegram_api::Function::wallet_enableBackup(telegram_api::wallet_enableBackup {
+                    // NEW_PUBLIC_KEY_MASK | PROOF_MASK (flags.1|flags.2).
+                    flags: (1 << 1) | (1 << 2),
+                    parts,
+                    new_public_key: public_key,
+                    proof: Some(proof),
+                }),
+            ),
+            None => tdutils::log_info!("Send wallet_enableBackup — [net-inert]"),
+        }
+    }
+
+    /// `DisableWalletBackupQuery::send` (cpp:330-344) — the password
+    /// form (PASSWORD_MASK) and the proof form (NEW_PUBLIC_KEY_MASK |
+    /// PROOF_MASK).
+    fn send_wallet_disable_backup_query(
+        &mut self,
+        input_password: Option<telegram_api::InputCheckPasswordSRP>,
+        public_key: Vec<u8>,
+        proof: Option<telegram_api::WalletOwnershipProof>,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::DisableBackup,
+                telegram_api::Function::wallet_disableBackup(telegram_api::wallet_disableBackup {
+                    flags: if input_password.is_some() {
+                        1
+                    } else {
+                        (1 << 1) | (1 << 2)
+                    },
+                    password: input_password,
+                    new_public_key: public_key,
+                    proof,
+                }),
+            ),
+            None => tdutils::log_info!("Send wallet_disableBackup — [net-inert]"),
+        }
+    }
+
+    /// `ReplaceWalletQuery::send` (cpp:433-439) — the PASSWORD_MASK form.
+    fn send_wallet_replace_wallet_query(
+        &mut self,
+        new_wallet: telegram_api::InputWalletReplacement,
+        input_password: Option<telegram_api::InputCheckPasswordSRP>,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::ReplaceWallet,
+                telegram_api::Function::wallet_replaceWallet(telegram_api::wallet_replaceWallet {
+                    flags: if input_password.is_some() { 1 } else { 0 },
+                    wallet: Some(new_wallet),
+                    password: input_password,
+                }),
+            ),
+            None => tdutils::log_info!("Send wallet_replaceWallet — [net-inert]"),
+        }
+    }
+
+    /// `ExportWalletSecretPhraseQuery::send` (cpp:237-244).
+    fn send_wallet_export_secret_phrase_query(
+        &mut self,
+        input_password: Option<telegram_api::InputCheckPasswordSRP>,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::ExportSecretPhrase,
+                telegram_api::Function::wallet_exportSecretPhrase(
+                    telegram_api::wallet_exportSecretPhrase {
+                        flags: 0,
+                        password: input_password,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_exportSecretPhrase — [net-inert]"),
+        }
+    }
+
+    /// `FetchWalletEncryptedSecretPhrasePartQuery::send` (cpp:270-273) —
+    /// the explicit holder-DC dispatch with the closure state.
+    fn send_wallet_fetch_secret_phrase_part_query(
+        &mut self,
+        token: &str,
+        public_key: Vec<u8>,
+        dc_id: i32,
+        query_id: u64,
+        private_key_id: tde2e::keychain::PrivateKeyId,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch_dc(
+                TonWalletNetKind::FetchSecretPhrasePart {
+                    query_id,
+                    private_key_id,
+                },
+                telegram_api::Function::wallet_fetchEncryptedSecretPhrasePart(
+                    telegram_api::wallet_fetchEncryptedSecretPhrasePart {
+                        token: token.to_owned(),
+                        public_key,
+                    },
+                ),
+                DcId::internal(dc_id),
+            ),
+            None => {
+                tdutils::log_info!("Send wallet_fetchEncryptedSecretPhrasePart — [net-inert]")
+            }
+        }
+    }
+
+    /// `GetTonWalletTransactionsQuery::send` (cpp:477-487).
+    fn send_wallet_get_transactions_query(
+        &mut self,
+        inbound: bool,
+        outbound: bool,
+        offset: &str,
+        limit: i32,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetTransactions,
+                telegram_api::Function::wallet_getTransactions(
+                    telegram_api::wallet_getTransactions {
+                        flags: 0,
+                        inbound,
+                        outbound,
+                        offset: offset.to_owned(),
+                        limit,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send wallet_getTransactions — [net-inert]")
+            }
+        }
+    }
+
+    /// `GetTonWalletTransactionQuery::send` (cpp:495-501) — the
+    /// by-ids/by-msg-hash forms.
+    fn send_wallet_get_transactions_by_query(&mut self, by_msg_hash: bool, ids: Vec<String>) {
+        match self.td.ton_wallet_net() {
+            Some(net) => {
+                let function = if by_msg_hash {
+                    telegram_api::Function::wallet_getTransactionsByMsgHash(
+                        telegram_api::wallet_getTransactionsByMsgHash { msg_hash: ids },
+                    )
+                } else {
+                    telegram_api::Function::wallet_getTransactionsByIDs(
+                        telegram_api::wallet_getTransactionsByIDs { id: ids },
+                    )
+                };
+                net.dispatch(TonWalletNetKind::GetTransactionsByIds, function)
+            }
+            None => {
+                tdutils::log_info!("Send wallet_getTransactionsByIDs/ByMsgHash — [net-inert]")
+            }
+        }
+    }
+
+    /// `SendWalletTransferQuery::send` (cpp:563-576) — the input-user
+    /// resolve with the `inputUserEmpty` fallback.
+    fn send_wallet_send_transfer_query(
+        &mut self,
+        data_normal: &[u8],
+        data_gasless: &[u8],
+        user_id: i64,
+        random_id: i64,
+    ) {
+        let Some(net) = self.td.ton_wallet_net() else {
+            return tdutils::log_info!("Send wallet_sendTransfer — [net-inert]");
+        };
+        let input_user = match self.get_input_user(user_id) {
+            tdutils::status::Result::Ok(input_user) => Some(input_user),
+            tdutils::status::Result::Err(_) => Some(telegram_api::InputUser::inputUserEmpty(
+                telegram_api::inputUserEmpty,
+            )),
+        };
+        net.dispatch(
+            TonWalletNetKind::SendTransfer { random_id },
+            telegram_api::Function::wallet_sendTransfer(telegram_api::wallet_sendTransfer {
+                flags: 0,
+                data_normal: data_normal.to_vec(),
+                data_gasless: data_gasless.to_vec(),
+                user_id: input_user,
+                random_id,
+            }),
+        )
+    }
+
+    /// `GetCurrencyRatesQuery::send` (cpp:610-612).
+    fn send_payments_get_currency_rates_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetCurrencyRates,
+                telegram_api::Function::payments_getCurrencyRates(
+                    telegram_api::payments_getCurrencyRates,
+                ),
+            ),
+            None => tdutils::log_info!("Send payments_getCurrencyRates — [net-inert]"),
+        }
+    }
+
+    /// `GetTonNftsQuery::send` (cpp:636-638).
+    fn send_wallet_get_nfts_query(&mut self, offset: &str, limit: i32) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetTonNfts,
+                telegram_api::Function::wallet_getNfts(telegram_api::wallet_getNfts {
+                    offset: offset.to_owned(),
+                    limit,
+                }),
+            ),
+            None => tdutils::log_info!("Send wallet_getNfts — [net-inert]"),
+        }
+    }
+
+    /// `GetTonConnectSessionsQuery::send` (cpp:665-667).
+    fn send_wallet_ton_connect_get_sessions_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectGetSessions,
+                telegram_api::Function::wallet_tonConnectGetSessions(
+                    telegram_api::wallet_tonConnectGetSessions,
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectGetSessions — [net-inert]"),
+        }
+    }
+
+    /// `CreateTonConnectSessionQuery::send` (cpp:689-691).
+    fn send_wallet_ton_connect_create_session_query(
+        &mut self,
+        dapp_client_id: &str,
+        manifest_url: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectCreateSession,
+                telegram_api::Function::wallet_tonConnectCreateSession(
+                    telegram_api::wallet_tonConnectCreateSession {
+                        dapp_client_id: dapp_client_id.to_owned(),
+                        manifest_url: manifest_url.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectCreateSession — [net-inert]"),
+        }
+    }
+
+    /// `RegisterTonConnectKeyQuery::send` (cpp:725-727).
+    fn send_wallet_ton_connect_register_key_query(&mut self, session_id: i64, client_id: &str) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectRegisterKey,
+                telegram_api::Function::wallet_tonConnectRegisterKey(
+                    telegram_api::wallet_tonConnectRegisterKey {
+                        session_id,
+                        client_id: client_id.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectRegisterKey — [net-inert]"),
+        }
+    }
+
+    /// `SubmitTonConnectResultQuery::send` (cpp:763-771).
+    fn send_wallet_ton_connect_submit_connect_result_query(
+        &mut self,
+        session_id: i64,
+        challenge_answer: &[u8],
+        is_error: bool,
+        body: &[u8],
+        trace_id: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectSubmitConnectResult,
+                telegram_api::Function::wallet_tonConnectSubmitConnectResult(
+                    telegram_api::wallet_tonConnectSubmitConnectResult {
+                        flags: 0,
+                        error: is_error,
+                        session_id,
+                        challenge_answer: challenge_answer.to_vec(),
+                        body: body.to_vec(),
+                        trace_id: trace_id.to_owned(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send wallet_tonConnectSubmitConnectResult — [net-inert]")
+            }
+        }
+    }
+
+    /// `GetTonConnectPendingQuery::send` (cpp:795-803) — the mutually
+    /// exclusive DAPP_CLIENT_ID_MASK/SESSION_ID_MASK forms.
+    fn send_wallet_ton_connect_get_pending_query(
+        &mut self,
+        by_dapp: bool,
+        session_id: i64,
+        dapp_client_id: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectGetPending,
+                telegram_api::Function::wallet_tonConnectGetPending(
+                    telegram_api::wallet_tonConnectGetPending {
+                        // DAPP_CLIENT_ID_MASK (flags.0) vs SESSION_ID_MASK
+                        // (flags.1).
+                        flags: if by_dapp { 1 } else { 1 << 1 },
+                        dapp_client_id: dapp_client_id.to_owned(),
+                        session_id,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectGetPending — [net-inert]"),
+        }
+    }
+
+    /// `ClaimTonConnectRequestQuery::send` (cpp:825-833).
+    fn send_wallet_ton_connect_claim_request_query(
+        &mut self,
+        session_id: i64,
+        message_id: i64,
+        dapp_request_id: &str,
+        is_rejected: bool,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectClaimRequest,
+                telegram_api::Function::wallet_tonConnectClaimRequest(
+                    telegram_api::wallet_tonConnectClaimRequest {
+                        flags: 0,
+                        declined: is_rejected,
+                        session_id,
+                        msg_id: crate::messages_manager::MessageId::new(message_id)
+                            .get_server_message_id()
+                            .get(),
+                        app_request_id: dapp_request_id.to_owned(),
+                        challenge_answer: Vec::new(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectClaimRequest — [net-inert]"),
+        }
+    }
+
+    /// `SubmitTonConnectResponseQuery::send` (cpp:852-861) — the
+    /// TRACE_ID_MASK form.
+    fn send_wallet_ton_connect_submit_response_query(
+        &mut self,
+        session_id: i64,
+        message_id: i64,
+        trace_id: &str,
+        body: &[u8],
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectSubmitResponse,
+                telegram_api::Function::wallet_tonConnectSubmitResponse(
+                    telegram_api::wallet_tonConnectSubmitResponse {
+                        flags: if trace_id.is_empty() { 0 } else { 1 },
+                        session_id,
+                        msg_id: crate::messages_manager::MessageId::new(message_id)
+                            .get_server_message_id()
+                            .get(),
+                        body: body.to_vec(),
+                        trace_id: trace_id.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectSubmitResponse — [net-inert]"),
+        }
+    }
+
+    /// `GetTonConnectNextEventIdQuery::send` (cpp:882-884).
+    fn send_wallet_ton_connect_next_event_id_query(&mut self, session_id: i64) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectNextEventId,
+                telegram_api::Function::wallet_tonConnectNextEventId(
+                    telegram_api::wallet_tonConnectNextEventId { session_id },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectNextEventId — [net-inert]"),
+        }
+    }
+
+    /// `CloseTonConnectSessionQuery::send` (cpp:911-919) — the
+    /// BODY_MASK form.
+    fn send_wallet_ton_connect_close_session_query(&mut self, session_id: i64, body: &[u8]) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonConnectCloseSession,
+                telegram_api::Function::wallet_tonConnectCloseSession(
+                    telegram_api::wallet_tonConnectCloseSession {
+                        flags: if body.is_empty() { 0 } else { 1 },
+                        session_id,
+                        body: body.to_vec(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_tonConnectCloseSession — [net-inert]"),
+        }
+    }
+
+    /// `GetOnRampProvidersQuery::send` (cpp:943-951) — the
+    /// CRYPTO_CURRENCY_MASK form.
+    fn send_payments_get_onramp_providers_query(&mut self, cryptocurrency: &str) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetOnRampProviders,
+                telegram_api::Function::payments_getOnrampProviders(
+                    telegram_api::payments_getOnrampProviders {
+                        flags: if cryptocurrency.is_empty() { 0 } else { 1 },
+                        crypto_currency: cryptocurrency.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send payments_getOnrampProviders — [net-inert]"),
+        }
+    }
+
+    /// `GetOnRampBaseCurrenciesQuery::send` (cpp:970-972).
+    fn send_payments_get_onramp_base_currencies_query(
+        &mut self,
+        provider: &str,
+        cryptocurrency: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetOnRampBaseCurrencies,
+                telegram_api::Function::payments_getOnrampBaseCurrencies(
+                    telegram_api::payments_getOnrampBaseCurrencies {
+                        provider: provider.to_owned(),
+                        crypto_currency: cryptocurrency.to_owned(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments_getOnrampBaseCurrencies — [net-inert]")
+            }
+        }
+    }
+
+    /// `GetOnRampAvailabilityQuery::send` (cpp:998-1006) — the
+    /// BASE_CURRENCY_MASK form.
+    fn send_payments_get_onramp_availability_query(
+        &mut self,
+        provider: &str,
+        cryptocurrency: &str,
+        base_currency: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetOnRampAvailability,
+                telegram_api::Function::payments_getOnrampAvailability(
+                    telegram_api::payments_getOnrampAvailability {
+                        flags: if base_currency.is_empty() { 0 } else { 1 },
+                        provider: provider.to_owned(),
+                        crypto_currency: cryptocurrency.to_owned(),
+                        base_currency: base_currency.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send payments_getOnrampAvailability — [net-inert]"),
+        }
+    }
+
+    /// `GetOnRampLimitsQuery::send` (cpp:1030-1040) — the
+    /// PAYMENT_METHOD_MASK form.
+    fn send_payments_get_onramp_limits_query(
+        &mut self,
+        provider: &str,
+        cryptocurrency: &str,
+        base_currency: &str,
+        payment_method: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetOnRampLimits,
+                telegram_api::Function::payments_getOnrampLimits(
+                    telegram_api::payments_getOnrampLimits {
+                        flags: if payment_method.is_empty() { 0 } else { 1 },
+                        provider: provider.to_owned(),
+                        crypto_currency: cryptocurrency.to_owned(),
+                        base_currency: base_currency.to_owned(),
+                        payment_method: payment_method.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send payments_getOnrampLimits — [net-inert]"),
+        }
+    }
+
+    /// `GetOnRampQuoteQuery::send` (cpp:1074-1089) — the BASE_AMOUNT /
+    /// CRYPTO_AMOUNT / PAYMENT_METHOD masks.
+    fn send_payments_get_onramp_quote_query(
+        &mut self,
+        provider: &str,
+        cryptocurrency: &str,
+        base_currency: &str,
+        cryptocurrency_amount: &str,
+        base_currency_amount: &str,
+        payment_method: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => {
+                // BASE_AMOUNT_MASK (flags.0), CRYPTO_AMOUNT_MASK
+                // (flags.1), PAYMENT_METHOD_MASK (flags.2).
+                let mut flags = 0;
+                if !base_currency_amount.is_empty() {
+                    flags |= 1;
+                }
+                if !cryptocurrency_amount.is_empty() {
+                    flags |= 1 << 1;
+                }
+                if !payment_method.is_empty() {
+                    flags |= 1 << 2;
+                }
+                net.dispatch(
+                    TonWalletNetKind::GetOnRampQuote,
+                    telegram_api::Function::payments_getOnrampQuote(
+                        telegram_api::payments_getOnrampQuote {
+                            flags,
+                            provider: provider.to_owned(),
+                            crypto_currency: cryptocurrency.to_owned(),
+                            base_currency: base_currency.to_owned(),
+                            base_amount: base_currency_amount.to_owned(),
+                            crypto_amount: cryptocurrency_amount.to_owned(),
+                            payment_method: payment_method.to_owned(),
+                        },
+                    ),
+                )
+            }
+            None => tdutils::log_info!("Send payments_getOnrampQuote — [net-inert]"),
+        }
+    }
+
+    /// `CreateOnRampSessionQuery::send` (cpp:1129-1151) — the eight
+    /// optional-field masks.
+    fn send_payments_create_onramp_session_query(
+        &mut self,
+        provider: &str,
+        cryptocurrency: &str,
+        address: &str,
+        payment_method: &str,
+        base_currency: &str,
+        cryptocurrency_amount: &str,
+        base_currency_amount: &str,
+        memo: &str,
+        theme: &str,
+        success_return_url: &str,
+        fail_return_url: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => {
+                // PAYMENT_METHOD (0), BASE_CURRENCY (1), CRYPTO_AMOUNT
+                // (2), BASE_AMOUNT (3), MEMO (4), THEME (5),
+                // SUCCESS_RETURN_URL (6), FAIL_RETURN_URL (7).
+                let mut flags = 0;
+                if !payment_method.is_empty() {
+                    flags |= 1;
+                }
+                if !base_currency.is_empty() {
+                    flags |= 1 << 1;
+                }
+                if !cryptocurrency_amount.is_empty() {
+                    flags |= 1 << 2;
+                }
+                if !base_currency_amount.is_empty() {
+                    flags |= 1 << 3;
+                }
+                if !memo.is_empty() {
+                    flags |= 1 << 4;
+                }
+                if !theme.is_empty() {
+                    flags |= 1 << 5;
+                }
+                if !success_return_url.is_empty() {
+                    flags |= 1 << 6;
+                }
+                if !fail_return_url.is_empty() {
+                    flags |= 1 << 7;
+                }
+                net.dispatch(
+                    TonWalletNetKind::CreateOnRampSession,
+                    telegram_api::Function::payments_createOnrampSession(
+                        telegram_api::payments_createOnrampSession {
+                            flags,
+                            provider: provider.to_owned(),
+                            crypto_currency: cryptocurrency.to_owned(),
+                            address: address.to_owned(),
+                            payment_method: payment_method.to_owned(),
+                            base_currency: base_currency.to_owned(),
+                            base_amount: base_currency_amount.to_owned(),
+                            memo: memo.to_owned(),
+                            theme: theme.to_owned(),
+                            success_return_url: success_return_url.to_owned(),
+                            fail_return_url: fail_return_url.to_owned(),
+                            crypto_amount: cryptocurrency_amount.to_owned(),
+                        },
+                    ),
+                )
+            }
+            None => tdutils::log_info!("Send payments_createOnrampSession — [net-inert]"),
+        }
+    }
+
+    /// `PerformTonCenterApiRequestQuery::send` (cpp:1168-1176) — the
+    /// QUERY_MASK/PAYLOAD_MASK forms on the webfile DC.
+    fn send_toncenter_perform_api_request_query(
+        &mut self,
+        endpoint: &str,
+        is_post: bool,
+        query: &str,
+        payload: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => {
+                // QUERY_MASK (flags.1), PAYLOAD_MASK (flags.2).
+                let mut flags = 0;
+                if !query.is_empty() {
+                    flags |= 1 << 1;
+                }
+                if !payload.is_empty() {
+                    flags |= 1 << 2;
+                }
+                let webfile_dc = self.td.webfile_dc_id();
+                net.dispatch_dc(
+                    TonWalletNetKind::TonCenterPerformApiRequest,
+                    telegram_api::Function::toncenter_performApiRequest(
+                        telegram_api::toncenter_performApiRequest {
+                            flags,
+                            post: is_post,
+                            endpoint: endpoint.to_owned(),
+                            query: query.to_owned(),
+                            payload: payload.to_owned(),
+                        },
+                    ),
+                    webfile_dc,
+                )
+            }
+            None => tdutils::log_info!("Send toncenter_performApiRequest — [net-inert]"),
+        }
+    }
+
+    /// `GetTonCenterStreamingApiUrlQuery::send` (cpp:1201-1203).
+    fn send_toncenter_get_streaming_url_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::TonCenterGetStreamingUrl,
+                telegram_api::Function::toncenter_getStreamingUrl(
+                    telegram_api::toncenter_getStreamingUrl,
+                ),
+            ),
+            None => tdutils::log_info!("Send toncenter_getStreamingUrl — [net-inert]"),
+        }
+    }
+
+    /// `GetWalletBackupHolderDcsQuery::send` (cpp:1227-1229).
+    fn send_wallet_get_backup_holder_dcs_query(&mut self) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::GetWalletBackupHolderDcs,
+                telegram_api::Function::wallet_getBackupHolderDcs(
+                    telegram_api::wallet_getBackupHolderDcs,
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_getBackupHolderDcs — [net-inert]"),
+        }
     }
 }
 
@@ -22771,6 +24685,304 @@ mod tests {
         net_fail(queries.remove(0), 404, "TIMEOUT");
         td.dispatch_completed_updates_net();
         assert!(td.updates_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the ton-wallet net slice: the query families ride the
+    // dispatcher and their answers drain through the real Td routing
+    // (the TonWalletManager.cpp handler halves). ----
+
+    type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    fn record_ton_unit() -> (Promise<()>, UnitSlot) {
+        struct Rec(UnitSlot);
+        impl tdutils::promise::PromiseInterface<()> for Rec {
+            fn set_value(&mut self, _value: ()) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(()));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type RatesSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::CurrencyExchangeRates>>>,
+    >;
+
+    fn record_ton_rates() -> (Promise<td_api::CurrencyExchangeRates>, RatesSlot) {
+        struct Rec(RatesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::CurrencyExchangeRates> for Rec {
+            fn set_value(&mut self, value: td_api::CurrencyExchangeRates) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: RatesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    /// Drive `f` over the taken ton-wallet manager + env (the requests
+    /// split, inlined).
+    fn with_ton_wallet_manager(
+        td: &mut Td,
+        f: impl FnOnce(&mut crate::ton_wallet::TonWalletManager, &mut TonWalletEnv<'_>),
+    ) {
+        let mut manager = std::mem::take(&mut td.ton_wallet_manager);
+        let mut env = TonWalletEnv { td: &mut *td };
+        f(&mut manager, &mut env);
+        td.ton_wallet_manager = manager;
+    }
+
+    #[test]
+    fn ton_wallet_state_and_rates_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ton_wallet_state_and_rates_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn ton_wallet_state_and_rates_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-tw-state");
+
+        // 1. reload_wallet_state dispatches wallet_getState.
+        let (promise, recorded) = record_ton_unit();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.reload_wallet_state(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].tl_constructor(), telegram_api::wallet_getState::ID);
+        let mut answer = Vec::new();
+        telegram_api::WalletState::walletState(telegram_api::walletState {
+            flags: 0,
+            backup_enabled: true,
+            can_export_phrase: false,
+            can_enable_backup: true,
+            address: "EQD123".to_owned(),
+            public_key: vec![1u8; 32],
+            balance: 77,
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_ton_wallet_net();
+        // The answer fed on_update_wallet_state — the cache band now
+        // answers get_wallet_state without a query (the emission itself
+        // rides the callback).
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        let (promise, recorded) = record_ton_unit();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.get_wallet_state(env, promise);
+        });
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(rec.sent.lock().is_empty(), "the cache band holds");
+
+        // 2. The reload band: the cached state answers without a query.
+        let (promise, recorded) = record_ton_unit();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.get_wallet_state(env, promise);
+        });
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(rec.sent.lock().is_empty(), "the cache band holds");
+
+        // 3. The currency-rates family: the query, the parse, the cache.
+        let (promise, recorded) = record_ton_rates();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.get_currency_rates(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getCurrencyRates::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_CurrencyRates {
+            rates: vec![telegram_api::CurrencyRate {
+                currency: "TON".to_owned(),
+                rate: 5.5,
+            }],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_ton_wallet_net();
+        match recorded.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(rates)) => {
+                assert_eq!(rates.rates.len(), 1);
+                assert_eq!(rates.rates[0].currency, "TON");
+            }
+            other => panic!("unexpected rates answer {other:?}"),
+        }
+        // The 60-second cache answers the follow-up without a query.
+        let (promise, recorded) = record_ton_rates();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.get_currency_rates(env, promise);
+        });
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(_))
+        ));
+        assert!(rec.sent.lock().is_empty(), "the rates cache holds");
+        assert!(td.ton_wallet_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn ton_wallet_backup_holder_dcs_wire_chain() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ton_wallet_backup_holder_dcs_wire_chain_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn ton_wallet_backup_holder_dcs_wire_chain_impl() {
+        let (mut td, rec) = netted_td("netfix-tw-dcs");
+
+        // load_backup_holder_dcs dispatches wallet_getBackupHolderDcs.
+        let (promise, recorded) = record_ton_unit();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.load_backup_holder_dcs(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::wallet_getBackupHolderDcs::ID
+        );
+        let mut answer = Vec::new();
+        let dcs: Vec<telegram_api::wallet_HolderDc> = (1..=3)
+            .map(|dc| {
+                let key = tde2e::keychain::key_generate_temporary_private_key().unwrap();
+                telegram_api::wallet_HolderDc {
+                    dc,
+                    public_key: tde2e::keychain::key_to_public_key(key).unwrap(),
+                }
+            })
+            .collect();
+        telegram_api::tl::__i32(&mut answer, telegram_api::tl::VECTOR_ID);
+        telegram_api::tl::__i32(&mut answer, dcs.len() as i32);
+        for dc in &dcs {
+            dc.store_boxed(&mut answer);
+        }
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_ton_wallet_net();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        // The cached DCs answer a second load without a query.
+        let (promise, recorded) = record_ton_unit();
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.load_backup_holder_dcs(env, promise);
+        });
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(rec.sent.lock().is_empty(), "the DC cache holds");
+    }
+
+    #[test]
+    fn ton_wallet_transfer_error_ladder() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ton_wallet_transfer_error_ladder_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn ton_wallet_transfer_error_ladder_impl() {
+        let (mut td, rec) = netted_td("netfix-tw-transfer");
+        // The transfer flow's get_me gate needs a valid own id.
+        {
+            let mut env = crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.user_manager
+                .set_my_id(&mut env, crate::user_manager::UserId::new(700000001));
+        }
+
+        // A WALLET_KEY_MISMATCH error: the reload query follows, the
+        // parked transfer promise errors.
+        type TransferSlot = std::sync::Arc<
+            std::sync::Mutex<Option<tdutils::status::Result<td_api::TonWalletTransferResult>>>,
+        >;
+        struct Rec(TransferSlot);
+        impl tdutils::promise::PromiseInterface<td_api::TonWalletTransferResult> for Rec {
+            fn set_value(&mut self, value: td_api::TonWalletTransferResult) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: TransferSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(Rec(slot.clone()));
+        let address = {
+            let mut raw = [0u8; 36];
+            raw[0] = 0x11;
+            for (i, byte) in raw.iter_mut().enumerate().skip(1) {
+                *byte = (i * 7 + 3) as u8;
+            }
+            let crc = tdutils::crypto::crc16(&raw[..34]);
+            raw[34] = (crc >> 8) as u8;
+            raw[35] = (crc & 0xFF) as u8;
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+        };
+        with_ton_wallet_manager(&mut td, |manager, env| {
+            manager.send_ton_wallet_transfer(
+                env,
+                vec![1],
+                vec![],
+                0,
+                &address,
+                1_000_000_000,
+                "c",
+                false,
+                3,
+                promise,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the local message is not a net query");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::wallet_sendTransfer::ID
+        );
+        net_fail(sent.into_iter().next().unwrap(), 400, "WALLET_KEY_MISMATCH");
+        td.dispatch_completed_ton_wallet_net();
+        // The error ladder: the mismatch reloads the wallet state (a
+        // fresh wallet_getState dispatch) and errors the promise.
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the reload state query");
+        assert_eq!(sent[0].tl_constructor(), telegram_api::wallet_getState::ID);
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "WALLET_KEY_MISMATCH"
+        ));
+        assert!(td.ton_wallet_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]

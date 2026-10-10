@@ -3,10 +3,11 @@
 //! the secret-phrase backup/restore flows over the `tde2e` keychain, the
 //! TonConnect session family, the on-ramp payment family and the TON
 //! Center request/cache plane. Every `td_->create_handler<...>->send(...)`
-//! query is a `[blocked: net]` seam on [`TonWalletManagerEnv`] — the send
-//! logs the query name and the promise parks in the manager's per-family
-//! vectors (or the shared `TonWalletManager::pending` lot) until the net
-//! step lands the answer halves:
+//! query rides the client-side dispatcher under its `TonWalletNetKind`
+//! (the answer routing lives in `Td::on_ton_wallet_net_answer`); the
+//! promise parks in the manager's per-family vector until the answer
+//! drains — the port of the C++ query handlers' `on_result`/`on_error`
+//! halves:
 //! `GetWalletStateQuery`, `GetExistingWalletBalanceQuery`,
 //! `GetUserWalletAddressesQuery` (the addresses/create/address forms),
 //! `ExportWalletSecretPhraseQuery`,
@@ -244,8 +245,7 @@ pub fn get_ton_connect_manifest_object(
 
 /// `TonWalletManager::TonConnectRequest::get_ton_connect_request_object`
 /// (TonWalletManager.cpp:1494-1498).
-#[cfg_attr(not(test), allow(dead_code))]
-fn get_ton_connect_request_object(
+pub(crate) fn get_ton_connect_request_object(
     request: &telegram_api::TonConnectRequest,
 ) -> td_api::TonConnectRequest {
     td_api::TonConnectRequest {
@@ -260,8 +260,7 @@ fn get_ton_connect_request_object(
 
 /// `TonWalletManager::TonConnectRequests::get_ton_connect_requests_object`
 /// (TonWalletManager.cpp:1513-1518).
-#[cfg_attr(not(test), allow(dead_code))]
-fn get_ton_connect_requests_object(
+pub(crate) fn get_ton_connect_requests_object(
     requests: &telegram_api::wallet_TonConnectPending,
 ) -> td_api::TonConnectRequests {
     td_api::TonConnectRequests {
@@ -274,6 +273,76 @@ fn get_ton_connect_requests_object(
             .iter()
             .map(get_ton_connect_request_object)
             .collect(),
+    }
+}
+
+/// `TonWalletManager::TonConnectChallenge::get_ton_connect_challenge_object`
+/// (TonWalletManager.cpp:1505-1519).
+pub(crate) fn get_ton_connect_challenge_object(
+    challenge: &telegram_api::wallet_TonConnectChallenge,
+) -> td_api::TonConnectChallenge {
+    td_api::TonConnectChallenge {
+        challenge: challenge.challenge.clone(),
+        event_id: challenge.event_id,
+    }
+}
+
+/// `TonWalletManager::OnRampProvider::get_on_ramp_provider_object`
+/// (TonWalletManager.cpp:1313-1326) — the flag passthrough.
+pub(crate) fn get_on_ramp_provider_object(
+    provider: &telegram_api::OnrampProviderInfo,
+) -> td_api::OnRampProvider {
+    td_api::OnRampProvider {
+        id: provider.id.clone(),
+        name: provider.name.clone(),
+        cryptocurrencies: provider.crypto_currencies.clone(),
+        supports_base_currencies: provider.supports_base_currencies,
+        supports_limits: provider.supports_limits,
+        supports_quote: provider.supports_quote,
+    }
+}
+
+/// `TonWalletManager::OnRampLimits::get_on_ramp_payment_limits_object`
+/// (TonWalletManager.cpp:1335-1351) — the field moves.
+pub(crate) fn get_on_ramp_payment_limits_object(
+    limits: telegram_api::OnrampLimits,
+) -> td_api::OnRampPaymentLimits {
+    td_api::OnRampPaymentLimits {
+        payment_method: limits.payment_method,
+        base_currency_min_amount: limits.base_min_amount,
+        base_currency_max_amount: limits.base_max_amount,
+        cryptocurrency_min_amount: limits.crypto_min_amount,
+        cryptocurrency_max_amount: limits.crypto_max_amount,
+    }
+}
+
+/// `TonWalletManager::OnRampQuote::get_on_ramp_payment_quote_object`
+/// (TonWalletManager.cpp:1353-1363) — the field moves.
+pub(crate) fn get_on_ramp_payment_quote_object(
+    quote: telegram_api::OnrampQuote,
+) -> td_api::OnRampPaymentQuote {
+    td_api::OnRampPaymentQuote {
+        payment_method: quote.payment_method,
+        expiration_date: quote.expires_date,
+        base_currency_amount: quote.base_amount,
+        cryptocurrency_amount: quote.crypto_amount,
+        cryptocurrency_price: quote.crypto_price,
+        fee_amount: quote.fee_amount,
+        extra_fee_amount: quote.extra_fee_amount,
+        network_fee_amount: quote.network_fee_amount,
+        total_amount: quote.total_amount,
+    }
+}
+
+/// `TonWalletManager::OnRampSession::get_on_ramp_payment_session_object`
+/// (TonWalletManager.cpp:1365-1375) — the field moves.
+pub(crate) fn get_on_ramp_payment_session_object(
+    session: telegram_api::OnrampSession,
+) -> td_api::OnRampPaymentSession {
+    td_api::OnRampPaymentSession {
+        session_id: session.session_id,
+        expiration_date: session.expires_date,
+        url: session.url,
     }
 }
 
@@ -389,7 +458,7 @@ pub fn get_ton_wallet_transaction_object(
 /// [blocked: files] seams (`get_web_document_photo_size`,
 /// `documents_manager_->on_get_document`); the extra JSON rides the
 /// value-or-null parse.
-fn get_ton_nft_object(item: &telegram_api::wallet_NftItem) -> td_api::TonNft {
+pub(crate) fn get_ton_nft_object(item: &telegram_api::wallet_NftItem) -> td_api::TonNft {
     let extra = item
         .extra
         .as_ref()
@@ -601,88 +670,93 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         tdutils::random::secure_int64()
     }
 
-    /// `GetWalletStateQuery::send` — `wallet_getState` — [blocked: net].
+    /// `GetWalletStateQuery::send` — `wallet_getState` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_state_query(&mut self) {
-        tdutils::log_info!("Send wallet_getState — [blocked: net]");
+        tdutils::log_info!("Send wallet_getState — [net-inert]");
     }
 
-    /// `GetWalletGaslessInfoQuery::send` — [blocked: net].
+    /// `GetWalletGaslessInfoQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_gasless_info_query(&mut self) {
-        tdutils::log_info!("Send wallet_getGaslessInfo — [blocked: net]");
+        tdutils::log_info!("Send wallet_getGaslessInfo — [net-inert]");
     }
 
-    /// `GetExistingWalletBalanceQuery::send` — [blocked: net].
+    /// `GetExistingWalletBalanceQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_existing_balance_query(&mut self) {
-        tdutils::log_info!("Send wallet_getExistingWaltBalance — [blocked: net]");
+        tdutils::log_info!("Send wallet_getExistingWaltBalance — [net-inert]");
     }
 
     /// `GetUserWalletAddressesQuery::send` (the three flag forms) —
-    /// [blocked: net].
+    /// the net-inert default (the Td env dispatches).
     fn send_wallet_get_user_addresses_query(
         &mut self,
         _create: bool,
+        _user_id: i64,
         _input_users: Vec<telegram_api::InputUser>,
         _addresses: Vec<String>,
     ) {
-        tdutils::log_info!("Send wallet_getUserAddresses — [blocked: net]");
+        tdutils::log_info!("Send wallet_getUserAddresses — [net-inert]");
     }
 
-    /// `GetWalletProofChallengeQuery::send` — [blocked: net].
+    /// `GetWalletProofChallengeQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_proof_challenge_query(&mut self) {
-        tdutils::log_info!("Send wallet_getProofChallenge — [blocked: net]");
+        tdutils::log_info!("Send wallet_getProofChallenge — [net-inert]");
     }
 
-    /// `EnableWalletBackupQuery::send` — [blocked: net].
+    /// `EnableWalletBackupQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_enable_backup_query(
         &mut self,
         _parts: Vec<Vec<u8>>,
         _public_key: Vec<u8>,
         _proof: telegram_api::WalletOwnershipProof,
     ) {
-        tdutils::log_info!("Send wallet_enableBackup — [blocked: net]");
+        tdutils::log_info!("Send wallet_enableBackup — [net-inert]");
     }
 
     /// `DisableWalletBackupQuery::send` (the password/proof forms) —
-    /// [blocked: net].
+    /// the net-inert default (the Td env dispatches).
     fn send_wallet_disable_backup_query(
         &mut self,
         _input_password: Option<telegram_api::InputCheckPasswordSRP>,
         _public_key: Vec<u8>,
         _proof: Option<telegram_api::WalletOwnershipProof>,
     ) {
-        tdutils::log_info!("Send wallet_disableBackup — [blocked: net]");
+        tdutils::log_info!("Send wallet_disableBackup — [net-inert]");
     }
 
-    /// `ReplaceWalletQuery::send` — [blocked: net].
+    /// `ReplaceWalletQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_replace_wallet_query(
         &mut self,
         _new_wallet: telegram_api::InputWalletReplacement,
         _input_password: Option<telegram_api::InputCheckPasswordSRP>,
     ) {
-        tdutils::log_info!("Send wallet_replaceWallet — [blocked: net]");
+        tdutils::log_info!("Send wallet_replaceWallet — [net-inert]");
     }
 
-    /// `ExportWalletSecretPhraseQuery::send` — [blocked: net].
+    /// `ExportWalletSecretPhraseQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_export_secret_phrase_query(
         &mut self,
         _input_password: Option<telegram_api::InputCheckPasswordSRP>,
     ) {
-        tdutils::log_info!("Send wallet_exportSecretPhrase — [blocked: net]");
+        tdutils::log_info!("Send wallet_exportSecretPhrase — [net-inert]");
     }
 
     /// `FetchWalletEncryptedSecretPhrasePartQuery::send` (per DC) —
-    /// [blocked: net].
+    /// the closure state (`query_id` + the per-DC temporary key) rides
+    /// the seam; the answer routes back through
+    /// [`TonWalletManager::on_get_ton_wallet_secret_phrase_part`].
     fn send_wallet_fetch_secret_phrase_part_query(
         &mut self,
         _token: &str,
         _public_key: Vec<u8>,
         _dc_id: i32,
+        _query_id: u64,
+        _private_key_id: tde2e::keychain::PrivateKeyId,
     ) {
-        tdutils::log_info!("Send wallet_fetchEncryptedSecretPhrasePart — [blocked: net]");
+        tdutils::log_info!("Send wallet_fetchEncryptedSecretPhrasePart — [net-inert]");
     }
 
     /// `GetTonWalletTransactionsQuery::send` (the three forms) —
-    /// [blocked: net].
+    /// the net-inert default (the Td env dispatches).
     fn send_wallet_get_transactions_query(
         &mut self,
         _inbound: bool,
@@ -690,14 +764,14 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _offset: &str,
         _limit: i32,
     ) {
-        tdutils::log_info!("Send wallet_getTransactions — [blocked: net]");
+        tdutils::log_info!("Send wallet_getTransactions — [net-inert]");
     }
 
     fn send_wallet_get_transactions_by_query(&mut self, _by_msg_hash: bool, _ids: Vec<String>) {
-        tdutils::log_info!("Send wallet_getTransactionsByIDs/ByMsgHash — [blocked: net]");
+        tdutils::log_info!("Send wallet_getTransactionsByIDs/ByMsgHash — [net-inert]");
     }
 
-    /// `SendWalletTransferQuery::send` — [blocked: net].
+    /// `SendWalletTransferQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_send_transfer_query(
         &mut self,
         _data_normal: &[u8],
@@ -705,39 +779,39 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _user_id: i64,
         _random_id: i64,
     ) {
-        tdutils::log_info!("Send wallet_sendTransfer — [blocked: net]");
+        tdutils::log_info!("Send wallet_sendTransfer — [net-inert]");
     }
 
-    /// `GetCurrencyRatesQuery::send` — [blocked: net].
+    /// `GetCurrencyRatesQuery::send` — the net-inert default (the Td env dispatches).
     fn send_payments_get_currency_rates_query(&mut self) {
-        tdutils::log_info!("Send payments_getCurrencyRates — [blocked: net]");
+        tdutils::log_info!("Send payments_getCurrencyRates — [net-inert]");
     }
 
-    /// `GetTonNftsQuery::send` — [blocked: net].
+    /// `GetTonNftsQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_nfts_query(&mut self, _offset: &str, _limit: i32) {
-        tdutils::log_info!("Send wallet_getNfts — [blocked: net]");
+        tdutils::log_info!("Send wallet_getNfts — [net-inert]");
     }
 
-    /// `GetTonConnectSessionsQuery::send` — [blocked: net].
+    /// `GetTonConnectSessionsQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_get_sessions_query(&mut self) {
-        tdutils::log_info!("Send wallet_tonConnectGetSessions — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectGetSessions — [net-inert]");
     }
 
-    /// `CreateTonConnectSessionQuery::send` — [blocked: net].
+    /// `CreateTonConnectSessionQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_create_session_query(
         &mut self,
         _dapp_client_id: &str,
         _manifest_url: &str,
     ) {
-        tdutils::log_info!("Send wallet_tonConnectCreateSession — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectCreateSession — [net-inert]");
     }
 
-    /// `RegisterTonConnectKeyQuery::send` — [blocked: net].
+    /// `RegisterTonConnectKeyQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_register_key_query(&mut self, _session_id: i64, _client_id: &str) {
-        tdutils::log_info!("Send wallet_tonConnectRegisterKey — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectRegisterKey — [net-inert]");
     }
 
-    /// `SubmitTonConnectResultQuery::send` — [blocked: net].
+    /// `SubmitTonConnectResultQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_submit_connect_result_query(
         &mut self,
         _session_id: i64,
@@ -746,20 +820,20 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _body: &[u8],
         _trace_id: &str,
     ) {
-        tdutils::log_info!("Send wallet_tonConnectSubmitConnectResult — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectSubmitConnectResult — [net-inert]");
     }
 
-    /// `GetTonConnectPendingQuery::send` — [blocked: net].
+    /// `GetTonConnectPendingQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_get_pending_query(
         &mut self,
         _by_dapp: bool,
         _session_id: i64,
         _dapp_client_id: &str,
     ) {
-        tdutils::log_info!("Send wallet_tonConnectGetPending — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectGetPending — [net-inert]");
     }
 
-    /// `ClaimTonConnectRequestQuery::send` — [blocked: net].
+    /// `ClaimTonConnectRequestQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_claim_request_query(
         &mut self,
         _session_id: i64,
@@ -767,10 +841,10 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _dapp_request_id: &str,
         _is_rejected: bool,
     ) {
-        tdutils::log_info!("Send wallet_tonConnectClaimRequest — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectClaimRequest — [net-inert]");
     }
 
-    /// `SubmitTonConnectResponseQuery::send` — [blocked: net].
+    /// `SubmitTonConnectResponseQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_submit_response_query(
         &mut self,
         _session_id: i64,
@@ -778,44 +852,44 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _trace_id: &str,
         _body: &[u8],
     ) {
-        tdutils::log_info!("Send wallet_tonConnectSubmitResponse — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectSubmitResponse — [net-inert]");
     }
 
-    /// `GetTonConnectNextEventIdQuery::send` — [blocked: net].
+    /// `GetTonConnectNextEventIdQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_next_event_id_query(&mut self, _session_id: i64) {
-        tdutils::log_info!("Send wallet_tonConnectNextEventId — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectNextEventId — [net-inert]");
     }
 
-    /// `CloseTonConnectSessionQuery::send` — [blocked: net].
+    /// `CloseTonConnectSessionQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_ton_connect_close_session_query(&mut self, _session_id: i64, _body: &[u8]) {
-        tdutils::log_info!("Send wallet_tonConnectCloseSession — [blocked: net]");
+        tdutils::log_info!("Send wallet_tonConnectCloseSession — [net-inert]");
     }
 
-    /// `GetOnRampProvidersQuery::send` — [blocked: net].
+    /// `GetOnRampProvidersQuery::send` — the net-inert default (the Td env dispatches).
     fn send_payments_get_onramp_providers_query(&mut self, _cryptocurrency: &str) {
-        tdutils::log_info!("Send payments_getOnrampProviders — [blocked: net]");
+        tdutils::log_info!("Send payments_getOnrampProviders — [net-inert]");
     }
 
-    /// `GetOnRampBaseCurrenciesQuery::send` — [blocked: net].
+    /// `GetOnRampBaseCurrenciesQuery::send` — the net-inert default (the Td env dispatches).
     fn send_payments_get_onramp_base_currencies_query(
         &mut self,
         _provider: &str,
         _cryptocurrency: &str,
     ) {
-        tdutils::log_info!("Send payments_getOnrampBaseCurrencies — [blocked: net]");
+        tdutils::log_info!("Send payments_getOnrampBaseCurrencies — [net-inert]");
     }
 
-    /// `GetOnRampAvailabilityQuery::send` — [blocked: net].
+    /// `GetOnRampAvailabilityQuery::send` — the net-inert default (the Td env dispatches).
     fn send_payments_get_onramp_availability_query(
         &mut self,
         _provider: &str,
         _cryptocurrency: &str,
         _base_currency: &str,
     ) {
-        tdutils::log_info!("Send payments_getOnrampAvailability — [blocked: net]");
+        tdutils::log_info!("Send payments_getOnrampAvailability — [net-inert]");
     }
 
-    /// `GetOnRampLimitsQuery::send` — [blocked: net].
+    /// `GetOnRampLimitsQuery::send` — the net-inert default (the Td env dispatches).
     fn send_payments_get_onramp_limits_query(
         &mut self,
         _provider: &str,
@@ -823,10 +897,10 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _base_currency: &str,
         _payment_method: &str,
     ) {
-        tdutils::log_info!("Send payments_getOnrampLimits — [blocked: net]");
+        tdutils::log_info!("Send payments_getOnrampLimits — [net-inert]");
     }
 
-    /// `GetOnRampQuoteQuery::send` — [blocked: net].
+    /// `GetOnRampQuoteQuery::send` — the net-inert default (the Td env dispatches).
     #[allow(clippy::too_many_arguments)]
     fn send_payments_get_onramp_quote_query(
         &mut self,
@@ -837,10 +911,10 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _base_currency_amount: &str,
         _payment_method: &str,
     ) {
-        tdutils::log_info!("Send payments_getOnrampQuote — [blocked: net]");
+        tdutils::log_info!("Send payments_getOnrampQuote — [net-inert]");
     }
 
-    /// `CreateOnRampSessionQuery::send` — [blocked: net].
+    /// `CreateOnRampSessionQuery::send` — the net-inert default (the Td env dispatches).
     #[allow(clippy::too_many_arguments)]
     fn send_payments_create_onramp_session_query(
         &mut self,
@@ -856,10 +930,10 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _success_return_url: &str,
         _fail_return_url: &str,
     ) {
-        tdutils::log_info!("Send payments_createOnrampSession — [blocked: net]");
+        tdutils::log_info!("Send payments_createOnrampSession — [net-inert]");
     }
 
-    /// `PerformTonCenterApiRequestQuery::send` — [blocked: net].
+    /// `PerformTonCenterApiRequestQuery::send` — the net-inert default (the Td env dispatches).
     fn send_toncenter_perform_api_request_query(
         &mut self,
         _endpoint: &str,
@@ -867,17 +941,17 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
         _query: &str,
         _payload: &str,
     ) {
-        tdutils::log_info!("Send toncenter_performApiRequest — [blocked: net]");
+        tdutils::log_info!("Send toncenter_performApiRequest — [net-inert]");
     }
 
-    /// `GetTonCenterStreamingApiUrlQuery::send` — [blocked: net].
+    /// `GetTonCenterStreamingApiUrlQuery::send` — the net-inert default (the Td env dispatches).
     fn send_toncenter_get_streaming_url_query(&mut self) {
-        tdutils::log_info!("Send toncenter_getStreamingUrl — [blocked: net]");
+        tdutils::log_info!("Send toncenter_getStreamingUrl — [net-inert]");
     }
 
-    /// `GetWalletBackupHolderDcsQuery::send` — [blocked: net].
+    /// `GetWalletBackupHolderDcsQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_backup_holder_dcs_query(&mut self) {
-        tdutils::log_info!("Send wallet_getBackupHolderDcs — [blocked: net]");
+        tdutils::log_info!("Send wallet_getBackupHolderDcs — [net-inert]");
     }
 }
 
@@ -926,31 +1000,6 @@ struct GetSecretPhraseQuery {
 /// net step's answer halves; their fields are read by that step, not the
 /// local planes.
 #[allow(dead_code, clippy::large_enum_variant)]
-enum PendingPromise {
-    Unit(Promise<()>),
-    String(Promise<String>),
-    WalletBotBalance(Promise<td_api::WalletBotBalance>),
-    UserTonWalletAddresses(Promise<td_api::UserTonWalletAddresses>),
-    UserTonWalletAddress(Promise<td_api::UserTonWalletAddress>),
-    ProofChallenge(Promise<td_api::TonWalletOwnershipProofChallenge>),
-    TonWalletTransaction(Promise<Option<td_api::TonWalletTransaction>>),
-    TonWalletTransactions(Promise<td_api::TonWalletTransactions>),
-    CurrencyExchangeRates(Promise<td_api::CurrencyExchangeRates>),
-    TonNfts(Promise<td_api::TonNfts>),
-    TonConnectSessions(Promise<td_api::TonConnectSessions>),
-    TonConnectSession(Promise<td_api::TonConnectSession>),
-    TonConnectChallenge(Promise<td_api::TonConnectChallenge>),
-    TonConnectRequests(Promise<td_api::TonConnectRequests>),
-    TonConnectSessionEventId(Promise<td_api::TonConnectSessionEventId>),
-    OnRampProviders(Promise<td_api::OnRampProviders>),
-    Currencies(Promise<td_api::Currencies>),
-    OnRampAvailability(Promise<td_api::OnRampPaymentAvailability>),
-    OnRampLimits(Promise<td_api::OnRampPaymentLimits>),
-    OnRampQuote(Promise<td_api::OnRampPaymentQuote>),
-    OnRampSession(Promise<td_api::OnRampPaymentSession>),
-    TonCenterStreamingApiUrl(Promise<td_api::TonCenterStreamingApiUrl>),
-}
-
 /// The collapsed `TonWalletManager`.
 #[derive(Default)]
 pub struct TonWalletManager {
@@ -979,15 +1028,95 @@ pub struct TonWalletManager {
     pending_enable_backup_flows:
         Vec<(String, Option<td_api::TonWalletOwnershipProof>, Promise<()>)>,
 
-    #[cfg_attr(not(test), allow(dead_code))]
     current_get_secret_phrase_query_id: u64,
     get_secret_phrase_queries: std::collections::HashMap<u64, GetSecretPhraseQuery>,
 
-    /// The net-tail parking lot.
-    pending: Vec<PendingPromise>,
+    // The net-tail promise lots — one per query family (the C++ handler
+    // owns its promise; the port parks them FIFO per family and the
+    // `Td::on_ton_wallet_net_answer` arms pop the head).
+    /// `GetWalletGaslessInfoQuery` (the answer re-enters through
+    /// `UpdatesManager::on_get_updates` with the popped promise).
+    pub(crate) pending_gasless_info: Vec<Promise<()>>,
+    /// `GetExistingWalletBalanceQuery`.
+    pub(crate) pending_existing_balance: Vec<Promise<td_api::WalletBotBalance>>,
+    /// `GetUserWalletAddressesQuery` (the get form).
+    pub(crate) pending_user_addresses: Vec<Promise<td_api::UserTonWalletAddresses>>,
+    /// `CreateUserWalletAddressQuery` (the request user id rides the
+    /// net kind).
+    pub(crate) pending_create_user_address: Vec<Promise<td_api::UserTonWalletAddress>>,
+    /// `GetAddressWalletQuery`.
+    pub(crate) pending_address_wallet: Vec<Promise<td_api::UserTonWalletAddress>>,
+    /// `ExportWalletSecretPhraseQuery` (the answer re-enters through
+    /// `do_get_ton_wallet_secret_phrase_with_parts`).
+    pub(crate) pending_secret_phrase: Vec<Promise<String>>,
+    /// `GetWalletProofChallengeQuery`.
+    pub(crate) pending_proof_challenge: Vec<Promise<td_api::TonWalletOwnershipProofChallenge>>,
+    /// `EnableWalletBackupQuery`.
+    pub(crate) pending_enable_backup: Vec<Promise<()>>,
+    /// `DisableWalletBackupQuery` (both forms).
+    pub(crate) pending_disable_backup: Vec<Promise<()>>,
+    /// `SendWalletTransferQuery` — the raw transfer-result promise; the
+    /// answer routing wraps it into the `on_get_updates` chain.
+    pub(crate) pending_transfer: Vec<Promise<td_api::TonWalletTransferResult>>,
+    /// `ReplaceWalletQuery` (the delete and replace flows share the
+    /// query class).
+    pub(crate) pending_replace_wallet: Vec<Promise<()>>,
+    /// `GetTonWalletTransactionsQuery`.
+    pub(crate) pending_transactions: Vec<Promise<td_api::TonWalletTransactions>>,
+    /// `GetTonWalletTransactionQuery` (the by-ids and by-msg-hash
+    /// forms share the parse).
+    pub(crate) pending_transaction: Vec<Promise<Option<td_api::TonWalletTransaction>>>,
+    /// `GetTonNftsQuery`.
+    pub(crate) pending_nfts: Vec<Promise<td_api::TonNfts>>,
+    /// `GetTonConnectSessionsQuery`.
+    pub(crate) pending_ton_connect_sessions: Vec<Promise<td_api::TonConnectSessions>>,
+    /// `CreateTonConnectSessionQuery`.
+    pub(crate) pending_ton_connect_session: Vec<Promise<td_api::TonConnectSession>>,
+    /// `RegisterTonConnectKeyQuery`.
+    pub(crate) pending_ton_connect_challenge: Vec<Promise<td_api::TonConnectChallenge>>,
+    /// `SubmitTonConnectResultQuery`.
+    pub(crate) pending_ton_connect_submit_result: Vec<Promise<()>>,
+    /// `GetTonConnectPendingQuery`.
+    pub(crate) pending_ton_connect_requests: Vec<Promise<td_api::TonConnectRequests>>,
+    /// `ClaimTonConnectRequestQuery`.
+    pub(crate) pending_ton_connect_claim: Vec<Promise<()>>,
+    /// `SubmitTonConnectResponseQuery`.
+    pub(crate) pending_ton_connect_submit_response: Vec<Promise<()>>,
+    /// `GetTonConnectNextEventIdQuery`.
+    pub(crate) pending_ton_connect_next_event_id: Vec<Promise<td_api::TonConnectSessionEventId>>,
+    /// `CloseTonConnectSessionQuery`.
+    pub(crate) pending_ton_connect_close_session: Vec<Promise<()>>,
+    /// `GetOnRampProvidersQuery`.
+    pub(crate) pending_on_ramp_providers: Vec<Promise<td_api::OnRampProviders>>,
+    /// `GetOnRampBaseCurrenciesQuery`.
+    pub(crate) pending_on_ramp_base_currencies: Vec<Promise<td_api::Currencies>>,
+    /// `GetOnRampAvailabilityQuery`.
+    pub(crate) pending_on_ramp_availability: Vec<Promise<td_api::OnRampPaymentAvailability>>,
+    /// `GetOnRampLimitsQuery`.
+    pub(crate) pending_on_ramp_limits: Vec<Promise<td_api::OnRampPaymentLimits>>,
+    /// `GetOnRampQuoteQuery`.
+    pub(crate) pending_on_ramp_quote: Vec<Promise<td_api::OnRampPaymentQuote>>,
+    /// `CreateOnRampSessionQuery`.
+    pub(crate) pending_on_ramp_session: Vec<Promise<td_api::OnRampPaymentSession>>,
+    /// `PerformTonCenterApiRequestQuery`.
+    pub(crate) pending_toncenter_request: Vec<Promise<String>>,
 }
 
 impl TonWalletManager {
+    /// Pop the head promise of a family lot — the answer-routing half of
+    /// a query family (the C++ handler's own promise).
+    pub(crate) fn take_promise<T: std::marker::Send>(
+        &mut self,
+        slot: for<'a> fn(&'a mut TonWalletManager) -> &'a mut Vec<Promise<T>>,
+    ) -> Option<Promise<T>> {
+        let lot = slot(self);
+        if lot.is_empty() {
+            None
+        } else {
+            Some(lot.remove(0))
+        }
+    }
+
     pub fn new() -> TonWalletManager {
         TonWalletManager::default()
     }
@@ -1134,7 +1263,7 @@ impl TonWalletManager {
         env: &mut impl TonWalletManagerEnv,
         promise: Promise<()>,
     ) {
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_gasless_info.push(promise);
         env.send_wallet_get_gasless_info_query();
     }
 
@@ -1144,7 +1273,7 @@ impl TonWalletManager {
         env: &mut impl TonWalletManagerEnv,
         promise: Promise<td_api::WalletBotBalance>,
     ) {
-        self.pending.push(PendingPromise::WalletBotBalance(promise));
+        self.pending_existing_balance.push(promise);
         env.send_wallet_get_existing_balance_query();
     }
 
@@ -1156,14 +1285,17 @@ impl TonWalletManager {
         user_ids: Vec<i64>,
         mut promise: Promise<td_api::UserTonWalletAddresses>,
     ) {
-        for &user_id in &user_ids {
-            if let Result::Err(status) = env.get_input_user(user_id) {
-                return promise.set_error(status);
+        // `UserManager::get_input_user` per user — the Ok arms ride the
+        // query (GetUserWalletAddressesQuery::send).
+        let mut input_users = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            match env.get_input_user(user_id) {
+                Result::Ok(input_user) => input_users.push(input_user),
+                Result::Err(status) => return promise.set_error(status),
             }
         }
-        self.pending
-            .push(PendingPromise::UserTonWalletAddresses(promise));
-        env.send_wallet_get_user_addresses_query(false, Vec::new(), Vec::new());
+        self.pending_user_addresses.push(promise);
+        env.send_wallet_get_user_addresses_query(false, 0, input_users, Vec::new());
     }
 
     /// `create_user_ton_wallet` (createUserTonWallet).
@@ -1173,12 +1305,12 @@ impl TonWalletManager {
         user_id: i64,
         mut promise: Promise<td_api::UserTonWalletAddress>,
     ) {
-        if let Result::Err(status) = env.get_input_user(user_id) {
-            return promise.set_error(status);
-        }
-        self.pending
-            .push(PendingPromise::UserTonWalletAddress(promise));
-        env.send_wallet_get_user_addresses_query(true, Vec::new(), Vec::new());
+        let input_user = match env.get_input_user(user_id) {
+            Result::Ok(input_user) => input_user,
+            Result::Err(status) => return promise.set_error(status),
+        };
+        self.pending_create_user_address.push(promise);
+        env.send_wallet_get_user_addresses_query(true, user_id, vec![input_user], Vec::new());
     }
 
     /// `get_address_ton_wallet` (getAddressTonWallet).
@@ -1192,9 +1324,8 @@ impl TonWalletManager {
             Result::Ok(()) => {}
             Result::Err(status) => return promise.set_error(status),
         }
-        self.pending
-            .push(PendingPromise::UserTonWalletAddress(promise));
-        env.send_wallet_get_user_addresses_query(false, Vec::new(), vec![address.to_owned()]);
+        self.pending_address_wallet.push(promise);
+        env.send_wallet_get_user_addresses_query(false, 0, Vec::new(), vec![address.to_owned()]);
     }
 
     /// `get_ton_wallet_secret_phrase` (TonWalletManager.cpp:1692-1722) —
@@ -1242,15 +1373,14 @@ impl TonWalletManager {
         if close_status.is_error() {
             return promise.set_error(close_status);
         }
-        self.pending.push(PendingPromise::String(promise));
+        self.pending_secret_phrase.push(promise);
         env.send_wallet_export_secret_phrase_query(input_password);
     }
 
     /// `do_get_ton_wallet_secret_phrase_with_parts`
     /// (TonWalletManager.cpp:1739-1760) — the per-DC key fan-out; the
-    /// export-query answer half (and the round-trip test) reach it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn do_get_ton_wallet_secret_phrase_with_parts(
+    /// export-query answer half re-enters here with the popped promise.
+    pub(crate) fn do_get_ton_wallet_secret_phrase_with_parts(
         &mut self,
         env: &mut impl TonWalletManagerEnv,
         parts: telegram_api::wallet_SecretPhraseParts,
@@ -1279,7 +1409,13 @@ impl TonWalletManager {
                         .set_error(Status::error(400, "Failed to generate encryption key"));
                 }
             };
-            env.send_wallet_fetch_secret_phrase_part_query(&parts.token, public_key, dc.dc_id);
+            env.send_wallet_fetch_secret_phrase_part_query(
+                &parts.token,
+                public_key,
+                dc.dc_id,
+                query_id,
+                private_key_id,
+            );
             // The per-part answer (query_id + private_key_id) re-enters
             // through on_get_ton_wallet_secret_phrase_part; the entry
             // below keeps the assembly state.
@@ -1362,7 +1498,7 @@ impl TonWalletManager {
         env: &mut impl TonWalletManagerEnv,
         promise: Promise<td_api::TonWalletOwnershipProofChallenge>,
     ) {
-        self.pending.push(PendingPromise::ProofChallenge(promise));
+        self.pending_proof_challenge.push(promise);
         env.send_wallet_get_proof_challenge_query();
     }
 
@@ -1429,7 +1565,7 @@ impl TonWalletManager {
             Result::Ok(part) => part,
             Result::Err(status) => return promise.set_error(status),
         };
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_enable_backup.push(promise);
         env.send_wallet_enable_backup_query(vec![part_a, part_b, part_c], public_key, proof);
     }
 
@@ -1462,7 +1598,7 @@ impl TonWalletManager {
         if close_status.is_error() {
             return promise.set_error(close_status);
         }
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_disable_backup.push(promise);
         env.send_wallet_disable_backup_query(input_password, Vec::new(), None);
     }
 
@@ -1477,7 +1613,7 @@ impl TonWalletManager {
             Result::Ok(parsed) => parsed,
             Result::Err(status) => return promise.set_error(status),
         };
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_disable_backup.push(promise);
         env.send_wallet_disable_backup_query(None, public_key, Some(proof));
     }
 
@@ -1554,12 +1690,9 @@ impl TonWalletManager {
             is_comment_encrypted,
             sending_id,
         );
-        self.pending
-            .push(PendingPromise::Unit(Promise::from_interface(
-                TransferResultPark {
-                    promise: Some(promise),
-                },
-            )));
+        // The raw transfer-result promise parks (the answer routing
+        // wraps it into the `on_get_updates` chain — the C++ lambda).
+        self.pending_transfer.push(promise);
         env.send_wallet_send_transfer_query(&data_normal, &data_gasless, peer_user_id, random_id);
     }
 
@@ -1592,7 +1725,7 @@ impl TonWalletManager {
         if close_status.is_error() {
             return promise.set_error(close_status);
         }
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_replace_wallet.push(promise);
         env.send_wallet_replace_wallet_query(
             telegram_api::InputWalletReplacement::inputWalletNew(telegram_api::inputWalletNew {}),
             input_password,
@@ -1659,7 +1792,7 @@ impl TonWalletManager {
             anchor_public_key: anchor_public_key.to_vec(),
             proof: Some(proof),
         };
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_replace_wallet.push(promise);
         env.send_wallet_replace_wallet_query(
             telegram_api::InputWalletReplacement::inputWalletImported(input_wallet),
             input_password,
@@ -1687,8 +1820,7 @@ impl TonWalletManager {
             Some(td_api::TransactionDirection::transactionDirectionOutgoing(_)) => (false, true),
             None => (false, false),
         };
-        self.pending
-            .push(PendingPromise::TonWalletTransactions(promise));
+        self.pending_transactions.push(promise);
         env.send_wallet_get_transactions_query(inbound, outbound, offset, limit);
     }
 
@@ -1706,8 +1838,7 @@ impl TonWalletManager {
         if close_status.is_error() {
             return promise.set_error(close_status);
         }
-        self.pending
-            .push(PendingPromise::TonWalletTransaction(promise));
+        self.pending_transaction.push(promise);
         env.send_wallet_get_transactions_by_query(false, vec![transaction_id.to_owned()]);
     }
 
@@ -1725,8 +1856,7 @@ impl TonWalletManager {
         if close_status.is_error() {
             return promise.set_error(close_status);
         }
-        self.pending
-            .push(PendingPromise::TonWalletTransaction(promise));
+        self.pending_transaction.push(promise);
         env.send_wallet_get_transactions_by_query(true, vec![msg_hash.to_owned()]);
     }
 
@@ -1798,7 +1928,7 @@ impl TonWalletManager {
         limit: i32,
         promise: Promise<td_api::TonNfts>,
     ) {
-        self.pending.push(PendingPromise::TonNfts(promise));
+        self.pending_nfts.push(promise);
         env.send_wallet_get_nfts_query(offset, limit);
     }
 
@@ -1808,8 +1938,7 @@ impl TonWalletManager {
         env: &mut impl TonWalletManagerEnv,
         promise: Promise<td_api::TonConnectSessions>,
     ) {
-        self.pending
-            .push(PendingPromise::TonConnectSessions(promise));
+        self.pending_ton_connect_sessions.push(promise);
         env.send_wallet_ton_connect_get_sessions_query();
     }
 
@@ -1821,8 +1950,7 @@ impl TonWalletManager {
         manifest_url: &str,
         promise: Promise<td_api::TonConnectSession>,
     ) {
-        self.pending
-            .push(PendingPromise::TonConnectSession(promise));
+        self.pending_ton_connect_session.push(promise);
         env.send_wallet_ton_connect_create_session_query(dapp_client_id, manifest_url);
     }
 
@@ -1834,8 +1962,7 @@ impl TonWalletManager {
         client_id: &str,
         promise: Promise<td_api::TonConnectChallenge>,
     ) {
-        self.pending
-            .push(PendingPromise::TonConnectChallenge(promise));
+        self.pending_ton_connect_challenge.push(promise);
         env.send_wallet_ton_connect_register_key_query(session_id, client_id);
     }
 
@@ -1852,7 +1979,7 @@ impl TonWalletManager {
         trace_id: &str,
         promise: Promise<()>,
     ) {
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_ton_connect_submit_result.push(promise);
         env.send_wallet_ton_connect_submit_connect_result_query(
             session_id,
             challenge_answer,
@@ -1871,8 +1998,7 @@ impl TonWalletManager {
         dapp_client_id: &str,
         promise: Promise<td_api::TonConnectRequests>,
     ) {
-        self.pending
-            .push(PendingPromise::TonConnectRequests(promise));
+        self.pending_ton_connect_requests.push(promise);
         env.send_wallet_ton_connect_get_pending_query(by_dapp, session_id, dapp_client_id);
     }
 
@@ -1890,7 +2016,7 @@ impl TonWalletManager {
         if !crate::messages_manager::MessageId::new(message_id).is_server() {
             return promise.set_error(Status::error(400, "Invalid message identifier specified"));
         }
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_ton_connect_claim.push(promise);
         env.send_wallet_ton_connect_claim_request_query(
             session_id,
             message_id,
@@ -1912,7 +2038,7 @@ impl TonWalletManager {
         if !crate::messages_manager::MessageId::new(message_id).is_server() {
             return promise.set_error(Status::error(400, "Invalid message identifier specified"));
         }
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_ton_connect_submit_response.push(promise);
         env.send_wallet_ton_connect_submit_response_query(session_id, message_id, trace_id, body);
     }
 
@@ -1923,8 +2049,7 @@ impl TonWalletManager {
         session_id: i64,
         promise: Promise<td_api::TonConnectSessionEventId>,
     ) {
-        self.pending
-            .push(PendingPromise::TonConnectSessionEventId(promise));
+        self.pending_ton_connect_next_event_id.push(promise);
         env.send_wallet_ton_connect_next_event_id_query(session_id);
     }
 
@@ -1936,7 +2061,7 @@ impl TonWalletManager {
         body: &[u8],
         promise: Promise<()>,
     ) {
-        self.pending.push(PendingPromise::Unit(promise));
+        self.pending_ton_connect_close_session.push(promise);
         env.send_wallet_ton_connect_close_session_query(session_id, body);
     }
 
@@ -1947,7 +2072,7 @@ impl TonWalletManager {
         cryptocurrency: &str,
         promise: Promise<td_api::OnRampProviders>,
     ) {
-        self.pending.push(PendingPromise::OnRampProviders(promise));
+        self.pending_on_ramp_providers.push(promise);
         env.send_payments_get_onramp_providers_query(cryptocurrency);
     }
 
@@ -1959,7 +2084,7 @@ impl TonWalletManager {
         cryptocurrency: &str,
         promise: Promise<td_api::Currencies>,
     ) {
-        self.pending.push(PendingPromise::Currencies(promise));
+        self.pending_on_ramp_base_currencies.push(promise);
         env.send_payments_get_onramp_base_currencies_query(provider, cryptocurrency);
     }
 
@@ -1972,8 +2097,7 @@ impl TonWalletManager {
         base_currency: &str,
         promise: Promise<td_api::OnRampPaymentAvailability>,
     ) {
-        self.pending
-            .push(PendingPromise::OnRampAvailability(promise));
+        self.pending_on_ramp_availability.push(promise);
         env.send_payments_get_onramp_availability_query(provider, cryptocurrency, base_currency);
     }
 
@@ -1987,7 +2111,7 @@ impl TonWalletManager {
         payment_method: &str,
         promise: Promise<td_api::OnRampPaymentLimits>,
     ) {
-        self.pending.push(PendingPromise::OnRampLimits(promise));
+        self.pending_on_ramp_limits.push(promise);
         env.send_payments_get_onramp_limits_query(
             provider,
             cryptocurrency,
@@ -2009,7 +2133,7 @@ impl TonWalletManager {
         payment_method: &str,
         promise: Promise<td_api::OnRampPaymentQuote>,
     ) {
-        self.pending.push(PendingPromise::OnRampQuote(promise));
+        self.pending_on_ramp_quote.push(promise);
         env.send_payments_get_onramp_quote_query(
             provider,
             cryptocurrency,
@@ -2038,7 +2162,7 @@ impl TonWalletManager {
         fail_return_url: &str,
         promise: Promise<td_api::OnRampPaymentSession>,
     ) {
-        self.pending.push(PendingPromise::OnRampSession(promise));
+        self.pending_on_ramp_session.push(promise);
         env.send_payments_create_onramp_session_query(
             provider,
             cryptocurrency,
@@ -2072,7 +2196,7 @@ impl TonWalletManager {
                 let Some(query) = crate::misc::clean_input_string(&get.query) else {
                     return promise.set_error(Status::error(400, "Query must be encoded in UTF-8"));
                 };
-                self.pending.push(PendingPromise::String(promise));
+                self.pending_toncenter_request.push(promise);
                 env.send_toncenter_perform_api_request_query(endpoint, false, &query, "");
             }
             td_api::TonCenterApiRequestType::tonCenterApiRequestTypePost(post) => {
@@ -2080,7 +2204,7 @@ impl TonWalletManager {
                     return promise
                         .set_error(Status::error(400, "Phone number must be encoded in UTF-8"));
                 };
-                self.pending.push(PendingPromise::String(promise));
+                self.pending_toncenter_request.push(promise);
                 env.send_toncenter_perform_api_request_query(endpoint, true, "", &payload);
             }
         }
@@ -2366,24 +2490,6 @@ impl PromiseInterface<telegram_api::InputCheckPasswordSRP> for ReplaceWalletSrp 
     }
 }
 
-/// The transfer-result park: the query-tail promise holder (the C++
-/// carries it through the updates_manager promise chain).
-struct TransferResultPark {
-    promise: Option<Promise<td_api::TonWalletTransferResult>>,
-}
-
-impl PromiseInterface<()> for TransferResultPark {
-    fn set_value(&mut self, _value: ()) {
-        tdutils::log_info!("TransferResultPark — the transfer result parks [blocked: net]");
-    }
-
-    fn set_error(&mut self, error: Status) {
-        if let Some(mut promise) = self.promise.take() {
-            promise.set_error(error);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2492,6 +2598,7 @@ mod tests {
         fn send_wallet_get_user_addresses_query(
             &mut self,
             _create: bool,
+            _user_id: i64,
             _input_users: Vec<telegram_api::InputUser>,
             _addresses: Vec<String>,
         ) {
@@ -2503,6 +2610,8 @@ mod tests {
             token: &str,
             public_key: Vec<u8>,
             dc_id: i32,
+            _query_id: u64,
+            _private_key_id: tde2e::keychain::PrivateKeyId,
         ) {
             self.fetch_calls.push((token.to_owned(), public_key, dc_id));
         }
@@ -2647,6 +2756,100 @@ mod tests {
         );
         assert_eq!(info.left, 100);
         assert_eq!(info.reset_date, 0);
+    }
+
+    #[test]
+    fn on_ramp_and_challenge_object_conversions() {
+        // `OnRampProvider::get_on_ramp_provider_object`
+        // (TonWalletManager.cpp:1313-1326).
+        let provider = get_on_ramp_provider_object(&telegram_api::OnrampProviderInfo {
+            flags: 0,
+            supports_base_currencies: true,
+            supports_limits: false,
+            supports_quote: true,
+            id: "moonpay".to_owned(),
+            name: "MoonPay".to_owned(),
+            crypto_currencies: vec!["TON".to_owned()],
+        });
+        assert_eq!(provider.id, "moonpay");
+        assert!(provider.supports_base_currencies);
+        assert!(!provider.supports_limits);
+        assert!(provider.supports_quote);
+        // `OnRampLimits` (cpp:1335-1351).
+        let limits = get_on_ramp_payment_limits_object(telegram_api::OnrampLimits {
+            base_currency: "USD".to_owned(),
+            base_min_amount: "1".to_owned(),
+            base_max_amount: "100".to_owned(),
+            crypto_min_amount: "0.1".to_owned(),
+            crypto_max_amount: "10".to_owned(),
+            payment_method: "card".to_owned(),
+        });
+        assert_eq!(limits.payment_method, "card");
+        assert_eq!(limits.cryptocurrency_min_amount, "0.1");
+        // `OnRampQuote` (cpp:1353-1363).
+        let quote = get_on_ramp_payment_quote_object(telegram_api::OnrampQuote {
+            base_currency: "USD".to_owned(),
+            base_amount: "10".to_owned(),
+            crypto_currency: "TON".to_owned(),
+            crypto_amount: "2".to_owned(),
+            crypto_price: "5".to_owned(),
+            fee_amount: "0.5".to_owned(),
+            extra_fee_amount: "0.1".to_owned(),
+            network_fee_amount: "0.05".to_owned(),
+            total_amount: "10.65".to_owned(),
+            payment_method: "card".to_owned(),
+            expires_date: 77,
+        });
+        assert_eq!(quote.expiration_date, 77);
+        assert_eq!(quote.total_amount, "10.65");
+        // `OnRampSession` (cpp:1365-1375).
+        let session = get_on_ramp_payment_session_object(telegram_api::OnrampSession {
+            provider: "moonpay".to_owned(),
+            session_id: "s1".to_owned(),
+            url: "https://buy".to_owned(),
+            expires_date: 99,
+        });
+        assert_eq!(session.session_id, "s1");
+        assert_eq!(session.url, "https://buy");
+        // `TonConnectChallenge` (cpp:1505-1519).
+        let challenge =
+            get_ton_connect_challenge_object(&telegram_api::wallet_TonConnectChallenge {
+                challenge: b"challenge-bytes".to_vec(),
+                event_id: 7,
+            });
+        assert_eq!(challenge.challenge, b"challenge-bytes".to_vec());
+        assert_eq!(challenge.event_id, 7);
+    }
+
+    #[test]
+    fn user_address_flows_gate_on_input_users() {
+        let mut env = TestEnv::default();
+        let mut manager = TonWalletManager::new();
+        // The default TestEnv answers the get_input_user gate with the
+        // "User not found" error — no query.
+        let recorded_addresses: std::sync::Arc<
+            std::sync::Mutex<Option<tdutils::status::Result<td_api::UserTonWalletAddresses>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        struct Rec(
+            std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::UserTonWalletAddresses>>>,
+            >,
+        );
+        impl tdutils::promise::PromiseInterface<td_api::UserTonWalletAddresses> for Rec {
+            fn set_value(&mut self, value: td_api::UserTonWalletAddresses) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let promise = Promise::from_interface(Rec(recorded_addresses.clone()));
+        manager.get_user_addresses(&mut env, vec![42], promise);
+        assert!(matches!(
+            recorded_addresses.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "User not found"
+        ));
+        assert!(env.queries.is_empty());
     }
 
     #[test]
