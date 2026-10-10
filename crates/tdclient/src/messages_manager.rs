@@ -22757,6 +22757,96 @@ pub fn send_message_group(
 }
 
 /// `MessagesManager::send_message` (MessagesManager.cpp:21721-21868) — the
+/// `MessagesManager::send_ton_wallet_transfer` (MessagesManager.cpp:25162-25187,
+/// b2696afb4/ffd864edd/4722e1f9b) — the local outgoing GramTransfer
+/// message with the `sending_id`-carrying send options; the wire
+/// `wallet_sendTransfer` query rides the TonWalletManager net seam with
+/// the returned random_id.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn send_ton_wallet_transfer(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &mut dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    user_manager: &crate::user_manager::UserManager,
+    peer_user_id: crate::user_manager::UserId,
+    peer_address: &str,
+    amount: i64,
+    comment: &str,
+    is_comment_encrypted: bool,
+    sending_id: i32,
+) -> i64 {
+    if !peer_user_id.is_valid() || user_manager.is_user_deleted_of(peer_user_id) {
+        return tdutils::random::secure_int64();
+    }
+
+    let dialog_id = DialogId::from_user_id(peer_user_id);
+    ctx.force_create_dialog(dialog_id, "send_ton_wallet_transfer");
+    if manager.get_dialog(dialog_id).is_none() {
+        return tdutils::random::secure_int64();
+    }
+
+    let mut need_update_dialog_pos = false;
+    let message_send_options = MessageSendOptions {
+        sending_id,
+        ..MessageSendOptions::default()
+    };
+    let content = crate::message_content::MessageContent::GramTransfer(
+        crate::message_content::MessageGramTransfer {
+            amount,
+            peer_address: peer_address.to_owned(),
+            transaction_id: String::new(),
+            comment: comment.to_owned(),
+            is_comment_encrypted,
+        },
+    );
+    let message_id = get_message_to_send(
+        ctx,
+        global,
+        manager,
+        reactions_ctx,
+        state,
+        dialog_id,
+        &MessageTopic::default(),
+        MessageInputReplyTo::default(),
+        &message_send_options,
+        content,
+        false,
+        &mut need_update_dialog_pos,
+        false,
+        None,
+        DialogId::default(),
+        false,
+        DialogId::default(),
+        false,
+    )
+    .get_message_id();
+    // take/put-back dance (the send_message shape) — the update builders
+    // borrow the manager while mutating the message
+    let mut m = manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.remove(&message_id))
+        .expect("get_message_to_send inserted the message");
+    let random_id = begin_send_message(manager, dialog_id, &m);
+    send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
+    let d = manager
+        .get_dialog_mut(dialog_id)
+        .expect("get_message_to_send forced the dialog");
+    d.messages.insert(message_id, m);
+    if need_update_dialog_pos {
+        send_update_chat_last_message(
+            manager,
+            ctx,
+            state,
+            reactions_ctx,
+            dialog_id,
+            "send_ton_wallet_transfer",
+        );
+    }
+    random_id
+}
+
 /// single-message send entry behind the `sendMessage` arm: the topic/reply
 /// plumbing, the reply-markup conversion, `get_message_to_send`, the draft
 /// clear, the durable send log event and the wire kick. The

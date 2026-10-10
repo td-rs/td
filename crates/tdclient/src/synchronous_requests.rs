@@ -111,7 +111,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
-fn get_json_value_object(json_value: &JsonValue) -> TdJsonValue {
+pub(crate) fn get_json_value_object(json_value: &JsonValue) -> TdJsonValue {
     match json_value {
         JsonValue::Null => TdJsonValue::jsonValueNull(td_api::jsonValueNull),
         JsonValue::Boolean(value) => {
@@ -143,7 +143,7 @@ fn get_json_value_object(json_value: &JsonValue) -> TdJsonValue {
 }
 
 /// `JsonValue.cpp:get_json_value`.
-fn get_json_value(json: &str) -> Result<TdJsonValue> {
+pub(crate) fn get_json_value(json: &str) -> Result<TdJsonValue> {
     match json_decode(json) {
         Result::Ok(value) => Result::Ok(get_json_value_object(&value)),
         Result::Err(status) => Result::Err(status),

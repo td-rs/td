@@ -1740,6 +1740,7 @@ dependencies = [
  "serde_json",
  "tdactor",
  "tddb",
+ "tde2e",
  "tdmtproto",
  "tdnet",
  "tdutils",
@@ -1761,6 +1762,9 @@ dependencies = [
 [[package]]
 name = "tde2e"
 version = "0.1.0"
+dependencies = [
+ "tdutils",
+]
 
 [[package]]
 name = "tdjson"

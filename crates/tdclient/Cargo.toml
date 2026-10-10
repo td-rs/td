@@ -16,6 +16,7 @@ tdnet = { path = "../tdnet" }
 tracing = "0.1"
 tdmtproto = { path = "../tdmtproto" }
 tdutils = { path = "../tdutils" }
+tde2e = { path = "../tde2e" }
 
 # tokio's `net` feature (mio) has no wasm32-unknown-emscripten backend; the
 # socket paths (session_multi_proxy::open_connection, the config-recoverer

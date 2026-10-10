@@ -551,6 +551,15 @@ impl PendingUpdate {
 pub trait UpdatesSink {
     fn on_user(&mut self, user: telegram_api::User);
     fn on_chat(&mut self, chat: telegram_api::Chat);
+    /// `on_update(updateWalletState)` — the TonWalletManager state intake
+    /// (cpp:5124-5127); the default no-op keeps the test sinks inert.
+    fn on_update_wallet_state(&mut self, _state: telegram_api::WalletState) {}
+    /// `on_update(updateWalletGaslessInfo)` (cpp:5129-5131).
+    fn on_update_wallet_gasless_info(&mut self, _info: telegram_api::updateWalletGaslessInfo) {}
+    /// `on_update(updateWalletTonConnectSession)` (cpp:5138-5140).
+    fn on_update_wallet_ton_connect_session(&mut self, _session: telegram_api::TonConnectSession) {}
+    /// `on_update(updateWalletTonConnectPendingDisconnect)` (cpp:5142-5147).
+    fn on_update_wallet_ton_connect_disconnect(&mut self, _session_ids: Vec<i64>) {}
     /// `MessagesManager::process_pts_update` — the applied-pts-update
     /// switch (the M.7.13 flip; the impl fans out per update kind).
     fn process_pts_update(&mut self, update: PendingUpdate);
@@ -4824,15 +4833,35 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 // the unsupported-updates tail (cpp:5146)
                 promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateWalletState(_))
-            | PendingUpdate::Wire(telegram_api::Update::updateWalletGaslessInfo(_))
-            | PendingUpdate::Wire(telegram_api::Update::updateSentWalletTransaction(_))
-            | PendingUpdate::Wire(telegram_api::Update::updateWalletTonConnectSession(_))
-            | PendingUpdate::Wire(telegram_api::Update::updateWalletTonConnectPendingDisconnect(
-                _,
+            PendingUpdate::Wire(telegram_api::Update::updateWalletState(update)) => {
+                // cpp:5124-5127 — the TonWalletManager state intake
+                // through the sink (the drain holds the env).
+                self.sink
+                    .on_update_wallet_state(update.state.unwrap_or_default());
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateWalletGaslessInfo(update)) => {
+                // cpp:5129-5131 — the gasless-info intake.
+                self.sink.on_update_wallet_gasless_info(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSentWalletTransaction(_)) => {
+                // cpp:5133-5136 — "Ignore unexpected" (the extract form
+                // lives on the SendWalletTransferQuery tail).
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateWalletTonConnectSession(update)) => {
+                // cpp:5138-5140 — the TonConnect-session intake.
+                self.sink
+                    .on_update_wallet_ton_connect_session(update.session.unwrap_or_default());
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateWalletTonConnectPendingDisconnect(
+                update,
             )) => {
-                // the TON wallet family — no-op overloads until the
-                // TonWalletManager plane lands (cpp:5124-5151)
+                // cpp:5142-5147 — the disconnect-required update.
+                self.sink
+                    .on_update_wallet_ton_connect_disconnect(update.session_ids);
                 promise.set_value(());
             }
 
@@ -6371,6 +6400,23 @@ fn get_updates_vec_mut(
     }
 }
 
+/// `UpdatesManager::extract_sent_wallet_transaction` (63c084905,
+/// UpdatesManager.cpp:1667-1677) — the first `updateSentWalletTransaction`
+/// of the container, erased out (the `SendWalletTransferQuery` tail reads
+/// it before feeding the container to `on_get_updates`).
+pub fn extract_sent_wallet_transaction(
+    updates: &mut telegram_api::Updates,
+) -> Option<telegram_api::updateSentWalletTransaction> {
+    let container = get_updates_vec_mut(updates)?;
+    let index = container.iter().position(|update| {
+        matches!(update, telegram_api::Update::updateSentWalletTransaction(_))
+    })?;
+    match container.remove(index) {
+        telegram_api::Update::updateSentWalletTransaction(update) => Some(update),
+        _ => None,
+    }
+}
+
 /// `UpdatesManager::are_empty_updates` (cpp:1412) — true for the two
 /// carry-no-updates umbrellas, the container emptiness otherwise.
 pub fn are_empty_updates(updates: &telegram_api::Updates) -> bool {
@@ -7155,6 +7201,84 @@ fn parse_pmc_i32(value: &str, key: &str) -> i32 {
             tdutils::log_error!("Failed to parse binlog pmc {} = {:?}", key, value);
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod extract_sent_wallet_transaction_tests {
+    use super::*;
+    use tdmtproto::telegram_api;
+
+    fn sent_update(gasless: bool) -> telegram_api::Update {
+        telegram_api::Update::updateSentWalletTransaction(
+            telegram_api::updateSentWalletTransaction {
+                flags: 0,
+                gasless,
+                msg_hash: "ab".to_owned(),
+                transaction: Some(telegram_api::WalletTransaction {
+                    flags: 0,
+                    incoming: true,
+                    gasless,
+                    failed: false,
+                    key_change: false,
+                    comment_encrypted: false,
+                    id: "tx".to_owned(),
+                    amount: 1,
+                    fee: 0,
+                    date: 2,
+                    peer: None,
+                    comment: String::new(),
+                    tx_hash: String::new(),
+                    nft: None,
+                }),
+            },
+        )
+    }
+
+    #[test]
+    fn extracts_and_erases_the_first_sent_transaction() {
+        // 63c084905 — the SendWalletTransferQuery tail form: the update is
+        // lifted out of the container before on_get_updates sees it.
+        let mut updates = telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![
+                sent_update(false),
+                telegram_api::Update::updateSentWalletTransaction(
+                    telegram_api::updateSentWalletTransaction {
+                        flags: 0,
+                        gasless: true,
+                        msg_hash: "cd".to_owned(),
+                        transaction: None,
+                    },
+                ),
+            ],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        });
+        let extracted = extract_sent_wallet_transaction(&mut updates).unwrap();
+        assert!(!extracted.gasless);
+        assert_eq!(extracted.msg_hash, "ab");
+        assert!(extracted.transaction.is_some());
+        // The second extraction lifts the remaining update; then None.
+        assert_eq!(
+            extract_sent_wallet_transaction(&mut updates)
+                .unwrap()
+                .msg_hash,
+            "cd"
+        );
+        assert!(extract_sent_wallet_transaction(&mut updates).is_none());
+        match &updates {
+            telegram_api::Updates::updates(u) => assert!(u.updates.is_empty()),
+            _ => panic!("unexpected container"),
+        }
+        // The short forms answer None.
+        assert!(
+            extract_sent_wallet_transaction(&mut telegram_api::Updates::updatesTooLong(
+                telegram_api::updatesTooLong
+            ))
+            .is_none()
+        );
     }
 }
 

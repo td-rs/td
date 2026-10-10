@@ -197,6 +197,20 @@ pub(crate) struct TdSink {
     /// connection state (before/after_get_difference, UpdatesManager.cpp
     /// :534/:2366); the drain applies them to the reducer.
     pub(crate) connection_sync: Vec<bool>,
+    /// The TON wallet family intake (UpdatesManager.cpp:5124-5151) — the
+    /// TonWalletManager update hops; the drain runs the manager planes
+    /// and emits the td_api updates through `Td::send_update`.
+    pub(crate) wallet_updates: Vec<WalletIntake>,
+}
+
+/// One `on_update(updateWallet...)` hop — the C++ arm set routed to the
+/// TonWalletManager (the disconnect form emits its td_api update
+/// directly).
+pub(crate) enum WalletIntake {
+    State(tdmtproto::telegram_api::WalletState),
+    Gasless(tdmtproto::telegram_api::updateWalletGaslessInfo),
+    TonConnectSession(tdmtproto::telegram_api::TonConnectSession),
+    TonConnectDisconnect(Vec<i64>),
 }
 
 /// The real `ConnectionState` order (ConnectionState.h) — the reducer's
@@ -321,6 +335,30 @@ impl StateManagerState {
 }
 
 impl UpdatesSink for TdSink {
+    fn on_update_wallet_state(&mut self, state: tdmtproto::telegram_api::WalletState) {
+        self.wallet_updates.push(WalletIntake::State(state));
+    }
+
+    fn on_update_wallet_gasless_info(
+        &mut self,
+        info: tdmtproto::telegram_api::updateWalletGaslessInfo,
+    ) {
+        self.wallet_updates.push(WalletIntake::Gasless(info));
+    }
+
+    fn on_update_wallet_ton_connect_session(
+        &mut self,
+        session: tdmtproto::telegram_api::TonConnectSession,
+    ) {
+        self.wallet_updates
+            .push(WalletIntake::TonConnectSession(session));
+    }
+
+    fn on_update_wallet_ton_connect_disconnect(&mut self, session_ids: Vec<i64>) {
+        self.wallet_updates
+            .push(WalletIntake::TonConnectDisconnect(session_ids));
+    }
+
     fn on_user(&mut self, user: tdmtproto::telegram_api::User) {
         self.users.push(user);
     }
@@ -2764,6 +2802,8 @@ pub struct Td {
     /// The community plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) community_updates: Vec<td_api::Update>,
+    /// `Td::ton_wallet_manager_` (the C++ init_managers block).
+    pub(crate) ton_wallet_manager: crate::ton_wallet::TonWalletManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// `Td::language_pack_manager_` (`Td.cpp:1348`, M.24) — the
@@ -3307,6 +3347,7 @@ impl Td {
             statistics_updates: Vec::new(),
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
+            ton_wallet_manager: crate::ton_wallet::TonWalletManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
             language_pack_updates: Vec::new(),
@@ -7706,6 +7747,40 @@ impl Td {
                 self.send_real_connection_state(state);
             }
             self.sync_config_timeout();
+        }
+        // The TON wallet family (UpdatesManager.cpp:5124-5151) — the
+        // TonWalletManager planes; the manager is taken out for the env
+        // (the BackgroundEnv convention).
+        for intake in sink.wallet_updates {
+            match intake {
+                WalletIntake::State(state) => {
+                    let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                    let mut env = TonWalletEnv { td: &mut *self };
+                    manager.on_update_wallet_state(&mut env, state);
+                    self.ton_wallet_manager = manager;
+                }
+                WalletIntake::Gasless(info) => {
+                    let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                    let mut env = TonWalletEnv { td: &mut *self };
+                    manager.on_update_wallet_gasless_info(&mut env, info);
+                    self.ton_wallet_manager = manager;
+                }
+                WalletIntake::TonConnectSession(session) => {
+                    let mut manager = std::mem::take(&mut self.ton_wallet_manager);
+                    let mut env = TonWalletEnv { td: &mut *self };
+                    manager.on_update_wallet_ton_connect_session(&mut env, session);
+                    self.ton_wallet_manager = manager;
+                }
+                WalletIntake::TonConnectDisconnect(session_ids) => {
+                    self.send_update(
+                        td_api::Object::updateTonWalletTonConnectSessionDisconnectRequired(
+                            td_api::updateTonWalletTonConnectSessionDisconnectRequired {
+                                session_ids,
+                            },
+                        ),
+                    );
+                }
+            }
         }
         // the users feed the UserManager container first — the C++
         // `process_updates_users_and_chats` tail (`td_->user_manager_->
@@ -12323,6 +12398,137 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
 
     fn auth_is_bot(&self) -> bool {
         self.auth_is_bot
+    }
+}
+
+/// The TON wallet-plane env over the whole `Td` — the manager is always
+/// `std::mem::take`n out for the call (the `BackgroundEnv` convention),
+/// so the env may hold the full `&mut Td`.
+pub(crate) struct TonWalletEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::ton_wallet::TonWalletUpdateEnv for TonWalletEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn auth_is_authorized(&self) -> bool {
+        self.td.auth_manager.is_authorized()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.td.global.unix_time()
+    }
+
+    fn get_option_integer(&self, name: &str) -> i64 {
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(0, |options| options.get_option_integer(name, 0))
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(td_api::Object::from(update));
+    }
+}
+
+impl crate::ton_wallet::TonWalletManagerEnv for TonWalletEnv<'_> {
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.td.close_flag != 0 {
+            tdutils::status::Status::error(500, "Request aborted")
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    fn get_my_id(&self) -> i64 {
+        self.td.user_manager.get_my_id().get()
+    }
+
+    fn get_user_id_object(&mut self, user_id: i64, source: &str) -> i64 {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("the ton wallet plane runs with the option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_user_id_object(
+            &mut env,
+            crate::user_manager::UserId::new(user_id),
+            source,
+        )
+    }
+
+    fn get_input_user(&mut self, user_id: i64) -> tdutils::status::Result<telegram_api::InputUser> {
+        let env = crate::user_manager::UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("the ton wallet plane runs with the option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        match self
+            .td
+            .user_manager
+            .get_input_user(&env, crate::user_manager::UserId::new(user_id))
+        {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn get_me(&mut self) -> bool {
+        // `UserManager::get_me` — the flow re-enters once the own user is
+        // known; offline the auth-restore pins it.
+        self.td.user_manager.get_my_id().is_valid()
+    }
+
+    fn send_ton_wallet_transfer_local_message(
+        &mut self,
+        peer_user_id: i64,
+        peer_address: &str,
+        amount: i64,
+        comment: &str,
+        is_comment_encrypted: bool,
+        sending_id: i32,
+    ) -> i64 {
+        // The `sendMessage`-arm split (the manager stays in place because
+        // the ton manager was taken out for the call).
+        let td_ptr = std::ptr::from_mut(self.td);
+        // SAFETY: the raw aliases read one Td strictly sequentially inside
+        // the callee (the split_context_alias contract).
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+        let reactions_ctx =
+            crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
+        crate::messages_manager::send_ton_wallet_transfer(
+            global,
+            manager,
+            &reactions_ctx,
+            ctx,
+            state,
+            &self.td.user_manager,
+            crate::user_manager::UserId::new(peer_user_id),
+            peer_address,
+            amount,
+            comment,
+            is_comment_encrypted,
+            sending_id,
+        )
     }
 }
 

@@ -105,6 +105,11 @@ pub trait AccountManagerEnv {
     fn send_reset_web_authorizations_query(&mut self) {
         tdutils::log_info!("Send account.resetWebAuthorizations — [blocked: net]");
     }
+    /// `CancelWebTokenAuthorizationQuery::send` (6f9801c65) —
+    /// `auth_cancelWebTokenAuthorization` — [blocked: net].
+    fn send_cancel_web_token_query(&mut self, token: &str) {
+        tdutils::log_info!("Send auth.cancelWebTokenAuthorization({token}) — [blocked: net]");
+    }
     fn send_export_contact_token_query(&mut self) {
         tdutils::log_info!("Send contacts.exportContactToken — [blocked: net]");
     }
@@ -727,6 +732,18 @@ impl AccountManager {
         promise: Promise<()>,
     ) {
         self.reset_web_authorizations_on_server(env, promise);
+    }
+
+    /// `cancel_web_token` (6f9801c65, AccountManager.cpp:1230-1232) — the
+    /// dismissWebToken flow; the promise parks with the query seam.
+    pub fn cancel_web_token(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        token: &str,
+        promise: Promise<()>,
+    ) {
+        env.send_cancel_web_token_query(token);
+        drop(promise);
     }
 
     /// `set_account_ttl` (cpp:936-938) — the SetAccountTtl log event +

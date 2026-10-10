@@ -381,6 +381,16 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 mq_manager.get_current_state(&env, &mut updates);
             }
 
+            // TonWalletManager::get_current_state (Requests.cpp:2257 —
+            // right after the message-query block; the manager's own
+            // authorized gate applies)
+            {
+                let manager = std::mem::take(&mut td.ton_wallet_manager);
+                let env = crate::td::TonWalletEnv { td: &mut *td };
+                manager.get_current_state(&env, &mut updates);
+                td.ton_wallet_manager = manager;
+            }
+
             // TranslationManager::get_current_state (Requests.cpp:2257 —
             // right after the message-query block, before web browser; the
             // manager's own authorized/non-bot gate applies)
@@ -17584,6 +17594,744 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
+        // -- the TON wallet / TonConnect / On-ramp family
+        //    (Requests.cpp:7943-8232; the TonWalletManager plane over the
+        //    [blocked: net] query seams) -------------------------
+        Function::getTonWalletTransactions(request) => {
+            // Requests.cpp:7943-7950 — CHECK_IS_USER + the offset clean.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::TonWalletTransactions, _>(
+                id,
+                Object::tonWalletTransactions,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_wallet_transactions(
+                &mut env,
+                &offset,
+                request.limit,
+                request.direction,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonWalletTransaction(request) => {
+            // Requests.cpp:7951-7957.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(transaction_id) = crate::misc::clean_input_string(&request.transaction_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<Option<td_api::TonWalletTransaction>, _>(id, |t| match t {
+                    Some(transaction) => Object::tonWalletTransaction(transaction),
+                    None => Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_owned(),
+                    }),
+                });
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_wallet_transaction(&mut env, &transaction_id, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonWalletTransactionByMsgHash(request) => {
+            // Requests.cpp:7958-7964.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(msg_hash) = crate::misc::clean_input_string(&request.msg_hash) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<Option<td_api::TonWalletTransaction>, _>(id, |t| match t {
+                    Some(transaction) => Object::tonWalletTransaction(transaction),
+                    None => Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_owned(),
+                    }),
+                });
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_wallet_transaction_by_msg_hash(&mut env, &msg_hash, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::loadTonWalletState(_) => {
+            // Requests.cpp:7965-7970 — CHECK_IS_USER; the cached-ok band
+            // answers synchronously, the reload parks at the net seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_wallet_state(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::loadTonWalletGaslessTransfersInfo(_) => {
+            // Requests.cpp:7971-7976.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_wallet_gasless_info(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::checkWalletBotBalance(_) => {
+            // Requests.cpp:7977-7982.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::WalletBotBalance, _>(id, Object::walletBotBalance);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_existing_wallet_balance(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getUserTonWalletAddresses(request) => {
+            // Requests.cpp:7983-7988 — the get_input_user gates answer the
+            // 400 bands offline.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::UserTonWalletAddresses, _>(
+                id,
+                Object::userTonWalletAddresses,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_user_addresses(&mut env, request.user_ids, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::createUserTonWallet(request) => {
+            // Requests.cpp:7989-7994.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::UserTonWalletAddress, _>(
+                id,
+                Object::userTonWalletAddress,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.create_user_ton_wallet(&mut env, request.user_id, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getAddressTonWallet(request) => {
+            // Requests.cpp:7995-8001 — the check_ton_address gate.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(address) = crate::misc::clean_input_string(&request.address) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::UserTonWalletAddress, _>(
+                id,
+                Object::userTonWalletAddress,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_address_ton_wallet(&mut env, &address, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonWalletSecretPhrase(request) => {
+            // Requests.cpp:8002-8008 — CREATE_TEXT_REQUEST_PROMISE.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = crate::misc::clean_input_string(&request.password) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            // CREATE_TEXT_REQUEST_PROMISE — the string answer maps to the
+            // td_api::text object.
+            let mut outbox = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<String>| match result {
+                    tdutils::status::Result::Ok(phrase) => {
+                        outbox.set_value(td_api::Text { text: phrase })
+                    }
+                    tdutils::status::Result::Err(status) => outbox.set_error(status),
+                },
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_wallet_secret_phrase(&mut env, &password, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonWalletOwnershipProofChallenge(_) => {
+            // Requests.cpp:8009-8014.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::TonWalletOwnershipProofChallenge, _>(
+                id,
+                Object::tonWalletOwnershipProofChallenge,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_wallet_proof_challenge(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::enableTonWalletBackup(request) => {
+            // Requests.cpp:8015-8022.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(secret_phrase) = crate::misc::clean_input_string(&request.secret_phrase)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.enable_ton_wallet_backup(&mut env, &secret_phrase, request.proof, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::disableTonWalletBackup(request) => {
+            // Requests.cpp:8023-8029.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = crate::misc::clean_input_string(&request.password) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.disable_ton_wallet_backup(&mut env, &password, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::disableTonWalletBackupWithProof(request) => {
+            // Requests.cpp:8030-8035 — the proof size gates answer offline.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.disable_ton_wallet_backup_with_proof(&mut env, request.proof, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::sendTonWalletTransfer(request) => {
+            // Requests.cpp:8036-8045 — the address/amount/input-user gates
+            // are offline-observable; the local GramTransfer message rides
+            // the do_ tail, the wire query parks.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(address) = crate::misc::clean_input_string(&request.address) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(comment) = crate::misc::clean_input_string(&request.comment) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::TonWalletTransferResult, _>(
+                id,
+                Object::tonWalletTransferResult,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.send_ton_wallet_transfer(
+                &mut env,
+                request.regular_transfer_data,
+                request.gasless_transfer_data,
+                request.user_id,
+                &address,
+                request.amount,
+                &comment,
+                request.is_comment_encrypted,
+                request.sending_id,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::deleteTonWallet(request) => {
+            // Requests.cpp:8046-8052.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = crate::misc::clean_input_string(&request.password) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.delete_ton_wallet(&mut env, &password, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::replaceTonWallet(request) => {
+            // Requests.cpp:8053-8060.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = crate::misc::clean_input_string(&request.password) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.replace_ton_wallet(
+                &mut env,
+                &password,
+                &request.anchor_public_key,
+                request.proof,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::getCurrencyExchangeRates(_) => {
+            // Requests.cpp:8061-8067 — the 60-second cache band answers
+            // offline after the first fill.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::CurrencyExchangeRates, _>(
+                id,
+                Object::currencyExchangeRates,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_currency_rates(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonWalletNfts(request) => {
+            // Requests.cpp:8069-8073.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::TonNfts, _>(id, Object::tonNfts);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_nfts(&mut env, &offset, request.limit, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonConnectSessions(_) => {
+            // Requests.cpp:8074-8079.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::TonConnectSessions, _>(id, Object::tonConnectSessions);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_connect_sessions(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::createTonConnectSession(request) => {
+            // Requests.cpp:8080-8088.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(dapp_client_id) = crate::misc::clean_input_string(&request.dapp_client_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(manifest_url) = crate::misc::clean_input_string(&request.manifest_url) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<td_api::TonConnectSession, _>(id, Object::tonConnectSession);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.create_ton_connect_session(&mut env, &dapp_client_id, &manifest_url, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::setTonConnectSessionWalletClientId(request) => {
+            // Requests.cpp:8089-8096.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(wallet_client_id) = crate::misc::clean_input_string(&request.wallet_client_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::TonConnectChallenge, _>(
+                id,
+                Object::tonConnectChallenge,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.register_ton_connect_key(
+                &mut env,
+                request.session_id,
+                &wallet_client_id,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::sendTonConnectSessionConnectResult(request) => {
+            // Requests.cpp:8097-8104.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(trace_id) = crate::misc::clean_input_string(&request.trace_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.submit_ton_connect_result(
+                &mut env,
+                request.session_id,
+                &request.challenge_answer,
+                request.is_error,
+                &request.body,
+                &trace_id,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonConnectSessionPendingRequests(request) => {
+            // Requests.cpp:8105-8110.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::TonConnectRequests, _>(id, Object::tonConnectRequests);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_connect_requests(&mut env, false, request.session_id, "", promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonConnectDAppPendingRequests(request) => {
+            // Requests.cpp:8111-8117.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(dapp_client_id) = crate::misc::clean_input_string(&request.dapp_client_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td
+                .deferred_promise::<td_api::TonConnectRequests, _>(id, Object::tonConnectRequests);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_connect_requests(&mut env, true, 0, &dapp_client_id, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::claimTonConnectRequest(request) => {
+            // Requests.cpp:8118-8126 — the server-message-id gate.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(dapp_request_id) = crate::misc::clean_input_string(&request.dapp_request_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.claim_ton_connect_request(
+                &mut env,
+                request.session_id,
+                request.message_id,
+                &dapp_request_id,
+                request.is_rejected,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::answerTonConnectRequest(request) => {
+            // Requests.cpp:8127-8134 — the server-message-id gate.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(trace_id) = crate::misc::clean_input_string(&request.trace_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.submit_ton_connect_response(
+                &mut env,
+                request.session_id,
+                request.message_id,
+                &trace_id,
+                &request.body,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonConnectSessionNextEventId(request) => {
+            // Requests.cpp:8135-8140.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::TonConnectSessionEventId, _>(
+                id,
+                Object::tonConnectSessionEventId,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_connect_next_event_id(&mut env, request.session_id, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::disconnectTonConnectSession(request) => {
+            // Requests.cpp:8141-8146.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.close_ton_connect_session(&mut env, request.session_id, &request.body, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getOnRampProviders(request) => {
+            // Requests.cpp:8147-8153.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(cryptocurrency) = crate::misc::clean_input_string(&request.cryptocurrency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<td_api::OnRampProviders, _>(id, Object::onRampProviders);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_on_ramp_providers(&mut env, &cryptocurrency, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getOnRampProviderBaseCurrencies(request) => {
+            // Requests.cpp:8154-8162.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(provider_id) = crate::misc::clean_input_string(&request.provider_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency) = crate::misc::clean_input_string(&request.cryptocurrency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::Currencies, _>(id, Object::currencies);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_on_ramp_base_currencies(&mut env, &provider_id, &cryptocurrency, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getOnRampPaymentAvailability(request) => {
+            // Requests.cpp:8163-8172.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(provider_id) = crate::misc::clean_input_string(&request.provider_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency) = crate::misc::clean_input_string(&request.cryptocurrency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(base_currency) = crate::misc::clean_input_string(&request.base_currency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::OnRampPaymentAvailability, _>(
+                id,
+                Object::onRampPaymentAvailability,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_on_ramp_availability(
+                &mut env,
+                &provider_id,
+                &cryptocurrency,
+                &base_currency,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::getOnRampPaymentLimits(request) => {
+            // Requests.cpp:8173-8183.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(provider_id) = crate::misc::clean_input_string(&request.provider_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency) = crate::misc::clean_input_string(&request.cryptocurrency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(base_currency) = crate::misc::clean_input_string(&request.base_currency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(payment_method_name) =
+                crate::misc::clean_input_string(&request.payment_method_name)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::OnRampPaymentLimits, _>(
+                id,
+                Object::onRampPaymentLimits,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_on_ramp_limits(
+                &mut env,
+                &provider_id,
+                &cryptocurrency,
+                &base_currency,
+                &payment_method_name,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::getOnRampPaymentQuote(request) => {
+            // Requests.cpp:8184-8197.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(provider_id) = crate::misc::clean_input_string(&request.provider_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency) = crate::misc::clean_input_string(&request.cryptocurrency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(base_currency) = crate::misc::clean_input_string(&request.base_currency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency_amount) =
+                crate::misc::clean_input_string(&request.cryptocurrency_amount)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(base_currency_amount) =
+                crate::misc::clean_input_string(&request.base_currency_amount)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(payment_method_name) =
+                crate::misc::clean_input_string(&request.payment_method_name)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td
+                .deferred_promise::<td_api::OnRampPaymentQuote, _>(id, Object::onRampPaymentQuote);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_on_ramp_quote(
+                &mut env,
+                &provider_id,
+                &cryptocurrency,
+                &base_currency,
+                &cryptocurrency_amount,
+                &base_currency_amount,
+                &payment_method_name,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::createOnRampPaymentSession(request) => {
+            // Requests.cpp:8198-8217 — the 9b5f0edf9 theme flag rides the
+            // query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(provider_id) = crate::misc::clean_input_string(&request.provider_id) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency) = crate::misc::clean_input_string(&request.cryptocurrency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(address) = crate::misc::clean_input_string(&request.address) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(payment_method_name) =
+                crate::misc::clean_input_string(&request.payment_method_name)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(base_currency) = crate::misc::clean_input_string(&request.base_currency)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(cryptocurrency_amount) =
+                crate::misc::clean_input_string(&request.cryptocurrency_amount)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(base_currency_amount) =
+                crate::misc::clean_input_string(&request.base_currency_amount)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(memo) = crate::misc::clean_input_string(&request.memo) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(theme) = crate::misc::clean_input_string(&request.theme) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(success_return_url) =
+                crate::misc::clean_input_string(&request.success_return_url)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(fail_return_url) = crate::misc::clean_input_string(&request.fail_return_url)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<td_api::OnRampPaymentSession, _>(
+                id,
+                Object::onRampPaymentSession,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.create_on_ramp_session(
+                &mut env,
+                &provider_id,
+                &cryptocurrency,
+                &address,
+                &payment_method_name,
+                &base_currency,
+                &cryptocurrency_amount,
+                &base_currency_amount,
+                &memo,
+                &theme,
+                &success_return_url,
+                &fail_return_url,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
+        Function::sendTonCenterApiRequest(request) => {
+            // Requests.cpp:8218-8225 — the type-dispatch UTF-8 bands.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(endpoint) = crate::misc::clean_input_string(&request.endpoint) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let mut outbox = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<String>| match result {
+                    tdutils::status::Result::Ok(response) => {
+                        outbox.set_value(td_api::Text { text: response })
+                    }
+                    tdutils::status::Result::Err(status) => outbox.set_error(status),
+                },
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.perform_ton_center_api_request(&mut env, &endpoint, request.r#type, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::getTonCenterStreamingApiUrl(_) => {
+            // Requests.cpp:8226-8231 — the 60-second cache band.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::TonCenterStreamingApiUrl, _>(
+                id,
+                Object::tonCenterStreamingApiUrl,
+            );
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.get_ton_center_streaming_api_url(&mut env, promise);
+            td.ton_wallet_manager = manager;
+        }
+
+        Function::dismissWebToken(request) => {
+            // Requests.cpp:9591-9595 (6f9801c65) — no CHECK_IS_USER, the
+            // token clean, then AccountManager::cancel_web_token (the
+            // auth_cancelWebTokenAuthorization send rides the net step).
+            let Some(token) = crate::misc::clean_input_string(&request.token) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .cancel_web_token(&mut env, &token, promise);
+        }
+
         Function::testNetwork(_) => {
             // Requests.cpp:9451-9462 — no CHECK_IS_USER (the
             // preauthentication set); the ok promise rides the
@@ -18033,6 +18781,20 @@ fn story_optional_to_object(value: Option<td_api::Story>) -> Object {
             message: "Not Found".to_owned(),
         }),
     }
+}
+
+/// The take-out split for the TON wallet arms (the `BackgroundEnv`
+/// convention): the manager becomes a local so the env may hold the whole
+/// `&mut Td`.
+fn ton_wallet_split(
+    td: &mut Td,
+) -> (
+    crate::ton_wallet::TonWalletManager,
+    crate::td::TonWalletEnv<'_>,
+) {
+    let manager = std::mem::take(&mut td.ton_wallet_manager);
+    let env = crate::td::TonWalletEnv { td: &mut *td };
+    (manager, env)
 }
 
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
@@ -18548,16 +19310,15 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1001,
+            1039,
             "dispatched count"
         );
-        // the c15d3f5a sync: the TON wallet / TonConnect / On-ramp
-        // surface lands as interim arms (38 functions; the
-        // TonWalletManager plane is unported — the bot secondary-username
-        // pair and the community write family
-        // (setCommunityPhoto/setCommunityPermissions/deleteCommunity,
-        // fb05f53c2/d55f0a694/f5f7fe5fd) went dispatched with their
-        // flows)
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 38, "interim count");
+        // the c15d3f5a sync: the TonWalletManager plane landed over the
+        // tde2e keychain subset — the TON wallet / TonConnect / On-ramp
+        // surface (38 arms incl. getTonWalletNfts and dismissWebToken)
+        // went dispatched with the community write family before it; the
+        // census closes: 1001 + 38 = 1039 dispatched / 0 interim, sync
+        // unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 0, "interim count");
     }
 }
