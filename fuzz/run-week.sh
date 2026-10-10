@@ -43,6 +43,16 @@ else
   echo "[$(date -Is)] seed-gen missing ($SEEDGEN) — build it before the week (fuzz/seed-gen/)" >> "$LOG"
 fi
 
+# Self-heal: rebuild all target binaries before each cycle. The fuzz/target
+# dir is shared with parallel sessions building from different checkouts,
+# which has wiped binaries mid-week (S78 finding: the five S3103-era targets
+# hit rc=127 "command not found" every cycle until rebuilt). Plain release
+# build = uninstrumented but stable; the coverage-guided instrumented rebuild
+# is manual: cargo +nightly fuzz build (needs nightly + cargo-fuzz on PATH).
+if ! ( env -u RUSTC_WRAPPER cargo build --release --target x86_64-unknown-linux-gnu >> "$LOG" 2>&1 ); then
+  echo "[$(date -Is)] WARN: self-heal rebuild failed - running with whatever binaries exist" >> "$LOG"
+fi
+
 echo "== fuzz week started $(date -Is) on $(hostname), chunk ${CHUNK}s per target ==" >> "$LOG"
 while true; do
   for t in "${TARGETS[@]}"; do
