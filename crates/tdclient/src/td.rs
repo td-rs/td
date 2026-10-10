@@ -201,6 +201,11 @@ pub(crate) struct TdSink {
     /// TonWalletManager update hops; the drain runs the manager planes
     /// and emits the td_api updates through `Td::send_update`.
     pub(crate) wallet_updates: Vec<WalletIntake>,
+    /// `MessagesManager::after_get_difference` (MessagesManager.cpp:7042,
+    /// the 6a7cd24b6 tail) — the marks-load hop records here; the drain
+    /// applies the bot/authorized gates (the postponed-container walks
+    /// are the unported receive planes).
+    pub(crate) after_get_difference_marks_load: bool,
 }
 
 /// One `on_update(updateWallet...)` hop — the C++ arm set routed to the
@@ -374,6 +379,11 @@ impl UpdatesSink for TdSink {
     /// `after_get_difference` tail (UpdatesManager.cpp:2366).
     fn on_after_get_difference(&mut self) {
         self.connection_sync.push(true);
+        // `MessagesManager::after_get_difference` (MessagesManager.cpp:7042)
+        // — the postponed-container and update_message_ids_ walks are the
+        // unported receive planes; the 6a7cd24b6 tail (the marks load,
+        // the legacy Archive recalc removed) records for the drain.
+        self.after_get_difference_marks_load = true;
     }
     /// `MessagesManager::process_pts_update` — the applied update switch:
     /// the new-message and delete kinds collect for the drain (the
@@ -7851,6 +7861,16 @@ impl Td {
                     );
                 }
             }
+        }
+        // `MessagesManager::after_get_difference`'s 6a7cd24b6 tail: the
+        // restore-missing timeout arm is the unported plane; the legacy
+        // Archive unread recalc is gone — the marks load keeps the
+        // bot+authorized gate.
+        if sink.after_get_difference_marks_load
+            && !self.auth_manager.is_bot()
+            && self.auth_manager.is_authorized()
+        {
+            crate::dialog_manager::load_dialog_marks_as_unread(self);
         }
         // the users feed the UserManager container first — the C++
         // `process_updates_users_and_chats` tail (`td_->user_manager_->
