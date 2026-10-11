@@ -3,11 +3,12 @@
 //! "en" fallback list, the phone-number → calling-code prefix matcher and
 //! its pattern formatter, and the two statics `get_country_flag_emoji` +
 //! `get_phone_number_info_sync` (the SynchronousRequests arms). The
-//! `help.getNearestDc` / `help.getCountriesList` ResultHandlers
-//! (`GetNearestDcQuery`, `GetCountriesListQuery`) are the net step: their
-//! sends park at the named env seams (the M.31 convention — the caller
-//! promises drop there, like the C++ LambdaPromise drop), while every
-//! local band answers REAL.
+//! `help.getNearestDc` / `help.getCountriesList` queries ride the
+//! client-side dispatcher under their `CountryNetKind` (the unauth send
+//! legs — `create_unauth`); the answers drain through
+//! `Td::on_country_net_answer` into `on_get_country_list`, whose pending
+//! lot carries the re-entry descriptors (the C++ closure's
+//! `do_get_*(is_recursive = true)` send).
 //!
 //! C++ shape notes:
 //! - the C++ `countries_` cache and the fragment-prefix statics are
@@ -16,11 +17,7 @@
 //!   under the *caller's* lock, the Rust helper is self-contained);
 //! - the `manager_count_` teardown (`tear_down` clears `countries_` when
 //!   the last manager dies) has no collapsed hook — the cache lives for
-//!   the process lifetime, invisible outside multi-Td processes;
-//! - `on_get_country_list`'s result/error routing rides the net step
-//!   (nothing completes the parked query); the cache-fill half
-//!   (`on_get_country_list_impl`) is exact and runs for the compiled-in
-//!   list.
+//!   the process lifetime, invisible outside multi-Td processes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -28,8 +25,8 @@ use std::sync::Mutex;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tdmtproto::telegram_api;
-use tdutils::promise::{Promise, PromiseCreator};
-use tdutils::status::{Result, Status};
+use tdutils::promise::Promise;
+use tdutils::status::Status;
 
 use crate::td_api;
 
@@ -119,7 +116,28 @@ static FRAGMENT_PREFIXES: Mutex<(String, Vec<String>)> = Mutex::new((String::new
 /// and the fragment prefixes are process statics like the C++.
 #[derive(Default)]
 pub(crate) struct CountryInfoManager {
-    pending_load_country_queries: HashMap<String, Vec<Promise<()>>>,
+    pending_load_country_queries: HashMap<String, Vec<PendingCountryQuery>>,
+}
+
+/// The pending-lot entry — the C++ parks a `Promise<Unit>` whose lambda
+/// re-enters the matching `do_get_*` with `is_recursive = true` on the
+/// query completion; the port parks the re-entry descriptor itself (the
+/// `load_country_promise` closure can't reach the manager).
+pub(crate) enum PendingCountryQuery {
+    /// `do_get_countries`'s re-entry (cpp:220-228).
+    Countries { promise: Promise<td_api::Countries> },
+    /// `do_get_country`'s re-entry (cpp:260-268).
+    Country {
+        country_code: String,
+        promise: Promise<Option<td_api::CountryInfo>>,
+    },
+    /// `do_get_phone_number_info`'s re-entry (cpp:303-311).
+    PhoneNumber {
+        phone_number_prefix: String,
+        promise: Promise<td_api::PhoneNumberInfo>,
+    },
+    /// The background reload's noop promise (the C++ `Promise<Unit>()`).
+    Background,
 }
 
 /// The [`CountryInfoManager`] seams over the `Td` fields — the env
@@ -141,14 +159,13 @@ pub(crate) trait CountryInfoManagerEnv {
     /// (cpp:188-190).
     fn get_main_language_code(&mut self) -> String;
 
-    /// `GetNearestDcQuery::send` (cpp:37-39) — the `[blocked: net]`
-    /// seam; the promise resolves with the C++ LambdaPromise drop
-    /// ("Lost promise") until the net step answers it.
+    /// `GetNearestDcQuery::send` (cpp:37-39) — the query rides the
+    /// dispatcher; the promise parks at the Td-side lot until the answer.
     fn get_nearest_dc_via_net(&mut self, promise: Promise<String>);
 
-    /// `GetCountriesListQuery::send` (cpp:67-69) — the `[blocked: net]`
-    /// seam; the queued pending promises stay in the manager (dropping
-    /// with it) until the net step completes the query.
+    /// `GetCountriesListQuery::send` (cpp:67-69) — the query rides the
+    /// dispatcher; the queued pending entries stay in the manager until
+    /// `on_get_country_list` completes them.
     fn get_countries_list_via_net(&mut self, language_code: &str, hash: i32);
 }
 
@@ -223,7 +240,12 @@ impl CountryInfoManager {
         if language_code.is_empty() {
             return promise.set_error(Status::error(400, "Invalid language code specified"));
         }
-        self.load_country_list(env, language_code, 0, load_country_promise(promise));
+        self.load_country_list(
+            env,
+            language_code,
+            0,
+            PendingCountryQuery::Countries { promise },
+        );
     }
 
     /// `get_country` (cpp:231-234).
@@ -269,7 +291,15 @@ impl CountryInfoManager {
         if language_code.is_empty() {
             return promise.set_error(Status::error(400, "Invalid language code specified"));
         }
-        self.load_country_list(env, language_code, 0, load_country_promise(promise));
+        self.load_country_list(
+            env,
+            language_code,
+            0,
+            PendingCountryQuery::Country {
+                country_code,
+                promise,
+            },
+        );
     }
 
     /// `get_phone_number_info` (cpp:271-278).
@@ -321,11 +351,19 @@ impl CountryInfoManager {
         if language_code.is_empty() {
             return promise.set_error(Status::error(400, "Invalid language code specified"));
         }
-        self.load_country_list(env, language_code, 0, load_country_promise(promise));
+        self.load_country_list(
+            env,
+            language_code,
+            0,
+            PendingCountryQuery::PhoneNumber {
+                phone_number_prefix,
+                promise,
+            },
+        );
     }
 
     /// `get_current_country_code` (cpp:420-422) — the `GetNearestDcQuery`
-    /// send; the query tail is the `[blocked: net]` seam.
+    /// send over the dispatcher.
     pub(crate) fn get_current_country_code(
         &mut self,
         env: &mut impl CountryInfoManagerEnv,
@@ -341,40 +379,116 @@ impl CountryInfoManager {
         env: &mut impl CountryInfoManagerEnv,
         language_code: String,
         hash: i32,
-        promise: Promise<()>,
+        pending: PendingCountryQuery,
     ) {
         let queries = self
             .pending_load_country_queries
             .entry(language_code.clone())
             .or_default();
-        if promise.is_empty() && !queries.is_empty() {
+        if matches!(pending, PendingCountryQuery::Background) && !queries.is_empty() {
             return;
         }
-        queries.push(promise);
+        queries.push(pending);
         if queries.len() == 1 {
             // `GetCountriesListQuery::send(language_code, hash)` — the
-            // `[blocked: net]` seam; the queued promises drop with the
-            // manager until the net step completes the query.
+            // first entry starts the query
             env.get_countries_list_via_net(&language_code, hash);
         }
     }
-}
 
-/// The `PromiseCreator::lambda` rewrap of the C++ load path
-/// (cpp:220-228/260-268/303-311): the query completion re-enters
-/// `do_get_*` with `is_recursive = true`; the query tail is the
-/// `[blocked: net]` seam, so the Ok arm's re-entry rides the net step and
-/// the closure (holding the caller promise) drops with it — the C++
-/// LambdaPromise drop — until the net step completes the query.
-fn load_country_promise<T: Send + 'static>(mut promise: Promise<T>) -> Promise<()> {
-    PromiseCreator::lambda_result(move |result: Result<()>| match result {
-        Result::Ok(()) => {
-            // `send_closure(actor_id, &CountryInfoManager::do_get_*,
-            // ..., /* is_recursive = */ true, ...)` — the net step's
-            // completion continuation.
+    /// `on_get_country_list` (cpp:439-470) — the query completion: pop
+    /// the pending lot; the error arm keeps the cached lists (the 60-120s
+    /// reload backoff) and resolves through the re-entry, the missing
+    /// cache fails the lot; the ok arm fills the cache and resolves.
+    pub(crate) fn on_get_country_list(
+        &mut self,
+        env: &mut impl CountryInfoManagerEnv,
+        language_code: &str,
+        result: std::result::Result<telegram_api::help_CountriesList, Status>,
+    ) {
+        let Some(pending) = self.pending_load_country_queries.remove(language_code) else {
+            return;
+        };
+        let status = match result {
+            Ok(country_list) => {
+                {
+                    let mut countries = COUNTRIES.lock().unwrap();
+                    on_get_country_list_impl(&mut countries, language_code, country_list);
+                }
+                self.resolve_pending(env, language_code, pending);
+                return;
+            }
+            Err(status) => status,
+        };
+        // the error arm: with a cached list the re-entry resolves from
+        // the cache (the C++ `set_promises`), and the reload backoff
+        // holds for 60-120s.
+        let have_cache = {
+            let mut countries = COUNTRIES.lock().unwrap();
+            match countries.get_mut(language_code) {
+                Some(list) => {
+                    let backoff = tdutils::time::now() + f64::from(tdutils::random::fast(60, 120));
+                    list.next_reload_time = list.next_reload_time.max(backoff);
+                    true
+                }
+                None => false,
+            }
+        };
+        if have_cache {
+            self.resolve_pending(env, language_code, pending);
+        } else {
+            for query in pending {
+                match query {
+                    PendingCountryQuery::Countries { mut promise } => {
+                        promise.set_error(status.clone())
+                    }
+                    PendingCountryQuery::Country { mut promise, .. } => {
+                        promise.set_error(status.clone())
+                    }
+                    PendingCountryQuery::PhoneNumber { mut promise, .. } => {
+                        promise.set_error(status.clone())
+                    }
+                    PendingCountryQuery::Background => {}
+                }
+            }
         }
-        Result::Err(status) => promise.set_error(status),
-    })
+    }
+
+    /// The `set_promises` half — the parked re-entries run their
+    /// `do_get_*` with `is_recursive = true` (the C++ closure send).
+    fn resolve_pending(
+        &mut self,
+        env: &mut impl CountryInfoManagerEnv,
+        language_code: &str,
+        pending: Vec<PendingCountryQuery>,
+    ) {
+        for query in pending {
+            match query {
+                PendingCountryQuery::Countries { promise } => {
+                    self.do_get_countries(env, language_code.to_owned(), true, promise);
+                }
+                PendingCountryQuery::Country {
+                    country_code,
+                    promise,
+                } => {
+                    self.do_get_country(env, country_code, language_code.to_owned(), true, promise);
+                }
+                PendingCountryQuery::PhoneNumber {
+                    phone_number_prefix,
+                    promise,
+                } => {
+                    self.do_get_phone_number_info(
+                        env,
+                        phone_number_prefix,
+                        language_code.to_owned(),
+                        true,
+                        promise,
+                    );
+                }
+                PendingCountryQuery::Background => {}
+            }
+        }
+    }
 }
 
 /// `CountryInfoManager::get_country_list` (cpp:532-628) — the guarded
@@ -412,7 +526,7 @@ fn get_country_list<T>(
         let result = guard.get(language_code).map(with_list);
         drop(guard);
         if let (Some(manager), Some((language_code, hash))) = (manager, reload) {
-            manager.load_country_list(env, language_code, hash, Promise::default());
+            manager.load_country_list(env, language_code, hash, PendingCountryQuery::Background);
         }
         result
     }
@@ -832,21 +946,49 @@ const EMBEDDED_EN_COUNTRIES_LIST: &str = concat!(
     "WkMhFiwr1Jju73va2Ke7G47A05uefzER0945xXQ994_M8_z__r_wF2XX6H",
 );
 
+/// The tests below mutate the process-global country cache and the
+/// fragment prefixes, so they serialize on one lock — in parallel they
+/// would corrupt each other (the tdutils TEST_LOCK pattern). The td.rs
+/// round-trip test shares it (its dispatcher flow touches the same
+/// cache).
+#[cfg(test)]
+pub(crate) static COUNTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The td.rs round-trip helper: the hermetic stale "en" list (the
+/// reload fires deterministically, whatever the cache holds).
+#[cfg(test)]
+pub(crate) fn force_stale_english_list_for_test(hash: i32) {
+    COUNTRIES.lock().unwrap().insert(
+        "en".to_string(),
+        CountryList {
+            countries: Vec::new(),
+            hash,
+            next_reload_time: 0.0,
+        },
+    );
+}
+
+/// The td.rs round-trip helper: drop the "en" entry (the embedded
+/// decode re-creates it on demand).
+#[cfg(test)]
+pub(crate) fn remove_english_list_for_test() {
+    COUNTRIES.lock().unwrap().remove("en");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The tests below mutate the process-global country cache and the
-    /// fragment prefixes, so they serialize on one lock — in parallel they
-    /// would corrupt each other (the tdutils TEST_LOCK pattern).
-    static COUNTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use tdutils::promise::PromiseCreator;
+    use tdutils::status::Result;
 
     /// The manager env over a map: the option strings ride a map, the net
-    /// seams record their queries (the production env drops the promises).
+    /// seams record their queries (the nearest-dc promise parks like the
+    /// Td env's lot).
     struct TestCountryEnv {
         options: std::collections::BTreeMap<String, String>,
         main_language_code: String,
         nearest_dc_queries: usize,
+        nearest_dc_promises: Vec<Promise<String>>,
         countries_list_queries: Vec<(String, i32)>,
     }
 
@@ -856,6 +998,7 @@ mod tests {
                 options: std::collections::BTreeMap::new(),
                 main_language_code: main_language_code.to_string(),
                 nearest_dc_queries: 0,
+                nearest_dc_promises: Vec::new(),
                 countries_list_queries: Vec::new(),
             }
         }
@@ -889,8 +1032,9 @@ mod tests {
             self.main_language_code.clone()
         }
 
-        fn get_nearest_dc_via_net(&mut self, _promise: Promise<String>) {
+        fn get_nearest_dc_via_net(&mut self, promise: Promise<String>) {
             self.nearest_dc_queries += 1;
+            self.nearest_dc_promises.push(promise);
         }
 
         fn get_countries_list_via_net(&mut self, language_code: &str, hash: i32) {
@@ -1206,17 +1350,37 @@ mod tests {
         let mut manager = CountryInfoManager::default();
         let mut env = TestCountryEnv::new("en");
 
-        manager.load_country_list(&mut env, "xx".to_string(), 0, Promise::default());
-        manager.load_country_list(&mut env, "xx".to_string(), 0, Promise::default());
+        manager.load_country_list(
+            &mut env,
+            "xx".to_string(),
+            0,
+            PendingCountryQuery::Background,
+        );
+        manager.load_country_list(
+            &mut env,
+            "xx".to_string(),
+            0,
+            PendingCountryQuery::Background,
+        );
         assert_eq!(env.countries_list_queries.len(), 1);
         assert_eq!(manager.pending_load_country_queries["xx"].len(), 1);
 
-        let (promise, _slot) = captured_promise::<()>();
-        manager.load_country_list(&mut env, "xx".to_string(), 0, promise);
+        let (promise, _slot) = captured_promise::<td_api::Countries>();
+        manager.load_country_list(
+            &mut env,
+            "xx".to_string(),
+            0,
+            PendingCountryQuery::Countries { promise },
+        );
         assert_eq!(manager.pending_load_country_queries["xx"].len(), 2);
         assert_eq!(env.countries_list_queries.len(), 1);
 
-        manager.load_country_list(&mut env, "yy".to_string(), 7, Promise::default());
+        manager.load_country_list(
+            &mut env,
+            "yy".to_string(),
+            7,
+            PendingCountryQuery::Background,
+        );
         assert_eq!(
             env.countries_list_queries,
             [("xx".to_string(), 0), ("yy".to_string(), 7)]
@@ -1301,9 +1465,9 @@ mod tests {
     }
 
     /// `get_current_country_code` (cpp:420-422): the promise rides the
-    /// `[blocked: net]` seam (the recorded query count is the park).
+    /// net seam (the TestEnv parks it like the Td env does).
     #[test]
-    fn get_country_code_parks_at_the_net_seam() {
+    fn get_country_code_rides_the_net_seam() {
         let _lock = COUNTRY_TEST_LOCK.lock().unwrap();
         let mut manager = CountryInfoManager::default();
         let mut env = TestCountryEnv::new("en");
@@ -1311,13 +1475,7 @@ mod tests {
         let (promise, slot) = captured_promise::<String>();
         manager.get_current_country_code(&mut env, promise);
         assert_eq!(env.nearest_dc_queries, 1);
-        // the seam drops the promise — the dropped LambdaPromise parks the
-        // captured slot with the "Lost promise" error (the recorded
-        // parked-arm convention until the net step answers)
-        let parked = &*slot.lock().unwrap();
-        assert!(
-            matches!(parked, Some(Result::Err(_))),
-            "expected the parked promise"
-        );
+        // the promise parks until the net answer (the TestEnv records it)
+        assert!((*slot.lock().unwrap()).is_none());
     }
 }

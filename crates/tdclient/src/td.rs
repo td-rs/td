@@ -2583,6 +2583,23 @@ impl<K: NetAnswerKind> NetKindHandle<K> {
 
     /// The per-DC form — `create(function, {}, dc_id)`.
     fn dispatch_dc(&self, kind: K, function: telegram_api::Function, dc_id: DcId) {
+        self.dispatch_query(kind, function, dc_id, AuthFlag::On);
+    }
+
+    /// The unauth form — the C++ `create_unauth` (the pre-auth window
+    /// queries: the country/help families).
+    fn dispatch_unauth(&self, kind: K, function: telegram_api::Function) {
+        self.dispatch_query(kind, function, DcId::main(), AuthFlag::Off);
+    }
+
+    /// The shared serialize + dispatch leg.
+    fn dispatch_query(
+        &self,
+        kind: K,
+        function: telegram_api::Function,
+        dc_id: DcId,
+        auth_flag: AuthFlag,
+    ) {
         let mut bytes = Vec::new();
         function.store(&mut bytes);
         let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
@@ -2590,7 +2607,7 @@ impl<K: NetAnswerKind> NetKindHandle<K> {
             0,
             dc_id,
             NetQueryType::Common,
-            AuthFlag::On,
+            auth_flag,
             GzipFlag::Off,
             tl_constructor,
             bytes,
@@ -2858,6 +2875,21 @@ pub(crate) enum SupportNetKind {
 /// The cloned support dispatch surface the [`SupportEnvTd`] senders use
 /// — the answers drain through [`Td::on_support_net_answer`].
 type SupportNetHandle = NetKindHandle<SupportNetKind>;
+
+/// The CountryInfoManager in-flight query kinds — the C++ ResultHandler
+/// classes of CountryInfoManager.cpp:30-71 (both unauth sends).
+#[derive(Clone, Copy)]
+pub(crate) enum CountryNetKind {
+    /// `GetNearestDcQuery` (cpp:30) — the country-code answer.
+    NearestDc,
+    /// `GetCountriesListQuery` (cpp:41) — the completion keys on the
+    /// language code (the interned index — the kinds stay `Copy`).
+    CountriesList { language_code_index: u32 },
+}
+
+/// The cloned country dispatch surface the [`CountryEnv`] senders use —
+/// the answers drain through [`Td::on_country_net_answer`].
+type CountryNetHandle = NetKindHandle<CountryNetKind>;
 
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
@@ -3572,6 +3604,15 @@ pub struct Td {
     support_info_promises: Vec<Promise<td_api::UserSupportInfo>>,
     /// The parked `String` promises — the `help.getSupportName` lot.
     support_name_promises: Vec<Promise<String>>,
+    /// The callback-parked CountryInfoManager query answers, parked by
+    /// kind (the `Td::on_country_net_answer` drain).
+    country_net_completed: Arc<Mutex<Vec<(CountryNetKind, NetQuery)>>>,
+    /// The parked `String` promises — the `help.getNearestDc` lot.
+    nearest_dc_promises: Vec<Promise<String>>,
+    /// The interned country-list language codes (the
+    /// `CountriesList { language_code_index }` kind payload — the kinds
+    /// stay `Copy`; send-time registration, completion-time lookup).
+    country_language_codes: Vec<std::sync::Arc<str>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -3995,6 +4036,9 @@ impl Td {
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_info_promises: Vec::new(),
             support_name_promises: Vec::new(),
+            country_net_completed: Arc::new(Mutex::new(Vec::new())),
+            nearest_dc_promises: Vec::new(),
+            country_language_codes: Vec::new(),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -6144,6 +6188,7 @@ impl Td {
         self.dispatch_completed_account_net();
         self.dispatch_completed_star_net();
         self.dispatch_completed_support_net();
+        self.dispatch_completed_country_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6212,6 +6257,16 @@ impl Td {
         Some(SupportNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.support_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned country dispatch surface for the [`CountryEnv`]
+    /// senders — `None` keeps the net-inert posture.
+    fn country_net(&self) -> Option<CountryNetHandle> {
+        Some(CountryNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.country_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7296,6 +7351,89 @@ impl Td {
             self.on_support_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked CountryInfoManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves
+    /// (CountryInfoManager.cpp:30-71).
+    fn dispatch_completed_country_net(&mut self) {
+        let completed = std::mem::take(&mut *self.country_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_country_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one CountryInfoManager net answer by kind (the C++ query
+    /// handler halves of CountryInfoManager.cpp:30-71).
+    fn on_country_net_answer(&mut self, kind: CountryNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetNearestDcQuery` (cpp:30-52).
+            CountryNetKind::NearestDc => {
+                let promise = if self.nearest_dc_promises.is_empty() {
+                    None
+                } else {
+                    Some(self.nearest_dc_promises.remove(0))
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !self.global.is_expected_error(&status)
+                        && status.message() != "BOT_METHOD_INVALID"
+                    {
+                        tdutils::log_error!("Receive error for GetNearestDcQuery: {status}");
+                    }
+                    if let Some(mut promise) = promise {
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                match telegram_api::NearestDc::parse(query.ok()) {
+                    Ok(result) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(result.country);
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("help_getNearestDc"));
+                        }
+                    }
+                }
+            }
+            // `GetCountriesListQuery` (cpp:41-65) — the answer re-enters
+            // `on_get_country_list` with the interned language code.
+            CountryNetKind::CountriesList {
+                language_code_index,
+            } => {
+                let Some(language_code) = self
+                    .country_language_codes
+                    .get(language_code_index as usize)
+                    .cloned()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::help_CountriesList::parse(query.ok()) {
+                        Ok(list) => Ok(list),
+                        Err(_) => Err(parse_error("help_getCountriesList")),
+                    }
+                };
+                if let Err(status) = &result
+                    && !self.global.is_expected_error(status)
+                {
+                    tdutils::log_error!("Receive error for GetCountriesListQuery: {status}");
+                }
+                let mut manager = std::mem::take(&mut self.country_info_manager);
+                let mut env = CountryEnv { td: &mut *self };
+                manager.on_get_country_list(&mut env, &language_code, result);
+                self.country_info_manager = manager;
+            }
+        }
     }
 
     /// Route one Support net answer by kind (the C++ query handler halves
@@ -16839,17 +16977,48 @@ impl crate::country_info_manager::CountryInfoManagerEnv for CountryEnv<'_> {
             .to_ascii_lowercase()
     }
 
-    /// `GetNearestDcQuery::send` — the `[blocked: net]` seam. Dropping
-    /// the promise answers with the C++ LambdaPromise drop ("Lost
-    /// promise") until the net step completes the query.
+    /// `GetNearestDcQuery::send` (CountryInfoManager.cpp:37-39) — the
+    /// unauth dispatch; the promise parks at the Td-side lot until the
+    /// answer.
     fn get_nearest_dc_via_net(&mut self, promise: Promise<String>) {
-        drop(promise);
+        self.td.nearest_dc_promises.push(promise);
+        match self.td.country_net() {
+            Some(net) => net.dispatch_unauth(
+                CountryNetKind::NearestDc,
+                telegram_api::Function::help_getNearestDc(telegram_api::help_getNearestDc),
+            ),
+            None => tdutils::log_info!("Send help.getNearestDc — [net-inert]"),
+        }
     }
 
-    /// `GetCountriesListQuery::send` — the `[blocked: net]` seam; the
-    /// pending promises stay queued in the manager (dropping with it)
-    /// until the net step completes the query.
-    fn get_countries_list_via_net(&mut self, _language_code: &str, _hash: i32) {}
+    /// `GetCountriesListQuery::send` (CountryInfoManager.cpp:67-69) —
+    /// the unauth dispatch with the interned language-code index.
+    fn get_countries_list_via_net(&mut self, language_code: &str, hash: i32) {
+        match self.td.country_net() {
+            Some(net) => {
+                let language_code_index = self.td.country_language_codes.len() as u32;
+                self.td
+                    .country_language_codes
+                    .push(std::sync::Arc::from(language_code));
+                net.dispatch_unauth(
+                    CountryNetKind::CountriesList {
+                        language_code_index,
+                    },
+                    telegram_api::Function::help_getCountriesList(
+                        telegram_api::help_getCountriesList {
+                            lang_code: language_code.to_owned(),
+                            hash,
+                        },
+                    ),
+                )
+            }
+            None => {
+                tdutils::log_info!(
+                    "Send help.getCountriesList({language_code}, {hash}) — [net-inert]"
+                )
+            }
+        }
+    }
 }
 
 /// The `G()`/manager split of the collapsed CountryInfoManager — the
@@ -27894,6 +28063,101 @@ mod tests {
         }
 
         assert!(td.support_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the country net slice: the unauth help.* queries ride the
+    // dispatcher (CountryInfoManager.cpp:30-71). ----
+
+    #[test]
+    fn country_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(country_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn country_queries_ride_the_dispatcher_impl() {
+        // the shared country-cache lock — the flow mutates COUNTRIES like
+        // the manager unit tests
+        let _lock = crate::country_info_manager::COUNTRY_TEST_LOCK
+            .lock()
+            .unwrap();
+        // the hermetic "en" list: a stale empty cache (the reload fires
+        // deterministically, whatever the other tests left)
+        crate::country_info_manager::force_stale_english_list_for_test(42);
+        let (mut td, rec) = netted_td("netfix-country");
+
+        // 1. getCountries — the compiled-in "en" list answers from the
+        //    cache and the background reload query fires (the embedded
+        //    hash); the NotModified answer completes the load.
+        let (promise, slot) = record_countries();
+        {
+            let (mut env, mut manager) = crate::td::country_env_split(&mut td);
+            manager.get_countries(&mut env, promise);
+            td.country_info_manager = manager;
+        }
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(_))
+        ));
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the background reload query");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::help_getCountriesList::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::help_countriesListNotModified {}.store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_country_net();
+        crate::country_info_manager::remove_english_list_for_test();
+
+        // 2. getCountryCode — the nearest-dc country answer.
+        let (promise, slot) = record_star_url();
+        {
+            let (mut env, mut manager) = crate::td::country_env_split(&mut td);
+            manager.get_current_country_code(&mut env, promise);
+            td.country_info_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::help_getNearestDc::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::NearestDc {
+            country: "DE".to_owned(),
+            this_dc: 1,
+            nearest_dc: 2,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_country_net();
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Ok(ref country)) if country == "DE")
+        );
+
+        assert!(td.country_net_completed.lock().is_empty(), "drained");
+    }
+
+    type CountriesSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::Countries>>>>;
+
+    fn record_countries() -> (Promise<td_api::Countries>, CountriesSlot) {
+        struct Rec(CountriesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::Countries> for Rec {
+            fn set_value(&mut self, value: td_api::Countries) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: CountriesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
     }
 
     type SupportInfoSlot =
