@@ -2909,6 +2909,32 @@ pub(crate) enum PromoNetKind {
 /// — the answers drain through [`Td::on_promo_net_answer`].
 type PromoNetHandle = NetKindHandle<PromoNetKind>;
 
+/// The SponsoredMessageManager in-flight query kinds — the C++
+/// ResultHandler classes of SponsoredMessageManager.cpp:37-200.
+#[derive(Clone, Copy)]
+pub(crate) enum SponsoredNetKind {
+    /// `GetSponsoredMessagesQuery` (cpp:37) — both the per-dialog and
+    /// the per-message (MSG_ID flag) fetch forms; the error ladder's
+    /// `on_get_dialog_error` keys on the dialog.
+    GetSponsoredMessages {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ViewSponsoredMessageQuery` (cpp:76) — fire-and-forget (the C++
+    /// `on_error` is empty).
+    ViewSponsoredMessage,
+    /// `ClickSponsoredMessageQuery` (cpp:93).
+    ClickSponsoredMessage,
+    /// `ReportSponsoredMessageQuery` (cpp:118).
+    ReportSponsoredMessage,
+    /// `GetSponsoredPeersQuery` (cpp:174) — the completion keys on the
+    /// search query (the interned index).
+    GetSponsoredPeers { query_index: u32 },
+}
+
+/// The cloned sponsored dispatch surface the [`TdSponsoredEnv`] senders
+/// use — the answers drain through [`Td::on_sponsored_net_answer`].
+type SponsoredNetHandle = NetKindHandle<SponsoredNetKind>;
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -3628,6 +3654,12 @@ pub struct Td {
     /// The callback-parked PromoDataManager query answers, parked by
     /// kind (the `Td::on_promo_net_answer` drain).
     promo_net_completed: Arc<Mutex<Vec<(PromoNetKind, NetQuery)>>>,
+    /// The callback-parked SponsoredMessageManager query answers,
+    /// parked by kind (the `Td::on_sponsored_net_answer` drain).
+    sponsored_net_completed: Arc<Mutex<Vec<(SponsoredNetKind, NetQuery)>>>,
+    /// The interned sponsored-peer search queries (the
+    /// `GetSponsoredPeers { query_index }` kind payload).
+    sponsored_peer_queries: Vec<std::sync::Arc<str>>,
     /// The parked `String` promises — the `help.getNearestDc` lot.
     nearest_dc_promises: Vec<Promise<String>>,
     /// The interned country-list language codes (the
@@ -4059,6 +4091,8 @@ impl Td {
             support_name_promises: Vec::new(),
             country_net_completed: Arc::new(Mutex::new(Vec::new())),
             promo_net_completed: Arc::new(Mutex::new(Vec::new())),
+            sponsored_net_completed: Arc::new(Mutex::new(Vec::new())),
+            sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -6212,6 +6246,7 @@ impl Td {
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
         self.dispatch_completed_promo_net();
+        self.dispatch_completed_sponsored_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6300,6 +6335,16 @@ impl Td {
         Some(PromoNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.promo_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned sponsored dispatch surface for the [`TdSponsoredEnv`]
+    /// senders — `None` keeps the net-inert posture.
+    fn sponsored_net(&self) -> Option<SponsoredNetHandle> {
+        Some(SponsoredNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.sponsored_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7406,6 +7451,112 @@ impl Td {
             self.on_promo_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked SponsoredMessageManager answers — the
+    /// C++ ResultHandler `on_result`/`on_error` halves
+    /// (SponsoredMessageManager.cpp:37-200).
+    fn dispatch_completed_sponsored_net(&mut self) {
+        let completed = std::mem::take(&mut *self.sponsored_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_sponsored_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one SponsoredMessageManager net answer by kind (the C++
+    /// query handler halves of SponsoredMessageManager.cpp:37-200).
+    fn on_sponsored_net_answer(&mut self, kind: SponsoredNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetSponsoredMessagesQuery` (cpp:37-74) — the answer
+            // re-enters `on_get_dialog_sponsored_messages`; the error
+            // ladder runs `on_get_dialog_error` first.
+            SponsoredNetKind::GetSponsoredMessages { dialog_id } => {
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        dialog_id,
+                        &status,
+                        "GetSponsoredMessagesQuery",
+                    );
+                    tdutils::status::Result::Err(status)
+                } else {
+                    match telegram_api::messages_SponsoredMessages::parse(query.ok()) {
+                        Ok(messages) => tdutils::status::Result::Ok(messages),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "messages_getSponsoredMessages",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.sponsored_message_manager);
+                let mut env = TdSponsoredEnv { td: &mut *self };
+                manager.on_get_dialog_sponsored_messages(&mut env, dialog_id, result);
+                self.sponsored_message_manager = manager;
+            }
+            // `ViewSponsoredMessageQuery` (cpp:76-91) — both answer
+            // halves are dropped (the fire-and-forget form).
+            SponsoredNetKind::ViewSponsoredMessage => {}
+            // `ClickSponsoredMessageQuery` (cpp:93-116).
+            SponsoredNetKind::ClickSponsoredMessage => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => tdutils::status::Result::Ok(true),
+                        None => tdutils::status::Result::Err(parse_error(
+                            "messages_clickSponsoredMessage",
+                        )),
+                    }
+                };
+                self.sponsored_message_manager
+                    .on_click_sponsored_message_result(result);
+            }
+            // `ReportSponsoredMessageQuery` (cpp:118-172).
+            SponsoredNetKind::ReportSponsoredMessage => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::channels_SponsoredMessageReportResult::parse(query.ok()) {
+                        Ok(result) => tdutils::status::Result::Ok(result),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "messages_reportSponsoredMessage",
+                        )),
+                    }
+                };
+                self.sponsored_message_manager
+                    .on_report_sponsored_message_result(result);
+            }
+            // `GetSponsoredPeersQuery` (cpp:174-200) — the answer
+            // re-enters `on_get_search_sponsored_dialogs` with the
+            // interned query.
+            SponsoredNetKind::GetSponsoredPeers { query_index } => {
+                let Some(query_string) = self
+                    .sponsored_peer_queries
+                    .get(query_index as usize)
+                    .cloned()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::contacts_SponsoredPeers::parse(query.ok()) {
+                        Ok(peers) => tdutils::status::Result::Ok(peers),
+                        Err(_) => {
+                            tdutils::status::Result::Err(parse_error("contacts_getSponsoredPeers"))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.sponsored_message_manager);
+                let mut env = TdSponsoredEnv { td: &mut *self };
+                manager.on_get_search_sponsored_dialogs(&mut env, &query_string, result);
+                self.sponsored_message_manager = manager;
+            }
+        }
     }
 
     /// Route one PromoDataManager net answer by kind (the C++ query
@@ -21465,32 +21616,136 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
 
     fn send_get_sponsored_messages_query(
         &mut self,
-        _dialog_id: crate::dialog_id::DialogId,
-        _message_id: crate::messages_manager::MessageId,
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::messages_manager::MessageId,
     ) {
-        // [blocked: net]
+        // `GetSponsoredMessagesQuery::send` (cpp:59-70) — the
+        // read-access input peer; the C++ CHECK band logs when the peer
+        // is missing (the None arm skips the send like the C++ actor
+        // would abort the handler).
+        let Some(net) = self.td.sponsored_net() else {
+            return tdutils::log_info!("Send messages.getSponsoredMessages — [net-inert]");
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("GetSponsoredMessagesQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let flags = usize::from(message_id.get() != 0) as i32;
+        net.dispatch(
+            SponsoredNetKind::GetSponsoredMessages { dialog_id },
+            telegram_api::Function::messages_getSponsoredMessages(
+                telegram_api::messages_getSponsoredMessages {
+                    flags,
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_id.get_server_message_id().get(),
+                },
+            ),
+        );
     }
 
-    fn send_get_sponsored_peers_query(&mut self, _query: &str) {
-        // [blocked: net]
+    fn send_get_sponsored_peers_query(&mut self, query: &str) {
+        // `GetSponsoredPeersQuery::send` (cpp:191-193).
+        match self.td.sponsored_net() {
+            Some(net) => {
+                let query_index = self.td.sponsored_peer_queries.len() as u32;
+                self.td
+                    .sponsored_peer_queries
+                    .push(std::sync::Arc::from(query));
+                net.dispatch(
+                    SponsoredNetKind::GetSponsoredPeers { query_index },
+                    telegram_api::Function::contacts_getSponsoredPeers(
+                        telegram_api::contacts_getSponsoredPeers {
+                            q: query.to_owned(),
+                        },
+                    ),
+                )
+            }
+            None => {
+                tdutils::log_info!("Send contacts.getSponsoredPeers({query}) — [net-inert]")
+            }
+        }
     }
 
-    fn send_view_sponsored_message_query(&mut self, _random_id: &[u8]) {
-        // [blocked: net]
+    fn send_view_sponsored_message_query(&mut self, random_id: &[u8]) {
+        // `ViewSponsoredMessageQuery::send` (cpp:83-85) — the
+        // fire-and-forget form.
+        match self.td.sponsored_net() {
+            Some(net) => net.dispatch(
+                SponsoredNetKind::ViewSponsoredMessage,
+                telegram_api::Function::messages_viewSponsoredMessage(
+                    telegram_api::messages_viewSponsoredMessage {
+                        random_id: random_id.to_vec(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.viewSponsoredMessage — [net-inert]")
+            }
+        }
     }
 
     fn send_click_sponsored_message_query(
         &mut self,
-        _query: crate::sponsored_message_manager::PendingClickQuery,
+        query: crate::sponsored_message_manager::PendingClickQuery,
     ) {
-        // [blocked: net]
+        // `ClickSponsoredMessageQuery::send` (cpp:103-105) — the flag
+        // pair; the promise parks in the manager's click lot.
+        let crate::sponsored_message_manager::PendingClickQuery {
+            random_id,
+            is_media_click,
+            from_fullscreen,
+            promise,
+        } = query;
+        self.td
+            .sponsored_message_manager
+            .park_click_promise(promise);
+        match self.td.sponsored_net() {
+            Some(net) => net.dispatch(
+                SponsoredNetKind::ClickSponsoredMessage,
+                telegram_api::Function::messages_clickSponsoredMessage(
+                    telegram_api::messages_clickSponsoredMessage {
+                        flags: (is_media_click as i32) | ((from_fullscreen as i32) << 1),
+                        media: is_media_click,
+                        fullscreen: from_fullscreen,
+                        random_id,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.clickSponsoredMessage — [net-inert]"),
+        }
     }
 
     fn send_report_sponsored_message_query(
         &mut self,
-        _query: crate::sponsored_message_manager::PendingReportQuery,
+        query: crate::sponsored_message_manager::PendingReportQuery,
     ) {
-        // [blocked: net]
+        // `ReportSponsoredMessageQuery::send` (cpp:125-127).
+        let crate::sponsored_message_manager::PendingReportQuery {
+            random_id,
+            option_id,
+            promise,
+        } = query;
+        self.td
+            .sponsored_message_manager
+            .park_report_promise(promise);
+        match self.td.sponsored_net() {
+            Some(net) => net.dispatch(
+                SponsoredNetKind::ReportSponsoredMessage,
+                telegram_api::Function::messages_reportSponsoredMessage(
+                    telegram_api::messages_reportSponsoredMessage {
+                        random_id,
+                        option: option_id,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.reportSponsoredMessage — [net-inert]")
+            }
+        }
     }
 }
 
@@ -28288,6 +28543,112 @@ mod tests {
         net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
         td.dispatch_completed_promo_net();
         assert!(td.promo_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the sponsored net slice: the sponsored-message queries ride
+    // the dispatcher (SponsoredMessageManager.cpp:37-200). ----
+
+    type SponsoredMessagesSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::SponsoredMessages>>>,
+    >;
+
+    fn record_sponsored_messages() -> (Promise<td_api::SponsoredMessages>, SponsoredMessagesSlot) {
+        struct Rec(SponsoredMessagesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::SponsoredMessages> for Rec {
+            fn set_value(&mut self, value: td_api::SponsoredMessages) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: SponsoredMessagesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn sponsored_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sponsored_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn sponsored_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-sponsored");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        // seed the self user record — `check_dialog_access` probes
+        // `have_accessible_user`, which needs the stored user
+        td.user_manager.on_get_user(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            telegram_api::User::user(telegram_api::user {
+                id: 700000001,
+                self_: true,
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+
+        // 1. getChatSponsoredMessages — the promise parks, the query
+        //    rides the read peer, the empty answer resolves the park.
+        let (promise, slot) = record_sponsored_messages();
+        {
+            let (mut manager, mut env) = crate::td::sponsored_env_split(&mut td);
+            manager.get_dialog_sponsored_messages(
+                &mut env,
+                crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(
+                    700000001,
+                )),
+                promise,
+            );
+            td.sponsored_message_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_getSponsoredMessages::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::messages_sponsoredMessages {
+            flags: 0,
+            posts_between: 0,
+            start_delay: 0,
+            between_delay: 0,
+            messages: vec![],
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_sponsored_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(messages)) => {
+                assert!(messages.messages.is_empty());
+            }
+            other => panic!("unexpected sponsored messages result: {other:?}"),
+        }
+
+        assert!(td.sponsored_net_completed.lock().is_empty(), "drained");
     }
 
     type CountriesSlot =

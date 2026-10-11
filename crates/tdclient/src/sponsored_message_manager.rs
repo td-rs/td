@@ -1,7 +1,11 @@
 //! The `SponsoredMessageManager` port (SponsoredMessageManager.{h,cpp})
 //! — the per-dialog sponsored-message/sponsored-dialog/video-ad caches,
-//! the view/click/report bookkeeping and the parked net query payloads
-//! (M.26).
+//! the view/click/report bookkeeping (M.26). The five queries ride the
+//! client-side dispatcher under their `SponsoredNetKind` (the answers
+//! drain through `Td::on_sponsored_net_answer` into the landed
+//! `on_get_dialog_sponsored_messages`/
+//! `on_get_search_sponsored_dialogs`/click/report intakes; the click/
+//! report promises park at the manager lots via the env).
 
 use crate::messages_manager::MessageId;
 use crate::messages_manager::MessageType;
@@ -155,12 +159,8 @@ pub(crate) struct VideoSponsoredMessages {
 /// A parked click promise (the C++ `ClickSponsoredMessageQuery`
 /// payload): the query random_id, the flag pair and the request promise.
 pub struct PendingClickQuery {
-    // the payload reads live on the [blocked: net] sender tails
-    #[allow(dead_code)]
     pub(crate) random_id: Vec<u8>,
-    #[allow(dead_code)]
     pub(crate) is_media_click: bool,
-    #[allow(dead_code)]
     pub(crate) from_fullscreen: bool,
     pub(crate) promise: Promise<()>,
 }
@@ -168,10 +168,7 @@ pub struct PendingClickQuery {
 /// A parked report promise (the C++ `ReportSponsoredMessageQuery`
 /// payload).
 pub struct PendingReportQuery {
-    // the payload reads live on the [blocked: net] sender tails
-    #[allow(dead_code)]
     pub(crate) random_id: Vec<u8>,
-    #[allow(dead_code)]
     pub(crate) option_id: Vec<u8>,
     pub(crate) promise: Promise<td_api::ReportSponsoredResult>,
 }
@@ -1471,6 +1468,27 @@ impl SponsoredMessageManager {
         promise.set_result(match result {
             Result::Ok(_) => Result::Ok(()),
             Result::Err(status) => Result::Err(status),
+        });
+    }
+
+    /// The env-side park of a click promise — the C++ query handler owns
+    /// its promise; the port's env parks it at the manager lot after the
+    /// send consumes the payload.
+    pub(crate) fn park_click_promise(&mut self, promise: Promise<()>) {
+        self.pending_click_queries.push(PendingClickQuery {
+            random_id: Vec::new(),
+            is_media_click: false,
+            from_fullscreen: false,
+            promise,
+        });
+    }
+
+    /// The env-side park of a report promise (the click twin).
+    pub(crate) fn park_report_promise(&mut self, promise: Promise<td_api::ReportSponsoredResult>) {
+        self.pending_report_queries.push(PendingReportQuery {
+            random_id: Vec::new(),
+            option_id: Vec::new(),
+            promise,
         });
     }
 }
