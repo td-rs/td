@@ -1233,12 +1233,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::sponsoredMessages,
             );
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.get_dialog_sponsored_messages(
                 &mut env,
                 crate::messages_manager::DialogId::new(request.chat_id),
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::clickChatSponsoredMessage(request) => {
             // Requests.cpp:2678-2684
@@ -1246,7 +1247,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.click_sponsored_message(
                 &mut env,
                 crate::messages_manager::DialogId::new(request.chat_id),
@@ -1255,6 +1256,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 request.from_fullscreen,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::reportChatSponsoredMessage(request) => {
             // Requests.cpp:2686-2691
@@ -1265,7 +1267,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 report_sponsored_result_to_object,
             );
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.report_sponsored_message(
                 &mut env,
                 crate::messages_manager::DialogId::new(request.chat_id),
@@ -1273,6 +1275,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 &request.option_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::getSearchSponsoredChats(request) => {
             // Requests.cpp:2693-2699
@@ -1284,8 +1287,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise::<crate::td_api::SponsoredChats, _>(id, Object::sponsoredChats);
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.get_search_sponsored_dialogs(&mut env, &query, promise);
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::viewSponsoredChat(request) => {
             // Requests.cpp:2700-2704
@@ -1293,12 +1297,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.view_sponsored_dialog(
                 &mut env,
                 request.sponsored_chat_unique_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::openSponsoredChat(request) => {
             // Requests.cpp:2706-2710
@@ -1306,12 +1311,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.open_sponsored_dialog(
                 &mut env,
                 request.sponsored_chat_unique_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::reportSponsoredChat(request) => {
             // Requests.cpp:2712-2717
@@ -1322,13 +1328,14 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 report_sponsored_result_to_object,
             );
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.report_sponsored_dialog(
                 &mut env,
                 request.sponsored_chat_unique_id,
                 &request.option_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::getVideoMessageAdvertisements(request) => {
             // Requests.cpp:2719-2725
@@ -1343,12 +1350,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 crate::messages_manager::DialogId::new(request.chat_id),
                 crate::messages_manager::MessageId::new(request.message_id),
             );
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.get_video_sponsored_messages(
                 &mut env,
                 message_full_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::viewVideoMessageAdvertisement(request) => {
             // Requests.cpp:2727-2731
@@ -1356,12 +1364,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.view_video_advertisement(
                 &mut env,
                 request.advertisement_unique_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::clickVideoMessageAdvertisement(request) => {
             // Requests.cpp:2733-2737
@@ -1369,12 +1378,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.click_video_advertisement(
                 &mut env,
                 request.advertisement_unique_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::reportVideoMessageAdvertisement(request) => {
             // Requests.cpp:2739-2744
@@ -1385,13 +1395,14 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 report_sponsored_result_to_object,
             );
-            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            let (mut sponsored_message_manager, mut env) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.report_video_advertisement(
                 &mut env,
                 request.advertisement_unique_id,
                 &request.option_id,
                 promise,
             );
+            td.sponsored_message_manager = sponsored_message_manager;
         }
         Function::importMessages(request) => {
             // Requests.cpp:6590-6594
@@ -1400,7 +1411,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
             let dialog_id = crate::messages_manager::DialogId::new(request.chat_id);
-            let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
+            let (mut message_import_manager, mut env) = crate::td::message_import_env_split(td);
             message_import_manager.import_messages(
                 &mut env,
                 dialog_id,
@@ -1408,6 +1419,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 request.attached_files,
                 promise,
             );
+            td.message_import_manager = message_import_manager;
         }
 
         // --- the M.10.22 flip wave: the manager arms whose receivers landed
@@ -1593,7 +1605,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let promise =
                 td.deferred_promise::<String, _>(id, |text| Object::text(td_api::Text { text }));
             let dialog_id = crate::messages_manager::DialogId::new(request.chat_id);
-            let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
+            let (mut message_import_manager, mut env) = crate::td::message_import_env_split(td);
             message_import_manager
                 .get_message_import_confirmation_text(&mut env, dialog_id, promise);
         }
@@ -1621,8 +1633,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                         }
                     },
                 );
-            let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
+            let (mut message_import_manager, mut env) = crate::td::message_import_env_split(td);
             message_import_manager.get_message_file_type(&mut env, &message_file_head, promise);
+            td.message_import_manager = message_import_manager;
         }
         Function::getStatisticalGraph(request) => {
             // `Requests.cpp:1586-1593` — the token read answers the stored

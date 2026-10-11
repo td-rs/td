@@ -2891,6 +2891,24 @@ pub(crate) enum CountryNetKind {
 /// the answers drain through [`Td::on_country_net_answer`].
 type CountryNetHandle = NetKindHandle<CountryNetKind>;
 
+/// The PromoDataManager in-flight query kinds — the C++ ResultHandler
+/// classes of PromoDataManager.cpp:31-86.
+#[derive(Clone, Copy)]
+pub(crate) enum PromoNetKind {
+    /// `GetPromoDataQuery` (cpp:31) — the answer re-enters
+    /// `on_get_promo_data`.
+    GetPromoData,
+    /// `HidePromoDataQuery` (cpp:58) — the result is dropped; the error
+    /// ladder's `on_get_dialog_error` keys on the request dialog.
+    HidePromoData {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+}
+
+/// The cloned promo dispatch surface the [`TdSponsoredEnv`] senders use
+/// — the answers drain through [`Td::on_promo_net_answer`].
+type PromoNetHandle = NetKindHandle<PromoNetKind>;
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -3607,6 +3625,9 @@ pub struct Td {
     /// The callback-parked CountryInfoManager query answers, parked by
     /// kind (the `Td::on_country_net_answer` drain).
     country_net_completed: Arc<Mutex<Vec<(CountryNetKind, NetQuery)>>>,
+    /// The callback-parked PromoDataManager query answers, parked by
+    /// kind (the `Td::on_promo_net_answer` drain).
+    promo_net_completed: Arc<Mutex<Vec<(PromoNetKind, NetQuery)>>>,
     /// The parked `String` promises — the `help.getNearestDc` lot.
     nearest_dc_promises: Vec<Promise<String>>,
     /// The interned country-list language codes (the
@@ -4037,6 +4058,7 @@ impl Td {
             support_info_promises: Vec::new(),
             support_name_promises: Vec::new(),
             country_net_completed: Arc::new(Mutex::new(Vec::new())),
+            promo_net_completed: Arc::new(Mutex::new(Vec::new())),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -6189,6 +6211,7 @@ impl Td {
         self.dispatch_completed_star_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
+        self.dispatch_completed_promo_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6267,6 +6290,16 @@ impl Td {
         Some(CountryNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.country_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned promo dispatch surface for the [`TdSponsoredEnv`]
+    /// senders — `None` keeps the net-inert posture.
+    fn promo_net(&self) -> Option<PromoNetHandle> {
+        Some(PromoNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.promo_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7362,6 +7395,62 @@ impl Td {
             self.on_country_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked PromoDataManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves
+    /// (PromoDataManager.cpp:31-86).
+    fn dispatch_completed_promo_net(&mut self) {
+        let completed = std::mem::take(&mut *self.promo_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_promo_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one PromoDataManager net answer by kind (the C++ query
+    /// handler halves of PromoDataManager.cpp:31-86).
+    fn on_promo_net_answer(&mut self, kind: PromoNetKind, query: NetQuery) {
+        match kind {
+            // `GetPromoDataQuery` (cpp:31-56) — the answer re-enters
+            // `on_get_promo_data` (the C++ promise lambda hop; the
+            // dummy bit stays false — the real query form).
+            PromoNetKind::GetPromoData => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::help_PromoData::parse(query.ok()) {
+                        Ok(promo_data) => tdutils::status::Result::Ok(promo_data),
+                        Err(_) => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the help_getPromoData answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.promo_data_manager);
+                let mut env = TdSponsoredEnv { td: &mut *self };
+                manager.on_get_promo_data(&mut env, result, false);
+                self.promo_data_manager = manager;
+            }
+            // `HidePromoDataQuery` (cpp:58-86) — the ok result is
+            // dropped ("we are not interested in the result"); the error
+            // ladder runs `on_get_dialog_error` and logs when both
+            // bands miss.
+            PromoNetKind::HidePromoData { dialog_id } => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let handled = crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        dialog_id,
+                        &status,
+                        "HidePromoDataQuery",
+                    );
+                    if !handled && !self.global.is_expected_error(&status) {
+                        tdutils::log_error!("Receive error for sponsored chat hiding: {status}");
+                    }
+                }
+            }
+        }
     }
 
     /// Route one CountryInfoManager net answer by kind (the C++ query
@@ -9591,8 +9680,9 @@ impl Td {
         // `td_->promo_data_manager_->init()` (PromoDataManager.cpp:105-107,
         // the Td.cpp:1246 constructor position) — idempotent.
         {
-            let (mut promo_env, promo_data_manager) = promo_env_split(self);
+            let (mut promo_data_manager, mut promo_env) = promo_env_split(self);
             promo_data_manager.init(&mut promo_env);
+            self.promo_data_manager = promo_data_manager;
         }
 
         // `td_->reaction_manager_->init()` (AuthManager.cpp:1549, after
@@ -13252,12 +13342,14 @@ impl Actor for Td {
         // (M.26): the C++ MultiTimeout callbacks collapse into
         // `tick_timeouts`.
         {
-            let (mut sponsored_env, sponsored_message_manager) = sponsored_env_split(self);
+            let (mut sponsored_message_manager, mut sponsored_env) = sponsored_env_split(self);
             sponsored_message_manager.tick_timeouts(&mut sponsored_env);
+            self.sponsored_message_manager = sponsored_message_manager;
         }
         {
-            let (mut promo_env, promo_data_manager) = promo_env_split(self);
+            let (mut promo_data_manager, mut promo_env) = promo_env_split(self);
             promo_data_manager.tick_timeouts(&mut promo_env);
+            self.promo_data_manager = promo_data_manager;
         }
 
         // The TopDialogManager timeout sweep (M.27).
@@ -16892,13 +16984,15 @@ impl crate::connection_creator::ConnectionCreatorEnv for ConnectionEnv<'_> {
     }
 
     fn remove_sponsored_dialog(&mut self) {
-        let (mut promo_env, promo_data_manager) = promo_env_split(self.td);
+        let (mut promo_data_manager, mut promo_env) = promo_env_split(self.td);
         promo_data_manager.remove_sponsored_dialog(&mut promo_env);
+        self.td.promo_data_manager = promo_data_manager;
     }
 
     fn reload_promo_data(&mut self) {
-        let (mut promo_env, promo_data_manager) = promo_env_split(self.td);
+        let (mut promo_data_manager, mut promo_env) = promo_env_split(self.td);
         promo_data_manager.reload_promo_data(&mut promo_env);
+        self.td.promo_data_manager = promo_data_manager;
     }
 
     fn update_mtproto_header(&mut self, _proxy: Option<&crate::connection_creator::Proxy>) {
@@ -21177,124 +21271,52 @@ impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> 
     }
 }
 
-/// Field-split the `Td` for the sponsored/promo/import manager calls.
 pub(crate) fn sponsored_env_split(
     td: &mut Td,
 ) -> (
+    crate::sponsored_message_manager::SponsoredMessageManager,
     TdSponsoredEnv<'_>,
-    &mut crate::sponsored_message_manager::SponsoredMessageManager,
 ) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        file_manager,
-        sponsored_message_manager,
-        sponsored_updates,
-        ..
-    } = td;
-    (
-        TdSponsoredEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-            file_manager: file_manager.clone(),
-            updates: sponsored_updates,
-        },
-        sponsored_message_manager,
-    )
+    let manager = std::mem::take(&mut td.sponsored_message_manager);
+    let env = TdSponsoredEnv { td: &mut *td };
+    (manager, env)
 }
 
 pub(crate) fn message_import_env_split(
     td: &mut Td,
 ) -> (
+    crate::message_import_manager::MessageImportManager,
     TdSponsoredEnv<'_>,
-    &mut crate::message_import_manager::MessageImportManager,
 ) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        file_manager,
-        message_import_manager,
-        sponsored_updates,
-        ..
-    } = td;
-    (
-        TdSponsoredEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-            file_manager: file_manager.clone(),
-            updates: sponsored_updates,
-        },
-        message_import_manager,
-    )
+    let manager = std::mem::take(&mut td.message_import_manager);
+    let env = TdSponsoredEnv { td: &mut *td };
+    (manager, env)
 }
 
 pub(crate) fn promo_env_split(
     td: &mut Td,
 ) -> (
+    crate::promo_data_manager::PromoDataManager,
     TdSponsoredEnv<'_>,
-    &mut crate::promo_data_manager::PromoDataManager,
 ) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        file_manager,
-        promo_data_manager,
-        sponsored_updates,
-        ..
-    } = td;
-    (
-        TdSponsoredEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-            file_manager: file_manager.clone(),
-            updates: sponsored_updates,
-        },
-        promo_data_manager,
-    )
+    let manager = std::mem::take(&mut td.promo_data_manager);
+    let env = TdSponsoredEnv { td: &mut *td };
+    (manager, env)
 }
 
 /// The `G()`/manager slice of the collapsed SponsoredMessageManager +
-/// PromoDataManager + MessageImportManager trio (M.26).
+/// PromoDataManager + MessageImportManager trio (M.26) — the whole-Td
+/// shape (the `star_env_split` convention): the manager is always
+/// `std::mem::take`n out for the call, so the env may hold the full
+/// `&mut Td` (the net senders reach the dispatcher and the dialog peer
+/// resolver).
 pub(crate) struct TdSponsoredEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    /// `None` once the option manager is torn down; the getters answer
-    /// their defaults on the destroy path.
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) auth_is_authorized: bool,
-    pub(crate) auth_is_bot: bool,
-    pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) chat_manager: &'a mut ChatManager,
-    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
-    // the shared sponsored outbox (drained by flush_user_updates); the
-    // promo/sponsored update fan-outs are the [blocked: net] intakes
-    #[allow(dead_code)]
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) td: &'a mut Td,
 }
 
 impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsoredEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn now(&self) -> f64 {
@@ -21302,37 +21324,41 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
     }
 
     fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_boolean(name, default_value)
-        })
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_boolean(name, default_value)
+            })
     }
 
     fn get_my_sponsored_enabled(&self) -> bool {
-        self.user_manager.get_my_sponsored_enabled()
+        self.td.user_manager.get_my_sponsored_enabled()
     }
 
     fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &'static str) {
-        let options = self.options.as_mut();
+        let options = self.td.option_manager.as_mut();
         if let Some(options) = options {
             let mut env = UserEnv {
-                global: &mut *self.global,
+                global: &mut self.td.global,
                 options,
-                auth_is_bot: self.auth_is_bot,
+                auth_is_bot: self.td.auth_manager.is_bot(),
             };
-            self.user_manager.on_get_users(&mut env, users, source);
+            self.td.user_manager.on_get_users(&mut env, users, source);
         }
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
-        let options = self.options.as_mut();
+        let options = self.td.option_manager.as_mut();
         if let Some(options) = options {
             let mut env = UserEnv {
-                global: &mut *self.global,
+                global: &mut self.td.global,
                 options,
-                auth_is_bot: self.auth_is_bot,
+                auth_is_bot: self.td.auth_manager.is_bot(),
             };
-            self.chat_manager
-                .on_get_chats(self.user_manager, &mut env, chats, source);
+            self.td
+                .chat_manager
+                .on_get_chats(&mut self.td.user_manager, &mut env, chats, source);
         }
     }
 
@@ -21341,7 +21367,7 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
         dialog_id: crate::dialog_id::DialogId,
         _source: &'static str,
     ) -> tdutils::status::Result<()> {
-        if !have_dialog_info_of(self.user_manager, dialog_id) {
+        if !have_dialog_info_of(&self.td.user_manager, dialog_id) {
             if !dialog_id.is_valid() {
                 return tdutils::status::Result::from_status(tdutils::status::Status::error(
                     400,
@@ -21357,7 +21383,7 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
     }
 
     fn have_dialog_info(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
-        have_dialog_info_of(self.user_manager, dialog_id)
+        have_dialog_info_of(&self.td.user_manager, dialog_id)
     }
 
     fn force_create_dialog(
@@ -21485,15 +21511,15 @@ fn have_dialog_info_of(user_manager: &UserManager, dialog_id: crate::dialog_id::
 
 impl crate::promo_data_manager::PromoDataManagerEnv for TdSponsoredEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn auth_is_authorized(&self) -> bool {
-        self.auth_is_authorized
+        self.td.auth_manager.is_authorized()
     }
 
     fn auth_is_bot(&self) -> bool {
-        self.auth_is_bot
+        self.td.auth_manager.is_bot()
     }
 
     fn now(&self) -> f64 {
@@ -21501,49 +21527,53 @@ impl crate::promo_data_manager::PromoDataManagerEnv for TdSponsoredEnv<'_> {
     }
 
     fn unix_time(&self) -> i32 {
-        self.global.unix_time()
+        self.td.global.unix_time()
     }
 
     fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_integer(name, default_value)
-        })
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_integer(name, default_value)
+            })
     }
 
     fn set_option_boolean(&mut self, name: &str, value: bool) {
-        if let Some(options) = self.options.as_mut() {
+        if let Some(options) = self.td.option_manager.as_mut() {
             options.set_option_boolean(name, value);
         }
     }
 
     fn set_option_empty(&mut self, name: &str) {
-        if let Some(options) = self.options.as_mut() {
+        if let Some(options) = self.td.option_manager.as_mut() {
             options.set_option_empty(name);
         }
     }
 
     fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &'static str) {
-        let options = self.options.as_mut();
+        let options = self.td.option_manager.as_mut();
         if let Some(options) = options {
             let mut env = UserEnv {
-                global: &mut *self.global,
+                global: &mut self.td.global,
                 options,
-                auth_is_bot: self.auth_is_bot,
+                auth_is_bot: self.td.auth_manager.is_bot(),
             };
-            self.user_manager.on_get_users(&mut env, users, source);
+            self.td.user_manager.on_get_users(&mut env, users, source);
         }
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
-        let options = self.options.as_mut();
+        let options = self.td.option_manager.as_mut();
         if let Some(options) = options {
             let mut env = UserEnv {
-                global: &mut *self.global,
+                global: &mut self.td.global,
                 options,
-                auth_is_bot: self.auth_is_bot,
+                auth_is_bot: self.td.auth_manager.is_bot(),
             };
-            self.chat_manager
-                .on_get_chats(self.user_manager, &mut env, chats, source);
+            self.td
+                .chat_manager
+                .on_get_chats(&mut self.td.user_manager, &mut env, chats, source);
         }
     }
 
@@ -21563,17 +21593,43 @@ impl crate::promo_data_manager::PromoDataManagerEnv for TdSponsoredEnv<'_> {
     }
 
     fn send_get_promo_data_query(&mut self) {
-        // [blocked: net]
+        // `GetPromoDataQuery::send` (PromoDataManager.cpp:41-43) — the
+        // answer drains into `on_get_promo_data`.
+        match self.td.promo_net() {
+            Some(net) => net.dispatch(
+                PromoNetKind::GetPromoData,
+                telegram_api::Function::help_getPromoData(telegram_api::help_getPromoData),
+            ),
+            None => tdutils::log_info!("Send help.getPromoData — [net-inert]"),
+        }
     }
 
-    fn send_hide_promo_data_query(&mut self, _dialog_id: crate::dialog_id::DialogId) {
-        // [blocked: net]
+    fn send_hide_promo_data_query(&mut self, dialog_id: crate::dialog_id::DialogId) {
+        // `HidePromoDataQuery::send` (PromoDataManager.cpp:70-78) — the
+        // read-access input peer of the dialog; the None arm just
+        // returns (the C++ `return` band).
+        let Some(net) = self.td.promo_net() else {
+            return tdutils::log_info!("Send help.hidePromoData — [net-inert]");
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return;
+        };
+        net.dispatch(
+            PromoNetKind::HidePromoData { dialog_id },
+            telegram_api::Function::help_hidePromoData(telegram_api::help_hidePromoData {
+                peer: Some(Box::new(peer)),
+            }),
+        );
     }
 }
 
 impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn check_dialog_access(
@@ -21581,7 +21637,7 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         dialog_id: crate::dialog_id::DialogId,
         _source: &str,
     ) -> Result<(), tdutils::status::Status> {
-        if !have_dialog_info_of(self.user_manager, dialog_id) {
+        if !have_dialog_info_of(&self.td.user_manager, dialog_id) {
             if !dialog_id.is_valid() {
                 return Err(tdutils::status::Status::error(
                     400,
@@ -21594,18 +21650,20 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
     }
 
     fn is_user_contact(&self, user_id: UserId) -> bool {
-        self.user_manager.is_user_contact_of(user_id, true)
+        self.td.user_manager.is_user_contact_of(user_id, true)
     }
 
     fn is_broadcast_channel(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
-        self.chat_manager
+        self.td
+            .chat_manager
             .get_channel_type_by_id(dialog_id.get_channel_id())
             == crate::chat_manager::ChannelType::Broadcast
     }
 
     fn can_change_info_and_settings(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
-        self.chat_manager
-            .get_channel_permissions_id(&*self.global, channel_id)
+        self.td
+            .chat_manager
+            .get_channel_permissions_id(&self.td.global, channel_id)
             .can_change_info_and_settings()
     }
 
@@ -21614,7 +21672,7 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         message_file: &td_api::InputFile,
         dialog_id: crate::dialog_id::DialogId,
     ) -> Result<FileId, tdutils::status::Status> {
-        self.file_manager.lock().get_input_file_id(
+        self.td.file_manager.lock().get_input_file_id(
             crate::files::FileType::Document,
             Some(message_file),
             dialog_id,
@@ -28141,6 +28199,95 @@ mod tests {
         );
 
         assert!(td.country_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the promo net slice: the promo-data queries ride the
+    // dispatcher (PromoDataManager.cpp:31-86). ----
+
+    #[test]
+    fn promo_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(promo_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn promo_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-promo");
+
+        // 1. the reload cycle: init schedules the immediate fetch, the
+        //    timeout pump fires the query, the promoData answer
+        //    re-schedules the deadline.
+        {
+            let (mut manager, mut env) = crate::td::promo_env_split(&mut td);
+            manager.init(&mut env);
+            manager.tick_timeouts(&mut env);
+            td.promo_data_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the promo-data fetch");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::help_getPromoData::ID
+        );
+        let mut answer = Vec::new();
+        let expires = td.global.unix_time() + 3600;
+        telegram_api::help_promoData {
+            flags: 0,
+            proxy: false,
+            expires,
+            peer: None,
+            psa_type: String::new(),
+            psa_message: String::new(),
+            pending_suggestions: vec![],
+            dismissed_suggestions: vec![],
+            custom_pending_suggestion: None,
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_promo_net();
+        let deadline_before = td.promo_data_manager.next_deadline();
+        assert!(
+            deadline_before.is_some_and(|deadline| deadline > tdutils::time::now()),
+            "the answer re-armed the expiry deadline"
+        );
+
+        // 2. hide: the read-access self peer rides the query; the ok
+        //    answer is dropped silently.
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        {
+            let (mut manager, mut env) = crate::td::promo_env_split(&mut td);
+            manager.hide_promo_data(
+                &mut env,
+                crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(
+                    700000001,
+                )),
+            );
+            td.promo_data_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::help_hidePromoData::ID
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_promo_net();
+        assert!(td.promo_net_completed.lock().is_empty(), "drained");
     }
 
     type CountriesSlot =

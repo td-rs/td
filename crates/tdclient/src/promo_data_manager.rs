@@ -7,12 +7,13 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`PromoDataManagerEnv`] trait carries the `G()`/option/cross-manager
-//! surfaces, and the two network tails are env seams marked
-//! `[blocked: net]` — `GetPromoDataQuery` (PromoDataManager.cpp:31-56)
-//! and `HidePromoDataQuery` (PromoDataManager.cpp:58-86). The get
-//! answer arrives through [`PromoDataManager::on_get_promo_data`] once
-//! the net step lands (the C++ `PromiseCreator::lambda` hop), so no
-//! promise is parked here.
+//! surfaces, and the two network queries ride the client-side dispatcher
+//! under their `PromoNetKind` (`GetPromoDataQuery`, PromoDataManager.cpp:31-56
+//! and `HidePromoDataQuery`, PromoDataManager.cpp:58-86): the get answer
+//! arrives through [`PromoDataManager::on_get_promo_data`] via
+//! `Td::on_promo_net_answer` (the C++ `PromiseCreator::lambda` hop), so
+//! no promise is parked here; the hide result is dropped and its error
+//! ladder runs `on_get_dialog_error`.
 //!
 //! The C++ actor timeout (`set_timeout_in`, PromoDataManager.cpp:126)
 //! is the single absolute deadline [`PromoDataManager::next_deadline`]
@@ -383,7 +384,7 @@ impl PromoDataManager {
     /// `hide_promo_data` (PromoDataManager.cpp:226-230) — the local half
     /// removes the sponsored dialog at once; the caller is
     /// MessagesManager (MessagesManager.cpp:8771, the M.10 seam) and the
-    /// query tail is [blocked: net].
+    /// query rides the dispatcher.
     pub fn hide_promo_data(&mut self, env: &mut impl PromoDataManagerEnv, dialog_id: DialogId) {
         self.remove_sponsored_dialog(env);
 
