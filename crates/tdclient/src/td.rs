@@ -2797,6 +2797,52 @@ pub(crate) enum AccountNetKind {
 /// the answers drain through [`Td::on_account_net_answer`].
 type AccountNetHandle = NetKindHandle<AccountNetKind>;
 
+/// The StarManager in-flight query kinds — the C++ ResultHandler classes
+/// of StarManager.cpp:49-1400 (the options/subscriptions/revenue
+/// families; the transactions pair lands with its own slice).
+#[derive(Clone, Copy)]
+pub(crate) enum StarNetKind {
+    /// `GetStarsTopupOptionsQuery` (cpp:49).
+    TopupOptions,
+    /// `GetStarsGiftOptionsQuery` (cpp:83).
+    GiftOptions,
+    /// `GetStarsGiveawayOptionsQuery` (cpp:122).
+    GiveawayOptions,
+    /// `GetStarsSubscriptionsQuery` (cpp:1011) — the users/chats intakes
+    /// and the owned-balance update ride the answer.
+    Subscriptions,
+    /// `ChangeStarsSubscriptionQuery` (cpp:1064).
+    ChangeSubscription,
+    /// `BotCancelStarsSubscriptionQuery` (cpp:1082).
+    BotCancelSubscription,
+    /// `FulfillStarsSubscriptionQuery` (cpp:1110).
+    FulfillSubscription,
+    /// `RefundStarsChargeQuery` (cpp:1131) — the Updates answer re-enters
+    /// `on_get_updates` with the popped promise.
+    RefundStarsCharge,
+    /// `GetStarsRevenueStatsQuery` (cpp:1196) — the error ladder's
+    /// `on_get_dialog_error` keys on the request dialog.
+    RevenueStats {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `GetStarsRevenueWithdrawalUrlQuery` (cpp:1237).
+    RevenueWithdrawalUrl {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `GetStarsRevenueAdsAccountUrlQuery` (cpp:1274).
+    RevenueAdsAccountUrl {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `GetGramRevenueStatsQuery` (cpp:1335) — the TON twin.
+    GramRevenueStats,
+    /// `GetPaidMessageRevenueQuery` (cpp:1370).
+    PaidMessageRevenue,
+}
+
+/// The cloned star dispatch surface the [`TdStarEnv`] senders use —
+/// the answers drain through [`Td::on_star_net_answer`].
+type StarNetHandle = NetKindHandle<StarNetKind>;
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -2889,19 +2935,96 @@ fn parse_wire_bool_value(data: &[u8]) -> Option<bool> {
     }
 }
 
+/// `StarSubscription::get_star_subscription_object`
+/// (StarSubscription.cpp:40-69) — the td_api conversion over the
+/// dialog-force/link builders; the photo leg stays the
+/// `[blocked: files]` seam (the object answers `None`).
+fn star_subscription_object(
+    td: &mut Td,
+    subscription: &crate::star_manager::StarSubscription,
+) -> td_api::StarSubscription {
+    use crate::dialog_id::DialogType;
+    let dialog_id = subscription.dialog_id;
+    crate::dialog_manager::force_create_dialog(td, dialog_id, "starSubscription");
+    let mut link_env = TdLinkEnv {
+        global: &mut td.global,
+        options: td.option_manager.as_mut(),
+    };
+    let type_ = match dialog_id.get_type() {
+        DialogType::User => {
+            td_api::StarSubscriptionType::starSubscriptionTypeBot(td_api::starSubscriptionTypeBot {
+                is_canceled_by_bot: subscription.is_bot_canceled,
+                title: subscription.title.clone(),
+                // `get_web_document_photo` — the photo leg stays
+                // [blocked: files]
+                photo: None,
+                invoice_link: crate::link_manager::get_internal_link(
+                    &mut link_env,
+                    Some(&td_api::InternalLinkType::internalLinkTypeInvoice(
+                        td_api::internalLinkTypeInvoice {
+                            invoice_name: subscription.invoice_slug.clone(),
+                        },
+                    )),
+                    false,
+                )
+                .unwrap_or_default(),
+            })
+        }
+        DialogType::Channel => td_api::StarSubscriptionType::starSubscriptionTypeChannel(
+            td_api::starSubscriptionTypeChannel {
+                can_reuse: subscription.can_reuse,
+                invite_link: crate::link_manager::get_dialog_invite_link(
+                    &link_env,
+                    &subscription.invite_hash,
+                    false,
+                ),
+            },
+        ),
+        DialogType::Chat | DialogType::SecretChat | DialogType::None => {
+            if dialog_id.get_type() == DialogType::Chat {
+                tdutils::log_error!("Receive subscription for {dialog_id:?}");
+            }
+            td_api::StarSubscriptionType::starSubscriptionTypeChannel(
+                td_api::starSubscriptionTypeChannel {
+                    can_reuse: false,
+                    invite_link: String::new(),
+                },
+            )
+        }
+    };
+    td_api::StarSubscription {
+        id: subscription.id.clone(),
+        chat_id: dialog_id.get(),
+        expiration_date: subscription.until_date,
+        is_canceled: subscription.is_canceled,
+        is_expiring: subscription.missing_balance,
+        pricing: subscription.pricing.get_star_subscription_pricing_object(),
+        r#type: Some(type_),
+    }
+}
+
 /// `Vector<onrampProviderInfo>` — the `payments_getOnrampProviders`
 /// answer.
 fn parse_onramp_providers(data: &[u8]) -> Option<Vec<telegram_api::OnrampProviderInfo>> {
+    parse_wire_vector(data, telegram_api::OnrampProviderInfo::read)
+}
+
+/// The generic `Vector<T>` answer parse (the bare-element read over the
+/// vector word — the shared shape of the option-list answers).
+fn parse_wire_vector<T>(
+    data: &[u8],
+    read: fn(&mut telegram_api::tl::Reader<'_>) -> Result<T, &'static str>,
+) -> Option<Vec<T>> {
     let mut reader = telegram_api::tl::Reader::new(data);
     if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
         return None;
     }
     let count = reader.i32().ok()? as u32 as usize;
-    let mut providers = Vec::with_capacity(count);
+    let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        providers.push(telegram_api::OnrampProviderInfo::read(&mut reader).ok()?);
+        items.push(read(&mut reader).ok()?);
     }
-    Some(providers)
+    Some(items)
 }
 
 /// `Vector<string>` — the `payments_getOnrampBaseCurrencies` answer.
@@ -3421,6 +3544,9 @@ pub struct Td {
     /// The callback-parked AccountManager query answers, parked by kind
     /// (the `Td::on_account_net_answer` drain).
     account_net_completed: Arc<Mutex<Vec<(AccountNetKind, NetQuery)>>>,
+    /// The callback-parked StarManager query answers, parked by kind (the
+    /// `Td::on_star_net_answer` drain).
+    star_net_completed: Arc<Mutex<Vec<(StarNetKind, NetQuery)>>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -3840,6 +3966,7 @@ impl Td {
             ton_wallet_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_net_completed: Arc::new(Mutex::new(Vec::new())),
             account_net_completed: Arc::new(Mutex::new(Vec::new())),
+            star_net_completed: Arc::new(Mutex::new(Vec::new())),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -4778,8 +4905,9 @@ impl Td {
         // updateOwnedStarCount/updateOwnedGramCount ride the star
         // updates outbox.
         {
-            let (mut env, manager) = crate::td::star_env_split(self);
+            let (mut manager, mut env) = crate::td::star_env_split(self);
             manager.start_up(&mut env);
+            self.star_manager = manager;
         }
 
         // `make_unique<PeopleNearbyManager>` (Td.cpp:1258, the
@@ -5986,6 +6114,7 @@ impl Td {
         self.dispatch_completed_ton_wallet_net();
         self.dispatch_completed_community_net();
         self.dispatch_completed_account_net();
+        self.dispatch_completed_star_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6034,6 +6163,16 @@ impl Td {
         Some(AccountNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.account_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned star dispatch surface for the [`TdStarEnv`] senders —
+    /// `None` keeps the net-inert posture (the pre-init windows).
+    pub(crate) fn star_net(&self) -> Option<StarNetHandle> {
+        Some(StarNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.star_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7099,6 +7238,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked StarManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves (StarManager.cpp:
+    /// 49-1400).
+    fn dispatch_completed_star_net(&mut self) {
+        let completed = std::mem::take(&mut *self.star_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_star_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Route one CommunityManager net answer by kind (the C++ query
     /// handler halves of CommunityManager.cpp:48-260).
     fn on_community_net_answer(&mut self, kind: CommunityNetKind, query: NetQuery) {
@@ -7710,6 +7860,424 @@ impl Td {
                         500,
                         &format!("Failed to parse the {what} answer"),
                     ));
+                }
+            }
+        }
+    }
+
+    /// Route one StarManager net answer by kind (the C++ query handler
+    /// halves of StarManager.cpp:49-1400).
+    fn on_star_net_answer(&mut self, kind: StarNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetStarsTopupOptionsQuery` (cpp:49-73) and
+            // `GetStarsGiftOptionsQuery` (cpp:83-104) — the shared
+            // star_payment_options lot; the Vector<starsTopupOption/
+            // starsGiftOption> answers convert over get_star_count.
+            StarNetKind::TopupOptions | StarNetKind::GiftOptions => {
+                let promise = self
+                    .star_manager
+                    .take_pending(|p| &mut p.star_payment_options);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let options = match kind {
+                    StarNetKind::TopupOptions => {
+                        parse_wire_vector(query.ok(), telegram_api::StarsTopupOption::read).map(
+                            |options| {
+                                options
+                                    .into_iter()
+                                    .map(|option| td_api::StarPaymentOption {
+                                        currency: option.currency,
+                                        amount: option.amount,
+                                        star_count: crate::star_manager::get_star_count(
+                                            option.stars,
+                                            false,
+                                        ),
+                                        store_product_id: option.store_product,
+                                        is_additional: option.extended,
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                    }
+                    _ => parse_wire_vector(query.ok(), telegram_api::StarsGiftOption::read).map(
+                        |options| {
+                            options
+                                .into_iter()
+                                .map(|option| td_api::StarPaymentOption {
+                                    currency: option.currency,
+                                    amount: option.amount,
+                                    star_count: crate::star_manager::get_star_count(
+                                        option.stars,
+                                        false,
+                                    ),
+                                    store_product_id: option.store_product,
+                                    is_additional: option.extended,
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    ),
+                };
+                match options {
+                    Some(options) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(td_api::StarPaymentOptions { options });
+                        }
+                    }
+                    None => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("star payment options"));
+                        }
+                    }
+                }
+            }
+            // `GetStarsGiveawayOptionsQuery` (cpp:122-149) — the winner
+            // options nest under each option.
+            StarNetKind::GiveawayOptions => {
+                let promise = self
+                    .star_manager
+                    .take_pending(|p| &mut p.star_giveaway_payment_options);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match parse_wire_vector(query.ok(), telegram_api::StarsGiveawayOption::read) {
+                    Some(results) => {
+                        let options = results
+                            .into_iter()
+                            .map(|result| td_api::StarGiveawayPaymentOption {
+                                currency: result.currency,
+                                amount: result.amount,
+                                star_count: crate::star_manager::get_star_count(
+                                    result.stars,
+                                    false,
+                                ),
+                                store_product_id: result.store_product,
+                                yearly_boost_count: result.yearly_boosts,
+                                winner_options: result
+                                    .winners
+                                    .into_iter()
+                                    .map(|winner| td_api::StarGiveawayWinnerOption {
+                                        winner_count: winner.users,
+                                        won_star_count: crate::star_manager::get_star_count(
+                                            winner.per_user_stars,
+                                            false,
+                                        ),
+                                        is_default: winner.default,
+                                    })
+                                    .collect(),
+                                is_default: result.default,
+                                is_additional: result.extended,
+                            })
+                            .collect();
+                        if let Some(mut promise) = promise {
+                            promise.set_value(td_api::StarGiveawayPaymentOptions { options });
+                        }
+                    }
+                    None => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("payments_getStarsGiveawayOptions"));
+                        }
+                    }
+                }
+            }
+            // `GetStarsSubscriptionsQuery` (cpp:1011-1052) — the
+            // users/chats intakes, the StarSubscription conversions and
+            // the owned-balance update.
+            StarNetKind::Subscriptions => {
+                let promise = self
+                    .star_manager
+                    .take_pending(|p| &mut p.star_subscriptions);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let Ok(result) = telegram_api::payments_StarsStatus::parse(query.ok()) else {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(parse_error("payments_getStarsSubscriptions"));
+                    }
+                    return;
+                };
+                {
+                    let mut env = UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("star answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    };
+                    self.user_manager.on_get_users(
+                        &mut env,
+                        result.users.clone(),
+                        "GetStarsSubscriptionsQuery",
+                    );
+                }
+                self.intake_chats(result.chats.clone(), "GetStarsSubscriptionsQuery");
+                if !matches!(
+                    result.balance,
+                    Some(telegram_api::StarsAmount::starsAmount(_))
+                ) {
+                    tdutils::log_error!("Receive an invalid starsStatus balance");
+                    if let Some(mut promise) = promise {
+                        promise.set_error(Status::error(500, "Receive invalid response"));
+                    }
+                    return;
+                }
+                let wire_subscriptions = result.subscriptions;
+                let mut subscriptions = Vec::with_capacity(wire_subscriptions.len());
+                for wire in wire_subscriptions {
+                    let subscription = crate::star_manager::StarSubscription::new(wire);
+                    if !subscription.is_valid() {
+                        tdutils::log_error!("Receive an invalid star subscription");
+                    } else {
+                        subscriptions.push(star_subscription_object(self, &subscription));
+                    }
+                }
+                let star_amount =
+                    crate::message_content::StarAmount::from_wire(result.balance.as_ref(), true);
+                {
+                    let mut manager = std::mem::take(&mut self.star_manager);
+                    let mut env = TdStarEnv { td: &mut *self };
+                    manager.on_update_owned_star_amount(&mut env, star_amount);
+                    self.star_manager = manager;
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(td_api::StarSubscriptions {
+                        star_amount: Some(star_amount.get_star_amount_object()),
+                        subscriptions,
+                        required_star_count: crate::star_manager::get_star_count(
+                            result.subscriptions_missing_balance,
+                            false,
+                        ),
+                        next_offset: result.subscriptions_next_offset,
+                    });
+                }
+            }
+            // `ChangeStarsSubscriptionQuery` (cpp:1064-1080),
+            // `BotCancelStarsSubscriptionQuery` (cpp:1082-1108) and
+            // `FulfillStarsSubscriptionQuery` (cpp:1110-1128) — the Bool
+            // answers over the shared units lot (no warn band).
+            StarNetKind::ChangeSubscription
+            | StarNetKind::BotCancelSubscription
+            | StarNetKind::FulfillSubscription => {
+                if let Some(mut promise) = self.star_manager.take_pending(|p| &mut p.units) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else if parse_wire_bool_value(query.ok()).is_some() {
+                        promise.set_value(());
+                    } else {
+                        promise.set_error(parse_error("the stars subscription answer"));
+                    }
+                }
+            }
+            // `RefundStarsChargeQuery` (cpp:1131-1155) — the Updates
+            // answer re-enters `on_get_updates` with the popped promise.
+            StarNetKind::RefundStarsCharge => {
+                if let Some(mut promise) = self.star_manager.take_pending(|p| &mut p.units) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => promise.set_error(parse_error("payments_refundStarsCharge")),
+                        }
+                    }
+                }
+            }
+            // `GetStarsRevenueStatsQuery` (cpp:1196-1228) — the graph,
+            // the status conversion and the usd-rate clamp.
+            StarNetKind::RevenueStats { dialog_id } => {
+                let promise = self
+                    .star_manager
+                    .take_pending(|p| &mut p.star_revenue_statistics);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        dialog_id,
+                        &status,
+                        "GetStarsRevenueStatsQuery",
+                    );
+                    if let Some(mut promise) = promise {
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                match telegram_api::payments_StarsRevenueStats::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(mut promise) = promise {
+                            let status = ptr
+                                .status
+                                .as_ref()
+                                .map(|status| {
+                                    crate::star_manager::convert_stars_revenue_status(
+                                        status,
+                                        self.global.unix_time(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            promise.set_value(td_api::StarRevenueStatistics {
+                                revenue_by_day_graph: Some(
+                                    ptr.revenue_graph
+                                        .as_ref()
+                                        .map(crate::statistics_manager::convert_stats_graph)
+                                        .unwrap_or(td_api::StatisticalGraph::statisticalGraphData(
+                                            td_api::statisticalGraphData {
+                                                json_data: String::new(),
+                                                zoom_token: String::new(),
+                                            },
+                                        )),
+                                ),
+                                status: Some(status),
+                                usd_rate: if ptr.usd_rate > 0.0 {
+                                    (ptr.usd_rate * 1e2).clamp(1e-18, 1e18)
+                                } else {
+                                    1.3
+                                },
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("payments_getStarsRevenueStats"));
+                        }
+                    }
+                }
+            }
+            // `GetGramRevenueStatsQuery` (cpp:1335-1368) — the TON twin
+            // with its own rate bands.
+            StarNetKind::GramRevenueStats => {
+                let promise = self
+                    .star_manager
+                    .take_pending(|p| &mut p.gram_revenue_statistics);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::payments_StarsRevenueStats::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(mut promise) = promise {
+                            let status = ptr
+                                .status
+                                .as_ref()
+                                .map(crate::star_manager::convert_gram_revenue_status)
+                                .unwrap_or_default();
+                            promise.set_value(td_api::GramRevenueStatistics {
+                                revenue_by_day_graph: Some(
+                                    ptr.revenue_graph
+                                        .as_ref()
+                                        .map(crate::statistics_manager::convert_stats_graph)
+                                        .unwrap_or(td_api::StatisticalGraph::statisticalGraphData(
+                                            td_api::statisticalGraphData {
+                                                json_data: String::new(),
+                                                zoom_token: String::new(),
+                                            },
+                                        )),
+                                ),
+                                status: Some(status),
+                                usd_rate: if ptr.usd_rate > 0.0 {
+                                    (ptr.usd_rate * 1e-7).clamp(1e-18, 1e18)
+                                } else {
+                                    3e-7
+                                },
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("payments_getStarsRevenueStats"));
+                        }
+                    }
+                }
+            }
+            // `GetStarsRevenueWithdrawalUrlQuery` (cpp:1237-1269) and
+            // `GetStarsRevenueAdsAccountUrlQuery` (cpp:1274-1313) — the
+            // shared urls lot.
+            StarNetKind::RevenueWithdrawalUrl { dialog_id }
+            | StarNetKind::RevenueAdsAccountUrl { dialog_id } => {
+                let promise = self.star_manager.take_pending(|p| &mut p.urls);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let source = match kind {
+                        StarNetKind::RevenueWithdrawalUrl { .. } => {
+                            "GetStarsRevenueWithdrawalUrlQuery"
+                        }
+                        _ => "GetStarsRevenueAdsAccountUrlQuery",
+                    };
+                    crate::dialog_manager::on_get_dialog_error(self, dialog_id, &status, source);
+                    if let Some(mut promise) = promise {
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let url = match kind {
+                    StarNetKind::RevenueWithdrawalUrl { .. } => {
+                        telegram_api::payments_StarsRevenueWithdrawalUrl::parse(query.ok())
+                            .ok()
+                            .map(|ptr| ptr.url)
+                    }
+                    _ => telegram_api::payments_StarsRevenueAdsAccountUrl::parse(query.ok())
+                        .ok()
+                        .map(|ptr| ptr.url),
+                };
+                match url {
+                    Some(url) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(url);
+                        }
+                    }
+                    None => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("the stars revenue url answer"));
+                        }
+                    }
+                }
+            }
+            // `GetPaidMessageRevenueQuery` (cpp:1370-1398).
+            StarNetKind::PaidMessageRevenue => {
+                let promise = self
+                    .star_manager
+                    .take_pending(|p| &mut p.paid_message_revenue);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::account_PaidMessagesRevenue::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(td_api::StarCount {
+                                star_count: crate::star_manager::get_star_count(
+                                    ptr.stars_amount,
+                                    false,
+                                ),
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("account_getPaidMessagesRevenue"));
+                        }
+                    }
                 }
             }
         }
@@ -22313,31 +22881,10 @@ impl crate::dialog_invite_link_manager::DialogInviteLinkManagerEnv for TdDialogI
     }
 }
 
-pub(crate) fn star_env_split(
-    td: &mut Td,
-) -> (TdStarEnv<'_>, &mut crate::star_manager::StarManager) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        star_manager,
-        star_updates,
-        ..
-    } = td;
-    (
-        TdStarEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-            updates: star_updates,
-        },
-        star_manager,
-    )
+pub(crate) fn star_env_split(td: &mut Td) -> (crate::star_manager::StarManager, TdStarEnv<'_>) {
+    let manager = std::mem::take(&mut td.star_manager);
+    let env = TdStarEnv { td: &mut *td };
+    (manager, env)
 }
 /// The `Td`-level [`MmRequestContext`] — the request-plane surface the
 /// M.mmreq methods read. The landed manager tails run for real (the
@@ -22576,34 +23123,26 @@ impl crate::messages_manager::MmRequestContext for Td {
 }
 
 /// The `G()`/`td_` slice [`crate::star_manager::StarManager`] reads
-/// through (the M.star env split; the StickersManager/PasswordManager
-/// halves keep their trait defaults — the C++ chains collapse at the
-/// seams, see the star_manager module header).
+/// through (the M.star env split, the whole-Td `TonWalletEnv` convention
+/// — the manager is always `std::mem::take`n out for the call; the
+/// StickersManager/PasswordManager halves keep their trait defaults —
+/// the C++ chains collapse at the seams, see the star_manager module
+/// header).
 pub(crate) struct TdStarEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    /// `None` once the option manager is torn down; the getters answer
-    /// their defaults like the other envs.
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) auth_is_authorized: bool,
-    pub(crate) auth_is_bot: bool,
-    pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
-    /// The `Td::send_update` outbox, drained by
-    /// [`Td::flush_user_updates`].
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) td: &'a mut Td,
 }
 
 impl crate::star_manager::StarManagerEnv for TdStarEnv<'_> {
     fn is_authorized(&self) -> bool {
-        self.auth_is_authorized
+        self.td.auth_manager.is_authorized()
     }
 
     fn is_bot(&self) -> bool {
-        self.auth_is_bot
+        self.td.auth_manager.is_bot()
     }
 
     fn close_status(&self) -> tdutils::status::Status {
-        if self.global.close_flag() {
+        if self.td.global.close_flag() {
             Status::error(500, "Request aborted")
         } else {
             tdutils::status::Status::ok()
@@ -22611,18 +23150,18 @@ impl crate::star_manager::StarManagerEnv for TdStarEnv<'_> {
     }
 
     fn my_user_id(&self) -> UserId {
-        self.user_manager.get_my_id()
+        self.td.user_manager.get_my_id()
     }
 
     fn my_dialog_id(&self) -> crate::dialog_id::DialogId {
-        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+        crate::dialog_id::DialogId::from_user_id(self.td.user_manager.get_my_id())
     }
 
     fn get_bot_data(
         &mut self,
         user_id: UserId,
     ) -> tdutils::status::Result<crate::user_manager::BotData> {
-        match self.user_manager.get_bot_data(user_id) {
+        match self.td.user_manager.get_bot_data(user_id) {
             Ok(bot_data) => tdutils::status::Result::Ok(bot_data),
             Err(status) => tdutils::status::Result::from_status(status),
         }
@@ -22632,37 +23171,346 @@ impl crate::star_manager::StarManagerEnv for TdStarEnv<'_> {
         &mut self,
         channel_id: crate::chat_manager::ChannelId,
     ) -> crate::chat_manager::DialogParticipantStatus {
-        self.chat_manager.get_channel_status(channel_id)
+        self.td.chat_manager.get_channel_status(channel_id)
     }
 
     fn get_input_user(
         &mut self,
         user_id: UserId,
     ) -> tdutils::status::Result<tdmtproto::telegram_api::InputUser> {
-        let Some(options) = self.options.as_deref_mut() else {
+        let Some(options) = self.td.option_manager.as_mut() else {
             return tdutils::status::Result::from_status(tdutils::status::Status::error(
                 500,
                 "Client is closing",
             ));
         };
         let env = crate::user_manager::UserEnv {
-            global: self.global,
+            global: &mut self.td.global,
             options,
-            auth_is_bot: self.auth_is_bot,
+            auth_is_bot: self.td.auth_manager.is_bot(),
         };
-        self.user_manager.get_input_user(&env, user_id).into()
+        self.td.user_manager.get_input_user(&env, user_id).into()
     }
 
     fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.binlog_pmc().get_raw(key)
+        self.td.global.binlog_pmc().get_raw(key)
     }
 
     fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.binlog_pmc().set_raw(key, value);
+        self.td.global.binlog_pmc().set_raw(key, value);
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.star_updates.push(update);
+    }
+
+    // ---- The net query senders — the C++ ResultHandler send legs
+    // (StarManager.cpp:49-1400). The peer-carrying sends resolve their
+    // write-access input peer here (the C++ send legs). ----
+
+    /// `GetStarsTopupOptionsQuery::send` (cpp:56-58).
+    fn send_get_star_payment_options_query(&mut self) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::TopupOptions,
+                telegram_api::Function::payments_getStarsTopupOptions(
+                    telegram_api::payments_getStarsTopupOptions,
+                ),
+            ),
+            None => tdutils::log_info!("Send payments.getStarsTopupOptions — [net-inert]"),
+        }
+    }
+
+    /// `GetStarsGiftOptionsQuery::send` (cpp:94-101).
+    fn send_get_star_gift_payment_options_query(
+        &mut self,
+        input_user: Option<telegram_api::InputUser>,
+    ) {
+        match self.td.star_net() {
+            Some(net) => {
+                let flags = input_user.is_some() as i32;
+                net.dispatch(
+                    StarNetKind::GiftOptions,
+                    telegram_api::Function::payments_getStarsGiftOptions(
+                        telegram_api::payments_getStarsGiftOptions {
+                            flags,
+                            user_id: input_user,
+                        },
+                    ),
+                )
+            }
+            None => tdutils::log_info!("Send payments.getStarsGiftOptions — [net-inert]"),
+        }
+    }
+
+    /// `GetStarsGiveawayOptionsQuery::send` (cpp:127-129).
+    fn send_get_star_giveaway_payment_options_query(&mut self) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::GiveawayOptions,
+                telegram_api::Function::payments_getStarsGiveawayOptions(
+                    telegram_api::payments_getStarsGiveawayOptions,
+                ),
+            ),
+            None => tdutils::log_info!("Send payments.getStarsGiveawayOptions — [net-inert]"),
+        }
+    }
+
+    /// `GetStarsSubscriptionsQuery::send` (cpp:1024-1027) — the
+    /// positional shape of the pinned scheme (the flags word stays 0, so
+    /// the second field never serializes).
+    fn send_get_star_subscriptions_query(&mut self, only_expiring: bool, offset: String) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::Subscriptions,
+                telegram_api::Function::payments_getStarsSubscriptions(
+                    telegram_api::payments_getStarsSubscriptions {
+                        flags: 0,
+                        missing_balance: only_expiring,
+                        peer: Some(Box::new(telegram_api::InputPeer::inputPeerSelf(
+                            telegram_api::inputPeerSelf,
+                        ))),
+                        offset,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.getStarsSubscriptions — [net-inert]");
+                let _ = only_expiring;
+            }
+        }
+    }
+
+    /// `ChangeStarsSubscriptionQuery::send` (cpp:1040-1043) — the
+    /// CANCELED_MASK flag.
+    fn send_change_star_subscription_query(&mut self, subscription_id: String, is_canceled: bool) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::ChangeSubscription,
+                telegram_api::Function::payments_changeStarsSubscription(
+                    telegram_api::payments_changeStarsSubscription {
+                        flags: 1,
+                        peer: Some(Box::new(telegram_api::InputPeer::inputPeerSelf(
+                            telegram_api::inputPeerSelf,
+                        ))),
+                        subscription_id,
+                        canceled: is_canceled,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.changeStarsSubscription — [net-inert]");
+                let _ = is_canceled;
+            }
+        }
+    }
+
+    /// `BotCancelStarsSubscriptionQuery::send` (cpp:1098-1101) — the
+    /// RESTORE flag inverts with is_canceled.
+    fn send_bot_cancel_star_subscription_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        telegram_payment_charge_id: String,
+        is_canceled: bool,
+    ) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::BotCancelSubscription,
+                telegram_api::Function::payments_botCancelStarsSubscription(
+                    telegram_api::payments_botCancelStarsSubscription {
+                        flags: (!is_canceled) as i32,
+                        restore: !is_canceled,
+                        user_id: Some(input_user),
+                        charge_id: telegram_payment_charge_id,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.botCancelStarsSubscription — [net-inert]")
+            }
+        }
+    }
+
+    /// `FulfillStarsSubscriptionQuery::send` (cpp:1124-1127).
+    fn send_fulfill_star_subscription_query(&mut self, subscription_id: String) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::FulfillSubscription,
+                telegram_api::Function::payments_fulfillStarsSubscription(
+                    telegram_api::payments_fulfillStarsSubscription {
+                        peer: Some(Box::new(telegram_api::InputPeer::inputPeerSelf(
+                            telegram_api::inputPeerSelf,
+                        ))),
+                        subscription_id,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send payments.fulfillStarsSubscription — [net-inert]"),
+        }
+    }
+
+    /// `RefundStarsChargeQuery::send` (cpp:1145-1147).
+    fn send_refund_star_charge_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        telegram_payment_charge_id: String,
+    ) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::RefundStarsCharge,
+                telegram_api::Function::payments_refundStarsCharge(
+                    telegram_api::payments_refundStarsCharge {
+                        user_id: Some(input_user),
+                        charge_id: telegram_payment_charge_id,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send payments.refundStarsCharge — [net-inert]"),
+        }
+    }
+
+    /// `GetStarsRevenueStatsQuery::send` (cpp:1211-1219) — the
+    /// write-access input peer of the dialog.
+    fn send_get_star_revenue_stats_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        is_dark: bool,
+    ) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsRevenueStats — [net-inert]");
+        };
+        // `DialogManager::get_input_peer(dialog_id, Write)` — the None
+        // arm answers the query family error.
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            tdutils::log_info!("GetStarsRevenueStatsQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        net.dispatch(
+            StarNetKind::RevenueStats { dialog_id },
+            telegram_api::Function::payments_getStarsRevenueStats(
+                telegram_api::payments_getStarsRevenueStats {
+                    flags: is_dark as i32,
+                    dark: is_dark,
+                    ton: false,
+                    peer: Some(Box::new(peer)),
+                },
+            ),
+        );
+    }
+
+    /// `GetStarsRevenueWithdrawalUrlQuery::send` (cpp:1255-1266).
+    fn send_get_stars_revenue_withdrawal_url_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        is_ton: bool,
+        amount: i64,
+        input_check_password: telegram_api::InputCheckPasswordSRP,
+    ) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsRevenueWithdrawalUrl — [net-inert]");
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            tdutils::log_info!(
+                "GetStarsRevenueWithdrawalUrlQuery — no input peer for {dialog_id:?}"
+            );
+            return;
+        };
+        // the AMOUNT_MASK flag word (the ton bit rides the field's own
+        // flags-or in the store)
+        net.dispatch(
+            StarNetKind::RevenueWithdrawalUrl { dialog_id },
+            telegram_api::Function::payments_getStarsRevenueWithdrawalUrl(
+                telegram_api::payments_getStarsRevenueWithdrawalUrl {
+                    flags: 1 << 1,
+                    ton: is_ton,
+                    peer: Some(Box::new(peer)),
+                    amount,
+                    password: Some(input_check_password),
+                },
+            ),
+        );
+    }
+
+    /// `GetStarsRevenueAdsAccountUrlQuery::send` (cpp:1295-1304).
+    fn send_get_stars_revenue_ads_account_url_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsRevenueAdsAccountUrl — [net-inert]");
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            tdutils::log_info!(
+                "GetStarsRevenueAdsAccountUrlQuery — no input peer for {dialog_id:?}"
+            );
+            return;
+        };
+        net.dispatch(
+            StarNetKind::RevenueAdsAccountUrl { dialog_id },
+            telegram_api::Function::payments_getStarsRevenueAdsAccountUrl(
+                telegram_api::payments_getStarsRevenueAdsAccountUrl {
+                    peer: Some(Box::new(peer)),
+                },
+            ),
+        );
+    }
+
+    /// `GetGramRevenueStatsQuery::send` (cpp:1350-1355) — the own
+    /// dialog's input peer, the ton flag set.
+    fn send_get_gram_revenue_stats_query(&mut self, is_dark: bool) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsRevenueStats (TON) — [net-inert]");
+        };
+        let my_dialog_id =
+            crate::dialog_id::DialogId::from_user_id(self.td.user_manager.get_my_id());
+        // the C++ CHECK(input_peer != nullptr) band — the self peer is
+        // always resolvable
+        let peer = crate::dialog_manager::get_input_peer(
+            self.td,
+            my_dialog_id,
+            crate::user_manager::AccessRights::Write,
+        )
+        .expect("the self input peer resolves");
+        net.dispatch(
+            StarNetKind::GramRevenueStats,
+            telegram_api::Function::payments_getStarsRevenueStats(
+                telegram_api::payments_getStarsRevenueStats {
+                    flags: (is_dark as i32) | (1 << 1),
+                    dark: is_dark,
+                    ton: true,
+                    peer: Some(Box::new(peer)),
+                },
+            ),
+        );
+    }
+
+    /// `GetPaidMessageRevenueQuery::send` (cpp:1379-1382).
+    fn send_get_paid_message_revenue_query(&mut self, input_user: telegram_api::InputUser) {
+        match self.td.star_net() {
+            Some(net) => net.dispatch(
+                StarNetKind::PaidMessageRevenue,
+                telegram_api::Function::account_getPaidMessagesRevenue(
+                    telegram_api::account_getPaidMessagesRevenue {
+                        flags: 0,
+                        parent_peer: None,
+                        user_id: Some(input_user),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send payments.getPaidMessageRevenue — [net-inert]"),
+        }
     }
 }
 
@@ -26528,6 +27376,238 @@ mod tests {
         }
 
         assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the star net slice: the option/subscription/revenue families
+    // ride the dispatcher and their answers drain through the real Td
+    // routing (the StarManager.cpp handler halves). ----
+
+    /// The production-shaped star split for the tests (the take-out
+    /// convention).
+    fn with_star_manager(
+        td: &mut Td,
+        f: impl FnOnce(&mut crate::star_manager::StarManager, &mut TdStarEnv<'_>),
+    ) {
+        let (mut manager, mut env) = crate::td::star_env_split(td);
+        f(&mut manager, &mut env);
+        td.star_manager = manager;
+    }
+
+    type StarOptionsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::StarPaymentOptions>>>,
+    >;
+
+    fn record_star_options() -> (Promise<td_api::StarPaymentOptions>, StarOptionsSlot) {
+        struct Rec(StarOptionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::StarPaymentOptions> for Rec {
+            fn set_value(&mut self, value: td_api::StarPaymentOptions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: StarOptionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type StarSubscriptionsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::StarSubscriptions>>>,
+    >;
+
+    fn record_star_subscriptions() -> (Promise<td_api::StarSubscriptions>, StarSubscriptionsSlot) {
+        struct Rec(StarSubscriptionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::StarSubscriptions> for Rec {
+            fn set_value(&mut self, value: td_api::StarSubscriptions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: StarSubscriptionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type UrlSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<String>>>>;
+
+    fn record_star_url() -> (Promise<String>, UrlSlot) {
+        struct Rec(UrlSlot);
+        impl tdutils::promise::PromiseInterface<String> for Rec {
+            fn set_value(&mut self, value: String) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: UrlSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn star_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(star_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn star_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-star");
+
+        // 1. getStarPaymentOptions — the topup vector converts over
+        //    get_star_count (the >2^51 band clamps).
+        let (promise, slot) = record_star_options();
+        with_star_manager(&mut td, |manager, env| {
+            manager.get_star_payment_options(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getStarsTopupOptions::ID
+        );
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&1i32.to_le_bytes());
+        telegram_api::StarsTopupOption {
+            flags: 1, // the STORE_PRODUCT bit (flags.0)
+            extended: false,
+            stars: 100,
+            store_product: "product".to_owned(),
+            currency: "USD".to_owned(),
+            amount: 199,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_star_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(options)) => {
+                assert_eq!(options.options.len(), 1);
+                let option = &options.options[0];
+                assert_eq!(option.currency, "USD");
+                assert_eq!(option.amount, 199);
+                assert_eq!(option.star_count, 100);
+                assert_eq!(option.store_product_id, "product");
+            }
+            other => panic!("unexpected option result: {other:?}"),
+        }
+
+        // 2. getStarSubscriptions — the balance gate, the channel
+        //    subscription conversion and the owned-balance update.
+        let (promise, slot) = record_star_subscriptions();
+        with_star_manager(&mut td, |manager, env| {
+            manager.get_star_subscriptions(env, false, String::new(), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getStarsSubscriptions::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsStatus {
+            flags: (1 << 1) | (1 << 2) | (1 << 4), // subscriptions + next_offset + missing_balance
+            balance: Some(telegram_api::StarsAmount::starsAmount(
+                telegram_api::starsAmount {
+                    amount: 42,
+                    nanos: 0,
+                },
+            )),
+            subscriptions: vec![telegram_api::StarsSubscription {
+                flags: 1 << 3, // the CHAT_INVITE_HASH bit (flags.3)
+                canceled: false,
+                can_refulfill: true,
+                missing_balance: false,
+                bot_canceled: false,
+                id: "sub1".to_owned(),
+                peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    channel_id: 9000,
+                })),
+                until_date: 1000,
+                pricing: Some(telegram_api::StarsSubscriptionPricing {
+                    period: 30,
+                    amount: 50,
+                }),
+                chat_invite_hash: "abc123".to_owned(),
+                title: String::new(),
+                photo: None,
+                invoice_slug: String::new(),
+            }],
+            subscriptions_next_offset: "offset2".to_owned(),
+            subscriptions_missing_balance: 7,
+            history: vec![],
+            next_offset: String::new(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_star_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(subscriptions)) => {
+                assert_eq!(subscriptions.star_amount.as_ref().unwrap().star_count, 42);
+                assert_eq!(subscriptions.subscriptions.len(), 1);
+                let subscription = &subscriptions.subscriptions[0];
+                assert_eq!(subscription.id, "sub1");
+                assert_eq!(subscription.chat_id, -1000000009000);
+                assert!(subscription.expiration_date == 1000);
+                match &subscription.r#type {
+                    Some(td_api::StarSubscriptionType::starSubscriptionTypeChannel(channel)) => {
+                        assert!(channel.can_reuse);
+                        assert!(channel.invite_link.ends_with("+abc123"));
+                    }
+                    other => panic!("unexpected subscription type: {other:?}"),
+                }
+                assert_eq!(subscriptions.required_star_count, 7);
+                assert_eq!(subscriptions.next_offset, "offset2");
+            }
+            other => panic!("unexpected subscriptions result: {other:?}"),
+        }
+
+        // 3. getStarWithdrawalUrl — the my-dialog input peer rides the
+        //    query (seed the own id like the community test); the url
+        //    answers (the SRP seam stays the parked PasswordManager
+        //    collapse — the empty-SRP send leg).
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        let my_dialog_id = crate::dialog_id::DialogId::from_user_id(td.user_manager.get_my_id());
+        let (promise, slot) = record_star_url();
+        with_star_manager(&mut td, |manager, env| {
+            manager.get_star_withdrawal_url(env, my_dialog_id, 100, "password".to_owned(), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getStarsRevenueWithdrawalUrl::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsRevenueWithdrawalUrl {
+            url: "https://example.com/withdraw".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_star_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(url)) => {
+                assert_eq!(url, "https://example.com/withdraw")
+            }
+            other => panic!("unexpected url result: {other:?}"),
+        }
+
+        assert!(td.star_net_completed.lock().is_empty(), "drained");
     }
 
     fn wire_authorization(

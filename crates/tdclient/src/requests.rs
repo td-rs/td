@@ -14167,28 +14167,31 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, Object::starPaymentOptions);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_payment_options(&mut env, promise);
+            td.star_manager = manager;
         }
         Function::getStarGiftPaymentOptions(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, Object::starPaymentOptions);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_gift_payment_options(
                 &mut env,
                 crate::user_manager::UserId::new(request.user_id),
                 promise,
             );
+            td.star_manager = manager;
         }
         Function::getStarGiveawayPaymentOptions(_) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, Object::starGiveawayPaymentOptions);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_giveaway_payment_options(&mut env, promise);
+            td.star_manager = manager;
         }
         Function::getStarTransactions(request) => {
             let Some(subscription_id) = clean_or_utf8_error(td, id, &request.subscription_id)
@@ -14216,7 +14219,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 }
             };
             let promise = td.deferred_promise(id, Object::starTransactions);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_transactions(
                 &mut env,
                 dialog_id,
@@ -14226,6 +14229,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 request.direction,
                 promise,
             );
+            td.star_manager = manager;
         }
         Function::getTonTransactions(request) => {
             if !check_is_user(td, id) {
@@ -14235,7 +14239,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise(id, Object::tonTransactions);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_ton_transactions(
                 &mut env,
                 offset,
@@ -14243,6 +14247,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 request.direction,
                 promise,
             );
+            td.star_manager = manager;
         }
         Function::getStarSubscriptions(request) => {
             if !check_is_user(td, id) {
@@ -14252,8 +14257,9 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise(id, Object::starSubscriptions);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_subscriptions(&mut env, request.only_expiring, offset, promise);
+            td.star_manager = manager;
         }
         Function::editStarSubscription(request) => {
             if !check_is_user(td, id) {
@@ -14264,8 +14270,9 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.edit_star_subscription(&mut env, subscription_id, request.is_canceled, promise);
+            td.star_manager = manager;
         }
         Function::editUserStarSubscription(request) => {
             if !check_is_bot(td, id) {
@@ -14277,7 +14284,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.edit_user_star_subscription(
                 &mut env,
                 crate::user_manager::UserId::new(request.user_id),
@@ -14285,6 +14292,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 request.is_canceled,
                 promise,
             );
+            td.star_manager = manager;
         }
         Function::reuseStarSubscription(request) => {
             if !check_is_user(td, id) {
@@ -14295,8 +14303,9 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.reuse_star_subscription(&mut env, subscription_id, promise);
+            td.star_manager = manager;
         }
         Function::refundStarPayment(request) => {
             if !check_is_bot(td, id) {
@@ -14308,13 +14317,14 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.refund_star_payment(
                 &mut env,
                 crate::user_manager::UserId::new(request.user_id),
                 telegram_payment_charge_id,
                 promise,
             );
+            td.star_manager = manager;
         }
         Function::getStarRevenueStatistics(request) => {
             if !check_is_user(td, id) {
@@ -14337,8 +14347,9 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 }
             };
             let promise = td.deferred_promise(id, Object::starRevenueStatistics);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_revenue_statistics(&mut env, dialog_id, request.is_dark, promise);
+            td.star_manager = manager;
         }
         Function::getStarWithdrawalUrl(request) => {
             if !check_is_user(td, id) {
@@ -14365,7 +14376,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_withdrawal_url(
                 &mut env,
                 dialog_id,
@@ -14373,6 +14384,7 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
                 password,
                 promise,
             );
+            td.star_manager = manager;
         }
         Function::getStarAdAccountUrl(request) => {
             if !check_is_user(td, id) {
@@ -14396,16 +14408,18 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_star_ad_account_url(&mut env, dialog_id, promise);
+            td.star_manager = manager;
         }
         Function::getGramRevenueStatistics(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, Object::gramRevenueStatistics);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_ton_revenue_statistics(&mut env, request.is_dark, promise);
+            td.star_manager = manager;
         }
         Function::getGramWithdrawalUrl(request) => {
             if !check_is_user(td, id) {
@@ -14416,20 +14430,22 @@ fn run_star_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_ton_withdrawal_url(&mut env, password, promise);
+            td.star_manager = manager;
         }
         Function::getPaidMessageRevenue(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, Object::starCount);
-            let (mut env, manager) = crate::td::star_env_split(td);
+            let (mut manager, mut env) = crate::td::star_env_split(td);
             manager.get_paid_message_revenue(
                 &mut env,
                 crate::user_manager::UserId::new(request.user_id),
                 promise,
             );
+            td.star_manager = manager;
         }
         _ => run_message_dialog_requests(td, id, function),
     }

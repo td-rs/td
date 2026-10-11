@@ -885,6 +885,22 @@ pub struct StarAmount {
 }
 
 impl StarAmount {
+    /// The wire constructor (StarAmount.cpp:12-18) over the
+    /// `starsAmount`/`starsTonAmount` union — only the Stars arm carries
+    /// a value; the nanostar normalization runs in place.
+    pub fn from_wire(
+        amount: Option<&telegram_api::StarsAmount>,
+        allow_negative: bool,
+    ) -> StarAmount {
+        let mut result = StarAmount::default();
+        if let Some(telegram_api::StarsAmount::starsAmount(amount)) = amount {
+            result.star_count = crate::star_manager::get_star_count(amount.amount, allow_negative);
+            result.nanostar_count =
+                crate::star_manager::get_nanostar_count(&mut result.star_count, amount.nanos);
+        }
+        result
+    }
+
     /// `StarAmount::is_positive` (StarAmount.h:28-31).
     pub fn is_positive(&self) -> bool {
         self.star_count > 0 || self.nanostar_count > 0
@@ -907,6 +923,37 @@ pub struct TonAmount {
 }
 
 impl TonAmount {
+    /// The wire constructor (TonAmount.cpp:12-18) over the union — only
+    /// the TON arm carries a value (`TonAmount::get_ton_count` with the
+    /// allow-negative band, TonAmount.cpp:23-41).
+    pub fn from_wire(
+        amount: Option<&telegram_api::StarsAmount>,
+        allow_negative: bool,
+    ) -> TonAmount {
+        let mut result = TonAmount::default();
+        if let Some(telegram_api::StarsAmount::starsTonAmount(amount)) = amount {
+            let max_amount = 1i64 << 51;
+            let amount = amount.amount;
+            result.ton_amount = if amount < 0 {
+                if !allow_negative {
+                    tdutils::log_error!("Receive TON amount = {amount}");
+                    0
+                } else if amount < -max_amount {
+                    tdutils::log_error!("Receive TON amount = {amount}");
+                    -max_amount
+                } else {
+                    amount
+                }
+            } else if amount > max_amount {
+                tdutils::log_error!("Receive TON amount = {amount}");
+                max_amount
+            } else {
+                amount
+            };
+        }
+        result
+    }
+
     /// `TonAmount::is_positive` (TonAmount.h:25-27).
     pub fn is_positive(&self) -> bool {
         self.ton_amount > 0

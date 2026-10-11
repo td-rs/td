@@ -28,20 +28,17 @@
 //! - UserManager (`get_bot_data`, `get_input_user`, `get_my_id`) and
 //!   ChatManager (`get_channel_status`) — the read halves delegate to
 //!   the real read surface through the td wiring.
-//! - Every `td_->create_handler<...>->send(...)` query is the
-//!   `[blocked: net]` query seam: the send logs the query name and the
-//!   promise parks in [`StarManager::pending`] until the net step lands
-//!   the answer halves (`GetStarsTopupOptionsQuery`,
-//!   `GetStarsGiftOptionsQuery`, `GetStarsGiveawayOptionsQuery`,
-//!   `GetStarsTransactionsQuery`, `GetTonTransactionsQuery`,
-//!   `GetStarsSubscriptionsQuery`, `ChangeStarsSubscriptionQuery`,
-//!   `BotCancelStarsSubscriptionQuery`,
-//!   `FulfillStarsSubscriptionQuery`, `RefundStarsChargeQuery`,
-//!   `GetStarsRevenueStatsQuery`,
-//!   `GetStarsRevenueWithdrawalUrlQuery`,
-//!   `GetGramRevenueStatsQuery`,
-//!   `GetStarsRevenueAdsAccountUrlQuery`,
-//!   `GetPaidMessageRevenueQuery`).
+//! - Every `td_->create_handler<...>->send(...)` query rides the
+//!   client-side dispatcher under its `StarNetKind` (the answers drain
+//!   through `Td::on_star_net_answer` — the port of the C++ handler
+//!   halves of StarManager.cpp:49-1400): the topup/gift/giveaway option
+//!   families, subscriptions (the [`StarSubscription`] conversion + the
+//!   owned-balance update), the subscription change/cancel/fulfill and
+//!   refund families, the revenue stats/withdrawal-url/ads-url set and
+//!   the paid-message revenue. The `GetStarsTransactionsQuery`/
+//!   `GetTonTransactionsQuery` pair keeps its `[blocked: net]` seam —
+//!   its answer conversion (the transaction partners/sources plane)
+//!   lands with its own slice.
 //!
 //! Recorded divergences:
 //! - `on_update_stars_revenue_status` (StarManager.cpp:1761-1782) and the
@@ -343,6 +340,132 @@ pub struct PendingStarQueries {
     pub paid_message_revenue: Vec<Promise<td_api::StarCount>>,
 }
 
+/// `StarSubscription` (StarSubscription.{h,cpp}) — the wire value class
+/// of the subscriptions answer; the photo leg stays the
+/// `[blocked: files]` seam (`get_web_document_photo` — the td_api object
+/// answers `None`).
+pub(crate) struct StarSubscription {
+    pub(crate) id: String,
+    pub(crate) dialog_id: DialogId,
+    pub(crate) until_date: i32,
+    pub(crate) can_reuse: bool,
+    pub(crate) is_canceled: bool,
+    pub(crate) is_bot_canceled: bool,
+    pub(crate) missing_balance: bool,
+    pub(crate) invite_hash: String,
+    pub(crate) title: String,
+    pub(crate) invoice_slug: String,
+    pub(crate) pricing: crate::chat_manager::StarSubscriptionPricing,
+}
+
+impl StarSubscription {
+    /// The wire constructor (StarSubscription.cpp:14-27).
+    pub(crate) fn new(subscription: telegram_api::StarsSubscription) -> StarSubscription {
+        StarSubscription {
+            id: subscription.id,
+            dialog_id: subscription
+                .peer
+                .as_ref()
+                .map_or(DialogId::default(), DialogId::from_peer),
+            until_date: subscription.until_date,
+            can_reuse: subscription.can_refulfill,
+            is_canceled: subscription.canceled,
+            is_bot_canceled: subscription.bot_canceled,
+            missing_balance: subscription.missing_balance,
+            invite_hash: subscription.chat_invite_hash,
+            title: subscription.title,
+            invoice_slug: subscription.invoice_slug,
+            pricing: crate::chat_manager::StarSubscriptionPricing::from_telegram(
+                subscription.pricing,
+            ),
+        }
+    }
+
+    /// `is_valid` (StarSubscription.h:35-37).
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.dialog_id.is_valid()
+            && self.until_date >= 0
+            && !self.pricing.is_empty()
+    }
+}
+
+/// `convert_stars_revenue_status` (StarManager.cpp:1157-1184) — the
+/// Stars-band status conversion; the invalid-amount band logs and keeps
+/// the zero amounts.
+pub(crate) fn convert_stars_revenue_status(
+    obj: &telegram_api::StarsRevenueStatus,
+    unix_time: i32,
+) -> td_api::StarRevenueStatus {
+    let mut next_withdrawal_in = 0;
+    if obj.withdrawal_enabled && obj.next_withdrawal_at > 0 {
+        next_withdrawal_in = (obj.next_withdrawal_at - unix_time).max(1);
+    }
+    let is_stars = |amount: &Option<telegram_api::StarsAmount>| {
+        matches!(amount, Some(telegram_api::StarsAmount::starsAmount(_)))
+    };
+    let (overall_revenue, current_balance, available_balance) = if is_stars(&obj.overall_revenue)
+        && is_stars(&obj.current_balance)
+        && is_stars(&obj.available_balance)
+    {
+        (
+            StarAmount::from_wire(obj.overall_revenue.as_ref(), true),
+            StarAmount::from_wire(obj.current_balance.as_ref(), true),
+            StarAmount::from_wire(obj.available_balance.as_ref(), true),
+        )
+    } else {
+        tdutils::log_error!("Receive invalid stars revenue status");
+        (
+            StarAmount::default(),
+            StarAmount::default(),
+            StarAmount::default(),
+        )
+    };
+    td_api::StarRevenueStatus {
+        total_amount: Some(overall_revenue.get_star_amount_object()),
+        current_amount: Some(current_balance.get_star_amount_object()),
+        available_amount: Some(available_balance.get_star_amount_object()),
+        withdrawal_enabled: obj.withdrawal_enabled,
+        next_withdrawal_in,
+    }
+}
+
+/// `convert_gram_revenue_status` (StarManager.cpp:1316-1341) — the TON
+/// twin over the `starsTonAmount` band.
+pub(crate) fn convert_gram_revenue_status(
+    obj: &telegram_api::StarsRevenueStatus,
+) -> td_api::GramRevenueStatus {
+    if obj.next_withdrawal_at != 0 {
+        tdutils::log_error!("Receive stars revenue status with a withdrawal date");
+    }
+    let is_ton = |amount: &Option<telegram_api::StarsAmount>| {
+        matches!(amount, Some(telegram_api::StarsAmount::starsTonAmount(_)))
+    };
+    let (overall_revenue, current_balance, available_balance) = if is_ton(&obj.overall_revenue)
+        && is_ton(&obj.current_balance)
+        && is_ton(&obj.available_balance)
+    {
+        (
+            TonAmount::from_wire(obj.overall_revenue.as_ref(), true),
+            TonAmount::from_wire(obj.current_balance.as_ref(), true),
+            TonAmount::from_wire(obj.available_balance.as_ref(), true),
+        )
+    } else {
+        tdutils::log_error!("Receive invalid gram revenue status");
+        (
+            TonAmount::default(),
+            TonAmount::default(),
+            TonAmount::default(),
+        )
+    };
+    td_api::GramRevenueStatus {
+        total_amount: overall_revenue.ton_amount,
+        balance_amount: current_balance.ton_amount,
+        available_amount: available_balance.ton_amount,
+        withdrawal_enabled: obj.withdrawal_enabled,
+    }
+}
+
 /// The collapsed `StarManager` (StarManager.h:22-92): the owned
 /// Telegram Stars / TON balance ledger plus the request plane.
 #[derive(Default)]
@@ -365,6 +488,20 @@ pub struct StarManager {
 impl StarManager {
     pub fn new() -> StarManager {
         StarManager::default()
+    }
+
+    /// Pop the head promise of a pending lot — the answer-routing half
+    /// of a query family (the C++ handler's own promise).
+    pub(crate) fn take_pending<T: std::marker::Send>(
+        &mut self,
+        slot: for<'a> fn(&'a mut PendingStarQueries) -> &'a mut Vec<Promise<T>>,
+    ) -> Option<Promise<T>> {
+        let lot = slot(&mut self.pending);
+        if lot.is_empty() {
+            None
+        } else {
+            Some(lot.remove(0))
+        }
     }
 
     /// `StarManager::start_up` (StarManager.cpp:1402-1423) — the

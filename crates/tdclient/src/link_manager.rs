@@ -3463,7 +3463,11 @@ fn get_dialog_filter_invite_link(env: &impl LinkEnv, slug: &str, is_internal: bo
 }
 
 /// `LinkManager::get_dialog_invite_link` (cpp:4275-4284).
-fn get_dialog_invite_link(env: &impl LinkEnv, invite_hash: &str, is_internal: bool) -> String {
+pub(crate) fn get_dialog_invite_link(
+    env: &impl LinkEnv,
+    invite_hash: &str,
+    is_internal: bool,
+) -> String {
     if !is_base64url_characters(invite_hash.as_bytes()) {
         return String::new();
     }
