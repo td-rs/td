@@ -2843,6 +2843,22 @@ pub(crate) enum StarNetKind {
 /// the answers drain through [`Td::on_star_net_answer`].
 type StarNetHandle = NetKindHandle<StarNetKind>;
 
+/// The Support query kinds — the C++ ResultHandler classes of
+/// Support.cpp:37-113 (the user-support-info pair + the support name).
+#[derive(Clone, Copy)]
+pub(crate) enum SupportNetKind {
+    /// `GetUserInfoQuery` (cpp:37) — `help.getUserInfo`.
+    GetUserInfo,
+    /// `EditUserInfoQuery` (cpp:61) — `help.editUserInfo`.
+    EditUserInfo,
+    /// `GetSupportNameQuery` (cpp:89) — `help.getSupportName`.
+    GetSupportName,
+}
+
+/// The cloned support dispatch surface the [`SupportEnvTd`] senders use
+/// — the answers drain through [`Td::on_support_net_answer`].
+type SupportNetHandle = NetKindHandle<SupportNetKind>;
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -3547,6 +3563,15 @@ pub struct Td {
     /// The callback-parked StarManager query answers, parked by kind (the
     /// `Td::on_star_net_answer` drain).
     star_net_completed: Arc<Mutex<Vec<(StarNetKind, NetQuery)>>>,
+    /// The callback-parked Support query answers, parked by kind (the
+    /// `Td::on_support_net_answer` drain).
+    support_net_completed: Arc<Mutex<Vec<(SupportNetKind, NetQuery)>>>,
+    /// The parked `td_api::UserSupportInfo` promises — the shared lot of
+    /// the `help.getUserInfo`/`help.editUserInfo` families (the C++
+    /// handler owns its promise).
+    support_info_promises: Vec<Promise<td_api::UserSupportInfo>>,
+    /// The parked `String` promises — the `help.getSupportName` lot.
+    support_name_promises: Vec<Promise<String>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -3967,6 +3992,9 @@ impl Td {
             community_net_completed: Arc::new(Mutex::new(Vec::new())),
             account_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_net_completed: Arc::new(Mutex::new(Vec::new())),
+            support_net_completed: Arc::new(Mutex::new(Vec::new())),
+            support_info_promises: Vec::new(),
+            support_name_promises: Vec::new(),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -6115,6 +6143,7 @@ impl Td {
         self.dispatch_completed_community_net();
         self.dispatch_completed_account_net();
         self.dispatch_completed_star_net();
+        self.dispatch_completed_support_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6173,6 +6202,16 @@ impl Td {
         Some(StarNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.star_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned support dispatch surface for the [`SupportEnvTd`]
+    /// senders — `None` keeps the net-inert posture.
+    fn support_net(&self) -> Option<SupportNetHandle> {
+        Some(SupportNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.support_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7247,6 +7286,86 @@ impl Td {
             self.on_star_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked Support answers — the C++ ResultHandler
+    /// `on_result`/`on_error` halves (Support.cpp:37-113).
+    fn dispatch_completed_support_net(&mut self) {
+        let completed = std::mem::take(&mut *self.support_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_support_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one Support net answer by kind (the C++ query handler halves
+    /// of Support.cpp:37-113).
+    fn on_support_net_answer(&mut self, kind: SupportNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetUserInfoQuery` (cpp:37-58) and `EditUserInfoQuery`
+            // (cpp:61-85) — the shared user-support-info lot; the
+            // `help_UserInfo` answer converts through the local
+            // `get_user_support_info_object` half.
+            SupportNetKind::GetUserInfo | SupportNetKind::EditUserInfo => {
+                let promise = if self.support_info_promises.is_empty() {
+                    None
+                } else {
+                    Some(self.support_info_promises.remove(0))
+                };
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::help_UserInfo::parse(query.ok()) {
+                    Ok(user_info) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(
+                                crate::support_manager::get_user_support_info_object(
+                                    Some(&mut SupportEnvTd { td: &mut *self }),
+                                    user_info,
+                                ),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("help user info"));
+                        }
+                    }
+                }
+            }
+            // `GetSupportNameQuery` (cpp:89-113).
+            SupportNetKind::GetSupportName => {
+                let promise = if self.support_name_promises.is_empty() {
+                    None
+                } else {
+                    Some(self.support_name_promises.remove(0))
+                };
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::help_SupportName::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(ptr.name);
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("help_getSupportName"));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Route one CommunityManager net answer by kind (the C++ query
@@ -16916,6 +17035,60 @@ pub(crate) struct SupportEnvTd<'a> {
     pub(crate) td: &'a mut Td,
 }
 
+impl crate::message_entity::UserManagerLike for SupportEnvTd<'_> {
+    fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("support answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("support answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_input_user(&env, user_id)
+            .map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.td.user_manager.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("support answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_input_user_force(&env, user_id)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(user_id)
+    }
+}
+
 impl crate::support_manager::SupportEnv for SupportEnvTd<'_> {
     fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
         let env = UserEnv {
@@ -16954,29 +17127,56 @@ impl crate::support_manager::SupportEnv for SupportEnvTd<'_> {
 
     fn get_user_info_via_net(
         &mut self,
-        _input_user: telegram_api::InputUser,
+        input_user: telegram_api::InputUser,
         promise: Promise<td_api::UserSupportInfo>,
     ) {
-        // `GetUserInfoQuery::send` — `help.getUserInfo`
-        // (`[blocked: net]`).
-        drop(promise);
+        // `GetUserInfoQuery::send` — `help.getUserInfo` (the promise
+        // parks at the shared info lot; the net-inert posture parks it
+        // too).
+        self.td.support_info_promises.push(promise);
+        match self.td.support_net() {
+            Some(net) => net.dispatch(
+                SupportNetKind::GetUserInfo,
+                telegram_api::Function::help_getUserInfo(telegram_api::help_getUserInfo {
+                    user_id: Some(input_user),
+                }),
+            ),
+            None => tdutils::log_info!("Send help.getUserInfo — [net-inert]"),
+        }
     }
 
     fn edit_user_info_via_net(
         &mut self,
-        _input_user: telegram_api::InputUser,
-        _message: telegram_api::TextWithEntities,
+        input_user: telegram_api::InputUser,
+        message: telegram_api::TextWithEntities,
         promise: Promise<td_api::UserSupportInfo>,
     ) {
-        // `EditUserInfoQuery::send` — `help.editUserInfo`
-        // (`[blocked: net]`).
-        drop(promise);
+        // `EditUserInfoQuery::send` (Support.cpp:82-84) — the wire build
+        // of the formatted text.
+        self.td.support_info_promises.push(promise);
+        match self.td.support_net() {
+            Some(net) => net.dispatch(
+                SupportNetKind::EditUserInfo,
+                telegram_api::Function::help_editUserInfo(telegram_api::help_editUserInfo {
+                    user_id: Some(input_user),
+                    message: message.text,
+                    entities: message.entities,
+                }),
+            ),
+            None => tdutils::log_info!("Send help.editUserInfo — [net-inert]"),
+        }
     }
 
     fn get_support_name_via_net(&mut self, promise: Promise<String>) {
-        // `GetSupportNameQuery::send` — `help.getSupportName`
-        // (`[blocked: net]`).
-        drop(promise);
+        // `GetSupportNameQuery::send` — `help.getSupportName`.
+        self.td.support_name_promises.push(promise);
+        match self.td.support_net() {
+            Some(net) => net.dispatch(
+                SupportNetKind::GetSupportName,
+                telegram_api::Function::help_getSupportName(telegram_api::help_getSupportName),
+            ),
+            None => tdutils::log_info!("Send help.getSupportName — [net-inert]"),
+        }
     }
 }
 
@@ -27608,6 +27808,110 @@ mod tests {
         }
 
         assert!(td.star_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the support net slice: the help.* queries ride the dispatcher
+    // (Support.cpp:37-113). ----
+
+    #[test]
+    fn support_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(support_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn support_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-support");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. getSupportName — the name answer.
+        let (promise, slot) = record_star_url();
+        {
+            let mut env = SupportEnvTd { td: &mut td };
+            crate::support_manager::get_support_name(&mut env, promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::help_getSupportName::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::help_SupportName {
+            name: "Support".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_support_net();
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Ok(ref name)) if name == "Support")
+        );
+
+        // 2. getUserInfo — the self user's input user rides the query;
+        //    the userInfo answer converts (the author/date bands).
+        let (promise, slot) = record_support_info();
+        {
+            let mut env = SupportEnvTd { td: &mut td };
+            crate::support_manager::get_user_info(
+                &mut env,
+                crate::user_manager::UserId::new(700000001),
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].tl_constructor(), telegram_api::help_getUserInfo::ID);
+        let mut answer = Vec::new();
+        telegram_api::help_userInfo {
+            message: "hello".to_owned(),
+            entities: vec![],
+            author: "author".to_owned(),
+            date: 123,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_support_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(info)) => {
+                assert_eq!(info.author, "author");
+                assert_eq!(info.date, 123);
+                assert_eq!(info.message.as_ref().unwrap().text, "hello");
+            }
+            other => panic!("unexpected support info result: {other:?}"),
+        }
+
+        assert!(td.support_net_completed.lock().is_empty(), "drained");
+    }
+
+    type SupportInfoSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::UserSupportInfo>>>>;
+
+    /// A `Promise<td_api::UserSupportInfo>` with its capture slot.
+    fn record_support_info() -> (Promise<td_api::UserSupportInfo>, SupportInfoSlot) {
+        struct Rec(SupportInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::UserSupportInfo> for Rec {
+            fn set_value(&mut self, value: td_api::UserSupportInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: SupportInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
     }
 
     fn wire_authorization(

@@ -6,11 +6,12 @@
 //! `UserManager::get_input_user` validation, Support.cpp:45-52/:76-85)
 //! and the `get_formatted_text` intake over the my-dialog context
 //! (Support.cpp:132-134); `get_user_support_info_object` is the shared
-//! result rewrap (Support.cpp:21-35). The `help.getUserInfo`/
-//! `help.editUserInfo`/`help.getSupportName` query tails park at the
-//! named [`SupportEnv`] net seams (the M.31 convention — the caller
-//! promises resolve with the C++ LambdaPromise drop until the net
-//! step's result handlers answer them).
+//! result rewrap (Support.cpp:21-35) — the answer half of the net
+//! routing. The `help.getUserInfo`/`help.editUserInfo`/
+//! `help.getSupportName` queries ride the client-side dispatcher under
+//! their `SupportNetKind` (the answers drain through
+//! `Td::on_support_net_answer`; the promises park at the Td-side lots
+//! until then).
 
 use tdutils::promise::Promise;
 use tdutils::status::Status;
@@ -23,7 +24,6 @@ use crate::user_manager::UserId;
 /// `help.getUserInfo`/`help.editUserInfo` result rewrap: the userInfo
 /// variant parses the message (the date-keyed server-entity fixups) and
 /// carries the author/date, the Empty variant keeps the defaults.
-#[allow(dead_code)] // the result half — the help.* net seams
 pub(crate) fn get_user_support_info_object<U: UserManagerLike + ?Sized>(
     mut user_manager: Option<&mut U>,
     user_info: tdmtproto::telegram_api::help_UserInfo,
@@ -64,8 +64,7 @@ pub(crate) fn get_user_support_info_object<U: UserManagerLike + ?Sized>(
 }
 
 /// `get_user_info` (Support.cpp:126-128) — the `GetUserInfoQuery::send`
-/// validation runs here; the `help.getUserInfo` query parks at the
-/// `[blocked: net]` seam.
+/// validation runs here; the `help.getUserInfo` query rides the seam.
 pub(crate) fn get_user_info(
     env: &mut impl SupportEnv,
     user_id: UserId,
@@ -84,8 +83,7 @@ pub(crate) fn get_user_info(
 /// my-dialog context; the user-manager capability reads are the ()
 /// stand-in, the M.4.12 documented shape), then the
 /// `EditUserInfoQuery::send` validation and wire build
-/// (Support.cpp:76-85); the `help.editUserInfo` query parks at the
-/// `[blocked: net]` seam.
+/// (Support.cpp:76-85); the `help.editUserInfo` query rides the seam.
 pub(crate) fn set_user_info(
     env: &mut impl SupportEnv,
     user_id: UserId,
@@ -124,8 +122,8 @@ pub(crate) fn set_user_info(
     );
 }
 
-/// `get_support_name` (Support.cpp:138-140) — the
-/// `help.getSupportName` query parks at the `[blocked: net]` seam.
+/// `get_support_name` (Support.cpp:138-140) — the `help.getSupportName`
+/// query rides the seam.
 pub(crate) fn get_support_name(env: &mut impl SupportEnv, promise: Promise<String>) {
     env.get_support_name_via_net(promise);
 }
@@ -153,7 +151,7 @@ pub(crate) trait SupportEnv {
     fn get_session_count(&self) -> i32;
 
     /// `GetUserInfoQuery::send` (Support.cpp:51) — the
-    /// `help.getUserInfo` query; `[blocked: net]`.
+    /// `help.getUserInfo` query over the dispatcher.
     fn get_user_info_via_net(
         &mut self,
         input_user: tdmtproto::telegram_api::InputUser,
@@ -161,7 +159,7 @@ pub(crate) trait SupportEnv {
     );
 
     /// `EditUserInfoQuery::send` (Support.cpp:82-84) — the
-    /// `help.editUserInfo` query; `[blocked: net]`.
+    /// `help.editUserInfo` query over the dispatcher.
     fn edit_user_info_via_net(
         &mut self,
         input_user: tdmtproto::telegram_api::InputUser,
@@ -170,7 +168,7 @@ pub(crate) trait SupportEnv {
     );
 
     /// `GetSupportNameQuery::send` (Support.cpp:109) — the
-    /// `help.getSupportName` query; `[blocked: net]`.
+    /// `help.getSupportName` query over the dispatcher.
     fn get_support_name_via_net(&mut self, promise: Promise<String>);
 }
 
