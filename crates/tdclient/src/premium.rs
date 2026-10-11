@@ -209,7 +209,7 @@ pub trait PremiumEnv {
         );
     }
     fn send_check_gift_code_query(&mut self, code: &str) {
-        tdutils::log_info!("Send payments.checkGiftCode for {code} — [blocked: net]");
+        tdutils::log_info!("Send payments.checkGiftCode for {code} — [net-inert]");
     }
     fn send_apply_gift_code_query(&mut self, code: &str) {
         tdutils::log_info!("Send payments.applyGiftCode for {code} — [net-inert]");
@@ -289,6 +289,9 @@ pub(crate) enum PremiumNetKind {
     /// `GetGiveawayInfoQuery` (cpp:726) — the kind carries the dialog for
     /// the `on_error` tail.
     GetGiveawayInfo { dialog_id: i64 },
+    /// `CheckGiftCodeQuery` (cpp:512) — the slug rides the query; the
+    /// users/chats intakes run at the answer.
+    CheckGiftCode,
 }
 
 /// The collapsed `PremiumManager` — a router over the query seams.
@@ -515,6 +518,102 @@ impl PremiumManager {
         } else {
             Some(self.pending_apply_gift_code.remove(0))
         }
+    }
+
+    /// `CheckGiftCodeQuery::on_result`'s promise pop
+    /// (Premium.cpp:521-576).
+    pub(crate) fn take_gift_code_info_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::PremiumGiftCodeInfo>> {
+        if self.parked_gift_code_infos.is_empty() {
+            None
+        } else {
+            Some(self.parked_gift_code_infos.remove(0))
+        }
+    }
+
+    /// `CheckGiftCodeQuery::on_result` (Premium.cpp:521-576) — the
+    /// users/chats intakes first, then the value bands (date/days/
+    /// used_date), the `from_id` creator resolution
+    /// (`have_dialog_info_force` + the non-User `force_create_dialog`),
+    /// the `to_id`/`giveaway_msg_id` invalid-value drops (a giveaway
+    /// message id survives only behind a Channel creator), the
+    /// month-count round-trip (`get_premium_duration_month_count` vs
+    /// `get_premium_duration_day_count`), and the object build. The
+    /// error arm is the plain `on_error` (cpp:578) — no dialog tail.
+    pub(crate) fn on_check_gift_code(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        result: Result<telegram_api::payments_CheckedGiftCode>,
+        mut promise: Promise<td_api::PremiumGiftCodeInfo>,
+    ) {
+        let result = match result {
+            Result::Err(status) => return promise.set_error(status),
+            Result::Ok(result) => result,
+        };
+        env.on_get_users(result.users, "CheckGiftCodeQuery");
+        env.on_get_chats(result.chats, "CheckGiftCodeQuery");
+
+        if result.date <= 0 || result.days <= 0 || result.used_date < 0 {
+            tdutils::log_error!("Receive invalid checked gift code response");
+            return promise.set_error(Status::error(500, "Receive invalid response"));
+        }
+
+        let mut creator_dialog_id = DialogId::default();
+        if let Some(from_id) = &result.from_id {
+            creator_dialog_id = DialogId::from_peer(from_id);
+            if !creator_dialog_id.is_valid()
+                || !env.have_dialog_info_force(creator_dialog_id, "CheckGiftCodeQuery")
+            {
+                tdutils::log_error!("Receive invalid gift code creator");
+                return promise.set_error(Status::error(500, "Receive invalid response"));
+            }
+            if creator_dialog_id.get_type() != crate::dialog_id::DialogType::User {
+                env.force_create_dialog(creator_dialog_id, "CheckGiftCodeQuery", true);
+            }
+        }
+        let mut user_id = UserId::new(result.to_id);
+        if !user_id.is_valid() && user_id != UserId::default() {
+            tdutils::log_error!("Receive invalid gift code recipient {}", user_id.get());
+            user_id = UserId::default();
+        }
+        let mut message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(result.giveaway_msg_id),
+        );
+        if !message_id.is_valid() && message_id != crate::messages_manager::MessageId::default() {
+            tdutils::log_error!(
+                "Receive invalid giveaway message id {}",
+                result.giveaway_msg_id
+            );
+            message_id = crate::messages_manager::MessageId::default();
+        }
+        if message_id != crate::messages_manager::MessageId::default()
+            && creator_dialog_id.get_type() != crate::dialog_id::DialogType::Channel
+        {
+            tdutils::log_error!(
+                "Receive giveaway message id {} behind a non-channel creator",
+                result.giveaway_msg_id
+            );
+            message_id = crate::messages_manager::MessageId::default();
+        }
+        let month_count = crate::message_content::get_premium_duration_month_count(result.days);
+        promise.set_value(td_api::PremiumGiftCodeInfo {
+            creator_id: (creator_dialog_id != DialogId::default())
+                .then(|| env.get_message_sender_object(creator_dialog_id, "premiumGiftCodeInfo")),
+            creation_date: result.date,
+            is_from_giveaway: result.via_giveaway,
+            giveaway_message_id: message_id.get(),
+            month_count: if crate::message_content::get_premium_duration_day_count(month_count)
+                == result.days
+            {
+                month_count
+            } else {
+                0
+            },
+            day_count: result.days,
+            user_id: env.get_user_id_object(user_id, "premiumGiftCodeInfo"),
+            use_date: result.used_date,
+        });
     }
 
     /// `GetPremiumGiftOptionsQuery::on_result`'s promise pop

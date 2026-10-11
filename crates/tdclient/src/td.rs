@@ -7905,6 +7905,26 @@ impl Td {
                     self.premium_manager = manager;
                 }
             }
+            // `CheckGiftCodeQuery` (cpp:521-578) — the users/chats intakes
+            // and the value bands run at the manager; the error arm is the
+            // plain `set_error`.
+            PremiumNetKind::CheckGiftCode => {
+                if let Some(promise) = self.premium_manager.take_gift_code_info_promise() {
+                    let result = if query.is_error() {
+                        tdutils::status::Result::Err(query.error().clone())
+                    } else {
+                        match telegram_api::payments_CheckedGiftCode::parse(query.ok()) {
+                            Ok(code) => tdutils::status::Result::Ok(code),
+                            Err(_) => {
+                                tdutils::status::Result::Err(parse_error("payments_checkGiftCode"))
+                            }
+                        }
+                    };
+                    let (mut manager, mut env) = premium_env_split(self);
+                    manager.on_check_gift_code(&mut env, result, promise);
+                    self.premium_manager = manager;
+                }
+            }
         }
     }
 
@@ -18283,6 +18303,24 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             ),
             None => {
                 tdutils::log_info!("Send payments.getGiveawayInfo({dialog_id}) — [net-inert]");
+            }
+        }
+    }
+
+    // `CheckGiftCodeQuery::send` (Premium.cpp:517-519) — the slug rides
+    // the query; the users/chats intakes run at the answer.
+    fn send_check_gift_code_query(&mut self, code: &str) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::CheckGiftCode,
+                telegram_api::Function::payments_checkGiftCode(
+                    telegram_api::payments_checkGiftCode {
+                        slug: code.to_string(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.checkGiftCode for {code} — [net-inert]");
             }
         }
     }
@@ -31180,6 +31218,24 @@ mod tests {
         (Promise::from_interface(Rec(slot.clone())), slot)
     }
 
+    type GiftCodeInfoSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::PremiumGiftCodeInfo>>>,
+    >;
+
+    fn record_gift_code_info() -> (Promise<td_api::PremiumGiftCodeInfo>, GiftCodeInfoSlot) {
+        struct Rec(GiftCodeInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::PremiumGiftCodeInfo> for Rec {
+            fn set_value(&mut self, value: td_api::PremiumGiftCodeInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GiftCodeInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
     #[test]
     fn premium_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -31536,6 +31592,92 @@ mod tests {
                 assert_eq!(status.message(), "Can't access the chat");
             }
             other => panic!("the missing-peer arm: {other:?}"),
+        }
+
+        // 9. checkGiftCode — the creator resolves over the seeded user
+        //    (have_dialog_info_force), the giveaway message id drops
+        //    behind the non-channel creator, and the 91-day month
+        //    round-trip holds (30 * 3 + 1).
+        let (promise, slot) = record_gift_code_info();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.check_premium_gift_code(env, "GIFTSLUG", promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_checkGiftCode::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_CheckedGiftCode {
+            // the conditional fields ride flags.0/3/4 (to_id, msg id,
+            // from_id); used_date stays absent
+            flags: 1 | 8 | 16,
+            via_giveaway: true,
+            from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 700000001,
+            })),
+            giveaway_msg_id: 77,
+            to_id: 700000001,
+            date: 100,
+            days: 91,
+            used_date: 0,
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(info)) => {
+                assert!(matches!(
+                    info.creator_id,
+                    Some(td_api::MessageSender::messageSenderUser(_))
+                ));
+                assert_eq!(info.creation_date, 100);
+                assert!(info.is_from_giveaway);
+                assert_eq!(
+                    info.giveaway_message_id, 0,
+                    "the giveaway message id drops behind the user creator"
+                );
+                assert_eq!(info.month_count, 3, "the day round-trip holds");
+                assert_eq!(info.day_count, 91);
+                assert_eq!(info.user_id, 700000001);
+                assert_eq!(info.use_date, 0);
+            }
+            other => panic!("unexpected gift code info: {other:?}"),
+        }
+
+        // 10. checkGiftCode — the value bands: a non-positive date
+        //     answers the C++ 500.
+        let (promise, slot) = record_gift_code_info();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.check_premium_gift_code(env, "BAD", promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_checkGiftCode::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_CheckedGiftCode {
+            flags: 0,
+            via_giveaway: false,
+            from_id: None,
+            giveaway_msg_id: 0,
+            to_id: 0,
+            date: 0,
+            days: 30,
+            used_date: 0,
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(status.message(), "Receive invalid response");
+            }
+            other => panic!("the value-band arm: {other:?}"),
         }
 
         assert!(td.premium_net_completed.lock().is_empty(), "drained");

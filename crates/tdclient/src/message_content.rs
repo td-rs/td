@@ -3473,7 +3473,7 @@ pub trait MessageContentStorage {
 
 /// `get_premium_duration_day_count` (misc.cpp:423-429) — the legacy
 /// month-to-day conversion the `!has_days` GiftPremium/GiftCode parses run.
-fn get_premium_duration_day_count(month_count: i32) -> i32 {
+pub(crate) fn get_premium_duration_day_count(month_count: i32) -> i32 {
     if month_count <= 0 || month_count > 10_000_000 {
         return 7;
     }
@@ -3482,7 +3482,7 @@ fn get_premium_duration_day_count(month_count: i32) -> i32 {
 
 /// `get_premium_duration_month_count` (misc.cpp:419-421) — the
 /// day-to-month rounding the gift registrations compare by.
-fn get_premium_duration_month_count(day_count: i32) -> i32 {
+pub(crate) fn get_premium_duration_month_count(day_count: i32) -> i32 {
     std::cmp::max(1, day_count / 30)
 }
 
