@@ -58,7 +58,6 @@ use crate::td::CallEnv;
 use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
-use crate::td::QuickReplyEnv;
 use crate::td::ReactionEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
@@ -9663,58 +9662,41 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = QuickReplyEnv {
-                global: &mut td.global,
-            };
-            td.quick_reply_manager.set_quick_reply_shortcut_name(
-                &mut env,
-                request.shortcut_id,
-                &name,
-                promise,
-            );
+            let (mut manager, mut env) = crate::td::quick_reply_env_split(&mut *td);
+            manager.set_quick_reply_shortcut_name(&mut env, request.shortcut_id, &name, promise);
+            td.quick_reply_manager = manager;
         }
         Function::deleteQuickReplyShortcut(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = QuickReplyEnv {
-                global: &mut td.global,
-            };
-            td.quick_reply_manager.delete_quick_reply_shortcut(
-                &mut env,
-                request.shortcut_id,
-                promise,
-            );
+            let (mut manager, mut env) = crate::td::quick_reply_env_split(&mut *td);
+            manager.delete_quick_reply_shortcut(&mut env, request.shortcut_id, promise);
+            td.quick_reply_manager = manager;
         }
         Function::reorderQuickReplyShortcuts(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = QuickReplyEnv {
-                global: &mut td.global,
-            };
-            td.quick_reply_manager.reorder_quick_reply_shortcuts(
-                &mut env,
-                &request.shortcut_ids,
-                promise,
-            );
+            let (mut manager, mut env) = crate::td::quick_reply_env_split(&mut *td);
+            manager.reorder_quick_reply_shortcuts(&mut env, &request.shortcut_ids, promise);
+            td.quick_reply_manager = manager;
         }
         Function::deleteQuickReplyShortcutMessages(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = QuickReplyEnv {
-                global: &mut td.global,
-            };
-            td.quick_reply_manager.delete_quick_reply_shortcut_messages(
+            let (mut manager, mut env) = crate::td::quick_reply_env_split(&mut *td);
+            manager.delete_quick_reply_shortcut_messages(
                 &mut env,
                 request.shortcut_id,
                 &request.message_ids,
                 promise,
             );
+            td.quick_reply_manager = manager;
         }
 
         // Everything else waits for its manager step.

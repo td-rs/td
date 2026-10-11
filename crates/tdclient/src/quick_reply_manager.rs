@@ -4,8 +4,13 @@
 //! deleteMessages — the only quick-reply td_api arms in this revision).
 //! Recorded collapses: the Shortcut/QuickReplyMessage byte-exact
 //! store/parse + the object builders ride the M.9/M.10 content and
-//! reply-markup surfaces (unmerged); the eight query handlers are
-//! `[blocked: net]` env seams with parked promises.
+//! reply-markup surfaces (unmerged); the four shortcut queries ride the
+//! client-side dispatcher under their `QuickReplyNetKind` — the answers
+//! drain through `Td::on_quick_reply_net_answer` (the ok values drop,
+//! Promise<Unit>; the delete-messages error tail's
+//! `reload_quick_reply_messages` re-entry rides the messages plane and
+//! parks as a logged note). The `messages.getQuickReplies` load machine
+//! stays a parked seam (messages plane).
 
 use crate::td_api;
 use tdutils::promise::Promise;
@@ -55,26 +60,46 @@ pub trait QuickReplyManagerEnv {
 
     fn send_update(&mut self, update: td_api::Update);
 
-    // ---- the query seams ([blocked: net]; the promises park) ----
+    // ---- the query sends — the dispatch happens at the env arms ----
     fn send_edit_quick_reply_shortcut_query(&mut self, shortcut_id: i32, name: &str) {
         tdutils::log_info!(
-            "Send messages.editQuickReplyShortcut({shortcut_id}, {name}) — [blocked: net]"
+            "Send messages.editQuickReplyShortcut({shortcut_id}, {name}) — [net-inert]"
         );
     }
     fn send_delete_quick_reply_shortcut_query(&mut self, shortcut_id: i32) {
-        tdutils::log_info!(
-            "Send messages.deleteQuickReplyShortcut({shortcut_id}) — [blocked: net]"
-        );
+        tdutils::log_info!("Send messages.deleteQuickReplyShortcut({shortcut_id}) — [net-inert]");
     }
     fn send_reorder_quick_replies_query(&mut self, shortcut_ids: &[i32]) {
-        tdutils::log_info!("Send messages.reorderQuickReplies — [blocked: net]");
+        tdutils::log_info!("Send messages.reorderQuickReplies — [net-inert]");
         let _ = shortcut_ids;
     }
     fn send_delete_quick_reply_messages_query(&mut self, shortcut_id: i32, message_ids: &[i64]) {
-        tdutils::log_info!(
-            "Send messages.deleteQuickReplyMessages({shortcut_id}) — [blocked: net]"
-        );
+        tdutils::log_info!("Send messages.deleteQuickReplyMessages({shortcut_id}) — [net-inert]");
         let _ = message_ids;
+    }
+}
+
+/// The quick-reply query kinds riding the dispatcher — the C++
+/// ResultHandler classes of QuickReplyManager.cpp:91-240.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum QuickReplyNetKind {
+    /// `EditQuickReplyShortcutQuery` (cpp:91) — answers Updates (dropped).
+    EditShortcut,
+    /// `DeleteQuickReplyShortcutQuery` (cpp:117) — answers Bool (dropped).
+    DeleteShortcut,
+    /// `ReorderQuickRepliesQuery` (cpp:144) — answers Bool (dropped).
+    Reorder,
+    /// `DeleteQuickReplyMessagesQuery` (cpp:209) — answers Updates
+    /// (dropped); the error tail re-enters `reload_quick_reply_messages`
+    /// with this shortcut id (cpp:233-237).
+    DeleteMessages { shortcut_id: i32 },
+}
+
+impl QuickReplyNetKind {
+    /// Whether `self` names the same query flow as `other` (the payload
+    /// rides only the error-arm reload note).
+    fn same_flow(self, other: Self) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
     }
 }
 
@@ -85,8 +110,12 @@ pub struct QuickReplyManager {
     /// `shortcuts_` — the id → name map (the full Shortcut records join
     /// the store/parse port).
     shortcuts: std::collections::BTreeMap<i32, String>,
-    /// The `()`-typed promises parked at their `[blocked: net]` query
-    /// sends.
+    /// The net-riding `(kind, promise)` pairs (the C++ handlers' own
+    /// promises; the `getQuickReplies` load machine keeps its separate
+    /// park below).
+    pub(crate) net_promises: Vec<(QuickReplyNetKind, Promise<()>)>,
+    /// The `()`-typed promises parked at the `messages.getQuickReplies`
+    /// load seam (the messages plane).
     pub net_blocked_promises: Vec<Promise<()>>,
 }
 
@@ -124,7 +153,8 @@ impl QuickReplyManager {
         };
         self.shortcuts.insert(shortcut_id, name.to_string());
         env.send_edit_quick_reply_shortcut_query(shortcut_id, name);
-        self.net_blocked_promises.push(promise);
+        self.net_promises
+            .push((QuickReplyNetKind::EditShortcut, promise));
     }
 
     /// `get_quick_reply_shortcuts` (QuickReplyManager.cpp:1126-1137).
@@ -148,7 +178,8 @@ impl QuickReplyManager {
             return promise.set_error(Status::error(400, "Shortcut not found"));
         }
         env.send_delete_quick_reply_shortcut_query(shortcut_id);
-        self.net_blocked_promises.push(promise);
+        self.net_promises
+            .push((QuickReplyNetKind::DeleteShortcut, promise));
     }
 
     /// `reorder_quick_reply_shortcuts` (QuickReplyManager.cpp:1447-1492).
@@ -165,7 +196,8 @@ impl QuickReplyManager {
             return promise.set_error(Status::error(400, "Shortcut not found"));
         }
         env.send_reorder_quick_replies_query(shortcut_ids);
-        self.net_blocked_promises.push(promise);
+        self.net_promises
+            .push((QuickReplyNetKind::Reorder, promise));
     }
 
     /// `delete_quick_reply_shortcut_messages` (QuickReplyManager.cpp).
@@ -180,7 +212,37 @@ impl QuickReplyManager {
             return promise.set_error(Status::error(400, "Shortcut not found"));
         }
         env.send_delete_quick_reply_messages_query(shortcut_id, message_ids);
-        self.net_blocked_promises.push(promise);
+        self.net_promises
+            .push((QuickReplyNetKind::DeleteMessages { shortcut_id }, promise));
+    }
+
+    /// Route one net answer by kind — the C++ `on_result`/`on_error`
+    /// halves (QuickReplyManager.cpp:104-113/129-138/159-168/226-240):
+    /// the ok value drops and the promise resolves Unit; the
+    /// delete-messages error tail would re-enter
+    /// `reload_quick_reply_messages(shortcut_id)` (cpp:234), which
+    /// rides the messages plane — it parks as a logged note until that
+    /// plane lands.
+    pub(crate) fn on_net_answer(&mut self, kind: QuickReplyNetKind, result: Result<(), Status>) {
+        let Some(index) = self
+            .net_promises
+            .iter()
+            .position(|(pending, _)| pending.same_flow(kind))
+        else {
+            return;
+        };
+        let (_, mut promise) = self.net_promises.remove(index);
+        match result {
+            Ok(()) => promise.set_value(()),
+            Err(status) => {
+                if let QuickReplyNetKind::DeleteMessages { shortcut_id } = kind {
+                    tdutils::log_info!(
+                        "Reload quick reply messages {shortcut_id} — [messages plane]"
+                    );
+                }
+                promise.set_error(status);
+            }
+        }
     }
 }
 
@@ -245,7 +307,7 @@ mod tests {
         let (promise, recorded) = record();
         manager.set_quick_reply_shortcut_name(&mut env, 1, "second", promise);
         assert!(env.queries.iter().any(|q| q == "edit 1 second"));
-        assert_eq!(manager.net_blocked_promises.len(), 1);
+        assert_eq!(manager.net_promises.len(), 1);
         assert!(!recorded.0.lock().unwrap().is_some(), "the promise parks");
 
         // unknown shortcut errors
@@ -263,6 +325,7 @@ mod tests {
         let (promise, _) = record();
         manager.delete_quick_reply_shortcut(&mut env, 1, promise);
         assert!(env.queries.iter().any(|q| q == "delete 1"));
+        assert_eq!(manager.net_promises.len(), 2, "the delete parks too");
         let (promise, recorded) = record();
         manager.delete_quick_reply_shortcut(&mut env, 1, promise);
         assert!(recorded.0.lock().unwrap().is_some(), "already deleted");

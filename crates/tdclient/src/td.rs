@@ -39,7 +39,7 @@ use std::sync::Arc;
 use crate::boost_manager::{BoostManager, BoostManagerEnv};
 use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 use crate::premium::{PremiumEnv, PremiumManager};
-use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
+use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv, QuickReplyNetKind};
 use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
@@ -3015,6 +3015,11 @@ pub(crate) enum AutoDownloadNetKind {
 /// use — the answers drain through [`Td::on_auto_download_net_answer`].
 type AutoDownloadNetHandle = NetKindHandle<AutoDownloadNetKind>;
 
+/// The cloned quick-reply dispatch surface the [`QuickReplyEnv`]
+/// senders use — the answers drain through
+/// [`Td::on_quick_reply_net_answer`].
+type QuickReplyNetHandle = NetKindHandle<QuickReplyNetKind>;
+
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
     /// The `GetAutoDownloadSettingsQuery` promise (cpp:35).
@@ -3857,6 +3862,9 @@ pub struct Td {
     auto_download_net_completed: Arc<Mutex<Vec<(AutoDownloadNetKind, NetQuery)>>>,
     /// The parked auto-download promises.
     auto_download_promises: Vec<PendingAutoDownloadQuery>,
+    /// The callback-parked quick-reply query answers (the
+    /// `Td::on_quick_reply_net_answer` drain).
+    quick_reply_net_completed: Arc<Mutex<Vec<(QuickReplyNetKind, NetQuery)>>>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4298,6 +4306,7 @@ impl Td {
             privacy_promises: Vec::new(),
             auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
             auto_download_promises: Vec::new(),
+            quick_reply_net_completed: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -6450,6 +6459,7 @@ impl Td {
         self.dispatch_completed_translation_net();
         self.dispatch_completed_privacy_net();
         self.dispatch_completed_auto_download_net();
+        self.dispatch_completed_quick_reply_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6578,6 +6588,15 @@ impl Td {
         Some(AutoDownloadNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.auto_download_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned quick-reply dispatch surface.
+    fn quick_reply_net(&self) -> Option<QuickReplyNetHandle> {
+        Some(QuickReplyNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.quick_reply_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7727,6 +7746,46 @@ impl Td {
             self.on_auto_download_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked quick-reply answers — the C++
+    /// ResultHandler halves (QuickReplyManager.cpp:91-240).
+    fn dispatch_completed_quick_reply_net(&mut self) {
+        let completed = std::mem::take(&mut *self.quick_reply_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_quick_reply_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one quick-reply net answer by kind — the ok values drop
+    /// (`Promise<Unit>`); the delete-messages error tail logs the
+    /// deferred `reload_quick_reply_messages` re-entry (the messages
+    /// plane).
+    fn on_quick_reply_net_answer(&mut self, kind: QuickReplyNetKind, query: NetQuery) {
+        if query.is_error() {
+            let mut manager = std::mem::take(&mut self.quick_reply_manager);
+            manager.on_net_answer(kind, Err(query.error().clone()));
+            self.quick_reply_manager = manager;
+            return;
+        }
+        // `fetch_result` only unwraps — the ok values drop; the parse
+        // validates the constructor the C++ fetches.
+        let parsed = match kind {
+            QuickReplyNetKind::EditShortcut | QuickReplyNetKind::DeleteMessages { .. } => {
+                telegram_api::Updates::parse(query.ok())
+                    .map(|_| ())
+                    .map_err(|_| Status::error(500, "Failed to parse the quick-reply answer"))
+            }
+            QuickReplyNetKind::DeleteShortcut | QuickReplyNetKind::Reorder => {
+                parse_wire_bool_value(query.ok())
+                    .map(|_| ())
+                    .ok_or_else(|| Status::error(500, "Failed to parse the quick-reply answer"))
+            }
+        };
+        let mut manager = std::mem::take(&mut self.quick_reply_manager);
+        manager.on_net_answer(kind, parsed);
+        self.quick_reply_manager = manager;
     }
 
     /// Route one auto-download net answer by kind (the C++ query handler
@@ -17761,17 +17820,96 @@ impl PremiumEnv for PremiumTdEnv<'_> {
     fn send_update(&mut self, _update: td_api::Update) {}
 }
 
-/// The quick-reply env over the `Td` fields.
+/// The quick-reply env over the whole `Td` — the send arms hand the
+/// `Td` remainder to the env (the `PrivacyEnv` convention).
 pub(crate) struct QuickReplyEnv<'a> {
-    pub(crate) global: &'a mut Global,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The [`QuickReplyEnv`] split — the manager out, the env over the
+/// `Td` remainder (the `privacy_env_split` convention).
+pub(crate) fn quick_reply_env_split(
+    td: &mut Td,
+) -> (
+    crate::quick_reply_manager::QuickReplyManager,
+    QuickReplyEnv<'_>,
+) {
+    let manager = std::mem::take(&mut td.quick_reply_manager);
+    (manager, QuickReplyEnv { td })
 }
 
 impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn send_update(&mut self, _update: td_api::Update) {}
+
+    // The four sends (QuickReplyManager.cpp:99/125/153/220) — the
+    // `Promise<Unit>` handlers park at the manager lot.
+    fn send_edit_quick_reply_shortcut_query(&mut self, shortcut_id: i32, name: &str) {
+        match self.td.quick_reply_net() {
+            Some(net) => net.dispatch(
+                QuickReplyNetKind::EditShortcut,
+                telegram_api::Function::messages_editQuickReplyShortcut(
+                    telegram_api::messages_editQuickReplyShortcut {
+                        shortcut_id,
+                        shortcut: name.to_string(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.editQuickReplyShortcut({shortcut_id}, {name}) — [net-inert]"
+            ),
+        }
+    }
+
+    fn send_delete_quick_reply_shortcut_query(&mut self, shortcut_id: i32) {
+        match self.td.quick_reply_net() {
+            Some(net) => net.dispatch(
+                QuickReplyNetKind::DeleteShortcut,
+                telegram_api::Function::messages_deleteQuickReplyShortcut(
+                    telegram_api::messages_deleteQuickReplyShortcut { shortcut_id },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.deleteQuickReplyShortcut({shortcut_id}) — [net-inert]"
+            ),
+        }
+    }
+
+    fn send_reorder_quick_replies_query(&mut self, shortcut_ids: &[i32]) {
+        match self.td.quick_reply_net() {
+            Some(net) => net.dispatch(
+                QuickReplyNetKind::Reorder,
+                telegram_api::Function::messages_reorderQuickReplies(
+                    telegram_api::messages_reorderQuickReplies {
+                        order: shortcut_ids.to_vec(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.reorderQuickReplies — [net-inert]");
+            }
+        }
+    }
+
+    fn send_delete_quick_reply_messages_query(&mut self, shortcut_id: i32, message_ids: &[i64]) {
+        match self.td.quick_reply_net() {
+            Some(net) => net.dispatch(
+                QuickReplyNetKind::DeleteMessages { shortcut_id },
+                telegram_api::Function::messages_deleteQuickReplyMessages(
+                    telegram_api::messages_deleteQuickReplyMessages {
+                        shortcut_id,
+                        id: message_ids.iter().map(|&id| id as i32).collect(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.deleteQuickReplyMessages({shortcut_id}) — [net-inert]"
+            ),
+        }
+    }
 }
 
 /// The boost-plane env over the `Td` fields.
@@ -30447,6 +30585,131 @@ mod tests {
         assert!(
             td.send_message_net_completed.lock().is_empty(),
             "the shortSentMessage answer drained"
+        );
+    }
+
+    // ---- the quick-reply net slice: the four shortcut queries ride
+    // the dispatcher (QuickReplyManager.cpp:91-240). ----
+
+    #[test]
+    fn quick_reply_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(quick_reply_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn quick_reply_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-quick-reply");
+
+        // Seed the shortcut map (the updateQuickReplyShortcut intake).
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.on_update_quick_reply_shortcut(&mut env, 1, "first".to_string());
+            td.quick_reply_manager = manager;
+        }
+
+        // 1. editQuickReplyShortcut — answers Updates (the value drops).
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.set_quick_reply_shortcut_name(&mut env, 1, "second", promise);
+            td.quick_reply_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_editQuickReplyShortcut::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::Updates::updatesTooLong(telegram_api::updatesTooLong).store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_quick_reply_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. deleteQuickReplyShortcut — answers Bool (the value drops).
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.delete_quick_reply_shortcut(&mut env, 1, promise);
+            td.quick_reply_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_deleteQuickReplyShortcut::ID
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(false));
+        td.dispatch_completed_quick_reply_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the delete-messages error tail — the promise errors and the
+        //    reload re-entry parks at the messages plane (logged).
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.on_update_quick_reply_shortcut(&mut env, 2, "notes".to_string());
+            td.quick_reply_manager = manager;
+        }
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.delete_quick_reply_shortcut_messages(&mut env, 2, &[100], promise);
+            td.quick_reply_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_deleteQuickReplyMessages::ID
+        );
+        net_fail(sent.into_iter().next().unwrap(), 400, "MESSAGE_IDS_INVALID");
+        td.dispatch_completed_quick_reply_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "MESSAGE_IDS_INVALID");
+            }
+            other => panic!("the error tail answers 400: {other:?}"),
+        }
+
+        // 4. reorderQuickReplies — answers Bool (the value drops).
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.on_update_quick_reply_shortcut(&mut env, 3, "third".to_string());
+            td.quick_reply_manager = manager;
+        }
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.reorder_quick_reply_shortcuts(&mut env, &[3, 2], promise);
+            td.quick_reply_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_reorderQuickReplies::ID
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_quick_reply_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        assert!(td.quick_reply_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.quick_reply_manager.net_promises.is_empty(),
+            "all promises resolved"
         );
     }
 }
