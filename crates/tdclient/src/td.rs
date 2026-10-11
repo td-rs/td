@@ -7845,10 +7845,14 @@ impl Td {
             PremiumNetKind::GetPremiumGiftCodeOptions => {
                 if let Some(promise) = self.premium_manager.take_gift_options_promise() {
                     let result = if query.is_error() {
-                        Err(query.error().clone())
+                        tdutils::status::Result::Err(query.error().clone())
                     } else {
-                        parse_vector_premium_gift_code_option(query.ok())
-                            .ok_or_else(|| parse_error("payments_getPremiumGiftCodeOptions"))
+                        match parse_vector_premium_gift_code_option(query.ok()) {
+                            Some(options) => tdutils::status::Result::Ok(options),
+                            None => tdutils::status::Result::Err(parse_error(
+                                "payments_getPremiumGiftCodeOptions",
+                            )),
+                        }
                     };
                     let mut manager = std::mem::take(&mut self.premium_manager);
                     manager.on_get_premium_gift_options(result, promise);
@@ -17981,34 +17985,182 @@ impl StatisticsManagerEnv for StatisticsEnv<'_> {
     }
 }
 
-/// The premium-plane env over the option manager.
+/// The premium-plane env over the whole `Td` — the request arms take the
+/// manager out of `Td` and hand the remainder to the env (the
+/// `privacy_env_split` convention), so the send legs resolve peers,
+/// chats and users through the real managers.
 pub(crate) struct PremiumTdEnv<'a> {
-    pub(crate) options: Option<&'a mut OptionManager>,
-    /// The cloned premium dispatch surface (the `AccountEnv` owned-net
-    /// convention) — `None` keeps the net-inert posture.
-    pub(crate) net: Option<PremiumNetHandle>,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out for the premium manager — the
+/// manager out, the env over the `Td` remainder (the `privacy_env_split`
+/// convention).
+pub(crate) fn premium_env_split(td: &mut Td) -> (crate::premium::PremiumManager, PremiumTdEnv<'_>) {
+    let manager = std::mem::take(&mut td.premium_manager);
+    (manager, PremiumTdEnv { td })
 }
 
 impl PremiumEnv for PremiumTdEnv<'_> {
     fn get_option_integer(&self, name: &str) -> i64 {
-        self.options
+        self.td
+            .option_manager
             .as_ref()
             .map_or(0, |options| options.get_option_integer(name, 0))
     }
 
     fn get_option_string(&self, name: &str, default_value: &str) -> String {
-        self.options.as_ref().map_or_else(
+        self.td.option_manager.as_ref().map_or_else(
             || default_value.to_string(),
             |options| options.get_option_string(name, default_value),
         )
     }
 
-    fn send_update(&mut self, _update: td_api::Update) {}
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(td_api::Object::from(update));
+    }
+
+    // The whole-Td reads (DialogManager/ChatManager/UserManager) — the
+    // `PrivacyEnv`/`TdSponsoredEnv` arms over the same managers.
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        crate::dialog_manager::have_dialog_force(self.td, dialog_id, source)
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.td.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &tdutils::status::Status,
+        source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let options = self.td.option_manager.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut self.td.global,
+                options,
+                auth_is_bot: self.td.auth_manager.is_bot(),
+            };
+            self.td.user_manager.on_get_users(&mut env, users, source);
+        }
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let options = self.td.option_manager.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut self.td.global,
+                options,
+                auth_is_bot: self.td.auth_manager.is_bot(),
+            };
+            self.td
+                .chat_manager
+                .on_get_chats(&mut self.td.user_manager, &mut env, chats, source);
+        }
+    }
+
+    fn have_channel_force(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        source: &str,
+    ) -> bool {
+        let options = self.td.option_manager.as_mut();
+        let Some(options) = options else {
+            return false;
+        };
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options,
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.chat_manager.have_channel_force(
+            &mut self.td.user_manager,
+            &mut env,
+            channel_id,
+            source,
+        )
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+        _force_read: bool,
+    ) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("premium calls run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        match self.td.user_manager.get_input_user(&env, user_id) {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn have_dialog_info_force(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> bool {
+        crate::dialog_manager::have_dialog_info_force(self.td, dialog_id, source)
+    }
+
+    fn get_message_sender_object(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> td_api::MessageSender {
+        crate::dialog_manager::get_message_sender_object(self.td, dialog_id, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("premium calls run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
 
     // The two landed sends (Premium.cpp:50-53/583-585) — the answers
     // drain through `Td::on_premium_net_answer`.
     fn send_get_premium_gift_options_query(&mut self) {
-        match self.net.clone() {
+        match self.td.premium_net() {
             Some(net) => net.dispatch(
                 PremiumNetKind::GetPremiumGiftCodeOptions,
                 telegram_api::Function::payments_getPremiumGiftCodeOptions(
@@ -18025,7 +18177,7 @@ impl PremiumEnv for PremiumTdEnv<'_> {
     }
 
     fn send_apply_gift_code_query(&mut self, code: &str) {
-        match self.net.clone() {
+        match self.td.premium_net() {
             Some(net) => net.dispatch(
                 PremiumNetKind::ApplyGiftCode,
                 telegram_api::Function::payments_applyGiftCode(
@@ -30872,12 +31024,7 @@ mod tests {
         td: &mut Td,
         f: impl FnOnce(&mut crate::premium::PremiumManager, &mut PremiumTdEnv<'_>),
     ) {
-        let mut manager = std::mem::take(&mut td.premium_manager);
-        let premium_net = td.premium_net();
-        let mut env = PremiumTdEnv {
-            options: td.option_manager.as_mut(),
-            net: premium_net,
-        };
+        let (mut manager, mut env) = premium_env_split(td);
         f(&mut manager, &mut env);
         td.premium_manager = manager;
     }

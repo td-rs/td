@@ -57,7 +57,6 @@ use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
-use crate::td::PremiumTdEnv;
 use crate::td::ReactionEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
@@ -9708,13 +9707,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |l: td_api::PremiumLimit| Object::premiumLimit(l));
-            let premium_net = td.premium_net();
-            let env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager
-                .get_premium_limit(&env, &request.limit_type, promise);
+            let (manager, env) = crate::td::premium_env_split(&mut *td);
+            manager.get_premium_limit(&env, &request.limit_type, promise);
+            td.premium_manager = manager;
         }
         Function::getPremiumFeatures(request) => {
             if !check_is_user(td, id) {
@@ -9723,12 +9718,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let _ = request.source;
             let promise =
                 td.deferred_promise(id, |f: td_api::PremiumFeatures| Object::premiumFeatures(f));
-            let premium_net = td.premium_net();
-            let env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.get_premium_features(&env, promise);
+            let (manager, env) = crate::td::premium_env_split(&mut *td);
+            manager.get_premium_features(&env, promise);
+            td.premium_manager = manager;
         }
         Function::getBusinessFeatures(_) => {
             if !check_is_user(td, id) {
@@ -9737,12 +9729,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |f: td_api::BusinessFeatures| {
                 Object::businessFeatures(f)
             });
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.get_business_features(&mut env, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.get_business_features(&mut env, promise);
+            td.premium_manager = manager;
         }
         Function::viewPremiumFeature(_) => {
             if !check_is_user(td, id) {
@@ -9768,12 +9757,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::PremiumState| Object::premiumState(s));
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.get_premium_state(&mut env, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.get_premium_state(&mut env, promise);
+            td.premium_manager = manager;
         }
         Function::getPremiumGiftPaymentOptions(_) => {
             if !check_is_user(td, id) {
@@ -9782,13 +9768,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |o: td_api::PremiumGiftPaymentOptions| {
                 Object::premiumGiftPaymentOptions(o)
             });
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager
-                .get_premium_gift_payment_options(&mut env, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.get_premium_gift_payment_options(&mut env, promise);
+            td.premium_manager = manager;
         }
         Function::getPremiumGiveawayPaymentOptions(request) => {
             if !check_is_user(td, id) {
@@ -9797,16 +9779,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |o: td_api::PremiumGiveawayPaymentOptions| {
                 Object::premiumGiveawayPaymentOptions(o)
             });
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.get_premium_giveaway_options(
-                &mut env,
-                request.boosted_chat_id,
-                promise,
-            );
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.get_premium_giveaway_options(&mut env, request.boosted_chat_id, promise);
+            td.premium_manager = manager;
         }
         Function::checkPremiumGiftCode(request) => {
             if !check_is_user(td, id) {
@@ -9818,13 +9793,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |i: td_api::PremiumGiftCodeInfo| {
                 Object::premiumGiftCodeInfo(i)
             });
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager
-                .check_premium_gift_code(&mut env, &code, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.check_premium_gift_code(&mut env, &code, promise);
+            td.premium_manager = manager;
         }
         Function::applyPremiumGiftCode(request) => {
             if !check_is_user(td, id) {
@@ -9834,44 +9805,33 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager
-                .apply_premium_gift_code(&mut env, &code, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.apply_premium_gift_code(&mut env, &code, promise);
+            td.premium_manager = manager;
         }
         Function::giftPremiumWithStars(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.gift_premium_with_stars(
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.gift_premium_with_stars(
                 &mut env,
                 request.user_id,
                 request.star_count,
                 request.month_count,
                 promise,
             );
+            td.premium_manager = manager;
         }
         Function::assignStoreTransaction(_) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager
-                .assign_store_transaction(&mut env, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.assign_store_transaction(&mut env, promise);
+            td.premium_manager = manager;
         }
 
         // Everything else waits for its manager step.
@@ -16253,12 +16213,9 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.can_purchase_premium(&mut env, promise);
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.can_purchase_premium(&mut env, promise);
+            td.premium_manager = manager;
         }
         _ => run_proxy_network_requests(td, id, function),
     }
@@ -17426,17 +17383,14 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::GiveawayInfo, _>(id, Object::from);
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.get_premium_giveaway_info(
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.get_premium_giveaway_info(
                 &mut env,
                 request.chat_id,
                 request.message_id,
                 promise,
             );
+            td.premium_manager = manager;
         }
         Function::launchPrepaidGiveaway(request) => {
             // Requests.cpp:9080-9085 → Premium.cpp:710-717: the
@@ -17447,12 +17401,8 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let premium_net = td.premium_net();
-            let mut env = PremiumTdEnv {
-                options: td.option_manager.as_mut(),
-                net: premium_net,
-            };
-            td.premium_manager.launch_prepaid_premium_giveaway(
+            let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
+            manager.launch_prepaid_premium_giveaway(
                 &mut env,
                 request.giveaway_id,
                 request.parameters.as_ref(),
@@ -17460,6 +17410,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 request.star_count,
                 promise,
             );
+            td.premium_manager = manager;
         }
         Function::processPushNotification(request) => {
             // Requests.cpp:2403-2409 — CHECK_IS_USER + the payload clean;

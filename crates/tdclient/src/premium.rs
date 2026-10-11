@@ -6,27 +6,32 @@
 //! re-enters `on_get_updates` with the promise) and
 //! `payments.getPremiumGiftCodeOptions` (the filter/star-price/discount
 //! conversion at [`PremiumManager::on_get_premium_gift_options`], the
-//! sticker leg parked at the stickers plane). The remaining ten flows
-//! (giveaway options/info, checkGiftCode, the store-purpose trio, the
-//! promo) join in follow-up slices.
+//! sticker leg parked at the stickers plane). The env is the whole-Td
+//! shape (the [`crate::td::PremiumTdEnv`] widening — the PrivacyEnv
+//! convention), so the remaining flows (giveaway options/info,
+//! checkGiftCode, the store-purpose trio, the promo) resolve
+//! peers/chats/users through the same trait.
 
+use crate::chat_manager::{ChannelId, DialogParticipantStatus};
+use crate::dialog_id::DialogId;
 use crate::td_api;
+use crate::user_manager::{AccessRights, UserId};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
-use tdutils::status::Status;
+use tdutils::status::{Result, Status};
 
 /// `check_payment_amount` (Premium.cpp:184-192).
-pub fn check_payment_amount(currency: &str, amount: i64) -> Result<(), Status> {
+pub fn check_payment_amount(currency: &str, amount: i64) -> Result<()> {
     if amount <= 0 || !crate::misc::check_currency_amount(amount) {
-        return Err(Status::error(
+        return Result::Err(Status::error(
             400,
             "Invalid amount of the currency specified",
         ));
     }
     if crate::misc::clean_input_string(currency).is_none() {
-        return Err(Status::error(400, "Strings must be encoded in UTF-8"));
+        return Result::Err(Status::error(400, "Strings must be encoded in UTF-8"));
     }
-    Ok(())
+    Result::Ok(())
 }
 
 /// `get_premium_limit_keys` (Premium.cpp:932-957).
@@ -121,13 +126,71 @@ pub fn get_premium_limit_object(
     })
 }
 
-/// The `G()`/`td_` surface of the premium plane.
+/// The `G()`/`td_` surface of the premium plane — the options reads plus
+/// the whole-Td resolution methods the C++ free functions over `Td`
+/// need (the §3 step 1b widening; the arms mirror the landed
+/// `PrivacyEnv`/`PaymentsEnv`/`TdSponsoredEnv` shapes over `Td`).
 pub trait PremiumEnv {
     fn get_option_integer(&self, name: &str) -> i64;
 
     fn get_option_string(&self, name: &str, default_value: &str) -> String;
 
     fn send_update(&mut self, update: td_api::Update);
+
+    // ---- the DialogManager/ChatManager/UserManager reads ----
+
+    /// `td_->dialog_manager_->have_dialog_force(dialog_id, source)`
+    /// (DialogManager.cpp:1536).
+    fn have_dialog_force(&mut self, dialog_id: DialogId, source: &str) -> bool;
+
+    /// `td_->chat_manager_->get_channel_status(channel_id)`
+    /// (ChatManager.cpp).
+    fn get_channel_status(&mut self, channel_id: ChannelId) -> DialogParticipantStatus;
+
+    /// `td_->dialog_manager_->get_input_peer(dialog_id, access_rights)`
+    /// (DialogManager.cpp:1377).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputPeer>;
+
+    /// `td_->dialog_manager_->on_get_dialog_error(dialog_id, status,
+    /// source)` (DialogManager.cpp:1996) — the ResultHandler `on_error`
+    /// intake.
+    fn on_get_dialog_error(&mut self, dialog_id: DialogId, status: &Status, source: &str);
+
+    /// `td_->user_manager_->on_get_users(users, source)`.
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str);
+
+    /// `td_->chat_manager_->on_get_chats(chats, source)`.
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str);
+
+    /// `td_->chat_manager_->have_channel_force(channel_id, source)`
+    /// (ChatManager.cpp:4963).
+    fn have_channel_force(&mut self, channel_id: ChannelId, source: &str) -> bool;
+
+    /// `td_->dialog_manager_->force_create_dialog(dialog_id, source,
+    /// force_read)` (DialogManager.cpp:1540).
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str, force_read: bool);
+
+    /// `td_->user_manager_->get_input_user(user_id)` (UserManager.cpp).
+    fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser>;
+
+    /// `td_->dialog_manager_->have_dialog_info_force(dialog_id, source)`
+    /// (DialogManager.cpp:1596).
+    fn have_dialog_info_force(&mut self, dialog_id: DialogId, source: &str) -> bool;
+
+    /// `get_message_sender_object(td, dialog_id, source)` — the free
+    /// function over the managers (dialog_manager).
+    fn get_message_sender_object(
+        &mut self,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> td_api::MessageSender;
+
+    /// `td_->user_manager_->get_user_id_object(user_id, source)`.
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64;
 
     // ---- the query sends — the dispatcher arms live at the Td env ----
     fn send_get_premium_promo_query(&mut self) {
@@ -360,7 +423,7 @@ impl PremiumManager {
     /// stickers plane — the None-leg convention.
     pub(crate) fn on_get_premium_gift_options(
         &mut self,
-        result: Result<Vec<telegram_api::PremiumGiftCodeOption>, Status>,
+        result: Result<Vec<telegram_api::PremiumGiftCodeOption>>,
         promise: Promise<td_api::PremiumGiftPaymentOptions>,
     ) {
         let mut promise = promise;
@@ -603,6 +666,58 @@ mod tests {
 
         fn send_update(&mut self, _update: td_api::Update) {}
 
+        // the whole-Td reads — the stub-inventory posture (the unloaded
+        // dialog/channel/user halves)
+        fn have_dialog_force(&mut self, _dialog_id: DialogId, _source: &str) -> bool {
+            false
+        }
+
+        fn get_channel_status(&mut self, _channel_id: ChannelId) -> DialogParticipantStatus {
+            DialogParticipantStatus::default()
+        }
+
+        fn get_input_peer(
+            &mut self,
+            _dialog_id: DialogId,
+            _access_rights: AccessRights,
+        ) -> Option<telegram_api::InputPeer> {
+            None
+        }
+
+        fn on_get_dialog_error(&mut self, _dialog_id: DialogId, _status: &Status, _source: &str) {}
+
+        fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
+
+        fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
+
+        fn have_channel_force(&mut self, _channel_id: ChannelId, _source: &str) -> bool {
+            false
+        }
+
+        fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str, _force_read: bool) {}
+
+        fn get_input_user(&mut self, _user_id: UserId) -> Result<telegram_api::InputUser> {
+            Result::from_status(Status::error(400, "User not found"))
+        }
+
+        fn have_dialog_info_force(&mut self, _dialog_id: DialogId, _source: &str) -> bool {
+            false
+        }
+
+        fn get_message_sender_object(
+            &mut self,
+            dialog_id: DialogId,
+            _source: &str,
+        ) -> td_api::MessageSender {
+            td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
+                chat_id: dialog_id.get(),
+            })
+        }
+
+        fn get_user_id_object(&mut self, user_id: UserId, _source: &str) -> i64 {
+            user_id.get()
+        }
+
         fn send_get_premium_promo_query(&mut self) {
             self.queries.push("getPremiumPromo".to_string());
         }
@@ -640,8 +755,8 @@ mod tests {
     #[test]
     fn payment_amount_validation() {
         assert!(check_payment_amount("USD", 100).is_ok());
-        assert!(check_payment_amount("USD", 0).is_err());
-        assert!(check_payment_amount("USD", 999_999_999_999_999).is_err());
+        assert!(check_payment_amount("USD", 0).is_error());
+        assert!(check_payment_amount("USD", 999_999_999_999_999).is_error());
     }
 
     #[test]
