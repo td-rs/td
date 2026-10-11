@@ -3020,6 +3020,10 @@ type AutoDownloadNetHandle = NetKindHandle<AutoDownloadNetKind>;
 /// [`Td::on_quick_reply_net_answer`].
 type QuickReplyNetHandle = NetKindHandle<QuickReplyNetKind>;
 
+/// The cloned theme dispatch surface the [`ThemeEnv`] senders use —
+/// the answers drain through [`Td::on_theme_net_answer`].
+pub(crate) type ThemeNetHandle = NetKindHandle<crate::theme_manager::ThemeNetKind>;
+
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
     /// The `GetAutoDownloadSettingsQuery` promise (cpp:35).
@@ -3865,6 +3869,9 @@ pub struct Td {
     /// The callback-parked quick-reply query answers (the
     /// `Td::on_quick_reply_net_answer` drain).
     quick_reply_net_completed: Arc<Mutex<Vec<(QuickReplyNetKind, NetQuery)>>>,
+    /// The callback-parked theme query answers (the
+    /// `Td::on_theme_net_answer` drain).
+    theme_net_completed: Arc<Mutex<Vec<(crate::theme_manager::ThemeNetKind, NetQuery)>>>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4307,6 +4314,7 @@ impl Td {
             auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
             auto_download_promises: Vec::new(),
             quick_reply_net_completed: Arc::new(Mutex::new(Vec::new())),
+            theme_net_completed: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -6460,6 +6468,7 @@ impl Td {
         self.dispatch_completed_privacy_net();
         self.dispatch_completed_auto_download_net();
         self.dispatch_completed_quick_reply_net();
+        self.dispatch_completed_theme_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6597,6 +6606,15 @@ impl Td {
         Some(QuickReplyNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.quick_reply_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned theme dispatch surface (the `ThemeEnv` senders).
+    pub(crate) fn theme_net(&self) -> Option<ThemeNetHandle> {
+        Some(ThemeNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.theme_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7756,6 +7774,82 @@ impl Td {
             self.on_quick_reply_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked theme answers — the C++ ResultHandler
+    /// halves (ThemeManager.cpp:44-170).
+    fn dispatch_completed_theme_net(&mut self) {
+        let completed = std::mem::take(&mut *self.theme_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_theme_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one theme net answer by kind into the manager intakes —
+    /// the C++ handler promises chain `on_get_*` through the actor
+    /// (ThemeManager.cpp:798-803/863-871/948-956/1024-1027).
+    fn on_theme_net_answer(&mut self, kind: crate::theme_manager::ThemeNetKind, query: NetQuery) {
+        let parse_error = || Status::error(500, "Failed to parse the theme answer");
+        let mut manager = std::mem::take(&mut self.theme_manager);
+        {
+            let mut env = ThemeEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
+                file_manager: std::sync::Arc::clone(&self.file_manager),
+                updates: &mut self.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+                file_reference_manager: &mut self.file_reference_manager,
+                documents_manager: &mut self.documents_manager,
+                audios: &mut self.audios_manager,
+                videos: &mut self.videos_manager,
+                voice_notes: &mut self.voice_notes_manager,
+                video_notes: &mut self.video_notes_manager,
+                background_manager: &mut self.background_manager,
+                background_updates: &mut self.background_updates,
+                theme_net: None,
+            };
+            match kind {
+                crate::theme_manager::ThemeNetKind::ChatThemes => {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        telegram_api::account_Themes::parse(query.ok()).map_err(|_| parse_error())
+                    };
+                    manager.on_get_chat_themes(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::PeerColors => {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        telegram_api::help_PeerColors::parse(query.ok()).map_err(|_| parse_error())
+                    };
+                    manager.on_get_accent_colors(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::PeerProfileColors => {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        telegram_api::help_PeerColors::parse(query.ok()).map_err(|_| parse_error())
+                    };
+                    manager.on_get_profile_accent_colors(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::UniqueGiftChatThemes => {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        telegram_api::account_ChatThemes::parse(query.ok())
+                            .map_err(|_| parse_error())
+                    };
+                    manager.on_get_unique_gift_chat_themes(&mut env, result);
+                }
+            }
+        }
+        self.theme_manager = manager;
     }
 
     /// Route one quick-reply net answer by kind — the ok values drop
@@ -10597,6 +10691,7 @@ impl Td {
     /// AuthManager.cpp:1552 call) — idempotent; the manager no-ops while
     /// unauthorized.
     fn init_theme_manager(&mut self) {
+        let theme_net = self.theme_net();
         let mut env = ThemeEnv {
             global: &mut self.global,
             options: self.option_manager.as_mut(),
@@ -10615,6 +10710,7 @@ impl Td {
             video_notes: &mut self.video_notes_manager,
             background_manager: &mut self.background_manager,
             background_updates: &mut self.background_updates,
+            theme_net,
         };
         self.theme_manager.init(&mut env);
         let attach_menu_updates = std::mem::take(&mut self.attach_menu_updates);
@@ -19097,6 +19193,9 @@ pub(crate) struct ThemeEnv<'a> {
     pub(crate) video_notes: &'a mut crate::video_notes_manager::VideoNotesManager,
     pub(crate) background_manager: &'a mut crate::background_manager::BackgroundManager,
     pub(crate) background_updates: &'a mut Vec<td_api::Update>,
+    /// The cloned theme dispatch surface (the `AccountEnv` owned-net
+    /// convention) — `None` keeps the net-inert posture.
+    pub(crate) theme_net: Option<ThemeNetHandle>,
 }
 
 impl crate::documents_manager::DocumentsManagerEnv for ThemeEnv<'_> {
@@ -19580,22 +19679,66 @@ impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
         None
     }
 
+    // The four sends (ThemeManager.cpp:52-54/78-80/104-106/130-132) —
+    // the answers drain through `Td::on_theme_net_answer`.
     fn send_get_chat_themes_query(&mut self, hash: i64) {
-        tdutils::log_info!("Send account.getChatThemes(hash = {hash}) — [blocked: net]");
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::ChatThemes,
+                telegram_api::Function::account_getChatThemes(
+                    telegram_api::account_getChatThemes { hash },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send account.getChatThemes(hash = {hash}) — [net-inert]");
+            }
+        }
     }
 
     fn send_get_peer_colors_query(&mut self, hash: i32) {
-        tdutils::log_info!("Send help.getPeerColors(hash = {hash}) — [blocked: net]");
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::PeerColors,
+                telegram_api::Function::help_getPeerColors(telegram_api::help_getPeerColors {
+                    hash,
+                }),
+            ),
+            None => {
+                tdutils::log_info!("Send help.getPeerColors(hash = {hash}) — [net-inert]");
+            }
+        }
     }
 
     fn send_get_peer_profile_colors_query(&mut self, hash: i32) {
-        tdutils::log_info!("Send help.getPeerProfileColors(hash = {hash}) — [blocked: net]");
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::PeerProfileColors,
+                telegram_api::Function::help_getPeerProfileColors(
+                    telegram_api::help_getPeerProfileColors { hash },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send help.getPeerProfileColors(hash = {hash}) — [net-inert]");
+            }
+        }
     }
 
     fn send_get_unique_gift_chat_themes_query(&mut self, offset: &str, limit: i32) {
-        tdutils::log_info!(
-            "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [blocked: net]"
-        );
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::UniqueGiftChatThemes,
+                telegram_api::Function::account_getUniqueGiftChatThemes(
+                    telegram_api::account_getUniqueGiftChatThemes {
+                        offset: offset.to_string(),
+                        limit,
+                        hash: 0,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [net-inert]"
+            ),
+        }
     }
 }
 
@@ -30586,6 +30729,190 @@ mod tests {
             td.send_message_net_completed.lock().is_empty(),
             "the shortSentMessage answer drained"
         );
+    }
+
+    // ---- the theme net slice: the four queries ride the dispatcher
+    // (ThemeManager.cpp:44-170). ----
+
+    type GiftThemesSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::GiftChatThemes>>>>;
+
+    fn record_gift_themes() -> (Promise<td_api::GiftChatThemes>, GiftThemesSlot) {
+        struct Rec(GiftThemesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::GiftChatThemes> for Rec {
+            fn set_value(&mut self, value: td_api::GiftChatThemes) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GiftThemesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn theme_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(theme_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn theme_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-theme");
+
+        // 1. reload_chat_themes — the account.themes answer lands in the
+        //    intake (the update fires).
+        {
+            let theme_net = td.theme_net();
+            let mut manager = std::mem::take(&mut td.theme_manager);
+            let mut env = ThemeEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                updates: &mut td.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                documents_manager: &mut td.documents_manager,
+                audios: &mut td.audios_manager,
+                videos: &mut td.videos_manager,
+                voice_notes: &mut td.voice_notes_manager,
+                video_notes: &mut td.video_notes_manager,
+                background_manager: &mut td.background_manager,
+                background_updates: &mut td.background_updates,
+                theme_net,
+            };
+            manager.reload_chat_themes(&mut env);
+            td.theme_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getChatThemes::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_Themes::account_themes(telegram_api::account_themes {
+            hash: 7,
+            themes: Vec::new(),
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_theme_net();
+        assert!(
+            td.theme_updates
+                .iter()
+                .any(|u| matches!(u, td_api::Update::updateEmojiChatThemes(_))),
+            "the intake fired the chat-themes update"
+        );
+
+        // 2. getUniqueGiftChatThemes — the pager promise resolves with
+        //    the next offset.
+        let (promise, slot) = record_gift_themes();
+        {
+            let theme_net = td.theme_net();
+            let mut manager = std::mem::take(&mut td.theme_manager);
+            let mut env = ThemeEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                updates: &mut td.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                documents_manager: &mut td.documents_manager,
+                audios: &mut td.audios_manager,
+                videos: &mut td.videos_manager,
+                voice_notes: &mut td.voice_notes_manager,
+                video_notes: &mut td.video_notes_manager,
+                background_manager: &mut td.background_manager,
+                background_updates: &mut td.background_updates,
+                theme_net,
+            };
+            manager.get_unique_gift_chat_themes(&mut env, "off", 8, promise);
+            td.theme_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getUniqueGiftChatThemes::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_ChatThemes::account_chatThemes(telegram_api::account_chatThemes {
+            flags: 1,
+            hash: 0,
+            themes: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+            next_offset: "next".to_string(),
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_theme_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(themes)) => {
+                assert_eq!(themes.next_offset, "next");
+                assert!(themes.themes.is_empty());
+            }
+            other => panic!("unexpected gift themes result: {other:?}"),
+        }
+
+        // 3. the peer-colors notModified arm — the intake returns
+        //    without an update.
+        let updates_before = td.theme_updates.len();
+        {
+            let theme_net = td.theme_net();
+            let mut manager = std::mem::take(&mut td.theme_manager);
+            let mut env = ThemeEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                updates: &mut td.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                documents_manager: &mut td.documents_manager,
+                audios: &mut td.audios_manager,
+                videos: &mut td.videos_manager,
+                voice_notes: &mut td.voice_notes_manager,
+                video_notes: &mut td.video_notes_manager,
+                background_manager: &mut td.background_manager,
+                background_updates: &mut td.background_updates,
+                theme_net,
+            };
+            manager.reload_accent_colors(&mut env);
+            td.theme_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::help_getPeerColors::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::help_PeerColors::help_peerColorsNotModified(
+            telegram_api::help_peerColorsNotModified,
+        )
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_theme_net();
+        assert_eq!(td.theme_updates.len(), updates_before, "notModified no-ops");
+
+        assert!(td.theme_net_completed.lock().is_empty(), "drained");
     }
 
     // ---- the quick-reply net slice: the four shortcut queries ride

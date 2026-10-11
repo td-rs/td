@@ -9,9 +9,10 @@
 //! Seams:
 //! - The four `Td::ResultHandler` queries (`GetChatThemesQuery`,
 //!   `GetPeerColorsQuery`, `GetPeerProfileColorsQuery`,
-//!   `GetUniqueGiftChatThemesQuery`) are the [`ThemeManagerEnv`] query
-//!   seams — `[blocked: net]` with the get-unique-gift promise parked (the
-//!   M.31 convention); the three answer handlers are real and unit-tested.
+//!   `GetUniqueGiftChatThemesQuery`) ride the client-side dispatcher
+//!   under their `ThemeNetKind` — the answers drain through
+//!   `Td::on_theme_net_answer` into the three real, unit-tested intake
+//!   handlers and the parked get-unique-gift promises.
 //! - `ThemeSettings`' wallpaper rides
 //!   [`ThemeManagerEnv::on_get_theme_background`] — the
 //!   `BackgroundManager::on_get_background` collapse (BackgroundManager
@@ -1335,9 +1336,9 @@ impl ThemeSettings {
     }
 }
 
-/// The `G()`/`td_` surface of the manager. The net queries are the
-/// `[blocked: net]` query seams; the `send_update` outbox is drained by
-/// [`crate::td::Td::flush_user_updates`].
+/// The `G()`/`td_` surface of the manager. The four net queries ride
+/// the dispatcher at the `ThemeEnv` arms; the `send_update` outbox is
+/// drained by [`crate::td::Td::flush_user_updates`].
 pub trait ThemeManagerEnv {
     /// `td_->auth_manager_->is_authorized()`.
     fn is_authorized(&self) -> bool;
@@ -1414,39 +1415,53 @@ pub trait ThemeManagerEnv {
         None
     }
 
-    /// `GetChatThemesQuery::send` (ThemeManager.cpp:52-54) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`ThemeManager::on_get_chat_themes`].
+    /// `GetChatThemesQuery::send` (ThemeManager.cpp:52-54) — the
+    /// dispatcher arm lives at the `ThemeEnv` impl; the answer arrives
+    /// through [`ThemeManager::on_get_chat_themes`].
     fn send_get_chat_themes_query(&mut self, hash: i64) {
-        tdutils::log_info!("Send account.getChatThemes(hash = {hash}) — [blocked: net]");
+        tdutils::log_info!("Send account.getChatThemes(hash = {hash}) — [net-inert]");
     }
 
-    /// `GetPeerColorsQuery::send` (ThemeManager.cpp:78-80) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`ThemeManager::on_get_accent_colors`].
+    /// `GetPeerColorsQuery::send` (ThemeManager.cpp:78-80) — the
+    /// dispatcher arm lives at the `ThemeEnv` impl; the answer arrives
+    /// through [`ThemeManager::on_get_accent_colors`].
     fn send_get_peer_colors_query(&mut self, hash: i32) {
-        tdutils::log_info!("Send help.getPeerColors(hash = {hash}) — [blocked: net]");
+        tdutils::log_info!("Send help.getPeerColors(hash = {hash}) — [net-inert]");
     }
 
     /// `GetPeerProfileColorsQuery::send` (ThemeManager.cpp:104-106) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`ThemeManager::on_get_profile_accent_colors`].
+    /// the dispatcher arm lives at the `ThemeEnv` impl; the answer
+    /// arrives through [`ThemeManager::on_get_profile_accent_colors`].
     fn send_get_peer_profile_colors_query(&mut self, hash: i32) {
-        tdutils::log_info!("Send help.getPeerProfileColors(hash = {hash}) — [blocked: net]");
+        tdutils::log_info!("Send help.getPeerProfileColors(hash = {hash}) — [net-inert]");
     }
 
-    /// `GetUniqueGiftChatThemesQuery::send` (ThemeManager.cpp:130-132) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`ThemeManager::on_get_unique_gift_chat_themes`].
+    /// `GetUniqueGiftChatThemesQuery::send` (ThemeManager.cpp:130-132)
+    /// — the answers drain through `Td::on_theme_net_answer`.
     fn send_get_unique_gift_chat_themes_query(&mut self, offset: &str, limit: i32) {
         tdutils::log_info!(
-            "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [blocked: net]"
+            "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [net-inert]"
         );
     }
 }
 
-/// The parked get-unique-gift-chat-themes promise (the `[blocked: net]`
-/// convention; the C++ promise rides the ResultHandler).
+/// The theme query kinds riding the dispatcher — the C++ ResultHandler
+/// classes of ThemeManager.cpp:44-170.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ThemeNetKind {
+    /// `GetChatThemesQuery` (cpp:44) — answers `account_Themes`.
+    ChatThemes,
+    /// `GetPeerColorsQuery` (cpp:70) — answers `help_PeerColors`.
+    PeerColors,
+    /// `GetPeerProfileColorsQuery` (cpp:96) — answers `help_PeerColors`.
+    PeerProfileColors,
+    /// `GetUniqueGiftChatThemesQuery` (cpp:122) — answers
+    /// `account_ChatThemes`.
+    UniqueGiftChatThemes,
+}
+
+/// The parked get-unique-gift-chat-themes promise (the C++ promise
+/// rides the ResultHandler; answered by the net drain).
 struct PendingGiftThemesQuery {
     promise: Promise<td_api::GiftChatThemes>,
 }
@@ -1671,7 +1686,7 @@ impl ThemeManager {
     }
 
     /// `ThemeManager::on_get_chat_themes` (ThemeManager.cpp:808-862) — the
-    /// answer handler; the query send is the `[blocked: net]` seam.
+    /// answer handler; the query send rides the dispatcher.
     pub fn on_get_chat_themes(
         &mut self,
         env: &mut impl ThemeManagerEnv,

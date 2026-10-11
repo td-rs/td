@@ -9225,6 +9225,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |b: td_api::GiftChatThemes| Object::giftChatThemes(b));
+            let theme_net = td.theme_net();
             let mut env = ThemeEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -9243,6 +9244,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 video_notes: &mut td.video_notes_manager,
                 background_manager: &mut td.background_manager,
                 background_updates: &mut td.background_updates,
+                theme_net,
             };
             td.theme_manager
                 .get_unique_gift_chat_themes(&mut env, &offset, request.limit, promise);
