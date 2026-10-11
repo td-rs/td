@@ -229,10 +229,13 @@ pub trait PremiumEnv {
             "Send payments.launchPrepaidGiveaway({giveaway_id}, users = {user_count}, stars = {star_count}) — [blocked: net]"
         );
     }
-    fn send_get_giveaway_info_query(&mut self, dialog_id: i64, message_id: i64) {
-        tdutils::log_info!(
-            "Send payments.getGiveawayInfo({dialog_id}, {message_id}) — [blocked: net]"
-        );
+    fn send_get_giveaway_info_query(
+        &mut self,
+        dialog_id: i64,
+        _peer: telegram_api::InputPeer,
+        _msg_id: i32,
+    ) {
+        tdutils::log_info!("Send payments.getGiveawayInfo({dialog_id}) — [net-inert]");
     }
     fn send_can_purchase_premium_query(&mut self) {
         tdutils::log_info!("Send payments.canPurchasePremium — [blocked: net]");
@@ -283,6 +286,9 @@ pub(crate) enum PremiumNetKind {
     /// `GetPremiumGiveawayOptionsQuery` (cpp:458) — the boosted twin; the
     /// kind carries the boosted dialog for the `on_error` tail.
     GetPremiumGiveawayOptions { boosted_dialog_id: i64 },
+    /// `GetGiveawayInfoQuery` (cpp:726) — the kind carries the dialog for
+    /// the `on_error` tail.
+    GetGiveawayInfo { dialog_id: i64 },
 }
 
 /// The collapsed `PremiumManager` — a router over the query seams.
@@ -633,16 +639,172 @@ impl PremiumManager {
         self.net_blocked_promises.push(promise);
     }
 
-    /// `get_premium_giveaway_info` (Premium.cpp) — the query is the seam.
+    /// `get_premium_giveaway_info` (Premium.cpp:1437-1442) →
+    /// `MessagesManager::get_giveaway_message_id` (cpp:36676-36697): the
+    /// `get_message_force` + giveaway-content bands ride the M.10 seam,
+    /// the pure id bands run here →
+    /// `GetGiveawayInfoQuery::send` (cpp:741-748): the Read input peer
+    /// resolves at the send leg; the `None` arm is the handler's
+    /// `on_error` (cpp:820-824 — the dialog-error tail, then `set_error`).
     pub fn get_premium_giveaway_info(
         &mut self,
         env: &mut impl PremiumEnv,
         dialog_id: i64,
         message_id: i64,
-        promise: Promise<td_api::GiveawayInfo>,
+        mut promise: Promise<td_api::GiveawayInfo>,
     ) {
-        env.send_get_giveaway_info_query(dialog_id, message_id);
+        let full_message_id = crate::messages_manager::MessageId::new(message_id);
+        if full_message_id.is_scheduled() {
+            return promise.set_error(Status::error(400, "Wrong scheduled message identifier"));
+        }
+        let server_message_id = if full_message_id.is_server() {
+            full_message_id.get_server_message_id()
+        } else {
+            return promise.set_error(Status::error(400, "Wrong message identifier"));
+        };
+        let dialog = DialogId::new(dialog_id);
+        let input_peer = match env.get_input_peer(dialog, AccessRights::Read) {
+            Some(peer) => peer,
+            None => {
+                let status = Status::error(400, "Can't access the chat");
+                env.on_get_dialog_error(dialog, &status, "GetGiveawayInfoQuery");
+                return promise.set_error(status);
+            }
+        };
+        env.send_get_giveaway_info_query(dialog_id, input_peer, server_message_id.get());
         self.parked_giveaway_infos.push(promise);
+    }
+
+    /// `GetGiveawayInfoQuery::on_result`'s promise pop
+    /// (Premium.cpp:750-818).
+    pub(crate) fn take_giveaway_info_promise(&mut self) -> Option<Promise<td_api::GiveawayInfo>> {
+        if self.parked_giveaway_infos.is_empty() {
+            None
+        } else {
+            Some(self.parked_giveaway_infos.remove(0))
+        }
+    }
+
+    /// `GetGiveawayInfoQuery::on_result` (Premium.cpp:750-818) — the
+    /// `payments_giveawayInfo` participant-status ladder and the
+    /// `payments_giveawayInfoResults` winner-count clamps. The error arm
+    /// is `on_error` (cpp:820-824): the dialog-error tail, then
+    /// `set_error`.
+    pub(crate) fn on_get_giveaway_info(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        dialog_id: i64,
+        result: Result<telegram_api::payments_GiveawayInfo>,
+        mut promise: Promise<td_api::GiveawayInfo>,
+    ) {
+        let info = match result {
+            Result::Err(status) => {
+                env.on_get_dialog_error(DialogId::new(dialog_id), &status, "GetGiveawayInfoQuery");
+                return promise.set_error(status);
+            }
+            Result::Ok(info) => info,
+        };
+        match info {
+            telegram_api::payments_GiveawayInfo::payments_giveawayInfo(info) => {
+                // the participant-status ladder (cpp:757-777) — the
+                // unknown-admin-disallowed-chat arm logs and falls
+                // through the remaining bands
+                let status = if info.joined_too_early_date > 0 {
+                    Some(td_api::GiveawayParticipantStatus::giveawayParticipantStatusAlreadyWasMember(
+                        td_api::giveawayParticipantStatusAlreadyWasMember {
+                            joined_chat_date: info.joined_too_early_date,
+                        },
+                    ))
+                } else if info.admin_disallowed_chat_id > 0 {
+                    let channel_id =
+                        crate::chat_manager::ChannelId::new(info.admin_disallowed_chat_id);
+                    if !channel_id.is_valid()
+                        || !env.have_channel_force(channel_id, "GetGiveawayInfoQuery")
+                    {
+                        tdutils::log_error!(
+                            "Receive invalid admin disallowed chat {}",
+                            info.admin_disallowed_chat_id
+                        );
+                        None
+                    } else {
+                        let dialog = DialogId::from_channel_id(channel_id);
+                        env.force_create_dialog(dialog, "GetGiveawayInfoQuery", false);
+                        Some(
+                            td_api::GiveawayParticipantStatus::giveawayParticipantStatusAdministrator(
+                                td_api::giveawayParticipantStatusAdministrator {
+                                    chat_id: crate::dialog_manager::get_chat_id_object(
+                                        dialog,
+                                        "giveawayParticipantStatusAdministrator",
+                                    ),
+                                },
+                            ),
+                        )
+                    }
+                } else {
+                    None
+                };
+                let status = status.unwrap_or_else(|| {
+                    if !info.disallowed_country.is_empty() {
+                        td_api::GiveawayParticipantStatus::giveawayParticipantStatusDisallowedCountry(
+                            td_api::giveawayParticipantStatusDisallowedCountry {
+                                user_country_code: info.disallowed_country.clone(),
+                            },
+                        )
+                    } else if info.participating {
+                        td_api::GiveawayParticipantStatus::giveawayParticipantStatusParticipating(
+                            td_api::giveawayParticipantStatusParticipating,
+                        )
+                    } else {
+                        td_api::GiveawayParticipantStatus::giveawayParticipantStatusEligible(
+                            td_api::giveawayParticipantStatusEligible,
+                        )
+                    }
+                });
+                promise.set_value(td_api::GiveawayInfo::giveawayInfoOngoing(
+                    td_api::giveawayInfoOngoing {
+                        creation_date: std::cmp::max(0, info.start_date),
+                        status: Some(status),
+                        // the C++ passes `preparing_results` into the
+                        // `is_ended` field position (the scheme reuse)
+                        is_ended: info.preparing_results,
+                    },
+                ));
+            }
+            telegram_api::payments_GiveawayInfo::payments_giveawayInfoResults(info) => {
+                // the winner-count clamps (cpp:795-806)
+                let mut winner_count = info.winners_count;
+                let mut activated_count = info.activated_count;
+                if activated_count < 0 || activated_count > winner_count {
+                    tdutils::log_error!(
+                        "Receive invalid giveaway results: winners = {winner_count}, activated = {activated_count}"
+                    );
+                    if activated_count < 0 {
+                        activated_count = 0;
+                    }
+                    if winner_count < 0 {
+                        winner_count = 0;
+                    }
+                    if activated_count > winner_count {
+                        activated_count = winner_count;
+                    }
+                }
+                promise.set_value(td_api::GiveawayInfo::giveawayInfoCompleted(
+                    td_api::giveawayInfoCompleted {
+                        creation_date: std::cmp::max(0, info.start_date),
+                        actual_winners_selection_date: std::cmp::max(0, info.finish_date),
+                        was_refunded: info.refunded,
+                        is_winner: info.winner,
+                        winner_count,
+                        activation_count: activated_count,
+                        gift_code: info.gift_code_slug,
+                        won_star_count: crate::star_manager::get_star_count(
+                            info.stars_prize,
+                            false,
+                        ),
+                    },
+                ));
+            }
+        }
     }
 
     /// `can_purchase_premium` (Premium.cpp) — the query is the seam.

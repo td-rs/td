@@ -7885,6 +7885,26 @@ impl Td {
                     self.premium_manager = manager;
                 }
             }
+            // `GetGiveawayInfoQuery` (cpp:750-824) — the participant-status
+            // ladder / winner-count clamps convert at the manager; the
+            // error arm runs the dialog-error tail.
+            PremiumNetKind::GetGiveawayInfo { dialog_id } => {
+                if let Some(promise) = self.premium_manager.take_giveaway_info_promise() {
+                    let result = if query.is_error() {
+                        tdutils::status::Result::Err(query.error().clone())
+                    } else {
+                        match telegram_api::payments_GiveawayInfo::parse(query.ok()) {
+                            Ok(info) => tdutils::status::Result::Ok(info),
+                            Err(_) => tdutils::status::Result::Err(parse_error(
+                                "payments_getGiveawayInfo",
+                            )),
+                        }
+                    };
+                    let (mut manager, mut env) = premium_env_split(self);
+                    manager.on_get_giveaway_info(&mut env, dialog_id, result, promise);
+                    self.premium_manager = manager;
+                }
+            }
         }
     }
 
@@ -18239,6 +18259,31 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             None => tdutils::log_info!(
                 "Send payments.getPremiumGiftCodeOptions for {boosted_dialog_id} — [net-inert]"
             ),
+        }
+    }
+
+    // `GetGiveawayInfoQuery::send` (Premium.cpp:741-748) — the Read peer
+    // resolves at the manager's send leg; the kind carries the dialog for
+    // the `on_error` tail.
+    fn send_get_giveaway_info_query(
+        &mut self,
+        dialog_id: i64,
+        peer: telegram_api::InputPeer,
+        msg_id: i32,
+    ) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::GetGiveawayInfo { dialog_id },
+                telegram_api::Function::payments_getGiveawayInfo(
+                    telegram_api::payments_getGiveawayInfo {
+                        peer: Some(Box::new(peer)),
+                        msg_id,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.getGiveawayInfo({dialog_id}) — [net-inert]");
+            }
         }
     }
 }
@@ -31101,7 +31146,6 @@ mod tests {
     type GiveawayOptionsSlot = std::sync::Arc<
         std::sync::Mutex<Option<tdutils::status::Result<td_api::PremiumGiveawayPaymentOptions>>>,
     >;
-
     fn record_giveaway_options() -> (
         Promise<td_api::PremiumGiveawayPaymentOptions>,
         GiveawayOptionsSlot,
@@ -31116,6 +31160,23 @@ mod tests {
             }
         }
         let slot: GiveawayOptionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type GiveawayInfoSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::GiveawayInfo>>>>;
+
+    fn record_giveaway_info() -> (Promise<td_api::GiveawayInfo>, GiveawayInfoSlot) {
+        struct Rec(GiveawayInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::GiveawayInfo> for Rec {
+            fn set_value(&mut self, value: td_api::GiveawayInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GiveawayInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         (Promise::from_interface(Rec(slot.clone())), slot)
     }
 
@@ -31342,6 +31403,139 @@ mod tests {
                 assert_eq!(options.options[1].amount, 2400);
             }
             other => panic!("unexpected giveaway options result: {other:?}"),
+        }
+
+        // 6. getGiveawayInfo — the send leg resolves the Read peer over a
+        //    seeded user dialog; the payments_giveawayInfo answer walks
+        //    the participant-status ladder.
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.user_manager.on_get_user(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            telegram_api::User::user(telegram_api::user {
+                id: 700000001,
+                access_hash: 7,
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+        let server_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(1234),
+        );
+        let (promise, slot) = record_giveaway_info();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_giveaway_info(env, 700000001, server_message_id.get(), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent_query = take_sent(sent, telegram_api::payments_getGiveawayInfo::ID);
+        let mut answer = Vec::new();
+        telegram_api::payments_GiveawayInfo::payments_giveawayInfo(
+            telegram_api::payments_giveawayInfo {
+                flags: 0,
+                participating: true,
+                preparing_results: false,
+                start_date: -5,
+                joined_too_early_date: 0,
+                admin_disallowed_chat_id: 0,
+                disallowed_country: String::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent_query, answer);
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(td_api::GiveawayInfo::giveawayInfoOngoing(info))) => {
+                assert_eq!(info.creation_date, 0, "max(0, start_date)");
+                assert!(matches!(
+                    info.status,
+                    Some(
+                        td_api::GiveawayParticipantStatus::giveawayParticipantStatusParticipating(
+                            _
+                        )
+                    )
+                ));
+                assert!(!info.is_ended);
+            }
+            other => panic!("unexpected giveaway info result: {other:?}"),
+        }
+
+        // 7. getGiveawayInfo — the results arm clamps the winner counts
+        //    and the star prize converts.
+        let (promise, slot) = record_giveaway_info();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_giveaway_info(env, 700000001, server_message_id.get(), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent_query = take_sent(sent, telegram_api::payments_getGiveawayInfo::ID);
+        let mut answer = Vec::new();
+        telegram_api::payments_GiveawayInfo::payments_giveawayInfoResults(
+            telegram_api::payments_giveawayInfoResults {
+                // the conditional fields ride flags.2/3/4
+                flags: 4 | 8 | 16,
+                winner: true,
+                refunded: false,
+                start_date: 10,
+                gift_code_slug: "SLUG".to_string(),
+                stars_prize: 1000,
+                finish_date: -3,
+                winners_count: 2,
+                activated_count: 5,
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent_query, answer);
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(td_api::GiveawayInfo::giveawayInfoCompleted(
+                info,
+            ))) => {
+                assert_eq!(info.creation_date, 10);
+                assert_eq!(info.actual_winners_selection_date, 0, "max(0, finish_date)");
+                assert_eq!(info.winner_count, 2);
+                assert_eq!(info.activation_count, 2, "clamped into [0, winner_count]");
+                assert_eq!(info.gift_code, "SLUG");
+                assert_eq!(
+                    info.won_star_count,
+                    crate::star_manager::get_star_count(1000, false)
+                );
+            }
+            other => panic!("unexpected giveaway results: {other:?}"),
+        }
+
+        // 8. getGiveawayInfo — the missing-peer send arm (the channel
+        //    stub): "Can't access the chat", nothing dispatched.
+        let (promise, slot) = record_giveaway_info();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_giveaway_info(
+                env,
+                -1000000000000,
+                server_message_id.get(),
+                promise,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert!(sent.is_empty(), "no query without the Read peer");
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Can't access the chat");
+            }
+            other => panic!("the missing-peer arm: {other:?}"),
         }
 
         assert!(td.premium_net_completed.lock().is_empty(), "drained");
