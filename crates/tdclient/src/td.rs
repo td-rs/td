@@ -7969,6 +7969,25 @@ impl Td {
                     }
                 }
             }
+            // `LaunchPrepaidGiveawayQuery` (cpp:720-728) — the Updates
+            // answer re-enters `on_get_updates` with the promise.
+            PremiumNetKind::LaunchPrepaidGiveaway => {
+                if let Some(mut promise) = self.premium_manager.take_launch_prepaid_promise() {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            }),
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_launchPrepaidGiveaway"));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -18425,6 +18444,77 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         }
     }
 
+    // `LaunchPrepaidGiveawayQuery::send` (Premium.cpp:710-718) — the
+    // Write peer of the boosted channel + the purpose build (the
+    // premium/stars giveaway forms over the payments surface; the C++
+    // amount placeholder 12345).
+    fn send_launch_prepaid_giveaway_query(
+        &mut self,
+        giveaway_id: i64,
+        parameters: &crate::payments::GiveawayParameters,
+        user_count: i32,
+        star_count: i64,
+    ) {
+        let Some(net) = self.td.premium_net() else {
+            return tdutils::log_info!(
+                "Send payments.launchPrepaidGiveaway({giveaway_id}) — [net-inert]"
+            );
+        };
+        let dialog_id = parameters.get_boosted_dialog_id();
+        let input_peer = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        );
+        // the C++ CHECK(input_peer != nullptr)
+        let input_peer = match input_peer {
+            Some(peer) => peer,
+            None => panic!("launchPrepaidGiveaway has no input peer"),
+        };
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = self.td;
+        let mut payments_env = crate::td::PaymentsEnv {
+            global,
+            options: Some(
+                option_manager
+                    .as_mut()
+                    .expect("premium calls run with the initialized option manager"),
+            ),
+            auth_is_bot: auth_manager.is_bot(),
+            my_dialog_id,
+            user_manager,
+            chat_manager,
+        };
+        let purpose = if star_count == 0 {
+            parameters.get_input_store_payment_premium_giveaway(&mut payments_env, "", 0)
+        } else {
+            parameters.get_input_store_payment_stars_giveaway(
+                &mut payments_env,
+                "",
+                12345,
+                user_count,
+                star_count,
+            )
+        };
+        net.dispatch(
+            PremiumNetKind::LaunchPrepaidGiveaway,
+            telegram_api::Function::payments_launchPrepaidGiveaway(
+                telegram_api::payments_launchPrepaidGiveaway {
+                    peer: Some(Box::new(input_peer)),
+                    giveaway_id,
+                    purpose: Some(purpose),
+                },
+            ),
+        );
+    }
+
     // `get_input_store_payment_purpose` (Premium.cpp:220-300) — the
     // conversion runs over the payments surface; the field-split
     // payments env over the same Td (the `payments_arm` convention).
@@ -18454,6 +18544,36 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             chat_manager,
         };
         crate::premium::get_input_store_payment_purpose(&mut payments_env, purpose)
+    }
+
+    // `GiveawayParameters::get_giveaway_parameters`
+    // (GiveawayParameters.cpp:39-80) over the payments surface.
+    fn get_giveaway_parameters(
+        &mut self,
+        parameters: Option<&td_api::GiveawayParameters>,
+    ) -> tdutils::status::Result<crate::payments::GiveawayParameters> {
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = self.td;
+        let mut payments_env = crate::td::PaymentsEnv {
+            global,
+            options: Some(
+                option_manager
+                    .as_mut()
+                    .expect("premium calls run with the initialized option manager"),
+            ),
+            auth_is_bot: auth_manager.is_bot(),
+            my_dialog_id,
+            user_manager,
+            chat_manager,
+        };
+        crate::payments::GiveawayParameters::get_giveaway_parameters(&mut payments_env, parameters)
     }
 }
 
@@ -31953,6 +32073,31 @@ mod tests {
                 assert_eq!(status.message(), "Transaction must be non-empty");
             }
             other => panic!("the empty-transaction arm: {other:?}"),
+        }
+
+        // 16. launchPrepaidGiveaway — the parameters ladder runs over the
+        //     real payments env: the channel stub fails the boosted band
+        //     ("Chat to boost not found"), nothing dispatches.
+        let (promise, slot) = record_translation_unit();
+        let parameters = td_api::GiveawayParameters {
+            boosted_chat_id: -1000000000000,
+            additional_chat_ids: Vec::new(),
+            winners_selection_date: 2000000000,
+            only_new_members: false,
+            has_public_winners: true,
+            country_codes: Vec::new(),
+            prize_description: "Prize".to_string(),
+        };
+        with_premium_manager(&mut td, |manager, env| {
+            manager.launch_prepaid_premium_giveaway(env, 7, Some(&parameters), 10, 100, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert!(sent.is_empty(), "no query on the failed parameters ladder");
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Chat to boost not found");
+            }
+            other => panic!("the boosted-channel band: {other:?}"),
         }
 
         assert!(td.premium_net_completed.lock().is_empty(), "drained");

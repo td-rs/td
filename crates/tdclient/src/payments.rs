@@ -1644,6 +1644,12 @@ impl GiveawayParameters {
         })
     }
 
+    /// `GiveawayParameters::get_boosted_dialog_id` (GiveawayParameters.h:65-67)
+    /// — the channel-cast of the boosted channel.
+    pub(crate) fn get_boosted_dialog_id(&self) -> DialogId {
+        DialogId::from_channel_id(self.boosted_channel_id)
+    }
+
     /// `GiveawayParameters::get_input_store_payment_premium_giveaway`
     /// (GiveawayParameters.cpp:90-121).
     pub(crate) fn get_input_store_payment_premium_giveaway(

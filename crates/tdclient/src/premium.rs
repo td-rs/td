@@ -222,11 +222,12 @@ pub trait PremiumEnv {
     fn send_launch_prepaid_giveaway_query(
         &mut self,
         giveaway_id: i64,
+        _parameters: &crate::payments::GiveawayParameters,
         user_count: i32,
         star_count: i64,
     ) {
         tdutils::log_info!(
-            "Send payments.launchPrepaidGiveaway({giveaway_id}, users = {user_count}, stars = {star_count}) — [blocked: net]"
+            "Send payments.launchPrepaidGiveaway({giveaway_id}, users = {user_count}, stars = {star_count}) — [net-inert]"
         );
     }
     fn send_get_giveaway_info_query(
@@ -277,6 +278,19 @@ pub trait PremiumEnv {
         tdutils::log_info!(
             "dismiss_suggested_action({action_type:?}) — [blocked: suggested-action plane]"
         );
+    }
+
+    /// `GiveawayParameters::get_giveaway_parameters`
+    /// (GiveawayParameters.cpp:39-80) over the payments surface — the
+    /// launch-prepaid validation ladder; the Td env builds the
+    /// field-split payments env (the conversion-seam convention).
+    fn get_giveaway_parameters(
+        &mut self,
+        parameters: Option<&td_api::GiveawayParameters>,
+    ) -> Result<crate::payments::GiveawayParameters> {
+        let _ = parameters;
+        tdutils::log_info!("get_giveaway_parameters — [blocked: payments plane]");
+        Result::from_status(Status::error(500, "Not implemented yet"))
     }
 }
 
@@ -520,6 +534,9 @@ pub(crate) enum PremiumNetKind {
     /// `AssignAppStoreTransactionQuery`/`AssignPlayMarketTransactionQuery`
     /// (cpp:860/893) — the Updates answers re-enter `on_get_updates`.
     AssignStoreTransaction { is_app_store: bool },
+    /// `LaunchPrepaidGiveawayQuery` (cpp:700) — the Updates answer
+    /// re-enters `on_get_updates` with the promise.
+    LaunchPrepaidGiveaway,
 }
 
 /// The collapsed `PremiumManager` — a router over the query seams.
@@ -555,6 +572,9 @@ pub struct PremiumManager {
     /// The `()`-typed promises parked at the store-transaction assigns
     /// (the C++ handler promises chain into `on_get_updates`).
     pub(crate) pending_assign_store_transaction: Vec<Promise<()>>,
+    /// The `()`-typed promises parked at the launch-prepaid flow (the C++
+    /// `LaunchPrepaidGiveawayQuery` promise chains into `on_get_updates`).
+    pub(crate) pending_launch_prepaid: Vec<Promise<()>>,
 }
 
 impl PremiumManager {
@@ -965,11 +985,30 @@ impl PremiumManager {
         star_count: i64,
         mut promise: Promise<()>,
     ) {
-        let Some(_parameters) = parameters else {
+        // `GiveawayParameters::get_giveaway_parameters`
+        // (GiveawayParameters.cpp:39-80) — the non-empty head band answers
+        // the 400 first (the C++ head of the builder), then the
+        // boosted/additional-channel + date + country ladder over the
+        // payments surface.
+        if parameters.is_none() {
             return promise.set_error(Status::error(400, "Giveaway parameters must be non-empty"));
+        }
+        let parameters = match env.get_giveaway_parameters(parameters) {
+            Result::Ok(parameters) => parameters,
+            Result::Err(status) => return promise.set_error(status),
         };
-        env.send_launch_prepaid_giveaway_query(giveaway_id, user_count, star_count);
-        self.net_blocked_promises.push(promise);
+        env.send_launch_prepaid_giveaway_query(giveaway_id, &parameters, user_count, star_count);
+        self.pending_launch_prepaid.push(promise);
+    }
+
+    /// `LaunchPrepaidGiveawayQuery`'s promise pop (the Updates answer
+    /// re-enters `on_get_updates` with the promise).
+    pub(crate) fn take_launch_prepaid_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_launch_prepaid.is_empty() {
+            None
+        } else {
+            Some(self.pending_launch_prepaid.remove(0))
+        }
     }
 
     /// `get_premium_giveaway_info` (Premium.cpp:1437-1442) →
@@ -1622,8 +1661,9 @@ mod tests {
             "expected the parameters error"
         );
 
-        // the validated query parks (the parameters ladder rides the
-        // PaymentsEnv plane)
+        // a non-empty purpose reaches the payments-plane seam — the test
+        // env keeps the blocked posture (the real ladder runs at the Td
+        // env; the netted test covers its boosted-channel band)
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let capture = slot.clone();
         let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
@@ -1639,7 +1679,10 @@ mod tests {
             prize_description: "Prize".to_string(),
         };
         manager.launch_prepaid_premium_giveaway(&mut env, 7, Some(&parameters), 10, 100, promise);
-        assert_eq!(manager.net_blocked_promises.len(), 1);
-        assert!((*slot.lock().unwrap()).is_none());
+        assert!(manager.pending_launch_prepaid.is_empty());
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Not implemented yet"),
+            "the seam's blocked posture"
+        );
     }
 }
