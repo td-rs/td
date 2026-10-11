@@ -9809,7 +9809,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             manager.apply_premium_gift_code(&mut env, &code, promise);
             td.premium_manager = manager;
         }
-        Function::giftPremiumWithStars(request) => {
+        Function::giftPremiumWithStars(mut request) => {
             if !check_is_user(td, id) {
                 return;
             }
@@ -9820,6 +9820,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 request.user_id,
                 request.star_count,
                 request.month_count,
+                request.text.take(),
                 promise,
             );
             td.premium_manager = manager;

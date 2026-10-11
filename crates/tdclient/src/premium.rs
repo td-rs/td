@@ -9,8 +9,10 @@
 //! store-purpose trio and launchPrepaidGiveaway. The env is the whole-Td
 //! shape (the `crate::td::PremiumTdEnv` widening — the PrivacyEnv
 //! convention), so the flows resolve peers/chats/users through the same
-//! trait; send_premium_gift parks with the payments plane and the promo
-//! with the files plane.
+//! trait; the gift-with-stars form→send chain rides the same plane
+//! (`GetPremiumGiftPaymentFormQuery` → `SendPremiumGiftQuery`, the
+//! promise chaining into `on_get_updates`); the promo parks with the
+//! files plane.
 
 use crate::chat_manager::{ChannelId, DialogParticipantStatus};
 use crate::dialog_id::DialogId;
@@ -214,10 +216,28 @@ pub trait PremiumEnv {
     fn send_apply_gift_code_query(&mut self, code: &str) {
         tdutils::log_info!("Send payments.applyGiftCode for {code} — [net-inert]");
     }
-    fn send_premium_gift_query(&mut self, user_id: i64, star_count: i64, month_count: i32) {
-        tdutils::log_info!(
-            "Send payments.sendStarsGift(user_id = {user_id}, star_count = {star_count}, month_count = {month_count}) — [blocked: net]"
-        );
+    fn send_get_premium_gift_payment_form_query(
+        &mut self,
+        _input_invoice: telegram_api::InputInvoice,
+    ) {
+        tdutils::log_info!("Send payments.getPaymentForm — [net-inert]");
+    }
+    fn send_send_premium_gift_query(
+        &mut self,
+        _send_input_invoice: telegram_api::InputInvoice,
+        _payment_form_id: i64,
+    ) {
+        tdutils::log_info!("Send payments.sendStarsForm — [net-inert]");
+    }
+    /// `get_premium_gift_text(td, text)` (Premium.cpp:209-222) over the
+    /// payments surface (`PaymentsEnv::premium_gift_text`) — `None` is
+    /// the empty-text case; the seam flips with the formatted-text
+    /// wiring (M.8.5/M.9).
+    fn premium_gift_text(
+        &mut self,
+        _text: Option<td_api::FormattedText>,
+    ) -> Result<Option<telegram_api::TextWithEntities>> {
+        Result::Ok(None)
     }
     fn send_launch_prepaid_giveaway_query(
         &mut self,
@@ -537,6 +557,24 @@ pub(crate) enum PremiumNetKind {
     /// `LaunchPrepaidGiveawayQuery` (cpp:700) — the Updates answer
     /// re-enters `on_get_updates` with the promise.
     LaunchPrepaidGiveaway,
+    /// `GetPremiumGiftPaymentFormQuery` (cpp:649) — the form-kind band +
+    /// the single-price check run at
+    /// [`PremiumManager::on_premium_gift_payment_form`], then the send
+    /// chain.
+    GetPremiumGiftPaymentForm,
+    /// `SendPremiumGiftQuery` (cpp:605) — the `payments.paymentResult`
+    /// answer re-enters `on_get_updates` with the promise.
+    SendPremiumGift,
+}
+
+/// The `GetPremiumGiftPaymentFormQuery` in-flight state — the C++
+/// handler's own members (cpp:652-657): the star count for the answer's
+/// single-price check, the send invoice for the chained
+/// `SendPremiumGiftQuery`, and the promise riding the form→send chain.
+pub(crate) struct PendingPremiumGiftForm {
+    pub star_count: i64,
+    pub send_input_invoice: telegram_api::InputInvoice,
+    pub promise: Promise<()>,
 }
 
 /// The collapsed `PremiumManager` — a router over the query seams.
@@ -575,6 +613,15 @@ pub struct PremiumManager {
     /// The `()`-typed promises parked at the launch-prepaid flow (the C++
     /// `LaunchPrepaidGiveawayQuery` promise chains into `on_get_updates`).
     pub(crate) pending_launch_prepaid: Vec<Promise<()>>,
+    /// The `GetPremiumGiftPaymentFormQuery` in-flight states (the C++
+    /// handler's own `star_count_`/`send_input_invoice_`/`promise_`
+    /// members, cpp:652-657) — the form answer pops one and either errors
+    /// or chains `SendPremiumGiftQuery`.
+    pub(crate) pending_premium_gift_forms: Vec<PendingPremiumGiftForm>,
+    /// The `()`-typed promises parked at `SendPremiumGiftQuery` (the C++
+    /// `payments.paymentResult` answer re-enters `on_get_updates` with
+    /// the promise).
+    pub(crate) pending_send_premium_gift: Vec<Promise<()>>,
 }
 
 impl PremiumManager {
@@ -958,17 +1005,121 @@ impl PremiumManager {
         promise.set_value(td_api::PremiumGiftPaymentOptions { options });
     }
 
-    /// `gift_premium_with_stars` (Premium.cpp) — the query is the seam.
+    /// `gift_premium_with_stars` (Premium.cpp:1410-1432) — the validation
+    /// ladder (`get_input_user`, `check_payment_amount("XTR", …)`,
+    /// `get_premium_gift_text`) then the two-invoice form→send chain; the
+    /// promise rides the chain into `on_get_updates`.
     pub fn gift_premium_with_stars(
         &mut self,
         env: &mut impl PremiumEnv,
         user_id: i64,
         star_count: i64,
         month_count: i32,
-        promise: Promise<()>,
+        text: Option<td_api::FormattedText>,
+        mut promise: Promise<()>,
     ) {
-        env.send_premium_gift_query(user_id, star_count, month_count);
-        self.net_blocked_promises.push(promise);
+        let input_user = match env.get_input_user(UserId::new(user_id)) {
+            Result::Ok(input_user) => input_user,
+            Result::Err(status) => return promise.set_error(status),
+        };
+        if let Result::Err(status) = check_payment_amount("XTR", star_count) {
+            return promise.set_error(status);
+        }
+        let message = match env.premium_gift_text(text) {
+            Result::Ok(message) => message,
+            Result::Err(status) => return promise.set_error(status),
+        };
+        // cpp:1425-1432 — the form-query invoice carries no message; the
+        // send invoice re-resolves the user (the C++ second
+        // `get_input_user().move_as_ok()`) and carries the message flag.
+        let mut flags = 0;
+        if message.is_some() {
+            flags = 1; // MESSAGE_MASK
+        }
+        let input_invoice = telegram_api::InputInvoice::inputInvoicePremiumGiftStars(
+            telegram_api::inputInvoicePremiumGiftStars {
+                flags: 0,
+                user_id: Some(input_user),
+                months: month_count,
+                message: None,
+            },
+        );
+        let send_input_user = match env.get_input_user(UserId::new(user_id)) {
+            Result::Ok(input_user) => input_user,
+            Result::Err(status) => return promise.set_error(status),
+        };
+        let send_input_invoice = telegram_api::InputInvoice::inputInvoicePremiumGiftStars(
+            telegram_api::inputInvoicePremiumGiftStars {
+                flags,
+                user_id: Some(send_input_user),
+                months: month_count,
+                message,
+            },
+        );
+        env.send_get_premium_gift_payment_form_query(input_invoice);
+        self.pending_premium_gift_forms
+            .push(PendingPremiumGiftForm {
+                star_count,
+                send_input_invoice,
+                promise,
+            });
+    }
+
+    /// `GetPremiumGiftPaymentFormQuery::on_result` (Premium.cpp:672-695)
+    /// — the non-stars forms answer the 500 "Unsupported" band; the
+    /// stars form runs the single-price check and chains
+    /// `SendPremiumGiftQuery`, the promise moving to the send flow.
+    pub(crate) fn on_premium_gift_payment_form(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        form: telegram_api::payments_PaymentForm,
+        state: PendingPremiumGiftForm,
+    ) {
+        let PendingPremiumGiftForm {
+            star_count,
+            send_input_invoice,
+            mut promise,
+        } = state;
+        match form {
+            telegram_api::payments_PaymentForm::payments_paymentFormStars(form) => {
+                // cpp:684-689 — exactly one price row matching the star
+                // count (a missing invoice fails the same band)
+                let prices_match = form.invoice.as_ref().is_some_and(|invoice| {
+                    invoice.prices.len() == 1 && invoice.prices[0].amount == star_count
+                });
+                if !prices_match {
+                    return promise.set_error(Status::error(
+                        400,
+                        "Wrong Premium subscription price specified",
+                    ));
+                }
+                env.send_send_premium_gift_query(send_input_invoice, form.form_id);
+                self.pending_send_premium_gift.push(promise);
+            }
+            // cpp:677-680 — the paymentForm/paymentFormStarGift answers
+            // are the 500 "Unsupported" band
+            _ => promise.set_error(Status::error(500, "Unsupported")),
+        }
+    }
+
+    /// `GetPremiumGiftPaymentFormQuery`'s in-flight state pop (the form
+    /// answer routes through the intake).
+    pub(crate) fn take_premium_gift_form(&mut self) -> Option<PendingPremiumGiftForm> {
+        if self.pending_premium_gift_forms.is_empty() {
+            None
+        } else {
+            Some(self.pending_premium_gift_forms.remove(0))
+        }
+    }
+
+    /// `SendPremiumGiftQuery`'s promise pop (the paymentResult answer
+    /// re-enters `on_get_updates` with the promise).
+    pub(crate) fn take_send_premium_gift_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_send_premium_gift.is_empty() {
+            None
+        } else {
+            Some(self.pending_send_premium_gift.remove(0))
+        }
     }
 
     /// `launch_prepaid_premium_giveaway` (Premium.cpp:710-717) — the
@@ -1377,6 +1528,11 @@ mod tests {
         /// the dialogs `have_dialog_force` answers `true` for (the
         /// user-dialog seeding of the boost-ladder tests).
         dialogs: std::collections::BTreeSet<i64>,
+        /// the users `get_input_user` resolves (the gift-with-stars
+        /// entry ladder).
+        users: std::collections::BTreeSet<i64>,
+        /// the `premium_gift_text` answer (the message-flag band).
+        gift_text: Option<telegram_api::TextWithEntities>,
         queries: Vec<String>,
     }
 
@@ -1424,8 +1580,17 @@ mod tests {
 
         fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str, _force_read: bool) {}
 
-        fn get_input_user(&mut self, _user_id: UserId) -> Result<telegram_api::InputUser> {
-            Result::from_status(Status::error(400, "User not found"))
+        fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser> {
+            if self.users.contains(&user_id.get()) {
+                Result::Ok(telegram_api::InputUser::inputUser(
+                    telegram_api::inputUser {
+                        user_id: user_id.get(),
+                        access_hash: 0,
+                    },
+                ))
+            } else {
+                Result::from_status(Status::error(400, "User not found"))
+            }
         }
 
         fn have_dialog_info_force(&mut self, _dialog_id: DialogId, _source: &str) -> bool {
@@ -1462,10 +1627,27 @@ mod tests {
             self.queries.push(format!("applyGiftCode {code}"));
         }
 
-        fn send_premium_gift_query(&mut self, user_id: i64, star_count: i64, month_count: i32) {
-            self.queries.push(format!(
-                "sendStarsGift {user_id} {star_count} {month_count}"
-            ));
+        fn send_get_premium_gift_payment_form_query(
+            &mut self,
+            _input_invoice: telegram_api::InputInvoice,
+        ) {
+            self.queries.push("getPaymentForm".to_string());
+        }
+
+        fn send_send_premium_gift_query(
+            &mut self,
+            _send_input_invoice: telegram_api::InputInvoice,
+            payment_form_id: i64,
+        ) {
+            self.queries
+                .push(format!("sendStarsForm {payment_form_id}"));
+        }
+
+        fn premium_gift_text(
+            &mut self,
+            _text: Option<td_api::FormattedText>,
+        ) -> Result<Option<telegram_api::TextWithEntities>> {
+            Result::Ok(std::mem::take(&mut self.gift_text))
         }
     }
 
@@ -1477,6 +1659,8 @@ mod tests {
             options,
             option_strings: std::collections::BTreeMap::new(),
             dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
             queries: Vec::new(),
         }
     }
@@ -1517,6 +1701,8 @@ mod tests {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
             dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
             queries: Vec::new(),
         };
         let manager = PremiumManager::new();
@@ -1532,6 +1718,8 @@ mod tests {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
             dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
             queries: Vec::new(),
         };
         let mut manager = PremiumManager::new();
@@ -1539,19 +1727,189 @@ mod tests {
         manager.get_premium_gift_payment_options(&mut env, Promise::default());
         manager.check_premium_gift_code(&mut env, "CODE", Promise::default());
         manager.apply_premium_gift_code(&mut env, "CODE", Promise::default());
-        manager.gift_premium_with_stars(&mut env, 5, 500, 3, Promise::default());
+        env.users.insert(5);
+        manager.gift_premium_with_stars(&mut env, 5, 500, 3, None, Promise::default());
         assert!(env.queries.iter().any(|q| q == "getPremiumPromo"));
         assert!(env.queries.iter().any(|q| q == "getPremiumGiftOptions"));
         assert!(env.queries.iter().any(|q| q == "checkGiftCode CODE"));
         assert!(env.queries.iter().any(|q| q == "applyGiftCode CODE"));
-        assert!(env.queries.iter().any(|q| q == "sendStarsGift 5 500 3"));
+        assert!(env.queries.iter().any(|q| q == "getPaymentForm"));
         assert_eq!(
             manager.net_blocked_promises.len(),
-            1,
-            "the stars-gift park; apply parks its own flow, the check its own type"
+            0,
+            "the stars-gift promise rides the form→send chain, not the blocked park"
         );
+        assert_eq!(manager.pending_premium_gift_forms.len(), 1);
         assert_eq!(manager.pending_apply_gift_code.len(), 1);
         assert_eq!(manager.parked_gift_code_infos.len(), 1);
+    }
+
+    #[test]
+    fn gift_with_stars_runs_the_entry_ladder() {
+        // an unknown user — the C++ TRY_RESULT_PROMISE head: the promise
+        // errors, no query, nothing parks
+        let mut env = TestEnv {
+            options: std::collections::BTreeMap::new(),
+            option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
+            queries: Vec::new(),
+        };
+        let mut manager = PremiumManager::new();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.gift_premium_with_stars(&mut env, 5, 500, 3, None, promise);
+        assert!(env.queries.is_empty());
+        assert!(manager.pending_premium_gift_forms.is_empty());
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "User not found")
+        );
+
+        // a known user with a non-positive amount — the XTR ladder band
+        env.users.insert(5);
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.gift_premium_with_stars(&mut env, 5, 0, 3, None, promise);
+        assert!(env.queries.is_empty());
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Invalid amount of the currency specified")
+        );
+
+        // the happy send — the form query dispatches; the state carries
+        // the star count and the flag-less send invoice (the empty-text
+        // case: `premium_gift_text` answers None)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.gift_premium_with_stars(&mut env, 5, 500, 3, None, promise);
+        assert_eq!(env.queries, vec!["getPaymentForm".to_string()]);
+        let state = manager.pending_premium_gift_forms.remove(0);
+        assert_eq!(state.star_count, 500);
+        match state.send_input_invoice {
+            telegram_api::InputInvoice::inputInvoicePremiumGiftStars(invoice) => {
+                assert_eq!(invoice.flags, 0);
+                assert!(invoice.message.is_none());
+                assert_eq!(invoice.months, 3);
+                assert!(matches!(invoice.user_id,
+                    Some(telegram_api::InputUser::inputUser(user)) if user.user_id == 5));
+            }
+            other => panic!("the send invoice shape: {other:?}"),
+        }
+
+        // with a text — the MESSAGE flag and the converted message ride
+        // the send invoice (the form-query invoice stays flag-less)
+        env.gift_text = Some(telegram_api::TextWithEntities {
+            text: "gift".to_string(),
+            entities: Vec::new(),
+        });
+        manager.gift_premium_with_stars(
+            &mut env,
+            5,
+            500,
+            3,
+            Some(td_api::FormattedText {
+                text: "gift".to_string(),
+                entities: Vec::new(),
+            }),
+            Promise::default(),
+        );
+        let state = manager.pending_premium_gift_forms.remove(0);
+        match state.send_input_invoice {
+            telegram_api::InputInvoice::inputInvoicePremiumGiftStars(invoice) => {
+                assert_eq!(invoice.flags, 1, "MESSAGE_MASK");
+                assert_eq!(invoice.message.unwrap().text, "gift");
+            }
+            other => panic!("the send invoice shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_form_answer_bands_chain_the_send_query() {
+        let mut env = TestEnv {
+            options: std::collections::BTreeMap::new(),
+            option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
+            queries: Vec::new(),
+        };
+        let mut manager = PremiumManager::new();
+        let stars_form = |amount: i64| {
+            telegram_api::payments_PaymentForm::payments_paymentFormStars(
+                telegram_api::payments_paymentFormStars {
+                    flags: 0,
+                    form_id: 9,
+                    bot_id: 0,
+                    title: String::new(),
+                    description: String::new(),
+                    photo: None,
+                    invoice: Some(telegram_api::Invoice {
+                        prices: vec![telegram_api::LabeledPrice {
+                            label: "Premium".to_string(),
+                            amount,
+                        }],
+                        ..telegram_api::Invoice::default()
+                    }),
+                    users: Vec::new(),
+                },
+            )
+        };
+        let state = |star_count: i64| PendingPremiumGiftForm {
+            star_count,
+            send_input_invoice: telegram_api::InputInvoice::inputInvoicePremiumGiftStars(
+                telegram_api::inputInvoicePremiumGiftStars::default(),
+            ),
+            promise: Promise::default(),
+        };
+
+        // a price mismatch — the C++ single-price band (cpp:684-689)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        let mut mismatch = state(500);
+        mismatch.promise = promise;
+        manager.on_premium_gift_payment_form(&mut env, stars_form(250), mismatch);
+        assert!(env.queries.is_empty());
+        assert!(manager.pending_send_premium_gift.is_empty());
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Wrong Premium subscription price specified")
+        );
+
+        // the non-stars forms — the 500 "Unsupported" band (cpp:677-680)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        let mut unsupported = state(500);
+        unsupported.promise = promise;
+        manager.on_premium_gift_payment_form(
+            &mut env,
+            telegram_api::payments_PaymentForm::payments_paymentForm(
+                telegram_api::payments_paymentForm::default(),
+            ),
+            unsupported,
+        );
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.code() == 500 && status.message() == "Unsupported")
+        );
+
+        // the match — the send query chains with the form id, the
+        // promise parks at the send flow
+        manager.on_premium_gift_payment_form(&mut env, stars_form(500), state(500));
+        assert_eq!(env.queries, vec!["sendStarsForm 9".to_string()]);
+        assert_eq!(manager.pending_send_premium_gift.len(), 1);
     }
 
     #[test]
@@ -1560,6 +1918,8 @@ mod tests {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
             dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
             queries: Vec::new(),
         };
         let mut manager = PremiumManager::new();
@@ -1645,6 +2005,8 @@ mod tests {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
             dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
             queries: Vec::new(),
         };
         let mut manager = PremiumManager::default();

@@ -7988,6 +7988,71 @@ impl Td {
                     }
                 }
             }
+            // `GetPremiumGiftPaymentFormQuery` (cpp:672-695) — the
+            // form-kind band + the single-price check run at the manager
+            // intake; the promise chains into the send flow.
+            PremiumNetKind::GetPremiumGiftPaymentForm => {
+                if let Some(mut state) = self.premium_manager.take_premium_gift_form() {
+                    if query.is_error() {
+                        state.promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_PaymentForm::parse(query.ok()) {
+                            Ok(form) => {
+                                let (mut manager, mut env) = premium_env_split(self);
+                                manager.on_premium_gift_payment_form(&mut env, form, state);
+                                self.premium_manager = manager;
+                            }
+                            Err(_) => {
+                                state
+                                    .promise
+                                    .set_error(parse_error("payments_getPaymentForm"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `SendPremiumGiftQuery` (cpp:621-645) — the paymentResult
+            // Updates answer re-enters `on_get_updates` with the promise;
+            // the verification-needed answer is the invalid-response band
+            // (cpp:629-632); FORM_SUBMIT_DUPLICATE logs and forwards
+            // (cpp:641-645).
+            PremiumNetKind::SendPremiumGift => {
+                if let Some(mut promise) = self.premium_manager.take_send_premium_gift_promise() {
+                    if query.is_error() {
+                        if query.error().message() == "FORM_SUBMIT_DUPLICATE" {
+                            tdutils::log_error!("Receive FORM_SUBMIT_DUPLICATE");
+                        }
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_PaymentResult::parse(query.ok()) {
+                            Ok(telegram_api::payments_PaymentResult::payments_paymentResult(
+                                result,
+                            )) => match result.updates {
+                                Some(updates) => self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                }),
+                                None => {
+                                    promise.set_error(parse_error("payments_sendStarsForm"));
+                                }
+                            },
+                            Ok(
+                                telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
+                                    _,
+                                ),
+                            ) => {
+                                tdutils::log_error!(
+                                    "Receive payments.paymentVerificationNeeded"
+                                );
+                                promise.set_error(Status::error(500, "Receive invalid response"));
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_sendStarsForm"));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -18513,6 +18578,88 @@ impl PremiumEnv for PremiumTdEnv<'_> {
                 },
             ),
         );
+    }
+
+    // `GetPremiumGiftPaymentFormQuery::send` (Premium.cpp:658-663) — the
+    // flag-less form query (theme_params absent); the answer routes
+    // through the manager intake and chains `SendPremiumGiftQuery`.
+    fn send_get_premium_gift_payment_form_query(
+        &mut self,
+        input_invoice: telegram_api::InputInvoice,
+    ) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::GetPremiumGiftPaymentForm,
+                telegram_api::Function::payments_getPaymentForm(
+                    telegram_api::payments_getPaymentForm {
+                        flags: 0,
+                        invoice: Some(input_invoice),
+                        theme_params: None,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.getPaymentForm — [net-inert]");
+            }
+        }
+    }
+
+    // `SendPremiumGiftQuery::send` (Premium.cpp:612-614) — the form id +
+    // the send invoice; the `payments.paymentResult` answer re-enters
+    // `on_get_updates` with the promise.
+    fn send_send_premium_gift_query(
+        &mut self,
+        send_input_invoice: telegram_api::InputInvoice,
+        payment_form_id: i64,
+    ) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::SendPremiumGift,
+                telegram_api::Function::payments_sendStarsForm(
+                    telegram_api::payments_sendStarsForm {
+                        form_id: payment_form_id,
+                        invoice: Some(send_input_invoice),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.sendStarsForm — [net-inert]");
+            }
+        }
+    }
+
+    // `get_premium_gift_text` (Premium.cpp:209-222) over the payments
+    // surface — the field-split payments env (the conversion-seam
+    // convention); the seam's own posture answers the empty-text case.
+    fn premium_gift_text(
+        &mut self,
+        text: Option<td_api::FormattedText>,
+    ) -> tdutils::status::Result<Option<telegram_api::TextWithEntities>> {
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = self.td;
+        let mut payments_env = crate::td::PaymentsEnv {
+            global,
+            options: Some(
+                option_manager
+                    .as_mut()
+                    .expect("premium calls run with the initialized option manager"),
+            ),
+            auth_is_bot: auth_manager.is_bot(),
+            my_dialog_id,
+            user_manager,
+            chat_manager,
+        };
+        <crate::td::PaymentsEnv<'_> as crate::payments::PaymentsEnv>::premium_gift_text(
+            &mut payments_env,
+            text,
+        )
     }
 
     // `get_input_store_payment_purpose` (Premium.cpp:220-300) — the
@@ -32100,11 +32247,208 @@ mod tests {
             other => panic!("the boosted-channel band: {other:?}"),
         }
 
+        // 17. giftPremiumWithStars — the full form→send chain over the
+        //     seeded user: the form query dispatches, the stars form with
+        //     the matching single price chains sendStarsForm, and the
+        //     paymentResult Updates answer resolves the promise through
+        //     on_get_updates.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.gift_premium_with_stars(env, 700000001, 250, 3, None, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                flags: 0,
+                form_id: 9,
+                bot_id: 700000001,
+                title: "Premium".to_string(),
+                description: String::new(),
+                photo: None,
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "Premium".to_string(),
+                        amount: 250,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                users: Vec::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        // the chained send query dispatched inside the drain
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::payments_sendStarsForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentResult(
+            telegram_api::payments_paymentResult {
+                updates: Some(telegram_api::Updates::updates(telegram_api::updates {
+                    updates: Vec::new(),
+                    users: Vec::new(),
+                    chats: Vec::new(),
+                    date: 0,
+                    seq: 0,
+                })),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 18. giftPremiumWithStars — the single-price band: the form
+        //     answers a different amount, the promise takes the C++ 400
+        //     and no send query dispatches.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.gift_premium_with_stars(env, 700000001, 250, 3, None, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "Premium".to_string(),
+                        amount: 999,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentFormStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no send query on the price mismatch"
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(
+                    status.message(),
+                    "Wrong Premium subscription price specified"
+                );
+            }
+            other => panic!("the price-mismatch band: {other:?}"),
+        }
+
+        // 19. giftPremiumWithStars — FORM_SUBMIT_DUPLICATE logs and
+        //     forwards the error (cpp:641-645).
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.gift_premium_with_stars(env, 700000001, 250, 3, None, promise);
+        });
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "Premium".to_string(),
+                        amount: 250,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentFormStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(
+            take_sent(
+                std::mem::take(&mut rec.sent.lock()),
+                telegram_api::payments_getPaymentForm::ID,
+            ),
+            answer,
+        );
+        td.dispatch_completed_premium_net();
+        net_fail(
+            take_sent(
+                std::mem::take(&mut rec.sent.lock()),
+                telegram_api::payments_sendStarsForm::ID,
+            ),
+            400,
+            "FORM_SUBMIT_DUPLICATE",
+        );
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "FORM_SUBMIT_DUPLICATE");
+            }
+            other => panic!("the duplicate-submit band: {other:?}"),
+        }
+
+        // 20. giftPremiumWithStars — the verification-needed answer is
+        //     the invalid-response band (cpp:629-632).
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.gift_premium_with_stars(env, 700000001, 250, 3, None, promise);
+        });
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "Premium".to_string(),
+                        amount: 250,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentFormStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(
+            take_sent(
+                std::mem::take(&mut rec.sent.lock()),
+                telegram_api::payments_getPaymentForm::ID,
+            ),
+            answer,
+        );
+        td.dispatch_completed_premium_net();
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
+            telegram_api::payments_paymentVerificationNeeded::default(),
+        )
+        .store(&mut answer);
+        net_complete(
+            take_sent(
+                std::mem::take(&mut rec.sent.lock()),
+                telegram_api::payments_sendStarsForm::ID,
+            ),
+            answer,
+        );
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(status.message(), "Receive invalid response");
+            }
+            other => panic!("the verification-needed band: {other:?}"),
+        }
+
         assert!(td.premium_net_completed.lock().is_empty(), "drained");
         assert!(
             td.premium_manager.pending_apply_gift_code.is_empty()
                 && td.premium_manager.parked_gift_payment_options.is_empty()
-                && td.premium_manager.parked_giveaway_options.is_empty(),
+                && td.premium_manager.parked_giveaway_options.is_empty()
+                && td.premium_manager.pending_premium_gift_forms.is_empty()
+                && td.premium_manager.pending_send_premium_gift.is_empty(),
             "all promises resolved"
         );
     }
