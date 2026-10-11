@@ -9824,13 +9824,21 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.premium_manager = manager;
         }
-        Function::assignStoreTransaction(_) => {
+        Function::assignStoreTransaction(mut request) => {
+            // Requests.cpp:9208-9212 → Premium.cpp:1450-1487: the
+            // transaction/purpose ladder + the AppStore/PlayMarket sends;
+            // the promise parks in the premium manager
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
-            manager.assign_store_transaction(&mut env, promise);
+            manager.assign_store_transaction(
+                &mut env,
+                request.transaction.take(),
+                request.purpose.take(),
+                promise,
+            );
             td.premium_manager = manager;
         }
 
@@ -16205,16 +16213,16 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-        Function::canPurchaseFromStore(_request) => {
-            // Requests.cpp:9202-9205 → Premium.cpp:1444-1446: the
-            // CanPurchasePremiumQuery send (with the store purpose) is the
-            // seam; the promise parks in the premium manager
+        Function::canPurchaseFromStore(request) => {
+            // Requests.cpp:9202-9205 → Premium.cpp:1444-1446: the store
+            // purpose converts at the send leg; the CanPurchasePremiumQuery
+            // promise parks in the premium manager
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut manager, mut env) = crate::td::premium_env_split(&mut *td);
-            manager.can_purchase_premium(&mut env, promise);
+            manager.can_purchase_premium(&mut env, request.purpose, promise);
             td.premium_manager = manager;
         }
         _ => run_proxy_network_requests(td, id, function),

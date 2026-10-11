@@ -7925,6 +7925,50 @@ impl Td {
                     self.premium_manager = manager;
                 }
             }
+            // `CanPurchasePremiumQuery` (cpp:840-854) — the false Bool is
+            // the 400 "Payment can't be completed" band.
+            PremiumNetKind::CanPurchasePremium => {
+                if let Some(mut promise) = self.premium_manager.take_can_purchase_promise() {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_wire_bool_value(query.ok()) {
+                            Some(true) => promise.set_value(()),
+                            Some(false) => {
+                                promise.set_error(Status::error(400, "Payment can't be completed"));
+                            }
+                            None => promise.set_error(parse_error("payments_canPurchaseStore")),
+                        }
+                    }
+                }
+            }
+            // The assign pair (cpp:860-930) — the Updates answers re-enter
+            // `on_get_updates` with the promise (the `ApplyGiftCodeQuery`
+            // convention).
+            PremiumNetKind::AssignStoreTransaction { is_app_store } => {
+                if let Some(mut promise) =
+                    self.premium_manager.take_assign_store_transaction_promise()
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            }),
+                            Err(_) => {
+                                let what = if is_app_store {
+                                    "payments_assignAppStoreTransaction"
+                                } else {
+                                    "payments_assignPlayMarketTransaction"
+                                };
+                                promise.set_error(parse_error(what));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -18323,6 +18367,93 @@ impl PremiumEnv for PremiumTdEnv<'_> {
                 tdutils::log_info!("Send payments.checkGiftCode for {code} — [net-inert]");
             }
         }
+    }
+
+    // `CanPurchasePremiumQuery::send` (Premium.cpp:830-838) — the store
+    // purpose rides the query.
+    fn send_can_purchase_premium_query(&mut self, purpose: telegram_api::InputStorePaymentPurpose) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::CanPurchasePremium,
+                telegram_api::Function::payments_canPurchaseStore(
+                    telegram_api::payments_canPurchaseStore {
+                        purpose: Some(purpose),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.canPurchaseStore — [net-inert]");
+            }
+        }
+    }
+
+    // The assign pair (Premium.cpp:860-893) — the AppStore receipt rides
+    // the wire as bytes, the PlayMarket one as the built dataJSON.
+    fn send_assign_store_transaction_query(
+        &mut self,
+        receipt: Vec<u8>,
+        purpose: telegram_api::InputStorePaymentPurpose,
+        is_app_store: bool,
+    ) {
+        let function = if is_app_store {
+            telegram_api::Function::payments_assignAppStoreTransaction(
+                telegram_api::payments_assignAppStoreTransaction {
+                    receipt,
+                    purpose: Some(purpose),
+                },
+            )
+        } else {
+            telegram_api::Function::payments_assignPlayMarketTransaction(
+                telegram_api::payments_assignPlayMarketTransaction {
+                    receipt: Some(telegram_api::DataJSON {
+                        // the manager-built JSON receipt (valid UTF-8 by
+                        // construction; the default keeps the seam total)
+                        data: String::from_utf8(receipt).unwrap_or_default(),
+                    }),
+                    purpose: Some(purpose),
+                },
+            )
+        };
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::AssignStoreTransaction { is_app_store },
+                function,
+            ),
+            None => {
+                tdutils::log_info!("Send the store-transaction assign — [net-inert]");
+            }
+        }
+    }
+
+    // `get_input_store_payment_purpose` (Premium.cpp:220-300) — the
+    // conversion runs over the payments surface; the field-split
+    // payments env over the same Td (the `payments_arm` convention).
+    fn get_input_store_payment_purpose(
+        &mut self,
+        purpose: Option<td_api::StorePaymentPurpose>,
+    ) -> tdutils::status::Result<telegram_api::InputStorePaymentPurpose> {
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = self.td;
+        let mut payments_env = crate::td::PaymentsEnv {
+            global,
+            options: Some(
+                option_manager
+                    .as_mut()
+                    .expect("premium calls run with the initialized option manager"),
+            ),
+            auth_is_bot: auth_manager.is_bot(),
+            my_dialog_id,
+            user_manager,
+            chat_manager,
+        };
+        crate::premium::get_input_store_payment_purpose(&mut payments_env, purpose)
     }
 }
 
@@ -31678,6 +31809,150 @@ mod tests {
                 assert_eq!(status.message(), "Receive invalid response");
             }
             other => panic!("the value-band arm: {other:?}"),
+        }
+
+        // 11. canPurchaseFromStore — the PremiumSubscription purpose is
+        //     the pure-flags conversion (the td env runs the payments-env
+        //     build); boolTrue answers the Unit.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.can_purchase_premium(
+                env,
+                Some(
+                    td_api::StorePaymentPurpose::storePaymentPurposePremiumSubscription(
+                        td_api::storePaymentPurposePremiumSubscription {
+                            is_restore: false,
+                            is_upgrade: true,
+                        },
+                    ),
+                ),
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_canPurchaseStore::ID,
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_premium_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 12. canPurchaseFromStore — the empty purpose answers the C++
+        //     400 before any dispatch.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.can_purchase_premium(env, None, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert!(sent.is_empty());
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Purchase purpose must be non-empty");
+            }
+            other => panic!("the empty-purpose arm: {other:?}"),
+        }
+
+        // 13. canPurchaseFromStore — the false Bool is the 400 band.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.can_purchase_premium(
+                env,
+                Some(
+                    td_api::StorePaymentPurpose::storePaymentPurposePremiumSubscription(
+                        td_api::storePaymentPurposePremiumSubscription {
+                            is_restore: false,
+                            is_upgrade: false,
+                        },
+                    ),
+                ),
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_canPurchaseStore::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Payment can't be completed");
+            }
+            other => panic!("the false-bool arm: {other:?}"),
+        }
+
+        // 14. assignStoreTransaction (GooglePlay) — the JSON receipt + the
+        //     PremiumSubscription purpose; the Updates answer re-enters
+        //     on_get_updates and resolves the promise.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.assign_store_transaction(
+                env,
+                Some(td_api::StoreTransaction::storeTransactionGooglePlay(
+                    td_api::storeTransactionGooglePlay {
+                        package_name: "org.telegram.plus".to_string(),
+                        store_product_id: "product/12".to_string(),
+                        purchase_token: "token\"x".to_string(),
+                    },
+                )),
+                Some(
+                    td_api::StorePaymentPurpose::storePaymentPurposePremiumSubscription(
+                        td_api::storePaymentPurposePremiumSubscription {
+                            is_restore: true,
+                            is_upgrade: false,
+                        },
+                    ),
+                ),
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_assignPlayMarketTransaction::ID,
+        );
+        // the serialized receipt: the C++ field order with the escaped
+        // purchase token
+        let expected_receipt = "{\"packageName\":\"org.telegram.plus\",\
+\"purchaseToken\":\"token\\\"x\",\"productId\":\"product/12\"}";
+        let query_bytes = sent.query();
+        assert!(
+            query_bytes
+                .windows(expected_receipt.len())
+                .any(|w| w == expected_receipt.as_bytes()),
+            "the built receipt rides the query"
+        );
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 15. assignStoreTransaction — the empty transaction answers the
+        //     C++ 400 before any dispatch.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.assign_store_transaction(env, None, None, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert!(sent.is_empty());
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Transaction must be non-empty");
+            }
+            other => panic!("the empty-transaction arm: {other:?}"),
         }
 
         assert!(td.premium_net_completed.lock().is_empty(), "drained");

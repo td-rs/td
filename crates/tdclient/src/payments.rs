@@ -93,9 +93,9 @@ const PAYMENT_REQUESTED_INFO_PHONE_MASK: i32 = 1 << 1;
 const PAYMENT_REQUESTED_INFO_EMAIL_MASK: i32 = 1 << 2;
 const PAYMENT_REQUESTED_INFO_SHIPPING_ADDRESS_MASK: i32 = 1 << 3;
 const INPUT_INVOICE_PREMIUM_GIFT_STARS_MESSAGE_MASK: i32 = 1;
-const INPUT_STORE_PREMIUM_GIFT_CODE_BOOST_PEER_MASK: i32 = 1;
-const INPUT_STORE_PREMIUM_GIFT_CODE_MESSAGE_MASK: i32 = 1 << 1;
-const INPUT_STORE_STARS_TOPUP_SPEND_PURPOSE_PEER_MASK: i32 = 1;
+pub(crate) const INPUT_STORE_PREMIUM_GIFT_CODE_BOOST_PEER_MASK: i32 = 1;
+pub(crate) const INPUT_STORE_PREMIUM_GIFT_CODE_MESSAGE_MASK: i32 = 1 << 1;
+pub(crate) const INPUT_STORE_STARS_TOPUP_SPEND_PURPOSE_PEER_MASK: i32 = 1;
 const INPUT_STORE_PREMIUM_GIVEAWAY_ADDITIONAL_PEERS_MASK: i32 = 1 << 1;
 const INPUT_STORE_PREMIUM_GIVEAWAY_COUNTRIES_ISO2_MASK: i32 = 1 << 2;
 const INPUT_STORE_PREMIUM_GIVEAWAY_PRIZE_DESCRIPTION_MASK: i32 = 1 << 4;
@@ -1512,8 +1512,11 @@ fn get_input_invoice_info(
     Result::Ok(result)
 }
 
-/// `get_boost_input_peer` (Premium.cpp:194-207).
-fn get_boost_input_peer(
+/// `get_boost_input_peer` (Premium.cpp:194-207) — the payments-plane
+/// copy over `PaymentsEnv` (the premium plane owns its own over
+/// `PremiumEnv` at the C++ anchor home; the env-trait arm-duplication
+/// convention).
+pub(crate) fn get_boost_input_peer(
     env: &mut impl PaymentsEnv,
     dialog_id: DialogId,
 ) -> Result<telegram_api::InputPeer> {
@@ -1583,7 +1586,7 @@ impl GiveawayParameters {
 
     /// `GiveawayParameters::get_giveaway_parameters`
     /// (GiveawayParameters.cpp:39-80).
-    fn get_giveaway_parameters(
+    pub(crate) fn get_giveaway_parameters(
         env: &mut impl PaymentsEnv,
         parameters: Option<&td_api::GiveawayParameters>,
     ) -> Result<GiveawayParameters> {
@@ -1643,7 +1646,7 @@ impl GiveawayParameters {
 
     /// `GiveawayParameters::get_input_store_payment_premium_giveaway`
     /// (GiveawayParameters.cpp:90-121).
-    fn get_input_store_payment_premium_giveaway(
+    pub(crate) fn get_input_store_payment_premium_giveaway(
         &self,
         env: &mut impl PaymentsEnv,
         currency: &str,
@@ -1701,7 +1704,7 @@ impl GiveawayParameters {
 
     /// `GiveawayParameters::get_input_store_payment_stars_giveaway`
     /// (GiveawayParameters.cpp:123-156).
-    fn get_input_store_payment_stars_giveaway(
+    pub(crate) fn get_input_store_payment_stars_giveaway(
         &self,
         env: &mut impl PaymentsEnv,
         currency: &str,

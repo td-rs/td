@@ -237,11 +237,46 @@ pub trait PremiumEnv {
     ) {
         tdutils::log_info!("Send payments.getGiveawayInfo({dialog_id}) — [net-inert]");
     }
-    fn send_can_purchase_premium_query(&mut self) {
-        tdutils::log_info!("Send payments.canPurchasePremium — [blocked: net]");
+    fn send_can_purchase_premium_query(
+        &mut self,
+        _purpose: telegram_api::InputStorePaymentPurpose,
+    ) {
+        tdutils::log_info!("Send payments.canPurchaseStore — [net-inert]");
     }
-    fn send_assign_store_transaction_query(&mut self) {
-        tdutils::log_info!("Send the store-transaction assign — [blocked: net]");
+    fn send_assign_store_transaction_query(
+        &mut self,
+        _receipt: Vec<u8>,
+        _purpose: telegram_api::InputStorePaymentPurpose,
+        _is_app_store: bool,
+    ) {
+        tdutils::log_info!("Send the store-transaction assign — [net-inert]");
+    }
+
+    // --- the store-purpose conversion + the suggested-action seam ---
+
+    /// `get_input_store_payment_purpose` (Premium.cpp:220-300) over the
+    /// payments surface — the Td env builds the field-split payments env
+    /// and runs the crate conversion; the default keeps the blocked
+    /// posture for the test envs.
+    fn get_input_store_payment_purpose(
+        &mut self,
+        purpose: Option<td_api::StorePaymentPurpose>,
+    ) -> Result<telegram_api::InputStorePaymentPurpose> {
+        let _ = purpose;
+        tdutils::log_info!("get_input_store_payment_purpose — [blocked: payments plane]");
+        Result::from_status(Status::error(500, "Not implemented yet"))
+    }
+
+    /// `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
+    /// — the premium-subscription assign legs (Premium.cpp:1461-1465);
+    /// the suggested-action plane parks at its own seam.
+    fn dismiss_suggested_action(
+        &mut self,
+        action_type: crate::suggested_action::SuggestedActionType,
+    ) {
+        tdutils::log_info!(
+            "dismiss_suggested_action({action_type:?}) — [blocked: suggested-action plane]"
+        );
     }
 }
 
@@ -272,6 +307,194 @@ pub(crate) fn get_boost_input_peer(
     }
 }
 
+/// `get_input_store_payment_purpose` (Premium.cpp:220-300) — the
+/// td_api::StorePaymentPurpose → wire conversion over the payments
+/// surface (its dependency legs — `get_input_user`, `check_dialog_access`,
+/// `get_boost_input_peer`, the `GiveawayParameters` builders,
+/// `get_premium_gift_text`, `dismiss_suggested_action` — all live on
+/// `PaymentsEnv` already).
+pub(crate) fn get_input_store_payment_purpose(
+    env: &mut impl crate::payments::PaymentsEnv,
+    purpose: Option<td_api::StorePaymentPurpose>,
+) -> Result<telegram_api::InputStorePaymentPurpose> {
+    use crate::payments::GiveawayParameters;
+    use crate::td_api::StorePaymentPurpose;
+    let Some(purpose) = purpose else {
+        return Result::from_status(Status::error(400, "Purchase purpose must be non-empty"));
+    };
+    match purpose {
+        StorePaymentPurpose::storePaymentPurposePremiumSubscription(p) => Result::Ok(
+            telegram_api::InputStorePaymentPurpose::inputStorePaymentPremiumSubscription(
+                telegram_api::inputStorePaymentPremiumSubscription {
+                    flags: 0,
+                    restore: p.is_restore,
+                    upgrade: p.is_upgrade,
+                },
+            ),
+        ),
+        StorePaymentPurpose::storePaymentPurposePremiumGift(p) => {
+            let input_user = match env.get_input_user(UserId::new(p.user_id)) {
+                Result::Ok(input_user) => input_user,
+                Result::Err(status) => return Result::Err(status),
+            };
+            if let Result::Err(status) = check_payment_amount(&p.currency, p.amount) {
+                return Result::Err(status);
+            }
+            let text = match env.premium_gift_text(p.text) {
+                Result::Ok(text) => text,
+                Result::Err(status) => return Result::Err(status),
+            };
+            let mut flags = 0;
+            if text.is_some() {
+                flags |= crate::payments::INPUT_STORE_PREMIUM_GIFT_CODE_MESSAGE_MASK;
+            }
+            Result::Ok(
+                telegram_api::InputStorePaymentPurpose::inputStorePaymentPremiumGiftCode(
+                    telegram_api::inputStorePaymentPremiumGiftCode {
+                        flags,
+                        users: vec![input_user],
+                        boost_peer: None,
+                        currency: p.currency,
+                        amount: p.amount,
+                        message: text,
+                    },
+                ),
+            )
+        }
+        StorePaymentPurpose::storePaymentPurposePremiumGiftCodes(p) => {
+            let mut input_users = Vec::with_capacity(p.user_ids.len());
+            for &user_id in &p.user_ids {
+                match env.get_input_user(UserId::new(user_id)) {
+                    Result::Ok(input_user) => input_users.push(input_user),
+                    Result::Err(status) => return Result::Err(status),
+                }
+            }
+            if let Result::Err(status) = check_payment_amount(&p.currency, p.amount) {
+                return Result::Err(status);
+            }
+            let boost_input_peer = match crate::payments::get_boost_input_peer(
+                env,
+                DialogId::new(p.boosted_chat_id),
+            ) {
+                Result::Ok(peer) => peer,
+                Result::Err(status) => return Result::Err(status),
+            };
+            let text = match env.premium_gift_text(p.text) {
+                Result::Ok(text) => text,
+                Result::Err(status) => return Result::Err(status),
+            };
+            let mut flags = crate::payments::INPUT_STORE_PREMIUM_GIFT_CODE_BOOST_PEER_MASK;
+            if text.is_some() {
+                flags |= crate::payments::INPUT_STORE_PREMIUM_GIFT_CODE_MESSAGE_MASK;
+            }
+            Result::Ok(
+                telegram_api::InputStorePaymentPurpose::inputStorePaymentPremiumGiftCode(
+                    telegram_api::inputStorePaymentPremiumGiftCode {
+                        flags,
+                        users: input_users,
+                        boost_peer: Some(Box::new(boost_input_peer)),
+                        currency: p.currency,
+                        amount: p.amount,
+                        message: text,
+                    },
+                ),
+            )
+        }
+        StorePaymentPurpose::storePaymentPurposePremiumGiveaway(p) => {
+            if let Result::Err(status) = check_payment_amount(&p.currency, p.amount) {
+                return Result::Err(status);
+            }
+            let parameters =
+                match GiveawayParameters::get_giveaway_parameters(env, p.parameters.as_ref()) {
+                    Result::Ok(parameters) => parameters,
+                    Result::Err(status) => return Result::Err(status),
+                };
+            Result::Ok(parameters.get_input_store_payment_premium_giveaway(
+                env,
+                &p.currency,
+                p.amount,
+            ))
+        }
+        StorePaymentPurpose::storePaymentPurposeStarGiveaway(p) => {
+            if let Result::Err(status) = check_payment_amount(&p.currency, p.amount) {
+                return Result::Err(status);
+            }
+            if p.winner_count <= 0 || p.star_count <= 0 {
+                return Result::from_status(Status::error(
+                    400,
+                    "Invalid giveaway parameters specified",
+                ));
+            }
+            let parameters =
+                match GiveawayParameters::get_giveaway_parameters(env, p.parameters.as_ref()) {
+                    Result::Ok(parameters) => parameters,
+                    Result::Err(status) => return Result::Err(status),
+                };
+            Result::Ok(parameters.get_input_store_payment_stars_giveaway(
+                env,
+                &p.currency,
+                p.amount,
+                p.winner_count,
+                p.star_count,
+            ))
+        }
+        StorePaymentPurpose::storePaymentPurposeStars(p) => {
+            let mut flags = 0;
+            let mut spend_purpose_input_peer = None;
+            let spend_dialog_id = DialogId::new(p.chat_id);
+            if spend_dialog_id != DialogId::default() {
+                if let Result::Err(status) =
+                    env.check_dialog_access(spend_dialog_id, "storePaymentPurposeStars")
+                {
+                    return Result::Err(status);
+                }
+                match env.get_input_peer(spend_dialog_id, AccessRights::Read) {
+                    Some(peer) => {
+                        spend_purpose_input_peer = Some(peer);
+                        flags |= crate::payments::INPUT_STORE_STARS_TOPUP_SPEND_PURPOSE_PEER_MASK;
+                    }
+                    // the C++ CHECK(spend_purpose_input_peer != nullptr)
+                    None => panic!("storePaymentPurposeStars has no input peer"),
+                }
+            }
+            if let Result::Err(status) = check_payment_amount(&p.currency, p.amount) {
+                return Result::Err(status);
+            }
+            env.dismiss_suggested_action();
+            Result::Ok(
+                telegram_api::InputStorePaymentPurpose::inputStorePaymentStarsTopup(
+                    telegram_api::inputStorePaymentStarsTopup {
+                        flags,
+                        stars: p.star_count,
+                        currency: p.currency,
+                        amount: p.amount,
+                        spend_purpose_peer: spend_purpose_input_peer.map(Box::new),
+                    },
+                ),
+            )
+        }
+        StorePaymentPurpose::storePaymentPurposeGiftedStars(p) => {
+            let input_user = match env.get_input_user(UserId::new(p.user_id)) {
+                Result::Ok(input_user) => input_user,
+                Result::Err(status) => return Result::Err(status),
+            };
+            if let Result::Err(status) = check_payment_amount(&p.currency, p.amount) {
+                return Result::Err(status);
+            }
+            Result::Ok(
+                telegram_api::InputStorePaymentPurpose::inputStorePaymentStarsGift(
+                    telegram_api::inputStorePaymentStarsGift {
+                        user_id: Some(input_user),
+                        stars: p.star_count,
+                        currency: p.currency,
+                        amount: p.amount,
+                    },
+                ),
+            )
+        }
+    }
+}
+
 /// The premium query kinds riding the dispatcher — the C++
 /// ResultHandler classes of Premium.cpp (the landed flows; the rest of
 /// the twelve join in follow-up slices).
@@ -292,6 +515,11 @@ pub(crate) enum PremiumNetKind {
     /// `CheckGiftCodeQuery` (cpp:512) — the slug rides the query; the
     /// users/chats intakes run at the answer.
     CheckGiftCode,
+    /// `CanPurchasePremiumQuery` (cpp:826) — the Bool answer band.
+    CanPurchasePremium,
+    /// `AssignAppStoreTransactionQuery`/`AssignPlayMarketTransactionQuery`
+    /// (cpp:860/893) — the Updates answers re-enter `on_get_updates`.
+    AssignStoreTransaction { is_app_store: bool },
 }
 
 /// The collapsed `PremiumManager` — a router over the query seams.
@@ -321,6 +549,12 @@ pub struct PremiumManager {
     /// The `()`-typed promises parked at the apply-gift-code flow (the
     /// C++ `ApplyGiftCodeQuery` promise chains into `on_get_updates`).
     pub(crate) pending_apply_gift_code: Vec<Promise<()>>,
+    /// The `()`-typed promises parked at the can-purchase flow (the C++
+    /// `CanPurchasePremiumQuery` promise).
+    pub(crate) pending_can_purchase: Vec<Promise<()>>,
+    /// The `()`-typed promises parked at the store-transaction assigns
+    /// (the C++ handler promises chain into `on_get_updates`).
+    pub(crate) pending_assign_store_transaction: Vec<Promise<()>>,
 }
 
 impl PremiumManager {
@@ -906,16 +1140,98 @@ impl PremiumManager {
         }
     }
 
-    /// `can_purchase_premium` (Premium.cpp) — the query is the seam.
-    pub fn can_purchase_premium(&mut self, env: &mut impl PremiumEnv, promise: Promise<()>) {
-        env.send_can_purchase_premium_query();
-        self.net_blocked_promises.push(promise);
+    /// `can_purchase_premium` (Premium.cpp:1444-1446) →
+    /// `CanPurchasePremiumQuery::send` (cpp:830-838) — the store purpose
+    /// converts at the send leg; the error arm is the handler's
+    /// `on_error` (plain `set_error`).
+    pub fn can_purchase_premium(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        purpose: Option<td_api::StorePaymentPurpose>,
+        mut promise: Promise<()>,
+    ) {
+        let input_purpose = match env.get_input_store_payment_purpose(purpose) {
+            Result::Ok(input_purpose) => input_purpose,
+            Result::Err(status) => return promise.set_error(status),
+        };
+        env.send_can_purchase_premium_query(input_purpose);
+        self.pending_can_purchase.push(promise);
     }
 
-    /// `assign_store_transaction` (Premium.cpp) — the query is the seam.
-    pub fn assign_store_transaction(&mut self, env: &mut impl PremiumEnv, promise: Promise<()>) {
-        env.send_assign_store_transaction_query();
-        self.net_blocked_promises.push(promise);
+    /// `CanPurchasePremiumQuery::on_result`'s promise pop
+    /// (Premium.cpp:840-848).
+    pub(crate) fn take_can_purchase_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_can_purchase.is_empty() {
+            None
+        } else {
+            Some(self.pending_can_purchase.remove(0))
+        }
+    }
+
+    /// `assign_store_transaction` (Premium.cpp:1450-1487) — the
+    /// transaction/purpose validation ladder, the PremiumSubscription
+    /// suggested-action dismisses, then the
+    /// `AssignAppStoreTransactionQuery`/`AssignPlayMarketTransactionQuery`
+    /// sends (cpp:860-893); the conversion error arm is the handlers'
+    /// `on_error` (plain `set_error`).
+    pub fn assign_store_transaction(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        transaction: Option<td_api::StoreTransaction>,
+        purpose: Option<td_api::StorePaymentPurpose>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(transaction) = transaction else {
+            return promise.set_error(Status::error(400, "Transaction must be non-empty"));
+        };
+        if matches!(
+            &purpose,
+            Some(td_api::StorePaymentPurpose::storePaymentPurposePremiumSubscription(_))
+        ) {
+            use crate::suggested_action::SuggestedActionType;
+            env.dismiss_suggested_action(SuggestedActionType::UpgradePremium);
+            env.dismiss_suggested_action(SuggestedActionType::SubscribeToAnnualPremium);
+            env.dismiss_suggested_action(SuggestedActionType::RestorePremium);
+        }
+        let (receipt, is_app_store) = match transaction {
+            td_api::StoreTransaction::storeTransactionAppStore(t) => (t.receipt, true),
+            td_api::StoreTransaction::storeTransactionGooglePlay(t) => {
+                let (Some(package_name), Some(store_product_id), Some(purchase_token)) = (
+                    crate::misc::clean_input_string(&t.package_name),
+                    crate::misc::clean_input_string(&t.store_product_id),
+                    crate::misc::clean_input_string(&t.purchase_token),
+                ) else {
+                    return promise
+                        .set_error(Status::error(400, "Strings must be encoded in UTF-8"));
+                };
+                // the C++ `json_encode<string>(json_object(...))` receipt
+                // (cpp:881-886) — the builder escapes the fields; the
+                // seam carries it as bytes (the AppStore form)
+                let mut receipt = tdutils::json::JsonBuilder::new(false);
+                receipt.object(|o| {
+                    o.field("packageName", package_name.as_str());
+                    o.field("purchaseToken", purchase_token.as_str());
+                    o.field("productId", store_product_id.as_str());
+                });
+                (receipt.as_str().as_bytes().to_vec(), false)
+            }
+        };
+        let input_purpose = match env.get_input_store_payment_purpose(purpose) {
+            Result::Ok(input_purpose) => input_purpose,
+            Result::Err(status) => return promise.set_error(status),
+        };
+        env.send_assign_store_transaction_query(receipt, input_purpose, is_app_store);
+        self.pending_assign_store_transaction.push(promise);
+    }
+
+    /// The store-transaction assigns' promise pop (the Updates answers
+    /// re-enter `on_get_updates` with the promise).
+    pub(crate) fn take_assign_store_transaction_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_assign_store_transaction.is_empty() {
+            None
+        } else {
+            Some(self.pending_assign_store_transaction.remove(0))
+        }
     }
 }
 
