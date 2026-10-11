@@ -2976,6 +2976,59 @@ pub(crate) enum TranslationNetKind {
 /// [`Td::on_translation_net_answer`].
 type TranslationNetHandle = NetKindHandle<TranslationNetKind>;
 
+/// The PrivacyManager/GlobalPrivacySettings query families riding the
+/// dispatcher — the C++ ResultHandler classes of
+/// PrivacyManager.cpp:26-81 and GlobalPrivacySettings.cpp:26-75.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PrivacyNetKind {
+    /// `GetPrivacyQuery` (PrivacyManager.cpp:26-50) — the answer keys on
+    /// the setting (the caller promises queue in the manager's
+    /// `PrivacyInfo`).
+    GetPrivacy {
+        setting: crate::privacy_manager::UserPrivacySettingType,
+    },
+    /// `SetPrivacyQuery` (PrivacyManager.cpp:54-81).
+    SetPrivacy {
+        setting: crate::privacy_manager::UserPrivacySettingType,
+    },
+    /// `GetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:26-46).
+    GetGlobalPrivacySettings,
+    /// `SetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:48-75).
+    SetGlobalPrivacySettings,
+}
+
+/// The cloned privacy dispatch surface the [`PrivacyEnv`] senders use —
+/// the answers drain through [`Td::on_privacy_net_answer`].
+type PrivacyNetHandle = NetKindHandle<PrivacyNetKind>;
+
+/// The parked privacy promises (the C++ handlers' own promises) — the
+/// set/global pairs; the get promises queue in the manager's
+/// `PrivacyInfo` instead (the C++ shape).
+enum PendingPrivacyQuery {
+    /// The `SetPrivacyQuery` promise (PrivacyManager.cpp:55).
+    SetPrivacy { promise: Promise<()> },
+    /// The `GetGlobalPrivacySettingsQuery` promise
+    /// (GlobalPrivacySettings.cpp:27).
+    GetGlobal {
+        promise: Promise<crate::privacy_manager::GlobalPrivacySettings>,
+    },
+    /// The `SetGlobalPrivacySettingsQuery` promise
+    /// (GlobalPrivacySettings.cpp:49).
+    SetGlobal { promise: Promise<()> },
+}
+
+impl PendingPrivacyQuery {
+    fn is_set_privacy(&self) -> bool {
+        matches!(self, Self::SetPrivacy { .. })
+    }
+    fn is_get_global(&self) -> bool {
+        matches!(self, Self::GetGlobal { .. })
+    }
+    fn is_set_global(&self) -> bool {
+        matches!(self, Self::SetGlobal { .. })
+    }
+}
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -3075,6 +3128,16 @@ fn take_translation_pending(
     promises: &mut Vec<crate::translation_manager::PendingTranslationQuery>,
     selector: fn(&crate::translation_manager::PendingTranslationQuery) -> bool,
 ) -> Option<crate::translation_manager::PendingTranslationQuery> {
+    let index = promises.iter().position(selector)?;
+    Some(promises.remove(index))
+}
+
+/// Pop the first parked [`PendingPrivacyQuery`] matching the selector
+/// (the translation twin over the privacy lot).
+fn take_privacy_pending(
+    promises: &mut Vec<PendingPrivacyQuery>,
+    selector: fn(&PendingPrivacyQuery) -> bool,
+) -> Option<PendingPrivacyQuery> {
     let index = promises.iter().position(selector)?;
     Some(promises.remove(index))
 }
@@ -3751,6 +3814,11 @@ pub struct Td {
     /// The parked TranslationManager promises (the C++ handlers' own
     /// promises) — popped by the answer drain.
     translation_promises: Vec<crate::translation_manager::PendingTranslationQuery>,
+    /// The callback-parked PrivacyManager query answers, parked by kind
+    /// (the `Td::on_privacy_net_answer` drain).
+    privacy_net_completed: Arc<Mutex<Vec<(PrivacyNetKind, NetQuery)>>>,
+    /// The parked privacy promises (the C++ handlers' own promises).
+    privacy_promises: Vec<PendingPrivacyQuery>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4188,6 +4256,8 @@ impl Td {
             sponsored_net_completed: Arc::new(Mutex::new(Vec::new())),
             translation_net_completed: Arc::new(Mutex::new(Vec::new())),
             translation_promises: Vec::new(),
+            privacy_net_completed: Arc::new(Mutex::new(Vec::new())),
+            privacy_promises: Vec::new(),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -6338,6 +6408,7 @@ impl Td {
         self.dispatch_completed_promo_net();
         self.dispatch_completed_sponsored_net();
         self.dispatch_completed_translation_net();
+        self.dispatch_completed_privacy_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6447,6 +6518,16 @@ impl Td {
         Some(TranslationNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.translation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned privacy dispatch surface — the [`PrivacyEnv`] senders
+    /// use it; `None` keeps the net-inert posture.
+    fn privacy_net(&self) -> Option<PrivacyNetHandle> {
+        Some(PrivacyNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.privacy_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7575,6 +7656,122 @@ impl Td {
             self.on_translation_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked privacy answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves
+    /// (PrivacyManager.cpp:26-81, GlobalPrivacySettings.cpp:26-75).
+    fn dispatch_completed_privacy_net(&mut self) {
+        let completed = std::mem::take(&mut *self.privacy_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_privacy_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one privacy net answer by kind (the C++ query handler
+    /// halves of PrivacyManager.cpp:26-81 / GlobalPrivacySettings.cpp:26-75).
+    fn on_privacy_net_answer(&mut self, kind: PrivacyNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        // The shared rules conversion — the account_privacyRules intake
+        // (UserPrivacySettingRule.cpp:279-284).
+        fn wire_rules(
+            td: &mut Td,
+            query: &NetQuery,
+        ) -> tdutils::status::Result<crate::privacy_manager::UserPrivacySettingRules> {
+            match telegram_api::account_PrivacyRules::parse(query.ok()) {
+                Result::Ok(rules) => {
+                    let mut env = crate::td::PrivacyEnv { td };
+                    tdutils::status::Result::Ok(
+                        crate::privacy_manager::UserPrivacySettingRules::from_account_privacy_rules(
+                            &mut env, rules,
+                        ),
+                    )
+                }
+                Result::Err(_) => tdutils::status::Result::Err(parse_error("account_privacyRules")),
+            }
+        }
+        match kind {
+            // `GetPrivacyQuery` (PrivacyManager.cpp:40-50) — the answer
+            // re-enters `on_get_user_privacy_settings`; the caller
+            // promises queue inside the manager.
+            PrivacyNetKind::GetPrivacy { setting } => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    wire_rules(self, &query)
+                };
+                let (mut manager, mut env) = privacy_env_split(self);
+                manager.on_get_user_privacy_settings(&mut env, setting, result);
+                self.privacy_manager = manager;
+            }
+            // `SetPrivacyQuery` (PrivacyManager.cpp:66-81) — the parked
+            // promise rides the re-entry.
+            PrivacyNetKind::SetPrivacy { setting } => {
+                let Some(pending) = take_privacy_pending(
+                    &mut self.privacy_promises,
+                    PendingPrivacyQuery::is_set_privacy,
+                ) else {
+                    return;
+                };
+                let PendingPrivacyQuery::SetPrivacy { promise } = pending else {
+                    unreachable!("the selector matches the variant");
+                };
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    wire_rules(self, &query)
+                };
+                let (mut manager, mut env) = privacy_env_split(self);
+                manager.on_set_user_privacy_settings(&mut env, setting, result, promise);
+                self.privacy_manager = manager;
+            }
+            // `GetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:33-46).
+            PrivacyNetKind::GetGlobalPrivacySettings => {
+                let Some(pending) = take_privacy_pending(
+                    &mut self.privacy_promises,
+                    PendingPrivacyQuery::is_get_global,
+                ) else {
+                    return;
+                };
+                let PendingPrivacyQuery::GetGlobal { mut promise } = pending else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::GlobalPrivacySettings::parse(query.ok()) {
+                    Ok(settings) => promise.set_value(
+                        crate::privacy_manager::GlobalPrivacySettings::from_wire(settings),
+                    ),
+                    Err(_) => promise.set_error(parse_error("account_getGlobalPrivacySettings")),
+                }
+            }
+            // `SetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:59-75)
+            // — the ok arm drops the echoed settings value.
+            PrivacyNetKind::SetGlobalPrivacySettings => {
+                let Some(pending) = take_privacy_pending(
+                    &mut self.privacy_promises,
+                    PendingPrivacyQuery::is_set_global,
+                ) else {
+                    return;
+                };
+                let PendingPrivacyQuery::SetGlobal { mut promise } = pending else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                } else if telegram_api::GlobalPrivacySettings::parse(query.ok()).is_ok() {
+                    // the echoed settings value drops (the C++ Unit band)
+                    promise.set_value(());
+                } else {
+                    promise.set_error(parse_error("account_setGlobalPrivacySettings"));
+                }
+            }
+        }
     }
 
     /// Route one SponsoredMessageManager net answer by kind (the C++
@@ -17933,7 +18130,20 @@ pub(crate) struct PrivacyEnv<'a> {
     pub(crate) td: &'a mut Td,
 }
 
+/// The disjoint manager/env take-out (the `translation_env_split`
+/// convention) for the privacy manager.
+pub(crate) fn privacy_env_split(
+    td: &mut Td,
+) -> (crate::privacy_manager::PrivacyManager, PrivacyEnv<'_>) {
+    let manager = std::mem::take(&mut td.privacy_manager);
+    (manager, PrivacyEnv { td })
+}
+
 impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.td.global.close_flag()
+    }
+
     fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
         crate::dialog_manager::have_dialog_force(self.td, dialog_id, source)
     }
@@ -18023,44 +18233,145 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
         suggested_action_manager.hide_suggested_action(&mut account_env, action);
     }
 
-    fn get_privacy_via_net(&mut self, _key: crate::privacy_manager::UserPrivacySettingType) {
-        // `GetPrivacyQuery::send` — `account.getPrivacy`; the queued
-        // caller promises ride the `PrivacyManager` state until the net
-        // step's `on_get_user_privacy_settings` drains them
-        // (`[blocked: net]`).
+    fn get_privacy_via_net(&mut self, key: crate::privacy_manager::UserPrivacySettingType) {
+        // `GetPrivacyQuery::send` (PrivacyManager.cpp:33-35) — the queued
+        // caller promises ride the `PrivacyManager` state until
+        // `on_get_user_privacy_settings` drains them.
+        match self.td.privacy_net() {
+            Some(net) => net.dispatch(
+                PrivacyNetKind::GetPrivacy { setting: key },
+                telegram_api::Function::account_getPrivacy(telegram_api::account_getPrivacy {
+                    key: Some(key.get_input_privacy_key()),
+                }),
+            ),
+            None => tdutils::log_info!("Get privacy — [net-inert]"),
+        }
     }
 
     fn set_privacy_via_net(
         &mut self,
-        _key: crate::privacy_manager::UserPrivacySettingType,
-        _rules: crate::privacy_manager::UserPrivacySettingRules,
+        key: crate::privacy_manager::UserPrivacySettingType,
+        rules: crate::privacy_manager::UserPrivacySettingRules,
         promise: Promise<()>,
     ) {
-        // `SetPrivacyQuery::send` — `account.setPrivacy`; the caller
-        // promise resolves with the C++ LambdaPromise drop
-        // (`[blocked: net]`).
-        drop(promise);
+        // `SetPrivacyQuery::send` (PrivacyManager.cpp:61-64) — the input
+        // rules resolve at the send leg.
+        self.td
+            .privacy_promises
+            .push(PendingPrivacyQuery::SetPrivacy { promise });
+        match self.td.privacy_net() {
+            Some(net) => net.dispatch(
+                PrivacyNetKind::SetPrivacy { setting: key },
+                telegram_api::Function::account_setPrivacy(telegram_api::account_setPrivacy {
+                    key: Some(key.get_input_privacy_key()),
+                    rules: rules.get_input_privacy_rules(self),
+                }),
+            ),
+            None => tdutils::log_info!("Set privacy — [net-inert]"),
+        }
     }
 
     fn get_global_privacy_via_net(
         &mut self,
         promise: Promise<crate::privacy_manager::GlobalPrivacySettings>,
     ) {
-        // `GetGlobalPrivacySettingsQuery::send` —
-        // `account.getGlobalPrivacySettings` (`[blocked: net]`); the
-        // promise resolves with the C++ LambdaPromise drop.
-        drop(promise);
+        // `GetGlobalPrivacySettingsQuery::send`
+        // (GlobalPrivacySettings.cpp:33-35) — the `{{"me"}}` dispatch
+        // band keys on the own user.
+        self.td
+            .privacy_promises
+            .push(PendingPrivacyQuery::GetGlobal { promise });
+        match self.td.privacy_net() {
+            Some(net) => net.dispatch(
+                PrivacyNetKind::GetGlobalPrivacySettings,
+                telegram_api::Function::account_getGlobalPrivacySettings(
+                    telegram_api::account_getGlobalPrivacySettings,
+                ),
+            ),
+            None => tdutils::log_info!("Get global privacy settings — [net-inert]"),
+        }
     }
 
     fn set_global_privacy_via_net(
         &mut self,
-        _settings: crate::privacy_manager::GlobalPrivacySettings,
+        settings: crate::privacy_manager::GlobalPrivacySettings,
         promise: Promise<()>,
     ) {
-        // the get → `apply_changes` → `SetGlobalPrivacySettingsQuery::send`
-        // chain (GlobalPrivacySettings.cpp:187-197); the caller promise
-        // rides the dropped query half (`[blocked: net]`).
-        drop(promise);
+        // `SetGlobalPrivacySettingsQuery::send`
+        // (GlobalPrivacySettings.cpp:59-62).
+        self.td
+            .privacy_promises
+            .push(PendingPrivacyQuery::SetGlobal { promise });
+        match self.td.privacy_net() {
+            Some(net) => net.dispatch(
+                PrivacyNetKind::SetGlobalPrivacySettings,
+                telegram_api::Function::account_setGlobalPrivacySettings(
+                    telegram_api::account_setGlobalPrivacySettings {
+                        settings: Some(settings.get_input_global_privacy_settings()),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Set global privacy settings — [net-inert]"),
+        }
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("privacy calls run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let td = &mut *self.td;
+        let mut env = UserEnv {
+            global: &mut td.global,
+            options: td
+                .option_manager
+                .as_mut()
+                .expect("privacy calls run with the initialized option manager"),
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        td.chat_manager
+            .on_get_chats(&mut td.user_manager, &mut env, chats, source);
+    }
+
+    fn have_accessible_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.td.user_manager.have_accessible_user(user_id)
+    }
+
+    fn get_input_users_force(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> Vec<telegram_api::InputUser> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("privacy calls run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_input_users_force(&env, user_ids)
+    }
+
+    fn have_chat(&self, chat_id: crate::chat_manager::ChatId) -> bool {
+        self.td.chat_manager.have_chat(chat_id)
+    }
+
+    fn have_channel(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.td.chat_manager.have_channel(channel_id)
+    }
+
+    fn force_create_dialog(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
     }
 }
 
@@ -29516,6 +29827,170 @@ mod tests {
 
         assert!(td.translation_net_completed.lock().is_empty(), "drained");
         assert!(td.translation_promises.is_empty(), "all promises resolved");
+    }
+
+    // ---- the privacy net slice: the privacy/global-privacy queries
+    // ride the dispatcher (PrivacyManager.cpp:26-81,
+    // GlobalPrivacySettings.cpp:26-75). ----
+
+    type PrivacyRulesSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::UserPrivacySettingRules>>>,
+    >;
+
+    fn record_privacy_rules() -> (Promise<td_api::UserPrivacySettingRules>, PrivacyRulesSlot) {
+        struct Rec(PrivacyRulesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::UserPrivacySettingRules> for Rec {
+            fn set_value(&mut self, value: td_api::UserPrivacySettingRules) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: PrivacyRulesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_privacy_rules_answer(rules: Vec<telegram_api::PrivacyRule>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::account_PrivacyRules {
+            rules,
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn privacy_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(privacy_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn privacy_queries_ride_the_dispatcher_impl() {
+        use crate::privacy_manager::UserPrivacySettingType;
+        let (mut td, rec) = netted_td("netfix-privacy");
+
+        // 1. getPrivacy — the caller promise queues in the PrivacyInfo,
+        //    the answer drains it and flips the cache; the second call
+        //    answers from the synchronized cache without a new query.
+        let (promise, slot) = record_privacy_rules();
+        {
+            let (mut manager, mut env) = privacy_env_split(&mut td);
+            manager
+                .get_privacy(
+                    &mut env,
+                    Some(&td_api::UserPrivacySetting::userPrivacySettingShowStatus(
+                        td_api::userPrivacySettingShowStatus,
+                    )),
+                    promise,
+                )
+                .unwrap();
+            td.privacy_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getPrivacy::ID
+        );
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the promise queues until the answer"
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_privacy_rules_answer(vec![telegram_api::PrivacyRule::privacyValueAllowAll(
+                telegram_api::privacyValueAllowAll,
+            )]),
+        );
+        td.dispatch_completed_privacy_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(rules)) => {
+                assert_eq!(rules.rules.len(), 1, "the allowAll rule converts");
+            }
+            other => panic!("unexpected privacy rules result: {other:?}"),
+        }
+
+        // the synchronized cache answers without a query
+        let (promise, slot) = record_privacy_rules();
+        {
+            let (mut manager, mut env) = privacy_env_split(&mut td);
+            manager
+                .get_privacy(
+                    &mut env,
+                    Some(&td_api::UserPrivacySetting::userPrivacySettingShowStatus(
+                        td_api::userPrivacySettingShowStatus,
+                    )),
+                    promise,
+                )
+                .unwrap();
+            td.privacy_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "the cache answers locally");
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(_))
+        ));
+
+        // 2. setPrivacy — the parked promise resolves Unit, the wire
+        //    rules land, the trailing RestrictAll drops
+        //    (UserPrivacySettingRule.cpp:293-296).
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = privacy_env_split(&mut td);
+            manager
+                .set_privacy(
+                    &mut env,
+                    Some(&td_api::UserPrivacySetting::userPrivacySettingShowStatus(
+                        td_api::userPrivacySettingShowStatus,
+                    )),
+                    Some(&td_api::UserPrivacySettingRules {
+                        rules: vec![
+                            td_api::UserPrivacySettingRule::userPrivacySettingRuleRestrictAll(
+                                td_api::userPrivacySettingRuleRestrictAll {},
+                            ),
+                        ],
+                    }),
+                    promise,
+                )
+                .unwrap();
+            td.privacy_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_setPrivacy::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_privacy_rules_answer(vec![
+                telegram_api::PrivacyRule::privacyValueAllowAll(telegram_api::privacyValueAllowAll),
+                telegram_api::PrivacyRule::privacyValueDisallowAll(
+                    telegram_api::privacyValueDisallowAll,
+                ),
+            ]),
+        );
+        td.dispatch_completed_privacy_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        // the cache keeps the converted pair (RestrictAll dropped)
+        assert_eq!(
+            td.privacy_manager
+                .info_rules_len_for_test(UserPrivacySettingType::UserStatus),
+            1
+        );
+
+        assert!(td.privacy_net_completed.lock().is_empty(), "drained");
+        assert!(td.privacy_promises.is_empty(), "all promises resolved");
     }
 
     type CountriesSlot =

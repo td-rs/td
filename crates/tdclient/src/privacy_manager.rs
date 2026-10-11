@@ -5,14 +5,18 @@
 //! and `getReadDatePrivacySettings`/`setReadDatePrivacySettings` +
 //! `getNewChatPrivacySettings`/`setNewChatPrivacySettings`.
 //!
-//! The `account.getPrivacy`/`account.setPrivacy` query tails and the
+//! The `account.getPrivacy`/`account.setPrivacy` queries and the
 //! `account.getGlobalPrivacySettings` → `apply_changes` →
-//! `account.setGlobalPrivacySettings` chain park at the named
-//! [`PrivacyManagerEnv`] net seams (the M.31 convention — the promise
-//! queues ride the [`PrivacyManager`] state exactly like the C++
-//! `PrivacyInfo`, and the query result handlers
-//! `on_get_user_privacy_settings`/`on_set_user_privacy_settings`
-//! (PrivacyManager.cpp:176-229) are the seam's unreachable consumers).
+//! `account.setGlobalPrivacySettings` chain ride the client-side
+//! dispatcher under their `PrivacyNetKind` — the answers drain through
+//! `Td::on_privacy_net_answer` into the landed
+//! `on_get_user_privacy_settings`/`on_set_user_privacy_settings` halves
+//! (the caller promise queues ride the [`PrivacyManager`] state exactly
+//! like the C++ `PrivacyInfo`, the on_set tail re-sends the parked
+//! `pending_rules` through the join promise), and the wire legs
+//! (`get_input_privacy_key`, `get_input_privacy_rules`, the
+//! `account_privacyRules` intake with its users/chats legs and the
+//! trailing RestrictAll/DisallowAll drops) landed with the net slice.
 //! Everything the C++ answers from local state is real: the privacy-key
 //! model, the rules intake with the 400 bands, the rules→td_api builders,
 //! the `do_update_privacy` cache flip + the `updateUserPrivacySettingRules`
@@ -26,7 +30,7 @@
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
-use crate::chat_manager::ChannelId;
+use crate::chat_manager::{ChannelId, ChatId};
 use crate::dialog_id::DialogId;
 use crate::messages_manager::DialogType;
 use crate::td_api;
@@ -101,6 +105,61 @@ impl UserPrivacySettingType {
             }
             td_api::UserPrivacySetting::userPrivacySettingShowProfileAudio(_) => Self::SavedMusic,
         })
+    }
+
+    /// `UserPrivacySetting::get_input_privacy_key`
+    /// (UserPrivacySetting.cpp:104-141) — the net-slice key converter
+    /// for `account.getPrivacy`/`account.setPrivacy`.
+    pub(crate) fn get_input_privacy_key(self) -> tdmtproto::telegram_api::InputPrivacyKey {
+        use tdmtproto::telegram_api;
+        match self {
+            Self::UserStatus => telegram_api::InputPrivacyKey::inputPrivacyKeyStatusTimestamp(
+                telegram_api::inputPrivacyKeyStatusTimestamp,
+            ),
+            Self::ChatInvite => telegram_api::InputPrivacyKey::inputPrivacyKeyChatInvite(
+                telegram_api::inputPrivacyKeyChatInvite,
+            ),
+            Self::Call => telegram_api::InputPrivacyKey::inputPrivacyKeyPhoneCall(
+                telegram_api::inputPrivacyKeyPhoneCall,
+            ),
+            Self::PeerToPeerCall => telegram_api::InputPrivacyKey::inputPrivacyKeyPhoneP2P(
+                telegram_api::inputPrivacyKeyPhoneP2P,
+            ),
+            Self::LinkInForwardedMessages => {
+                telegram_api::InputPrivacyKey::inputPrivacyKeyForwards(
+                    telegram_api::inputPrivacyKeyForwards,
+                )
+            }
+            Self::UserProfilePhoto => telegram_api::InputPrivacyKey::inputPrivacyKeyProfilePhoto(
+                telegram_api::inputPrivacyKeyProfilePhoto,
+            ),
+            Self::UserPhoneNumber => telegram_api::InputPrivacyKey::inputPrivacyKeyPhoneNumber(
+                telegram_api::inputPrivacyKeyPhoneNumber,
+            ),
+            Self::FindByPhoneNumber => telegram_api::InputPrivacyKey::inputPrivacyKeyAddedByPhone(
+                telegram_api::inputPrivacyKeyAddedByPhone,
+            ),
+            Self::VoiceMessages => telegram_api::InputPrivacyKey::inputPrivacyKeyVoiceMessages(
+                telegram_api::inputPrivacyKeyVoiceMessages,
+            ),
+            Self::UserBio => telegram_api::InputPrivacyKey::inputPrivacyKeyAbout(
+                telegram_api::inputPrivacyKeyAbout,
+            ),
+            Self::UserBirthdate => telegram_api::InputPrivacyKey::inputPrivacyKeyBirthday(
+                telegram_api::inputPrivacyKeyBirthday,
+            ),
+            Self::StarGiftAutosave => {
+                telegram_api::InputPrivacyKey::inputPrivacyKeyStarGiftsAutoSave(
+                    telegram_api::inputPrivacyKeyStarGiftsAutoSave,
+                )
+            }
+            Self::NoPaidMessages => telegram_api::InputPrivacyKey::inputPrivacyKeyNoPaidMessages(
+                telegram_api::inputPrivacyKeyNoPaidMessages,
+            ),
+            Self::SavedMusic => telegram_api::InputPrivacyKey::inputPrivacyKeySavedMusic(
+                telegram_api::inputPrivacyKeySavedMusic,
+            ),
+        }
     }
 
     /// `UserPrivacySetting::get_user_privacy_setting_object`
@@ -296,6 +355,191 @@ impl UserPrivacySettingRule {
         }
     }
 
+    /// `UserPrivacySettingRule::set_dialog_ids_from_server`
+    /// (UserPrivacySettingRule.cpp:157-171) — the server ids resolve
+    /// through the chat/channel cache and force-create the dialog.
+    fn set_dialog_ids_from_server(
+        env: &mut impl PrivacyManagerEnv,
+        chat_ids: &[i64],
+    ) -> Vec<DialogId> {
+        let mut dialog_ids = Vec::new();
+        for server_chat_id in chat_ids {
+            let chat_id = ChatId::new(*server_chat_id);
+            let mut dialog_id = DialogId::from_chat_id(chat_id);
+            if !env.have_chat(chat_id) {
+                let channel_id = ChannelId::new(*server_chat_id);
+                dialog_id = DialogId::from_channel_id(channel_id);
+                if !env.have_channel(channel_id) {
+                    tdutils::log_error!("Receive unknown group {server_chat_id} from the server");
+                    continue;
+                }
+            }
+            env.force_create_dialog(dialog_id, "set_dialog_ids_from_server");
+            dialog_ids.push(dialog_id);
+        }
+        dialog_ids
+    }
+
+    /// `UserPrivacySettingRule::UserPrivacySettingRule(Td *, const
+    /// telegram_api::PrivacyRule &)` (UserPrivacySettingRule.cpp:98-155)
+    /// — the wire form; the unknown users drop from the tail.
+    pub(crate) fn from_wire(
+        env: &mut impl PrivacyManagerEnv,
+        rule: tdmtproto::telegram_api::PrivacyRule,
+    ) -> Self {
+        use tdmtproto::telegram_api;
+        let mut result = match rule {
+            telegram_api::PrivacyRule::privacyValueAllowContacts(_) => {
+                Self::bare(rule_type::ALLOW_CONTACTS)
+            }
+            telegram_api::PrivacyRule::privacyValueAllowBots(_) => {
+                Self::bare(rule_type::ALLOW_BOTS)
+            }
+            telegram_api::PrivacyRule::privacyValueAllowPremium(_) => {
+                Self::bare(rule_type::ALLOW_PREMIUM)
+            }
+            telegram_api::PrivacyRule::privacyValueAllowCloseFriends(_) => {
+                Self::bare(rule_type::ALLOW_CLOSE_FRIENDS)
+            }
+            telegram_api::PrivacyRule::privacyValueAllowAll(_) => Self::bare(rule_type::ALLOW_ALL),
+            telegram_api::PrivacyRule::privacyValueAllowUsers(rule) => Self {
+                r#type: rule_type::ALLOW_USERS,
+                user_ids: Self::get_user_ids(&rule.users),
+                dialog_ids: Vec::new(),
+            },
+            telegram_api::PrivacyRule::privacyValueAllowChatParticipants(rule) => Self {
+                r#type: rule_type::ALLOW_CHAT_PARTICIPANTS,
+                user_ids: Vec::new(),
+                dialog_ids: Self::set_dialog_ids_from_server(env, &rule.chats),
+            },
+            telegram_api::PrivacyRule::privacyValueDisallowContacts(_) => {
+                Self::bare(rule_type::RESTRICT_CONTACTS)
+            }
+            telegram_api::PrivacyRule::privacyValueDisallowBots(_) => {
+                Self::bare(rule_type::RESTRICT_BOTS)
+            }
+            telegram_api::PrivacyRule::privacyValueDisallowAll(_) => {
+                Self::bare(rule_type::RESTRICT_ALL)
+            }
+            telegram_api::PrivacyRule::privacyValueDisallowUsers(rule) => Self {
+                r#type: rule_type::RESTRICT_USERS,
+                user_ids: Self::get_user_ids(&rule.users),
+                dialog_ids: Vec::new(),
+            },
+            telegram_api::PrivacyRule::privacyValueDisallowChatParticipants(rule) => Self {
+                r#type: rule_type::RESTRICT_CHAT_PARTICIPANTS,
+                user_ids: Vec::new(),
+                dialog_ids: Self::set_dialog_ids_from_server(env, &rule.chats),
+            },
+        };
+        result.user_ids.retain(|user_id| {
+            if !env.have_accessible_user(*user_id) {
+                tdutils::log_error!("Receive unknown {user_id:?}");
+                false
+            } else {
+                true
+            }
+        });
+        result
+    }
+
+    /// `UserPrivacySettingRule::get_input_chat_ids`
+    /// (UserPrivacySettingRule.cpp:246-260).
+    fn get_input_chat_ids(&self, env: &mut impl PrivacyManagerEnv) -> Vec<i64> {
+        let mut result = Vec::new();
+        for dialog_id in &self.dialog_ids {
+            match dialog_id.get_type() {
+                DialogType::Chat => result.push(dialog_id.get_chat_id().get()),
+                DialogType::Channel => {
+                    let channel_id = dialog_id.get_channel_id();
+                    if env.is_megagroup_channel(channel_id) {
+                        result.push(-channel_id.get());
+                    } else {
+                        tdutils::log_error!(
+                            "Have no access to {channel_id:?} from the privacy rules"
+                        );
+                    }
+                }
+                _ => unreachable!("the stored dialog ids are the chat/megagroup pair"),
+            }
+        }
+        result
+    }
+
+    /// `UserPrivacySettingRule::get_input_privacy_rule`
+    /// (UserPrivacySettingRule.cpp:211-240).
+    pub(crate) fn get_input_privacy_rule(
+        &self,
+        env: &mut impl PrivacyManagerEnv,
+    ) -> tdmtproto::telegram_api::InputPrivacyRule {
+        use tdmtproto::telegram_api;
+        match self.r#type {
+            rule_type::ALLOW_CONTACTS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueAllowContacts(
+                    telegram_api::inputPrivacyValueAllowContacts,
+                )
+            }
+            rule_type::ALLOW_BOTS => telegram_api::InputPrivacyRule::inputPrivacyValueAllowBots(
+                telegram_api::inputPrivacyValueAllowBots,
+            ),
+            rule_type::ALLOW_PREMIUM => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueAllowPremium(
+                    telegram_api::inputPrivacyValueAllowPremium,
+                )
+            }
+            rule_type::ALLOW_CLOSE_FRIENDS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueAllowCloseFriends(
+                    telegram_api::inputPrivacyValueAllowCloseFriends,
+                )
+            }
+            rule_type::ALLOW_ALL => telegram_api::InputPrivacyRule::inputPrivacyValueAllowAll(
+                telegram_api::inputPrivacyValueAllowAll,
+            ),
+            rule_type::ALLOW_USERS => telegram_api::InputPrivacyRule::inputPrivacyValueAllowUsers(
+                telegram_api::inputPrivacyValueAllowUsers {
+                    users: env.get_input_users_force(&self.user_ids),
+                },
+            ),
+            rule_type::ALLOW_CHAT_PARTICIPANTS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueAllowChatParticipants(
+                    telegram_api::inputPrivacyValueAllowChatParticipants {
+                        chats: self.get_input_chat_ids(env),
+                    },
+                )
+            }
+            rule_type::RESTRICT_CONTACTS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueDisallowContacts(
+                    telegram_api::inputPrivacyValueDisallowContacts,
+                )
+            }
+            rule_type::RESTRICT_BOTS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueDisallowBots(
+                    telegram_api::inputPrivacyValueDisallowBots,
+                )
+            }
+            rule_type::RESTRICT_ALL => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueDisallowAll(
+                    telegram_api::inputPrivacyValueDisallowAll,
+                )
+            }
+            rule_type::RESTRICT_USERS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueDisallowUsers(
+                    telegram_api::inputPrivacyValueDisallowUsers {
+                        users: env.get_input_users_force(&self.user_ids),
+                    },
+                )
+            }
+            rule_type::RESTRICT_CHAT_PARTICIPANTS => {
+                telegram_api::InputPrivacyRule::inputPrivacyValueDisallowChatParticipants(
+                    telegram_api::inputPrivacyValueDisallowChatParticipants {
+                        chats: self.get_input_chat_ids(env),
+                    },
+                )
+            }
+            _ => unreachable!("the C++ UNREACHABLE default"),
+        }
+    }
+
     /// `UserPrivacySettingRule::get_user_privacy_setting_rule_object`
     /// (UserPrivacySettingRule.cpp:173-209).
     pub(crate) fn get_user_privacy_setting_rule_object(
@@ -417,6 +661,66 @@ impl UserPrivacySettingRules {
         Ok(result)
     }
 
+    /// `UserPrivacySettingRules::get_user_privacy_setting_rules(
+    /// telegram_api::account_privacyRules &&)`
+    /// (UserPrivacySettingRule.cpp:279-284) — the users/chats intake
+    /// plus the wire rules walk.
+    pub(crate) fn from_account_privacy_rules(
+        env: &mut impl PrivacyManagerEnv,
+        rules: tdmtproto::telegram_api::account_PrivacyRules,
+    ) -> UserPrivacySettingRules {
+        env.on_get_users(rules.users, "on get privacy rules");
+        env.on_get_chats(rules.chats, "on get privacy rules");
+        Self::from_wire_rules(env, rules.rules)
+    }
+
+    /// `UserPrivacySettingRules::get_user_privacy_setting_rules(
+    /// vector<telegram_api::PrivacyRule> &&)`
+    /// (UserPrivacySettingRule.cpp:286-297) — the wire form; the
+    /// trailing RestrictAll drops.
+    pub(crate) fn from_wire_rules(
+        env: &mut impl PrivacyManagerEnv,
+        rules: Vec<tdmtproto::telegram_api::PrivacyRule>,
+    ) -> UserPrivacySettingRules {
+        let mut result = UserPrivacySettingRules::default();
+        for rule in rules {
+            result
+                .rules
+                .push(UserPrivacySettingRule::from_wire(env, rule));
+        }
+        if result
+            .rules
+            .last()
+            .is_some_and(|rule| rule.r#type == rule_type::RESTRICT_ALL)
+        {
+            result.rules.pop();
+        }
+        result
+    }
+
+    /// `UserPrivacySettingRules::get_input_privacy_rules`
+    /// (UserPrivacySettingRule.cpp:389-396) — the trailing
+    /// inputPrivacyValueDisallowAll drops.
+    pub(crate) fn get_input_privacy_rules(
+        &self,
+        env: &mut impl PrivacyManagerEnv,
+    ) -> Vec<tdmtproto::telegram_api::InputPrivacyRule> {
+        let mut result = self
+            .rules
+            .iter()
+            .map(|rule| rule.get_input_privacy_rule(env))
+            .collect::<Vec<_>>();
+        if result.last().is_some_and(|rule| {
+            matches!(
+                rule,
+                tdmtproto::telegram_api::InputPrivacyRule::inputPrivacyValueDisallowAll(_)
+            )
+        }) {
+            result.pop();
+        }
+        result
+    }
+
     /// `UserPrivacySettingRules::get_user_privacy_setting_rules_object`
     /// (UserPrivacySettingRule.cpp:353-357).
     pub(crate) fn get_user_privacy_setting_rules_object(
@@ -486,6 +790,13 @@ impl PrivacyManager {
     /// `PrivacyManager::get_info` (PrivacyManager.h:53-55).
     fn get_info(&mut self, key: UserPrivacySettingType) -> &mut PrivacyInfo {
         &mut self.info[key.index()]
+    }
+
+    /// The test read of the cached rules (the round-trip assertion
+    /// surface).
+    #[cfg(test)]
+    pub(crate) fn info_rules_len_for_test(&self, key: UserPrivacySettingType) -> usize {
+        self.info[key.index()].rules.rules.len()
     }
 
     /// `PrivacyManager::get_privacy` (PrivacyManager.cpp:120-138) — the
@@ -593,6 +904,114 @@ impl PrivacyManager {
                 setting: Some(key_object),
                 rules: Some(rules_object),
             });
+        }
+    }
+
+    /// `PrivacyManager::on_get_user_privacy_settings`
+    /// (PrivacyManager.cpp:175-193) — the `GetPrivacyQuery` answer half:
+    /// the queued caller promises drain (error clones, ok converts),
+    /// then the cache flip.
+    pub(crate) fn on_get_user_privacy_settings(
+        &mut self,
+        env: &mut impl PrivacyManagerEnv,
+        user_privacy_setting: UserPrivacySettingType,
+        r_privacy_rules: tdutils::status::Result<UserPrivacySettingRules>,
+    ) {
+        // `G()->ignore_result_if_closing` — a closing Td drops the
+        // error results; the ok ones still land (the C++ checks
+        // is_error only).
+        if env.close_flag() && r_privacy_rules.is_error() {
+            return;
+        }
+        let info = self.get_info(user_privacy_setting);
+        let promises = std::mem::take(&mut info.get_promises);
+        for mut promise in promises {
+            match &r_privacy_rules {
+                tdutils::status::Result::Err(status) => promise.set_error(status.clone()),
+                tdutils::status::Result::Ok(rules) => {
+                    promise.set_value(rules.get_user_privacy_setting_rules_object(env))
+                }
+            }
+        }
+        if let tdutils::status::Result::Ok(privacy_rules) = r_privacy_rules {
+            self.do_update_privacy(env, user_privacy_setting, privacy_rules, false);
+        }
+    }
+
+    /// `PrivacyManager::set_privacy_impl` (PrivacyManager.cpp:167-174)
+    /// — the send tail shared by `set_privacy` and the on_set re-chain.
+    pub(crate) fn set_privacy_impl(
+        &mut self,
+        env: &mut impl PrivacyManagerEnv,
+        user_privacy_setting: UserPrivacySettingType,
+        privacy_rules: Option<UserPrivacySettingRules>,
+        promise: Promise<()>,
+    ) {
+        let privacy_rules =
+            privacy_rules.unwrap_or_else(|| self.get_info(user_privacy_setting).rules.clone());
+        env.set_privacy_via_net(user_privacy_setting, privacy_rules, promise);
+    }
+
+    /// `PrivacyManager::on_set_user_privacy_settings`
+    /// (PrivacyManager.cpp:195-226) — the `SetPrivacyQuery` answer half:
+    /// the flag clears, the promise answers, and the parked
+    /// `pending_rules` re-send chains through the join promise (the ok
+    /// answers all the parked promises, the error fails them).
+    pub(crate) fn on_set_user_privacy_settings(
+        &mut self,
+        env: &mut impl PrivacyManagerEnv,
+        user_privacy_setting: UserPrivacySettingType,
+        r_privacy_rules: tdutils::status::Result<UserPrivacySettingRules>,
+        mut promise: Promise<()>,
+    ) {
+        if env.close_flag() {
+            let info = self.get_info(user_privacy_setting);
+            info.has_set_query = false;
+            let promises = std::mem::take(&mut info.set_promises);
+            let error = crate::config_result::request_aborted_error();
+            for mut parked in promises {
+                parked.set_error(error.clone());
+            }
+            promise.set_error(error);
+            return;
+        }
+
+        let info = self.get_info(user_privacy_setting);
+        debug_assert!(info.has_set_query, "the C++ CHECK(has_set_query_) band");
+        info.has_set_query = false;
+        match r_privacy_rules {
+            tdutils::status::Result::Err(status) => promise.set_error(status),
+            tdutils::status::Result::Ok(privacy_rules) => {
+                self.do_update_privacy(env, user_privacy_setting, privacy_rules, true);
+                promise.set_value(());
+            }
+        }
+        let info = self.get_info(user_privacy_setting);
+        if !info.set_promises.is_empty() {
+            info.has_set_query = true;
+            let promises = std::mem::take(&mut info.set_promises);
+            let pending_rules = info.pending_rules.take();
+            let join_promise = Promise::from_interface(JoinUnitPromises(promises));
+            self.set_privacy_impl(env, user_privacy_setting, pending_rules, join_promise);
+        }
+    }
+}
+
+/// The on_set join promise (PrivacyManager.cpp:218-224 — the
+/// `PromiseCreator::lambda` over the parked `set_promises`): ok answers
+/// every parked promise, an error fails them all.
+struct JoinUnitPromises(Vec<Promise<()>>);
+
+impl tdutils::promise::PromiseInterface<()> for JoinUnitPromises {
+    fn set_value(&mut self, _value: ()) {
+        for promise in &mut self.0 {
+            promise.set_value(());
+        }
+    }
+
+    fn set_error(&mut self, error: Status) {
+        for promise in &mut self.0 {
+            promise.set_error(error.clone());
         }
     }
 }
@@ -707,6 +1126,44 @@ impl GlobalPrivacySettings {
         }
     }
 
+    /// `GlobalPrivacySettings::GlobalPrivacySettings(
+    /// telegram_api::globalPrivacySettings &&)`
+    /// (GlobalPrivacySettings.cpp:39-49/64-73) — the wire form the
+    /// `GetGlobalPrivacySettingsQuery` answer converts through (the
+    /// star count clamps, the gifts ride the `StarGiftSettings`
+    /// ctor).
+    pub(crate) fn from_wire(
+        settings: tdmtproto::telegram_api::GlobalPrivacySettings,
+    ) -> GlobalPrivacySettings {
+        let tdmtproto::telegram_api::GlobalPrivacySettings {
+            archive_and_mute_new_noncontact_peers,
+            keep_archived_unmuted,
+            keep_archived_folders,
+            hide_read_marks,
+            new_noncontact_peers_require_premium,
+            display_gifts_button,
+            noncontact_peers_paid_stars,
+            disallowed_gifts,
+            ..
+        } = settings;
+        GlobalPrivacySettings {
+            set_type: SetType::None,
+            archive_and_mute_new_noncontact_peers,
+            keep_archived_unmuted,
+            keep_archived_folders,
+            hide_read_marks,
+            new_noncontact_peers_require_premium,
+            noncontact_peers_paid_star_count: crate::star_manager::get_star_count(
+                noncontact_peers_paid_stars,
+                false,
+            ),
+            gift_settings: crate::star_gift_settings::StarGiftSettings::new(
+                display_gifts_button,
+                disallowed_gifts,
+            ),
+        }
+    }
+
     /// `GlobalPrivacySettings::get_read_date_privacy_settings_object`
     /// (GlobalPrivacySettings.cpp:163-167).
     pub(crate) fn get_read_date_privacy_settings_object(&self) -> td_api::ReadDatePrivacySettings {
@@ -794,6 +1251,9 @@ impl GlobalPrivacySettings {
 /// fields — the env convention
 /// ([`crate::connection_creator::ConnectionCreatorEnv`]).
 pub(crate) trait PrivacyManagerEnv {
+    /// `Global::close_flag`.
+    fn close_flag(&self) -> bool;
+
     /// `DialogManager::have_dialog_force`.
     fn have_dialog_force(&mut self, dialog_id: DialogId, source: &str) -> bool;
 
@@ -855,6 +1315,36 @@ pub(crate) trait PrivacyManagerEnv {
     /// `account.setGlobalPrivacySettings` tail of the get →
     /// `apply_changes` → set chain; `[blocked: net]`.
     fn set_global_privacy_via_net(&mut self, settings: GlobalPrivacySettings, promise: Promise<()>);
+
+    /// `UserManager::on_get_users` — the wire rules intake leg
+    /// (UserPrivacySettingRule.cpp:280).
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str);
+
+    /// `ChatManager::on_get_chats` — the wire rules intake leg
+    /// (UserPrivacySettingRule.cpp:281).
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str);
+
+    /// `UserManager::have_accessible_user` — the unknown-user rule
+    /// drop (UserPrivacySettingRule.cpp:152-158).
+    fn have_accessible_user(&self, user_id: UserId) -> bool;
+
+    /// `UserManager::get_input_users_force`
+    /// (UserPrivacySettingRule.cpp:242-244).
+    fn get_input_users_force(
+        &mut self,
+        user_ids: &[UserId],
+    ) -> Vec<tdmtproto::telegram_api::InputUser>;
+
+    /// `ChatManager::have_chat` — the server dialog-id resolution
+    /// (UserPrivacySettingRule.cpp:162).
+    fn have_chat(&self, chat_id: ChatId) -> bool;
+
+    /// `ChatManager::have_channel` (UserPrivacySettingRule.cpp:165).
+    fn have_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `DialogManager::force_create_dialog`
+    /// (UserPrivacySettingRule.cpp:169).
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str);
 }
 
 #[cfg(test)]
@@ -902,9 +1392,48 @@ mod tests {
     }
 
     impl PrivacyManagerEnv for TestPrivacyEnv {
+        fn close_flag(&self) -> bool {
+            false
+        }
+
         fn have_dialog_force(&mut self, dialog_id: DialogId, _source: &str) -> bool {
             self.dialogs.contains(&dialog_id)
         }
+
+        fn on_get_users(&mut self, _users: Vec<tdmtproto::telegram_api::User>, _source: &str) {}
+
+        fn on_get_chats(&mut self, _chats: Vec<tdmtproto::telegram_api::Chat>, _source: &str) {}
+
+        fn have_accessible_user(&self, _user_id: UserId) -> bool {
+            true
+        }
+
+        fn get_input_users_force(
+            &mut self,
+            user_ids: &[UserId],
+        ) -> Vec<tdmtproto::telegram_api::InputUser> {
+            user_ids
+                .iter()
+                .map(|&user_id| {
+                    tdmtproto::telegram_api::InputUser::inputUser(
+                        tdmtproto::telegram_api::inputUser {
+                            user_id: user_id.get(),
+                            access_hash: 0,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        fn have_chat(&self, _chat_id: ChatId) -> bool {
+            true
+        }
+
+        fn have_channel(&self, _channel_id: ChannelId) -> bool {
+            true
+        }
+
+        fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {}
 
         fn is_megagroup_channel(&mut self, channel_id: ChannelId) -> bool {
             self.megagroups.contains(&channel_id)
