@@ -2,15 +2,15 @@
 //! manager plane. The value surface (check_payment_amount, the premium
 //! limits table, the gift-option helpers) is the real port; the queries
 //! ride the client-side dispatcher under their `PremiumNetKind` — the
-//! landed flows are `payments.applyGiftCode` (the Updates answer
-//! re-enters `on_get_updates` with the promise) and
-//! `payments.getPremiumGiftCodeOptions` (the filter/star-price/discount
-//! conversion at [`PremiumManager::on_get_premium_gift_options`], the
-//! sticker leg parked at the stickers plane). The env is the whole-Td
-//! shape (the [`crate::td::PremiumTdEnv`] widening — the PrivacyEnv
-//! convention), so the remaining flows (giveaway options/info,
-//! checkGiftCode, the store-purpose trio, the promo) resolve
-//! peers/chats/users through the same trait.
+//! landed flows span applyGiftCode + getPremiumGiftCodeOptions (the
+//! filter/star-price/discount conversion at
+//! `PremiumManager::on_get_premium_gift_options`, the sticker leg parked
+//! at the stickers plane), the giveaway options/info, checkGiftCode, the
+//! store-purpose trio and launchPrepaidGiveaway. The env is the whole-Td
+//! shape (the `crate::td::PremiumTdEnv` widening — the PrivacyEnv
+//! convention), so the flows resolve peers/chats/users through the same
+//! trait; send_premium_gift parks with the payments plane and the promo
+//! with the files plane.
 
 use crate::chat_manager::{ChannelId, DialogParticipantStatus};
 use crate::dialog_id::DialogId;
