@@ -45,7 +45,8 @@ pub struct SuggestedActionManager {
     dialog_suggested_actions: std::collections::BTreeMap<i64, Vec<SuggestedAction>>,
     /// The `()`-typed promises parked at their `[blocked: net]` dismiss
     /// sends, keyed by the action.
-    dismiss_suggested_action_queries: std::collections::BTreeMap<(i64, i32), Vec<Promise<()>>>,
+    pub(crate) dismiss_suggested_action_queries:
+        std::collections::BTreeMap<(i64, i32), Vec<Promise<()>>>,
     /// The login-email check promises parked at the promo-data seam.
     pub parked_login_email_promises: Vec<Promise<()>>,
 }

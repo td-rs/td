@@ -18662,6 +18662,45 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         )
     }
 
+    // `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
+    // (Premium.cpp:1461-1465) over the suggested-action manager — the
+    // `AccountEnv` build (the `hide_archive_and_mute_suggested_action`
+    // precedent); the `DismissSuggestionQuery` seam parks with the
+    // suggested-action net slice.
+    fn dismiss_suggested_action(
+        &mut self,
+        action_type: crate::suggested_action::SuggestedActionType,
+    ) {
+        let this = &mut *self.td;
+        let crate::td::Td {
+            global,
+            option_manager,
+            user_manager,
+            device_token_manager,
+            auth_manager,
+            suggested_action_manager,
+            account_updates,
+            ..
+        } = this;
+        let mut action = crate::suggested_action::SuggestedAction::default();
+        action.init(action_type);
+        let mut account_env = AccountEnv {
+            global,
+            options: option_manager.as_mut(),
+            user_manager,
+            device_token_manager,
+            auth_is_bot: auth_manager.is_bot(),
+            updates: account_updates,
+            net: None,
+        };
+        // the C++ internal callers drop their promises
+        suggested_action_manager.dismiss_suggested_action(
+            &mut account_env,
+            action,
+            Promise::default(),
+        );
+    }
+
     // `get_input_store_payment_purpose` (Premium.cpp:220-300) — the
     // conversion runs over the payments surface; the field-split
     // payments env over the same Td (the `payments_arm` convention).
@@ -32206,6 +32245,18 @@ mod tests {
             slot.lock().unwrap().take(),
             Some(tdutils::status::Result::Ok(()))
         ));
+        // the PremiumSubscription purpose dismisses the three
+        // suggested actions (cpp:1461-1465) — the promises park at the
+        // suggested-action plane's net seam
+        assert_eq!(
+            td.suggested_action_manager
+                .dismiss_suggested_action_queries
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(0, 7), (0, 8), (0, 9)],
+            "UpgradePremium/SubscribeToAnnualPremium/RestorePremium"
+        );
 
         // 15. assignStoreTransaction — the empty transaction answers the
         //     C++ 400 before any dispatch.
