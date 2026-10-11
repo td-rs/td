@@ -2751,6 +2751,52 @@ enum CommunityNetKind {
 /// use — the answers drain through [`Td::on_community_net_answer`].
 type CommunityNetHandle = NetKindHandle<CommunityNetKind>;
 
+/// The AccountManager in-flight query kinds — the C++ ResultHandler
+/// classes of AccountManager.cpp:180-612 (the sessions/authorizations,
+/// web-authorization, contact-token and TTL families).
+#[derive(Clone, Copy)]
+pub(crate) enum AccountNetKind {
+    /// `SetAccountTtlQuery` (cpp:180) — the `!result` 500 band.
+    SetAccountTtl,
+    /// `GetAccountTtlQuery` (cpp:211).
+    GetAccountTtl,
+    /// `AcceptLoginTokenQuery` (cpp:239) — the QR-login confirmation.
+    AcceptLoginToken,
+    /// `GetAuthorizationsQuery` (cpp:266) — the answer confirms the
+    /// received non-current sessions on the way (the unconfirmed-session
+    /// cleanup).
+    GetAuthorizations,
+    /// `ResetAuthorizationQuery` (cpp:322).
+    ResetAuthorization,
+    /// `ResetAuthorizationsQuery` (cpp:349) — the ok half re-registers
+    /// the device tokens.
+    ResetAuthorizations,
+    /// `ChangeAuthorizationSettingsQuery` (cpp:377).
+    ChangeAuthorizationSettings,
+    /// `SetAuthorizationTtlQuery` (cpp:415).
+    SetAuthorizationTtl,
+    /// `GetWebAuthorizationsQuery` (cpp:443) — the users intake feeds
+    /// the website conversion.
+    GetWebAuthorizations,
+    /// `ResetWebAuthorizationQuery` (cpp:491).
+    ResetWebAuthorization,
+    /// `ResetWebAuthorizationsQuery` (cpp:518).
+    ResetWebAuthorizations,
+    /// `CancelWebTokenAuthorizationQuery` (6f9801c65) — the
+    /// dismissWebToken flow.
+    CancelWebToken,
+    /// `ExportContactTokenQuery` (cpp:545) — the token arm of
+    /// `get_user_link` (the expires clamp).
+    ExportContactToken,
+    /// `ImportContactTokenQuery` (cpp:574) — the `on_get_user` intake
+    /// answers with the stored user object.
+    ImportContactToken,
+}
+
+/// The cloned account dispatch surface the [`AccountEnv`] senders use —
+/// the answers drain through [`Td::on_account_net_answer`].
+type AccountNetHandle = NetKindHandle<AccountNetKind>;
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -2822,6 +2868,22 @@ fn parse_wire_bool(data: &[u8]) -> Option<()> {
     let constructor = i32::from_le_bytes(data.get(..4)?.try_into().ok()?);
     if constructor == BOOL_TRUE_ID || constructor == BOOL_FALSE_ID {
         Some(())
+    } else {
+        None
+    }
+}
+
+/// The value form of [`parse_wire_bool`] — `Some(true)`/`Some(false)`
+/// for the account families that log (`LOG_IF(WARNING, !result)`) or
+/// error (`SetAccountTtlQuery`) on the false band.
+fn parse_wire_bool_value(data: &[u8]) -> Option<bool> {
+    const BOOL_TRUE_ID: i32 = 0x9972_75b5u32 as i32;
+    const BOOL_FALSE_ID: i32 = 0xbc79_9737u32 as i32;
+    let constructor = i32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    if constructor == BOOL_TRUE_ID {
+        Some(true)
+    } else if constructor == BOOL_FALSE_ID {
+        Some(false)
     } else {
         None
     }
@@ -3356,6 +3418,9 @@ pub struct Td {
     /// The callback-parked CommunityManager query answers, parked by
     /// kind (the `Td::on_community_net_answer` drain).
     community_net_completed: Arc<Mutex<Vec<(CommunityNetKind, NetQuery)>>>,
+    /// The callback-parked AccountManager query answers, parked by kind
+    /// (the `Td::on_account_net_answer` drain).
+    account_net_completed: Arc<Mutex<Vec<(AccountNetKind, NetQuery)>>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -3774,6 +3839,7 @@ impl Td {
             updates_net_completed: Arc::new(Mutex::new(Vec::new())),
             ton_wallet_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_net_completed: Arc::new(Mutex::new(Vec::new())),
+            account_net_completed: Arc::new(Mutex::new(Vec::new())),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -4693,6 +4759,7 @@ impl Td {
         // loads; the unconfirmed-session timeout is the recorded actor
         // collapse.
         {
+            let net = self.account_net();
             let mut env = AccountEnv {
                 global: &mut self.global,
                 options: self.option_manager.as_mut(),
@@ -4700,6 +4767,7 @@ impl Td {
                 device_token_manager: &mut self.device_token_manager,
                 auth_is_bot: self.auth_manager.is_bot(),
                 updates: &mut self.account_updates,
+                net,
             };
             self.account_manager.start_up(&mut env);
             self.suggested_action_manager.start_up(&mut env);
@@ -5917,6 +5985,7 @@ impl Td {
         self.dispatch_completed_updates_net();
         self.dispatch_completed_ton_wallet_net();
         self.dispatch_completed_community_net();
+        self.dispatch_completed_account_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -5954,6 +6023,17 @@ impl Td {
         Some(CommunityNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.community_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned account dispatch surface for the [`AccountEnv`]
+    /// senders — `None` keeps the net-inert posture (the pre-init
+    /// windows, the destroy path).
+    pub(crate) fn account_net(&self) -> Option<AccountNetHandle> {
+        Some(AccountNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.account_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7008,6 +7088,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked AccountManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves (AccountManager.cpp:
+    /// 180-612).
+    fn dispatch_completed_account_net(&mut self) {
+        let completed = std::mem::take(&mut *self.account_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_account_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Route one CommunityManager net answer by kind (the C++ query
     /// handler halves of CommunityManager.cpp:48-260).
     fn on_community_net_answer(&mut self, kind: CommunityNetKind, query: NetQuery) {
@@ -7182,6 +7273,443 @@ impl Td {
                             Err(_) => promise.set_error(parse_error("channels_deleteChannel")),
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Route one AccountManager net answer by kind (the C++ query
+    /// handler halves of AccountManager.cpp:180-612).
+    fn on_account_net_answer(&mut self, kind: AccountNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `AcceptLoginTokenQuery` (cpp:239-264) — the Authorization
+            // answer converts straight into the Session object.
+            AccountNetKind::AcceptLoginToken => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.parked_session_promises);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::Authorization::parse(query.ok()) {
+                    Ok(authorization) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(
+                                crate::account_manager::convert_authorization_object(
+                                    &authorization,
+                                ),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("auth_acceptLoginToken"));
+                        }
+                    }
+                }
+            }
+            // `GetAuthorizationsQuery` (cpp:266-320) — the ttl clamp, the
+            // sort and the non-current-session confirmation loop run even
+            // for the promise-less (start-up) form.
+            AccountNetKind::GetAuthorizations => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.parked_sessions_promises);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let Ok(ptr) = telegram_api::account_Authorizations::parse(query.ok()) else {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(parse_error("account_getAuthorizations"));
+                    }
+                    return;
+                };
+                let ttl_days = ptr.authorization_ttl_days;
+                let ttl_days = if ttl_days <= 0 || ttl_days > 366 {
+                    tdutils::log_error!("Receive invalid inactive sessions TTL {ttl_days}");
+                    180
+                } else {
+                    ttl_days
+                };
+                let mut sessions: Vec<td_api::Session> = ptr
+                    .authorizations
+                    .iter()
+                    .map(crate::account_manager::convert_authorization_object)
+                    .collect();
+                sessions.sort_by(|lhs, rhs| {
+                    rhs.is_current
+                        .cmp(&lhs.is_current)
+                        .then(rhs.is_password_pending.cmp(&lhs.is_password_pending))
+                        .then(rhs.is_unconfirmed.cmp(&lhs.is_unconfirmed))
+                        .then(rhs.last_active_date.cmp(&lhs.last_active_date))
+                });
+                {
+                    let mut env = AccountEnv {
+                        global: &mut self.global,
+                        options: self.option_manager.as_mut(),
+                        user_manager: &mut self.user_manager,
+                        device_token_manager: &mut self.device_token_manager,
+                        auth_is_bot: self.auth_manager.is_bot(),
+                        updates: &mut self.account_updates,
+                        net: None,
+                    };
+                    for session in &sessions {
+                        if !session.is_current && !session.is_unconfirmed {
+                            self.account_manager
+                                .on_confirm_authorization(&mut env, false, session.id, 0);
+                        }
+                    }
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(td_api::Sessions {
+                        sessions,
+                        inactive_session_ttl_days: ttl_days,
+                    });
+                }
+            }
+            // `ResetAuthorizationQuery` (cpp:322-347) — the boolFalse band
+            // only warns.
+            AccountNetKind::ResetAuthorization => {
+                Self::answer_unit_bool(
+                    self.account_manager
+                        .take_promise(|m| &mut m.pending_reset_authorization),
+                    &query,
+                    "Failed to terminate session",
+                    "account_resetAuthorization",
+                );
+            }
+            // `ResetAuthorizationsQuery` (cpp:349-375) — the ok half
+            // re-registers the device tokens (`DeviceTokenManager::
+            // reregister_device`).
+            AccountNetKind::ResetAuthorizations => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.pending_reset_authorizations);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match parse_wire_bool_value(query.ok()) {
+                    Some(true) => {}
+                    Some(false) => {
+                        tdutils::log_warning!("Failed to terminate all sessions")
+                    }
+                    None => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("auth_resetAuthorizations"));
+                        }
+                        return;
+                    }
+                }
+                {
+                    let mut env = NotificationEnv {
+                        global: &mut self.global,
+                        options: self.option_manager.as_mut(),
+                        auth_is_authorized: self.auth_manager.is_authorized(),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                        updates: &mut self.notification_updates,
+                    };
+                    self.device_token_manager.reregister_device(&mut env);
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(());
+                }
+            }
+            // `ChangeAuthorizationSettingsQuery` (cpp:377-413).
+            AccountNetKind::ChangeAuthorizationSettings => {
+                Self::answer_unit_bool(
+                    self.account_manager
+                        .take_promise(|m| &mut m.pending_change_settings),
+                    &query,
+                    "Failed to change session settings",
+                    "account_changeAuthorizationSettings",
+                );
+            }
+            // `SetAuthorizationTtlQuery` (cpp:415-441).
+            AccountNetKind::SetAuthorizationTtl => {
+                Self::answer_unit_bool(
+                    self.account_manager
+                        .take_promise(|m| &mut m.pending_set_authorization_ttl),
+                    &query,
+                    "Failed to set inactive session TTL",
+                    "account_setAuthorizationTTL",
+                );
+            }
+            // `GetWebAuthorizationsQuery` (cpp:443-489) — the users
+            // intake, then the ConnectedWebsites conversion.
+            AccountNetKind::GetWebAuthorizations => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.parked_websites_promises);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let Ok(ptr) = telegram_api::account_WebAuthorizations::parse(query.ok()) else {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(parse_error("account_getWebAuthorizations"));
+                    }
+                    return;
+                };
+                {
+                    let mut env = UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("account answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    };
+                    self.user_manager.on_get_users(
+                        &mut env,
+                        ptr.users.clone(),
+                        "GetWebAuthorizationsQuery",
+                    );
+                }
+                let mut websites = Vec::with_capacity(ptr.authorizations.len());
+                for authorization in &ptr.authorizations {
+                    let mut bot_user_id = UserId::new(authorization.bot_id);
+                    if !bot_user_id.is_valid() {
+                        tdutils::log_error!("Receive invalid bot {bot_user_id:?}");
+                        bot_user_id = UserId::default();
+                    }
+                    let mut env = UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("account answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    };
+                    let bot_user_id = self.user_manager.get_user_id_object(
+                        &mut env,
+                        bot_user_id,
+                        "GetWebAuthorizationsQuery",
+                    );
+                    websites.push(td_api::ConnectedWebsite {
+                        id: authorization.hash,
+                        domain_name: authorization.domain.clone(),
+                        bot_user_id,
+                        browser: authorization.browser.clone(),
+                        platform: authorization.platform.clone(),
+                        log_in_date: authorization.date_created,
+                        last_active_date: authorization.date_active,
+                        ip_address: authorization.ip.clone(),
+                        location: authorization.region.clone(),
+                    });
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(td_api::ConnectedWebsites { websites });
+                }
+            }
+            // `ResetWebAuthorizationQuery` (cpp:491-516).
+            AccountNetKind::ResetWebAuthorization => {
+                Self::answer_unit_bool(
+                    self.account_manager
+                        .take_promise(|m| &mut m.pending_reset_web_authorization),
+                    &query,
+                    "Failed to disconnect website",
+                    "account_resetWebAuthorization",
+                );
+            }
+            // `ResetWebAuthorizationsQuery` (cpp:518-543).
+            AccountNetKind::ResetWebAuthorizations => {
+                Self::answer_unit_bool(
+                    self.account_manager
+                        .take_promise(|m| &mut m.pending_reset_web_authorizations),
+                    &query,
+                    "Failed to disconnect all websites",
+                    "account_resetWebAuthorizations",
+                );
+            }
+            // `CancelWebTokenAuthorizationQuery` (6f9801c65) — the
+            // dismissWebToken flow (the boolFalse band warns, the
+            // reset-web-authorization convention).
+            AccountNetKind::CancelWebToken => {
+                Self::answer_unit_bool(
+                    self.account_manager
+                        .take_promise(|m| &mut m.pending_cancel_web_token),
+                    &query,
+                    "Failed to cancel the web token authorization",
+                    "auth_cancelWebTokenAuthorization",
+                );
+            }
+            // `ExportContactTokenQuery` (cpp:545-572) — the expires
+            // clamp keeps the link alive for at least a second.
+            AccountNetKind::ExportContactToken => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.pending_user_link);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::ExportedContactToken::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(mut promise) = promise {
+                            let expires_in = (ptr.expires - self.global.unix_time()).max(1);
+                            promise.set_value(td_api::UserLink {
+                                url: ptr.url,
+                                expires_in,
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("contacts_exportContactToken"));
+                        }
+                    }
+                }
+            }
+            // `ImportContactTokenQuery` (cpp:574-597) — the `on_get_user`
+            // intake answers with the stored user object.
+            AccountNetKind::ImportContactToken => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.parked_user_promises);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::User::parse(query.ok()) {
+                    Ok(user) => {
+                        let user_id = {
+                            let mut env = UserEnv {
+                                global: &mut self.global,
+                                options: self.option_manager.as_mut().expect(
+                                    "account answers run with the initialized option manager",
+                                ),
+                                auth_is_bot: self.auth_manager.is_bot(),
+                            };
+                            self.user_manager
+                                .on_get_user(&mut env, user, "ImportContactTokenQuery")
+                        };
+                        if let Some(mut promise) = promise {
+                            let env = UserEnv {
+                                global: &mut self.global,
+                                options: self.option_manager.as_mut().expect(
+                                    "account answers run with the initialized option manager",
+                                ),
+                                auth_is_bot: self.auth_manager.is_bot(),
+                            };
+                            promise.set_value(self.user_manager.get_user_object_of(&env, user_id));
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("contacts_importContactToken"));
+                        }
+                    }
+                }
+            }
+            // `SetAccountTtlQuery` (cpp:180-209) — the `!result` 500 band.
+            AccountNetKind::SetAccountTtl => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.pending_set_account_ttl);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match parse_wire_bool_value(query.ok()) {
+                    Some(true) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(());
+                        }
+                    }
+                    Some(false) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(Status::error(
+                                500,
+                                "Internal Server Error: failed to set account TTL",
+                            ));
+                        }
+                    }
+                    None => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("account_setAccountTTL"));
+                        }
+                    }
+                }
+            }
+            // `GetAccountTtlQuery` (cpp:211-237).
+            AccountNetKind::GetAccountTtl => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.pending_account_ttl);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::AccountDaysTTL::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(td_api::AccountTtl { days: ptr.days });
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("account_getAccountTTL"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shared `Promise<Unit>` bool-answer shape of the account
+    /// families (`ResetAuthorization`/`ChangeAuthorizationSettings`/
+    /// `SetAuthorizationTtl`/`ResetWebAuthorization*`/`CancelWebToken`):
+    /// the error forwards, boolFalse warns (`LOG_IF(WARNING, !result)`),
+    /// both value bands answer ok.
+    fn answer_unit_bool(
+        mut promise: Option<Promise<()>>,
+        query: &NetQuery,
+        warning: &str,
+        what: &str,
+    ) {
+        if query.is_error() {
+            if let Some(mut promise) = promise.take() {
+                promise.set_error(query.error().clone());
+            }
+            return;
+        }
+        match parse_wire_bool_value(query.ok()) {
+            Some(result) => {
+                if !result {
+                    tdutils::log_warning!("{warning}");
+                }
+                if let Some(mut promise) = promise.take() {
+                    promise.set_value(());
+                }
+            }
+            None => {
+                if let Some(mut promise) = promise.take() {
+                    promise.set_error(Status::error(
+                        500,
+                        &format!("Failed to parse the {what} answer"),
+                    ));
                 }
             }
         }
@@ -8296,6 +8824,7 @@ impl Td {
             device_token_manager: &mut self.device_token_manager,
             auth_is_bot: self.auth_manager.is_bot(),
             updates: &mut self.account_updates,
+            net: None,
         };
         self.terms_of_service_manager.init(&mut env);
     }
@@ -8873,6 +9402,7 @@ impl Td {
                 device_token_manager: &mut self.device_token_manager,
                 auth_is_bot: self.auth_manager.is_bot(),
                 updates: &mut self.account_updates,
+                net: None,
             };
             self.suggested_action_manager
                 .hide_suggested_action(&mut env, action);
@@ -13731,7 +14261,10 @@ impl tdnet::net_query::DcInitSink for InertDcInit {
 
 /// The account-plane env over the `Td` fields (AccountManager,
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
-/// the field-split borrows (the `NotificationEnv` convention).
+/// the field-split borrows (the `NotificationEnv` convention); the net
+/// field carries the live dispatch surface for the query senders (`None`
+/// keeps the net-inert posture — the TOS/suggested-action arms never
+/// send).
 pub(crate) struct AccountEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: Option<&'a mut OptionManager>,
@@ -13739,6 +14272,9 @@ pub(crate) struct AccountEnv<'a> {
     pub(crate) device_token_manager: &'a mut crate::device_token_manager::DeviceTokenManager,
     pub(crate) auth_is_bot: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The live dispatch surface (the C++ ResultHandler send legs); the
+    /// `None` arm logs the send instead of dispatching.
+    pub(crate) net: Option<AccountNetHandle>,
 }
 
 impl AccountManagerEnv for AccountEnv<'_> {
@@ -13822,6 +14358,247 @@ impl AccountManagerEnv for AccountEnv<'_> {
         // the device-token env plumbing joins with the account plane
         // later (the M.13S continuation); the seam no-ops
         let _ = &mut self.device_token_manager;
+    }
+
+    fn get_my_first_username(&mut self) -> String {
+        let my_id = self.user_manager.get_my_id();
+        self.user_manager
+            .get_user_first_username_of(my_id)
+            .to_owned()
+    }
+
+    // ---- The net query senders — the C++ ResultHandler send legs
+    // (AccountManager.cpp:180-612). The dispatch-dependency argument of
+    // the C++ `net_query_creator().create` calls collapses (the port's
+    // NetQuery carries no dependency set). ----
+
+    /// `AcceptLoginTokenQuery::send` (cpp:247-250).
+    fn send_accept_login_token_query(&mut self, login_token: &[u8]) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::AcceptLoginToken,
+                telegram_api::Function::auth_acceptLoginToken(
+                    telegram_api::auth_acceptLoginToken {
+                        token: login_token.to_vec(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!(
+                    "Send auth.acceptLoginToken for {} bytes — [net-inert]",
+                    login_token.len()
+                )
+            }
+        }
+    }
+
+    /// `GetAuthorizationsQuery::send` (cpp:280-283).
+    fn send_get_authorizations_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::GetAuthorizations,
+                telegram_api::Function::account_getAuthorizations(
+                    telegram_api::account_getAuthorizations,
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getAuthorizations — [net-inert]"),
+        }
+    }
+
+    /// `ResetAuthorizationQuery::send` (cpp:331-334).
+    fn send_reset_authorization_query(&mut self, authorization_id: i64) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ResetAuthorization,
+                telegram_api::Function::account_resetAuthorization(
+                    telegram_api::account_resetAuthorization {
+                        hash: authorization_id,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!(
+                    "Send account.resetAuthorization({authorization_id}) — [net-inert]"
+                )
+            }
+        }
+    }
+
+    /// `ResetAuthorizationsQuery::send` (cpp:358-361).
+    fn send_reset_authorizations_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ResetAuthorizations,
+                telegram_api::Function::auth_resetAuthorizations(
+                    telegram_api::auth_resetAuthorizations,
+                ),
+            ),
+            None => tdutils::log_info!("Send auth.resetAuthorizations — [net-inert]"),
+        }
+    }
+
+    /// `ChangeAuthorizationSettingsQuery::send` (cpp:393-408) — the
+    /// flags.0/flags.1 mask of the two set-table toggles.
+    fn send_change_authorization_settings_query(
+        &mut self,
+        hash: i64,
+        set_encrypted_requests_disabled: bool,
+        encrypted_requests_disabled: bool,
+        set_call_requests_disabled: bool,
+        call_requests_disabled: bool,
+        confirm: bool,
+    ) {
+        match self.net.clone() {
+            Some(net) => {
+                let flags = set_encrypted_requests_disabled as i32
+                    | ((set_call_requests_disabled as i32) << 1);
+                net.dispatch(
+                    AccountNetKind::ChangeAuthorizationSettings,
+                    telegram_api::Function::account_changeAuthorizationSettings(
+                        telegram_api::account_changeAuthorizationSettings {
+                            flags,
+                            confirmed: confirm,
+                            hash,
+                            encrypted_requests_disabled,
+                            call_requests_disabled,
+                        },
+                    ),
+                )
+            }
+            None => tdutils::log_info!(
+                "Send account.changeAuthorizationSettings(hash = {hash}, confirm = {confirm}) — [net-inert]"
+            ),
+        }
+    }
+
+    /// `GetWebAuthorizationsQuery::send` (cpp:467-470).
+    fn send_get_web_authorizations_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::GetWebAuthorizations,
+                telegram_api::Function::account_getWebAuthorizations(
+                    telegram_api::account_getWebAuthorizations,
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getWebAuthorizations — [net-inert]"),
+        }
+    }
+
+    /// `ResetWebAuthorizationQuery::send` (cpp:503-506).
+    fn send_reset_web_authorization_query(&mut self, hash: i64) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ResetWebAuthorization,
+                telegram_api::Function::account_resetWebAuthorization(
+                    telegram_api::account_resetWebAuthorization { hash },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send account.resetWebAuthorization({hash}) — [net-inert]")
+            }
+        }
+    }
+
+    /// `ResetWebAuthorizationsQuery::send` (cpp:530-533).
+    fn send_reset_web_authorizations_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ResetWebAuthorizations,
+                telegram_api::Function::account_resetWebAuthorizations(
+                    telegram_api::account_resetWebAuthorizations,
+                ),
+            ),
+            None => tdutils::log_info!("Send account.resetWebAuthorizations — [net-inert]"),
+        }
+    }
+
+    /// `CancelWebTokenAuthorizationQuery::send` (6f9801c65).
+    fn send_cancel_web_token_query(&mut self, token: &str) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::CancelWebToken,
+                telegram_api::Function::auth_cancelWebTokenAuthorization(
+                    telegram_api::auth_cancelWebTokenAuthorization {
+                        web_auth_token: token.to_owned(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send auth.cancelWebTokenAuthorization({token}) — [net-inert]")
+            }
+        }
+    }
+
+    /// `ExportContactTokenQuery::send` (cpp:555-558).
+    fn send_export_contact_token_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ExportContactToken,
+                telegram_api::Function::contacts_exportContactToken(
+                    telegram_api::contacts_exportContactToken,
+                ),
+            ),
+            None => tdutils::log_info!("Send contacts.exportContactToken — [net-inert]"),
+        }
+    }
+
+    /// `ImportContactTokenQuery::send` (cpp:584-587).
+    fn send_import_contact_token_query(&mut self, token: &str) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ImportContactToken,
+                telegram_api::Function::contacts_importContactToken(
+                    telegram_api::contacts_importContactToken {
+                        token: token.to_owned(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send contacts.importContactToken({token}) — [net-inert]");
+                let _ = token;
+            }
+        }
+    }
+
+    /// `SetAccountTtlQuery::send` (cpp:188-191).
+    fn send_set_account_ttl_query(&mut self, account_ttl: i32) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::SetAccountTtl,
+                telegram_api::Function::account_setAccountTTL(
+                    telegram_api::account_setAccountTTL {
+                        ttl: Some(telegram_api::AccountDaysTTL { days: account_ttl }),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.setAccountTTL({account_ttl}) — [net-inert]"),
+        }
+    }
+
+    /// `GetAccountTtlQuery::send` (cpp:219-222).
+    fn send_get_account_ttl_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::GetAccountTtl,
+                telegram_api::Function::account_getAccountTTL(telegram_api::account_getAccountTTL),
+            ),
+            None => tdutils::log_info!("Send account.getAccountTTL — [net-inert]"),
+        }
+    }
+
+    /// `SetAuthorizationTtlQuery::send` (cpp:423-426).
+    fn send_set_authorization_ttl_query(&mut self, days: i32) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::SetAuthorizationTtl,
+                telegram_api::Function::account_setAuthorizationTTL(
+                    telegram_api::account_setAuthorizationTTL {
+                        authorization_ttl_days: days,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.setAuthorizationTTL({days}) — [net-inert]"),
+        }
     }
 }
 
@@ -15495,6 +16272,7 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
             device_token_manager,
             auth_is_bot: auth_manager.is_bot(),
             updates: account_updates,
+            net: None,
         };
         suggested_action_manager.hide_suggested_action(&mut account_env, action);
     }
@@ -25432,6 +26210,352 @@ mod tests {
             Some(tdutils::status::Result::Ok(()))
         ));
         assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the account net slice: the AccountManager query families
+    // ride the dispatcher and their answers drain through the real Td
+    // routing (the AccountManager.cpp handler halves). ----
+
+    /// The production-shaped account split for the tests — the env
+    /// carries the live dispatch handle (the `netted_td` posture).
+    fn with_account_manager(
+        td: &mut Td,
+        f: impl FnOnce(&mut crate::account_manager::AccountManager, &mut AccountEnv<'_>),
+    ) {
+        let net = td.account_net();
+        let mut env = AccountEnv {
+            global: &mut td.global,
+            options: td.option_manager.as_mut(),
+            user_manager: &mut td.user_manager,
+            device_token_manager: &mut td.device_token_manager,
+            auth_is_bot: td.auth_manager.is_bot(),
+            updates: &mut td.account_updates,
+            net,
+        };
+        f(&mut td.account_manager, &mut env);
+    }
+
+    fn bool_answer(value: bool) -> Vec<u8> {
+        let id: u32 = if value { 0x9972_75b5 } else { 0xbc79_9737 };
+        id.to_le_bytes().to_vec()
+    }
+
+    type SessionSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::Session>>>>;
+
+    fn record_account_session() -> (Promise<td_api::Session>, SessionSlot) {
+        struct Rec(SessionSlot);
+        impl tdutils::promise::PromiseInterface<td_api::Session> for Rec {
+            fn set_value(&mut self, value: td_api::Session) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: SessionSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type SessionsSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::Sessions>>>>;
+
+    fn record_account_sessions() -> (Promise<td_api::Sessions>, SessionsSlot) {
+        struct Rec(SessionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::Sessions> for Rec {
+            fn set_value(&mut self, value: td_api::Sessions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: SessionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type UserLinkSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::UserLink>>>>;
+
+    fn record_account_user_link() -> (Promise<td_api::UserLink>, UserLinkSlot) {
+        struct Rec(UserLinkSlot);
+        impl tdutils::promise::PromiseInterface<td_api::UserLink> for Rec {
+            fn set_value(&mut self, value: td_api::UserLink) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: UserLinkSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type AccountTtlSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::AccountTtl>>>>;
+
+    fn record_account_ttl() -> (Promise<td_api::AccountTtl>, AccountTtlSlot) {
+        struct Rec(AccountTtlSlot);
+        impl tdutils::promise::PromiseInterface<td_api::AccountTtl> for Rec {
+            fn set_value(&mut self, value: td_api::AccountTtl) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: AccountTtlSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type WebsitesSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::ConnectedWebsites>>>,
+    >;
+
+    fn record_account_websites() -> (Promise<td_api::ConnectedWebsites>, WebsitesSlot) {
+        struct Rec(WebsitesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::ConnectedWebsites> for Rec {
+            fn set_value(&mut self, value: td_api::ConnectedWebsites) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: WebsitesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn account_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(account_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn account_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-account");
+
+        // 1. getUserLink — the empty first username parks at the
+        //    contacts_exportContactToken query; the answer clamps the
+        //    expiry against the td clock.
+        let (promise, slot) = record_account_user_link();
+        with_account_manager(&mut td, |manager, env| {
+            manager.get_user_link(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::contacts_exportContactToken::ID
+        );
+        let expires = td.global.unix_time() + 100;
+        let mut answer = Vec::new();
+        telegram_api::ExportedContactToken {
+            url: "https://t.me/contact".to_owned(),
+            expires,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_account_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(link)) => {
+                assert_eq!(link.url, "https://t.me/contact");
+                assert_eq!(link.expires_in, 100);
+            }
+            other => panic!("unexpected user link result: {other:?}"),
+        }
+
+        // 2. setInactiveSessionTtlDays — the SetAuthorizationTtlQuery
+        //    dispatch; boolTrue answers ok.
+        let (promise, slot) = record_ton_unit();
+        with_account_manager(&mut td, |manager, env| {
+            manager.set_inactive_session_ttl_days(env, 90, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_setAuthorizationTTL::ID
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_account_net();
+        assert!(matches!(
+            *slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. setAccountTtl — the boolFalse 500 band.
+        let (promise, slot) = record_ton_unit();
+        with_account_manager(&mut td, |manager, env| {
+            manager.set_account_ttl(env, 180, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_setAccountTTL::ID
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(false));
+        td.dispatch_completed_account_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(
+                    status.message(),
+                    "Internal Server Error: failed to set account TTL"
+                );
+            }
+            other => panic!("unexpected ttl result: {other:?}"),
+        }
+
+        // 4. getAccountTtl — the days answer converts.
+        let (promise, slot) = record_account_ttl();
+        with_account_manager(&mut td, |manager, env| {
+            manager.get_account_ttl(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAccountTTL::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::AccountDaysTTL { days: 30 }.store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_account_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(ttl)) => assert_eq!(ttl.days, 30),
+            other => panic!("unexpected ttl result: {other:?}"),
+        }
+
+        // 5. confirmQrCodeAuthentication — the AcceptLoginTokenQuery
+        //    dispatch; the Authorization answer converts to the Session.
+        let (promise, slot) = record_account_session();
+        with_account_manager(&mut td, |manager, env| {
+            manager.confirm_qr_code_authentication(env, "tg://login?token=QUJD", promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::auth_acceptLoginToken::ID
+        );
+        let mut answer = Vec::new();
+        wire_authorization(5, true, 42).store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_account_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(session)) => {
+                assert_eq!(session.id, 5);
+                assert!(session.is_current);
+            }
+            other => panic!("unexpected session result: {other:?}"),
+        }
+
+        // 6. getActiveSessions — the ttl clamp (9999 → 180) and the
+        //    current-first sort.
+        let (promise, slot) = record_account_sessions();
+        with_account_manager(&mut td, |manager, env| {
+            manager.get_active_sessions(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAuthorizations::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_Authorizations {
+            authorization_ttl_days: 9999,
+            authorizations: vec![
+                wire_authorization(2, false, 10),
+                wire_authorization(1, true, 20),
+            ],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_account_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(sessions)) => {
+                assert_eq!(sessions.inactive_session_ttl_days, 180);
+                assert_eq!(sessions.sessions.len(), 2);
+                assert_eq!(sessions.sessions[0].id, 1);
+                assert!(sessions.sessions[0].is_current);
+                assert_eq!(sessions.sessions[1].id, 2);
+            }
+            other => panic!("unexpected sessions result: {other:?}"),
+        }
+
+        // 7. getConnectedWebsites — the websites conversion over the
+        //    users intake.
+        let (promise, slot) = record_account_websites();
+        with_account_manager(&mut td, |manager, env| {
+            manager.get_connected_websites(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getWebAuthorizations::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_WebAuthorizations {
+            authorizations: vec![telegram_api::WebAuthorization {
+                hash: 3,
+                bot_id: 7,
+                domain: "example.com".to_owned(),
+                browser: "Firefox".to_owned(),
+                platform: "Linux".to_owned(),
+                date_created: 1,
+                date_active: 2,
+                ip: "127.0.0.1".to_owned(),
+                region: "Region".to_owned(),
+            }],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_account_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(websites)) => {
+                assert_eq!(websites.websites.len(), 1);
+                let website = websites.websites.into_iter().next().unwrap();
+                assert_eq!(website.id, 3);
+                assert_eq!(website.domain_name, "example.com");
+                assert_eq!(website.bot_user_id, 7);
+            }
+            other => panic!("unexpected websites result: {other:?}"),
+        }
+
+        assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
+    fn wire_authorization(
+        hash: i64,
+        current: bool,
+        date_active: i32,
+    ) -> telegram_api::Authorization {
+        telegram_api::Authorization {
+            hash,
+            flags: 0,
+            current,
+            password_pending: false,
+            unconfirmed: false,
+            encrypted_requests_disabled: false,
+            call_requests_disabled: false,
+            api_id: 0,
+            app_name: "td-rs".to_string(),
+            app_version: String::new(),
+            official_app: false,
+            device_model: "device".to_string(),
+            platform: String::new(),
+            system_version: String::new(),
+            date_created: 1,
+            date_active,
+            ip: String::new(),
+            country: String::new(),
+            region: String::new(),
+        }
     }
 
     #[test]

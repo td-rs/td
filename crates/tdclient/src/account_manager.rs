@@ -1,8 +1,10 @@
 //! `AccountManager` (td/telegram/AccountManager.{h,cpp}) — the M.33
 //! Wave-3 account manager: the sessions/authorizations plane, the
 //! age-verification state and the unconfirmed-session machinery. The C++
-//! actor collapses to a plain struct (the M.13 convention); the thirteen
-//! query handlers are `[blocked: net]` env seams with parked promises, the
+//! actor collapses to a plain struct (the M.13 convention); the query
+//! handlers ride the client-side dispatcher under their `AccountNetKind`
+//! (the answer routing lives in `Td::on_account_net_answer`) with the
+//! promises parked per family, the
 //! binlog log events (0x500-0x508) replay through [`AccountManager::on_binlog_events`],
 //! and the actor timeout (the unconfirmed-session expiry re-check) is the
 //! recorded collapse. The flows with no td_api arm in this revision
@@ -61,21 +63,28 @@ pub trait AccountManagerEnv {
     /// `DeviceTokenManager::reregister_device` — the terminate-all tail.
     fn reregister_device(&mut self);
 
-    // ---- the query seams ([blocked: net]; the promises park) ----
+    /// `UserManager::get_user_first_username(get_my_id())` — the
+    /// `get_user_link` username arm.
+    fn get_my_first_username(&mut self) -> String {
+        String::new()
+    }
+
+    // ---- the query seams (the net-inert defaults; the Td env
+    // dispatches) ----
     fn send_accept_login_token_query(&mut self, login_token: &[u8]) {
         tdutils::log_info!(
-            "Send auth.acceptLoginToken for {} bytes — [blocked: net]",
+            "Send auth.acceptLoginToken for {} bytes — [net-inert]",
             login_token.len()
         );
     }
     fn send_get_authorizations_query(&mut self) {
-        tdutils::log_info!("Send account.getAuthorizations — [blocked: net]");
+        tdutils::log_info!("Send account.getAuthorizations — [net-inert]");
     }
     fn send_reset_authorization_query(&mut self, authorization_id: i64) {
-        tdutils::log_info!("Send account.resetAuthorization({authorization_id}) — [blocked: net]");
+        tdutils::log_info!("Send account.resetAuthorization({authorization_id}) — [net-inert]");
     }
     fn send_reset_authorizations_query(&mut self) {
-        tdutils::log_info!("Send auth.resetAuthorizations — [blocked: net]");
+        tdutils::log_info!("Send auth.resetAuthorizations — [net-inert]");
     }
     fn send_change_authorization_settings_query(
         &mut self,
@@ -87,7 +96,7 @@ pub trait AccountManagerEnv {
         confirm: bool,
     ) {
         tdutils::log_info!(
-            "Send account.changeAuthorizationSettings(hash = {hash}, confirm = {confirm}) — [blocked: net]"
+            "Send account.changeAuthorizationSettings(hash = {hash}, confirm = {confirm}) — [net-inert]"
         );
         let _ = (
             set_encrypted_requests_disabled,
@@ -97,37 +106,38 @@ pub trait AccountManagerEnv {
         );
     }
     fn send_get_web_authorizations_query(&mut self) {
-        tdutils::log_info!("Send account.getWebAuthorizations — [blocked: net]");
+        tdutils::log_info!("Send account.getWebAuthorizations — [net-inert]");
     }
     fn send_reset_web_authorization_query(&mut self, hash: i64) {
-        tdutils::log_info!("Send account.resetWebAuthorization({hash}) — [blocked: net]");
+        tdutils::log_info!("Send account.resetWebAuthorization({hash}) — [net-inert]");
     }
     fn send_reset_web_authorizations_query(&mut self) {
-        tdutils::log_info!("Send account.resetWebAuthorizations — [blocked: net]");
+        tdutils::log_info!("Send account.resetWebAuthorizations — [net-inert]");
     }
     /// `CancelWebTokenAuthorizationQuery::send` (6f9801c65) —
-    /// `auth_cancelWebTokenAuthorization` — [blocked: net].
+    /// `auth_cancelWebTokenAuthorization` — the net-inert default (the
+    /// Td env dispatches).
     fn send_cancel_web_token_query(&mut self, token: &str) {
-        tdutils::log_info!("Send auth.cancelWebTokenAuthorization({token}) — [blocked: net]");
+        tdutils::log_info!("Send auth.cancelWebTokenAuthorization({token}) — [net-inert]");
     }
     fn send_export_contact_token_query(&mut self) {
-        tdutils::log_info!("Send contacts.exportContactToken — [blocked: net]");
+        tdutils::log_info!("Send contacts.exportContactToken — [net-inert]");
     }
 
     fn send_set_account_ttl_query(&mut self, account_ttl: i32) {
-        tdutils::log_info!("Send account.setAccountTTL({account_ttl}) — [blocked: net]");
+        tdutils::log_info!("Send account.setAccountTTL({account_ttl}) — [net-inert]");
     }
 
     fn send_get_account_ttl_query(&mut self) {
-        tdutils::log_info!("Send account.getAccountTTL — [blocked: net]");
+        tdutils::log_info!("Send account.getAccountTTL — [net-inert]");
     }
 
     fn send_set_authorization_ttl_query(&mut self, days: i32) {
-        tdutils::log_info!("Send account.setAuthorizationTTL({days}) — [blocked: net]");
+        tdutils::log_info!("Send account.setAuthorizationTTL({days}) — [net-inert]");
     }
 
     fn send_import_contact_token_query(&mut self, token: &str) {
-        tdutils::log_info!("Send contacts.importContactToken — [blocked: net]");
+        tdutils::log_info!("Send contacts.importContactToken — [net-inert]");
         let _ = token;
     }
 }
@@ -459,9 +469,22 @@ pub fn convert_authorization_object(
 pub struct AccountManager {
     unconfirmed_authorizations: Option<UnconfirmedAuthorizations>,
     age_verification_parameters: AgeVerificationParameters,
-    /// The `()`-typed promises parked at their `[blocked: net]` query
-    /// sends (the UserManager `net_blocked_promises` convention).
-    pub net_blocked_promises: Vec<Promise<()>>,
+    /// The `()`-typed promise lots per query family (the C++ handler
+    /// owns its promise; the port parks them FIFO per family and the
+    /// `Td::on_account_net_answer` arms pop the head).
+    pub(crate) pending_reset_authorization: Vec<Promise<()>>,
+    pub(crate) pending_reset_authorizations: Vec<Promise<()>>,
+    pub(crate) pending_change_settings: Vec<Promise<()>>,
+    pub(crate) pending_set_account_ttl: Vec<Promise<()>>,
+    pub(crate) pending_set_authorization_ttl: Vec<Promise<()>>,
+    pub(crate) pending_reset_web_authorization: Vec<Promise<()>>,
+    pub(crate) pending_reset_web_authorizations: Vec<Promise<()>>,
+    pub(crate) pending_cancel_web_token: Vec<Promise<()>>,
+    /// The `GetAccountTtlQuery` promise lot.
+    pub(crate) pending_account_ttl: Vec<Promise<td_api::AccountTtl>>,
+    /// The `ExportContactTokenQuery` promise lot (the token arm of
+    /// `get_user_link`).
+    pub(crate) pending_user_link: Vec<Promise<td_api::UserLink>>,
     /// The `td_api::Sessions`-typed promises parked at the
     /// GetAuthorizations seam.
     pub parked_sessions_promises: Vec<Promise<td_api::Sessions>>,
@@ -477,6 +500,20 @@ pub struct AccountManager {
 }
 
 impl AccountManager {
+    /// Pop the head promise of a family lot — the answer-routing half of
+    /// a query family (the C++ handler's own promise).
+    pub(crate) fn take_promise<T: std::marker::Send>(
+        &mut self,
+        slot: for<'a> fn(&'a mut AccountManager) -> &'a mut Vec<Promise<T>>,
+    ) -> Option<Promise<T>> {
+        let lot = slot(self);
+        if lot.is_empty() {
+            None
+        } else {
+            Some(lot.remove(0))
+        }
+    }
+
     pub fn new() -> AccountManager {
         AccountManager::default()
     }
@@ -576,7 +613,8 @@ impl AccountManager {
     }
 
     /// `get_active_sessions` (cpp:957-959) — the GetAuthorizationsQuery
-    /// is `[blocked: net]`.
+    /// rides the dispatcher; the answer drains through
+    /// `Td::on_account_net_answer`.
     pub fn get_active_sessions(
         &mut self,
         env: &mut impl AccountManagerEnv,
@@ -682,8 +720,8 @@ impl AccountManager {
     }
 
     /// `import_contact_token` (cpp:831-833) — the
-    /// `contacts.importContactToken` query is the seam; the user-typed
-    /// promise parks.
+    /// `contacts.importContactToken` query rides the dispatcher; the
+    /// user-typed promise parks.
     pub fn import_contact_token(
         &mut self,
         env: &mut impl AccountManagerEnv,
@@ -698,21 +736,21 @@ impl AccountManager {
 
     /// `set_inactive_session_ttl_days` (cpp:1004-1006 →
     /// `set_authorization_ttl_on_server` cpp:1124-1133) — the
-    /// SetAuthorizationTtlOnServer log event (0x505) + the query seam;
-    /// the ok answers at send time (the `set_account_ttl` convention —
-    /// the server ack resolves through the net result handler).
+    /// SetAuthorizationTtlOnServer log event (0x505) + the query; the
+    /// `()`-typed promise parks at its family lot (the server ack
+    /// resolves through `Td::on_account_net_answer`).
     pub fn set_inactive_session_ttl_days(
         &mut self,
         env: &mut impl AccountManagerEnv,
         authorization_ttl_days: i32,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
         store_parse::store_i32(&mut data, authorization_ttl_days);
         let _log_event_id = env.binlog_add(SET_AUTHORIZATION_TTL_ON_SERVER, &data);
+        self.pending_set_authorization_ttl.push(promise);
         env.send_set_authorization_ttl_query(authorization_ttl_days);
-        promise.set_value(());
     }
 
     /// `disconnect_website` (cpp:1173-1175).
@@ -742,8 +780,8 @@ impl AccountManager {
         token: &str,
         promise: Promise<()>,
     ) {
+        self.pending_cancel_web_token.push(promise);
         env.send_cancel_web_token_query(token);
-        drop(promise);
     }
 
     /// `set_account_ttl` (cpp:936-938) — the SetAccountTtl log event +
@@ -752,42 +790,49 @@ impl AccountManager {
         &mut self,
         env: &mut impl AccountManagerEnv,
         account_ttl: i32,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
         store_parse::store_i32(&mut data, account_ttl);
         let _log_event_id = env.binlog_add(SET_ACCOUNT_TTL_ON_SERVER, &data);
+        self.pending_set_account_ttl.push(promise);
         env.send_set_account_ttl_query(account_ttl);
-        promise.set_value(());
     }
 
-    /// `get_account_ttl` (cpp:940-942) — the query seam.
+    /// `get_account_ttl` (cpp:940-942) — the GetAccountTtlQuery park.
     pub fn get_account_ttl(
         &mut self,
         env: &mut impl AccountManagerEnv,
-        mut promise: Promise<td_api::AccountTtl>,
+        promise: Promise<td_api::AccountTtl>,
     ) {
+        self.pending_account_ttl.push(promise);
         env.send_get_account_ttl_query();
-        promise.set_value(td_api::AccountTtl { days: 180 });
     }
 
-    /// `get_user_link` (cpp:1205-1224) — the get_me chain collapses into
-    /// the direct username check (the M.4 `get_me` is sync); the public
-    /// link builder is the Wave-2 M.23 surface, so the username path
-    /// answers `@username` and the token query is the seam.
+    /// `get_user_link` (cpp:1205-1253) — the get_me chain collapses into
+    /// the direct username check (the M.4 `get_me` is sync): the username
+    /// form answers the public link directly, the empty username parks at
+    /// the ExportContactToken query.
     pub fn get_user_link(
         &mut self,
         env: &mut impl AccountManagerEnv,
         mut promise: Promise<td_api::UserLink>,
     ) {
-        // get_user_link_impl: the username form + the ExportContactToken
-        // query seam
+        let username = env.get_my_first_username();
+        if !username.is_empty() {
+            // `LinkManager::get_public_dialog_link(username, "", false,
+            // false)` — the t_me_url prefix.
+            let base = env.get_option_string("t_me_url", "https://t.me/");
+            let mut url = base;
+            if !url.ends_with('/') {
+                url.push('/');
+            }
+            url.push_str(&username);
+            return promise.set_value(td_api::UserLink { url, expires_in: 0 });
+        }
+        self.pending_user_link.push(promise);
         env.send_export_contact_token_query();
-        promise.set_value(td_api::UserLink {
-            url: String::new(),
-            expires_in: 0,
-        });
     }
 
     /// `on_new_unconfirmed_authorization` (cpp:1260-1284) — the C++
@@ -897,7 +942,7 @@ impl AccountManager {
         set_call_requests_disabled: bool,
         call_requests_disabled: bool,
         confirm: bool,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
@@ -913,6 +958,7 @@ impl AccountManager {
         );
         store_parse::store_i64(&mut data, hash);
         let _log_event_id = env.binlog_add(CHANGE_AUTHORIZATION_SETTINGS_ON_SERVER, &data);
+        self.pending_change_settings.push(promise);
         env.send_change_authorization_settings_query(
             hash,
             set_encrypted_requests_disabled,
@@ -921,60 +967,58 @@ impl AccountManager {
             call_requests_disabled,
             confirm,
         );
-        promise.set_value(());
     }
 
     fn reset_authorization_on_server(
         &mut self,
         env: &mut impl AccountManagerEnv,
         hash: i64,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
         store_parse::store_i64(&mut data, hash);
         let _log_event_id = env.binlog_add(RESET_AUTHORIZATION_ON_SERVER, &data);
+        self.pending_reset_authorization.push(promise);
         env.send_reset_authorization_query(hash);
-        promise.set_value(());
     }
 
     fn reset_authorizations_on_server(
         &mut self,
         env: &mut impl AccountManagerEnv,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
         let _log_event_id = env.binlog_add(RESET_AUTHORIZATIONS_ON_SERVER, &data);
+        self.pending_reset_authorizations.push(promise);
         env.send_reset_authorizations_query();
-        env.reregister_device();
-        promise.set_value(());
     }
 
     fn reset_web_authorization_on_server(
         &mut self,
         env: &mut impl AccountManagerEnv,
         hash: i64,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
         store_parse::store_i64(&mut data, hash);
         let _log_event_id = env.binlog_add(RESET_WEB_AUTHORIZATION_ON_SERVER, &data);
+        self.pending_reset_web_authorization.push(promise);
         env.send_reset_web_authorization_query(hash);
-        promise.set_value(());
     }
 
     fn reset_web_authorizations_on_server(
         &mut self,
         env: &mut impl AccountManagerEnv,
-        mut promise: Promise<()>,
+        promise: Promise<()>,
     ) {
         let mut data = Vec::new();
         store_parse::store_log_event_version(&mut data);
         let _log_event_id = env.binlog_add(RESET_WEB_AUTHORIZATIONS_ON_SERVER, &data);
+        self.pending_reset_web_authorizations.push(promise);
         env.send_reset_web_authorizations_query();
-        promise.set_value(());
     }
 
     /// `on_binlog_events` (cpp:1350-1426) — the 0x500-0x508 replay.
@@ -1506,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn set_inactive_session_ttl_days_writes_the_log_event_and_answers() {
+    fn set_inactive_session_ttl_days_writes_the_log_event_and_parks() {
         let mut env = TestEnv::new();
         let mut manager = AccountManager::default();
 
@@ -1524,10 +1568,14 @@ mod tests {
         // the version word + the little-endian days payload
         assert_eq!(data.len(), 8);
         assert_eq!(data[4..8], 90i32.to_le_bytes());
-        // the ok answers at send time (the set_account_ttl convention)
-        assert!(matches!(
-            *slot.lock().unwrap(),
-            Some(tdutils::status::Result::Ok(()))
-        ));
+        // the promise parks at the family lot until the net answer
+        assert!((*slot.lock().unwrap()).is_none());
+        assert_eq!(manager.pending_set_authorization_ttl.len(), 1);
+        assert!(
+            manager
+                .take_promise(|m: &mut AccountManager| &mut m.pending_set_authorization_ttl)
+                .is_some()
+        );
+        assert!(manager.pending_set_authorization_ttl.is_empty());
     }
 }

@@ -345,6 +345,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     device_token_manager: &mut td.device_token_manager,
                     auth_is_bot: td.auth_manager.is_bot(),
                     updates: &mut td.account_updates,
+                    net: None,
                 };
                 td.suggested_action_manager
                     .get_current_state(&env, &mut updates);
@@ -1670,6 +1671,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net: None,
             };
             td.suggested_action_manager
                 .is_login_email_address_required(&mut env, promise);
@@ -6557,6 +6559,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |session: td_api::Session| Object::session(session));
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6564,6 +6567,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .confirm_qr_code_authentication(&mut env, &link, promise);
@@ -6582,6 +6586,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net: None,
             };
             td.suggested_action_manager
                 .hide_suggested_action(&mut env, SuggestedAction::from_td_api(action));
@@ -6594,6 +6599,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |user_link: td_api::UserLink| {
                 Object::userLink(user_link)
             });
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6601,6 +6607,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.get_user_link(&mut env, promise);
         }
@@ -6610,6 +6617,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |sessions: td_api::Sessions| Object::sessions(sessions));
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6617,6 +6625,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.get_active_sessions(&mut env, promise);
         }
@@ -6625,6 +6634,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6632,6 +6642,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .terminate_session(&mut env, request.session_id, promise);
@@ -6641,6 +6652,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6648,6 +6660,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .terminate_all_other_sessions(&mut env, promise);
@@ -6657,6 +6670,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6664,6 +6678,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .confirm_session(&mut env, request.session_id, promise);
@@ -6673,6 +6688,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6680,6 +6696,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.toggle_session_can_accept_calls(
                 &mut env,
@@ -6693,6 +6710,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6700,6 +6718,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.toggle_session_can_accept_secret_chats(
                 &mut env,
@@ -6715,6 +6734,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |websites: td_api::ConnectedWebsites| {
                 Object::connectedWebsites(websites)
             });
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6722,6 +6742,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.get_connected_websites(&mut env, promise);
         }
@@ -6730,6 +6751,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6737,6 +6759,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .disconnect_website(&mut env, request.website_id, promise);
@@ -6746,6 +6769,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6753,6 +6777,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .disconnect_all_websites(&mut env, promise);
@@ -6765,6 +6790,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "New account TTL must be non-empty");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6772,6 +6798,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .set_account_ttl(&mut env, ttl.days, promise);
@@ -6782,6 +6809,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |ttl: td_api::AccountTtl| Object::accountTtl(ttl));
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6789,6 +6817,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.get_account_ttl(&mut env, promise);
         }
@@ -6809,6 +6838,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net: None,
             };
             td.terms_of_service_manager.accept_terms_of_service(
                 &mut env,
@@ -17527,6 +17557,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise::<td_api::User, _>(id, Object::user);
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -17534,6 +17565,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .import_contact_token(&mut env, token, promise);
@@ -17584,6 +17616,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -17591,6 +17624,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager.set_inactive_session_ttl_days(
                 &mut env,
@@ -18324,6 +18358,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -18331,6 +18366,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
+                net,
             };
             td.account_manager
                 .cancel_web_token(&mut env, &token, promise);
