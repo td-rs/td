@@ -1,10 +1,17 @@
 //! `Premium` (td/telegram/Premium.{h,cpp}) — the M.36 Wave-3 premium
 //! manager plane. The value surface (check_payment_amount, the premium
-//! limits table, the gift-option helpers) is the real port; the
-//! promo/gift-code/giveaway/store queries are `[blocked: net]` env seams
-//! with parked promises.
+//! limits table, the gift-option helpers) is the real port; the queries
+//! ride the client-side dispatcher under their `PremiumNetKind` — the
+//! landed flows are `payments.applyGiftCode` (the Updates answer
+//! re-enters `on_get_updates` with the promise) and
+//! `payments.getPremiumGiftCodeOptions` (the filter/star-price/discount
+//! conversion at [`PremiumManager::on_get_premium_gift_options`], the
+//! sticker leg parked at the stickers plane). The remaining ten flows
+//! (giveaway options/info, checkGiftCode, the store-purpose trio, the
+//! promo) join in follow-up slices.
 
 use crate::td_api;
+use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
@@ -122,12 +129,12 @@ pub trait PremiumEnv {
 
     fn send_update(&mut self, update: td_api::Update);
 
-    // ---- the query seams ([blocked: net]; the promises park) ----
+    // ---- the query sends — the dispatcher arms live at the Td env ----
     fn send_get_premium_promo_query(&mut self) {
-        tdutils::log_info!("Send help.getPremiumPromo — [blocked: net]");
+        tdutils::log_info!("Send help.getPremiumPromo — [net-inert]");
     }
     fn send_get_premium_gift_options_query(&mut self) {
-        tdutils::log_info!("Send payments.getPremiumGiftOptions — [blocked: net]");
+        tdutils::log_info!("Send payments.getPremiumGiftCodeOptions — [net-inert]");
     }
     fn send_get_premium_giveaway_options_query(&mut self, dialog_id: i64) {
         tdutils::log_info!(
@@ -138,7 +145,7 @@ pub trait PremiumEnv {
         tdutils::log_info!("Send payments.checkGiftCode for {code} — [blocked: net]");
     }
     fn send_apply_gift_code_query(&mut self, code: &str) {
-        tdutils::log_info!("Send payments.applyGiftCode for {code} — [blocked: net]");
+        tdutils::log_info!("Send payments.applyGiftCode for {code} — [net-inert]");
     }
     fn send_premium_gift_query(&mut self, user_id: i64, star_count: i64, month_count: i32) {
         tdutils::log_info!(
@@ -168,6 +175,19 @@ pub trait PremiumEnv {
     }
 }
 
+/// The premium query kinds riding the dispatcher — the C++
+/// ResultHandler classes of Premium.cpp (the landed flows; the rest of
+/// the twelve join in follow-up slices).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PremiumNetKind {
+    /// `ApplyGiftCodeQuery` (cpp:580) — the Updates answer re-enters
+    /// `on_get_updates` with the promise.
+    ApplyGiftCode,
+    /// `GetPremiumGiftOptionsQuery` (cpp:395) — the gift option vector
+    /// converts at [`PremiumManager::on_get_premium_gift_options`].
+    GetPremiumGiftCodeOptions,
+}
+
 /// The collapsed `PremiumManager` — a router over the query seams.
 #[derive(Default)]
 pub struct PremiumManager {
@@ -192,6 +212,9 @@ pub struct PremiumManager {
     pub parked_giveaway_infos: Vec<Promise<td_api::GiveawayInfo>>,
     /// The `()`-typed promises parked at the action seams.
     pub net_blocked_promises: Vec<Promise<()>>,
+    /// The `()`-typed promises parked at the apply-gift-code flow (the
+    /// C++ `ApplyGiftCodeQuery` promise chains into `on_get_updates`).
+    pub(crate) pending_apply_gift_code: Vec<Promise<()>>,
 }
 
 impl PremiumManager {
@@ -304,7 +327,104 @@ impl PremiumManager {
         promise: Promise<()>,
     ) {
         env.send_apply_gift_code_query(code);
-        self.net_blocked_promises.push(promise);
+        self.pending_apply_gift_code.push(promise);
+    }
+
+    /// `ApplyGiftCodeQuery::on_result`'s promise pop (Premium.cpp:595).
+    pub(crate) fn take_apply_gift_code_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_apply_gift_code.is_empty() {
+            None
+        } else {
+            Some(self.pending_apply_gift_code.remove(0))
+        }
+    }
+
+    /// `GetPremiumGiftOptionsQuery::on_result`'s promise pop
+    /// (Premium.cpp:411-456).
+    pub(crate) fn take_gift_options_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::PremiumGiftPaymentOptions>> {
+        if self.parked_gift_payment_options.is_empty() {
+            None
+        } else {
+            Some(self.parked_gift_payment_options.remove(0))
+        }
+    }
+
+    /// `GetPremiumGiftOptionsQuery::on_result` (Premium.cpp:411-456) —
+    /// the filter (users == 1, months > 0, amount > 0, non-empty
+    /// currency, store_quantity <= 1), the XTR star-price map, the
+    /// per-currency max monthly price and the relative discount, sorted
+    /// by month count. The sticker leg
+    /// (`stickers_manager_->get_premium_gift_sticker_object`) rides the
+    /// stickers plane — the None-leg convention.
+    pub(crate) fn on_get_premium_gift_options(
+        &mut self,
+        result: Result<Vec<telegram_api::PremiumGiftCodeOption>, Status>,
+        promise: Promise<td_api::PremiumGiftPaymentOptions>,
+    ) {
+        let mut promise = promise;
+        let results = match result {
+            Result::Err(status) => return promise.set_error(status),
+            Result::Ok(results) => results,
+        };
+        let results: Vec<_> = results
+            .into_iter()
+            .filter(|option| {
+                option.users == 1
+                    && option.months > 0
+                    && option.amount > 0
+                    && !option.currency.is_empty()
+                    && option.store_quantity <= 1
+            })
+            .collect();
+        let monthly_price = |option: &telegram_api::PremiumGiftCodeOption| {
+            option.amount as f64 / option.months as f64
+        };
+        let mut star_prices: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
+        let mut max_prices: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for option in &results {
+            if option.currency == "XTR" {
+                if star_prices
+                    .insert(
+                        option.months,
+                        crate::star_manager::get_star_count(option.amount, false),
+                    )
+                    .is_some()
+                {
+                    tdutils::log_error!(
+                        "Receive duplicate Telegram Star price for {}",
+                        option.months
+                    );
+                }
+                continue;
+            }
+            let price = monthly_price(option);
+            let max_price = max_prices.entry(option.currency.clone()).or_insert(0.0);
+            if price > *max_price {
+                *max_price = price;
+            }
+        }
+        let mut options = Vec::new();
+        for option in results {
+            if option.currency == "XTR" {
+                continue;
+            }
+            let relative_price = monthly_price(&option) / max_prices[&option.currency];
+            options.push(td_api::PremiumGiftPaymentOption {
+                currency: option.currency,
+                amount: option.amount,
+                star_count: star_prices.get(&option.months).copied().unwrap_or(0),
+                discount_percentage: (100.0 * (1.0 - relative_price)) as i32,
+                month_count: option.months,
+                store_product_id: option.store_product,
+                // `get_premium_gift_sticker_object` — [blocked: stickers]
+                sticker: None,
+            });
+        }
+        options.sort_by_key(|option| option.month_count);
+        promise.set_value(td_api::PremiumGiftPaymentOptions { options });
     }
 
     /// `gift_premium_with_stars` (Premium.cpp) — the query is the seam.
@@ -581,9 +701,10 @@ mod tests {
         assert!(env.queries.iter().any(|q| q == "sendStarsGift 5 500 3"));
         assert_eq!(
             manager.net_blocked_promises.len(),
-            2,
-            "apply + gift park; the check parks its own type"
+            1,
+            "the stars-gift park; apply parks its own flow, the check its own type"
         );
+        assert_eq!(manager.pending_apply_gift_code.len(), 1);
         assert_eq!(manager.parked_gift_code_infos.len(), 1);
     }
 

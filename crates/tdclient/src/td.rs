@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use crate::boost_manager::{BoostManager, BoostManagerEnv};
 use crate::community_manager::{CommunityManager, CommunityManagerEnv};
-use crate::premium::{PremiumEnv, PremiumManager};
+use crate::premium::{PremiumEnv, PremiumManager, PremiumNetKind};
 use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv, QuickReplyNetKind};
 use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
@@ -3024,6 +3024,10 @@ type QuickReplyNetHandle = NetKindHandle<QuickReplyNetKind>;
 /// the answers drain through [`Td::on_theme_net_answer`].
 pub(crate) type ThemeNetHandle = NetKindHandle<crate::theme_manager::ThemeNetKind>;
 
+/// The cloned premium dispatch surface the [`PremiumTdEnv`] senders
+/// use — the answers drain through [`Td::on_premium_net_answer`].
+pub(crate) type PremiumNetHandle = NetKindHandle<PremiumNetKind>;
+
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
     /// The `GetAutoDownloadSettingsQuery` promise (cpp:35).
@@ -3872,6 +3876,9 @@ pub struct Td {
     /// The callback-parked theme query answers (the
     /// `Td::on_theme_net_answer` drain).
     theme_net_completed: Arc<Mutex<Vec<(crate::theme_manager::ThemeNetKind, NetQuery)>>>,
+    /// The callback-parked premium query answers (the
+    /// `Td::on_premium_net_answer` drain).
+    premium_net_completed: Arc<Mutex<Vec<(PremiumNetKind, NetQuery)>>>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4315,6 +4322,7 @@ impl Td {
             auto_download_promises: Vec::new(),
             quick_reply_net_completed: Arc::new(Mutex::new(Vec::new())),
             theme_net_completed: Arc::new(Mutex::new(Vec::new())),
+            premium_net_completed: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -6469,6 +6477,7 @@ impl Td {
         self.dispatch_completed_auto_download_net();
         self.dispatch_completed_quick_reply_net();
         self.dispatch_completed_theme_net();
+        self.dispatch_completed_premium_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6615,6 +6624,15 @@ impl Td {
         Some(ThemeNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.theme_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned premium dispatch surface (the `PremiumTdEnv` senders).
+    pub(crate) fn premium_net(&self) -> Option<PremiumNetHandle> {
+        Some(PremiumNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.premium_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7784,6 +7802,60 @@ impl Td {
             self.on_theme_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked premium answers — the C++ ResultHandler
+    /// halves (Premium.cpp:395-605).
+    fn dispatch_completed_premium_net(&mut self) {
+        let completed = std::mem::take(&mut *self.premium_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_premium_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one premium net answer by kind (the landed flows of
+    /// Premium.cpp:395-605).
+    fn on_premium_net_answer(&mut self, kind: PremiumNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `ApplyGiftCodeQuery` (cpp:595-601) — the Updates answer
+            // re-enters `on_get_updates` with the promise.
+            PremiumNetKind::ApplyGiftCode => {
+                if let Some(mut promise) = self.premium_manager.take_apply_gift_code_promise() {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            }),
+                            Err(_) => {
+                                promise.set_error(parse_error("payments_applyGiftCode"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetPremiumGiftOptionsQuery` (cpp:411-456) — the vector
+            // converts at the manager.
+            PremiumNetKind::GetPremiumGiftCodeOptions => {
+                if let Some(promise) = self.premium_manager.take_gift_options_promise() {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        parse_vector_premium_gift_code_option(query.ok())
+                            .ok_or_else(|| parse_error("payments_getPremiumGiftCodeOptions"))
+                    };
+                    let mut manager = std::mem::take(&mut self.premium_manager);
+                    manager.on_get_premium_gift_options(result, promise);
+                    self.premium_manager = manager;
+                }
+            }
+        }
     }
 
     /// Route one theme net answer by kind into the manager intakes —
@@ -14201,6 +14273,21 @@ impl FileLoadNetFactory for TdFileLoadNetFactory {
 }
 
 /// Parses a top-level boxed `Vector<user>` (the `users.getUsers` result).
+fn parse_vector_premium_gift_code_option(
+    data: &[u8],
+) -> Option<Vec<telegram_api::PremiumGiftCodeOption>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut options = Vec::with_capacity(count);
+    for _ in 0..count {
+        options.push(telegram_api::PremiumGiftCodeOption::read(&mut reader).ok()?);
+    }
+    Some(options)
+}
+
 fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
     let mut reader = telegram_api::tl::Reader::new(data);
     if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
@@ -17897,6 +17984,9 @@ impl StatisticsManagerEnv for StatisticsEnv<'_> {
 /// The premium-plane env over the option manager.
 pub(crate) struct PremiumTdEnv<'a> {
     pub(crate) options: Option<&'a mut OptionManager>,
+    /// The cloned premium dispatch surface (the `AccountEnv` owned-net
+    /// convention) — `None` keeps the net-inert posture.
+    pub(crate) net: Option<PremiumNetHandle>,
 }
 
 impl PremiumEnv for PremiumTdEnv<'_> {
@@ -17914,6 +18004,41 @@ impl PremiumEnv for PremiumTdEnv<'_> {
     }
 
     fn send_update(&mut self, _update: td_api::Update) {}
+
+    // The two landed sends (Premium.cpp:50-53/583-585) — the answers
+    // drain through `Td::on_premium_net_answer`.
+    fn send_get_premium_gift_options_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::GetPremiumGiftCodeOptions,
+                telegram_api::Function::payments_getPremiumGiftCodeOptions(
+                    telegram_api::payments_getPremiumGiftCodeOptions {
+                        flags: 0,
+                        boost_peer: None,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.getPremiumGiftCodeOptions — [net-inert]");
+            }
+        }
+    }
+
+    fn send_apply_gift_code_query(&mut self, code: &str) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::ApplyGiftCode,
+                telegram_api::Function::payments_applyGiftCode(
+                    telegram_api::payments_applyGiftCode {
+                        slug: code.to_string(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send payments.applyGiftCode for {code} — [net-inert]");
+            }
+        }
+    }
 }
 
 /// The quick-reply env over the whole `Td` — the send arms hand the
@@ -30728,6 +30853,189 @@ mod tests {
         assert!(
             td.send_message_net_completed.lock().is_empty(),
             "the shortSentMessage answer drained"
+        );
+    }
+
+    /// The sent query with the given constructor — the updates machinery
+    /// may enqueue its own queries (e.g. `updates.getState`) beside the
+    /// one under test.
+    fn take_sent(sent: Vec<NetQuery>, constructor: i32) -> NetQuery {
+        sent.into_iter()
+            .find(|query| query.tl_constructor() == constructor)
+            .expect("the query under test was dispatched")
+    }
+
+    // ---- the premium net slice: the first two flows ride the
+    // dispatcher (Premium.cpp:395-605). ----
+
+    fn with_premium_manager(
+        td: &mut Td,
+        f: impl FnOnce(&mut crate::premium::PremiumManager, &mut PremiumTdEnv<'_>),
+    ) {
+        let mut manager = std::mem::take(&mut td.premium_manager);
+        let premium_net = td.premium_net();
+        let mut env = PremiumTdEnv {
+            options: td.option_manager.as_mut(),
+            net: premium_net,
+        };
+        f(&mut manager, &mut env);
+        td.premium_manager = manager;
+    }
+
+    type GiftOptionsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::PremiumGiftPaymentOptions>>>,
+    >;
+
+    fn record_premium_gift_options() -> (Promise<td_api::PremiumGiftPaymentOptions>, GiftOptionsSlot)
+    {
+        struct Rec(GiftOptionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::PremiumGiftPaymentOptions> for Rec {
+            fn set_value(&mut self, value: td_api::PremiumGiftPaymentOptions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GiftOptionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn premium_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(premium_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn premium_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-premium");
+
+        // 1. applyGiftCode — the Updates answer re-enters on_get_updates
+        //    and resolves the promise.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.apply_premium_gift_code(env, "GIFTslug", promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_applyGiftCode::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(
+            take_sent(sent, telegram_api::payments_applyGiftCode::ID),
+            answer,
+        );
+        td.dispatch_completed_premium_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. applyGiftCode error — the promise errors.
+        let (promise, slot) = record_translation_unit();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.apply_premium_gift_code(env, "bad", promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        net_fail(
+            take_sent(sent, telegram_api::payments_applyGiftCode::ID),
+            400,
+            "GIFT_SLUG_EXPIRED",
+        );
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "GIFT_SLUG_EXPIRED");
+            }
+            other => panic!("the error tail answers 400: {other:?}"),
+        }
+
+        // 3. getPremiumGiftCodeOptions — the filter, the XTR star-price
+        //    map, the relative discount and the sort.
+        let (promise, slot) = record_premium_gift_options();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_gift_payment_options(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getPremiumGiftCodeOptions::ID
+        );
+        let gift_option = |flags: i32, users: i32, months: i32, currency: &str, amount: i64| {
+            telegram_api::PremiumGiftCodeOption {
+                flags,
+                users,
+                months,
+                store_product: String::new(),
+                store_quantity: 0,
+                currency: currency.to_string(),
+                amount,
+            }
+        };
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&4i32.to_le_bytes());
+        // dropped: users != 1
+        gift_option(0, 2, 6, "USD", 1200).store_boxed(&mut answer);
+        // the XTR star price for 12 months
+        gift_option(0, 1, 12, "XTR", 1000).store_boxed(&mut answer);
+        // USD 12 months: the max monthly price (discount 0)
+        gift_option(0, 1, 12, "USD", 2400).store_boxed(&mut answer);
+        // USD 6 months: monthly 180 of max 200 (discount 10)
+        gift_option(0, 1, 6, "USD", 1080).store_boxed(&mut answer);
+        net_complete(
+            take_sent(sent, telegram_api::payments_getPremiumGiftCodeOptions::ID),
+            answer,
+        );
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(options)) => {
+                assert_eq!(
+                    options.options.len(),
+                    2,
+                    "the users!=1 row dropped, XTR skipped"
+                );
+                assert_eq!(options.options[0].month_count, 6, "sorted by month count");
+                // 100 * (1 - 1080.0/6 / 2400.0/12) truncates to 9 — the
+                // C++ static_cast<int32> on the same float math.
+                assert_eq!(options.options[0].discount_percentage, 9);
+                // no XTR price for 6 months — the C++ FlatHashMap
+                // default is 0.
+                assert_eq!(options.options[0].star_count, 0);
+                assert_eq!(options.options[1].month_count, 12);
+                assert_eq!(options.options[1].discount_percentage, 0);
+                assert_eq!(
+                    options.options[1].star_count,
+                    crate::star_manager::get_star_count(1000, false)
+                );
+                assert!(
+                    options.options[1].sticker.is_none(),
+                    "the stickers plane parks"
+                );
+            }
+            other => panic!("unexpected gift options result: {other:?}"),
+        }
+
+        assert!(td.premium_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.premium_manager.pending_apply_gift_code.is_empty()
+                && td.premium_manager.parked_gift_payment_options.is_empty(),
+            "all promises resolved"
         );
     }
 

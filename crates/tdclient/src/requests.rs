@@ -9708,8 +9708,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |l: td_api::PremiumLimit| Object::premiumLimit(l));
+            let premium_net = td.premium_net();
             let env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager
                 .get_premium_limit(&env, &request.limit_type, promise);
@@ -9721,8 +9723,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let _ = request.source;
             let promise =
                 td.deferred_promise(id, |f: td_api::PremiumFeatures| Object::premiumFeatures(f));
+            let premium_net = td.premium_net();
             let env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.get_premium_features(&env, promise);
         }
@@ -9733,8 +9737,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |f: td_api::BusinessFeatures| {
                 Object::businessFeatures(f)
             });
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.get_business_features(&mut env, promise);
         }
@@ -9762,8 +9768,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::PremiumState| Object::premiumState(s));
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.get_premium_state(&mut env, promise);
         }
@@ -9774,8 +9782,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |o: td_api::PremiumGiftPaymentOptions| {
                 Object::premiumGiftPaymentOptions(o)
             });
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager
                 .get_premium_gift_payment_options(&mut env, promise);
@@ -9787,8 +9797,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |o: td_api::PremiumGiveawayPaymentOptions| {
                 Object::premiumGiveawayPaymentOptions(o)
             });
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.get_premium_giveaway_options(
                 &mut env,
@@ -9806,8 +9818,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |i: td_api::PremiumGiftCodeInfo| {
                 Object::premiumGiftCodeInfo(i)
             });
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager
                 .check_premium_gift_code(&mut env, &code, promise);
@@ -9820,8 +9834,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager
                 .apply_premium_gift_code(&mut env, &code, promise);
@@ -9831,8 +9847,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.gift_premium_with_stars(
                 &mut env,
@@ -9847,8 +9865,10 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager
                 .assign_store_transaction(&mut env, promise);
@@ -16233,8 +16253,10 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.can_purchase_premium(&mut env, promise);
         }
@@ -17404,8 +17426,10 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::GiveawayInfo, _>(id, Object::from);
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.get_premium_giveaway_info(
                 &mut env,
@@ -17423,8 +17447,10 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            let premium_net = td.premium_net();
             let mut env = PremiumTdEnv {
                 options: td.option_manager.as_mut(),
+                net: premium_net,
             };
             td.premium_manager.launch_prepaid_premium_giveaway(
                 &mut env,
