@@ -7,11 +7,14 @@
 //! (AutoDownloadSettings.cpp:21-32), the "New settings must be non-empty"
 //! band (Requests.cpp:3126-3128) and the net-type-keyed
 //! roaming/wifi flag derivation of `SaveAutoDownloadSettingsQuery::send`
-//! (AutoDownloadSettings.cpp:78-81). The `account.getAutoDownloadSettings`
-//! / `account.saveAutoDownloadSettings` query tails park at the named
-//! [`AutoDownloadSettingsEnv`] net seams (the M.31 convention — the
-//! caller promises resolve with the C++ LambdaPromise drop until the net
-//! step's result handlers answer them).
+//! (AutoDownloadSettings.cpp:78-81). The
+//! `account.getAutoDownloadSettings` / `account.saveAutoDownloadSettings`
+//! queries ride the client-side dispatcher under their
+//! `AutoDownloadNetKind` — the answers drain through
+//! `Td::on_auto_download_net_answer` (the presets triple converts
+//! through the clamps; the save ok value drops), and the value → wire
+//! `get_input_auto_download_settings` builder landed with the net
+//! slice.
 
 use tdutils::promise::Promise;
 
@@ -71,6 +74,29 @@ pub(crate) fn get_auto_download_settings(
         preload_next_audio: settings.preload_next_audio,
         preload_stories: settings.preload_stories,
         use_less_data_for_calls: settings.use_less_data_for_calls,
+    }
+}
+
+/// `get_input_auto_download_settings` (AutoDownloadSettings.cpp:62-68)
+/// — the value → wire form the `SaveAutoDownloadSettingsQuery` sends
+/// (the C++ passes flags = 0 and leaves the queue caps at their
+/// defaults).
+pub(crate) fn get_input_auto_download_settings(
+    settings: &AutoDownloadSettings,
+) -> tdmtproto::telegram_api::AutoDownloadSettings {
+    tdmtproto::telegram_api::AutoDownloadSettings {
+        flags: 0,
+        disabled: !settings.is_enabled,
+        video_preload_large: settings.preload_large_videos,
+        audio_preload_next: settings.preload_next_audio,
+        phonecalls_less_data: settings.use_less_data_for_calls,
+        stories_preload: settings.preload_stories,
+        photo_size_max: settings.max_photo_file_size,
+        video_size_max: settings.max_video_file_size,
+        file_size_max: settings.max_other_file_size,
+        video_upload_maxbitrate: settings.video_upload_bitrate,
+        small_queue_active_operations_max: 0,
+        large_queue_active_operations_max: 0,
     }
 }
 

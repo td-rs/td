@@ -3001,6 +3001,39 @@ pub(crate) enum PrivacyNetKind {
 /// the answers drain through [`Td::on_privacy_net_answer`].
 type PrivacyNetHandle = NetKindHandle<PrivacyNetKind>;
 
+/// The auto-download query pair riding the dispatcher — the C++
+/// ResultHandler classes of AutoDownloadSettings.cpp:34-90.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AutoDownloadNetKind {
+    /// `GetAutoDownloadSettingsQuery` (cpp:34-55).
+    GetAutoDownloadSettings,
+    /// `SaveAutoDownloadSettingsQuery` (cpp:70-90).
+    SaveAutoDownloadSettings,
+}
+
+/// The cloned auto-download dispatch surface the [`PrivacyEnv`] senders
+/// use — the answers drain through [`Td::on_auto_download_net_answer`].
+type AutoDownloadNetHandle = NetKindHandle<AutoDownloadNetKind>;
+
+/// The parked auto-download promises (the C++ handlers' own promises).
+enum PendingAutoDownloadQuery {
+    /// The `GetAutoDownloadSettingsQuery` promise (cpp:35).
+    GetPresets {
+        promise: Promise<td_api::AutoDownloadSettingsPresets>,
+    },
+    /// The `SaveAutoDownloadSettingsQuery` promise (cpp:71).
+    Save { promise: Promise<()> },
+}
+
+impl PendingAutoDownloadQuery {
+    fn is_get_presets(&self) -> bool {
+        matches!(self, Self::GetPresets { .. })
+    }
+    fn is_save(&self) -> bool {
+        matches!(self, Self::Save { .. })
+    }
+}
+
 /// The parked privacy promises (the C++ handlers' own promises) — the
 /// set/global pairs; the get promises queue in the manager's
 /// `PrivacyInfo` instead (the C++ shape).
@@ -3819,6 +3852,11 @@ pub struct Td {
     privacy_net_completed: Arc<Mutex<Vec<(PrivacyNetKind, NetQuery)>>>,
     /// The parked privacy promises (the C++ handlers' own promises).
     privacy_promises: Vec<PendingPrivacyQuery>,
+    /// The callback-parked auto-download query answers
+    /// (the `Td::on_auto_download_net_answer` drain).
+    auto_download_net_completed: Arc<Mutex<Vec<(AutoDownloadNetKind, NetQuery)>>>,
+    /// The parked auto-download promises.
+    auto_download_promises: Vec<PendingAutoDownloadQuery>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4258,6 +4296,8 @@ impl Td {
             translation_promises: Vec::new(),
             privacy_net_completed: Arc::new(Mutex::new(Vec::new())),
             privacy_promises: Vec::new(),
+            auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
+            auto_download_promises: Vec::new(),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -6409,6 +6449,7 @@ impl Td {
         self.dispatch_completed_sponsored_net();
         self.dispatch_completed_translation_net();
         self.dispatch_completed_privacy_net();
+        self.dispatch_completed_auto_download_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6528,6 +6569,15 @@ impl Td {
         Some(PrivacyNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.privacy_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned auto-download dispatch surface (the privacy twin).
+    fn auto_download_net(&self) -> Option<AutoDownloadNetHandle> {
+        Some(AutoDownloadNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.auto_download_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7667,6 +7717,91 @@ impl Td {
             self.on_privacy_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked auto-download answers — the C++
+    /// ResultHandler halves (AutoDownloadSettings.cpp:34-90).
+    fn dispatch_completed_auto_download_net(&mut self) {
+        let completed = std::mem::take(&mut *self.auto_download_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_auto_download_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one auto-download net answer by kind (the C++ query handler
+    /// halves of AutoDownloadSettings.cpp:34-90).
+    fn on_auto_download_net_answer(&mut self, kind: AutoDownloadNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetAutoDownloadSettingsQuery` (cpp:48-55) — the three
+            // presets convert through the clamps
+            // (`convert_auto_download_settings`).
+            AutoDownloadNetKind::GetAutoDownloadSettings => {
+                let Some(pending) = self
+                    .auto_download_promises
+                    .iter()
+                    .position(PendingAutoDownloadQuery::is_get_presets)
+                    .map(|index| self.auto_download_promises.remove(index))
+                else {
+                    return;
+                };
+                let PendingAutoDownloadQuery::GetPresets { mut promise } = pending else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::account_AutoDownloadSettings::parse(query.ok()) {
+                    Ok(settings) => {
+                        let low = settings.low.unwrap_or_default();
+                        let medium = settings.medium.unwrap_or_default();
+                        let high = settings.high.unwrap_or_default();
+                        promise.set_value(td_api::AutoDownloadSettingsPresets {
+                            low: Some(
+                                crate::auto_download_settings::convert_auto_download_settings(&low),
+                            ),
+                            medium: Some(
+                                crate::auto_download_settings::convert_auto_download_settings(
+                                    &medium,
+                                ),
+                            ),
+                            high: Some(
+                                crate::auto_download_settings::convert_auto_download_settings(
+                                    &high,
+                                ),
+                            ),
+                        });
+                    }
+                    Err(_) => promise.set_error(parse_error("account_getAutoDownloadSettings")),
+                }
+            }
+            // `SaveAutoDownloadSettingsQuery` (cpp:85-90) — the ok value
+            // drops.
+            AutoDownloadNetKind::SaveAutoDownloadSettings => {
+                let Some(pending) = self
+                    .auto_download_promises
+                    .iter()
+                    .position(PendingAutoDownloadQuery::is_save)
+                    .map(|index| self.auto_download_promises.remove(index))
+                else {
+                    return;
+                };
+                let PendingAutoDownloadQuery::Save { mut promise } = pending else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                } else if parse_wire_bool_value(query.ok()).is_some() {
+                    promise.set_value(());
+                } else {
+                    promise.set_error(parse_error("account_saveAutoDownloadSettings"));
+                }
+            }
+        }
     }
 
     /// Route one privacy net answer by kind (the C++ query handler
@@ -18380,21 +18515,52 @@ impl crate::auto_download_settings::AutoDownloadSettingsEnv for PrivacyEnv<'_> {
         &mut self,
         promise: Promise<td_api::AutoDownloadSettingsPresets>,
     ) {
-        // `GetAutoDownloadSettingsQuery::send` —
-        // `account.getAutoDownloadSettings` (`[blocked: net]`).
-        drop(promise);
+        // `GetAutoDownloadSettingsQuery::send` (cpp:44-45).
+        self.td
+            .auto_download_promises
+            .push(PendingAutoDownloadQuery::GetPresets { promise });
+        match self.td.auto_download_net() {
+            Some(net) => net.dispatch(
+                AutoDownloadNetKind::GetAutoDownloadSettings,
+                telegram_api::Function::account_getAutoDownloadSettings(
+                    telegram_api::account_getAutoDownloadSettings,
+                ),
+            ),
+            None => tdutils::log_info!("Get auto-download settings — [net-inert]"),
+        }
     }
 
     fn set_auto_download_settings_via_net(
         &mut self,
-        _is_roaming: bool,
-        _is_wifi: bool,
-        _settings: crate::auto_download_settings::AutoDownloadSettings,
+        is_roaming: bool,
+        is_wifi: bool,
+        settings: crate::auto_download_settings::AutoDownloadSettings,
         promise: Promise<()>,
     ) {
-        // `SaveAutoDownloadSettingsQuery::send` —
-        // `account.saveAutoDownloadSettings` (`[blocked: net]`).
-        drop(promise);
+        // `SaveAutoDownloadSettingsQuery::send` (cpp:76-80) — the
+        // roaming/wifi flag pair (the C++ passes flags = 0 and lets the
+        // generated store OR the bits).
+        self.td
+            .auto_download_promises
+            .push(PendingAutoDownloadQuery::Save { promise });
+        match self.td.auto_download_net() {
+            Some(net) => net.dispatch(
+                AutoDownloadNetKind::SaveAutoDownloadSettings,
+                telegram_api::Function::account_saveAutoDownloadSettings(
+                    telegram_api::account_saveAutoDownloadSettings {
+                        flags: 0,
+                        low: is_roaming,
+                        high: is_wifi,
+                        settings: Some(
+                            crate::auto_download_settings::get_input_auto_download_settings(
+                                &settings,
+                            ),
+                        ),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Save auto-download settings — [net-inert]"),
+        }
     }
 }
 
@@ -29991,6 +30157,125 @@ mod tests {
 
         assert!(td.privacy_net_completed.lock().is_empty(), "drained");
         assert!(td.privacy_promises.is_empty(), "all promises resolved");
+    }
+
+    // ---- the auto-download net slice: the settings pair rides the
+    // dispatcher (AutoDownloadSettings.cpp:34-90). ----
+
+    type AutoDownloadPresetsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::AutoDownloadSettingsPresets>>>,
+    >;
+
+    fn record_auto_download_presets() -> (
+        Promise<td_api::AutoDownloadSettingsPresets>,
+        AutoDownloadPresetsSlot,
+    ) {
+        struct Rec(AutoDownloadPresetsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::AutoDownloadSettingsPresets> for Rec {
+            fn set_value(&mut self, value: td_api::AutoDownloadSettingsPresets) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: AutoDownloadPresetsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_auto_download_settings(photo: i32) -> Option<telegram_api::AutoDownloadSettings> {
+        Some(telegram_api::AutoDownloadSettings {
+            flags: 1 << 1 | 1 << 2 | 1 << 3 | 1 << 4,
+            disabled: false,
+            video_preload_large: true,
+            audio_preload_next: true,
+            phonecalls_less_data: true,
+            stories_preload: true,
+            photo_size_max: photo,
+            video_size_max: 1 << 22,
+            file_size_max: 1 << 21,
+            video_upload_maxbitrate: 512,
+            small_queue_active_operations_max: 0,
+            large_queue_active_operations_max: 0,
+        })
+    }
+
+    #[test]
+    fn auto_download_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(auto_download_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn auto_download_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-auto-download");
+
+        // 1. getAutoDownloadSettings — the three presets convert through
+        //    the clamps.
+        let (promise, slot) = record_auto_download_presets();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            crate::auto_download_settings::get_auto_download_settings_presets(&mut env, promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAutoDownloadSettings::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_AutoDownloadSettings {
+            low: wire_auto_download_settings(1 << 10),
+            medium: wire_auto_download_settings(1 << 20),
+            high: wire_auto_download_settings(9 * (1 << 20)),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_auto_download_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(presets)) => {
+                assert_eq!(presets.low.as_ref().unwrap().max_photo_file_size, 1 << 10);
+                assert_eq!(
+                    presets.high.as_ref().unwrap().max_photo_file_size,
+                    9 * (1 << 20)
+                );
+                assert!(presets.medium.as_ref().unwrap().preload_large_videos);
+            }
+            other => panic!("unexpected presets result: {other:?}"),
+        }
+
+        // 2. saveAutoDownloadSettings — the ok value drops.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            crate::auto_download_settings::set_auto_download_settings(
+                &mut env,
+                crate::connection_creator::NetType::WiFi,
+                crate::auto_download_settings::AutoDownloadSettings::default(),
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_saveAutoDownloadSettings::ID
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_auto_download_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        assert!(td.auto_download_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.auto_download_promises.is_empty(),
+            "all promises resolved"
+        );
     }
 
     type CountriesSlot =
