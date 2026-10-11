@@ -2935,6 +2935,47 @@ pub(crate) enum SponsoredNetKind {
 /// use — the answers drain through [`Td::on_sponsored_net_answer`].
 type SponsoredNetHandle = NetKindHandle<SponsoredNetKind>;
 
+/// The TranslationManager query families riding the dispatcher — the
+/// C++ ResultHandler classes of TranslationManager.cpp:34-568 (the
+/// rich-message pair stays on the RichMessage-blocked seams).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TranslationNetKind {
+    /// `TranslateTextQuery` (cpp:34-86) — the text form; the answer
+    /// chains into `on_get_translated_texts`.
+    TranslateText,
+    /// `GetAiComposeTonesQuery` (cpp:175-202) — the reload surface; its
+    /// completion also resolves the parked tone-style chains.
+    GetAiComposeTones,
+    /// `CreateToneQuery` (cpp:204-234).
+    CreateTone,
+    /// `UpdateToneQuery` (cpp:236-270).
+    UpdateTone,
+    /// `DeleteToneQuery` (cpp:272-296).
+    DeleteTone,
+    /// `GetToneQuery` (cpp:298-340).
+    GetTone,
+    /// `GetToneExampleQuery` (cpp:342-369).
+    GetToneExample,
+    /// `SaveToneQuery` (cpp:371-395).
+    SaveTone,
+    /// `ComposeMessageWithAiQuery` (cpp:397-438); the pair chains into
+    /// the formatted-text answer.
+    ComposeMessageWithAi {
+        skip_bot_commands: bool,
+        max_media_timestamp: i32,
+    },
+    /// `ProofreadMessageWithAiQuery` (cpp:529-568).
+    ProofreadMessageWithAi {
+        skip_bot_commands: bool,
+        max_media_timestamp: i32,
+    },
+}
+
+/// The cloned translation dispatch surface the [`TdTranslationEnv`]
+/// senders use — the answers drain through
+/// [`Td::on_translation_net_answer`].
+type TranslationNetHandle = NetKindHandle<TranslationNetKind>;
+
 /// The `SendWalletTransferQuery` promise chain (cpp:585-593): the
 /// transfer result rides the `on_get_updates` completion — the value
 /// arm answers the parked promise with the carried object, the error
@@ -3024,6 +3065,53 @@ fn parse_wire_bool_value(data: &[u8]) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+/// Pop the first parked [`PendingTranslationQuery`] matching the
+/// selector (the star `take_pending` convention over the single enum
+/// lot).
+fn take_translation_pending(
+    promises: &mut Vec<crate::translation_manager::PendingTranslationQuery>,
+    selector: fn(&crate::translation_manager::PendingTranslationQuery) -> bool,
+) -> Option<crate::translation_manager::PendingTranslationQuery> {
+    let index = promises.iter().position(selector)?;
+    Some(promises.remove(index))
+}
+
+/// The `reload_ai_compose_tones` completion tail: the parked tone-style
+/// chains (the Create/Update lambda chains, cpp:225-227/261-263) resolve
+/// with their converted styles, then the reload's own parked promise
+/// resolves Unit (the C++ ignores errors — both halves land here).
+fn answer_translation_reload_promises(td: &mut Td) {
+    while let Some(pending) = take_translation_pending(
+        &mut td.translation_promises,
+        crate::translation_manager::PendingTranslationQuery::is_tone_style,
+    ) {
+        let crate::translation_manager::PendingTranslationQuery::ToneStyle { style, mut promise } =
+            pending
+        else {
+            unreachable!("the selector matches the variant");
+        };
+        match style {
+            Some(style) => promise.set_value(style),
+            // a style parked without its answer (a lost create answer)
+            None => promise.set_error(Status::error(
+                500,
+                "Failed to reload text composition styles",
+            )),
+        }
+    }
+    if let Some(pending) = take_translation_pending(
+        &mut td.translation_promises,
+        crate::translation_manager::PendingTranslationQuery::is_tones_reload,
+    ) {
+        let crate::translation_manager::PendingTranslationQuery::TonesReload { mut promise } =
+            pending
+        else {
+            unreachable!("the selector matches the variant");
+        };
+        promise.set_value(());
     }
 }
 
@@ -3657,6 +3745,12 @@ pub struct Td {
     /// The callback-parked SponsoredMessageManager query answers,
     /// parked by kind (the `Td::on_sponsored_net_answer` drain).
     sponsored_net_completed: Arc<Mutex<Vec<(SponsoredNetKind, NetQuery)>>>,
+    /// The callback-parked TranslationManager query answers, parked by
+    /// kind (the `Td::on_translation_net_answer` drain).
+    translation_net_completed: Arc<Mutex<Vec<(TranslationNetKind, NetQuery)>>>,
+    /// The parked TranslationManager promises (the C++ handlers' own
+    /// promises) — popped by the answer drain.
+    translation_promises: Vec<crate::translation_manager::PendingTranslationQuery>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4092,6 +4186,8 @@ impl Td {
             country_net_completed: Arc::new(Mutex::new(Vec::new())),
             promo_net_completed: Arc::new(Mutex::new(Vec::new())),
             sponsored_net_completed: Arc::new(Mutex::new(Vec::new())),
+            translation_net_completed: Arc::new(Mutex::new(Vec::new())),
+            translation_promises: Vec::new(),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -4741,15 +4837,9 @@ impl Td {
         // (start_up guards is_authorized && !is_bot); the empty-cache
         // reload is the [blocked: net] tail.
         {
-            let mut env = TranslationEnv {
-                global: &mut self.global,
-                options: self.option_manager.as_mut(),
-                auth_is_authorized: self.auth_manager.is_authorized(),
-                auth_is_bot: self.auth_manager.is_bot(),
-                updates: &mut self.translation_updates,
-                users: &mut self.user_manager,
-            };
-            self.translation_manager.init(&mut env);
+            let (mut manager, mut env) = translation_env_split(self);
+            manager.init(&mut env);
+            self.translation_manager = manager;
         }
 
         // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
@@ -6247,6 +6337,7 @@ impl Td {
         self.dispatch_completed_country_net();
         self.dispatch_completed_promo_net();
         self.dispatch_completed_sponsored_net();
+        self.dispatch_completed_translation_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6345,6 +6436,17 @@ impl Td {
         Some(SponsoredNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.sponsored_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned translation dispatch surface — the whole-Td
+    /// [`TdTranslationEnv`] senders use it; `None` keeps the net-inert
+    /// posture.
+    fn translation_net(&self) -> Option<TranslationNetHandle> {
+        Some(TranslationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.translation_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7464,6 +7566,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked TranslationManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves
+    /// (TranslationManager.cpp:34-568).
+    fn dispatch_completed_translation_net(&mut self) {
+        let completed = std::mem::take(&mut *self.translation_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_translation_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Route one SponsoredMessageManager net answer by kind (the C++
     /// query handler halves of SponsoredMessageManager.cpp:37-200).
     fn on_sponsored_net_answer(&mut self, kind: SponsoredNetKind, query: NetQuery) {
@@ -7555,6 +7668,339 @@ impl Td {
                 let mut env = TdSponsoredEnv { td: &mut *self };
                 manager.on_get_search_sponsored_dialogs(&mut env, &query_string, result);
                 self.sponsored_message_manager = manager;
+            }
+        }
+    }
+
+    /// Route one TranslationManager net answer by kind (the C++ query
+    /// handler halves of TranslationManager.cpp:34-568).
+    fn on_translation_net_answer(&mut self, kind: TranslationNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `TranslateTextQuery` (cpp:34-86) — the answer re-enters
+            // `on_get_translated_texts`; the INPUT_TEXT_EMPTY error band
+            // synthesizes one empty text (cpp:79-84).
+            TranslationNetKind::TranslateText => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_translate_text,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::TranslateText {
+                    skip_bot_commands,
+                    max_media_timestamp,
+                    mut promise,
+                } = pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "INPUT_TEXT_EMPTY" {
+                        let texts = vec![telegram_api::TextWithEntities {
+                            text: String::new(),
+                            entities: Vec::new(),
+                        }];
+                        let (manager, mut env) = translation_env_split(self);
+                        manager.on_get_translated_texts(
+                            &mut env,
+                            texts,
+                            skip_bot_commands,
+                            max_media_timestamp,
+                            promise,
+                        );
+                        self.translation_manager = manager;
+                    } else {
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                match telegram_api::messages_TranslatedText::parse(query.ok()) {
+                    Ok(translated) => {
+                        let (manager, mut env) = translation_env_split(self);
+                        manager.on_get_translated_texts(
+                            &mut env,
+                            translated.result,
+                            skip_bot_commands,
+                            max_media_timestamp,
+                            promise,
+                        );
+                        self.translation_manager = manager;
+                    }
+                    Err(_) => promise.set_error(parse_error("messages_translateText")),
+                }
+            }
+            // `ComposeMessageWithAiQuery` (cpp:397-438) — the formatted
+            // text answer.
+            TranslationNetKind::ComposeMessageWithAi {
+                skip_bot_commands,
+                max_media_timestamp,
+            } => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_compose,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::Compose {
+                    mut promise,
+                    ..
+                } = pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::messages_ComposedMessageWithAI::parse(query.ok()) {
+                    Ok(composed) => {
+                        let (manager, mut env) = translation_env_split(self);
+                        let result_text = composed.result_text.unwrap_or_default();
+                        let formatted_text = crate::message_entity::get_formatted_text(
+                            Some(&mut env),
+                            result_text.text,
+                            result_text.entities,
+                            max_media_timestamp == -1,
+                            true,
+                            "ComposeMessageWithAiQuery",
+                        );
+                        promise.set_value(crate::message_entity::get_formatted_text_object(
+                            Some(&mut env),
+                            &formatted_text,
+                            skip_bot_commands,
+                            max_media_timestamp,
+                        ));
+                        self.translation_manager = manager;
+                    }
+                    Err(_) => promise.set_error(parse_error("messages_composeMessageWithAI")),
+                }
+            }
+            // `ProofreadMessageWithAiQuery` (cpp:529-568) — the fixed
+            // text + diff pair; the diff rides the `DiffText` port.
+            TranslationNetKind::ProofreadMessageWithAi {
+                skip_bot_commands,
+                max_media_timestamp,
+            } => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_proofread,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::Proofread {
+                    mut promise,
+                    ..
+                } = pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::messages_ComposedMessageWithAI::parse(query.ok()) {
+                    Ok(composed) => {
+                        let diff_text = crate::diff_text::DiffText::new(composed.diff_text);
+                        let (manager, mut env) = translation_env_split(self);
+                        let result_text = composed.result_text.unwrap_or_default();
+                        let formatted_text = crate::message_entity::get_formatted_text(
+                            Some(&mut env),
+                            result_text.text,
+                            result_text.entities,
+                            max_media_timestamp == -1,
+                            true,
+                            "ProofreadMessageWithAiQuery",
+                        );
+                        promise.set_value(td_api::FixedText {
+                            text: Some(crate::message_entity::get_formatted_text_object(
+                                Some(&mut env),
+                                &formatted_text,
+                                skip_bot_commands,
+                                max_media_timestamp,
+                            )),
+                            diff_text: Some(diff_text.get_diff_text_object()),
+                        });
+                        self.translation_manager = manager;
+                    }
+                    Err(_) => promise.set_error(parse_error("messages_composeMessageWithAI")),
+                }
+            }
+            // `GetAiComposeTonesQuery` (cpp:175-202) — the answer
+            // re-enters `on_get_ai_compose_tones`; the error arm ignores
+            // the status (the C++ resolves Unit on both halves) and both
+            // arms resolve the parked reload/style chains.
+            TranslationNetKind::GetAiComposeTones => {
+                if !query.is_error()
+                    && let Ok(tones) = telegram_api::aicompose_Tones::parse(query.ok())
+                {
+                    let (mut manager, mut env) = translation_env_split(self);
+                    manager.on_get_ai_compose_tones(&mut env, tones);
+                    self.translation_manager = manager;
+                }
+                answer_translation_reload_promises(self);
+            }
+            // `CreateToneQuery` (cpp:204-234) — the answer converts the
+            // style, parks it with the promise, and reloads the tones
+            // (the PromiseCreator lambda chain).
+            TranslationNetKind::CreateTone | TranslationNetKind::UpdateTone => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_tone_style,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::ToneStyle {
+                    style: _,
+                    mut promise,
+                } = pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::AiComposeTone::parse(query.ok()) {
+                    Ok(tone) => {
+                        let style = {
+                            let (manager, mut env) = translation_env_split(self);
+                            let style =
+                                crate::translation_manager::AiComposeTone::new_from_telegram(tone)
+                                    .get_text_composition_style_object(&mut env);
+                            self.translation_manager = manager;
+                            style
+                        };
+                        self.translation_promises.push(
+                            crate::translation_manager::PendingTranslationQuery::ToneStyle {
+                                style: Some(style),
+                                promise,
+                            },
+                        );
+                        // the chained reload — its completion resolves
+                        // the parked style promise
+                        let (manager, mut env) = translation_env_split(self);
+                        manager.reload_ai_compose_tones(&mut env, Promise::default());
+                        self.translation_manager = manager;
+                    }
+                    Err(_) => promise.set_error(parse_error("aicompose_tone")),
+                }
+            }
+            // `DeleteToneQuery`/`SaveToneQuery` (cpp:272-296/371-395) —
+            // the ok answer drops the value and reloads the tones with
+            // the request's own promise.
+            TranslationNetKind::DeleteTone | TranslationNetKind::SaveTone => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_tone_unit,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::ToneUnit { mut promise } =
+                    pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                if parse_wire_bool_value(query.ok()).is_some() {
+                    let (manager, mut env) = translation_env_split(self);
+                    manager.reload_ai_compose_tones(&mut env, promise);
+                    self.translation_manager = manager;
+                } else {
+                    promise.set_error(parse_error("aicompose_tone"));
+                }
+            }
+            // `GetToneQuery` (cpp:298-340) — the not-modified and the
+            // wrong-size bands are the C++ null-value tails; the port
+            // answers 500 (the request promise is not nullable).
+            TranslationNetKind::GetTone => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_get_tone,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::GetTone { mut promise } =
+                    pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::aicompose_Tones::parse(query.ok()) {
+                    Ok(telegram_api::aicompose_Tones::aicompose_tones(tones)) => {
+                        let (manager, mut env) = translation_env_split(self);
+                        let update = crate::translation_manager::AiComposeTones::new_from_telegram(
+                            &mut env, tones,
+                        )
+                        .get_update_text_composition_styles_object(&mut env);
+                        self.translation_manager = manager;
+                        let td_api::Update::updateTextCompositionStyles(mut update) = update else {
+                            unreachable!("the conversion returns the update variant");
+                        };
+                        if update.styles.len() == 1 {
+                            promise.set_value(update.styles.pop().unwrap());
+                        } else {
+                            tdutils::log_error!(
+                                "Receive {} text composition styles instead of one",
+                                update.styles.len()
+                            );
+                            promise.set_error(Status::error(
+                                500,
+                                "Receive unexpected number of text composition styles",
+                            ));
+                        }
+                    }
+                    Ok(telegram_api::aicompose_Tones::aicompose_tonesNotModified(_)) => {
+                        tdutils::log_error!("Receive aicompose.tonesNotModified for the tone");
+                        promise.set_error(Status::error(500, "Receive aicompose.tonesNotModified"));
+                    }
+                    Err(_) => promise.set_error(parse_error("aicompose_getTone")),
+                }
+            }
+            // `GetToneExampleQuery` (cpp:342-369).
+            TranslationNetKind::GetToneExample => {
+                let Some(pending) = take_translation_pending(
+                    &mut self.translation_promises,
+                    crate::translation_manager::PendingTranslationQuery::is_tone_example,
+                ) else {
+                    return;
+                };
+                let crate::translation_manager::PendingTranslationQuery::ToneExample {
+                    mut promise,
+                } = pending
+                else {
+                    unreachable!("the selector matches the variant");
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                match telegram_api::AiComposeToneExample::parse(query.ok()) {
+                    Ok(example) => {
+                        let example =
+                            crate::translation_manager::AiComposeToneExample::new_from_telegram(
+                                Some(example),
+                            );
+                        match example.get_text_composition_style_example_object() {
+                            Some(example) => promise.set_value(example),
+                            // the C++ null-value tail (the empty example)
+                            None => promise.set_error(Status::error(
+                                500,
+                                "Receive empty text composition style example",
+                            )),
+                        }
+                    }
+                    Err(_) => promise.set_error(parse_error("aicompose_getToneExample")),
+                }
             }
         }
     }
@@ -10013,15 +10459,9 @@ impl Td {
     /// don't call this (the C++ fires it only from on_get_authorization;
     /// the constructor restore already sent the styles update).
     fn on_translation_authorization_success(&mut self) {
-        let mut env = TranslationEnv {
-            global: &mut self.global,
-            options: self.option_manager.as_mut(),
-            auth_is_authorized: self.auth_manager.is_authorized(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            updates: &mut self.translation_updates,
-            users: &mut self.user_manager,
-        };
-        self.translation_manager.on_authorization_success(&mut env);
+        let (mut manager, mut env) = translation_env_split(self);
+        manager.on_authorization_success(&mut env);
+        self.translation_manager = manager;
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -14429,62 +14869,68 @@ impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'
     }
 }
 
-/// The [`crate::translation_manager::TranslationManagerEnv`] over the `Td`
-/// fields — built per call (the `NotificationEnv` convention), never held
-/// across calls. The user plane rides the same split-`UserEnv` borrow as
-/// the bot arms (`bot_user_split`), because the manager's entity scan
-/// also needs the [`crate::message_entity::UserManagerLike`] surface.
-pub(crate) struct TranslationEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    /// `None` once the option manager is torn down; the getters answer
-    /// their defaults, matching the C++ close ordering.
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) auth_is_authorized: bool,
-    pub(crate) auth_is_bot: bool,
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
-    pub(crate) users: &'a mut UserManager,
+/// The whole-Td [`crate::translation_manager::TranslationManagerEnv`]
+/// (the `TdStarEnv` convention) — the net slice sends through the cloned
+/// [`TranslationNetHandle`] and parks the query promises on the Td-side
+/// lot. The user plane rides the split-`UserEnv` borrow
+/// (`bot_user_split`), because the manager's entity scan also needs the
+/// [`crate::message_entity::UserManagerLike`] surface.
+pub(crate) struct TdTranslationEnv<'a> {
+    pub(crate) td: &'a mut Td,
 }
 
-impl TranslationEnv<'_> {
+/// The disjoint manager/env take-out (the `star_env_split` convention).
+pub(crate) fn translation_env_split(
+    td: &mut Td,
+) -> (
+    crate::translation_manager::TranslationManager,
+    TdTranslationEnv<'_>,
+) {
+    let manager = std::mem::take(&mut td.translation_manager);
+    (manager, TdTranslationEnv { td })
+}
+
+impl TdTranslationEnv<'_> {
     /// The disjoint `UserEnv` + manager borrow (the `bot_user_split`
     /// convention in requests.rs).
     fn user_env_split(&mut self) -> (UserEnv<'_>, &mut UserManager) {
         let options = self
-            .options
-            .as_deref_mut()
+            .td
+            .option_manager
+            .as_mut()
             .expect("translation calls run with the initialized option manager");
         let env = UserEnv {
-            global: &mut *self.global,
+            global: &mut self.td.global,
             options,
-            auth_is_bot: self.auth_is_bot,
+            auth_is_bot: self.td.auth_manager.is_bot(),
         };
-        (env, &mut *self.users)
+        (env, &mut self.td.user_manager)
     }
 }
 
-impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
+impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> {
     fn auth_is_authorized(&self) -> bool {
-        self.auth_is_authorized
+        self.td.auth_manager.is_authorized()
     }
 
     fn auth_is_bot(&self) -> bool {
-        self.auth_is_bot
+        self.td.auth_manager.is_bot()
     }
 
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.binlog_pmc().get_raw(key)
+        self.td.global.binlog_pmc().get_raw(key)
     }
 
     fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.binlog_pmc().set_raw(key, value);
+        self.td.global.binlog_pmc().set_raw(key, value);
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.translation_updates.push(update);
     }
 
     fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
@@ -14512,8 +14958,8 @@ impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
         users.get_me(&mut env);
     }
 
-    /// `TranslateTextQuery::send` — [blocked: net]; the promise drops,
-    /// which keeps the C++ request unanswered offline.
+    /// `TranslateTextQuery::send` (TranslationManager.cpp:44-66) — the
+    /// text form (the PEER form stays with the message-translate flow).
     fn send_translate_text_query(
         &mut self,
         texts: Vec<FormattedText>,
@@ -14521,65 +14967,197 @@ impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
         tone: String,
         skip_bot_commands: bool,
         max_media_timestamp: i32,
-        _promise: tdutils::promise::Promise<td_api::FormattedText>,
+        promise: tdutils::promise::Promise<td_api::FormattedText>,
     ) {
-        let _ = (
-            texts,
-            to_language_code,
-            tone,
-            skip_bot_commands,
-            max_media_timestamp,
+        use crate::translation_manager::PendingTranslationQuery;
+        let Some(net) = self.td.translation_net() else {
+            tdutils::log_info!("Translate text — [net-inert]");
+            return;
+        };
+        let mut flags = 2; // TEXT_MASK
+        if !tone.is_empty() {
+            flags |= 4; // TONE_MASK
+        }
+        let input_texts = texts
+            .iter()
+            .map(|text| {
+                crate::message_entity::get_input_text_with_entities(
+                    Some(&mut *self),
+                    text,
+                    "TranslateTextQuery",
+                )
+            })
+            .collect();
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::TranslateText {
+                skip_bot_commands,
+                max_media_timestamp,
+                promise,
+            });
+        net.dispatch(
+            TranslationNetKind::TranslateText,
+            telegram_api::Function::messages_translateText(telegram_api::messages_translateText {
+                flags,
+                peer: None,
+                id: Vec::new(),
+                text: input_texts,
+                to_lang: to_language_code,
+                tone,
+            }),
         );
-        tdutils::log_info!("Translate text — [blocked: net]");
     }
 
-    /// `ComposeMessageWithAiQuery::send` — [blocked: net].
+    /// `ComposeMessageWithAiQuery::send` (TranslationManager.cpp:413-425).
     fn send_compose_message_with_ai_query(
         &mut self,
-        text: FormattedText,
+        text: crate::translation_manager::InputText,
         translate_to_language_code: String,
         input_tone: Option<telegram_api::InputAiComposeTone>,
         emojify: bool,
-        _promise: tdutils::promise::Promise<td_api::FormattedText>,
+        promise: tdutils::promise::Promise<td_api::FormattedText>,
     ) {
-        let _ = (text, translate_to_language_code, input_tone, emojify);
-        tdutils::log_info!("Compose message with AI — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        let crate::translation_manager::InputText {
+            text,
+            skip_bot_commands,
+            max_media_timestamp,
+        } = text;
+        let Some(net) = self.td.translation_net() else {
+            tdutils::log_info!("Compose message with AI — [net-inert]");
+            return;
+        };
+        let mut flags = 0;
+        if !translate_to_language_code.is_empty() {
+            flags |= 1 << 1; // TRANSLATE_TO_LANG_MASK
+        }
+        if input_tone.is_some() {
+            flags |= 1 << 2; // TONE_MASK
+        }
+        let input_text = crate::message_entity::get_input_text_with_entities(
+            Some(&mut *self),
+            &text,
+            "ComposeMessageWithAiQuery",
+        );
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::Compose { promise });
+        net.dispatch(
+            TranslationNetKind::ComposeMessageWithAi {
+                skip_bot_commands,
+                max_media_timestamp,
+            },
+            telegram_api::Function::messages_composeMessageWithAI(
+                telegram_api::messages_composeMessageWithAI {
+                    flags,
+                    proofread: false,
+                    emojify,
+                    text: Some(input_text),
+                    translate_to_lang: translate_to_language_code,
+                    tone: input_tone,
+                },
+            ),
+        );
     }
 
-    /// `ProofreadMessageWithAiQuery::send` — [blocked: net].
+    /// `ProofreadMessageWithAiQuery::send` (TranslationManager.cpp:541-551)
+    /// — the proofread form of the same wire function.
     fn send_proofread_message_with_ai_query(
         &mut self,
-        text: FormattedText,
-        _promise: tdutils::promise::Promise<td_api::FixedText>,
+        text: crate::translation_manager::InputText,
+        promise: tdutils::promise::Promise<td_api::FixedText>,
     ) {
-        let _ = text;
-        tdutils::log_info!("Proofread message with AI — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        let crate::translation_manager::InputText {
+            text,
+            skip_bot_commands,
+            max_media_timestamp,
+        } = text;
+        let Some(net) = self.td.translation_net() else {
+            tdutils::log_info!("Proofread message with AI — [net-inert]");
+            return;
+        };
+        let input_text = crate::message_entity::get_input_text_with_entities(
+            Some(&mut *self),
+            &text,
+            "ProofreadMessageWithAiQuery",
+        );
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::Proofread { promise });
+        net.dispatch(
+            TranslationNetKind::ProofreadMessageWithAi {
+                skip_bot_commands,
+                max_media_timestamp,
+            },
+            telegram_api::Function::messages_composeMessageWithAI(
+                telegram_api::messages_composeMessageWithAI {
+                    flags: 0,
+                    proofread: true,
+                    emojify: false,
+                    text: Some(input_text),
+                    translate_to_lang: String::new(),
+                    tone: None,
+                },
+            ),
+        );
     }
 
-    /// `GetAiComposeTonesQuery::send` — [blocked: net].
+    /// `GetAiComposeTonesQuery::send` (TranslationManager.cpp:180-181).
     fn send_get_ai_compose_tones_query(
         &mut self,
         hash: i64,
-        _promise: tdutils::promise::Promise<()>,
+        promise: tdutils::promise::Promise<()>,
     ) {
-        let _ = hash;
-        tdutils::log_info!("Get AI-compose tones hash {hash} — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::TonesReload { promise });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::GetAiComposeTones,
+                telegram_api::Function::aicompose_getTones(telegram_api::aicompose_getTones {
+                    hash,
+                }),
+            ),
+            None => tdutils::log_info!("Get AI-compose tones hash {hash} — [net-inert]"),
+        }
     }
 
-    /// `CreateToneQuery::send` — [blocked: net].
+    /// `CreateToneQuery::send` (TranslationManager.cpp:212-215).
     fn send_create_tone_query(
         &mut self,
         title: String,
         custom_emoji_id: i64,
         prompt: String,
         show_creator: bool,
-        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+        promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
     ) {
-        let _ = (title, custom_emoji_id, prompt, show_creator);
-        tdutils::log_info!("Create AI-compose tone — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::ToneStyle {
+                style: None,
+                promise,
+            });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::CreateTone,
+                telegram_api::Function::aicompose_createTone(telegram_api::aicompose_createTone {
+                    flags: 0,
+                    display_author: show_creator,
+                    emoji_id: custom_emoji_id,
+                    title,
+                    prompt,
+                }),
+            ),
+            None => tdutils::log_info!("Create AI-compose tone — [net-inert]"),
+        }
     }
 
-    /// `UpdateToneQuery::send` — [blocked: net].
+    /// `UpdateToneQuery::send` (TranslationManager.cpp:244-251) — the
+    /// pinned scheme carries all four value fields under their flags
+    /// (`display_author` is a wire `Bool`).
     fn send_update_tone_query(
         &mut self,
         input_tone: telegram_api::InputAiComposeTone,
@@ -14587,52 +15165,119 @@ impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
         custom_emoji_id: i64,
         prompt: String,
         show_creator: bool,
-        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+        promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
     ) {
-        let _ = (input_tone, title, custom_emoji_id, prompt, show_creator);
-        tdutils::log_info!("Update AI-compose tone — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::ToneStyle {
+                style: None,
+                promise,
+            });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::UpdateTone,
+                telegram_api::Function::aicompose_updateTone(telegram_api::aicompose_updateTone {
+                    flags: 1 | 1 << 1 | 1 << 2 | 1 << 3,
+                    tone: Some(input_tone),
+                    display_author: show_creator,
+                    emoji_id: custom_emoji_id,
+                    title,
+                    prompt,
+                }),
+            ),
+            None => tdutils::log_info!("Update AI-compose tone — [net-inert]"),
+        }
     }
 
-    /// `DeleteToneQuery::send` — [blocked: net].
+    /// `DeleteToneQuery::send` (TranslationManager.cpp:284-285).
     fn send_delete_tone_query(
         &mut self,
         input_tone: telegram_api::InputAiComposeTone,
-        _promise: tdutils::promise::Promise<()>,
+        promise: tdutils::promise::Promise<()>,
     ) {
-        let _ = input_tone;
-        tdutils::log_info!("Delete AI-compose tone — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::ToneUnit { promise });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::DeleteTone,
+                telegram_api::Function::aicompose_deleteTone(telegram_api::aicompose_deleteTone {
+                    tone: Some(input_tone),
+                }),
+            ),
+            None => tdutils::log_info!("Delete AI-compose tone — [net-inert]"),
+        }
     }
 
-    /// `GetToneQuery::send` — [blocked: net].
+    /// `GetToneQuery::send` (TranslationManager.cpp:310-311).
     fn send_get_tone_query(
         &mut self,
         input_tone: telegram_api::InputAiComposeTone,
-        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+        promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
     ) {
-        let _ = input_tone;
-        tdutils::log_info!("Get AI-compose tone — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::GetTone { promise });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::GetTone,
+                telegram_api::Function::aicompose_getTone(telegram_api::aicompose_getTone {
+                    tone: Some(input_tone),
+                }),
+            ),
+            None => tdutils::log_info!("Get AI-compose tone — [net-inert]"),
+        }
     }
 
-    /// `GetToneExampleQuery::send` — [blocked: net].
+    /// `GetToneExampleQuery::send` (TranslationManager.cpp:357-359).
     fn send_get_tone_example_query(
         &mut self,
         input_tone: telegram_api::InputAiComposeTone,
         num: i32,
-        _promise: tdutils::promise::Promise<td_api::TextCompositionStyleExample>,
+        promise: tdutils::promise::Promise<td_api::TextCompositionStyleExample>,
     ) {
-        let _ = (input_tone, num);
-        tdutils::log_info!("Get AI-compose tone example — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::ToneExample { promise });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::GetToneExample,
+                telegram_api::Function::aicompose_getToneExample(
+                    telegram_api::aicompose_getToneExample {
+                        tone: Some(input_tone),
+                        num,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Get AI-compose tone example — [net-inert]"),
+        }
     }
 
-    /// `SaveToneQuery::send` — [blocked: net].
+    /// `SaveToneQuery::send` (TranslationManager.cpp:383-385).
     fn send_save_tone_query(
         &mut self,
         input_tone: telegram_api::InputAiComposeTone,
         unsave: bool,
-        _promise: tdutils::promise::Promise<()>,
+        promise: tdutils::promise::Promise<()>,
     ) {
-        let _ = (input_tone, unsave);
-        tdutils::log_info!("Save AI-compose tone — [blocked: net]");
+        use crate::translation_manager::PendingTranslationQuery;
+        self.td
+            .translation_promises
+            .push(PendingTranslationQuery::ToneUnit { promise });
+        match self.td.translation_net() {
+            Some(net) => net.dispatch(
+                TranslationNetKind::SaveTone,
+                telegram_api::Function::aicompose_saveTone(telegram_api::aicompose_saveTone {
+                    tone: Some(input_tone),
+                    unsave,
+                }),
+            ),
+            None => tdutils::log_info!("Save AI-compose tone — [net-inert]"),
+        }
     }
 
     /// `TranslateRichMessageQuery::send` — [blocked: net] over the
@@ -14673,7 +15318,7 @@ impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
     }
 }
 
-impl crate::message_entity::UserManagerLike for TranslationEnv<'_> {
+impl crate::message_entity::UserManagerLike for TdTranslationEnv<'_> {
     fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
         let (mut env, users) = self.user_env_split();
         users.get_user_id_object(&mut env, user_id, source)
@@ -14685,7 +15330,7 @@ impl crate::message_entity::UserManagerLike for TranslationEnv<'_> {
     }
 
     fn have_min_user(&self, user_id: UserId) -> bool {
-        self.users.have_min_user(user_id)
+        self.td.user_manager.have_min_user(user_id)
     }
 
     fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
@@ -14694,7 +15339,7 @@ impl crate::message_entity::UserManagerLike for TranslationEnv<'_> {
     }
 
     fn is_user_bot(&self, user_id: UserId) -> bool {
-        self.users.is_user_bot_of(user_id)
+        self.td.user_manager.is_user_bot_of(user_id)
     }
 }
 
@@ -28649,6 +29294,228 @@ mod tests {
         }
 
         assert!(td.sponsored_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the translation net slice: the translate/tone queries ride
+    // the dispatcher (TranslationManager.cpp:34-568). ----
+
+    type TranslationFormattedSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::FormattedText>>>>;
+
+    fn record_translation_formatted() -> (Promise<td_api::FormattedText>, TranslationFormattedSlot)
+    {
+        struct Rec(TranslationFormattedSlot);
+        impl tdutils::promise::PromiseInterface<td_api::FormattedText> for Rec {
+            fn set_value(&mut self, value: td_api::FormattedText) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: TranslationFormattedSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type TranslationUnitSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    fn record_translation_unit() -> (Promise<()>, TranslationUnitSlot) {
+        struct Rec(TranslationUnitSlot);
+        impl tdutils::promise::PromiseInterface<()> for Rec {
+            fn set_value(&mut self, _value: ()) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(()));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: TranslationUnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type TranslationStyleSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::TextCompositionStyle>>>,
+    >;
+
+    fn record_translation_style() -> (Promise<td_api::TextCompositionStyle>, TranslationStyleSlot) {
+        struct Rec(TranslationStyleSlot);
+        impl tdutils::promise::PromiseInterface<td_api::TextCompositionStyle> for Rec {
+            fn set_value(&mut self, value: td_api::TextCompositionStyle) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: TranslationStyleSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_ai_tone(slug: &str, title: &str) -> telegram_api::AiComposeTone {
+        telegram_api::AiComposeTone::aiComposeTone(telegram_api::aiComposeTone {
+            flags: 1 << 1 | 1 << 2 | 1 << 3 | 1 << 4,
+            creator: false,
+            id: 10,
+            access_hash: 20,
+            slug: slug.to_owned(),
+            title: title.to_owned(),
+            emoji_id: 30,
+            prompt: "Be helpful".to_owned(),
+            installs_count: 4,
+            author_id: 0,
+            example_english: None,
+        })
+    }
+
+    fn wire_tones_answer(hash: i64, tones: Vec<telegram_api::AiComposeTone>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::aicompose_Tones::aicompose_tones(telegram_api::aicompose_tones {
+            hash,
+            tones,
+            users: vec![],
+        })
+        .store(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn translation_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(translation_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn translation_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-translation");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. translateText — the promise parks, the text rides the wire,
+        //    the translated answer resolves the park.
+        let (promise, slot) = record_translation_formatted();
+        {
+            let (manager, mut env) = translation_env_split(&mut td);
+            manager.translate_text(
+                &mut env,
+                Some(td_api::FormattedText {
+                    text: "hello".to_owned(),
+                    entities: vec![],
+                }),
+                "de".to_owned(),
+                String::new(),
+                promise,
+            );
+            td.translation_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_translateText::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::messages_TranslatedText {
+            result: vec![telegram_api::TextWithEntities {
+                text: "hallo".to_owned(),
+                entities: vec![],
+            }],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_translation_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(text)) => {
+                assert_eq!(text.text, "hallo");
+            }
+            other => panic!("unexpected translated text result: {other:?}"),
+        }
+
+        // 2. getTones — the reload rides the hash, the tones land in the
+        //    cache, the update flushes, the promise resolves Unit.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let (manager, mut env) = translation_env_split(&mut td);
+            manager.reload_ai_compose_tones(&mut env, promise);
+            td.translation_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::aicompose_getTones::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_tones_answer(7, vec![wire_ai_tone("formal", "Formal")]),
+        );
+        td.translation_updates.clear();
+        td.dispatch_completed_translation_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert_eq!(td.translation_updates.len(), 1, "the styles update flushed");
+
+        // 3. createTone — the answer converts the style, the chained
+        //    reload resolves the parked promise with it.
+        let (promise, style_slot) = record_translation_style();
+        {
+            let (manager, mut env) = translation_env_split(&mut td);
+            manager.create_tone(
+                &mut env,
+                "Terse".to_owned(),
+                40,
+                "Answer briefly".to_owned(),
+                false,
+                promise,
+            );
+            td.translation_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::aicompose_createTone::ID
+        );
+        let mut answer = Vec::new();
+        wire_ai_tone("terse", "Terse").store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_translation_net();
+        // the chained getTones rides — its completion resolves the style
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the chained reload rides");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::aicompose_getTones::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_tones_answer(8, vec![wire_ai_tone("terse", "Terse")]),
+        );
+        td.dispatch_completed_translation_net();
+        match style_slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(style)) => {
+                assert_eq!(style.name, "terse");
+                assert_eq!(style.title, "Terse");
+            }
+            other => panic!("unexpected tone style result: {other:?}"),
+        }
+
+        assert!(td.translation_net_completed.lock().is_empty(), "drained");
+        assert!(td.translation_promises.is_empty(), "all promises resolved");
     }
 
     type CountriesSlot =

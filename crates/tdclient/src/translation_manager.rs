@@ -4,9 +4,18 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`TranslationManagerEnv`] trait carries the `G()`/auth/pmc/user
-//! surfaces, and every `create_handler<...>` network tail is an env
-//! seam marked `[blocked: net]` — the C++ promise parks unanswered
-//! offline, exactly like the collapsed-line convention.
+//! surfaces, and the ten net queries ride the client-side dispatcher
+//! under their [`crate::td::TranslationNetKind`] — the answers drain
+//! through `Td::on_translation_net_answer` into the landed
+//! `on_get_ai_compose_tones`/`on_get_translated_texts` intakes, the
+//! formatted-text/fixed-text answers (the proofread diff rides the
+//! [`crate::diff_text`] port), and the tone CRUD style conversions;
+//! the reload chain (`aicompose.getTones`) resolves the parked
+//! tone-style promises (the C++ `reload_ai_compose_tones` lambda
+//! chain, TranslationManager.cpp:225-227/261-263). The two C++
+//! null-value tails (`GetToneQuery`'s not-modified/wrong-size bands,
+//! the empty tone example) answer 500 — the port's request promises
+//! are not nullable.
 //!
 //! Landed here: the `ai_compose_styles` pmc state (the
 //! [`AiComposeTones`] value plane with the byte-exact store/parse
@@ -19,11 +28,9 @@
 //! plumbing.
 //!
 //! Env seams (the C++ callers that do not exist yet):
-//! - every `create_handler<...>` query tail — [blocked: net]; each one
-//!   drops its promise, which keeps the C++ request unanswered
-//!   offline. The answer-side entry points that are pure manager
-//!   state (`on_get_ai_compose_tones`, `on_get_translated_texts`)
-//!   are landed and unit-tested here.
+//! - the message-translate form of `TranslateTextQuery` (the PEER-flag
+//!   wire shape) rides with the messages plane — the landed text form
+//!   covers the `translateText` request family.
 //! - the rich-message half (`translateRichMessage`,
 //!   `composeRichMessageWithAi`, `createRichMessageWithAi`,
 //!   `fixRichMessageWithAi`) — [blocked: RichMessage]; the
@@ -557,19 +564,23 @@ pub trait TranslationManagerEnv {
         max_media_timestamp: i32,
         promise: Promise<td_api::FormattedText>,
     );
-    /// `ComposeMessageWithAiQuery::send` (TranslationManager.cpp:397-442).
+    /// `ComposeMessageWithAiQuery::send` (TranslationManager.cpp:397-442)
+    /// — the `InputText` carries the answer's
+    /// `skip_bot_commands`/`max_media_timestamp` pair.
     fn send_compose_message_with_ai_query(
         &mut self,
-        text: FormattedText,
+        text: InputText,
         translate_to_language_code: String,
         input_tone: Option<telegram_api::InputAiComposeTone>,
         emojify: bool,
         promise: Promise<td_api::FormattedText>,
     );
-    /// `ProofreadMessageWithAiQuery::send` (TranslationManager.cpp:529-568).
+    /// `ProofreadMessageWithAiQuery::send` (TranslationManager.cpp:529-568)
+    /// — the `InputText` carries the answer's
+    /// `skip_bot_commands`/`max_media_timestamp` pair.
     fn send_proofread_message_with_ai_query(
         &mut self,
-        text: FormattedText,
+        text: InputText,
         promise: Promise<td_api::FixedText>,
     );
     /// `GetAiComposeTonesQuery::send` (TranslationManager.cpp:175-202).
@@ -649,12 +660,87 @@ pub trait TranslationManagerEnv {
     );
 }
 
+/// The parked TranslationManager promises (the net step): the C++ query
+/// handlers own their promises; the port parks them at the Td-side lot
+/// until the matching `TranslationNetKind` answer drains. The tone-CRUD
+/// pair parks its payload for the answer conversion, and the reload
+/// chain (`TonesReload`) resolves the parked `ToneStyle` entries when a
+/// `aicompose.getTones` completion lands (the C++
+/// `reload_ai_compose_tones` PromiseCreator lambda chain,
+/// TranslationManager.cpp:225-227/261-263).
+pub(crate) enum PendingTranslationQuery {
+    /// The `TranslateTextQuery` promise (cpp:34-41).
+    TranslateText {
+        skip_bot_commands: bool,
+        max_media_timestamp: i32,
+        promise: Promise<td_api::FormattedText>,
+    },
+    /// The `ComposeMessageWithAiQuery` promise (cpp:397-406) — the
+    /// skip/timestamp pair rides the kind payload.
+    Compose {
+        promise: Promise<td_api::FormattedText>,
+    },
+    /// The `ProofreadMessageWithAiQuery` promise (cpp:529-536) — the
+    /// skip/timestamp pair rides the kind payload.
+    Proofread { promise: Promise<td_api::FixedText> },
+    /// The `GetAiComposeTonesQuery` promise — the reload surface
+    /// (cpp:175-180); the delete/save tails park here through
+    /// `reload_ai_compose_tones`.
+    TonesReload { promise: Promise<()> },
+    /// The `CreateToneQuery`/`UpdateToneQuery` promise pair (cpp:204-270)
+    /// — the send parks `None`, the answer fills the converted style and
+    /// the reload completion resolves it.
+    ToneStyle {
+        style: Option<td_api::TextCompositionStyle>,
+        promise: Promise<td_api::TextCompositionStyle>,
+    },
+    /// The `DeleteToneQuery`/`SaveToneQuery` promise (cpp:272-295/371-395).
+    ToneUnit { promise: Promise<()> },
+    /// The `GetToneQuery` promise (cpp:298-305).
+    GetTone {
+        promise: Promise<td_api::TextCompositionStyle>,
+    },
+    /// The `GetToneExampleQuery` promise (cpp:342-348).
+    ToneExample {
+        promise: Promise<td_api::TextCompositionStyleExample>,
+    },
+}
+
+impl PendingTranslationQuery {
+    // The Td-side slot selectors (the star `take_pending` fn-ptr
+    // convention) — one per parked family.
+    pub(crate) fn is_translate_text(&self) -> bool {
+        matches!(self, Self::TranslateText { .. })
+    }
+    pub(crate) fn is_compose(&self) -> bool {
+        matches!(self, Self::Compose { .. })
+    }
+    pub(crate) fn is_proofread(&self) -> bool {
+        matches!(self, Self::Proofread { .. })
+    }
+    pub(crate) fn is_tones_reload(&self) -> bool {
+        matches!(self, Self::TonesReload { .. })
+    }
+    pub(crate) fn is_tone_style(&self) -> bool {
+        matches!(self, Self::ToneStyle { .. })
+    }
+    pub(crate) fn is_tone_unit(&self) -> bool {
+        matches!(self, Self::ToneUnit { .. })
+    }
+    pub(crate) fn is_get_tone(&self) -> bool {
+        matches!(self, Self::GetTone { .. })
+    }
+    pub(crate) fn is_tone_example(&self) -> bool {
+        matches!(self, Self::ToneExample { .. })
+    }
+}
+
 /// `TranslationManager::InputText` (TranslationManager.h:38-42).
 #[derive(Clone, Debug, Default)]
 pub struct InputText {
-    text: FormattedText,
-    skip_bot_commands: bool,
-    max_media_timestamp: i32,
+    pub(crate) text: FormattedText,
+    pub(crate) skip_bot_commands: bool,
+    pub(crate) max_media_timestamp: i32,
 }
 
 /// The `TranslationManager` collapsed actor — the `Td`-owned struct with
@@ -905,7 +991,7 @@ impl TranslationManager {
             }
         };
         env.send_compose_message_with_ai_query(
-            input_text.text,
+            input_text,
             translate_to_language_code,
             input_tone,
             emojify,
@@ -928,7 +1014,7 @@ impl TranslationManager {
                 return;
             }
         };
-        env.send_proofread_message_with_ai_query(input_text.text, promise);
+        env.send_proofread_message_with_ai_query(input_text, promise);
     }
 
     /// `TranslationManager::compose_rich_message_with_ai`
@@ -1383,7 +1469,7 @@ mod tests {
 
         fn send_compose_message_with_ai_query(
             &mut self,
-            _text: FormattedText,
+            _text: InputText,
             _translate_to_language_code: String,
             _input_tone: Option<telegram_api::InputAiComposeTone>,
             _emojify: bool,
@@ -1394,7 +1480,7 @@ mod tests {
 
         fn send_proofread_message_with_ai_query(
             &mut self,
-            _text: FormattedText,
+            _text: InputText,
             _promise: Promise<td_api::FixedText>,
         ) {
             self.queries.push("proofread");

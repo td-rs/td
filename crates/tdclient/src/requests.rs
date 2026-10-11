@@ -66,8 +66,8 @@ use crate::td::TdAnimationsEnv;
 use crate::td::TdLinkEnv;
 use crate::td::TdStaticLinkEnv;
 use crate::td::ThemeEnv;
-use crate::td::TranslationEnv;
 use crate::td::WebBrowserEnv;
+use crate::td::translation_env_split;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
@@ -395,16 +395,9 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // right after the message-query block, before web browser; the
             // manager's own authorized/non-bot gate applies)
             {
-                let mut env = TranslationEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    auth_is_authorized: td.auth_manager.is_authorized(),
-                    auth_is_bot: td.auth_manager.is_bot(),
-                    updates: &mut td.translation_updates,
-                    users: &mut td.user_manager,
-                };
-                td.translation_manager
-                    .get_current_state(&mut env, &mut updates);
+                let (manager, mut env) = translation_env_split(td);
+                manager.get_current_state(&mut env, &mut updates);
+                td.translation_manager = manager;
             }
 
             // WebBrowserManager::get_current_state (Requests.cpp:2259; the
@@ -12362,15 +12355,8 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::textCompositionStyle,
             );
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.create_tone(
+            let (manager, mut env) = translation_env_split(td);
+            manager.create_tone(
                 &mut env,
                 title,
                 request.custom_emoji_id,
@@ -12378,6 +12364,7 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 request.show_creator,
                 promise,
             );
+            td.translation_manager = manager;
         }
         Function::editTextCompositionStyle(request) => {
             // `Requests.cpp:2272-2280`.
@@ -12397,15 +12384,8 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::textCompositionStyle,
             );
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.update_tone(
+            let (manager, mut env) = translation_env_split(td);
+            manager.update_tone(
                 &mut env,
                 name,
                 title,
@@ -12414,6 +12394,7 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 request.show_creator,
                 promise,
             );
+            td.translation_manager = manager;
         }
         Function::deleteTextCompositionStyle(request) => {
             // `Requests.cpp:2281-2285`.
@@ -12424,15 +12405,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.delete_tone(&mut env, name, promise);
+            let (manager, mut env) = translation_env_split(td);
+            manager.delete_tone(&mut env, name, promise);
+            td.translation_manager = manager;
         }
         Function::searchTextCompositionStyle(request) => {
             // `Requests.cpp:2286-2292` — the tone read parks at the
@@ -12447,15 +12422,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::textCompositionStyle,
             );
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.search_tone(&mut env, name, promise);
+            let (manager, mut env) = translation_env_split(td);
+            manager.search_tone(&mut env, name, promise);
+            td.translation_manager = manager;
         }
         Function::getTextCompositionStyleExample(request) => {
             // `Requests.cpp:2293-2296`.
@@ -12469,20 +12438,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::textCompositionStyleExample,
             );
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.get_tone_example(
-                &mut env,
-                name,
-                request.example_number,
-                promise,
-            );
+            let (manager, mut env) = translation_env_split(td);
+            manager.get_tone_example(&mut env, name, request.example_number, promise);
+            td.translation_manager = manager;
         }
         Function::addTextCompositionStyle(request) => {
             // `Requests.cpp:2297-2300`.
@@ -12493,15 +12451,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.add_tone(&mut env, name, promise);
+            let (manager, mut env) = translation_env_split(td);
+            manager.add_tone(&mut env, name, promise);
+            td.translation_manager = manager;
         }
         Function::removeTextCompositionStyle(request) => {
             // `Requests.cpp:2301-2304`.
@@ -12512,15 +12464,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.remove_tone(&mut env, name, promise);
+            let (manager, mut env) = translation_env_split(td);
+            manager.remove_tone(&mut env, name, promise);
+            td.translation_manager = manager;
         }
         Function::recognizeSpeech(request) => {
             // `Requests.cpp:2933-2938`: CHECK_IS_USER, then the
@@ -12589,21 +12535,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.translate_text(
-                &mut env,
-                request.text,
-                to_language_code,
-                tone,
-                promise,
-            );
+            let (manager, mut env) = translation_env_split(td);
+            manager.translate_text(&mut env, request.text, to_language_code, tone, promise);
+            td.translation_manager = manager;
         }
         Function::translateRichMessage(request) => {
             // `Requests.cpp:2855-2861`: CHECK_IS_USER, clean, then the
@@ -12620,21 +12554,15 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.translate_rich_message(
+            let (manager, mut env) = translation_env_split(td);
+            manager.translate_rich_message(
                 &mut env,
                 request.message.map(|message| *message),
                 to_language_code,
                 tone,
                 promise,
             );
+            td.translation_manager = manager;
         }
         Function::composeTextWithAi(request) => {
             // `Requests.cpp:2892-2898`: CHECK_IS_USER, clean, then the
@@ -12652,15 +12580,8 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.compose_message_with_ai(
+            let (manager, mut env) = translation_env_split(td);
+            manager.compose_message_with_ai(
                 &mut env,
                 request.text,
                 translate_to_language_code,
@@ -12668,6 +12589,7 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 request.add_emojis,
                 promise,
             );
+            td.translation_manager = manager;
         }
         Function::composeRichMessageWithAi(request) => {
             // `Requests.cpp:2900-2910`: CHECK_IS_USER, the three strings,
@@ -12687,15 +12609,8 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.compose_rich_message_with_ai(
+            let (manager, mut env) = translation_env_split(td);
+            manager.compose_rich_message_with_ai(
                 &mut env,
                 request.message.map(|message| *message),
                 translate_to_language_code,
@@ -12704,6 +12619,7 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 request.add_emojis,
                 promise,
             );
+            td.translation_manager = manager;
         }
         Function::createRichMessageWithAi(request) => {
             // `Requests.cpp:2912-2919`: CHECK_IS_USER, clean the two
@@ -12719,21 +12635,15 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.create_rich_message_with_ai(
+            let (manager, mut env) = translation_env_split(td);
+            manager.create_rich_message_with_ai(
                 &mut env,
                 prompt,
                 language_code,
                 request.add_emojis,
                 promise,
             );
+            td.translation_manager = manager;
         }
         Function::fixTextWithAi(request) => {
             // `Requests.cpp:2921-2925`: CHECK_IS_USER, then the manager's
@@ -12743,16 +12653,9 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::FixedText, _>(id, Object::fixedText);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager
-                .proofread_message_with_ai(&mut env, request.text, promise);
+            let (manager, mut env) = translation_env_split(td);
+            manager.proofread_message_with_ai(&mut env, request.text, promise);
+            td.translation_manager = manager;
         }
         Function::fixRichMessageWithAi(request) => {
             // `Requests.cpp:2927-2931`: CHECK_IS_USER, then the manager's
@@ -12761,19 +12664,13 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
-            let mut env = TranslationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.translation_updates,
-                users: &mut td.user_manager,
-            };
-            td.translation_manager.proofread_rich_message_with_ai(
+            let (manager, mut env) = translation_env_split(td);
+            manager.proofread_rich_message_with_ai(
                 &mut env,
                 request.message.map(|message| *message),
                 promise,
             );
+            td.translation_manager = manager;
         }
 
         // Everything else waits for its manager step.

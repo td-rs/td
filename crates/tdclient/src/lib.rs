@@ -75,6 +75,7 @@ pub mod dialog_invite_link_manager;
 pub mod dialog_manager;
 pub mod dialog_participant_filter;
 pub mod dialog_participant_manager;
+pub mod diff_text;
 pub mod document;
 pub mod documents_manager;
 pub mod emoji_status;
