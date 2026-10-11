@@ -7859,6 +7859,32 @@ impl Td {
                     self.premium_manager = manager;
                 }
             }
+            // `GetPremiumGiveawayOptionsQuery` (cpp:483-509) — the boosted
+            // twin converts at the manager; the error arm runs the
+            // dialog-error tail for the boosted chat (the kind carries
+            // the dialog id).
+            PremiumNetKind::GetPremiumGiveawayOptions { boosted_dialog_id } => {
+                if let Some(promise) = self.premium_manager.take_giveaway_options_promise() {
+                    let result = if query.is_error() {
+                        tdutils::status::Result::Err(query.error().clone())
+                    } else {
+                        match parse_vector_premium_gift_code_option(query.ok()) {
+                            Some(options) => tdutils::status::Result::Ok(options),
+                            None => tdutils::status::Result::Err(parse_error(
+                                "payments_getPremiumGiftCodeOptions",
+                            )),
+                        }
+                    };
+                    let (mut manager, mut env) = premium_env_split(self);
+                    manager.on_get_premium_giveaway_options(
+                        &mut env,
+                        boosted_dialog_id,
+                        result,
+                        promise,
+                    );
+                    self.premium_manager = manager;
+                }
+            }
         }
     }
 
@@ -18189,6 +18215,30 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             None => {
                 tdutils::log_info!("Send payments.applyGiftCode for {code} — [net-inert]");
             }
+        }
+    }
+
+    // `GetPremiumGiveawayOptionsQuery::send` (Premium.cpp:471-481) — the
+    // BOOST_PEER flag (flags.0) with the resolved boost peer; the kind
+    // carries the boosted dialog for the `on_error` tail.
+    fn send_get_premium_giveaway_options_query(
+        &mut self,
+        boost_peer: telegram_api::InputPeer,
+        boosted_dialog_id: i64,
+    ) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::GetPremiumGiveawayOptions { boosted_dialog_id },
+                telegram_api::Function::payments_getPremiumGiftCodeOptions(
+                    telegram_api::payments_getPremiumGiftCodeOptions {
+                        flags: 1, // BOOST_PEER_MASK
+                        boost_peer: Some(Box::new(boost_peer)),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send payments.getPremiumGiftCodeOptions for {boosted_dialog_id} — [net-inert]"
+            ),
         }
     }
 }
@@ -31048,6 +31098,27 @@ mod tests {
         (Promise::from_interface(Rec(slot.clone())), slot)
     }
 
+    type GiveawayOptionsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::PremiumGiveawayPaymentOptions>>>,
+    >;
+
+    fn record_giveaway_options() -> (
+        Promise<td_api::PremiumGiveawayPaymentOptions>,
+        GiveawayOptionsSlot,
+    ) {
+        struct Rec(GiveawayOptionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::PremiumGiveawayPaymentOptions> for Rec {
+            fn set_value(&mut self, value: td_api::PremiumGiveawayPaymentOptions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GiveawayOptionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
     #[test]
     fn premium_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -31178,10 +31249,106 @@ mod tests {
             other => panic!("unexpected gift options result: {other:?}"),
         }
 
+        // 4. getPremiumGiveawayPaymentOptions — the boost-peer resolution
+        //    at the send leg: the channel dialog answers the M.6 stub
+        //    (have_dialog_force false), so the promise takes the C++
+        //    on_error arm ("Chat to boost not found") and nothing
+        //    dispatches.
+        let (promise, slot) = record_giveaway_options();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_giveaway_options(env, -1000000000000, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert!(sent.is_empty(), "no query on a failed boost resolution");
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Chat to boost not found");
+            }
+            other => panic!("the resolution error arm: {other:?}"),
+        }
+
+        // 5. getPremiumGiveawayPaymentOptions — the answer conversion
+        //    (the routing arm + the giveaway filter/store_quantity
+        //    bands), driven through the real completed-queue drain. The
+        //    send leg itself is stub-blocked above, so the promise parks
+        //    directly and the answer query is injected.
+        let (promise, slot) = record_giveaway_options();
+        with_premium_manager(&mut td, |manager, _env| {
+            manager.parked_giveaway_options.push(promise);
+        });
+        let giveaway_option = |users: i32,
+                               months: i32,
+                               currency: &str,
+                               amount: i64,
+                               store_product: &str,
+                               store_quantity: i32| {
+            // store_product/store_quantity ride flags.0/flags.1
+            let mut flags = 0;
+            if !store_product.is_empty() {
+                flags |= 1;
+            }
+            if store_quantity != 0 {
+                flags |= 1 << 1;
+            }
+            telegram_api::PremiumGiftCodeOption {
+                flags,
+                users,
+                months,
+                store_product: store_product.to_string(),
+                store_quantity,
+                currency: currency.to_string(),
+                amount,
+            }
+        };
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&4i32.to_le_bytes());
+        // dropped: users <= 0
+        giveaway_option(0, 6, "USD", 1200, "", 0).store_boxed(&mut answer);
+        // dropped: the XTR currency
+        giveaway_option(10, 6, "XTR", 1000, "", 0).store_boxed(&mut answer);
+        // no store product — store_quantity forced to 0
+        giveaway_option(10, 6, "USD", 1200, "", 3).store_boxed(&mut answer);
+        // a store product with a zero quantity — clamped to 1
+        giveaway_option(50, 12, "USD", 2400, "org.telegram.premium", 0).store_boxed(&mut answer);
+        let mut query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            telegram_api::payments_getPremiumGiftCodeOptions::ID,
+            Vec::new(),
+            u32::MAX,
+            60,
+        );
+        query.set_ok(answer);
+        td.premium_net_completed.lock().push((
+            crate::premium::PremiumNetKind::GetPremiumGiveawayOptions {
+                boosted_dialog_id: -1000000000000,
+            },
+            query,
+        ));
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(options)) => {
+                assert_eq!(options.options.len(), 2, "users<=0 and XTR dropped");
+                assert_eq!(options.options[0].store_product_quantity, 0);
+                assert_eq!(options.options[0].winner_count, 10);
+                assert_eq!(options.options[0].month_count, 6);
+                assert_eq!(options.options[1].store_product_id, "org.telegram.premium");
+                assert_eq!(options.options[1].store_product_quantity, 1, "clamped");
+                assert_eq!(options.options[1].winner_count, 50);
+                assert_eq!(options.options[1].amount, 2400);
+            }
+            other => panic!("unexpected giveaway options result: {other:?}"),
+        }
+
         assert!(td.premium_net_completed.lock().is_empty(), "drained");
         assert!(
             td.premium_manager.pending_apply_gift_code.is_empty()
-                && td.premium_manager.parked_gift_payment_options.is_empty(),
+                && td.premium_manager.parked_gift_payment_options.is_empty()
+                && td.premium_manager.parked_giveaway_options.is_empty(),
             "all promises resolved"
         );
     }

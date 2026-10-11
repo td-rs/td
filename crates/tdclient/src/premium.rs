@@ -199,9 +199,13 @@ pub trait PremiumEnv {
     fn send_get_premium_gift_options_query(&mut self) {
         tdutils::log_info!("Send payments.getPremiumGiftCodeOptions — [net-inert]");
     }
-    fn send_get_premium_giveaway_options_query(&mut self, dialog_id: i64) {
+    fn send_get_premium_giveaway_options_query(
+        &mut self,
+        _boost_peer: telegram_api::InputPeer,
+        boosted_dialog_id: i64,
+    ) {
         tdutils::log_info!(
-            "Send payments.getPremiumGiveawayOptions for {dialog_id} — [blocked: net]"
+            "Send payments.getPremiumGiftCodeOptions for {boosted_dialog_id} — [net-inert]"
         );
     }
     fn send_check_gift_code_query(&mut self, code: &str) {
@@ -238,6 +242,33 @@ pub trait PremiumEnv {
     }
 }
 
+/// `get_boost_input_peer` (Premium.cpp:194-207) — the premium-plane copy
+/// over [`PremiumEnv`] (the payments plane keeps its own
+/// `crate::payments::get_boost_input_peer` over `PaymentsEnv` — the
+/// env-trait arm-duplication convention; this is the C++ anchor home).
+pub(crate) fn get_boost_input_peer(
+    env: &mut impl PremiumEnv,
+    dialog_id: DialogId,
+) -> Result<telegram_api::InputPeer> {
+    if !env.have_dialog_force(dialog_id, "get_boost_input_peer") {
+        return Result::from_status(Status::error(400, "Chat to boost not found"));
+    }
+    if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
+        return Result::from_status(Status::error(400, "Can't boost the chat"));
+    }
+    if !env
+        .get_channel_status(dialog_id.get_channel_id())
+        .is_administrator()
+    {
+        return Result::from_status(Status::error(400, "Not enough rights in the chat"));
+    }
+    match env.get_input_peer(dialog_id, AccessRights::Write) {
+        Some(peer) => Result::Ok(peer),
+        // the C++ CHECK(input_peer != nullptr)
+        None => panic!("get_boost_input_peer has no input peer"),
+    }
+}
+
 /// The premium query kinds riding the dispatcher — the C++
 /// ResultHandler classes of Premium.cpp (the landed flows; the rest of
 /// the twelve join in follow-up slices).
@@ -249,6 +280,9 @@ pub(crate) enum PremiumNetKind {
     /// `GetPremiumGiftOptionsQuery` (cpp:395) — the gift option vector
     /// converts at [`PremiumManager::on_get_premium_gift_options`].
     GetPremiumGiftCodeOptions,
+    /// `GetPremiumGiveawayOptionsQuery` (cpp:458) — the boosted twin; the
+    /// kind carries the boosted dialog for the `on_error` tail.
+    GetPremiumGiveawayOptions { boosted_dialog_id: i64 },
 }
 
 /// The collapsed `PremiumManager` — a router over the query seams.
@@ -359,16 +393,91 @@ impl PremiumManager {
         self.parked_gift_payment_options.push(promise);
     }
 
-    /// `get_premium_giveaway_options` (Premium.cpp) — the query is the
-    /// seam.
+    /// `get_premium_giveaway_options` (Premium.cpp:1395-1397) →
+    /// `GetPremiumGiveawayOptionsQuery::send` (cpp:471-481) — the boost
+    /// peer resolves at the send leg over the widened env; the error arm
+    /// is the handler's `on_error` (cpp:505-509): the dialog-error tail,
+    /// then `set_error`.
     pub fn get_premium_giveaway_options(
         &mut self,
         env: &mut impl PremiumEnv,
         boosted_dialog_id: i64,
-        promise: Promise<td_api::PremiumGiveawayPaymentOptions>,
+        mut promise: Promise<td_api::PremiumGiveawayPaymentOptions>,
     ) {
-        env.send_get_premium_giveaway_options_query(boosted_dialog_id);
+        let dialog_id = DialogId::new(boosted_dialog_id);
+        let boost_input_peer = match get_boost_input_peer(env, dialog_id) {
+            Result::Ok(peer) => peer,
+            Result::Err(status) => {
+                env.on_get_dialog_error(dialog_id, &status, "GetPremiumGiveawayOptionsQuery");
+                return promise.set_error(status);
+            }
+        };
+        env.send_get_premium_giveaway_options_query(boost_input_peer, boosted_dialog_id);
         self.parked_giveaway_options.push(promise);
+    }
+
+    /// `GetPremiumGiveawayOptionsQuery::on_result`'s promise pop
+    /// (Premium.cpp:483-503).
+    pub(crate) fn take_giveaway_options_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::PremiumGiveawayPaymentOptions>> {
+        if self.parked_giveaway_options.is_empty() {
+            None
+        } else {
+            Some(self.parked_giveaway_options.remove(0))
+        }
+    }
+
+    /// `GetPremiumGiveawayOptionsQuery::on_result` (Premium.cpp:483-503)
+    /// — the giveaway filter (`users > 0 && months > 0 && amount > 0 &&
+    /// non-empty currency != "XTR"`), then the
+    /// `PremiumGiveawayPaymentOption` build with the `store_quantity`
+    /// bands (0 with no store product, else clamped to `>= 1`); no sort.
+    /// The error arm is `on_error` (cpp:505-509): the dialog-error tail
+    /// for the boosted chat, then `set_error`.
+    pub(crate) fn on_get_premium_giveaway_options(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        boosted_dialog_id: i64,
+        result: Result<Vec<telegram_api::PremiumGiftCodeOption>>,
+        mut promise: Promise<td_api::PremiumGiveawayPaymentOptions>,
+    ) {
+        let results = match result {
+            Result::Err(status) => {
+                env.on_get_dialog_error(
+                    DialogId::new(boosted_dialog_id),
+                    &status,
+                    "GetPremiumGiveawayOptionsQuery",
+                );
+                return promise.set_error(status);
+            }
+            Result::Ok(results) => results,
+        };
+        let options = results
+            .into_iter()
+            .filter(|option| {
+                option.users > 0
+                    && option.months > 0
+                    && option.amount > 0
+                    && !option.currency.is_empty()
+                    && option.currency != "XTR"
+            })
+            .map(|mut option| td_api::PremiumGiveawayPaymentOption {
+                store_product_quantity: if option.store_product.is_empty() {
+                    0
+                } else if option.store_quantity <= 0 {
+                    1
+                } else {
+                    option.store_quantity
+                },
+                currency: std::mem::take(&mut option.currency),
+                amount: option.amount,
+                winner_count: option.users,
+                month_count: option.months,
+                store_product_id: option.store_product,
+            })
+            .collect();
+        promise.set_value(td_api::PremiumGiveawayPaymentOptions { options });
     }
 
     /// `check_premium_gift_code` (Premium.cpp) — the query is the seam.
@@ -649,6 +758,9 @@ mod tests {
     struct TestEnv {
         options: std::collections::BTreeMap<String, i64>,
         option_strings: std::collections::BTreeMap<String, String>,
+        /// the dialogs `have_dialog_force` answers `true` for (the
+        /// user-dialog seeding of the boost-ladder tests).
+        dialogs: std::collections::BTreeSet<i64>,
         queries: Vec<String>,
     }
 
@@ -668,8 +780,8 @@ mod tests {
 
         // the whole-Td reads — the stub-inventory posture (the unloaded
         // dialog/channel/user halves)
-        fn have_dialog_force(&mut self, _dialog_id: DialogId, _source: &str) -> bool {
-            false
+        fn have_dialog_force(&mut self, dialog_id: DialogId, _source: &str) -> bool {
+            self.dialogs.contains(&dialog_id.get())
         }
 
         fn get_channel_status(&mut self, _channel_id: ChannelId) -> DialogParticipantStatus {
@@ -748,6 +860,7 @@ mod tests {
         TestEnv {
             options,
             option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
             queries: Vec::new(),
         }
     }
@@ -787,6 +900,7 @@ mod tests {
         let env = TestEnv {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
             queries: Vec::new(),
         };
         let manager = PremiumManager::new();
@@ -801,6 +915,7 @@ mod tests {
         let mut env = TestEnv {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
             queries: Vec::new(),
         };
         let mut manager = PremiumManager::new();
@@ -821,6 +936,43 @@ mod tests {
         );
         assert_eq!(manager.pending_apply_gift_code.len(), 1);
         assert_eq!(manager.parked_gift_code_infos.len(), 1);
+    }
+
+    #[test]
+    fn giveaway_options_resolve_the_boost_peer_at_the_send_leg() {
+        let mut env = TestEnv {
+            options: std::collections::BTreeMap::new(),
+            option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
+            queries: Vec::new(),
+        };
+        let mut manager = PremiumManager::new();
+
+        // an unknown channel — the C++
+        // `on_error` arm: the promise errors, nothing parks
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.get_premium_giveaway_options(&mut env, -1000000000000, promise);
+        assert!(manager.parked_giveaway_options.is_empty());
+        assert!(env.queries.is_empty());
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Chat to boost not found")
+        );
+
+        // a seeded non-channel dialog fails the second band instead
+        env.dialogs.insert(10);
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.get_premium_giveaway_options(&mut env, 10, promise);
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Can't boost the chat")
+        );
     }
 
     #[test]
@@ -876,6 +1028,7 @@ mod tests {
         let mut env = TestEnv {
             options: std::collections::BTreeMap::new(),
             option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
             queries: Vec::new(),
         };
         let mut manager = PremiumManager::default();
