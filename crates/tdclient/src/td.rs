@@ -3033,6 +3033,15 @@ pub(crate) type PremiumNetHandle = NetKindHandle<PremiumNetKind>;
 /// [`Td::dispatch_completed_user_net`].
 pub(crate) type UserNetHandle = NetKindHandle<crate::user_manager::UserNetKind>;
 
+/// The cloned chat dispatch surface (the `ChatManager::net` handle —
+/// the `td_` back-pointer narrowed to the net plane); the answers drain
+/// through [`Td::dispatch_completed_chat_net`].
+pub(crate) type ChatNetHandle = NetKindHandle<crate::chat_manager::ChatNetKind>;
+
+/// The cloned dialog dispatch surface (the `DialogManager::net` handle);
+/// the answers drain through [`Td::dispatch_completed_dialog_net`].
+pub(crate) type DialogNetHandle = NetKindHandle<crate::dialog_manager::DialogNetKind>;
+
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
     /// The `GetAutoDownloadSettingsQuery` promise (cpp:35).
@@ -3887,6 +3896,12 @@ pub struct Td {
     /// The callback-parked user query answers (the
     /// `Td::on_user_net_answer` drain).
     user_net_completed: Arc<Mutex<Vec<(crate::user_manager::UserNetKind, NetQuery)>>>,
+    /// The callback-parked chat answers — the `Td::on_chat_net_answer`
+    /// drain.
+    chat_net_completed: Arc<Mutex<Vec<(crate::chat_manager::ChatNetKind, NetQuery)>>>,
+    /// The callback-parked dialog answers — the
+    /// `Td::on_dialog_net_answer` drain.
+    dialog_net_completed: Arc<Mutex<Vec<(crate::dialog_manager::DialogNetKind, NetQuery)>>>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4332,6 +4347,8 @@ impl Td {
             theme_net_completed: Arc::new(Mutex::new(Vec::new())),
             premium_net_completed: Arc::new(Mutex::new(Vec::new())),
             user_net_completed: Arc::new(Mutex::new(Vec::new())),
+            chat_net_completed: Arc::new(Mutex::new(Vec::new())),
+            dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -4808,6 +4825,8 @@ impl Td {
         }
         self.net_query_dispatcher = Some(Arc::new(dispatcher));
         self.user_manager.net = self.user_net();
+        self.chat_manager.net = self.chat_net();
+        self.dialog_manager.net = self.dialog_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -6489,6 +6508,8 @@ impl Td {
         self.dispatch_completed_theme_net();
         self.dispatch_completed_premium_net();
         self.dispatch_completed_user_net();
+        self.dispatch_completed_chat_net();
+        self.dispatch_completed_dialog_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6654,6 +6675,25 @@ impl Td {
         Some(UserNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.user_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned chat dispatch surface (the `ChatManager::net` handle).
+    pub(crate) fn chat_net(&self) -> Option<ChatNetHandle> {
+        Some(ChatNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.chat_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned dialog dispatch surface (the `DialogManager::net`
+    /// handle).
+    pub(crate) fn dialog_net(&self) -> Option<DialogNetHandle> {
+        Some(DialogNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.dialog_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7911,6 +7951,110 @@ impl Td {
             }
         }
         self.user_manager = user_manager;
+    }
+
+    /// Drain the callback-parked chat answers — the C++ ResultHandler
+    /// halves of the ChatManager query families (ChatManager.cpp).
+    fn dispatch_completed_chat_net(&mut self) {
+        let completed = std::mem::take(&mut *self.chat_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_chat_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked dialog answers — the C++ ResultHandler
+    /// halves of the DialogManager query families (DialogManager.cpp).
+    fn dispatch_completed_dialog_net(&mut self) {
+        let completed = std::mem::take(&mut *self.dialog_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_dialog_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one dialog net answer by kind.
+    fn on_dialog_net_answer(
+        &mut self,
+        kind: crate::dialog_manager::DialogNetKind,
+        _query: NetQuery,
+    ) {
+        match kind {}
+    }
+
+    /// Route one chat net answer by kind — the parse legs front the
+    /// manager intakes (the `on_success` full-update, the promise
+    /// flush, the error tails).
+    fn on_chat_net_answer(&mut self, kind: crate::chat_manager::ChatNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `EditChatAboutQuery` (ChatManager.cpp:1059-1120) — the Bool
+            // answer band, the `on_success` full-description intake, the
+            // CHAT_ABOUT_NOT_MODIFIED/CHAT_NOT_MODIFIED value band and
+            // the dialog-error tail.
+            crate::chat_manager::ChatNetKind::EditChatAbout { dialog_id } => {
+                let Some((about, mut promise)) = self.chat_manager.take_edit_chat_about() else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        Some(false) => Err(Status::error(500, "Chat description is not updated")),
+                        None => {
+                            promise.set_error(parse_error("messages_editChatAbout"));
+                            return;
+                        }
+                    }
+                };
+                let not_modified = matches!(result, Err(ref status) if status.message() == "CHAT_ABOUT_NOT_MODIFIED"
+                    || status.message() == "CHAT_NOT_MODIFIED");
+                // `on_success` (cpp:1064-1073) — runs for the true answer
+                // and the NOT_MODIFIED error band.
+                if result.is_ok() || not_modified {
+                    let mut chat_manager = std::mem::take(&mut self.chat_manager);
+                    let mut user_manager = std::mem::take(&mut self.user_manager);
+                    if let Some(options) = self.option_manager.as_mut() {
+                        let mut env = crate::user_manager::UserEnv {
+                            global: &mut self.global,
+                            options,
+                            auth_is_bot: self.auth_manager.is_bot(),
+                        };
+                        edit_chat_about_on_success(
+                            &mut chat_manager,
+                            &mut user_manager,
+                            &mut env,
+                            dialog_id,
+                            about.clone(),
+                        );
+                    }
+                    self.user_manager = user_manager;
+                    self.chat_manager = chat_manager;
+                } else if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        dialog_id,
+                        status,
+                        "EditChatAboutQuery",
+                    );
+                }
+                match result {
+                    // the !bot NOT_MODIFIED band answers the value
+                    // (cpp:1106-1112); every other path settles the error
+                    Ok(()) => promise.set_value(()),
+                    Err(status) => {
+                        if not_modified && !self.auth_manager.is_bot() {
+                            promise.set_value(());
+                        } else {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Route one premium net answer by kind (the landed flows of
@@ -14780,6 +14924,36 @@ actor_messages! {
         /// wakes the actor to drain them (the C++
         /// `send_closure_later(G()->td(), ...)`.
         DrainNetEvents => drain_net_events(),
+    }
+}
+
+/// `EditChatAboutQuery::on_success` (ChatManager.cpp:1064-1073) — the
+/// per-type description intake over the taken-out managers (the env
+/// borrows the remaining `Td` fields, so the managers ride as locals).
+fn edit_chat_about_on_success(
+    chat_manager: &mut crate::chat_manager::ChatManager,
+    user_manager: &mut crate::user_manager::UserManager,
+    env: &mut crate::user_manager::UserEnv<'_>,
+    dialog_id: crate::messages_manager::DialogId,
+    about: String,
+) {
+    use crate::messages_manager::DialogType;
+    match dialog_id.get_type() {
+        DialogType::Chat => chat_manager.on_update_chat_description(
+            user_manager,
+            env,
+            dialog_id.get_chat_id(),
+            about,
+        ),
+        DialogType::Channel => chat_manager.on_update_channel_description(
+            user_manager,
+            env,
+            dialog_id.get_channel_id(),
+            about,
+        ),
+        DialogType::User | DialogType::SecretChat | DialogType::None => {
+            unreachable!("EditChatAboutQuery on {dialog_id:?}")
+        }
     }
 }
 
@@ -29553,6 +29727,13 @@ mod tests {
     /// A parameterized, force-authorized Td whose net query dispatcher is
     /// a recording session sink. Returns the recorder too.
     fn netted_td(name: &str) -> (Td, Arc<RecNetSession>) {
+        let (td, rec, _callback) = netted_td_with_callback(name);
+        (td, rec)
+    }
+
+    /// The [`netted_td`] form that also hands back the response collector
+    /// — the live td_api arm round-trips assert through it.
+    fn netted_td_with_callback(name: &str) -> (Td, Arc<RecNetSession>, CollectCallback) {
         let callback = CollectCallback::default();
         let dir = temp_db_dir(name);
         let mut td = Td::new(Box::new(CollectCallback {
@@ -29575,7 +29756,9 @@ mod tests {
         dispatcher.mark_dc_inited(1);
         td.net_query_dispatcher = Some(Arc::new(dispatcher));
         td.user_manager.net = td.user_net();
-        (td, rec)
+        td.chat_manager.net = td.chat_net();
+        td.dialog_manager.net = td.dialog_net();
+        (td, rec, callback)
     }
 
     /// The env exactly as the production drains build it — expanded at the
@@ -32169,6 +32352,289 @@ mod tests {
         ));
 
         assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the §2 flip slice: the ported-but-intercepted td_api arms ride
+    // their manager flows and the queries ride the dispatcher — every
+    // round-trip goes through the LIVE td_api request arm. ----
+
+    /// Seed one wire chat + channel pair through the real intakes (the
+    /// `on_get_chat`/`on_get_channel` half) — the group creator, the
+    /// broadcast creator and the member channel for the rights bands.
+    fn seed_dialog_chats(td: &mut Td) {
+        use crate::chat_manager::{ChannelId, ChatId};
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        let chat = |id: i64, creator: bool, title: &str| {
+            telegram_api::Chat::chat(telegram_api::chat {
+                creator,
+                id,
+                title: title.to_owned(),
+                ..telegram_api::chat::default()
+            })
+        };
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            chat(701, true, "group"),
+            "test",
+        );
+        let channel = |id: i64, creator: bool, title: &str| {
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator,
+                broadcast: true,
+                id,
+                access_hash: 777,
+                title: title.to_owned(),
+                ..telegram_api::channel::default()
+            })
+        };
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            channel(702, true, "channel"),
+            "test",
+        );
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            channel(703, false, "member channel"),
+            "test",
+        );
+        let _ = (ChatId::new(701), ChannelId::new(702));
+    }
+
+    /// Seed one accessible user (the §2 flip bands' user dialogs).
+    fn seed_dialog_user(td: &mut Td) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        user_manager.on_get_user(
+            &mut env,
+            telegram_api::User::user(telegram_api::user {
+                id: 700000001,
+                flags: 1, // USER_ACCESS_HASH_MASK
+                access_hash: 5,
+                first_name: "User".to_owned(),
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+    }
+
+    #[test]
+    fn chat_description_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_description_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_description_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-chat-about");
+        seed_dialog_chats(&mut td);
+        seed_dialog_user(&mut td);
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+
+        // 1. setChatDescription on the basic group — the live arm runs
+        //    the manager flow and dispatches messages.editChatAbout with
+        //    the Write peer and the stripped about.
+        td.request(
+            1,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: group_dialog,
+                description: "  About the group  ".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatAbout::ID,
+        );
+        let body =
+            telegram_api::messages_editChatAbout::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChat(peer)) => {
+                assert_eq!(peer.chat_id, 701);
+            }
+            other => panic!("the group peer: {other:?}"),
+        }
+        assert_eq!(body.about, "About the group");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the channel twin — inputPeerChannel with the access hash
+        td.request(
+            2,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: channel_dialog,
+                description: "About the channel".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatAbout::ID,
+        );
+        let body =
+            telegram_api::messages_editChatAbout::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 702);
+                assert_eq!(peer.access_hash, 777);
+            }
+            other => panic!("the channel peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the CHAT_NOT_MODIFIED band — the !bot value answer (the
+        //    on_success intake runs for the loaded fulls only)
+        td.request(
+            3,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: group_dialog,
+                description: "About the group".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatAbout::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. a hard error forwards through the dialog-error tail
+        td.request(
+            4,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: group_dialog,
+                description: "About the group".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatAbout::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_7");
+
+        // 5. the false Bool answer is the C++ 500 band
+        td.request(
+            5,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: group_dialog,
+                description: "About the group".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatAbout::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Chat description is not updated");
+
+        // 6. the rights band — a member channel answers the C++ 400 and
+        //    dispatches nothing
+        td.request(
+            6,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: member_dialog,
+                description: "About the channel".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Not enough rights to set chat description");
+        assert!(rec.sent.lock().is_empty(), "no query on the rights band");
+
+        // 7. the unknown dialog answers the dialog gate's 400
+        td.request(
+            7,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: crate::messages_manager::DialogId::from_chat_id(
+                    crate::chat_manager::ChatId::new(799),
+                )
+                .get(),
+                description: "About".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // 8. the user dialog keeps the C++ 400
+        td.request(
+            8,
+            Function::setChatDescription(td_api::setChatDescription {
+                chat_id: 700000001,
+                description: "About".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 8);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Can't change private chat description");
+
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
     }
 
     fn premium_queries_ride_the_dispatcher_impl() {

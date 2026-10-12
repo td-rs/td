@@ -5027,18 +5027,18 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_slot(td, id, slot);
         }
         Function::setChatDescription(request) => {
-            // the C++ has no CHECK_IS_USER here (Requests.cpp:6093-6097)
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:6093-6097);
+            // the promise settles from the EditChatAboutQuery answer
             let Some(description) = clean_or_utf8_error(td, id, &request.description) else {
                 return;
             };
-            let (promise, slot) = unit_request_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::set_dialog_description(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &description,
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::getBlockedMessageSenders(request) => {
             if !check_is_user(td, id) {

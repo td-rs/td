@@ -147,8 +147,20 @@ pub fn get_input_peer(
             td.user_manager
                 .get_input_peer_user(&env, user_id, access_rights)
         }
-        // ChatManager peers arrive with its read surface (stub inventory).
-        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => None,
+        crate::dialog_id::DialogType::Chat => td
+            .chat_manager
+            .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+        crate::dialog_id::DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let options = td.option_manager.as_mut()?;
+            let env = UserEnv {
+                global: &mut td.global,
+                options,
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.chat_manager
+                .get_input_peer_channel(&env, channel_id, access_rights)
+        }
         crate::dialog_id::DialogType::SecretChat => None,
         crate::dialog_id::DialogType::None => {
             Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
@@ -377,8 +389,10 @@ pub fn have_dialog_info(td: &Td, dialog_id: DialogId) -> bool {
         crate::dialog_id::DialogType::User => td
             .user_manager
             .have_accessible_user(dialog_id.get_user_id()),
-        crate::dialog_id::DialogType::Chat => false,
-        crate::dialog_id::DialogType::Channel => false,
+        crate::dialog_id::DialogType::Chat => td.chat_manager.have_chat(dialog_id.get_chat_id()),
+        crate::dialog_id::DialogType::Channel => {
+            td.chat_manager.have_channel(dialog_id.get_channel_id())
+        }
         crate::dialog_id::DialogType::SecretChat => td
             .user_manager
             .have_secret_chat(dialog_id.get_secret_chat_id()),
@@ -1058,6 +1072,13 @@ const MAX_GET_DIALOGS: i32 = 100;
 /// limit for a chat title.
 const MAX_TITLE_LENGTH: usize = 128;
 
+/// The dialog-plane in-flight query kinds — the C++ ResultHandler
+/// classes of the §2 flip families (DialogManager.cpp). The kinds ride
+/// the `DialogManager::net` handle; the answers drain through
+/// [`Td::dispatch_completed_dialog_net`](crate::td::Td::dispatch_completed_dialog_net).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DialogNetKind {}
+
 /// `DialogManager` — the state of the C++ DialogManager actor that exists in
 /// this slice: the two recent-dialog lists (the ctor, DialogManager.cpp:1311-1312)
 /// and the search hints.
@@ -1078,6 +1099,10 @@ pub struct DialogManager {
     pub(crate) found_on_server_dialogs: [HashMap<String, Vec<DialogId>>; 3],
     /// `reload_video_chat_on_search_usernames_` (DialogManager.h).
     pub(crate) reload_video_chat_on_search_usernames: std::collections::BTreeSet<String>,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in
+    /// the net-inert tests; set at the dispatcher install).
+    pub(crate) net: Option<crate::td::DialogNetHandle>,
 }
 
 impl Default for DialogManager {
@@ -1098,6 +1123,7 @@ impl DialogManager {
             found_public_dialogs: Default::default(),
             found_on_server_dialogs: Default::default(),
             reload_video_chat_on_search_usernames: Default::default(),
+            net: None,
         }
     }
 
@@ -3006,7 +3032,7 @@ pub fn toggle_dialog_has_protected_content(
 pub fn set_dialog_description(
     td: &mut Td,
     dialog_id: DialogId,
-    _description: &str,
+    description: &str,
     mut promise: Promise<()>,
 ) {
     if !have_dialog_force(td, dialog_id, "set_dialog_description") {
@@ -3018,10 +3044,44 @@ pub fn set_dialog_description(
         crate::dialog_id::DialogType::User => {
             promise.set_error(Status::error(400, "Can't change private chat description"));
         }
-        // chat_manager_->set_chat_description / set_channel_description —
-        // M.5.44+ (stub inventory).
+        // chat_manager_->set_chat_description / set_channel_description
+        // (ChatManager.cpp:3165/:3678) — the flows dispatch the
+        // `EditChatAboutQuery` over the ChatManager net handle.
         crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
-            promise_unimplemented(&mut promise);
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                chat_manager,
+                ..
+            } = td;
+            let Some(options) = option_manager.as_mut() else {
+                promise_unimplemented(&mut promise);
+                return;
+            };
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            match dialog_id.get_type() {
+                crate::dialog_id::DialogType::Chat => chat_manager.set_chat_description(
+                    user_manager,
+                    &mut env,
+                    dialog_id.get_chat_id(),
+                    description,
+                    promise,
+                ),
+                crate::dialog_id::DialogType::Channel => chat_manager.set_channel_description(
+                    user_manager,
+                    &mut env,
+                    dialog_id.get_channel_id(),
+                    description,
+                    promise,
+                ),
+                _ => unreachable!("the outer match narrowed the dialog type"),
+            }
         }
         crate::dialog_id::DialogType::SecretChat => {
             promise.set_error(Status::error(400, "Can't change secret chat description"));

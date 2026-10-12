@@ -5345,6 +5345,22 @@ fn parse_channel_log_event(
 /// same add/rewrite-while-unsaved, retire-on-save pattern as the user
 /// records — `log_event_id`
 /// stays 0 and every mirror branch is inert.
+/// The chat-plane in-flight query kinds — the C++ ResultHandler
+/// classes of the §2 flip families (ChatManager.cpp). The kinds ride
+/// the `ChatManager::net` handle (the `td_` back-pointer narrowed to
+/// the net plane); the answers drain through
+/// [`Td::dispatch_completed_chat_net`](crate::td::Td::dispatch_completed_chat_net).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChatNetKind {
+    /// `EditChatAboutQuery` (ChatManager.cpp:1059) — the kind carries the
+    /// dialog for the `on_success` intake switch and the error tail; the
+    /// about string parks with the promise (the handler's `about_`
+    /// member).
+    EditChatAbout {
+        dialog_id: crate::messages_manager::DialogId,
+    },
+}
+
 pub struct ChatManager {
     chats: BTreeMap<i64, Chat>,
     /// the `grf<id>` plane — M.5.15.
@@ -5413,6 +5429,14 @@ pub struct ChatManager {
     /// counter (the Files-step convention), replaced by the real registry
     /// with the Files slice.
     file_source_id_counter: i32,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in
+    /// the net-inert tests; set at the dispatcher install).
+    pub(crate) net: Option<crate::td::ChatNetHandle>,
+    /// The `EditChatAboutQuery` in-flight states (the C++ handler's own
+    /// `about_`/`promise_` members, ChatManager.cpp:1061-1063) — the
+    /// answer pops the head and runs the `on_success` intake.
+    pending_edit_chat_about: Vec<(String, Promise<()>)>,
 }
 
 impl ChatManager {
@@ -5447,6 +5471,8 @@ impl ChatManager {
             inactive_channel_ids_inited: false,
             restricted_channel_ids: BTreeSet::new(),
             file_source_id_counter: 0,
+            net: None,
+            pending_edit_chat_about: Vec::new(),
         }
     }
 
@@ -8417,9 +8443,9 @@ impl ChatManager {
         }
     }
 
-    /// `on_update_chat_description` (ChatManager.cpp:7509-7526).
-    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
-    fn on_update_chat_description(
+    /// `on_update_chat_description` (ChatManager.cpp:7509-7526) — the
+    /// `EditChatAboutQuery` success intake for basic groups.
+    pub(crate) fn on_update_chat_description(
         &mut self,
         user_manager: &mut UserManager,
         env: &mut UserEnv,
@@ -8452,6 +8478,65 @@ impl ChatManager {
                 env,
                 chat_id,
                 "on_update_chat_description",
+                false,
+            );
+        }
+    }
+
+    /// The shared dispatch tail — `send_query(G()->net_query_creator()…)`
+    /// narrowed to the handle; the None arm is the net-inert log.
+    fn send_chat_net_query(&self, kind: ChatNetKind, function: telegram_api::Function, what: &str) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
+    /// `EditChatAboutQuery::on_result`'s in-flight pop (the handler's
+    /// `about_`/`promise_` members, ChatManager.cpp:1061-1063).
+    pub(crate) fn take_edit_chat_about(&mut self) -> Option<(String, Promise<()>)> {
+        if self.pending_edit_chat_about.is_empty() {
+            None
+        } else {
+            Some(self.pending_edit_chat_about.remove(0))
+        }
+    }
+
+    /// `on_update_channel_description` (ChatManager.cpp:8065-8078) — the
+    /// `EditChatAboutQuery` success intake for channels.
+    pub(crate) fn on_update_channel_description(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        description: String,
+    ) {
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_description",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && f.description != description
+        {
+            f.description = description;
+            f.is_changed = true;
+            // td_->group_call_manager_->on_update_dialog_about — the
+            // wave-2 stub.
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_description",
                 false,
             );
         }
@@ -10739,7 +10824,7 @@ impl ChatManager {
     }
 
     /// `set_chat_description` (ChatManager.cpp:3165-3176) — the
-    /// EditChatAboutQuery send is [blocked: net] (M.5.45).
+    /// `EditChatAboutQuery` send rides the `net` handle (the §2 flip).
     pub fn set_chat_description(
         &mut self,
         _user_manager: &mut UserManager,
@@ -10748,7 +10833,7 @@ impl ChatManager {
         description: &str,
         mut promise: Promise<()>,
     ) {
-        let _new_description = crate::misc::strip_empty_characters(description, 255, false);
+        let new_description = crate::misc::strip_empty_characters(description, 255, false);
         let Some(c) = self.get_chat(chat_id) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
@@ -10761,20 +10846,39 @@ impl ChatManager {
                 "Not enough rights to set chat description",
             ));
         }
-        tdutils::log_info!("EditChatAboutQuery for {chat_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `EditChatAboutQuery::send` (ChatManager.cpp:1077-1087) — the
+        // Write input peer resolves at the send leg; the peer-less band
+        // is the handler's local on_error (cpp:1080 — "Can't access the
+        // chat" matches no on_get_dialog_error pattern on the chat arm).
+        let Some(input_peer) = self.get_input_peer_chat(chat_id, AccessRights::Write) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        // `about_` parks with the promise (the handler members); the
+        // dialog rides the kind.
+        self.pending_edit_chat_about
+            .push((new_description.clone(), promise));
+        self.send_chat_net_query(
+            ChatNetKind::EditChatAbout {
+                dialog_id: crate::messages_manager::DialogId::from_chat_id(chat_id),
+            },
+            telegram_api::Function::messages_editChatAbout(telegram_api::messages_editChatAbout {
+                peer: Some(Box::new(input_peer)),
+                about: new_description,
+            }),
+            "messages.editChatAbout",
+        );
     }
 
     /// `set_channel_description` (ChatManager.cpp:3678-3688).
     pub fn set_channel_description(
         &mut self,
-        _user_manager: &mut UserManager,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         description: &str,
         mut promise: Promise<()>,
     ) {
-        let _new_description = crate::misc::strip_empty_characters(description, 255, false);
+        let new_description = crate::misc::strip_empty_characters(description, 255, false);
         let Some(c) = self.get_channel(channel_id) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
@@ -10785,8 +10889,35 @@ impl ChatManager {
                 "Not enough rights to set chat description",
             ));
         }
-        tdutils::log_info!("EditChatAboutQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `EditChatAboutQuery::send` (ChatManager.cpp:1077-1087) — the
+        // channel Write peer; the peer-less band runs the handler's
+        // on_error head (`on_get_channel_error`) before the error.
+        let input_peer = match self.get_input_peer_channel(env, channel_id, AccessRights::Write) {
+            Some(input_peer) => input_peer,
+            None => {
+                let status = Status::error(400, "Can't access the chat");
+                self.on_get_channel_error(
+                    user_manager,
+                    env,
+                    channel_id,
+                    &status,
+                    "EditChatAboutQuery",
+                );
+                return promise.set_error(status);
+            }
+        };
+        self.pending_edit_chat_about
+            .push((new_description.clone(), promise));
+        self.send_chat_net_query(
+            ChatNetKind::EditChatAbout {
+                dialog_id: crate::messages_manager::DialogId::from_channel_id(channel_id),
+            },
+            telegram_api::Function::messages_editChatAbout(telegram_api::messages_editChatAbout {
+                peer: Some(Box::new(input_peer)),
+                about: new_description,
+            }),
+            "messages.editChatAbout",
+        );
     }
 
     /// `set_channel_username` (ChatManager.cpp:3178-3191) — the
@@ -18286,6 +18417,102 @@ mod tests {
         );
         assert_eq!(chat.default_permissions, expected);
         assert_eq!(chat.migrated_to_channel_id, ChannelId::new(1_000_000_001));
+    }
+
+    #[test]
+    fn on_update_chat_and_channel_description_mutate_the_fulls() {
+        let (mut global, mut options) = open_db(&db_dir("m545-about-fulls"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(701);
+        let channel_id = ChannelId::new(702);
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::chat(telegram_api::chat {
+                creator: true,
+                id: chat_id.get(),
+                title: "group".to_owned(),
+                ..telegram_api::chat::default()
+            }),
+            "test",
+        );
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                broadcast: true,
+                id: channel_id.get(),
+                access_hash: 777,
+                title: "channel".to_owned(),
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+        let mut chat_full = ChatFull::new();
+        chat_full.description = "old group about".to_owned();
+        cm.chats_full.insert(chat_id.get(), chat_full);
+        let mut channel_full = ChannelFull::new();
+        channel_full.description = "old channel about".to_owned();
+        cm.channels_full.insert(channel_id.get(), channel_full);
+
+        // the chat intake: a changed description mutates and marks the
+        // full changed (the C++ runs update_chat_full)
+        cm.on_update_chat_description(&mut um, &mut env, chat_id, "new group about".to_owned());
+        let full = cm.get_chat_full(chat_id).expect("chat full");
+        assert_eq!(full.description, "new group about");
+        // update_chat_full consumed the change: the record persisted and
+        // the flags returned to rest
+        assert!(!full.is_changed && !full.need_save_to_database);
+        assert!(
+            !env.global
+                .td_db()
+                .common_kv()
+                .get(&ChatManager::get_chat_full_database_key(chat_id))
+                .is_empty()
+        );
+
+        // the same-description band is the no-op
+        cm.on_update_chat_description(&mut um, &mut env, chat_id, "new group about".to_owned());
+
+        // the channel twin
+        cm.on_update_channel_description(
+            &mut um,
+            &mut env,
+            channel_id,
+            "new channel about".to_owned(),
+        );
+        let full = cm.get_channel_full_const(channel_id).expect("channel full");
+        assert_eq!(full.description, "new channel about");
+        assert!(!full.is_changed && !full.need_save_to_database);
+        assert!(
+            !env.global
+                .td_db()
+                .common_kv()
+                .get(&ChatManager::get_channel_full_database_key(channel_id))
+                .is_empty()
+        );
+        cm.on_update_channel_description(
+            &mut um,
+            &mut env,
+            channel_id,
+            "new channel about".to_owned(),
+        );
+
+        // the missing-full band returns before the mutation (the C++
+        // get_*_full_force nullptr band)
+        cm.on_update_chat_description(&mut um, &mut env, ChatId::new(799), "x".to_owned());
+        cm.on_update_channel_description(&mut um, &mut env, ChannelId::new(798), "x".to_owned());
+        assert!(cm.get_chat_full(ChatId::new(799)).is_none());
+
+        // the invalid chat id is the LOG(ERROR) band (the channel twin
+        // CHECKs and cannot be reached with an invalid id)
+        cm.on_update_chat_description(&mut um, &mut env, ChatId::new(0), "x".to_owned());
+
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m545-about-fulls"));
     }
 
     #[test]
