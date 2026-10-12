@@ -149,15 +149,14 @@ impl EmojiStatus {
         if self.is_empty() {
             return telegram_api::EmojiStatus::emojiStatusEmpty(telegram_api::emojiStatusEmpty);
         }
+        let flags = if self.until_date != 0 { 1 } else { 0 };
         if self.custom_emoji_id.is_valid() {
-            let flags = if self.until_date != 0 { 1 } else { 0 };
             return telegram_api::EmojiStatus::emojiStatus(telegram_api::emojiStatus {
                 flags,
                 document_id: self.custom_emoji_id.get(),
                 until: self.until_date,
             });
         }
-        let flags = if self.until_date != 0 { 1 } else { 0 };
         telegram_api::EmojiStatus::inputEmojiStatusCollectible(
             telegram_api::inputEmojiStatusCollectible {
                 flags,

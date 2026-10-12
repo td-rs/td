@@ -10170,7 +10170,6 @@ impl ChatManager {
     /// the not-yet-ported on_get_channel_forbidden, so the emulation
     /// reduces to the invalidation tail (the channel-intake slice owns
     /// the full form).
-    #[allow(dead_code)] // production caller: the net query error paths (M.10)
     pub(crate) fn on_get_channel_error(
         &mut self,
         user_manager: &mut UserManager,
@@ -11122,28 +11121,16 @@ impl ChatManager {
             return promise.set_error(Status::error(400, "Not enough rights in the channel"));
         }
         // `UpdateChannelColorQuery::send` (ChatManager.cpp:330-341) — the
-        // input channel exists by the record check (the C++ CHECKs it).
-        let input_channel = self
-            .get_input_channel(env, channel_id)
-            .expect("the flow read the channel record");
-        let mut flags = 0;
-        if accent_color_id.is_valid() {
-            flags |= 4; // COLOR_MASK
-        }
-        if background_custom_emoji_id.is_valid() {
-            flags |= 1; // BACKGROUND_EMOJI_ID_MASK
-        }
-        self.pending_update_channel_color.push(promise);
-        self.send_chat_net_query(
-            ChatNetKind::UpdateChannelColor { channel_id },
-            telegram_api::Function::channels_updateColor(telegram_api::channels_updateColor {
-                flags,
-                for_profile: false,
-                channel: Some(input_channel),
-                color: accent_color_id.get(),
-                background_emoji_id: background_custom_emoji_id.get(),
-            }),
-            "channels.updateColor",
+        // input channel exists by the record check (the C++ CHECKs it);
+        // the flags carry COLOR for a valid accent id and
+        // BACKGROUND_EMOJI_ID for a valid emoji id.
+        self.send_update_channel_color(
+            env,
+            channel_id,
+            false,
+            accent_color_id,
+            background_custom_emoji_id,
+            promise,
         );
     }
 
@@ -11166,16 +11153,38 @@ impl ChatManager {
         {
             return promise.set_error(Status::error(400, "Not enough rights in the chat"));
         }
-        // `UpdateChannelColorQuery::send` (ChatManager.cpp:330-341) — the
-        // profile variant rides the `for_profile` flag.
+        // `UpdateChannelColorQuery::send` — the profile variant rides the
+        // `for_profile` flag.
+        self.send_update_channel_color(
+            env,
+            channel_id,
+            true,
+            profile_accent_color_id,
+            profile_background_custom_emoji_id,
+            promise,
+        );
+    }
+
+    /// `UpdateChannelColorQuery::send` (ChatManager.cpp:330-341) — the
+    /// shared tail of both accent-color flows (the C++ handler's one
+    /// send site).
+    fn send_update_channel_color(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        for_profile: bool,
+        accent_color_id: AccentColorId,
+        background_custom_emoji_id: CustomEmojiId,
+        promise: Promise<()>,
+    ) {
         let input_channel = self
             .get_input_channel(env, channel_id)
             .expect("the flow read the channel record");
         let mut flags = 0;
-        if profile_accent_color_id.is_valid() {
+        if accent_color_id.is_valid() {
             flags |= 4; // COLOR_MASK
         }
-        if profile_background_custom_emoji_id.is_valid() {
+        if background_custom_emoji_id.is_valid() {
             flags |= 1; // BACKGROUND_EMOJI_ID_MASK
         }
         self.pending_update_channel_color.push(promise);
@@ -11183,10 +11192,10 @@ impl ChatManager {
             ChatNetKind::UpdateChannelColor { channel_id },
             telegram_api::Function::channels_updateColor(telegram_api::channels_updateColor {
                 flags,
-                for_profile: true,
+                for_profile,
                 channel: Some(input_channel),
-                color: profile_accent_color_id.get(),
-                background_emoji_id: profile_background_custom_emoji_id.get(),
+                color: accent_color_id.get(),
+                background_emoji_id: background_custom_emoji_id.get(),
             }),
             "channels.updateColor",
         );

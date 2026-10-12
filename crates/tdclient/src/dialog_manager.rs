@@ -1805,20 +1805,18 @@ pub fn report_dialog_photo(
     let input_peer = get_input_peer(td, dialog_id, AccessRights::Read)
         .expect("the access gate guaranteed the peer");
     td.dialog_manager.pending_report_profile_photo.push(promise);
-    match &td.dialog_manager.net {
-        Some(net) => net.dispatch(
-            crate::dialog_manager::DialogNetKind::ReportProfilePhoto { dialog_id },
-            tdmtproto::telegram_api::Function::account_reportProfilePhoto(
-                tdmtproto::telegram_api::account_reportProfilePhoto {
-                    peer: Some(Box::new(input_peer)),
-                    photo_id: Some(input_photo),
-                    reason: Some(reason.get_input_report_reason()),
-                    message: reason.get_message().to_owned(),
-                },
-            ),
+    td.dialog_manager.send_dialog_net_query(
+        crate::dialog_manager::DialogNetKind::ReportProfilePhoto { dialog_id },
+        tdmtproto::telegram_api::Function::account_reportProfilePhoto(
+            tdmtproto::telegram_api::account_reportProfilePhoto {
+                peer: Some(Box::new(input_peer)),
+                photo_id: Some(input_photo),
+                reason: Some(reason.get_input_report_reason()),
+                message: reason.get_message().to_owned(),
+            },
         ),
-        None => tdutils::log_info!("Send account.reportProfilePhoto — [net-inert]"),
-    }
+        "account.reportProfilePhoto",
+    );
 }
 
 /// `BlockListId` (BlockListId.h) — the block-list facet of
@@ -3721,6 +3719,21 @@ pub enum CheckDialogUsernameResult {
 /// username intakes; their fan-ins arrive with those steps.
 #[allow(dead_code)]
 impl DialogManager {
+    /// The shared dispatch tail — `send_query(G()->net_query_creator()…)`
+    /// narrowed to the handle; the None arm is the net-inert log (the
+    /// `ChatManager::send_chat_net_query` shape).
+    pub(crate) fn send_dialog_net_query(
+        &self,
+        kind: DialogNetKind,
+        function: tdmtproto::telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
     /// `ReportProfilePhotoQuery::on_result`'s promise pop
     /// (DialogManager.cpp:575-588).
     pub(crate) fn take_report_profile_photo_promise(&mut self) -> Option<Promise<()>> {

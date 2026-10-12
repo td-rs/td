@@ -8103,7 +8103,7 @@ impl Td {
                             &mut user_manager,
                             &mut env,
                             dialog_id,
-                            about.clone(),
+                            about,
                         );
                     }
                     self.user_manager = user_manager;
@@ -27289,21 +27289,19 @@ impl crate::messages_manager::DialogAvailableReactionsEnv for TdDialogAvailableR
         self.dialog_manager
             .pending_set_chat_available_reactions
             .push(promise);
-        match &self.dialog_manager.net {
-            Some(net) => net.dispatch(
-                crate::dialog_manager::DialogNetKind::SetChatAvailableReactions { dialog_id },
-                tdmtproto::telegram_api::Function::messages_setChatAvailableReactions(
-                    tdmtproto::telegram_api::messages_setChatAvailableReactions {
-                        flags,
-                        peer: Some(Box::new(input_peer)),
-                        available_reactions: Some(container.get_input_chat_reactions()),
-                        reactions_limit: available_reactions.reactions_limit,
-                        paid_enabled: available_reactions.paid_reactions_available,
-                    },
-                ),
+        self.dialog_manager.send_dialog_net_query(
+            crate::dialog_manager::DialogNetKind::SetChatAvailableReactions { dialog_id },
+            tdmtproto::telegram_api::Function::messages_setChatAvailableReactions(
+                tdmtproto::telegram_api::messages_setChatAvailableReactions {
+                    flags,
+                    peer: Some(Box::new(input_peer)),
+                    available_reactions: Some(container.get_input_chat_reactions()),
+                    reactions_limit: available_reactions.reactions_limit,
+                    paid_enabled: available_reactions.paid_reactions_available,
+                },
             ),
-            None => tdutils::log_info!("Send messages.setChatAvailableReactions — [net-inert]"),
-        }
+            "messages.setChatAvailableReactions",
+        );
     }
 }
 
@@ -32702,7 +32700,6 @@ mod tests {
     /// `on_get_chat`/`on_get_channel` half) — the group creator, the
     /// broadcast creator and the member channel for the rights bands.
     fn seed_dialog_chats(td: &mut Td) {
-        use crate::chat_manager::{ChannelId, ChatId};
         let crate::td::Td {
             global,
             option_manager,
@@ -32767,7 +32764,6 @@ mod tests {
             }),
             "test",
         );
-        let _ = (ChatId::new(701), ChannelId::new(702));
     }
 
     /// Seed one accessible user (the §2 flip bands' user dialogs).

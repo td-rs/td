@@ -15643,7 +15643,7 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             }
             let reason = match crate::report_reason::ReportReason::get_report_reason(
                 request.reason.as_ref(),
-                request.text.clone(),
+                request.text,
             ) {
                 tdutils::status::Result::Ok(reason) => reason,
                 tdutils::status::Result::Err(status) => {
