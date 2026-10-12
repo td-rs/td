@@ -9221,10 +9221,12 @@ pub trait DialogAvailableReactionsEnv: crate::chat_reactions::ChatReactionsEnv {
     ) {
     }
 
-    // -- the net query seam ([blocked: net])
+    // -- the net query seam
     /// `td_->dialog_manager_->set_dialog_available_reactions_on_server`
-    /// — the changed-reactions server ack; dropping the promise keeps
-    /// the C++ request unanswered offline.
+    /// — the changed-reactions server ack (the `SetChatAvailableReactionsQuery`
+    /// dispatch). The Td env sends it over the dialog net handle; the
+    /// default keeps the manager-level tests offline (the promise drops
+    /// like the C++ without a network).
     fn set_dialog_available_reactions_on_server(
         &mut self,
         dialog_id: DialogId,

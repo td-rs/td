@@ -1097,6 +1097,11 @@ pub(crate) enum DialogNetKind {
     ReportProfilePhoto {
         dialog_id: crate::dialog_id::DialogId,
     },
+    /// `SetChatAvailableReactionsQuery` (DialogManager.cpp:822) — the
+    /// kind carries the dialog for the error tail.
+    SetChatAvailableReactions {
+        dialog_id: crate::dialog_id::DialogId,
+    },
 }
 
 /// `DialogManager` — the state of the C++ DialogManager actor that exists in
@@ -1126,6 +1131,8 @@ pub struct DialogManager {
     /// The `ReportProfilePhotoQuery` promises (the C++ handler's
     /// `promise_`, DialogManager.cpp:546).
     pub(crate) pending_report_profile_photo: Vec<Promise<()>>,
+    /// The `SetChatAvailableReactionsQuery` promises (DialogManager.cpp:824).
+    pub(crate) pending_set_chat_available_reactions: Vec<Promise<()>>,
 }
 
 impl Default for DialogManager {
@@ -1148,6 +1155,7 @@ impl DialogManager {
             reload_video_chat_on_search_usernames: Default::default(),
             net: None,
             pending_report_profile_photo: Vec::new(),
+            pending_set_chat_available_reactions: Vec::new(),
         }
     }
 
@@ -3720,6 +3728,16 @@ impl DialogManager {
             None
         } else {
             Some(self.pending_report_profile_photo.remove(0))
+        }
+    }
+
+    /// `SetChatAvailableReactionsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:846-856).
+    pub(crate) fn take_set_chat_available_reactions_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_set_chat_available_reactions.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_chat_available_reactions.remove(0))
         }
     }
 

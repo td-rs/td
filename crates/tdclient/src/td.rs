@@ -7983,6 +7983,49 @@ impl Td {
             Status::error(500, &format!("Failed to parse the {what} answer"))
         }
         match kind {
+            // `SetChatAvailableReactionsQuery` (DialogManager.cpp:822-870)
+            // — the Updates answer re-enters `on_get_updates` with the
+            // promise; the error tail runs the CHAT_NOT_MODIFIED !bot
+            // value band and the dialog-error head (the
+            // reload_dialog_info_full refire rides the reload slices).
+            crate::dialog_manager::DialogNetKind::SetChatAvailableReactions { dialog_id } => {
+                let Some(mut promise) = self
+                    .dialog_manager
+                    .take_set_chat_available_reactions_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            crate::dialog_manager::on_get_dialog_error(
+                                self,
+                                dialog_id,
+                                &status,
+                                "SetChatAvailableReactionsQuery",
+                            );
+                            // reload_dialog_info_full (cpp:866) — the
+                            // reload families are their own net slices
+                            // (§3.3/§3.4)
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => {
+                            promise.set_error(parse_error("messages_setChatAvailableReactions"))
+                        }
+                    }
+                }
+            }
             // `ReportProfilePhotoQuery` (DialogManager.cpp:543-613) — the
             // Bool answer band (the false value is the C++ 400); the
             // error tail logs and forwards (the file-reference repair
@@ -27062,6 +27105,9 @@ pub(crate) struct TdDialogAvailableReactionsEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The dialog plane — the server-ack promise parks here and the net
+    /// handle dispatches the query.
+    pub(crate) dialog_manager: &'a mut DialogManager,
 }
 
 pub(crate) fn dialog_available_reactions_env_split(
@@ -27076,6 +27122,7 @@ pub(crate) fn dialog_available_reactions_env_split(
         auth_manager,
         user_manager,
         chat_manager,
+        dialog_manager,
         messages_manager,
         ..
     } = td;
@@ -27086,6 +27133,7 @@ pub(crate) fn dialog_available_reactions_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            dialog_manager,
         },
         messages_manager,
     )
@@ -27163,6 +27211,99 @@ impl crate::messages_manager::DialogAvailableReactionsEnv for TdDialogAvailableR
     ) -> crate::chat_manager::DialogParticipantStatus {
         self.chat_manager
             .get_channel_permissions_id(self.global, channel_id)
+    }
+
+    /// `DialogManager::set_dialog_available_reactions_on_server`
+    /// (DialogManager.cpp:3622-3627) — the `SetChatAvailableReactionsQuery`
+    /// send (cpp:829-844): the Write input peer resolves at the send leg
+    /// (the peer-less band is the handler's local on_error), the flags
+    /// carry PAID_ENABLED always and REACTIONS_LIMIT when set.
+    fn set_dialog_available_reactions_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        available_reactions: &crate::messages_manager::ChatReactions,
+        mut promise: Promise<()>,
+    ) {
+        use crate::messages_manager::DialogType;
+        let input_peer = match dialog_id.get_type() {
+            DialogType::User => {
+                let Some(options) = self.options.as_deref_mut() else {
+                    return promise.set_error(Status::error(400, "Can't access the chat"));
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Write,
+                )
+            }
+            DialogType::Chat => self.chat_manager.get_input_peer_chat(
+                dialog_id.get_chat_id(),
+                crate::user_manager::AccessRights::Write,
+            ),
+            DialogType::Channel => {
+                let Some(options) = self.options.as_deref_mut() else {
+                    return promise.set_error(Status::error(400, "Can't access the chat"));
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &env,
+                    dialog_id.get_channel_id(),
+                    crate::user_manager::AccessRights::Write,
+                )
+            }
+            DialogType::SecretChat | DialogType::None => None,
+        };
+        let Some(input_peer) = input_peer else {
+            // the handler's local on_error (cpp:835-837)
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        // the C++ single ChatReactions class builds the wire form from
+        // its fields (ChatReactions.cpp:121-130); the Rust split keeps
+        // the container twin as the wire builder
+        let container = crate::chat_reactions::ChatReactions {
+            reaction_types: available_reactions
+                .reaction_types
+                .iter()
+                .map(|reaction_type| {
+                    crate::reaction_type::ReactionType::new(reaction_type.get_string().to_owned())
+                })
+                .collect(),
+            allow_all_regular: available_reactions.allow_all_regular,
+            allow_all_custom: available_reactions.allow_all_custom,
+            reactions_limit: available_reactions.reactions_limit,
+            paid_reactions_available: available_reactions.paid_reactions_available,
+        };
+        let mut flags = 2; // PAID_ENABLED_MASK
+        if available_reactions.reactions_limit != 0 {
+            flags |= 1; // REACTIONS_LIMIT_MASK
+        }
+        self.dialog_manager
+            .pending_set_chat_available_reactions
+            .push(promise);
+        match &self.dialog_manager.net {
+            Some(net) => net.dispatch(
+                crate::dialog_manager::DialogNetKind::SetChatAvailableReactions { dialog_id },
+                tdmtproto::telegram_api::Function::messages_setChatAvailableReactions(
+                    tdmtproto::telegram_api::messages_setChatAvailableReactions {
+                        flags,
+                        peer: Some(Box::new(input_peer)),
+                        available_reactions: Some(container.get_input_chat_reactions()),
+                        reactions_limit: available_reactions.reactions_limit,
+                        paid_enabled: available_reactions.paid_reactions_available,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.setChatAvailableReactions — [net-inert]"),
+        }
     }
 }
 
@@ -33489,6 +33630,241 @@ mod tests {
         let error = error_of(&callback, 8);
         assert_eq!(error.code, 400);
         assert_eq!(error.message, "Chat report reason must be non-empty");
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn set_chat_available_reactions_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(set_chat_available_reactions_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn set_chat_available_reactions_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-available-reactions");
+        seed_dialog_chats(&mut td);
+        seed_dialog_user(&mut td);
+        // the messages-manager dialog records — the flow's local half
+        // mutates them; the send-update LOG_CHECK precondition is set
+        for dialog_id in [
+            crate::messages_manager::DialogId::from_channel_id(
+                crate::chat_manager::ChannelId::new(702),
+            ),
+            crate::messages_manager::DialogId::from_channel_id(
+                crate::chat_manager::ChannelId::new(703),
+            ),
+            crate::messages_manager::DialogId::from_channel_id(
+                crate::chat_manager::ChannelId::new(704),
+            ),
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                700000001,
+            )),
+        ] {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = dialog_id;
+            d.is_update_new_chat_sent = true;
+            td.messages_manager.dialogs.insert(dialog_id, d);
+        }
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        // the megagroup — the local half keeps the All form (the
+        // broadcast twin fix_broadcast_reactions the stored copy)
+        let megagroup_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(704),
+        )
+        .get();
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. the happy path — the All form dispatches
+        //    messages.setChatAvailableReactions with the Write peer, the
+        //    chatReactionsAll wire form and the PAID_ENABLED flag; the
+        //    Updates answer resolves the ok and the local half mutated
+        td.request(
+            1,
+            Function::setChatAvailableReactions(td_api::setChatAvailableReactions {
+                chat_id: megagroup_dialog,
+                available_reactions: Some(
+                    td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+                        td_api::chatAvailableReactionsAll {
+                            max_reaction_count: 0,
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatAvailableReactions::ID,
+        );
+        let body = telegram_api::messages_setChatAvailableReactions::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 2, "PAID_ENABLED_MASK only (no limit)");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 704);
+                assert_eq!(peer.access_hash, 778);
+            }
+            other => panic!("the write peer: {other:?}"),
+        }
+        assert!(matches!(
+            body.available_reactions,
+            Some(telegram_api::ChatReactions::chatReactionsAll(_))
+        ));
+        assert!(!body.paid_enabled);
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+        // the local half — the megagroup dialog's available reactions
+        // keep the All form (the broadcast twin would fix it against the
+        // active set)
+        let d =
+            &td.messages_manager.dialogs[&crate::messages_manager::DialogId::new(megagroup_dialog)];
+        assert!(d.available_reactions.allow_all_regular);
+        assert!(d.is_available_reactions_inited);
+
+        // 2. the CHAT_NOT_MODIFIED band — the !bot value answer
+        td.request(
+            2,
+            Function::setChatAvailableReactions(td_api::setChatAvailableReactions {
+                chat_id: channel_dialog,
+                available_reactions: Some(
+                    td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+                        td_api::chatAvailableReactionsAll {
+                            max_reaction_count: 3,
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatAvailableReactions::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the error band forwards through the dialog-error tail
+        td.request(
+            3,
+            Function::setChatAvailableReactions(td_api::setChatAvailableReactions {
+                chat_id: channel_dialog,
+                available_reactions: Some(
+                    td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+                        td_api::chatAvailableReactionsAll {
+                            max_reaction_count: 3,
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatAvailableReactions::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_3");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_3");
+
+        // 4. the rights band — the member channel answers the C++ 400
+        td.request(
+            4,
+            Function::setChatAvailableReactions(td_api::setChatAvailableReactions {
+                chat_id: member_dialog,
+                available_reactions: Some(
+                    td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+                        td_api::chatAvailableReactionsAll {
+                            max_reaction_count: 0,
+                        },
+                    ),
+                ),
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(
+            error.message,
+            "Not enough rights to change chat available reactions"
+        );
+
+        // 5. the private-chat band
+        td.request(
+            5,
+            Function::setChatAvailableReactions(td_api::setChatAvailableReactions {
+                chat_id: user_dialog,
+                available_reactions: Some(
+                    td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+                        td_api::chatAvailableReactionsAll {
+                            max_reaction_count: 0,
+                        },
+                    ),
+                ),
+            }),
+        );
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(
+            error.message,
+            "Can't change private chat available reactions"
+        );
+
+        // 6. the unknown dialog answers the access band's 400
+        td.request(
+            6,
+            Function::setChatAvailableReactions(td_api::setChatAvailableReactions {
+                chat_id: crate::messages_manager::DialogId::from_channel_id(
+                    crate::chat_manager::ChannelId::new(799),
+                )
+                .get(),
+                available_reactions: Some(
+                    td_api::ChatAvailableReactions::chatAvailableReactionsAll(
+                        td_api::chatAvailableReactionsAll {
+                            max_reaction_count: 0,
+                        },
+                    ),
+                ),
+            }),
+        );
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
 
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.dialog_net_completed.lock().is_empty(), "drained");
