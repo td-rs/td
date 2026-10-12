@@ -8028,20 +8028,26 @@ impl Td {
             }
             // `ReportProfilePhotoQuery` (DialogManager.cpp:543-613) — the
             // Bool answer band (the false value is the C++ 400); the
-            // error tail logs and forwards (the file-reference repair
-            // chain — the kind's dialog — is the Files plane).
-            crate::dialog_manager::DialogNetKind::ReportProfilePhoto {
-                dialog_id: _dialog_id,
-            } => {
+            // error tail logs, runs the dialog-error head (cpp:604) and
+            // forwards (the file-reference repair chain above the head
+            // is the Files plane).
+            crate::dialog_manager::DialogNetKind::ReportProfilePhoto { dialog_id } => {
                 let Some(mut promise) = self.dialog_manager.take_report_profile_photo_promise()
                 else {
                     return;
                 };
                 if query.is_error() {
-                    // cpp:598-613 — LOG(INFO) then the file-reference
-                    // repair chain ([blocked: files]) and set_error
-                    tdutils::log_info!("Receive error for report chat photo: {}", query.error());
-                    promise.set_error(query.error().clone());
+                    // cpp:598-604 — LOG(INFO), then the repair-chain gate
+                    // ([blocked: files]) falls through to the head
+                    let status = query.error().clone();
+                    tdutils::log_info!("Receive error for report chat photo: {status}");
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        dialog_id,
+                        &status,
+                        "ReportProfilePhotoQuery",
+                    );
+                    promise.set_error(status);
                 } else {
                     match parse_wire_bool_value(query.ok()) {
                         Some(true) => promise.set_value(()),
