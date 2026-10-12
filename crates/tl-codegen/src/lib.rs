@@ -135,22 +135,23 @@ mod tests {
 
     #[test]
     fn td_api_counts_match_the_c_oracle() {
-        // Fixed by the S07 differential dump (td's own tl-parser): td_api has
-        // 753 types / 2192 constructors / 1022 functions.
+        // Fixed by the S07 differential dump (td's own tl-parser), re-run at
+        // the c15d3f5a re-pin (6e2b9aa): 792 types / 2260 constructors /
+        // 1065 functions. Refresh on every scheme re-pin (RELEASE.md §1-2).
         let program = TlProgram::parse(TD_API_TL.as_bytes().to_vec()).unwrap();
-        assert_eq!(program.total_types, 753);
-        assert_eq!(program.total_ctors, 2192);
-        assert_eq!(program.total_funcs, 1022);
+        assert_eq!(program.total_types, 792);
+        assert_eq!(program.total_ctors, 2260);
+        assert_eq!(program.total_funcs, 1065);
     }
 
     #[test]
     fn telegram_api_counts_match_the_c_oracle() {
-        // Fixed by the S07 differential dump: 627 types / 1669 ctors / 819
-        // functions.
+        // Fixed by the S07 differential dump, re-run at the c15d3f5a re-pin
+        // (6e2b9aa): 660 types / 1715 ctors / 856 functions.
         let program = TlProgram::parse(TELEGRAM_API_TL.as_bytes().to_vec()).unwrap();
-        assert_eq!(program.total_types, 627);
-        assert_eq!(program.total_ctors, 1669);
-        assert_eq!(program.total_funcs, 819);
+        assert_eq!(program.total_types, 660);
+        assert_eq!(program.total_ctors, 1715);
+        assert_eq!(program.total_funcs, 856);
     }
 
     #[test]
