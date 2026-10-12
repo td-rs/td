@@ -37,20 +37,20 @@
 //! | `chat_manager_->is_megagroup_channel` / `is_broadcast_channel` / `is_forum_channel` / `is_forum_tabs_channel` / `is_monoforum_channel` / `is_admined_monoforum_channel` / `get_channel_status` / `on_get_channel_error` (cpp:1942-2028) | the unloaded-channel C++ results — `false` for the type predicates, `Banned(0, "")` for `get_channel_status` (except the status-message heads of `on_get_channel_error`, which are wired) |
 //! | `chat_manager_->get_chat_title` / `get_channel_search_text` (cpp:2258-2266) | `""` (the unloaded-chat C++ result) |
 //! | `user_manager_->is_user_received_from_server` (cpp:1585) | wired (`is_user_received_from_server_of`) |
-//! | `chat_manager_->get_chat_status` / `get_chat_permissions` / `get_channel_status` / `get_channel_permissions` (cpp:1766/:2360/:2300/:2445) | the unloaded C++ `Banned(0, "")` status, so the creator/admin gates answer the unloaded `false` |
-//! | `chat_manager_->get_chat_migrated_to_channel_id` / `have_channel` (cpp:1772/:1788) | invalid / `false` |
+//! | `chat_manager_->get_chat_status` / `get_chat_permissions` / `get_channel_status` / `get_channel_permissions` (cpp:1766/:2360/:2300/:2445) | wired — the live chat-manager reads; the unloaded C++ `Banned(0, "")` still answers for absent records |
+//! | `chat_manager_->get_chat_migrated_to_channel_id` / `have_channel` (cpp:1772/:1788) | wired — the live chat-manager reads (the record's `migrated_to_channel_id` / the channels map) |
 //! | `messages_manager_->delete_dialog_history` / `chat_manager_->delete_chat` / `delete_channel` / the `SecretChatsManager::cancel_chat` closure (cpp:2041-2048) | the promise completes with 500 "Network is not implemented yet" |
 //! | `chat_manager_->get_chat_has_protected_content` / `get_channel_has_protected_content` (cpp:2285/:2288/:2302/:2305) | `false` |
 //! | `messages_manager_->report_dialog_from_action_bar` (cpp:2835) | `{is_reported: false, know_action_bar: false}` (the empty option/text/message argument set is the only caller-visible shape until MessagesManager) |
 //! | `messages_manager_->can_report_message` (cpp:2849) | `Ok` (no messages exist until MessagesManager) |
-//! | the peer-settings/report/blocked/toggle query actors (`UpdatePeerSettingsQuery`, `ReportPeerQuery`, `ReportProfilePhotoQuery`, `ReportEncryptedSpamQuery`, `GetPeerSettingsQuery`, `GetBlockedDialogsQuery`, `GetDialogUnreadMarksQuery`, `ReorderPinnedDialogsQuery`, `ToggleDialogIsBlockedQuery`, `ToggleDialogUnreadMarkQuery`, `ToggleDialogPinQuery`, `ToggleDialogTranslationsQuery`, `ToggleViewForumAsMessagesQuery`, `EditChatDefaultBannedRightsQuery`, `ToggleNoForwardsQuery`, `EditDialogTitleQuery`, `EditDialogPhotoQuery`, `SetChatAvailableReactionsQuery`, `SaveDefaultSendAsQuery`, `EditPeerFoldersQuery`, `SetHistoryTtlQuery`, `SetChatThemeQuery`, `MigrateChatQuery`, `SetChatPhotoQuery` upload tail) | the send is `[blocked: net]` — the promise completes with 500 "Network is not implemented yet"; the `on_result`/`on_error` halves land with the net step |
+//! | the peer-settings/report/blocked/toggle query actors (`UpdatePeerSettingsQuery`, `ReportPeerQuery`, `ReportProfilePhotoQuery`, `ReportEncryptedSpamQuery`, `GetPeerSettingsQuery`, `GetBlockedDialogsQuery`, `GetDialogUnreadMarksQuery`, `ReorderPinnedDialogsQuery`, `ToggleDialogIsBlockedQuery`, `ToggleDialogUnreadMarkQuery`, `ToggleDialogPinQuery`, `ToggleDialogTranslationsQuery`, `ToggleViewForumAsMessagesQuery`, `EditDialogPhotoQuery`, `SaveDefaultSendAsQuery`, `EditPeerFoldersQuery`, `SetHistoryTtlQuery`, `SetChatThemeQuery`, `SetChatPhotoQuery` upload tail) | the send is `[blocked: net]` — the promise completes with 500 "Network is not implemented yet"; the `on_result`/`on_error` halves land with the net step (the rights-gated five — `MigrateChatQuery`, `EditDialogTitleQuery`, `EditChatDefaultBannedRightsQuery`, `ToggleNoForwardsQuery`, `CheckUsernameQuery`/`CheckChannelUsernameQuery` — dispatch over the dialog net handle) |
 //! | the erase-log-event promise (`get_erase_log_event_promise`) | not wired — the C++ erases the mirror on settlement, success or error (LogEventHelper.cpp:42-52); the Rust mirrors stay until the net step can complete them (net-step residue: on error paths the Rust re-saves where the C++ erases) |
 //! | `get_channel_first_username` (RecentDialogList.cpp:57) | channel dialogs persist by id — the C++ `@username` form arrives with the ChatManager username read |
 //! | `file_manager_` file views / `resume_upload` + `UploadDialogPhotoCallback` + `being_uploaded_dialog_photos_` (cpp:2398-2406/:2498-2593) | `[blocked: files]` — set_dialog_photo ports the gates and the empty/previous-photo validation, then reaches the net-blocked query |
 //! | `messages_manager_->create_dialog` / `sort_dialogs_by_order` / `can_add_dialog_to_filter` (cpp:3291/:3414/:3385) | local no-op completion / unsorted truncation / `Ok` |
 //! | `chat_manager_->reload_channel_full` (cpp:3295) | the promise completes with 500 "Network is not implemented yet" |
 //! | `user_manager_->on_update_user_commands` / `chat_manager_->on_update_chat_bot_commands` / `on_update_channel_bot_commands` (cpp:2991/:2995/:2997) | commented no-ops (BotCommands arrives with the M.5/M.8 integration) |
-//! | `CheckUsernameQuery` / `CheckChannelUsernameQuery` (cpp:3096-3098) | the send is `[blocked: net]` (see [`check_dialog_username`]) |
+//! | `CheckUsernameQuery` / `CheckChannelUsernameQuery` (cpp:3096-3098) | dispatch over the dialog net handle (see [`check_dialog_username`]) |
 //! | `ResolveUsernameQuery` + the `resolve_dialog_username_queries_` queue (cpp:3134-3145) | `[blocked: net]` — the promise completes inline instead of parking in the queue; `resolve_dialog` itself (cpp:3185-3207) lands with the net step |
 //! | `SearchPublicDialogsQuery` / `send_search_public_dialogs_query` (cpp:3436-3446) | the send is `[blocked: net]` (see [`search_public_dialogs`] / [`search_dialogs_on_server`]) |
 //! | `get_input_dialog_id` (cpp:1340-1348) | lands with the `InputDialogId` type |
@@ -726,13 +726,13 @@ pub fn is_admined_monoforum_channel(td: &mut Td, dialog_id: DialogId) -> bool {
 }
 
 /// `DialogManager::is_broadcast_channel` (DialogManager.cpp:1973-1982) —
-/// the channel read is stubbed to `false` (stub inventory).
+/// the chat-manager read over the live channel record.
 pub fn is_broadcast_channel(td: &mut Td, dialog_id: DialogId) -> bool {
-    let _ = td;
     if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
         return false;
     }
-    false
+    td.chat_manager
+        .is_broadcast_channel(dialog_id.get_channel_id())
 }
 
 /// `DialogManager::can_dialog_have_threads` (DialogManager.cpp:1981-1994).
@@ -1096,6 +1096,36 @@ pub(crate) enum DialogNetKind {
     SetChatAvailableReactions {
         dialog_id: crate::dialog_id::DialogId,
     },
+    /// `MigrateChatQuery` (DialogManager.cpp:199) — the kind carries the
+    /// basic group; the answer is an `Updates` container whose intakes
+    /// set the migrated-to channel before the object tail runs.
+    MigrateChat {
+        chat_id: crate::chat_manager::ChatId,
+    },
+    /// `EditDialogTitleQuery` (DialogManager.cpp:226) — the kind carries
+    /// the dialog for the error tail.
+    EditDialogTitle {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `EditChatDefaultBannedRightsQuery` (DialogManager.cpp:365) — the
+    /// kind carries the dialog for the error tail.
+    EditChatDefaultBannedRights {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ToggleNoForwardsQuery` (DialogManager.cpp:406) — the kind carries
+    /// the dialog for the error tail.
+    ToggleNoForwards {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `CheckUsernameQuery` (DialogManager.cpp:60) — the own-account
+    /// username check; no channel-error head.
+    CheckUsername,
+    /// `CheckChannelUsernameQuery` (DialogManager.cpp:85) — the kind
+    /// carries the channel for the `on_get_channel_error` head (`None`
+    /// for the bot/empty-channel legs, which skip it).
+    CheckChannelUsername {
+        channel_id: Option<crate::chat_manager::ChannelId>,
+    },
 }
 
 /// `DialogManager` — the state of the C++ DialogManager actor that exists in
@@ -1127,6 +1157,20 @@ pub struct DialogManager {
     pub(crate) pending_report_profile_photo: Vec<Promise<()>>,
     /// The `SetChatAvailableReactionsQuery` promises (DialogManager.cpp:824).
     pub(crate) pending_set_chat_available_reactions: Vec<Promise<()>>,
+    /// The `MigrateChatQuery` promises (DialogManager.cpp:201) — the
+    /// `upgradeBasicGroupChatToSupergroupChat` object promises riding the
+    /// C++ `PromiseCreator::lambda` chain (cpp:1768-1775).
+    pub(crate) pending_migrate_chat: Vec<Promise<crate::td_api::Object>>,
+    /// The `EditDialogTitleQuery` promises (DialogManager.cpp:228).
+    pub(crate) pending_edit_dialog_title: Vec<Promise<()>>,
+    /// The `EditChatDefaultBannedRightsQuery` promises (DialogManager.cpp:367).
+    pub(crate) pending_edit_chat_default_banned_rights: Vec<Promise<()>>,
+    /// The `ToggleNoForwardsQuery` promises (DialogManager.cpp:408).
+    pub(crate) pending_toggle_no_forwards: Vec<Promise<()>>,
+    /// The `CheckUsernameQuery`/`CheckChannelUsernameQuery` promises
+    /// (DialogManager.cpp:62/:87) — the `checkChatUsername` object
+    /// promises behind the C++ error→result mapping lambda (cpp:3074-3092).
+    pub(crate) pending_check_username: Vec<Promise<crate::td_api::Object>>,
 }
 
 impl Default for DialogManager {
@@ -1150,6 +1194,11 @@ impl DialogManager {
             net: None,
             pending_report_profile_photo: Vec::new(),
             pending_set_chat_available_reactions: Vec::new(),
+            pending_migrate_chat: Vec::new(),
+            pending_edit_dialog_title: Vec::new(),
+            pending_edit_chat_default_banned_rights: Vec::new(),
+            pending_toggle_no_forwards: Vec::new(),
+            pending_check_username: Vec::new(),
         }
     }
 
@@ -1461,6 +1510,29 @@ pub(crate) fn get_my_dialog_id(td: &Td) -> DialogId {
     DialogId::from_user_id(td.user_manager.get_my_id())
 }
 
+/// `td_->chat_manager_->get_input_channel(channel_id)` — the env-borrow
+/// wrapper for the dialog-plane send legs (the UserEnv pieces come out of
+/// `Td` for the manager call).
+fn get_input_channel_td(
+    td: &mut Td,
+    channel_id: crate::chat_manager::ChannelId,
+) -> Option<tdmtproto::telegram_api::InputChannel> {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        chat_manager,
+        ..
+    } = td;
+    let options = option_manager.as_mut()?;
+    let env = UserEnv {
+        global,
+        options,
+        auth_is_bot: auth_manager.is_bot(),
+    };
+    chat_manager.get_input_channel(&env, channel_id)
+}
+
 /// The C++ net-blocked promise completion — every server-query tail in this
 /// slice ends here (the C++ promise completes from the query's
 /// `on_result`/`on_error`, unreachable until the net step).
@@ -1472,8 +1544,10 @@ fn promise_unimplemented<T: Send>(promise: &mut Promise<T>) {
 // (DialogManager.cpp:1755-1810, :2030-2340, :2800-2960).
 
 /// `DialogManager::migrate_dialog_to_megagroup` (DialogManager.cpp:1755-1781).
-/// The creator gate reads the unloaded chat status (stub inventory), and the
-/// `MigrateChatQuery` send is [blocked: net].
+/// The creator gate reads the live chat status; the `MigrateChatQuery`
+/// send rides the dialog net handle, and the answer's `Updates` intakes
+/// set the migrated-to channel before the object tail runs (the C++
+/// `PromiseCreator::lambda` chain, cpp:1768-1775).
 pub fn migrate_dialog_to_megagroup(
     td: &mut Td,
     dialog_id: DialogId,
@@ -1491,35 +1565,60 @@ pub fn migrate_dialog_to_megagroup(
         return;
     }
 
-    let _chat_id = dialog_id.get_chat_id();
-    // get_chat_status(chat_id).is_creator() — the C++ has no CHECK here;
-    // the unloaded-chat status is `Banned(0, "")` (ChatManager.cpp:8559-8562),
-    // whose is_creator() is false (stub inventory). The gate answers the
-    // same "not creator" decision.
-    let is_creator =
-        crate::chat_manager::DialogParticipantStatus::banned(0, String::new()).is_creator();
-    if !is_creator {
+    let chat_id = dialog_id.get_chat_id();
+    if !td.chat_manager.get_chat_status(chat_id).is_creator() {
         promise.set_error(Status::error(400, "Need creator rights in the chat"));
         return;
     }
-    // get_chat_migrated_to_channel_id(chat_id).is_valid() — unloaded →
-    // invalid → the C++ falls through to the query (stub inventory).
-    tracing::info!("Migrate basic group to supergroup — [blocked: net]");
-    promise_unimplemented(&mut promise);
+    if td
+        .chat_manager
+        .get_chat_migrated_to_channel_id(chat_id)
+        .is_valid()
+    {
+        return on_migrate_chat_to_megagroup(td, chat_id, promise);
+    }
+
+    td.dialog_manager.pending_migrate_chat.push(promise);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::MigrateChat { chat_id },
+        tdmtproto::telegram_api::Function::messages_migrateChat(
+            tdmtproto::telegram_api::messages_migrateChat {
+                chat_id: chat_id.get(),
+            },
+        ),
+        "messages.migrateChat",
+    );
 }
 
 /// `DialogManager::on_migrate_chat_to_megagroup`
-/// (DialogManager.cpp:1782-1797) — the migrated-to channel id is the
-/// unloaded invalid (stub inventory), so only the error head is reachable.
+/// (DialogManager.cpp:1782-1797).
 pub fn on_migrate_chat_to_megagroup(
     td: &mut Td,
-    _chat_id: crate::chat_manager::ChatId,
+    chat_id: crate::chat_manager::ChatId,
     mut promise: Promise<crate::td_api::Object>,
 ) {
-    let _ = td;
-    // C++: !get_chat_migrated_to_channel_id(chat_id).is_valid()
-    tracing::error!("Can't find the supergroup to which the basic group has migrated");
-    promise.set_error(Status::error(500, "Supergroup not found"));
+    let channel_id = td.chat_manager.get_chat_migrated_to_channel_id(chat_id);
+    if !channel_id.is_valid() {
+        tracing::error!("Can't find the supergroup to which the basic group has migrated");
+        promise.set_error(Status::error(500, "Supergroup not found"));
+        return;
+    }
+    if !td.chat_manager.have_channel(channel_id) {
+        tracing::error!(
+            "Can't find info about the supergroup to which the basic group has migrated"
+        );
+        promise.set_error(Status::error(500, "Supergroup info is not found"));
+        return;
+    }
+
+    let dialog_id = DialogId::from_channel_id(channel_id);
+    force_create_dialog(td, dialog_id, "on_migrate_chat_to_megagroup");
+    // messages_manager_->get_chat_object (cpp:1795) — the fat chat-object
+    // builder is the M.10.20-22 dispatcher-flip surface (it needs the
+    // Dialog record `force_create_dialog` would have created and every
+    // per-field td_api builder); the object tail parks at the documented
+    // interim until that slice (stub inventory).
+    promise_unimplemented(&mut promise);
 }
 
 /// `DialogManager::delete_dialog` (DialogManager.cpp:2030-2050) — the
@@ -2689,12 +2788,9 @@ pub fn on_binlog_dialog_events(td: &mut Td, events: &[tddb::binlog::event::Binlo
 // M.6.19 — the dialog edit surface (DialogManager.cpp:2341-2800) and the
 // username resolve family (:3018-3549).
 
-/// `DialogManager::set_dialog_title` (DialogManager.cpp:2341-2384). The
-/// Chat/Channel rights gates answer the unloaded defaults (stub inventory),
-/// so the C++ tail (the no-op check against `get_dialog_title` + the
-/// `EditDialogTitleQuery` send) is ported but unreachable until the
-/// ChatManager read surface lands.
-#[allow(unreachable_code, unused_variables)]
+/// `DialogManager::set_dialog_title` (DialogManager.cpp:2341-2384) — the
+/// Chat/Channel rights gates read the live chat-manager surface; the
+/// equal-title no-op and the `EditDialogTitleQuery` send ride it.
 pub fn set_dialog_title(td: &mut Td, dialog_id: DialogId, title: &str, mut promise: Promise<()>) {
     if !have_dialog_force(td, dialog_id, "set_dialog_title") {
         promise.set_error(Status::error(400, "Chat not found"));
@@ -2713,16 +2809,24 @@ pub fn set_dialog_title(td: &mut Td, dialog_id: DialogId, title: &str, mut promi
             return;
         }
         crate::dialog_id::DialogType::Chat => {
-            // get_chat_permissions — the unloaded default cannot change info
-            // (stub inventory); the is_appointed_chat_administrator bot
-            // conjunct is unreachable past the same gate.
-            promise.set_error(Status::error(400, "Not enough rights to change chat title"));
-            return;
+            let chat_id = dialog_id.get_chat_id();
+            let status = td.chat_manager.get_chat_permissions_id(chat_id);
+            if !status.can_change_info_and_settings()
+                || (td.auth_manager.is_bot()
+                    && !td.chat_manager.is_appointed_chat_administrator(chat_id))
+            {
+                promise.set_error(Status::error(400, "Not enough rights to change chat title"));
+                return;
+            }
         }
         crate::dialog_id::DialogType::Channel => {
-            // get_channel_permissions — the unloaded default (stub inventory).
-            promise.set_error(Status::error(400, "Not enough rights to change chat title"));
-            return;
+            let status = td
+                .chat_manager
+                .get_channel_permissions_id(&td.global, dialog_id.get_channel_id());
+            if !status.can_change_info_and_settings() {
+                promise.set_error(Status::error(400, "Not enough rights to change chat title"));
+                return;
+            }
         }
         crate::dialog_id::DialogType::SecretChat => {
             promise.set_error(Status::error(400, "Can't change secret chat title"));
@@ -2739,7 +2843,47 @@ pub fn set_dialog_title(td: &mut Td, dialog_id: DialogId, title: &str, mut promi
         promise.set_value(());
         return;
     }
-    promise_unimplemented(&mut promise);
+
+    // `EditDialogTitleQuery::send` (DialogManager.cpp:237-253) — the
+    // basic-group id form; the channel twin resolves the input channel
+    // at the send leg.
+    match dialog_id.get_type() {
+        crate::dialog_id::DialogType::Chat => {
+            td.dialog_manager.pending_edit_dialog_title.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::EditDialogTitle { dialog_id },
+                tdmtproto::telegram_api::Function::messages_editChatTitle(
+                    tdmtproto::telegram_api::messages_editChatTitle {
+                        chat_id: dialog_id.get_chat_id().get(),
+                        title: new_title,
+                    },
+                ),
+                "messages.editChatTitle",
+            );
+        }
+        crate::dialog_id::DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let Some(input_channel) = get_input_channel_td(td, channel_id) else {
+                // the C++ CHECK(input_channel != nullptr) — unreachable
+                // past the Write-rights gate; the peer-less band keeps the
+                // promise honest instead of crashing
+                promise.set_error(Status::error(400, "Can't access the chat"));
+                return;
+            };
+            td.dialog_manager.pending_edit_dialog_title.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::EditDialogTitle { dialog_id },
+                tdmtproto::telegram_api::Function::channels_editTitle(
+                    tdmtproto::telegram_api::channels_editTitle {
+                        channel: Some(input_channel),
+                        title: new_title,
+                    },
+                ),
+                "channels.editTitle",
+            );
+        }
+        _ => unreachable!("the gates match narrowed the dialog type"),
+    }
 }
 
 /// `DialogManager::set_dialog_photo` (DialogManager.cpp:2385-2412, the
@@ -2991,12 +3135,10 @@ pub fn set_dialog_profile_accent_color(
     ));
 }
 
-/// `DialogManager::set_dialog_permissions` (DialogManager.cpp:2648-2695).
-/// The Chat/Channel rights gates answer the unloaded defaults (stub
-/// inventory), so the C++ tail (the equal-permissions no-op check against
-/// `get_dialog_default_permissions` + the `EditChatDefaultBannedRightsQuery`
-/// send) is ported but unreachable until the ChatManager read surface lands.
-#[allow(unreachable_code, unused_variables, unused_mut)]
+/// `DialogManager::set_dialog_permissions` (DialogManager.cpp:2648-2695)
+/// — the Chat/Channel rights gates read the live chat-manager surface;
+/// the equal-permissions no-op and the
+/// `EditChatDefaultBannedRightsQuery` send ride it.
 pub fn set_dialog_permissions(
     td: &mut Td,
     dialog_id: DialogId,
@@ -3027,43 +3169,72 @@ pub fn set_dialog_permissions(
             return;
         }
         crate::dialog_id::DialogType::Chat => {
-            // get_chat_permissions — the unloaded default cannot restrict
-            // (stub inventory).
-            promise.set_error(Status::error(
-                400,
-                "Not enough rights to change chat permissions",
-            ));
-            return;
+            let status = td
+                .chat_manager
+                .get_chat_permissions_id(dialog_id.get_chat_id());
+            if !status.can_restrict_members() {
+                promise.set_error(Status::error(
+                    400,
+                    "Not enough rights to change chat permissions",
+                ));
+                return;
+            }
         }
         crate::dialog_id::DialogType::Channel => {
             if is_broadcast_channel(td, dialog_id) {
                 promise.set_error(Status::error(400, "Can't change channel chat permissions"));
                 return;
             }
-            // get_channel_permissions — the unloaded default (stub
-            // inventory); the C++ proceeds with ChannelType::Megagroup.
-            promise.set_error(Status::error(
-                400,
-                "Not enough rights to change chat permissions",
-            ));
-            return;
+            let status = td
+                .chat_manager
+                .get_channel_permissions_id(&td.global, dialog_id.get_channel_id());
+            if !status.can_restrict_members() {
+                promise.set_error(Status::error(
+                    400,
+                    "Not enough rights to change chat permissions",
+                ));
+                return;
+            }
+            channel_type = ChannelType::Megagroup;
         }
         crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => {
             unreachable!("set_dialog_permissions on a non-group dialog")
         }
     }
 
-    // The equal-permissions no-op check compares against
-    // [`get_dialog_default_permissions`] (the chat/channel halves answer the
-    // unloaded `restrict_all()`, stub inventory); the
-    // EditChatDefaultBannedRightsQuery send is [blocked: net].
-    {
-        let _new_permissions = crate::chat_manager::RestrictedRights::from_chat_permissions(
-            Some(permissions),
-            channel_type,
-        );
-        promise_unimplemented(&mut promise);
+    let new_permissions = crate::chat_manager::RestrictedRights::from_chat_permissions(
+        Some(permissions),
+        channel_type,
+    );
+    // TODO this can be wrong if there were previous change permissions
+    // requests (the C++ comment).
+    if get_dialog_default_permissions(td, dialog_id) == new_permissions {
+        promise.set_value(());
+        return;
     }
+
+    // `EditChatDefaultBannedRightsQuery::send` (DialogManager.cpp:372-381)
+    // — the Write input peer resolves at the send leg.
+    let Some(input_peer) = get_input_peer(td, dialog_id, AccessRights::Write) else {
+        // the C++ CHECK(input_peer != nullptr) — unreachable past the
+        // Write-rights gate; the peer-less band keeps the promise honest
+        // instead of crashing
+        promise.set_error(Status::error(400, "Can't access the chat"));
+        return;
+    };
+    td.dialog_manager
+        .pending_edit_chat_default_banned_rights
+        .push(promise);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::EditChatDefaultBannedRights { dialog_id },
+        tdmtproto::telegram_api::Function::messages_editChatDefaultBannedRights(
+            tdmtproto::telegram_api::messages_editChatDefaultBannedRights {
+                peer: Some(Box::new(input_peer)),
+                banned_rights: Some(new_permissions.get_chat_banned_rights()),
+            },
+        ),
+        "messages.editChatDefaultBannedRights",
+    );
 }
 
 /// `DialogManager::set_dialog_emoji_status` (DialogManager.cpp:2696-2720).
@@ -3147,9 +3318,9 @@ pub fn set_dialog_emoji_status(
 }
 
 /// `DialogManager::toggle_dialog_has_protected_content`
-/// (DialogManager.cpp:2721-2761). `has_protected_content` rides the
-/// net-blocked `ToggleNoForwardsQuery` send (stub inventory).
-#[allow(unused_variables)]
+/// (DialogManager.cpp:2721-2761) — the creator gates read the live
+/// chat-manager status surface; the `ToggleNoForwardsQuery` send rides
+/// the dialog net handle.
 pub fn toggle_dialog_has_protected_content(
     td: &mut Td,
     dialog_id: DialogId,
@@ -3172,26 +3343,69 @@ pub fn toggle_dialog_has_protected_content(
     let is_request = request_message_id.is_some();
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User => {}
-        // get_chat_status / get_channel_status — the unloaded defaults are
-        // not creators (stub inventory).
-        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
-            promise.set_error(Status::error(400, "Only owner can restrict saving content"));
-            return;
+        crate::dialog_id::DialogType::Chat => {
+            if !td
+                .chat_manager
+                .get_chat_status(dialog_id.get_chat_id())
+                .is_creator()
+            {
+                promise.set_error(Status::error(400, "Only owner can restrict saving content"));
+                return;
+            }
+        }
+        crate::dialog_id::DialogType::Channel => {
+            if !td
+                .chat_manager
+                .get_channel_status(dialog_id.get_channel_id())
+                .is_creator()
+            {
+                promise.set_error(Status::error(400, "Only owner can restrict saving content"));
+                return;
+            }
         }
         crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => {
             unreachable!("toggle_dialog_has_protected_content on a non-supergroup dialog")
         }
     }
+    let mut request_msg_id = 0;
     if is_request {
         let request_message_id = request_message_id.unwrap();
         if !request_message_id.is_server() {
             promise.set_error(Status::error(400, "Invalid message identifier specified"));
             return;
         }
+        request_msg_id = request_message_id.get_server_message_id().get();
     }
 
-    // ToggleNoForwardsQuery send — [blocked: net] (stub inventory).
-    promise_unimplemented(&mut promise);
+    // `ToggleNoForwardsQuery::send` (DialogManager.cpp:412-421) — the
+    // Read input peer resolves at the send leg; REQUEST_MSG_ID_MASK rides
+    // the request form only.
+    let Some(input_peer) = get_input_peer(td, dialog_id, AccessRights::Read) else {
+        // the C++ CHECK(input_peer != nullptr) — unreachable past the
+        // Read-access gate; the peer-less band keeps the promise honest
+        // instead of crashing
+        promise.set_error(Status::error(400, "Can't access the chat"));
+        return;
+    };
+    const REQUEST_MSG_ID_MASK: i32 = 1;
+    let flags = if request_msg_id != 0 {
+        REQUEST_MSG_ID_MASK
+    } else {
+        0
+    };
+    td.dialog_manager.pending_toggle_no_forwards.push(promise);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::ToggleNoForwards { dialog_id },
+        tdmtproto::telegram_api::Function::messages_toggleNoForwards(
+            tdmtproto::telegram_api::messages_toggleNoForwards {
+                flags,
+                peer: Some(Box::new(input_peer)),
+                enabled: has_protected_content,
+                request_msg_id,
+            },
+        ),
+        "messages.toggleNoForwards",
+    );
 }
 
 /// `DialogManager::set_dialog_description` (DialogManager.cpp:2762-2781).
@@ -3430,9 +3644,12 @@ pub fn get_dialog_title(td: &mut Td, dialog_id: DialogId) -> String {
         crate::dialog_id::DialogType::User => {
             td.user_manager.get_user_title_of(dialog_id.get_user_id())
         }
-        // chat_manager_->get_chat_title / get_channel_title — the unloaded
-        // `""` (stub inventory).
-        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => String::new(),
+        crate::dialog_id::DialogType::Chat => {
+            td.chat_manager.get_chat_title(dialog_id.get_chat_id())
+        }
+        crate::dialog_id::DialogType::Channel => td
+            .chat_manager
+            .get_channel_title(dialog_id.get_channel_id(), false),
         crate::dialog_id::DialogType::SecretChat => td
             .user_manager
             .get_secret_chat_title_of(dialog_id.get_secret_chat_id()),
@@ -3653,19 +3870,22 @@ pub fn get_dialog_permissions(
 }
 
 /// `DialogManager::get_dialog_default_permissions`
-/// (DialogManager.cpp:2205-2221) — the unloaded C++ result is
-/// `RestrictedRights::restrict_all()` on every arm (UserManager.cpp:5610-5615,
-/// 5620-5624; ChatManager.cpp:3041-3055); the loaded user/secret halves
-/// land with the user-default-permissions helper (stub inventory).
+/// (DialogManager.cpp:2205-2221) — the user/secret halves answer the
+/// unloaded `restrict_all()` until the user-default-permissions helper
+/// lands (stub inventory); the chat/channel halves read the live
+/// chat-manager surface.
 pub fn get_dialog_default_permissions(
-    _td: &Td,
+    td: &Td,
     dialog_id: DialogId,
 ) -> crate::chat_manager::RestrictedRights {
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User => crate::chat_manager::RestrictedRights::restrict_all(),
-        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
-            crate::chat_manager::RestrictedRights::restrict_all()
-        }
+        crate::dialog_id::DialogType::Chat => td
+            .chat_manager
+            .get_chat_default_permissions(dialog_id.get_chat_id()),
+        crate::dialog_id::DialogType::Channel => td
+            .chat_manager
+            .get_channel_default_permissions(dialog_id.get_channel_id()),
         crate::dialog_id::DialogType::SecretChat => {
             crate::chat_manager::RestrictedRights::restrict_all()
         }
@@ -3748,6 +3968,55 @@ impl DialogManager {
         }
     }
 
+    /// `MigrateChatQuery::on_result`'s promise pop (DialogManager.cpp:212-216).
+    pub(crate) fn take_migrate_chat_promise(&mut self) -> Option<Promise<crate::td_api::Object>> {
+        if self.pending_migrate_chat.is_empty() {
+            None
+        } else {
+            Some(self.pending_migrate_chat.remove(0))
+        }
+    }
+
+    /// `EditDialogTitleQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:255-259).
+    pub(crate) fn take_edit_dialog_title_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_edit_dialog_title.is_empty() {
+            None
+        } else {
+            Some(self.pending_edit_dialog_title.remove(0))
+        }
+    }
+
+    /// `EditChatDefaultBannedRightsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:386-391).
+    pub(crate) fn take_edit_chat_default_banned_rights_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_edit_chat_default_banned_rights.is_empty() {
+            None
+        } else {
+            Some(self.pending_edit_chat_default_banned_rights.remove(0))
+        }
+    }
+
+    /// `ToggleNoForwardsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:427-432).
+    pub(crate) fn take_toggle_no_forwards_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_toggle_no_forwards.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_no_forwards.remove(0))
+        }
+    }
+
+    /// `CheckUsernameQuery`/`CheckChannelUsernameQuery::on_result`'s
+    /// promise pop (DialogManager.cpp:73-77/:103-107).
+    pub(crate) fn take_check_username_promise(&mut self) -> Option<Promise<crate::td_api::Object>> {
+        if self.pending_check_username.is_empty() {
+            None
+        } else {
+            Some(self.pending_check_username.remove(0))
+        }
+    }
+
     pub(crate) fn on_dialog_usernames_updated(
         &mut self,
         dialog_id: DialogId,
@@ -3794,8 +4063,11 @@ impl DialogManager {
 
 /// `DialogManager::check_dialog_username` (DialogManager.cpp:3028-3112) —
 /// the local gates and the empty/invalid answers are faithful; the
-/// `CheckUsernameQuery`/`CheckChannelUsernameQuery` sends are [blocked: net]
-/// (stub inventory) and their error→result mapping is net-step residue.
+/// channel creator gate and the editable-username fast path read the
+/// live chat-manager surface, and the `CheckUsernameQuery`/
+/// `CheckChannelUsernameQuery` sends ride the dialog net handle (the
+/// error→result mapping runs in the answer tail, the C++
+/// `request_promise` lambda, cpp:3074-3092).
 pub fn check_dialog_username(
     td: &mut Td,
     dialog_id: DialogId,
@@ -3822,11 +4094,17 @@ pub fn check_dialog_username(
             }
         }
         crate::dialog_id::DialogType::Channel => {
-            // get_channel_status — the unloaded default is not a creator
-            // (stub inventory); the editable-username fast path is
-            // unreachable past it.
-            promise.set_error(Status::error(400, "Not enough rights to change username"));
-            return;
+            let channel_id = dialog_id.get_channel_id();
+            if !td.chat_manager.get_channel_status(channel_id).is_creator() {
+                promise.set_error(Status::error(400, "Not enough rights to change username"));
+                return;
+            }
+            if username == td.chat_manager.get_channel_editable_username(channel_id) {
+                promise.set_value(get_check_chat_username_result_object(
+                    CheckDialogUsernameResult::Ok,
+                ));
+                return;
+            }
         }
         crate::dialog_id::DialogType::None => {}
         crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::SecretChat => {
@@ -3854,9 +4132,80 @@ pub fn check_dialog_username(
         return;
     }
 
-    // CheckUsernameQuery / CheckChannelUsernameQuery send — [blocked: net]
-    // (stub inventory).
-    promise_unimplemented(&mut promise);
+    // The query dispatch (cpp:3094-3110) — the user leg sends
+    // `account.checkUsername`; the channel and bot legs share
+    // `CheckChannelUsernameQuery` (the bot form `bots.checkUsername`, the
+    // channel form `channels.checkUsername` with the empty channel for
+    // the dialog-less check).
+    let (kind, function, what) = match dialog_id.get_type() {
+        crate::dialog_id::DialogType::User => (
+            DialogNetKind::CheckUsername,
+            tdmtproto::telegram_api::Function::account_checkUsername(
+                tdmtproto::telegram_api::account_checkUsername {
+                    username: username.to_owned(),
+                },
+            ),
+            "account.checkUsername",
+        ),
+        crate::dialog_id::DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let Some(input_channel) = get_input_channel_td(td, channel_id) else {
+                // the C++ CHECK(input_channel != nullptr) — unreachable
+                // past the creator gate; the peer-less band keeps the
+                // promise honest instead of crashing
+                promise.set_error(Status::error(400, "Can't access the chat"));
+                return;
+            };
+            (
+                DialogNetKind::CheckChannelUsername {
+                    channel_id: Some(channel_id),
+                },
+                tdmtproto::telegram_api::Function::channels_checkUsername(
+                    tdmtproto::telegram_api::channels_checkUsername {
+                        channel: Some(input_channel),
+                        username: username.to_owned(),
+                    },
+                ),
+                "channels.checkUsername",
+            )
+        }
+        crate::dialog_id::DialogType::None => {
+            if is_bot {
+                (
+                    DialogNetKind::CheckChannelUsername { channel_id: None },
+                    tdmtproto::telegram_api::Function::bots_checkUsername(
+                        tdmtproto::telegram_api::bots_checkUsername {
+                            flags: 0,
+                            additional: false,
+                            username: username.to_owned(),
+                        },
+                    ),
+                    "bots.checkUsername",
+                )
+            } else {
+                (
+                    DialogNetKind::CheckChannelUsername { channel_id: None },
+                    tdmtproto::telegram_api::Function::channels_checkUsername(
+                        tdmtproto::telegram_api::channels_checkUsername {
+                            channel: Some(
+                                tdmtproto::telegram_api::InputChannel::inputChannelEmpty(
+                                    tdmtproto::telegram_api::inputChannelEmpty {},
+                                ),
+                            ),
+                            username: username.to_owned(),
+                        },
+                    ),
+                    "channels.checkUsername",
+                )
+            }
+        }
+        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::SecretChat => {
+            unreachable!("the non-empty-username gates returned above")
+        }
+    };
+    td.dialog_manager.pending_check_username.push(promise);
+    td.dialog_manager
+        .send_dialog_net_query(kind, function, what);
 }
 
 /// `DialogManager::get_check_chat_username_result_object`
@@ -5260,15 +5609,23 @@ mod tests {
             other => panic!("expected Invalid, got {other:?}"),
         }
 
-        // a 4-character username escapes the local invalid gate but reaches
-        // the net-blocked check
+        // a 4-character username escapes the local invalid gate and
+        // parks on the CheckChannelUsernameQuery (the netted round-trip
+        // test covers the wire leg; here the parked promise is settled
+        // by hand so the drop contract holds)
         let (object_promise, object_slot) = new_object_slot();
         check_dialog_username(&mut td, DialogId::new(0), "abcd", false, object_promise);
+        assert!(
+            object_slot.lock().unwrap().take().is_none(),
+            "the promise parks on the query"
+        );
+        let mut parked = td.dialog_manager.pending_check_username.remove(0);
+        parked.set_error(Status::error(500, "Network is not implemented yet"));
         match object_slot.lock().unwrap().take() {
             Some(Result::Err(status)) => {
                 assert_eq!(status.message(), "Network is not implemented yet")
             }
-            other => panic!("expected the net-blocked error, got {other:?}"),
+            other => panic!("expected the parked error, got {other:?}"),
         }
 
         // a basic group can only have an empty username

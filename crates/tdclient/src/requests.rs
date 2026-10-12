@@ -4839,7 +4839,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
                 return;
             };
-            let (promise, slot) = object_request_promise();
+            // the promise settles from the CheckUsername/
+            // CheckChannelUsernameQuery answer
+            let promise = td.deferred_promise::<crate::td_api::Object, _>(id, |object| object);
             crate::dialog_manager::check_dialog_username(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
@@ -4847,13 +4849,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 false,
                 promise,
             );
-            finish_object_slot(td, id, slot);
         }
         Function::checkBotUsername(request) => {
             let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
                 return;
             };
-            let (promise, slot) = object_request_promise();
+            // the promise settles from the bots.checkUsername answer
+            let promise = td.deferred_promise::<crate::td_api::Object, _>(id, |object| object);
             crate::dialog_manager::check_dialog_username(
                 td,
                 crate::dialog_id::DialogId::new(0),
@@ -4861,7 +4863,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 true,
                 promise,
             );
-            finish_object_slot(td, id, slot);
         }
         Function::addRecentlyFoundChat(request) => {
             if !check_is_user(td, id) {
@@ -4912,13 +4913,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = object_request_promise();
+            // the promise settles from the MigrateChatQuery answer chain
+            let promise = td.deferred_promise::<crate::td_api::Object, _>(id, |object| object);
             crate::dialog_manager::migrate_dialog_to_megagroup(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 promise,
             );
-            finish_object_slot(td, id, slot);
         }
         Function::setChatTitle(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:5778-5782) —
@@ -4926,14 +4927,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
                 return;
             };
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the EditDialogTitleQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::set_dialog_title(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &title,
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::setChatPhoto(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:5784-5787)
@@ -4976,20 +4977,22 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::setChatPermissions(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:5818-5821)
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the
+            // EditChatDefaultBannedRightsQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::set_dialog_permissions(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.permissions.as_ref(),
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::toggleChatHasProtectedContent(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the ToggleNoForwardsQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::toggle_dialog_has_protected_content(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
@@ -4997,13 +5000,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.has_protected_content,
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::processChatHasProtectedContentDisableRequest(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the ToggleNoForwardsQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::toggle_dialog_has_protected_content(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
@@ -5013,7 +5016,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 !request.approve,
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::setChatDescription(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:6093-6097);

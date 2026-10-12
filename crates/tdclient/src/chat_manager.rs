@@ -10721,6 +10721,60 @@ impl ChatManager {
         }
     }
 
+    /// `get_chat_migrated_to_channel_id` (ChatManager.cpp:8551-8556).
+    pub fn get_chat_migrated_to_channel_id(&self, chat_id: ChatId) -> ChannelId {
+        match self.get_chat(chat_id) {
+            Some(c) => c.migrated_to_channel_id,
+            None => ChannelId::default(),
+        }
+    }
+
+    /// `get_chat_title` (ChatManager.cpp:3018-3024).
+    pub fn get_chat_title(&self, chat_id: ChatId) -> String {
+        self.get_chat(chat_id)
+            .map(|c| c.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// `get_channel_title` (ChatManager.cpp:3026-3039) — the min-channel
+    /// fallback for unloaded channels; the monoforum arm recurses once
+    /// (`is_recursive`) onto the linked monoforum channel.
+    pub fn get_channel_title(&self, channel_id: ChannelId, is_recursive: bool) -> String {
+        match self.get_channel(channel_id) {
+            Some(c) => {
+                if c.is_monoforum && !is_recursive {
+                    return self.get_channel_title(c.monoforum_channel_id, true);
+                }
+                c.title.clone()
+            }
+            None => self
+                .get_min_channel(channel_id)
+                .map(|min_channel| min_channel.title_.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// `get_chat_default_permissions` (ChatManager.cpp:3041-3047).
+    pub fn get_chat_default_permissions(&self, chat_id: ChatId) -> RestrictedRights {
+        self.get_chat(chat_id)
+            .map(|c| c.default_permissions)
+            .unwrap_or_else(RestrictedRights::restrict_all)
+    }
+
+    /// `get_channel_default_permissions` (ChatManager.cpp:3049-3055).
+    pub fn get_channel_default_permissions(&self, channel_id: ChannelId) -> RestrictedRights {
+        self.get_channel(channel_id)
+            .map(|c| c.default_permissions)
+            .unwrap_or_else(RestrictedRights::restrict_all)
+    }
+
+    /// `get_channel_editable_username` (ChatManager.cpp:3153-3159).
+    pub fn get_channel_editable_username(&self, channel_id: ChannelId) -> String {
+        self.get_channel(channel_id)
+            .map(|c| c.usernames.get_editable_username().to_owned())
+            .unwrap_or_default()
+    }
+
     /// `get_chat_participant_count` (ChatManager.cpp:8622-8626).
     pub fn get_chat_participant_count(&self, chat_id: ChatId) -> i32 {
         self.get_chat(chat_id)

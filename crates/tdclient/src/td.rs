@@ -8208,7 +8208,209 @@ impl Td {
                     }
                 }
             }
+            // `MigrateChatQuery` (DialogManager.cpp:199-223) — the
+            // `Updates` answer re-enters `on_get_updates`, then the
+            // C++ lambda's success arm runs `on_migrate_chat_to_megagroup`
+            // with the object promise; the error tail forwards (the
+            // lambda's error arm).
+            crate::dialog_manager::DialogNetKind::MigrateChat { chat_id } => {
+                let Some(mut promise) = self.dialog_manager.take_migrate_chat_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdatesMigrateChat {
+                            updates: Box::new(updates),
+                            chat_id,
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("messages_migrateChat")),
+                    }
+                }
+            }
+            // `EditDialogTitleQuery` (DialogManager.cpp:226-273) — the
+            // `Updates` answer re-enters `on_get_updates` with the
+            // promise; the error tail runs the CHAT_NOT_MODIFIED !bot
+            // value band and the dialog-error head (the
+            // `EditChatAboutQuery` shape).
+            crate::dialog_manager::DialogNetKind::EditDialogTitle { dialog_id } => {
+                let Some(promise) = self.dialog_manager.take_edit_dialog_title_promise() else {
+                    return;
+                };
+                self.edit_updates_answer_tail(
+                    query,
+                    dialog_id,
+                    promise,
+                    "messages_editChatTitle",
+                    "EditDialogTitleQuery",
+                );
+            }
+            // `EditChatDefaultBannedRightsQuery` (DialogManager.cpp:365-404)
+            // — the same Updates/error shape as the title query.
+            crate::dialog_manager::DialogNetKind::EditChatDefaultBannedRights { dialog_id } => {
+                let Some(promise) = self
+                    .dialog_manager
+                    .take_edit_chat_default_banned_rights_promise()
+                else {
+                    return;
+                };
+                self.edit_updates_answer_tail(
+                    query,
+                    dialog_id,
+                    promise,
+                    "messages_editChatDefaultBannedRights",
+                    "EditChatDefaultBannedRightsQuery",
+                );
+            }
+            // `ToggleNoForwardsQuery` (DialogManager.cpp:406-447) — the
+            // `Updates` answer re-enters `on_get_updates`; the error tail
+            // answers the CHAT_NOT_MODIFIED value band with NO bot check
+            // (cpp:439-442 — unlike the title/default-rights twins).
+            crate::dialog_manager::DialogNetKind::ToggleNoForwards { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_toggle_no_forwards_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "CHAT_NOT_MODIFIED" {
+                        promise.set_value(());
+                    } else {
+                        crate::dialog_manager::on_get_dialog_error(
+                            self,
+                            dialog_id,
+                            &status,
+                            "ToggleNoForwardsQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("messages_toggleNoForwards")),
+                    }
+                }
+            }
+            // `CheckUsernameQuery` (DialogManager.cpp:60-82) — the Bool
+            // answer and the error surface run the `request_promise`
+            // mapping (cpp:3074-3092); no channel-error head.
+            crate::dialog_manager::DialogNetKind::CheckUsername => {
+                let Some(promise) = self.dialog_manager.take_check_username_promise() else {
+                    return;
+                };
+                self.check_username_answer_tail(query, None, promise);
+            }
+            // `CheckChannelUsernameQuery` (DialogManager.cpp:85-131) — the
+            // same mapping tail plus the `on_get_channel_error` head for a
+            // valid channel (the bot/empty-channel legs skip it).
+            crate::dialog_manager::DialogNetKind::CheckChannelUsername { channel_id } => {
+                let Some(promise) = self.dialog_manager.take_check_username_promise() else {
+                    return;
+                };
+                self.check_username_answer_tail(query, channel_id, promise);
+            }
         }
+    }
+
+    /// The shared `EditDialogTitleQuery`/`EditChatDefaultBannedRightsQuery`
+    /// answer tail (DialogManager.cpp:255-273/:386-404) — the `Updates`
+    /// answer re-enters `on_get_updates` with the promise; the error tail
+    /// runs the CHAT_NOT_MODIFIED !bot value band and the dialog-error
+    /// head.
+    fn edit_updates_answer_tail(
+        &mut self,
+        query: NetQuery,
+        dialog_id: crate::dialog_id::DialogId,
+        mut promise: Promise<()>,
+        what: &str,
+        source: &str,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        if query.is_error() {
+            let status = query.error().clone();
+            let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+            if not_modified && !self.auth_manager.is_bot() {
+                promise.set_value(());
+            } else {
+                if !not_modified {
+                    crate::dialog_manager::on_get_dialog_error(self, dialog_id, &status, source);
+                }
+                promise.set_error(status);
+            }
+        } else {
+            match telegram_api::Updates::parse(query.ok()) {
+                Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                    updates: Box::new(updates),
+                    promise,
+                }),
+                Err(_) => promise.set_error(parse_error(what)),
+            }
+        }
+    }
+
+    /// The shared `CheckUsernameQuery`/`CheckChannelUsernameQuery` answer
+    /// tail — the Bool answer and the error surface run the C++
+    /// `request_promise` mapping lambda (DialogManager.cpp:3074-3092):
+    /// `true` → Ok, `false` → Occupied, and the five error names map to
+    /// their result variants; everything else forwards. The valid-channel
+    /// legs run the `on_get_channel_error` head first (cpp:121-126).
+    fn check_username_answer_tail(
+        &mut self,
+        query: NetQuery,
+        channel_id: Option<crate::chat_manager::ChannelId>,
+        mut promise: Promise<crate::td_api::Object>,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        let result: tdutils::status::Result<bool> = if query.is_error() {
+            tdutils::status::Result::Err(query.error().clone())
+        } else {
+            match parse_wire_bool_value(query.ok()) {
+                Some(value) => tdutils::status::Result::Ok(value),
+                None => tdutils::status::Result::Err(parse_error("checkUsername")),
+            }
+        };
+        if let tdutils::status::Result::Err(status) = &result
+            && let Some(channel_id) = channel_id
+            && channel_id.is_valid()
+        {
+            self.chat_channel_error_head(channel_id, status, "CheckChannelUsernameQuery");
+        }
+        let check_result = match result {
+            tdutils::status::Result::Ok(true) => {
+                crate::dialog_manager::CheckDialogUsernameResult::Ok
+            }
+            tdutils::status::Result::Ok(false) => {
+                crate::dialog_manager::CheckDialogUsernameResult::Occupied
+            }
+            tdutils::status::Result::Err(status) => match status.message() {
+                "CHANNEL_PUBLIC_GROUP_NA" => {
+                    crate::dialog_manager::CheckDialogUsernameResult::PublicGroupsUnavailable
+                }
+                "CHANNELS_ADMIN_PUBLIC_TOO_MUCH" => {
+                    crate::dialog_manager::CheckDialogUsernameResult::PublicDialogsTooMany
+                }
+                "USERNAME_INVALID" => crate::dialog_manager::CheckDialogUsernameResult::Invalid,
+                "USERNAME_OCCUPIED" => crate::dialog_manager::CheckDialogUsernameResult::Occupied,
+                "USERNAME_PURCHASE_AVAILABLE" => {
+                    crate::dialog_manager::CheckDialogUsernameResult::Purchasable
+                }
+                _ => {
+                    promise.set_error(status);
+                    return;
+                }
+            },
+        };
+        promise
+            .set_value(crate::dialog_manager::get_check_chat_username_result_object(check_result));
     }
 
     /// Route one chat net answer by kind — the parse legs front the
@@ -12662,7 +12864,7 @@ impl Td {
 
     /// Converts and emits what the sink collected.
     fn drain_sink(&mut self) {
-        let sink = std::mem::take(self.updates_manager.sink());
+        let mut sink = std::mem::take(self.updates_manager.sink());
         // `StateManager::on_synchronized` — the get-difference sync half
         // of the connection state, applied as the C++ fires it inside
         // before/after_get_difference.
@@ -12781,6 +12983,13 @@ impl Td {
                     }
                 }
             }
+        }
+        // the chats feed the ChatManager container — the C++
+        // `process_updates_users_and_chats` second half
+        // (`td_->chat_manager_->on_get_chats`, UpdatesManager.cpp:1591-1592);
+        // the users block above is the first half
+        if !sink.chats.is_empty() {
+            self.intake_chats(std::mem::take(&mut sink.chats), "Updates");
         }
         for (message, source) in &sink.new_messages {
             self.apply_new_message(message, source);
@@ -15271,6 +15480,16 @@ pub(crate) enum UmMessage {
         updates: Box<telegram_api::Updates>,
         promise: Promise<()>,
     },
+    /// `on_get_updates` + the migrate tail — the C++
+    /// `PromiseCreator::lambda` chain of `migrate_dialog_to_megagroup`
+    /// (DialogManager.cpp:1768-1775): the Updates run through the engine,
+    /// then `on_migrate_chat_to_megagroup` completes the object promise
+    /// (the lambda's `send_closure` hop collapses onto the run slice).
+    OnGetUpdatesMigrateChat {
+        updates: Box<telegram_api::Updates>,
+        chat_id: crate::chat_manager::ChatId,
+        promise: Promise<crate::td_api::Object>,
+    },
     /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
     /// (cpp:522, :364).
     OnGetDifference {
@@ -15303,6 +15522,22 @@ impl UmMessage {
         match self {
             UmMessage::OnGetUpdates { updates, promise } => {
                 td.with_updates_env(|um, env| um.on_get_updates(env, *updates, promise));
+            }
+            UmMessage::OnGetUpdatesMigrateChat {
+                updates,
+                chat_id,
+                promise,
+            } => {
+                // the empty promise stands in for the C++ `Promise<Unit>`
+                // the handler passes to `on_get_updates` — the chain's
+                // only continuation is the tail below
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                // the C++ ordering guarantee is the actor mailbox: the
+                // sink's chats intake was queued before the lambda's
+                // `on_migrate_chat_to_megagroup` hop, so the drain runs
+                // between them here
+                td.drain_sink();
+                crate::dialog_manager::on_migrate_chat_to_megagroup(td, chat_id, promise);
             }
             UmMessage::OnGetDifference { difference } => {
                 td.with_updates_env(|um, env| um.on_get_difference(env, difference));
@@ -32591,6 +32826,19 @@ mod tests {
             .expect("the query under test was dispatched")
     }
 
+    /// No query of the family's constructor went out (the updates
+    /// machinery may still refire its own queries — those are not the
+    /// arm under test).
+    fn assert_not_sent(rec: &Arc<RecNetSession>, constructor: i32, what: &str) {
+        assert!(
+            !rec.sent
+                .lock()
+                .iter()
+                .any(|query| query.tl_constructor() == constructor),
+            "{what} sends nothing"
+        );
+    }
+
     // ---- the premium net slice: the first two flows ride the
     // dispatcher (Premium.cpp:395-605). ----
 
@@ -33387,6 +33635,17 @@ mod tests {
     /// `on_get_chat`/`on_get_channel` half) — the group creator, the
     /// broadcast creator and the member channel for the rights bands.
     fn seed_dialog_chats(td: &mut Td) {
+        seed_dialog_basic_group(td, 701, true);
+        seed_dialog_channel(td, 702, true, false);
+        seed_dialog_channel(td, 703, false, false);
+        // a creator megagroup — the §2 permissions/toggle bands
+        seed_dialog_channel(td, 704, true, true);
+    }
+
+    /// Seed one basic group via the chat intake (the §2 flip bands'
+    /// group dialogs); `creator` drives the participant status the
+    /// rights gates read.
+    fn seed_dialog_basic_group(td: &mut Td, id: i64, creator: bool) {
         let crate::td::Td {
             global,
             option_manager,
@@ -33402,51 +33661,50 @@ mod tests {
                 .expect("option manager exists after init"),
             auth_is_bot: auth_manager.is_bot(),
         };
-        let chat = |id: i64, creator: bool, title: &str| {
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
             telegram_api::Chat::chat(telegram_api::chat {
                 creator,
                 id,
-                title: title.to_owned(),
+                title: "group".to_owned(),
                 ..telegram_api::chat::default()
-            })
+            }),
+            "test",
+        );
+    }
+
+    /// Seed one channel via the chat intake; `megagroup` flips the
+    /// broadcast/megagroup kind (the permissions gate reads it) and
+    /// `creator` the participant status. The access hash follows the
+    /// seed_dialog_chats ladder (702/703 → 777, 704 → 778, …) so the
+    /// per-test channels stay distinct and the existing assertions hold.
+    fn seed_dialog_channel(td: &mut Td, id: i64, creator: bool, megagroup: bool) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
         };
         chat_manager.on_get_chat(
             &mut *user_manager,
             &mut env,
-            chat(701, true, "group"),
-            "test",
-        );
-        let channel = |id: i64, creator: bool, title: &str| {
             telegram_api::Chat::channel(telegram_api::channel {
                 creator,
-                broadcast: true,
+                broadcast: !megagroup,
+                megagroup,
                 id,
-                access_hash: 777,
-                title: title.to_owned(),
-                ..telegram_api::channel::default()
-            })
-        };
-        chat_manager.on_get_chat(
-            &mut *user_manager,
-            &mut env,
-            channel(702, true, "channel"),
-            "test",
-        );
-        chat_manager.on_get_chat(
-            &mut *user_manager,
-            &mut env,
-            channel(703, false, "member channel"),
-            "test",
-        );
-        chat_manager.on_get_chat(
-            &mut *user_manager,
-            &mut env,
-            telegram_api::Chat::channel(telegram_api::channel {
-                creator: true,
-                megagroup: true,
-                id: 704,
-                access_hash: 778,
-                title: "megagroup".to_owned(),
+                access_hash: 777 + (id - 703).max(0),
+                title: if megagroup { "megagroup" } else { "channel" }.to_owned(),
                 ..telegram_api::channel::default()
             }),
             "test",
@@ -34550,6 +34808,1054 @@ mod tests {
         assert_eq!(error.message, "Chat not found");
 
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn chat_title_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_title_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_title_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-edit-dialog-title");
+        seed_dialog_chats(&mut td);
+        seed_dialog_user(&mut td);
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. the basic group — messages.editChatTitle with the id and the
+        //    cleaned title; the Updates answer resolves the ok
+        td.request(
+            1,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: group_dialog,
+                title: "  New Title  ".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatTitle::ID,
+        );
+        let body =
+            telegram_api::messages_editChatTitle::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.chat_id, 701);
+        assert_eq!(body.title, "New Title");
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the equal-title no-op — the record still carries the seeded
+        //    title (the empty Updates answer carries no title change), so
+        //    the same title completes the value without a query
+        td.request(
+            2,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: group_dialog,
+                title: "group".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+        assert_not_sent(&rec, telegram_api::messages_editChatTitle::ID, "the no-op");
+
+        // 3. the channel twin — inputChannel with the access hash
+        td.request(
+            3,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: channel_dialog,
+                title: "New Chan".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editTitle::ID,
+        );
+        let body = telegram_api::channels_editTitle::parse(sent.query()).expect("the sent body");
+        match body.channel {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 702);
+                assert_eq!(channel.access_hash, 777);
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.title, "New Chan");
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the rights band — a member channel answers the 400 BEFORE
+        //    the park (no query out)
+        td.request(
+            4,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: member_dialog,
+                title: "Nope".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Not enough rights to change chat title");
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_editChatTitle::ID,
+            "the rights band",
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::channels_editTitle::ID,
+            "the rights band",
+        );
+
+        // 5. the CHAT_NOT_MODIFIED band — the !bot value answer
+        td.request(
+            5,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: group_dialog,
+                title: "Another Title".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatTitle::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. a hard error forwards through the dialog-error tail
+        td.request(
+            6,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: group_dialog,
+                title: "Third Title".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatTitle::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_7");
+
+        // 7. the private-chat band
+        td.request(
+            7,
+            Function::setChatTitle(td_api::setChatTitle {
+                chat_id: user_dialog,
+                title: "Nope".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Can't change private chat title");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn chat_permissions_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_permissions_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_permissions_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-edit-default-banned");
+        seed_dialog_chats(&mut td);
+        let broadcast_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let megagroup_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(704),
+        )
+        .get();
+        // a member megagroup — the rights band
+        seed_dialog_channel(&mut td, 705, false, true);
+        let member_megagroup_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(705),
+        )
+        .get();
+        // a megagroup seeded with the nothing-banned wire rights — its
+        // record default matches the all-true td_api permissions (the
+        // no-op band)
+        seed_dialog_channel(&mut td, 707, true, true);
+        {
+            let c = td
+                .chat_manager
+                .get_channel_mut(crate::chat_manager::ChannelId::new(707))
+                .expect("the seeded channel");
+            c.default_permissions = crate::chat_manager::RestrictedRights::from_chat_banned_rights(
+                Some(&telegram_api::ChatBannedRights {
+                    until_date: i32::MAX,
+                    ..telegram_api::ChatBannedRights::default()
+                }),
+                crate::chat_manager::ChannelType::Megagroup,
+            );
+        }
+        let no_op_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(707),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+        let open_permissions = td_api::ChatPermissions {
+            can_send_basic_messages: true,
+            can_send_audios: true,
+            can_send_documents: true,
+            can_send_photos: true,
+            can_send_videos: true,
+            can_send_video_notes: true,
+            can_send_voice_notes: true,
+            can_send_polls: true,
+            can_send_other_messages: true,
+            can_add_link_previews: true,
+            can_change_info: true,
+            can_invite_users: true,
+            can_pin_messages: true,
+            can_create_topics: true,
+            can_edit_tag: true,
+            can_react_to_messages: true,
+        };
+
+        // 1. the megagroup — messages.editChatDefaultBannedRights with the
+        //    Write peer and the inverted wire banned rights
+        td.request(
+            1,
+            Function::setChatPermissions(td_api::setChatPermissions {
+                chat_id: megagroup_dialog,
+                permissions: Some(open_permissions.clone()),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatDefaultBannedRights::ID,
+        );
+        let body = telegram_api::messages_editChatDefaultBannedRights::parse(sent.query())
+            .expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 704);
+                assert_eq!(peer.access_hash, 778);
+            }
+            other => panic!("the write peer: {other:?}"),
+        }
+        let banned = body.banned_rights.expect("the banned rights");
+        assert!(!banned.send_plain);
+        assert!(!banned.change_info);
+        assert!(!banned.manage_topics, "the request opens topics too");
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the broadcast band — channels reject the request outright
+        td.request(
+            2,
+            Function::setChatPermissions(td_api::setChatPermissions {
+                chat_id: broadcast_dialog,
+                permissions: Some(open_permissions.clone()),
+            }),
+        );
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Can't change channel chat permissions");
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_editChatDefaultBannedRights::ID,
+            "the broadcast band",
+        );
+
+        // 3. the rights band — a member megagroup answers the 400 BEFORE
+        //    the park
+        td.request(
+            3,
+            Function::setChatPermissions(td_api::setChatPermissions {
+                chat_id: member_megagroup_dialog,
+                permissions: Some(open_permissions.clone()),
+            }),
+        );
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 400);
+        assert_eq!(
+            error.message,
+            "Not enough rights to change chat permissions"
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_editChatDefaultBannedRights::ID,
+            "the rights band",
+        );
+
+        // 4. the equal-permissions no-op — the 707 record carries the
+        //    nothing-banned default and the all-true request maps to it;
+        //    the value completes without a query
+        td.request(
+            4,
+            Function::setChatPermissions(td_api::setChatPermissions {
+                chat_id: no_op_dialog,
+                permissions: Some(open_permissions.clone()),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_editChatDefaultBannedRights::ID,
+            "the no-op",
+        );
+
+        // 5. the CHAT_NOT_MODIFIED band — the !bot value answer
+        td.request(
+            5,
+            Function::setChatPermissions(td_api::setChatPermissions {
+                chat_id: megagroup_dialog,
+                permissions: Some(open_permissions.clone()),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatDefaultBannedRights::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. a hard error forwards through the dialog-error tail
+        td.request(
+            6,
+            Function::setChatPermissions(td_api::setChatPermissions {
+                chat_id: megagroup_dialog,
+                permissions: Some(open_permissions),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatDefaultBannedRights::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_7");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn protected_content_toggle_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(protected_content_toggle_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn protected_content_toggle_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-toggle-no-forwards");
+        seed_dialog_chats(&mut td);
+        seed_dialog_user(&mut td);
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. the user dialog — messages.toggleNoForwards with the Read
+        //    peer, no REQUEST_MSG_ID flag
+        td.request(
+            1,
+            Function::toggleChatHasProtectedContent(td_api::toggleChatHasProtectedContent {
+                chat_id: user_dialog,
+                has_protected_content: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleNoForwards::ID,
+        );
+        let body =
+            telegram_api::messages_toggleNoForwards::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 0);
+        assert_eq!(body.request_msg_id, 0);
+        assert!(body.enabled);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+                assert_eq!(peer.access_hash, 5);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the creator channel twin — inputPeerChannel
+        td.request(
+            2,
+            Function::toggleChatHasProtectedContent(td_api::toggleChatHasProtectedContent {
+                chat_id: channel_dialog,
+                has_protected_content: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleNoForwards::ID,
+        );
+        let body =
+            telegram_api::messages_toggleNoForwards::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 702);
+                assert_eq!(peer.access_hash, 777);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the basic-group creator twin — inputPeerChat
+        td.request(
+            3,
+            Function::toggleChatHasProtectedContent(td_api::toggleChatHasProtectedContent {
+                chat_id: group_dialog,
+                has_protected_content: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleNoForwards::ID,
+        );
+        let body =
+            telegram_api::messages_toggleNoForwards::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChat(peer)) => {
+                assert_eq!(peer.chat_id, 701);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        assert!(!body.enabled);
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the creator gate — a member channel answers the 400 BEFORE
+        //    the park
+        td.request(
+            4,
+            Function::toggleChatHasProtectedContent(td_api::toggleChatHasProtectedContent {
+                chat_id: member_dialog,
+                has_protected_content: true,
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Only owner can restrict saving content");
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_toggleNoForwards::ID,
+            "the creator band",
+        );
+
+        // 5. the request form — REQUEST_MSG_ID carries the server id
+        td.request(
+            5,
+            Function::processChatHasProtectedContentDisableRequest(
+                td_api::processChatHasProtectedContentDisableRequest {
+                    chat_id: channel_dialog,
+                    request_message_id: 12345 << 20,
+                    approve: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleNoForwards::ID,
+        );
+        let body =
+            telegram_api::messages_toggleNoForwards::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1, "REQUEST_MSG_ID_MASK");
+        assert_eq!(body.request_msg_id, 12345);
+        assert!(body.enabled, "!approve");
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. the invalid request id band
+        td.request(
+            6,
+            Function::processChatHasProtectedContentDisableRequest(
+                td_api::processChatHasProtectedContentDisableRequest {
+                    chat_id: channel_dialog,
+                    request_message_id: 0,
+                    approve: true,
+                },
+            ),
+        );
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Invalid message identifier specified");
+
+        // 7. the CHAT_NOT_MODIFIED band — the value answer with NO bot
+        //    check (cpp:439-442)
+        td.request(
+            7,
+            Function::toggleChatHasProtectedContent(td_api::toggleChatHasProtectedContent {
+                chat_id: channel_dialog,
+                has_protected_content: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleNoForwards::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn chat_username_checks_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_username_checks_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_username_checks_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-check-username");
+        seed_dialog_chats(&mut td);
+        // a creator channel with an editable username — the fast path
+        seed_dialog_channel(&mut td, 706, true, true);
+        {
+            let c = td
+                .chat_manager
+                .get_channel_mut(crate::chat_manager::ChannelId::new(706))
+                .expect("the seeded channel");
+            c.usernames =
+                crate::usernames::Usernames::from_telegram("myownname".to_owned(), Vec::new());
+        }
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        let username_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(706),
+        )
+        .get();
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+
+        // 1. the creator channel — channels.checkUsername with the input
+        //    channel; the true Bool answer maps to checkChatUsernameResultOk
+        td.request(
+            1,
+            Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: channel_dialog,
+                username: "somechannel".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_checkUsername::ID,
+        );
+        let body =
+            telegram_api::channels_checkUsername::parse(sent.query()).expect("the sent body");
+        match body.channel {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 702);
+                assert_eq!(channel.access_hash, 777);
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.username, "somechannel");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::checkChatUsernameResultOk(_))
+        ));
+
+        // 2. the false Bool band — Occupied
+        td.request(
+            2,
+            Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: channel_dialog,
+                username: "taken".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_checkUsername::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::checkChatUsernameResultUsernameOccupied(_))
+        ));
+
+        // 3. the error→result mapping bands — every mapped name answers
+        //    its result variant
+        type ObjectMatcher = fn(&Object) -> bool;
+        let mapped: &[(u64, &str, ObjectMatcher)] = &[
+            (3, "USERNAME_OCCUPIED", |o| {
+                matches!(o, Object::checkChatUsernameResultUsernameOccupied(_))
+            }),
+            (4, "USERNAME_INVALID", |o| {
+                matches!(o, Object::checkChatUsernameResultUsernameInvalid(_))
+            }),
+            (5, "CHANNELS_ADMIN_PUBLIC_TOO_MUCH", |o| {
+                matches!(o, Object::checkChatUsernameResultPublicChatsTooMany(_))
+            }),
+            (6, "CHANNEL_PUBLIC_GROUP_NA", |o| {
+                matches!(o, Object::checkChatUsernameResultPublicGroupsUnavailable(_))
+            }),
+            (7, "USERNAME_PURCHASE_AVAILABLE", |o| {
+                matches!(o, Object::checkChatUsernameResultUsernamePurchasable(_))
+            }),
+        ];
+        for (n, name, is_expected) in mapped {
+            td.request(
+                *n,
+                Function::checkChatUsername(td_api::checkChatUsername {
+                    chat_id: channel_dialog,
+                    username: "checked".to_owned(),
+                }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::channels_checkUsername::ID,
+            );
+            net_fail(sent, 400, name);
+            td.dispatch_completed_dialog_net();
+            td.flush_deferred_results();
+            let responses = responses_of(&callback, *n);
+            let Some(response) = responses.first() else {
+                panic!("case {n} ({name}): no response");
+            };
+            assert!(
+                is_expected(response),
+                "case {n} ({name}): wrong response variant"
+            );
+        }
+        // the unmapped error forwards
+        td.request(
+            8,
+            Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: channel_dialog,
+                username: "checked".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_checkUsername::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_9");
+
+        // 4. the creator gate — a member channel answers the 400 BEFORE
+        //    the park
+        td.request(
+            9,
+            Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: member_dialog,
+                username: "somechannel".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 9);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Not enough rights to change username");
+        assert_not_sent(
+            &rec,
+            telegram_api::channels_checkUsername::ID,
+            "the creator band",
+        );
+
+        // 5. the editable-username fast path — the own username answers
+        //    Ok without a query
+        td.request(
+            10,
+            Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: username_dialog,
+                username: "myownname".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 10).first(),
+            Some(Object::checkChatUsernameResultOk(_))
+        ));
+        assert_not_sent(
+            &rec,
+            telegram_api::channels_checkUsername::ID,
+            "the fast path",
+        );
+
+        // 6. the bot leg — checkBotUsername rides bots.checkUsername
+        //    (the None dialog + the is_bot flag)
+        td.request(
+            11,
+            Function::checkBotUsername(td_api::checkBotUsername {
+                username: "somebot".to_owned(),
+                is_secondary: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_checkUsername::ID,
+        );
+        let body = telegram_api::bots_checkUsername::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 0);
+        assert!(!body.additional);
+        assert_eq!(body.username, "somebot");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 11).first(),
+            Some(Object::checkChatUsernameResultOk(_))
+        ));
+
+        // 7. the basic-group band — a chat can't have a username
+        td.request(
+            12,
+            Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: group_dialog,
+                username: "nope".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 12);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "The chat can't have a username");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn chat_migration_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_migration_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_migration_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-migrate-chat");
+        seed_dialog_chats(&mut td);
+        // a member basic group — the creator-gate band
+        seed_dialog_basic_group(&mut td, 711, false);
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        let member_group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(711))
+                .get();
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let migrated_updates_answer = |with_channel: bool| {
+            let mut chat = telegram_api::chat {
+                creator: true,
+                id: 701,
+                title: "group".to_owned(),
+                ..telegram_api::chat::default()
+            };
+            if with_channel {
+                // the MIGRATED_TO_MASK flag bit gates the optional wire
+                // field (the direct-struct seeds never serialize, so the
+                // bit matters only on this stored answer)
+                chat.flags |= 1 << 6;
+                chat.migrated_to = Some(telegram_api::InputChannel::inputChannel(
+                    telegram_api::inputChannel {
+                        channel_id: 800,
+                        access_hash: 999,
+                    },
+                ));
+            }
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: vec![telegram_api::Chat::chat(chat)],
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+        let empty_updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. the creator gate — a member basic group answers the 400
+        //    BEFORE the park
+        td.request(
+            1,
+            Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: member_group_dialog,
+                },
+            ),
+        );
+        let error = error_of(&callback, 1);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Need creator rights in the chat");
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_migrateChat::ID,
+            "the creator band",
+        );
+
+        // 2. the type band — a channel can't be migrated
+        td.request(
+            2,
+            Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: channel_dialog,
+                },
+            ),
+        );
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 400);
+        assert_eq!(
+            error.message,
+            "Only basic group chats can be converted to supergroup"
+        );
+
+        // 3. the creator group — messages.migrateChat; a hard error
+        //    forwards through the query promise
+        td.request(
+            3,
+            Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: group_dialog,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_migrateChat::ID,
+        );
+        let body = telegram_api::messages_migrateChat::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.chat_id, 701);
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_5");
+
+        // 4. the migration answer without the migrated chat — the
+        //    on_migrate head answers the 500 "Supergroup not found"
+        td.request(
+            4,
+            Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: group_dialog,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_migrateChat::ID,
+        );
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Supergroup not found");
+
+        // 5. the full migration answer — the intake sets the migrated-to
+        //    channel and creates its record; the object tail parks at the
+        //    M.10.20-22 chat-object residue
+        td.request(
+            5,
+            Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: group_dialog,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_migrateChat::ID,
+        );
+        net_complete(sent, migrated_updates_answer(true));
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Network is not implemented yet");
+
+        // 6. the migrated fast path — the record now carries the
+        //    migrated-to channel, so the request takes the
+        //    on_migrate_chat_to_megagroup arm with NO query out
+        td.request(
+            6,
+            Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: group_dialog,
+                },
+            ),
+        );
+        td.flush_deferred_results();
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_migrateChat::ID,
+            "the fast path",
+        );
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Network is not implemented yet");
+
         assert!(td.dialog_net_completed.lock().is_empty(), "drained");
     }
 
