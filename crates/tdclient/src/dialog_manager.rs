@@ -479,34 +479,13 @@ pub fn get_dialog_info_full(
     }
 }
 
-/// `DialogManager::reload_dialog_info_full` (DialogManager.cpp:1656-1682);
-/// every branch needs a server query (stub inventory).
-pub fn reload_dialog_info_full(td: &mut Td, dialog_id: DialogId, _source: &str) {
-    if td.global.close_flag() {
-        return;
-    }
-
-    tracing::info!(
-        "Reload full info about {:?} from {}",
-        dialog_id.get(),
-        _source
-    );
-    match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User
-        | crate::dialog_id::DialogType::Chat
-        | crate::dialog_id::DialogType::Channel => {
-            // M.6 stub: the *_full reload queries ([blocked: net])
-        }
-        crate::dialog_id::DialogType::SecretChat => {}
-        crate::dialog_id::DialogType::None => {}
-    }
-}
-
 /// `DialogManager::on_dialog_info_full_invalidated` (DialogManager.cpp:1684-1686)
 /// — the `is_dialog_opened` MessagesManager call is stubbed to `false`
 /// (stub inventory).
 pub fn on_dialog_info_full_invalidated(_td: &mut Td, _dialog_id: DialogId) {
-    // M.6 stub: messages_manager_->is_dialog_opened → reload_dialog_info_full
+    // M.6 stub: messages_manager_->is_dialog_opened gates the full-info
+    // reload, which lands with the user/chat/channel full-reload
+    // families (§3.3/§3.4).
 }
 
 // M.6.16 — builders, predicates and error mapping.
@@ -765,7 +744,9 @@ pub fn on_get_dialog_error(
         return true;
     }
     if message == "SEND_AS_PEER_INVALID" {
-        reload_dialog_info_full(td, dialog_id, "SEND_AS_PEER_INVALID");
+        // C++: reload_dialog_info_full (DialogManager.cpp:1656-1682)
+        // here — the full-info reload lands with the user/chat/channel
+        // full-reload families (§3.3/§3.4).
         return true;
     }
     if message == "QUOTE_TEXT_INVALID"
@@ -1871,6 +1852,9 @@ pub fn on_get_blocked_dialogs(
 
 /// `DialogManager::reget_peer_settings` (DialogManager.cpp:3480-3485) — the
 /// `GetPeerSettingsQuery` send is [blocked: net] (stub inventory).
+/// Keep: no trigger yet — lands with the peer-settings update refire
+/// (the C++ internal caller, DialogManager.cpp:609).
+#[allow(dead_code)]
 pub fn reget_peer_settings(td: &mut Td, dialog_id: DialogId) {
     if !have_input_peer(td, dialog_id, false, AccessRights::Read)
         || is_monoforum_channel(td, dialog_id)
@@ -2362,21 +2346,11 @@ pub fn toggle_dialog_view_as_messages_on_server(
     log_event_id
 }
 
-/// `DialogManager::set_dialog_available_reactions_on_server`
-/// (DialogManager.cpp:3622-3627) — called from the ChatManager reaction
-/// setters; the `ChatReactions` record and the
-/// `SetChatAvailableReactionsQuery` send land with those steps (stub
-/// inventory).
-pub fn set_dialog_available_reactions_on_server(
-    _td: &mut Td,
-    _dialog_id: DialogId,
-    mut promise: Promise<()>,
-) {
-    promise_unimplemented(&mut promise);
-}
-
 /// `DialogManager::set_dialog_default_send_as_on_server`
-/// (DialogManager.cpp:3628-3632).
+/// (DialogManager.cpp:3628-3632). Keep: zero callers — the td_api arm is
+/// a placeholder that never calls it; this is the correct net tail and
+/// lands with the dialog net slice (§3.4).
+#[allow(dead_code)]
 pub fn set_dialog_default_send_as_on_server(
     _td: &mut Td,
     _dialog_id: DialogId,
@@ -2387,7 +2361,10 @@ pub fn set_dialog_default_send_as_on_server(
 }
 
 /// `DialogManager::set_dialog_folder_id_on_server`
-/// (DialogManager.cpp:3633-3637).
+/// (DialogManager.cpp:3633-3637). Keep: zero callers — the td_api arm is
+/// a placeholder that never calls it; this is the correct net tail and
+/// lands with the dialog net slice (§3.4).
+#[allow(dead_code)]
 pub fn set_dialog_folder_id_on_server(
     _td: &mut Td,
     _dialog_id: DialogId,
@@ -2398,7 +2375,10 @@ pub fn set_dialog_folder_id_on_server(
 }
 
 /// `DialogManager::set_dialog_message_ttl_on_server`
-/// (DialogManager.cpp:3638-3641).
+/// (DialogManager.cpp:3638-3641). Keep: zero callers — the td_api arm is
+/// a placeholder that never calls it; this is the correct net tail and
+/// lands with the dialog net slice (§3.4).
+#[allow(dead_code)]
 pub fn set_dialog_message_ttl_on_server(
     _td: &mut Td,
     _dialog_id: DialogId,
@@ -3728,11 +3708,10 @@ pub fn drop_username(td: &mut Td, username: &str) {
 
     match manager.resolved_usernames.get(&cleaned_username) {
         Some(resolved_username) if resolved_username.dialog_id.is_valid() => {
-            let dialog_id = resolved_username.dialog_id;
-            if have_input_peer(td, dialog_id, false, AccessRights::Read) {
-                reload_dialog_info_full(td, dialog_id, "drop_username");
-            }
-
+            // C++: when the resolved dialog's input peer is readable it
+            // reloads the full info here (reload_dialog_info_full,
+            // DialogManager.cpp:1656-1682) — that reload lands with the
+            // user/chat/channel full-reload families (§3.3/§3.4).
             manager.resolved_usernames.remove(&cleaned_username);
         }
         _ => {}

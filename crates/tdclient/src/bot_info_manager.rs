@@ -12,8 +12,9 @@
 //! Seams:
 //! - Every `Td::ResultHandler` send is a [`BotInfoManagerEnv`] query seam —
 //!   `tdutils::log_info!` of the query name + the promise parked in the
-//!   manager (`[blocked: net]`, the M.31 GetUniqueGiftChatThemesQuery
-//!   convention). The C++ keeps the free-function families' promises
+//!   manager (`[blocked: net]`, the M.31 SetBotCommandsQuery
+//!   convention; the former GetUniqueGiftChatThemesQuery example is
+//!   net-live). The C++ keeps the free-function families' promises
 //!   (BotCommand.cpp/BotMenuButton.cpp/BotQueries.cpp handlers) in
 //!   Td-owned ResultHandlers; the manager is the bot state home in the
 //!   collapsed Rust Td, so those park here too — `hangup` fails them with

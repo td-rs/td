@@ -7801,9 +7801,10 @@ impl UserManager {
 
     // ------------------------------------------------------------------
     // M.4 tails: the profile-note/tab/birthdate setters, the photo-set
-    // family and the support-user/emoji-status query planes
-    // (UserManager.cpp:5981-6835, 7178-7212 + EmojiStatus.cpp:571-637).
-    // Every net query send is the [blocked: net] park; the file-coupled
+    // family and the support-user query planes
+    // (UserManager.cpp:5981-6835, 7178-7212). The setters' and
+    // support-user sends park [blocked: net]; the emoji-status planes
+    // ride the `net` handle (live since d5c9b66); the file-coupled
     // photo legs stay the Files-slice seams.
 
     /// `UserManager::set_user_note` (UserManager.cpp:6440-6466). The
@@ -8136,8 +8137,8 @@ impl UserManager {
     }
 
     // --- the emoji-status query planes (EmojiStatus.cpp:571-637) —
-    // the cached lists answer here; the hash-revalidation query sends
-    // are [blocked: net] ---
+    // the cached lists answer here; the hash-revalidation queries
+    // ride the `net` handle (live since d5c9b66) ---
 
     // ------------------------------------------------------------------
     // The emoji-status family net slice (EmojiStatus.cpp:165-352) — the
