@@ -5080,10 +5080,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_object_slot(td, id, slot);
         }
 
-        // setChatEmojiStatus needs the td_api emojiStatus → EmojiStatus
-        // conversion (the collectible variants arrive with the emoji-status
-        // read surface), and reportChatPhoto needs ReportReason — both stay
-        // interim with those gaps.
+        // setChatEmojiStatus and reportChatPhoto ride the dispatcher
+        // since the §2 flips (e26f545 / d287c84) — the emoji-status
+        // conversion and the ReportReason port landed with them.
 
         // --- the chat-manager request family (M.5.47, folded in at the
         // integration-m6b merge) — each local-validating entry settles its
