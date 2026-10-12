@@ -95,6 +95,7 @@ use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
 use crate::phone_number_manager::{PhoneAnswer, PhoneNumberManager, PhonePendingKind};
 use crate::photo::{Dimensions, Photo, PhotoSize};
+use crate::query_combiner::QueryCombiner;
 use crate::query_merger::QueryMerger;
 use crate::requests;
 use crate::session_multi_proxy::{NetRouter, NetShared, PublicRsaKeySharedMain, RouterSink};
@@ -3769,6 +3770,15 @@ pub struct Td {
     /// queries).
     #[allow(dead_code)]
     premium_required_contact_merger: Option<ActorOwn<QueryMerger>>,
+    /// The GetUserMerger actor (`get_user_queries_`, UserManager.h:1310 —
+    /// "GetUserMerger", 3, 50); same ownership shape as the
+    /// premium-required twin.
+    #[allow(dead_code)]
+    get_user_merger: Option<ActorOwn<QueryMerger>>,
+    /// The GetUserFullCombiner actor (`get_user_full_queries_`,
+    /// UserManager.h:1314 — "GetUserFullCombiner", 2.0).
+    #[allow(dead_code)]
+    get_user_full_combiner: Option<ActorOwn<QueryCombiner>>,
     /// `Td::chat_manager_` — the basic-group/supergroup cache (created with
     /// Td; its binlog replay rides the same `process_binlog_events` pass as
     /// the users, in the C++ users→chats→channels order).
@@ -4309,6 +4319,8 @@ impl Td {
             attach_menu_manager: crate::attach_menu_manager::AttachMenuManager::new(),
             attach_menu_updates: Vec::new(),
             premium_required_contact_merger: None,
+            get_user_merger: None,
+            get_user_full_combiner: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
             updates_manager: UpdatesManager::new(TdSink::default()),
@@ -5054,13 +5066,14 @@ impl Td {
         self.config_recoverer = Some(recoverer);
         self.apply_recoverer_actions(recoverer_actions);
 
-        // The UserManager member actors (the C++ `get_is_premium_required_
-        // to_contact_queries_` value member + its `set_merge_function`;
-        // the Rust merger is an actor whose merge function messages the Td
-        // actor to build the input users and send the query). Both need the
-        // scheduler context — the direct-call tests run bare, leaving the
-        // merger unwired (its uncached consumers answer the "Request
-        // aborted" surface, like the C++ close state).
+        // The UserManager member actors (the C++ value members + their
+        // `set_merge_function`s: `get_is_premium_required_to_contact_
+        // queries_`, `get_user_queries_` and `get_user_full_queries_`;
+        // the Rust merger/combiner are actors whose functions message the
+        // Td actor to build the input users and send the query). All need
+        // the scheduler context — the direct-call tests run bare, leaving
+        // them unwired (their uncached consumers park like offline
+        // queries, the C++ close state analogue).
         if tdactor::Scheduler::in_scheduler_context() {
             let td_id = self.actor_id_of::<Td>();
             let merger = tdactor::create_actor(
@@ -5082,6 +5095,43 @@ impl Td {
             self.user_manager.get_is_premium_required_to_contact_queries = Some(merger.get());
             self.premium_required_contact_merger = Some(merger);
             self.user_manager.td_actor_id = Some(self.actor_id_of::<Td>());
+
+            // `get_user_queries_{"GetUserMerger", 3, 50}` (UserManager.h:1310
+            // + the merge function cpp:2798-2802)
+            let td_id = self.actor_id_of::<Td>();
+            let get_user_merger = tdactor::create_actor(
+                "GetUserMerger",
+                QueryMerger::new(
+                    3,
+                    50,
+                    Box::new(move |query_ids, promise| {
+                        tdactor::send_closure(
+                            td_id.clone(),
+                            MergeGetUserQueries {
+                                user_ids: query_ids,
+                                promise,
+                            },
+                        );
+                    }),
+                ),
+            );
+            self.user_manager.get_user_queries = Some(get_user_merger.get());
+            self.get_user_merger = Some(get_user_merger);
+
+            // `get_user_full_queries_{"GetUserFullCombiner", 2.0}`
+            // (UserManager.h:1314) — the QueryCombiner's `G()->
+            // close_flag()` gate reads the shared close probe
+            // (Global::set_close_flag keeps it in step).
+            let close_probe = self.global.shared_close_flag();
+            let get_user_full_combiner = tdactor::create_actor(
+                "GetUserFullCombiner",
+                QueryCombiner::new(
+                    2.0,
+                    Box::new(move || close_probe.load(std::sync::atomic::Ordering::Relaxed)),
+                ),
+            );
+            self.user_manager.get_user_full_queries = Some(get_user_full_combiner.get());
+            self.get_user_full_combiner = Some(get_user_full_combiner);
         }
 
         self.parameters = Some(parameters);
@@ -6518,6 +6568,13 @@ impl Td {
             };
             self.on_walking_answer(request_id, kind, query);
         }
+        // The net-answer completions resolve deferred request promises
+        // (the merger/combiner re-runs, the manager flows). Their chains
+        // queue further actor messages first — schedule the flush behind
+        // them, like `request` flushes after `run_request`.
+        if tdactor::Scheduler::in_scheduler_context() {
+            tdactor::send_closure_later(self.actor_id_of::<Td>(), TdMessage::FlushDeferred);
+        }
     }
 
     /// The cloned updates dispatch surface for the env builders — `None`
@@ -7886,8 +7943,8 @@ impl Td {
     }
 
     /// Route one user net answer by kind — the parse legs front the
-    /// manager intakes (the cache save, the notModified 500 band, the
-    /// promise flush).
+    /// manager intakes (the users core cpp:1427-1803, the emoji-status
+    /// cache saves, the notModified 500 band, the promise flushes).
     fn on_user_net_answer(&mut self, kind: crate::user_manager::UserNetKind, query: NetQuery) {
         fn parse_error(what: &str) -> Status {
             Status::error(500, &format!("Failed to parse the {what} answer"))
@@ -7904,6 +7961,97 @@ impl Td {
             auth_is_bot: is_bot,
         };
         match kind {
+            crate::user_manager::UserNetKind::GetUsers => {
+                // `GetUsersQuery::on_result`/`on_error` (cpp:1427-1445)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_get_users_answer(query.ok()).map_err(|_| parse_error("users_getUsers"))
+                };
+                match result {
+                    Ok(users) => {
+                        user_manager.on_get_users(&mut env, users, "GetUsersQuery");
+                        if let Some(mut promise) = user_manager.take_get_users_query_promise() {
+                            promise.set_value(());
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) = user_manager.take_get_users_query_promise() {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::GetFullUser => {
+                // `GetFullUserQuery::on_result`/`on_error` (cpp:1461-1481):
+                // the users/chats pre-application, then the full record
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::users_UserFull::parse(query.ok())
+                        .map_err(|_| parse_error("users_getFullUser"))
+                };
+                match result {
+                    Ok(answer) => {
+                        let telegram_api::users_UserFull {
+                            full_user,
+                            chats,
+                            users,
+                        } = answer;
+                        user_manager.on_get_users(&mut env, users, "GetFullUserQuery");
+                        let mut chat_manager = std::mem::take(&mut self.chat_manager);
+                        chat_manager.on_get_chats(
+                            &mut user_manager,
+                            &mut env,
+                            chats,
+                            "GetFullUserQuery",
+                        );
+                        self.chat_manager = chat_manager;
+                        // the parse always fills the record; the default
+                        // arm only keeps the type flat
+                        user_manager.on_get_user_full(&mut env, full_user.unwrap_or_default());
+                        if let Some(mut promise) = user_manager.take_get_full_user_query_promise() {
+                            promise.set_value(());
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) = user_manager.take_get_full_user_query_promise() {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::GetRequirementsToContact => {
+                // `GetIsPremiumRequiredToContactQuery::on_result`/
+                // `on_error` (cpp:1788-1803) — the user ids ride the
+                // family queue (the handler's `user_ids_` member)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_vector_requirement_to_contact(query.ok())
+                        .map_err(|_| parse_error("users_getRequirementsToContact"))
+                };
+                match result {
+                    Ok(requirements) => {
+                        if let Some((user_ids, promise)) =
+                            user_manager.take_get_requirements_to_contact_query()
+                        {
+                            user_manager.on_get_is_premium_required_to_contact_users(
+                                user_ids,
+                                requirements,
+                                promise,
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        if let Some((_, mut promise)) =
+                            user_manager.take_get_requirements_to_contact_query()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
             crate::user_manager::UserNetKind::GetDefault => {
                 let result = if query.is_error() {
                     Err(query.error().clone())
@@ -14921,6 +15069,38 @@ impl FileHashUploaderNet for LiveHashNet {
     }
 }
 
+/// `Vector<user>` — the `users_getUsers` result (the merged GetUserMerger
+/// batches; the elements ride boxed, like the generated vector readers).
+fn parse_get_users_answer(data: &[u8]) -> Result<Vec<telegram_api::User>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut users = Vec::with_capacity(count);
+    for _ in 0..count {
+        users.push(telegram_api::User::read(&mut reader)?);
+    }
+    Ok(users)
+}
+
+/// `Vector<RequirementToContact>` — the `users_getRequirementsToContact`
+/// result.
+fn parse_vector_requirement_to_contact(
+    data: &[u8],
+) -> Result<Vec<telegram_api::RequirementToContact>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut requirements = Vec::with_capacity(count);
+    for _ in 0..count {
+        requirements.push(telegram_api::RequirementToContact::read(&mut reader)?);
+    }
+    Ok(requirements)
+}
+
 /// `Vector<fileHash>` (the `upload.getFileHashes`/`upload.reuploadCdnFile`
 /// result).
 fn parse_vector_file_hash(data: &[u8]) -> Result<Vec<telegram_api::FileHash>, &'static str> {
@@ -15172,6 +15352,11 @@ actor_messages! {
         /// wakes the actor to drain them (the C++
         /// `send_closure_later(G()->td(), ...)`.
         DrainNetEvents => drain_net_events(),
+        /// The end-of-turn deferred-outbox flush — queued behind the
+        /// actor messages a net-answer drain emitted (the merger/combiner
+        /// re-runs), so their deferred completions answer in the same
+        /// wake (the `request` end-of-turn hop for the net plane).
+        FlushDeferred => flush_deferred_results(),
     }
 }
 
@@ -17022,9 +17207,10 @@ impl crate::call_manager::CallManagerEnv for CallEnv<'_> {
 
 /// The premium-required-to-contact QueryMerger merge function: build the
 /// input users and send the merged `users.getRequirementsToContact`
-/// query. The query send is [blocked: net] and answers the C++ error
-/// surface until M.4.16 wires it (which then routes the answer through
-/// `UserManager::on_get_is_premium_required_to_contact_users`).
+/// query (the merge function cpp:2803-2811 +
+/// `GetIsPremiumRequiredToContactQuery::send` cpp:1783-1786). The answer
+/// routes through
+/// `UserManager::on_get_is_premium_required_to_contact_users`.
 struct MergePremiumRequiredContactQueries {
     user_ids: Vec<i64>,
     promise: Promise<()>,
@@ -17050,15 +17236,54 @@ impl tdactor::ActorMessage for MergePremiumRequiredContactQueries {
                 .promise
                 .set_error(Status::error(500, "Request aborted"));
         }
+        // `transform(user_ids, get_input_user_force)` — every id rides
+        // the query (the unknown ids take the zero access-hash form)
         let user_ids: Vec<UserId> = self.user_ids.iter().map(|id| UserId::new(*id)).collect();
-        let input_users = td.user_manager.get_input_users_force(&env, &user_ids);
-        let _ = input_users; // the GetIsPremiumRequiredToContactQuery payload
-        tdutils::log_info!(
-            "Get requirements to contact {} users — [blocked: net]",
-            user_ids.len()
-        );
-        self.promise
-            .set_error(Status::error(500, "Network is not implemented yet"));
+        let input_users = user_ids
+            .iter()
+            .map(|user_id| td.user_manager.get_input_user_force(&env, *user_id))
+            .collect();
+        td.user_manager
+            .send_get_requirements_to_contact_query(user_ids, input_users, self.promise);
+    }
+}
+
+/// The GetUserMerger merge function (cpp:2798-2802): build the input
+/// users and send the merged `users.getUsers` query
+/// (`GetUsersQuery::send` cpp:1436-1438). The answer feeds
+/// `UserManager::on_get_users` and flushes the merger's result promise.
+struct MergeGetUserQueries {
+    user_ids: Vec<i64>,
+    promise: Promise<()>,
+}
+
+impl tdactor::ActorMessage for MergeGetUserQueries {
+    type Actor = Td;
+
+    fn dispatch(mut self, td: &mut Td) {
+        let Some(options) = td.option_manager.as_mut() else {
+            // the C++ TRY_STATUS_PROMISE(promise, G()->close_status())
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        };
+        let env = UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        if env.global.close_flag() {
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        }
+        let input_users = self
+            .user_ids
+            .iter()
+            .map(|id| td.user_manager.get_input_user_force(&env, UserId::new(*id)))
+            .collect();
+        td.user_manager
+            .send_get_users_query(input_users, self.promise);
     }
 }
 
@@ -20073,9 +20298,25 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
         this.user_manager.on_update_phone_number_privacy(&user_env);
     }
 
-    fn reload_user(&mut self, _user_id: crate::user_manager::UserId, _source: &str) {
-        // `UserManager::reload_user` — the user-reload plane
-        // (`[blocked: user-reload]`, the stub inventory).
+    fn reload_user(&mut self, user_id: crate::user_manager::UserId, source: &str) {
+        // `UserManager::reload_user(user_id, Promise<Unit>(), source)`
+        // (GlobalPrivacySettings.cpp:253) — the empty-promise refetch
+        // over the GetUserMerger
+        let this = &mut *self.td;
+        let mut user_env = UserEnv {
+            global: &mut this.global,
+            options: this
+                .option_manager
+                .as_mut()
+                .expect("user requests run with the initialized option manager"),
+            auth_is_bot: this.auth_manager.is_bot(),
+        };
+        this.user_manager.reload_user(
+            &mut user_env,
+            user_id,
+            tdutils::promise::Promise::default(),
+            source,
+        );
     }
 
     fn hide_archive_and_mute_suggested_action(&mut self) {
@@ -22028,9 +22269,10 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
 
     fn reload_user_full(&mut self, user_id: crate::user_manager::UserId, promise: Promise<()>) {
         // `UserManager::reload_user_full` (the users.getFullUser reload)
-        // is [blocked: net]; the forwarded promise dies here like the
-        // other net tails — the request stays unanswered until the net
-        // step lands
+        // rides the GetUserFullCombiner now; the §3.2 flip (the
+        // SetBotInfoQuery/DeletePreviewMediaQuery on_result tails) wires
+        // the forward — until then the tail stays [blocked: net] and the
+        // forwarded promise dies here
         let _ = (user_id, promise);
         tdutils::log_info!("UserManager::reload_user_full — [blocked: net]");
     }
@@ -32696,6 +32938,445 @@ mod tests {
         ));
 
         assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the users-core net slice (§3.1 #1-#3): the GetUserMerger and
+    // the premium-required merger ride the dispatcher through their Td
+    // merge-function messages, the GetUserFullCombiner through its send
+    // leg. The merger/combiner actors need the scheduler context, so the
+    // netted harness drives the exact message code the actors run. ----
+
+    /// One wire user record with a full access hash and a first name
+    /// (the `on_get_users` intake accepts it as received).
+    fn wire_user(id: i64, first_name: &str) -> telegram_api::User {
+        telegram_api::User::user(telegram_api::user {
+            flags: 1 | (1 << 1), // access_hash present + first_name, not min
+            access_hash: 42,
+            id,
+            first_name: first_name.to_owned(),
+            ..telegram_api::user::default()
+        })
+    }
+
+    /// A boxed `Vector<User>` answer (the users.getUsers result shape).
+    fn users_vector_answer(user: telegram_api::User) -> Vec<u8> {
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&1i32.to_le_bytes());
+        user.store(&mut answer);
+        answer
+    }
+
+    /// A boxed `Vector<RequirementToContact>` answer (the
+    /// users.getRequirementsToContact result shape).
+    fn requirements_vector_answer(requirement: telegram_api::RequirementToContact) -> Vec<u8> {
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&1i32.to_le_bytes());
+        requirement.store(&mut answer);
+        answer
+    }
+
+    /// The sent payload of a query, parsed back into the function.
+    fn sent_function(query: &NetQuery) -> telegram_api::Function {
+        telegram_api::Function::parse(query.query()).expect("the sent payload parses")
+    }
+
+    #[test]
+    fn user_get_users_merger_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_get_users_merger_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_get_users_merger_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-user-get-users");
+
+        // 1. the merge-function half (cpp:2798-2802): the merged batch
+        //    dispatches users.getUsers with the force input users (the
+        //    unknown id takes the zero access-hash form).
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergeGetUserQueries {
+                user_ids: vec![5],
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getUsers::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::users_getUsers(payload) => match &payload.id[..] {
+                [telegram_api::InputUser::inputUser(input_user)] => {
+                    assert_eq!((input_user.user_id, input_user.access_hash), (5, 0));
+                }
+                other => panic!("the merged payload: {other:?}"),
+            },
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the happy-path answer: on_get_users caches the record and
+        //    the merger's result promise flushes (cpp:1427-1438).
+        net_complete(sent, users_vector_answer(wire_user(5, "Alice")));
+        td.dispatch_completed_user_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.user_manager
+                .have_min_user(crate::user_manager::UserId::new(5))
+        );
+
+        // 3. the error band forwards to the promise (the handler's
+        //    on_error, cpp:1440-1444)
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergeGetUserQueries {
+                user_ids: vec![5],
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getUsers::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (420, "FLOOD_WAIT_5"));
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn user_get_full_user_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_get_full_user_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_get_full_user_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-user-get-full");
+
+        // 1. the combiner's send leg (`GetFullUserQuery::send`, the
+        //    send_query lambda resolution of cpp:8963-8970): the query
+        //    goes out with the parked result promise.
+        let (promise, slot) = record_ton_unit();
+        let input_user = telegram_api::InputUser::inputUser(telegram_api::inputUser {
+            user_id: 5,
+            access_hash: 42,
+        });
+        td.user_manager
+            .send_get_full_user_query(input_user, promise);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getFullUser::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::users_getFullUser(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.id.expect("the input user rides the query")
+                else {
+                    panic!("the full-user query rides a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (5, 42));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the happy-path answer (cpp:1469-1476): the users pre-apply,
+        //    the full record caches, the promise flushes.
+        let mut answer = Vec::new();
+        telegram_api::users_UserFull {
+            full_user: Some(telegram_api::UserFull {
+                id: 5,
+                ..telegram_api::UserFull::default()
+            }),
+            chats: Vec::new(),
+            users: vec![wire_user(5, "Alice")],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_user_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.user_manager
+                .get_user_full(crate::user_manager::UserId::new(5))
+                .is_some()
+        );
+
+        // 3. the error band forwards to the promise (cpp:1478-1481)
+        let (promise, slot) = record_ton_unit();
+        td.user_manager.send_get_full_user_query(
+            telegram_api::InputUser::inputUser(telegram_api::inputUser {
+                user_id: 5,
+                access_hash: 42,
+            }),
+            promise,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getFullUser::ID,
+        );
+        net_fail(sent, 400, "USER_ID_INVALID");
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "USER_ID_INVALID"));
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn user_requirements_to_contact_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_requirements_to_contact_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_requirements_to_contact_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-user-requirements");
+
+        // seed a received user so the input-user build rides its access
+        // hash (the merge function's transform, cpp:2803-2811)
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(7, "Bob")], "t");
+        });
+
+        // 1. the merge-function half: the merged query dispatches with
+        //    the user's access hash.
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergePremiumRequiredContactQueries {
+                user_ids: vec![7],
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getRequirementsToContact::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::users_getRequirementsToContact(payload) => {
+                match &payload.id[..] {
+                    [telegram_api::InputUser::inputUser(input_user)] => {
+                        assert_eq!((input_user.user_id, input_user.access_hash), (7, 42));
+                    }
+                    other => panic!("the merged payload: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the premium-required answer caches the price and flushes
+        //    the promise (cpp:1788-1798 + the intake cpp:7854-7882)
+        net_complete(
+            sent,
+            requirements_vector_answer(
+                telegram_api::RequirementToContact::requirementToContactPremium(
+                    telegram_api::requirementToContactPremium,
+                ),
+            ),
+        );
+        td.dispatch_completed_user_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.user_manager
+                .get_user_full(crate::user_manager::UserId::new(7))
+                .is_none()
+        );
+
+        // 3. the length-mismatch band answers the C++ 500 (the intake's
+        //    error, cpp:7860-7863)
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergePremiumRequiredContactQueries {
+                user_ids: vec![7, 8],
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getRequirementsToContact::ID,
+        );
+        net_complete(
+            sent,
+            requirements_vector_answer(
+                telegram_api::RequirementToContact::requirementToContactEmpty(
+                    telegram_api::requirementToContactEmpty,
+                ),
+            ),
+        );
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(
+                    (status.code(), status.message()),
+                    (500, "Receive invalid response")
+                );
+            }
+            other => panic!("the mismatch band: {other:?}"),
+        }
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// Test-only Td message: swap the net dispatcher for the recorder
+    /// (the netted_td field assignments, delivered inside the actor).
+    struct InstallRecordingNet(Arc<RecNetSession>);
+
+    impl tdactor::ActorMessage for InstallRecordingNet {
+        type Actor = Td;
+
+        fn dispatch(self, td: &mut Td) {
+            let dispatcher = NetQueryDispatcher::new(
+                Box::new(RecNetSessionHandle(self.0)),
+                Box::new(NullConfigSink),
+                Box::new(AcceptingDcInitSink),
+            );
+            dispatcher.mark_dc_inited(1);
+            td.net_query_dispatcher = Some(Arc::new(dispatcher));
+            td.user_manager.net = td.user_net();
+        }
+    }
+
+    /// Test-only Td message: set `my_id` without the user record — the
+    /// merger-park band of `get_user` (the C++ `get_me` shape: the self
+    /// input user exists, the record does not).
+    struct SeedMyId(i64);
+
+    impl tdactor::ActorMessage for SeedMyId {
+        type Actor = Td;
+
+        fn dispatch(self, td: &mut Td) {
+            td.auth_manager.force_authorized_for_test();
+            let mut env = UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.user_manager
+                .set_my_id(&mut env, crate::user_manager::UserId::new(self.0));
+        }
+    }
+
+    #[test]
+    fn get_user_and_full_info_round_trip_the_live_arms() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("netfix-user-live-arm");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            let rec = Arc::new(RecNetSession {
+                sent: parking_lot::Mutex::new(Vec::new()),
+            });
+            {
+                let send_ptr = scheduler.send_scheduler();
+                let _guard = send_ptr.guard(false);
+                tdactor::send_closure(actor, InstallRecordingNet(rec.clone()));
+                tdactor::send_closure(actor, SeedMyId(500));
+            }
+            scheduler.run_main(0.01);
+
+            // 1. the live getUser arm: the miss parks on the GetUserMerger
+            //    (the self input user resolves, the record does not), the
+            //    merged users.getUsers rides the dispatcher, the answer
+            //    caches the record and the re-run completes the request.
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::getUser(td_api::getUser { user_id: 500 }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::users_getUsers::ID,
+            );
+            assert!(rec.sent.lock().is_empty(), "one merged query only");
+            match sent_function(&sent) {
+                telegram_api::Function::users_getUsers(payload) => match &payload.id[..] {
+                    [telegram_api::InputUser::inputUserSelf(_)] => {}
+                    other => panic!("the merged payload: {other:?}"),
+                },
+                other => panic!("the sent function: {other:?}"),
+            }
+            net_complete(sent, users_vector_answer(wire_user(500, "Eve")));
+            scheduler.run_main(0.05);
+            let responses = responses_of(callback, 2);
+            assert_eq!(responses.len(), 1, "getUser answers exactly once");
+            let Object::user(user) = &responses[0] else {
+                panic!("getUser answers the user object, got {:?}", responses[0]);
+            };
+            assert_eq!(user.id, 500);
+            assert_eq!(user.first_name, "Eve");
+
+            // 2. the live getUserFullInfo arm over the same user: the
+            //    missing full parks on the GetUserFullCombiner, the
+            //    combined users.getFullUser rides the dispatcher, the
+            //    answer caches the record and completes the request.
+            send(
+                actor,
+                scheduler,
+                3,
+                Function::getUserFullInfo(td_api::getUserFullInfo { user_id: 500 }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::users_getFullUser::ID,
+            );
+            let mut answer = Vec::new();
+            telegram_api::users_UserFull {
+                full_user: Some(telegram_api::UserFull {
+                    id: 500,
+                    ..telegram_api::UserFull::default()
+                }),
+                chats: Vec::new(),
+                users: vec![wire_user(500, "Eve")],
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            scheduler.run_main(0.05);
+            let responses = responses_of(callback, 3);
+            assert_eq!(responses.len(), 1, "getUserFullInfo answers exactly once");
+            let Object::userFullInfo(user_full_info) = &responses[0] else {
+                panic!(
+                    "getUserFullInfo answers the full-info object, got {:?}",
+                    responses[0]
+                );
+            };
+            let _ = user_full_info;
+            assert!(callback.errors.lock().iter().all(|(id, _)| *id != 3));
+        });
     }
 
     // ---- the §2 flip slice: the ported-but-intercepted td_api arms ride

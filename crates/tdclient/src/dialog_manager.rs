@@ -468,9 +468,8 @@ pub fn reload_dialog_info(_td: &mut Td, dialog_id: DialogId, mut promise: Promis
 }
 
 /// `DialogManager::get_dialog_info_full` (DialogManager.cpp:1633-1654). The
-/// C++ resolves the promise from the async load; here the user-full load
-/// runs inline (the M.4.16 park contract applies inside). The C++ forwards
-/// the caller's `source` into the load.
+/// user leg rides `UserManager::load_user_full` (the users.getFullUser
+/// combiner park); the C++ forwards the caller's `source` into the load.
 pub fn get_dialog_info_full(
     td: &mut Td,
     dialog_id: DialogId,
@@ -489,13 +488,8 @@ pub fn get_dialog_info_full(
                 options,
                 auth_is_bot: td.auth_manager.is_bot(),
             };
-            match td
-                .user_manager
-                .load_user_full(&mut env, user_id, false, source)
-            {
-                Ok(_) => promise.set_value(()),
-                Err(message) => promise.set_error(Status::error(400, message)),
-            }
+            td.user_manager
+                .load_user_full(&mut env, user_id, false, promise, source);
         }
         crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
             promise.set_error(Status::error(500, "Network is not implemented yet"));

@@ -1279,8 +1279,9 @@ pub(crate) trait PrivacyManagerEnv {
     #[allow(dead_code)] // do_update_privacy's fan-out (the intake plane)
     fn on_update_phone_number_privacy(&mut self);
 
-    /// `UserManager::reload_user` — the user-reload plane (the
-    /// unrestricted-user online-status refetch walk parks here).
+    /// `UserManager::reload_user(user_id, Promise<Unit>(), source)` —
+    /// the unrestricted-user online-status refetch walk (the GetUserMerger
+    /// park behind it).
     #[allow(dead_code)] // do_update_privacy's fan-out (the intake plane)
     fn reload_user(&mut self, user_id: UserId, source: &str);
 

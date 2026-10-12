@@ -66,10 +66,11 @@
 //!   `ChatManager::have_channel` gate is the `known_channels` stand-in,
 //!   empty until the ChatManager slice feeds it), `can_send_message_to_user`
 //!   with the `get_is_premium_required_to_contact_queries_` QueryMerger
-//!   (the merger actor is created by `Td::init`; its merge function's net
-//!   send is [blocked: net] and answers the C++ error surface until
-//!   M.4.16), the `user_full_contact_price_` cache + its intake
-//!   `on_get_is_premium_required_to_contact_users`, `allow_send_message_
+//!   (the merger actor is created by `Td::init`; the merged
+//!   `users.getRequirementsToContact` query rides the
+//!   the `UserManager` net handle), the `user_full_contact_price_` cache +
+//!   its intake `on_get_is_premium_required_to_contact_users`,
+//!   `allow_send_message_
 //!   to_user`, `share_phone_number` (parked in the contacts-load queue),
 //!   the noforwards-request registry + deadline map
 //!   (`register_noforwards_request`/`unregister_noforwards_request`/
@@ -87,8 +88,12 @@
 //!   updates, StoryManager, ReactionManager, ContactsManager hints,
 //!   OnlineManager, ConfigManager) are documented no-ops in
 //!   `update_user` until those managers land;
-//! - the network-backed paths (`reload_user`, `load_user_full` queries,
-//!   `QueryMerger`/`QueryCombiner`) stay with the net step;
+//! - the users-core net families ride the dispatcher: `get_user`/
+//!   `reload_user` park on the GetUserMerger (`get_user_queries_`),
+//!   `load_user_full`/`reload_user_full` on the GetUserFullCombiner
+//!   (`get_user_full_queries_`) — both created by `Td::init` — and the
+//!   answers drain through the `Td` net-answer chain
+//!   (`dispatch_completed_user_net`);
 //! - the read surface (cpp:5196-5880) ports the InputUser/InputPeer/
 //!   `inputEncryptedChat` construction, `get_bot_data` and the field
 //!   getters; the min-user fromMessage fallback (`user_messages_` +
@@ -98,7 +103,7 @@
 //!   `get_user_default_permissions`/`get_secret_chat_
 //!   default_permissions` and `get_bot_commands` carry
 //!   `RestrictedRights`/`BotCommands` from `DialogParticipant.h` into
-//!   the ChatManager slice, and `reload_user`/`send_get_me_query` are
+//!   the ChatManager slice, and `send_get_me_query` is
 //!   the net step;
 //! - the current codegen cannot express nullable td_api fields (the
 //!   nullability modeling lands with the S76 codegen merge), so
@@ -1853,12 +1858,26 @@ impl<'a> UserEnv<'a> {
 }
 
 /// The user-plane in-flight query kinds — the C++ ResultHandler classes
-/// of the emoji-status family (EmojiStatus.cpp:165-352). The kinds ride
-/// the `UserManager::net` handle (the `td_` back-pointer narrowed to
+/// of the landed families (the users core cpp:1432-1803, the emoji-status
+/// family EmojiStatus.cpp:165-352). The kinds ride the
+/// `UserManager::net` handle (the `td_` back-pointer narrowed to
 /// the net plane); the answers drain through
 /// [`Td::dispatch_completed_user_net`](crate::td::Td::dispatch_completed_user_net).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UserNetKind {
+    /// `GetUsersQuery` (cpp:1432) — the merged `users.getUsers` query of
+    /// the GetUserMerger; the answer feeds `on_get_users` and flushes
+    /// the merger's result promise.
+    GetUsers,
+    /// `GetFullUserQuery` (cpp:1459) — the combined `users.getFullUser`
+    /// query; the answer feeds `on_get_users`, `on_get_chats` and
+    /// `on_get_user_full`, then flushes the combiner's result promise.
+    GetFullUser,
+    /// `GetIsPremiumRequiredToContactQuery` (cpp:1777) — the merged
+    /// `users.getRequirementsToContact` query; the answer feeds
+    /// `on_get_is_premium_required_to_contact_users` (the user ids ride
+    /// the family queue — the handler's `user_ids_` member).
+    GetRequirementsToContact,
     /// `GetDefaultEmojiStatusesQuery` (cpp:165).
     GetDefault,
     /// `GetChannelDefaultEmojiStatusesQuery` (cpp:209).
@@ -2183,6 +2202,25 @@ pub struct UserManager {
     /// — the QueryMerger actor, created by the Td init.
     pub(crate) get_is_premium_required_to_contact_queries:
         Option<tdactor::ActorId<crate::query_merger::QueryMerger>>,
+    /// `get_user_queries_` (UserManager.h:1310) — the GetUserMerger actor
+    /// ("GetUserMerger", 3, 50), created by the Td init.
+    pub(crate) get_user_queries: Option<tdactor::ActorId<crate::query_merger::QueryMerger>>,
+    /// `get_user_full_queries_` (UserManager.h:1314) — the
+    /// GetUserFullCombiner actor ("GetUserFullCombiner", 2.0), created by
+    /// the Td init.
+    pub(crate) get_user_full_queries:
+        Option<tdactor::ActorId<crate::query_combiner::QueryCombiner>>,
+    /// The `GetUsersQuery` in-flight promises (the C++ handler's
+    /// `promise_`, cpp:1428-1445) — the merger's result promise per
+    /// merged batch; the answer pops the head.
+    pending_get_users_queries: Vec<Promise<()>>,
+    /// The `GetFullUserQuery` in-flight promises (cpp:1461-1481) — the
+    /// combiner's result promise per combined query.
+    pending_get_full_user_queries: Vec<Promise<()>>,
+    /// The `GetIsPremiumRequiredToContactQuery` in-flight states (the
+    /// handler's `user_ids_` + `promise_`, cpp:1779-1803) — the answer
+    /// intake keys on the user ids.
+    pending_get_requirements_to_contact_queries: Vec<(Vec<UserId>, Promise<()>)>,
     /// The owning Td actor (the C++ `td_` back-pointer) — the
     /// `can_send_message_to_user` merger re-dispatch rides it.
     pub(crate) td_actor_id: Option<tdactor::ActorId<crate::td::Td>>,
@@ -3220,8 +3258,10 @@ impl UserManager {
                 loaded,
                 "the synthetic special user {user_id:?} must be received"
             );
-            // `reload_user` refreshes the special users from the server;
-            // the query lands with the net step.
+            // `reload_user(user_id, Promise<Unit>(), "get_user_force")`
+            // (cpp:5115) — refreshes the synthesized special user from
+            // the server
+            self.reload_user(env, user_id, Promise::default(), "get_user_force");
         }
         loaded
     }
@@ -5049,8 +5089,9 @@ impl UserManager {
                 let u = self.users.get_mut(&user_id.get()).unwrap();
                 u.is_repaired = true;
                 tdutils::log_info!("Repairing cache of {user_id:?}");
-                // reload_user(user_id, Promise<Unit>(), "update_user") —
-                // [blocked: net]
+                // `reload_user(user_id, Promise<Unit>(), "update_user")`
+                // (cpp:10070)
+                self.reload_user(env, user_id, Promise::default(), "update_user");
             }
         }
 
@@ -5060,7 +5101,9 @@ impl UserManager {
             let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
             user_full.need_send_update = true;
             self.update_user_full(env, user_id, "update_user is_full_info_changed", false);
-            // reload_user_full — with the net step
+            // `reload_user_full(user_id, Promise<Unit>(), "update_user")`
+            // (cpp:10077)
+            self.reload_user_full(env, user_id, Promise::default(), "update_user");
         }
     }
 
@@ -5857,7 +5900,12 @@ impl UserManager {
             .map(|user_full| user_full.expires_at == 0.0)
             .unwrap_or(false)
         {
-            self.reload_user_full(env, user_id, "on_load_user_full_from_database 4");
+            self.reload_user_full(
+                env,
+                user_id,
+                Promise::default(),
+                "on_load_user_full_from_database 4",
+            );
         }
         self.update_user_full(env, user_id, "on_load_user_full_from_database 3", true);
 
@@ -5894,27 +5942,34 @@ impl UserManager {
         }
     }
 
-    /// `UserManager::load_user_full` (UserManager.cpp:8930-8953) — the
-    /// local half. The `users.getFullUser` sends (fresh, expired-bot,
-    /// expired-auto; cpp:8939-8947) are [blocked: net] and un-stub at
-    /// M.4.16 through the QueryCombiner; the 400 error maps to the C++
-    /// promise error.
+    /// `UserManager::load_user_full` (UserManager.cpp:8930-8953). The
+    /// never-loaded and expired-bot bands park the promise on the merged
+    /// `users.getFullUser` query (the GetUserFullCombiner); the
+    /// expired-non-bot band refreshes in the background (the empty
+    /// promise rides the combiner's delay window) and completes
+    /// immediately. `StoryManager::on_view_dialog_active_stories` stays
+    /// with its manager.
     pub fn load_user_full(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
         force: bool,
+        mut promise: Promise<()>,
         source: &str,
-    ) -> Result<bool, &'static str> {
+    ) {
         if !self.users.contains_key(&user_id.get()) {
-            return Err("User not found");
+            return promise.set_error(Status::error(400, "User not found"));
         }
         if !self.get_user_full_force(env, user_id, source) {
-            // the never-loaded case: `send_get_user_full_query` parks the
-            // promise on the merged `users.getFullUser` query —
-            // [blocked: net], the merger wiring lands with the net step
-            tdutils::log_info!("Get full {user_id:?} from {source} — [blocked: net]");
-            return Ok(false);
+            // cpp:8936-8939 — `TRY_RESULT_PROMISE(input_user,
+            // get_input_user(user_id))` then the combined query
+            match self.get_input_user(env, user_id) {
+                Ok(input_user) => {
+                    self.send_get_user_full_query(user_id, input_user, promise, source)
+                }
+                Err(error) => promise.set_error(error),
+            }
+            return;
         }
         let expired = {
             let ctx = env.time_ctx();
@@ -5925,19 +5980,219 @@ impl UserManager {
         };
         if expired {
             // cpp:8941-8948 — the expired row triggers the background
-            // refresh query (bots: the promise itself rides the query);
-            // the refresh send is [blocked: net]
-            let _ = force;
-            tdutils::log_info!("Get full {user_id:?} refresh — [blocked: net]");
+            // refresh query; bots without force park the promise itself
+            // on the query, the other forms refresh fire-and-forget
+            let input_user = self.get_input_user_force(env, user_id);
+            if env.auth_is_bot && !force {
+                return self.send_get_user_full_query(
+                    user_id,
+                    input_user,
+                    promise,
+                    "load expired user_full",
+                );
+            }
+            self.send_get_user_full_query(
+                user_id,
+                input_user,
+                Promise::default(),
+                "load expired user_full",
+            );
         }
-        // StoryManager::on_view_dialog_active_stories — with its step
-        Ok(true)
+        promise.set_value(());
+    }
+
+    /// `GetUserFullInfoRequest::do_run` + `do_send_result`
+    /// (Requests.cpp:235-249) — the two-tries RequestActor collapsed onto
+    /// the load: the locally-answerable band (the full is loaded and not
+    /// in the promise-riding window) builds the object immediately; the
+    /// query bands park the answer on the GetUserFullCombiner and the
+    /// completion builds the object (a still-missing full answers the
+    /// tries-exhausted 500, the RequestActor ladder end).
+    pub fn load_user_full_for_request(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        force: bool,
+        mut answer: Promise<td_api::UserFullInfo>,
+        source: &str,
+    ) {
+        if !self.users.contains_key(&user_id.get()) {
+            // the load's first check (cpp:8932-8934)
+            return answer.set_error(Status::error(400, "User not found"));
+        }
+        let loaded = self.get_user_full_force(env, user_id, source);
+        let expired = loaded && {
+            let ctx = env.time_ctx();
+            self.users_full
+                .get(&user_id.get())
+                .unwrap()
+                .is_expired(&ctx)
+        };
+        // cpp:8935-8948 — the promise rides the query only when the full
+        // is missing, or for the expired-bot-without-force refresh; the
+        // other expired forms still fire the background refresh
+        // (fire-and-forget, the combiner's delay window) before the
+        // local answer
+        if loaded && !(expired && env.auth_is_bot && !force) {
+            if expired {
+                let input_user = self.get_input_user_force(env, user_id);
+                self.send_get_user_full_query(
+                    user_id,
+                    input_user,
+                    Promise::default(),
+                    "load expired user_full",
+                );
+            }
+            return answer.set_value(self.get_user_full_info_object_of(env, user_id));
+        }
+        let completion = match self.td_actor_id.clone() {
+            Some(td_actor_id) => PromiseCreator::lambda_result(tdactor::promise_send_closure(
+                td_actor_id,
+                move |td: &mut crate::td::Td, result: tdutils::status::Result<()>| match result {
+                    tdutils::status::Result::Ok(()) => {
+                        let Some(options) = td.option_manager.as_mut() else {
+                            return answer.set_error(Status::error(500, "Request aborted"));
+                        };
+                        let env = UserEnv {
+                            global: &mut td.global,
+                            options,
+                            auth_is_bot: td.auth_manager.is_bot(),
+                        };
+                        td.user_manager
+                            .finish_get_user_full_info_request(&env, user_id, answer);
+                    }
+                    tdutils::status::Result::Err(error) => answer.set_error(error),
+                },
+            )),
+            None => {
+                // the net-inert posture — the query bands park without the
+                // actor machinery; the answer takes the C++ close-state
+                // surface (the uncached-consumer convention) and the
+                // completion absorbs the load's own band answers
+                tdutils::log_info!("Get full {user_id:?} from {source} — [net-inert]");
+                answer.set_error(Status::error(500, "Request aborted"));
+                Promise::default()
+            }
+        };
+        self.load_user_full(env, user_id, force, completion, source);
+    }
+
+    /// The completion half of [`UserManager::load_user_full_for_request`]
+    /// — `GetUserFullInfoRequest::do_send_result`: the loaded full builds
+    /// the object; a still-missing one answers the tries-exhausted 500
+    /// (`RequestActor::loop`, RequestActor.h:56-60).
+    fn finish_get_user_full_info_request(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        mut answer: Promise<td_api::UserFullInfo>,
+    ) {
+        if self.users_full.contains_key(&user_id.get()) {
+            answer.set_value(self.get_user_full_info_object_of(env, user_id));
+        } else {
+            answer.set_error(Status::error(500, "Requested data is inaccessible"));
+        }
     }
 
     /// `UserManager::reload_user_full` (UserManager.cpp:8954-8957) — the
-    /// query send is [blocked: net] (M.4.16).
-    fn reload_user_full(&mut self, _env: &mut UserEnv, user_id: UserId, source: &str) {
-        tdutils::log_info!("Get full {user_id:?} from {source} — [blocked: net]");
+    /// unconditional reload over the combined `users.getFullUser` query.
+    pub fn reload_user_full(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        match self.get_input_user(env, user_id) {
+            Ok(input_user) => self.send_get_user_full_query(user_id, input_user, promise, source),
+            Err(error) => promise.set_error(error),
+        }
+    }
+
+    /// `UserManager::send_get_user_full_query` (UserManager.cpp:8959-8972)
+    /// — the QueryCombiner park: the first waiter supplies the send
+    /// closure, the duplicates join; the combiner resolves the send
+    /// closure with its result promise when the query actually goes out
+    /// (the Td-actor hop of the closure runs the send half,
+    /// [`UserManager::send_get_full_user_query`]).
+    fn send_get_user_full_query(
+        &mut self,
+        user_id: UserId,
+        input_user: telegram_api::InputUser,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        tdutils::log_info!("Get full {user_id:?} from {source}");
+        if !user_id.is_valid() {
+            return promise.set_error(Status::error(500, "Invalid user_id"));
+        }
+        let td_actor_id = match self.td_actor_id.clone() {
+            Some(td_actor_id) => td_actor_id,
+            None => {
+                // the net-inert posture — the combiner is unwired without
+                // the scheduler context; the C++ close-state surface
+                // answers (the uncached-consumer convention)
+                tdutils::log_info!("Get full {user_id:?} from {source} — [net-inert]");
+                return promise.set_error(Status::error(500, "Request aborted"));
+            }
+        };
+        let send_query = PromiseCreator::lambda_result(tdactor::promise_send_closure(
+            td_actor_id,
+            move |td: &mut crate::td::Td, result: tdutils::status::Result<Promise<()>>| {
+                if let tdutils::status::Result::Ok(promise) = result
+                    && !td.global.close_flag()
+                {
+                    // `td->create_handler<GetFullUserQuery>(
+                    // promise.move_as_ok())->send(std::move(input_user))`
+                    td.user_manager
+                        .send_get_full_user_query(input_user, promise);
+                }
+            },
+        ));
+        match self.get_user_full_queries.clone() {
+            Some(combiner) => tdactor::send_closure(
+                combiner,
+                crate::query_combiner::QueryCombinerMessage::AddQuery {
+                    query_id: user_id.get(),
+                    send_query,
+                    promise,
+                },
+            ),
+            None => {
+                tdutils::log_info!("Get full {user_id:?} from {source} — [net-inert]");
+                promise.set_error(Status::error(500, "Request aborted"));
+            }
+        }
+    }
+
+    /// `GetFullUserQuery::send` (cpp:1464-1466) — park the handler's
+    /// result promise and dispatch the `users.getFullUser` query over
+    /// the net handle.
+    pub(crate) fn send_get_full_user_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        promise: Promise<()>,
+    ) {
+        self.pending_get_full_user_queries.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::GetFullUser,
+                telegram_api::Function::users_getFullUser(telegram_api::users_getFullUser {
+                    id: Some(input_user),
+                }),
+            ),
+            None => tdutils::log_info!("Send users.getFullUser — [net-inert]"),
+        }
+    }
+
+    /// `GetFullUserQuery::on_result`'s promise pop (cpp:1461-1481) — the
+    /// head in-flight combiner result promise.
+    pub(crate) fn take_get_full_user_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_full_user_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_full_user_queries.remove(0))
+        }
     }
 
     /// `UserManager::drop_user_full_photos` (UserManager.cpp:9485-9520).
@@ -6306,7 +6561,9 @@ impl UserManager {
     }
 
     /// `UserManager::get_me` (UserManager.cpp:5148-5157) — the local fast
-    /// path; the users.getUsers query stays with the net step.
+    /// path; the C++ promise park on the GetUserMerger is covered by the
+    /// request arm's own users.getUsers round-trip (the td.rs getMe
+    /// walking dispatch), so the overload stays promise-less here.
     pub fn get_me(&mut self, env: &mut UserEnv) -> UserId {
         let my_id = self.my_id;
         if !self.get_user_force(env, my_id, "get_me") {
@@ -6317,7 +6574,8 @@ impl UserManager {
 
     /// `UserManager::get_user` (UserManager.cpp:5159-5192) — the local
     /// path with the synchronous database preload; the merged
-    /// users.getUsers query stays with the net step. Returns whether the
+    /// users.getUsers query tail parks at the request overload
+    /// ([`UserManager::load_user`]). Returns whether the
     /// user is answerable locally.
     pub fn get_user_local(&mut self, env: &mut UserEnv, user_id: UserId) -> bool {
         if !user_id.is_valid() {
@@ -6348,18 +6606,23 @@ impl UserManager {
     /// `UserManager::get_user(UserId, int, Promise)`
     /// (UserManager.cpp:5159-5192) — the request-facing overload. The
     /// asynchronous db-load park collapses onto the synchronous
-    /// `get_user_force` re-check; the merged `users.getUsers` query tail
-    /// is [blocked: net] and answers nothing (the QueryMerger wiring
-    /// lands with the net step). `Ok(true)` — answerable;
-    /// `Ok(false)` — the query tail parked; `Err` — the promise error.
+    /// `get_user_force` re-check; the miss parks the answer on the
+    /// GetUserMerger (the merged `users.getUsers` query, cpp:5186) and
+    /// the merger resolution re-runs this load with the decremented
+    /// tries (the RequestActor re-entry collapsed onto the completion
+    /// closure). Every band completes `answer` — `GetUserRequest::
+    /// do_send_result` builds the object (Requests.cpp:217-233). Returns
+    /// whether the user is answerable locally.
     pub fn load_user(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
         left_tries: i32,
-    ) -> Result<bool, Status> {
+        mut answer: Promise<td_api::User>,
+    ) -> bool {
         if !user_id.is_valid() {
-            return Err(Status::error(400, "Invalid user identifier"));
+            answer.set_error(Status::error(400, "Invalid user identifier"));
+            return false;
         }
 
         if user_id == UserManager::get_service_notifications_user_id()
@@ -6392,19 +6655,144 @@ impl UserManager {
             if !have {
                 let r_input_user = self.get_input_user(env, user_id);
                 if left_tries == 1 || r_input_user.is_err() {
-                    return Err(match r_input_user {
+                    let error = match r_input_user {
                         Err(error) => error,
                         Ok(_) => Status::error(400, "User not found"),
-                    });
+                    };
+                    answer.set_error(error);
+                    return false;
                 }
 
-                // the merged users.getUsers query — [blocked: net]
-                tdutils::log_info!("Get user {user_id:?} query — [blocked: net]");
-                return Ok(false);
+                // `get_user_queries_.add_query(user_id, promise,
+                // "get_user")` — the merged users.getUsers query
+                self.add_get_user_query(user_id, left_tries, answer);
+                return false;
             }
         }
 
-        Ok(true)
+        answer.set_value(self.get_user_object_of(env, user_id));
+        true
+    }
+
+    /// `UserManager::reload_user` (UserManager.cpp:5194-5204) — force the
+    /// local halves, then park the promise on the GetUserMerger whatever
+    /// the state (the server record replaces the local one).
+    pub fn reload_user(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        if !user_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid user identifier"));
+        }
+
+        self.have_user_force(env, user_id, source);
+
+        match self.get_input_user(env, user_id) {
+            // `TRY_STATUS_PROMISE(promise, get_input_user(user_id))` —
+            // the ok value drops; only the error rides
+            Ok(_) => self.add_reload_user_query(user_id, promise),
+            Err(error) => promise.set_error(error),
+        }
+    }
+
+    /// The `get_user_queries_.add_query` park of the `get_user` request
+    /// overload (cpp:5186): the answer rides the merger and the
+    /// resolution re-runs `load_user` with the decremented tries — the
+    /// RequestActor `raw_event` → `loop` re-entry (RequestActor.h:83-87).
+    fn add_get_user_query(
+        &mut self,
+        user_id: UserId,
+        left_tries: i32,
+        mut answer: Promise<td_api::User>,
+    ) {
+        match (self.get_user_queries.clone(), self.td_actor_id.clone()) {
+            (Some(merger), Some(td_actor_id)) => {
+                let query_promise = PromiseCreator::lambda_result(tdactor::promise_send_closure(
+                    td_actor_id,
+                    move |td: &mut crate::td::Td, result: tdutils::status::Result<()>| match result
+                    {
+                        tdutils::status::Result::Ok(()) => {
+                            let Some(options) = td.option_manager.as_mut() else {
+                                return answer.set_error(Status::error(500, "Request aborted"));
+                            };
+                            let mut env = UserEnv {
+                                global: &mut td.global,
+                                options,
+                                auth_is_bot: td.auth_manager.is_bot(),
+                            };
+                            td.user_manager
+                                .load_user(&mut env, user_id, left_tries - 1, answer);
+                        }
+                        tdutils::status::Result::Err(error) => answer.set_error(error),
+                    },
+                ));
+                tdactor::send_closure(
+                    merger,
+                    crate::query_merger::QueryMergerMessage::AddQuery {
+                        query_id: user_id.get(),
+                        promise: query_promise,
+                    },
+                );
+            }
+            _ => {
+                // the net-inert posture: no scheduler context wired the
+                // merger — the answer takes the C++ close-state surface
+                // (the uncached-consumer convention)
+                tdutils::log_info!("Get user {user_id:?} query — [net-inert]");
+                answer.set_error(Status::error(500, "Request aborted"));
+            }
+        }
+    }
+
+    /// The `get_user_queries_.add_query` park of `reload_user`
+    /// (cpp:5203) — the plain `()`-typed merger ride.
+    fn add_reload_user_query(&mut self, user_id: UserId, mut promise: Promise<()>) {
+        match self.get_user_queries.clone() {
+            Some(merger) => tdactor::send_closure(
+                merger,
+                crate::query_merger::QueryMergerMessage::AddQuery {
+                    query_id: user_id.get(),
+                    promise,
+                },
+            ),
+            None => {
+                tdutils::log_info!("Reload user {user_id:?} — [net-inert]");
+                promise.set_error(Status::error(500, "Request aborted"));
+            }
+        }
+    }
+
+    /// `GetUsersQuery::send` (cpp:1436-1438, reached through the
+    /// GetUserMerger merge function cpp:2798-2802): park the handler's
+    /// result promise and dispatch the merged `users.getUsers` query.
+    pub(crate) fn send_get_users_query(
+        &mut self,
+        input_users: Vec<telegram_api::InputUser>,
+        promise: Promise<()>,
+    ) {
+        self.pending_get_users_queries.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::GetUsers,
+                telegram_api::Function::users_getUsers(telegram_api::users_getUsers {
+                    id: input_users,
+                }),
+            ),
+            None => tdutils::log_info!("Send users.getUsers — [net-inert]"),
+        }
+    }
+
+    /// `GetUsersQuery::on_result`'s promise pop (cpp:1428-1445) — the
+    /// head in-flight merger result promise.
+    pub(crate) fn take_get_users_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_users_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_users_queries.remove(0))
+        }
     }
 
     /// The `pending_user_requests` re-run (the request actors' post-load
@@ -7456,8 +7844,17 @@ impl UserManager {
                 .get_user(user_id)
                 .expect("the update flow forces the user");
             if !u.usernames.can_toggle(is_bot, username) {
-                // reload_user(user_id, ...) — the net step
+                // `reload_user(user_id, std::move(promise),
+                // "on_update_username_is_active")` (cpp:6575) — the flow
+                // promise rides the ToggleUsername query family; the
+                // empty-promise reload runs the refetch
                 tdutils::log_info!("Need to reload {user_id:?} after the username toggle");
+                self.reload_user(
+                    env,
+                    user_id,
+                    Promise::default(),
+                    "on_update_username_is_active",
+                );
                 return;
             }
             u.usernames.toggle(is_bot, username, is_active)
@@ -7480,8 +7877,16 @@ impl UserManager {
                 .get_user(user_id)
                 .expect("the update flow forces the user");
             if !u.usernames.can_reorder_to(&usernames) {
-                // reload_user(user_id, ...) — the net step
+                // `reload_user(user_id, std::move(promise),
+                // "on_update_active_usernames_order")` (cpp:6587) — same
+                // empty-promise form as the toggle twin
                 tdutils::log_info!("Need to reload {user_id:?} after the username reorder");
+                self.reload_user(
+                    env,
+                    user_id,
+                    Promise::default(),
+                    "on_update_active_usernames_order",
+                );
                 return;
             }
             u.usernames.reorder_to(usernames)
@@ -9296,12 +9701,15 @@ impl UserManager {
                 );
                 self.update_user_full(env, user_id, "on_remove_saved_music 2", false);
             } else {
-                // reload_user_full — the net step; the promise completes
-                // there (M.4.16)
-                tdutils::log_info!(
-                    "Get full {user_id:?} from on_remove_saved_music — [blocked: net]"
+                // `reload_user_full(user_id, std::move(promise),
+                // "on_remove_saved_music")` (cpp:7408) — the promise
+                // rides the reload
+                return self.reload_user_full(
+                    env,
+                    user_id,
+                    std::mem::take(promise),
+                    "on_remove_saved_music",
                 );
-                return;
             }
         }
         promise.set_value(());
@@ -11571,6 +11979,41 @@ impl UserManager {
         );
     }
 
+    /// `GetIsPremiumRequiredToContactQuery::send` (cpp:1783-1786, reached
+    /// through the merger's merge function cpp:2803-2811): park the
+    /// handler's `user_ids_`/`promise_` pair and dispatch the merged
+    /// `users.getRequirementsToContact` query.
+    pub(crate) fn send_get_requirements_to_contact_query(
+        &mut self,
+        user_ids: Vec<UserId>,
+        input_users: Vec<telegram_api::InputUser>,
+        promise: Promise<()>,
+    ) {
+        self.pending_get_requirements_to_contact_queries
+            .push((user_ids, promise));
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::GetRequirementsToContact,
+                telegram_api::Function::users_getRequirementsToContact(
+                    telegram_api::users_getRequirementsToContact { id: input_users },
+                ),
+            ),
+            None => tdutils::log_info!("Send users.getRequirementsToContact — [net-inert]"),
+        }
+    }
+
+    /// `GetIsPremiumRequiredToContactQuery::on_result`'s in-flight pop
+    /// (cpp:1788-1798) — the head `user_ids_`/`promise_` pair.
+    pub(crate) fn take_get_requirements_to_contact_query(
+        &mut self,
+    ) -> Option<(Vec<UserId>, Promise<()>)> {
+        if self.pending_get_requirements_to_contact_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_requirements_to_contact_queries.remove(0))
+        }
+    }
+
     /// `UserManager::on_get_is_premium_required_to_contact_users`
     /// (UserManager.cpp:7854-7882) — the merged-query answer: cache the
     /// price per user that has no `UserFull` yet.
@@ -13664,16 +14107,26 @@ mod tests {
         );
         um.take_updates();
         // An unknown user is the C++ 400 "User not found".
-        assert_eq!(
-            um.load_user_full(&mut temp.env(false), UserId::new(999), false, "t"),
-            Err("User not found")
-        );
-        // No cached full and no row: the promise parks on the merged
-        // users.getFullUser query ([blocked: net]) — Ok(false).
-        assert_eq!(
-            um.load_user_full(&mut temp.env(false), UserId::new(5), false, "t"),
-            Ok(false)
-        );
+        let (promise, result) = promise_unit_result();
+        um.load_user_full(&mut temp.env(false), UserId::new(999), false, promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "User not found"));
+            }
+            other => panic!("the unknown user: {other:?}"),
+        }
+        // No cached full and no row: the query band parks on the combined
+        // users.getFullUser query — the net-inert posture answers the C++
+        // close-state surface (the combiner is unwired without the
+        // scheduler).
+        let (promise, result) = promise_unit_result();
+        um.load_user_full(&mut temp.env(false), UserId::new(5), false, promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (500, "Request aborted"));
+            }
+            other => panic!("the query band: {other:?}"),
+        }
 
         // An expired row still force-loads (the C++ reload decision is
         // the caller's, cpp:8936-8948).
@@ -13699,10 +14152,157 @@ mod tests {
             now: tdutils::time::now(),
             server_time: 0.0
         }));
-        assert_eq!(
-            um.load_user_full(&mut temp.env(false), UserId::new(5), false, "t"),
-            Ok(true)
+        // The expired-non-bot band refreshes in the background and
+        // completes immediately (cpp:8941-8949)
+        let (promise, result) = promise_unit_result();
+        um.load_user_full(&mut temp.env(false), UserId::new(5), false, promise, "t");
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+    }
+
+    /// The shared completion slot of a user-full-info answer.
+    type UserFullInfoSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::UserFullInfo>>>>;
+
+    /// A `Promise<td_api::UserFullInfo>` capturing its `Result` into a
+    /// shared slot.
+    fn promise_user_full_info() -> (Promise<td_api::UserFullInfo>, UserFullInfoSlot) {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        (
+            PromiseCreator::lambda_result(move |r| *result_clone.lock().unwrap() = Some(r)),
+            result,
+        )
+    }
+
+    #[test]
+    fn load_user_full_for_request_answers_the_expired_cache() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
         );
+        um.take_updates();
+
+        // The unknown user keeps the load's 400 (cpp:8932-8934)
+        let (answer, slot) = promise_user_full_info();
+        um.load_user_full_for_request(&mut temp.env(false), UserId::new(999), false, answer, "t");
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "User not found"));
+            }
+            other => panic!("the unknown user: {other:?}"),
+        }
+
+        // An expired cached full answers the object immediately — the
+        // non-bot band's background refresh rides the (net-inert)
+        // combiner park, the answer does not wait for it (cpp:8941-8949
+        // + the GetUserFullInfoRequest do_send_result)
+        let ctx = TimeCtx {
+            now: tdutils::time::now() - 120.0,
+            server_time: 0.0,
+        };
+        let mut user_full = UserFull::new();
+        user_full.about = "old".to_owned();
+        user_full.expires_at = ctx.now;
+        let mut bytes = Vec::new();
+        user_full.store_value(&mut bytes, &ctx);
+        um.unavailable_user_fulls.clear();
+        temp.env(false)
+            .global
+            .td_db()
+            .common_kv()
+            .set(b"usf5", &bytes);
+        let (answer, slot) = promise_user_full_info();
+        um.load_user_full_for_request(&mut temp.env(false), UserId::new(5), false, answer, "t");
+        assert!(
+            matches!(&*slot.lock().unwrap(), Some(tdutils::status::Result::Ok(_))),
+            "the expired cache answers the object"
+        );
+    }
+
+    #[test]
+    fn reload_user_bands_match_the_cpp_errors() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+
+        // the invalid id is the C++ 400 (cpp:5196-5198)
+        let (promise, result) = promise_unit_result();
+        um.reload_user(&mut temp.env(false), UserId::new(-5), promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(
+                    (status.code(), status.message()),
+                    (400, "Invalid user identifier")
+                );
+            }
+            other => panic!("the invalid id: {other:?}"),
+        }
+
+        // an unknown user: `get_input_user` errors the promise
+        // (cpp:5201, TRY_STATUS_PROMISE)
+        let (promise, result) = promise_unit_result();
+        um.reload_user(&mut temp.env(false), UserId::new(999), promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "User not found"));
+            }
+            other => panic!("the unknown user: {other:?}"),
+        }
+
+        // the known user parks on the GetUserMerger — the net-inert
+        // posture answers the close-state surface (cpp:5203)
+        let (promise, result) = promise_unit_result();
+        um.reload_user(&mut temp.env(false), UserId::new(5), promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (500, "Request aborted"));
+            }
+            other => panic!("the reload park: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_user_full_bands_match_the_cpp_errors() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+
+        // an unknown user: `get_input_user` errors the promise (cpp:8955)
+        let (promise, result) = promise_unit_result();
+        um.reload_user_full(&mut temp.env(false), UserId::new(999), promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "User not found"));
+            }
+            other => panic!("the unknown user: {other:?}"),
+        }
+
+        // the known user rides the combined query — the net-inert
+        // posture answers the close-state surface
+        let (promise, result) = promise_unit_result();
+        um.reload_user_full(&mut temp.env(false), UserId::new(5), promise, "t");
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (500, "Request aborted"));
+            }
+            other => panic!("the reload park: {other:?}"),
+        }
     }
 
     #[test]
@@ -16706,6 +17306,19 @@ mod tests {
         assert!(um.noforwards_request_timeouts.is_empty());
         assert!(um.noforwards_request_ids.is_empty());
         um.unregister_noforwards_request(message_full_id);
+    }
+
+    /// The shared completion slot of a unit-typed promise.
+    type UnitResultSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    /// A `Promise<()>` capturing its `Result` into a shared slot.
+    fn promise_unit_result() -> (Promise<()>, UnitResultSlot) {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        (
+            PromiseCreator::lambda_result(move |r| *result_clone.lock().unwrap() = Some(r)),
+            result,
+        )
     }
 
     /// The shared completion slot of the can-send deferred promise.

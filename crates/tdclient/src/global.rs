@@ -81,6 +81,11 @@ pub struct Global {
     dialog_db_async: Option<DialogDbAsync>,
     /// `Global::close_flag_`.
     close_flag: bool,
+    /// The shared `close_flag_` probe — the scheduler-owned actor tails
+    /// (the QueryCombiner `G()->close_flag()` gate) read the close state
+    /// through this handle; [`Global::set_close_flag`] keeps it in step
+    /// with the bool.
+    close_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// `Global::is_test_dc()` — read from the database parameters.
     is_test_dc: bool,
     /// `Global::server_time_difference_` — loaded (and repaired) from the
@@ -116,6 +121,7 @@ impl Global {
             dialog_db_sync_safe: None,
             dialog_db_async: None,
             close_flag: false,
+            close_probe: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_test_dc: false,
             // the C++ atomic defaults to 0 harmlessly (its `Time::now` is
             // wall-clock-based); the process-anchored Rust clock needs the
@@ -300,6 +306,14 @@ impl Global {
     /// `Global::set_close_flag()`.
     pub fn set_close_flag(&mut self) {
         self.close_flag = true;
+        self.close_probe
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The shared close-flag handle for the scheduler-owned actor tails
+    /// (see the field docs).
+    pub fn shared_close_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.close_probe)
     }
 
     /// `Global::is_test_dc()`.

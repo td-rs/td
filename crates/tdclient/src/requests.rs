@@ -1082,45 +1082,33 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
 
         // --- the read surface ---
         Function::getUser(request) => {
-            // GetUserRequest (Requests.cpp:217-233): set_tries(3)
+            // GetUserRequest (Requests.cpp:217-233): set_tries(3). The
+            // local/db halves run synchronously; the miss parks the
+            // answer on the GetUserMerger (the merged users.getUsers
+            // query) and the merger resolution re-runs the load with the
+            // decremented tries — the RequestActor re-entry.
             let user_id = UserId::new(request.user_id);
-            let loaded = {
-                let mut env = user_env!(td);
-                td.user_manager.load_user(&mut env, user_id, 3)
-            };
-            match loaded {
-                Ok(true) => {
-                    let user = {
-                        let env = user_env!(td);
-                        td.user_manager.get_user_object_of(&env, user_id)
-                    };
-                    td.send_result(id, Object::user(user));
-                }
-                Ok(false) => {} // the merged users.getUsers query — [blocked: net]
-                Err(status) => send_error_status(td, id, status),
-            }
+            let answer = td.deferred_promise::<td_api::User, _>(id, Object::user);
+            let mut env = user_env!(td);
+            td.user_manager.load_user(&mut env, user_id, 3, answer);
         }
         Function::getUserFullInfo(request) => {
             // GetUserFullInfoRequest (Requests.cpp:235-249): the default
             // two tries run the first pass with force = get_tries() < 2 =
-            // false; the db row load is synchronous (the collapse)
+            // false; the db row load is synchronous (the collapse), the
+            // miss parks the answer on the GetUserFullCombiner (the
+            // combined users.getFullUser query) and the completion
+            // builds the full-info object (do_send_result).
             let user_id = UserId::new(request.user_id);
-            let loaded = {
-                let mut env = user_env!(td);
-                td.user_manager
-                    .load_user_full(&mut env, user_id, false, "GetUserFullInfoRequest")
-            };
-            match loaded {
-                Ok(true) => {
-                    let user_full_info = {
-                        let env = user_env!(td);
-                        td.user_manager.get_user_full_info_object_of(&env, user_id)
-                    };
-                    td.send_result(id, Object::userFullInfo(user_full_info));
-                }
-                Ok(false) => {} // the users.getFullUser query — [blocked: net]
-                Err(message) => td.send_error_impl(id, 400, message),
-            }
+            let answer = td.deferred_promise::<td_api::UserFullInfo, _>(id, Object::userFullInfo);
+            let mut env = user_env!(td);
+            td.user_manager.load_user_full_for_request(
+                &mut env,
+                user_id,
+                false,
+                answer,
+                "GetUserFullInfoRequest",
+            );
         }
         Function::getSecretChat(request) => {
             // GetSecretChatRequest (Requests.cpp:323-338): the default two
