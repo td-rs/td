@@ -1507,12 +1507,40 @@ pub fn delete_dialog(td: &mut Td, dialog_id: DialogId, mut promise: Promise<()>)
     }
 
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User
-        | crate::dialog_id::DialogType::Chat
-        | crate::dialog_id::DialogType::Channel => {
-            // messages_manager_->delete_dialog_history /
-            // chat_manager_->delete_chat / delete_channel (stub inventory).
+        // messages_manager_->delete_dialog_history — the user-dialog
+        // cascade is the messages plane (stub inventory);
+        // chat_manager_->delete_chat / delete_channel (ChatManager.cpp:4021/:4036)
+        // dispatch the DeleteChatQuery / DeleteChannelQuery over the
+        // ChatManager net handle.
+        crate::dialog_id::DialogType::User => {
             promise_unimplemented(&mut promise);
+        }
+        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                chat_manager,
+                ..
+            } = td;
+            let Some(options) = option_manager.as_mut() else {
+                promise_unimplemented(&mut promise);
+                return;
+            };
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            match dialog_id.get_type() {
+                crate::dialog_id::DialogType::Chat => {
+                    chat_manager.delete_chat(&mut env, dialog_id.get_chat_id(), promise)
+                }
+                crate::dialog_id::DialogType::Channel => {
+                    chat_manager.delete_channel(&mut env, dialog_id.get_channel_id(), promise)
+                }
+                _ => unreachable!("the outer match narrowed the dialog type"),
+            }
         }
         crate::dialog_id::DialogType::SecretChat => {
             // send_closure(secret_chats_manager_, cancel_chat) — the

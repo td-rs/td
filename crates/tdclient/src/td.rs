@@ -8136,6 +8136,62 @@ impl Td {
                     }
                 }
             }
+            // `DeleteChatQuery` (ChatManager.cpp:1375-1399) — the Bool
+            // answer (either value; the C++ only logs it) refires
+            // get_difference and chains the empty `updates` container
+            // into `on_get_updates` with the promise.
+            crate::chat_manager::ChatNetKind::DeleteChat => {
+                let Some(mut promise) = self.chat_manager.take_delete_chat_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => {
+                            // cpp:1391-1392 — the difference refire, then
+                            // the empty container
+                            self.with_updates_env(|um, env| {
+                                um.get_difference(env, "DeleteChatQuery")
+                            });
+                            self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(telegram_api::Updates::updates(
+                                    telegram_api::updates {
+                                        updates: Vec::new(),
+                                        users: Vec::new(),
+                                        chats: Vec::new(),
+                                        date: 0,
+                                        seq: 0,
+                                    },
+                                )),
+                                promise,
+                            });
+                        }
+                        None => promise.set_error(parse_error("messages_deleteChat")),
+                    }
+                }
+            }
+            // `DeleteChannelQuery` (ChatManager.cpp:1402-1432) — the
+            // Updates answer re-enters `on_get_updates`; the error tail
+            // runs the channel-error head.
+            crate::chat_manager::ChatNetKind::DeleteChannel { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_delete_channel_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.chat_channel_error_head(channel_id, &status, "DeleteChannelQuery");
+                    promise.set_error(status);
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_deleteChannel")),
+                    }
+                }
+            }
         }
     }
 
@@ -32993,6 +33049,152 @@ mod tests {
             error.message,
             "Accent color can be changed only in channel chats"
         );
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn delete_chat_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(delete_chat_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn delete_chat_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-delete-chat");
+        seed_dialog_chats(&mut td);
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        let channel_id = crate::chat_manager::ChannelId::new(702);
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(channel_id).get();
+        // the can_be_deleted flag arrives with the channel full
+        // (ChatManager.cpp:6170-6171) — the GetFullChannelQuery family is
+        // its own net slice, so the test seeds the synced state
+        td.chat_manager
+            .get_channel_mut(channel_id)
+            .expect("the seeded channel")
+            .can_be_deleted = true;
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. deleteChat on the basic group — the bare chat id rides the
+        //    query; the Bool answer refires get_difference (the engine's
+        //    unknown pts dispatches getState) and the empty updates
+        //    container resolves the ok
+        td.request(
+            1,
+            Function::deleteChat(td_api::deleteChat {
+                chat_id: group_dialog,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_deleteChat::ID,
+        );
+        let body = telegram_api::messages_deleteChat::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.chat_id, 701);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the get_difference getState refire");
+        assert_eq!(sent[0].tl_constructor(), telegram_api::updates_getState::ID);
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. deleteChat on the channel — the input channel rides the
+        //    query and the Updates answer resolves the ok
+        td.request(
+            2,
+            Function::deleteChat(td_api::deleteChat {
+                chat_id: channel_dialog,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_deleteChannel::ID,
+        );
+        let body =
+            telegram_api::channels_deleteChannel::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 702);
+                assert_eq!(channel.access_hash, 777);
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the error band forwards through the channel-error tail
+        td.request(
+            3,
+            Function::deleteChat(td_api::deleteChat {
+                chat_id: channel_dialog,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_deleteChannel::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "CHANNEL_PRIVATE");
+
+        // 4. the unknown chat answers the dialog gate's 400
+        td.request(
+            4,
+            Function::deleteChat(td_api::deleteChat {
+                chat_id: crate::messages_manager::DialogId::from_chat_id(
+                    crate::chat_manager::ChatId::new(799),
+                )
+                .get(),
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // 5. the full-less channel keeps the C++ "can't be deleted" band
+        //    (can_be_deleted arrives with the channel full)
+        td.request(
+            5,
+            Function::deleteChat(td_api::deleteChat {
+                chat_id: crate::messages_manager::DialogId::from_channel_id(
+                    crate::chat_manager::ChannelId::new(703),
+                )
+                .get(),
+            }),
+        );
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "The chat can't be deleted");
 
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");

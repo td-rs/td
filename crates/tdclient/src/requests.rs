@@ -4910,13 +4910,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the DeleteChat/DeleteChannelQuery
+            // answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::delete_dialog(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::upgradeBasicGroupChatToSupergroupChat(request) => {
             // Requests.cpp:5543 — `migrate_dialog_to_megagroup`.

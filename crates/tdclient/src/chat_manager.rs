@@ -5364,6 +5364,12 @@ pub(crate) enum ChatNetKind {
     UpdateChannelColor { channel_id: ChannelId },
     /// `UpdateChannelEmojiStatusQuery` (ChatManager.cpp:370).
     UpdateChannelEmojiStatus { channel_id: ChannelId },
+    /// `DeleteChatQuery` (ChatManager.cpp:1375) — the basic-group delete;
+    /// the answer tail refires `get_difference` and chains the empty
+    /// `updates` container into `on_get_updates`.
+    DeleteChat,
+    /// `DeleteChannelQuery` (ChatManager.cpp:1402).
+    DeleteChannel { channel_id: ChannelId },
 }
 
 pub struct ChatManager {
@@ -5447,6 +5453,10 @@ pub struct ChatManager {
     pending_update_channel_color: Vec<Promise<()>>,
     /// The `UpdateChannelEmojiStatusQuery` promises (ChatManager.cpp:372).
     pending_update_channel_emoji_status: Vec<Promise<()>>,
+    /// The `DeleteChatQuery` promises (ChatManager.cpp:1377).
+    pending_delete_chat: Vec<Promise<()>>,
+    /// The `DeleteChannelQuery` promises (ChatManager.cpp:1404).
+    pending_delete_channel: Vec<Promise<()>>,
 }
 
 impl ChatManager {
@@ -5485,6 +5495,8 @@ impl ChatManager {
             pending_edit_chat_about: Vec::new(),
             pending_update_channel_color: Vec::new(),
             pending_update_channel_emoji_status: Vec::new(),
+            pending_delete_chat: Vec::new(),
+            pending_delete_channel: Vec::new(),
         }
     }
 
@@ -8534,6 +8546,25 @@ impl ChatManager {
         }
     }
 
+    /// `DeleteChatQuery::on_result`'s promise pop (ChatManager.cpp:1387-1397).
+    pub(crate) fn take_delete_chat_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_delete_chat.is_empty() {
+            None
+        } else {
+            Some(self.pending_delete_chat.remove(0))
+        }
+    }
+
+    /// `DeleteChannelQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:1418-1428).
+    pub(crate) fn take_delete_channel_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_delete_channel.is_empty() {
+            None
+        } else {
+            Some(self.pending_delete_channel.remove(0))
+        }
+    }
+
     /// `on_update_channel_description` (ChatManager.cpp:8065-8078) — the
     /// `EditChatAboutQuery` success intake for channels.
     pub(crate) fn on_update_channel_description(
@@ -11380,9 +11411,9 @@ impl ChatManager {
         promise.set_value(());
     }
 
-    /// `delete_chat` (ChatManager.cpp:4021-4032) — the DeleteChatQuery
-    /// send is [blocked: net] (M.5.46); local state mutation happens in
-    /// the query's on_ok.
+    /// `delete_chat` (ChatManager.cpp:4021-4032) — the `DeleteChatQuery`
+    /// send rides the `net` handle (the §2 flip); the local state
+    /// mutation happens in the query's `on_ok` tail (the updates engine).
     pub fn delete_chat(&mut self, _env: &mut UserEnv, chat_id: ChatId, mut promise: Promise<()>) {
         let Some(c) = self.get_chat(chat_id) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
@@ -11393,15 +11424,23 @@ impl ChatManager {
         if !c.is_active {
             return promise.set_error(Status::error(400, "Chat is already deactivated"));
         }
-        tdutils::log_info!("DeleteChatQuery for {chat_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `DeleteChatQuery::send` (ChatManager.cpp:1381-1385) — the bare
+        // chat id; no input peer.
+        self.pending_delete_chat.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::DeleteChat,
+            telegram_api::Function::messages_deleteChat(telegram_api::messages_deleteChat {
+                chat_id: chat_id.get(),
+            }),
+            "messages.deleteChat",
+        );
     }
 
-    /// `delete_channel` (ChatManager.cpp:4036-4045) — the DeleteChannelQuery
-    /// send is [blocked: net] (M.5.46).
+    /// `delete_channel` (ChatManager.cpp:4036-4045) — the
+    /// `DeleteChannelQuery` send rides the `net` handle (the §2 flip).
     pub fn delete_channel(
         &mut self,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         mut promise: Promise<()>,
     ) {
@@ -11411,8 +11450,19 @@ impl ChatManager {
         if !c.can_be_deleted {
             return promise.set_error(Status::error(400, "The chat can't be deleted"));
         }
-        tdutils::log_info!("DeleteChannelQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `DeleteChannelQuery::send` (ChatManager.cpp:1410-1417) — the
+        // input channel exists by the record check (the C++ CHECKs it).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_delete_channel.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::DeleteChannel { channel_id },
+            telegram_api::Function::channels_deleteChannel(telegram_api::channels_deleteChannel {
+                channel: Some(input_channel),
+            }),
+            "channels.deleteChannel",
+        );
     }
 
     // ---- M.5.41: the toggle family (ChatManager.cpp:3444-3675) ----
