@@ -5359,6 +5359,11 @@ pub(crate) enum ChatNetKind {
     EditChatAbout {
         dialog_id: crate::messages_manager::DialogId,
     },
+    /// `UpdateChannelColorQuery` (ChatManager.cpp:320) — the kind carries
+    /// the channel for the error tail (both accent-color arms).
+    UpdateChannelColor { channel_id: ChannelId },
+    /// `UpdateChannelEmojiStatusQuery` (ChatManager.cpp:370).
+    UpdateChannelEmojiStatus { channel_id: ChannelId },
 }
 
 pub struct ChatManager {
@@ -5437,6 +5442,11 @@ pub struct ChatManager {
     /// `about_`/`promise_` members, ChatManager.cpp:1061-1063) — the
     /// answer pops the head and runs the `on_success` intake.
     pending_edit_chat_about: Vec<(String, Promise<()>)>,
+    /// The `UpdateChannelColorQuery` promises (the C++ handler's
+    /// `promise_`, ChatManager.cpp:322).
+    pending_update_channel_color: Vec<Promise<()>>,
+    /// The `UpdateChannelEmojiStatusQuery` promises (ChatManager.cpp:372).
+    pending_update_channel_emoji_status: Vec<Promise<()>>,
 }
 
 impl ChatManager {
@@ -5473,6 +5483,8 @@ impl ChatManager {
             file_source_id_counter: 0,
             net: None,
             pending_edit_chat_about: Vec::new(),
+            pending_update_channel_color: Vec::new(),
+            pending_update_channel_emoji_status: Vec::new(),
         }
     }
 
@@ -8502,6 +8514,26 @@ impl ChatManager {
         }
     }
 
+    /// `UpdateChannelColorQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:344-352).
+    pub(crate) fn take_update_channel_color_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_update_channel_color.is_empty() {
+            None
+        } else {
+            Some(self.pending_update_channel_color.remove(0))
+        }
+    }
+
+    /// `UpdateChannelEmojiStatusQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:394-402).
+    pub(crate) fn take_update_channel_emoji_status_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_update_channel_emoji_status.is_empty() {
+            None
+        } else {
+            Some(self.pending_update_channel_emoji_status.remove(0))
+        }
+    }
+
     /// `on_update_channel_description` (ChatManager.cpp:8065-8078) — the
     /// `EditChatAboutQuery` success intake for channels.
     pub(crate) fn on_update_channel_description(
@@ -10108,7 +10140,7 @@ impl ChatManager {
     /// reduces to the invalidation tail (the channel-intake slice owns
     /// the full form).
     #[allow(dead_code)] // production caller: the net query error paths (M.10)
-    fn on_get_channel_error(
+    pub(crate) fn on_get_channel_error(
         &mut self,
         user_manager: &mut UserManager,
         env: &mut UserEnv,
@@ -11025,14 +11057,16 @@ impl ChatManager {
         promise.set_error(Status::error(500, "Network is not implemented yet"));
     }
 
-    /// `set_channel_accent_color` (ChatManager.cpp:3275-3293).
+    /// `set_channel_accent_color` (ChatManager.cpp:3275-3293) — the
+    /// `UpdateChannelColorQuery` send rides the `net` handle (the §2
+    /// flip).
     pub fn set_channel_accent_color(
         &mut self,
         _user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         accent_color_id: AccentColorId,
-        _background_custom_emoji_id: CustomEmojiId,
+        background_custom_emoji_id: CustomEmojiId,
         mut promise: Promise<()>,
     ) {
         if !accent_color_id.is_valid() {
@@ -11056,8 +11090,30 @@ impl ChatManager {
         {
             return promise.set_error(Status::error(400, "Not enough rights in the channel"));
         }
-        tdutils::log_info!("UpdateChannelColorQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `UpdateChannelColorQuery::send` (ChatManager.cpp:330-341) — the
+        // input channel exists by the record check (the C++ CHECKs it).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        let mut flags = 0;
+        if accent_color_id.is_valid() {
+            flags |= 4; // COLOR_MASK
+        }
+        if background_custom_emoji_id.is_valid() {
+            flags |= 1; // BACKGROUND_EMOJI_ID_MASK
+        }
+        self.pending_update_channel_color.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::UpdateChannelColor { channel_id },
+            telegram_api::Function::channels_updateColor(telegram_api::channels_updateColor {
+                flags,
+                for_profile: false,
+                channel: Some(input_channel),
+                color: accent_color_id.get(),
+                background_emoji_id: background_custom_emoji_id.get(),
+            }),
+            "channels.updateColor",
+        );
     }
 
     /// `set_channel_profile_accent_color` (ChatManager.cpp:3296-3308).
@@ -11066,8 +11122,8 @@ impl ChatManager {
         _user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
-        _profile_accent_color_id: AccentColorId,
-        _profile_background_custom_emoji_id: CustomEmojiId,
+        profile_accent_color_id: AccentColorId,
+        profile_background_custom_emoji_id: CustomEmojiId,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -11079,17 +11135,41 @@ impl ChatManager {
         {
             return promise.set_error(Status::error(400, "Not enough rights in the chat"));
         }
-        tdutils::log_info!("UpdateChannelColorQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `UpdateChannelColorQuery::send` (ChatManager.cpp:330-341) — the
+        // profile variant rides the `for_profile` flag.
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        let mut flags = 0;
+        if profile_accent_color_id.is_valid() {
+            flags |= 4; // COLOR_MASK
+        }
+        if profile_background_custom_emoji_id.is_valid() {
+            flags |= 1; // BACKGROUND_EMOJI_ID_MASK
+        }
+        self.pending_update_channel_color.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::UpdateChannelColor { channel_id },
+            telegram_api::Function::channels_updateColor(telegram_api::channels_updateColor {
+                flags,
+                for_profile: true,
+                channel: Some(input_channel),
+                color: profile_accent_color_id.get(),
+                background_emoji_id: profile_background_custom_emoji_id.get(),
+            }),
+            "channels.updateColor",
+        );
     }
 
-    /// `set_channel_emoji_status` (ChatManager.cpp:3311-3325).
+    /// `set_channel_emoji_status` (ChatManager.cpp:3311-3325) — the
+    /// `UpdateChannelEmojiStatusQuery` send rides the `net` handle (the
+    /// §2 flip).
     pub fn set_channel_emoji_status(
         &mut self,
         _user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
-        _emoji_status: Option<EmojiStatus>,
+        emoji_status: Option<EmojiStatus>,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -11101,9 +11181,24 @@ impl ChatManager {
         {
             return promise.set_error(Status::error(400, "Not enough rights in the chat"));
         }
-        // StickersManager add_recent_emoji_status — the wave-2 stub.
-        tdutils::log_info!("UpdateChannelEmojiStatusQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // StickersManager add_recent_emoji_status — the wave-2 stub
+        // (the C++ runs it when the status is non-null).
+        // `UpdateChannelEmojiStatusQuery::send` (ChatManager.cpp:379-388).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        let input_status = EmojiStatus::get_input_emoji_status_of(emoji_status.as_ref());
+        self.pending_update_channel_emoji_status.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::UpdateChannelEmojiStatus { channel_id },
+            telegram_api::Function::channels_updateEmojiStatus(
+                telegram_api::channels_updateEmojiStatus {
+                    channel: Some(input_channel),
+                    emoji_status: Some(input_status),
+                },
+            ),
+            "channels.updateEmojiStatus",
+        );
     }
 
     /// `set_channel_sticker_set` (ChatManager.cpp:3328-3356).

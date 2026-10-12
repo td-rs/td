@@ -4961,7 +4961,8 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the UpdateChannelColorQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::set_dialog_accent_color(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
@@ -4969,13 +4970,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 crate::emoji_status::CustomEmojiId::new(request.background_custom_emoji_id),
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::setChatProfileAccentColor(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = unit_request_promise();
+            // the promise settles from the UpdateChannelColorQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::set_dialog_profile_accent_color(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
@@ -4983,7 +4984,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 crate::emoji_status::CustomEmojiId::new(request.profile_background_custom_emoji_id),
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::setChatPermissions(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:5818-5821)

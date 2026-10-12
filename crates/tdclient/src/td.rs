@@ -8054,7 +8054,118 @@ impl Td {
                     }
                 }
             }
+            // `UpdateChannelColorQuery` (ChatManager.cpp:320-360) — the
+            // Updates answer re-enters `on_get_updates` with the promise;
+            // the error tail runs the CHAT_NOT_MODIFIED !bot value band
+            // and the channel-error head.
+            crate::chat_manager::ChatNetKind::UpdateChannelColor { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_update_channel_color_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "UpdateChannelColorQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_updateColor")),
+                    }
+                }
+            }
+            // `UpdateChannelEmojiStatusQuery` (ChatManager.cpp:370-411) —
+            // the Updates answer re-enters `on_get_updates`; the error
+            // tail adds the `get_recent_emoji_statuses` refire.
+            crate::chat_manager::ChatNetKind::UpdateChannelEmojiStatus { channel_id } => {
+                let Some(mut promise) =
+                    self.chat_manager.take_update_channel_emoji_status_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "UpdateChannelEmojiStatusQuery",
+                            );
+                            // get_recent_emoji_statuses(td_, Auto()) —
+                            // the fire-and-forget refire
+                            // (EmojiStatus.cpp:590-597).
+                            let mut user_manager = std::mem::take(&mut self.user_manager);
+                            if let Some(options) = self.option_manager.as_mut() {
+                                let mut env = crate::user_manager::UserEnv {
+                                    global: &mut self.global,
+                                    options,
+                                    auth_is_bot: self.auth_manager.is_bot(),
+                                };
+                                user_manager
+                                    .get_recent_emoji_statuses(&mut env, Promise::default());
+                            }
+                            self.user_manager = user_manager;
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_updateEmojiStatus")),
+                    }
+                }
+            }
         }
+    }
+
+    /// The `ChatManager::on_get_channel_error` head for the chat net
+    /// answer tails — takes the managers out for the env borrow, runs
+    /// the intake, restores.
+    fn chat_channel_error_head(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        status: &Status,
+        source: &str,
+    ) {
+        let mut chat_manager = std::mem::take(&mut self.chat_manager);
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        if let Some(options) = self.option_manager.as_mut() {
+            let mut env = crate::user_manager::UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            chat_manager.on_get_channel_error(
+                &mut user_manager,
+                &mut env,
+                channel_id,
+                status,
+                source,
+            );
+        }
+        self.user_manager = user_manager;
+        self.chat_manager = chat_manager;
     }
 
     /// Route one premium net answer by kind (the landed flows of
@@ -32414,6 +32525,19 @@ mod tests {
             channel(703, false, "member channel"),
             "test",
         );
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                megagroup: true,
+                id: 704,
+                access_hash: 778,
+                title: "megagroup".to_owned(),
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
         let _ = (ChatId::new(701), ChannelId::new(702));
     }
 
@@ -32634,6 +32758,243 @@ mod tests {
         assert_eq!(error.code, 400);
         assert_eq!(error.message, "Can't change private chat description");
 
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn channel_color_and_emoji_status_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_color_and_emoji_status_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn channel_color_and_emoji_status_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-color");
+        seed_dialog_chats(&mut td);
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. setChatAccentColor — the live arm runs the flow and
+        //    dispatches channels.updateColor with the COLOR flag and the
+        //    input channel; the Updates answer resolves the ok
+        td.request(
+            1,
+            Function::setChatAccentColor(td_api::setChatAccentColor {
+                chat_id: channel_dialog,
+                accent_color_id: 5,
+                background_custom_emoji_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateColor::ID,
+        );
+        let body = telegram_api::channels_updateColor::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags & 4, 4, "COLOR_MASK for the valid accent id");
+        assert_eq!(body.flags & 1, 0, "no BACKGROUND_EMOJI_ID_MASK");
+        assert!(!body.for_profile);
+        assert_eq!(body.color, 5);
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 702);
+                assert_eq!(channel.access_hash, 777);
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. setChatProfileAccentColor — the for_profile variant
+        td.request(
+            2,
+            Function::setChatProfileAccentColor(td_api::setChatProfileAccentColor {
+                chat_id: channel_dialog,
+                profile_accent_color_id: 3,
+                profile_background_custom_emoji_id: 42,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateColor::ID,
+        );
+        let body = telegram_api::channels_updateColor::parse(sent.query()).expect("the sent body");
+        assert!(body.for_profile);
+        assert_eq!(body.flags & 4, 4);
+        assert_eq!(body.flags & 1, 1, "BACKGROUND_EMOJI_ID_MASK for 42");
+        assert_eq!(body.background_emoji_id, 42);
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        // the !bot CHAT_NOT_MODIFIED band answers the value
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. setChatEmojiStatus — the emojiStatusEmpty input form for a
+        //    null status
+        td.request(
+            3,
+            Function::setChatEmojiStatus(td_api::setChatEmojiStatus {
+                chat_id: channel_dialog,
+                emoji_status: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateEmojiStatus::ID,
+        );
+        let body =
+            telegram_api::channels_updateEmojiStatus::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.emoji_status,
+            Some(telegram_api::EmojiStatus::emojiStatusEmpty(_))
+        ));
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the custom-emoji input form
+        td.request(
+            4,
+            Function::setChatEmojiStatus(td_api::setChatEmojiStatus {
+                chat_id: channel_dialog,
+                emoji_status: Some(td_api::EmojiStatus {
+                    expiration_date: 0,
+                    r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+                        td_api::emojiStatusTypeCustomEmoji {
+                            custom_emoji_id: 5005,
+                        },
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateEmojiStatus::ID,
+        );
+        let body =
+            telegram_api::channels_updateEmojiStatus::parse(sent.query()).expect("the sent body");
+        match body.emoji_status {
+            Some(telegram_api::EmojiStatus::emojiStatus(status)) => {
+                assert_eq!(status.document_id, 5005);
+                assert_eq!(status.until, 0);
+            }
+            other => panic!("the custom-emoji status: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 5. the hard error forwards through the channel-error tail and
+        //    refires get_recent_emoji_statuses
+        td.request(
+            5,
+            Function::setChatEmojiStatus(td_api::setChatEmojiStatus {
+                chat_id: channel_dialog,
+                emoji_status: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateEmojiStatus::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "CHANNEL_PRIVATE");
+        // the EmojiStatus.cpp:590 refire — the recent-statuses query rides
+        // the user plane
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the get_recent_emoji_statuses refire");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getRecentEmojiStatuses::ID
+        );
+
+        // 6. the rights band — the member channel answers the C++ 400
+        //    and dispatches nothing
+        td.request(
+            6,
+            Function::setChatAccentColor(td_api::setChatAccentColor {
+                chat_id: member_dialog,
+                accent_color_id: 5,
+                background_custom_emoji_id: 0,
+            }),
+        );
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Not enough rights in the channel");
+
+        // 7. the invalid accent id band (the default -1 id)
+        td.request(
+            7,
+            Function::setChatAccentColor(td_api::setChatAccentColor {
+                chat_id: channel_dialog,
+                accent_color_id: -1,
+                background_custom_emoji_id: 0,
+            }),
+        );
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Invalid accent color identifier specified");
+        // 8. the megagroup band — accent colors are broadcast-only
+        let megagroup_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(704),
+        )
+        .get();
+        td.request(
+            8,
+            Function::setChatAccentColor(td_api::setChatAccentColor {
+                chat_id: megagroup_dialog,
+                accent_color_id: 5,
+                background_custom_emoji_id: 0,
+            }),
+        );
+        let error = error_of(&callback, 8);
+        assert_eq!(error.code, 400);
+        assert_eq!(
+            error.message,
+            "Accent color can be changed only in channel chats"
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
     }
 

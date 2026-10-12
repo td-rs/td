@@ -2802,10 +2802,34 @@ pub fn set_dialog_accent_color(
             return;
         }
         crate::dialog_id::DialogType::Channel => {
-            // chat_manager_->set_channel_accent_color — the ChatManager
-            // setter surface is M.5.44+; the query tail is the net-blocked
-            // error (stub inventory).
-            promise_unimplemented(&mut promise);
+            // chat_manager_->set_channel_accent_color (ChatManager.cpp:3275)
+            // — the flow dispatches the `UpdateChannelColorQuery` over the
+            // ChatManager net handle.
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                chat_manager,
+                ..
+            } = td;
+            let Some(options) = option_manager.as_mut() else {
+                promise_unimplemented(&mut promise);
+                return;
+            };
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            chat_manager.set_channel_accent_color(
+                user_manager,
+                &mut env,
+                dialog_id.get_channel_id(),
+                accent_color_id,
+                background_custom_emoji_id,
+                promise,
+            );
             return;
         }
         _ => {}
@@ -2837,9 +2861,34 @@ pub fn set_dialog_profile_accent_color(
             return;
         }
         crate::dialog_id::DialogType::Channel => {
-            // chat_manager_->set_channel_profile_accent_color — M.5.44+
-            // (stub inventory).
-            promise_unimplemented(&mut promise);
+            // chat_manager_->set_channel_profile_accent_color
+            // (ChatManager.cpp:3296) — the profile variant of the
+            // `UpdateChannelColorQuery` flow.
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                chat_manager,
+                ..
+            } = td;
+            let Some(options) = option_manager.as_mut() else {
+                promise_unimplemented(&mut promise);
+                return;
+            };
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            chat_manager.set_channel_profile_accent_color(
+                user_manager,
+                &mut env,
+                dialog_id.get_channel_id(),
+                profile_accent_color_id,
+                profile_background_custom_emoji_id,
+                promise,
+            );
             return;
         }
         _ => {}
@@ -2970,9 +3019,34 @@ pub fn set_dialog_emoji_status(
             return;
         }
         crate::dialog_id::DialogType::Channel => {
-            // chat_manager_->set_channel_emoji_status — M.5.44+ (stub
-            // inventory).
-            promise_unimplemented(&mut promise);
+            // chat_manager_->set_channel_emoji_status (ChatManager.cpp:3311)
+            // — the flow dispatches the
+            // `UpdateChannelEmojiStatusQuery` over the ChatManager net
+            // handle.
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                chat_manager,
+                ..
+            } = td;
+            let Some(options) = option_manager.as_mut() else {
+                promise_unimplemented(&mut promise);
+                return;
+            };
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            chat_manager.set_channel_emoji_status(
+                user_manager,
+                &mut env,
+                dialog_id.get_channel_id(),
+                emoji_status.cloned(),
+                promise,
+            );
             return;
         }
         _ => {}

@@ -141,6 +141,44 @@ impl EmojiStatus {
         self.until_date
     }
 
+    /// `EmojiStatus::get_input_emoji_status` (EmojiStatus.cpp:461-479) —
+    /// the request-side wire form: the empty and custom-emoji statuses
+    /// map to `emojiStatus`/`emojiStatusEmpty`; the collectible carries
+    /// its input form (`inputEmojiStatusCollectible`).
+    pub fn get_input_emoji_status(&self) -> telegram_api::EmojiStatus {
+        if self.is_empty() {
+            return telegram_api::EmojiStatus::emojiStatusEmpty(telegram_api::emojiStatusEmpty);
+        }
+        if self.custom_emoji_id.is_valid() {
+            let flags = if self.until_date != 0 { 1 } else { 0 };
+            return telegram_api::EmojiStatus::emojiStatus(telegram_api::emojiStatus {
+                flags,
+                document_id: self.custom_emoji_id.get(),
+                until: self.until_date,
+            });
+        }
+        let flags = if self.until_date != 0 { 1 } else { 0 };
+        telegram_api::EmojiStatus::inputEmojiStatusCollectible(
+            telegram_api::inputEmojiStatusCollectible {
+                flags,
+                collectible_id: self.collectible_id,
+                until: self.until_date,
+            },
+        )
+    }
+
+    /// `EmojiStatus::get_input_emoji_status(const unique_ptr<EmojiStatus> &)`
+    /// (EmojiStatus.cpp:481-487) — the null status maps to the empty
+    /// constructor.
+    pub fn get_input_emoji_status_of(
+        emoji_status: Option<&EmojiStatus>,
+    ) -> telegram_api::EmojiStatus {
+        match emoji_status {
+            Some(status) => status.get_input_emoji_status(),
+            None => telegram_api::EmojiStatus::emojiStatusEmpty(telegram_api::emojiStatusEmpty),
+        }
+    }
+
     pub fn clear_until_date(&mut self) {
         self.until_date = 0;
     }
@@ -546,6 +584,57 @@ mod tests {
             text_color: 4,
             until: 0,
         })
+    }
+
+    #[test]
+    fn input_emoji_status_maps_the_three_forms() {
+        // the null and structurally-empty statuses map to the empty
+        // constructor (EmojiStatus.cpp:481-487, :463-465)
+        assert!(matches!(
+            EmojiStatus::get_input_emoji_status_of(None),
+            telegram_api::EmojiStatus::emojiStatusEmpty(_)
+        ));
+        assert!(matches!(
+            EmojiStatus::get_input_emoji_status_of(Some(&EmojiStatus::default())),
+            telegram_api::EmojiStatus::emojiStatusEmpty(_)
+        ));
+
+        // the custom-emoji form carries the until flag only when set
+        // (cpp:466-472)
+        let status = EmojiStatus::get_emoji_status(plain(42)).unwrap();
+        match EmojiStatus::get_input_emoji_status_of(Some(&status)) {
+            telegram_api::EmojiStatus::emojiStatus(status) => {
+                assert_eq!(status.flags, 0);
+                assert_eq!(status.document_id, 42);
+                assert_eq!(status.until, 0);
+            }
+            other => panic!("the custom form: {other:?}"),
+        }
+        let with_until = EmojiStatus::get_emoji_status(telegram_api::EmojiStatus::emojiStatus(
+            telegram_api::emojiStatus {
+                flags: 1,
+                document_id: 42,
+                until: 500,
+            },
+        ))
+        .unwrap();
+        match EmojiStatus::get_input_emoji_status_of(Some(&with_until)) {
+            telegram_api::EmojiStatus::emojiStatus(status) => {
+                assert_eq!(status.flags, 1);
+                assert_eq!(status.until, 500);
+            }
+            other => panic!("the until form: {other:?}"),
+        }
+
+        // the collectible form keeps its input constructor (cpp:473-479)
+        let status = EmojiStatus::get_emoji_status(collectible(77)).unwrap();
+        match EmojiStatus::get_input_emoji_status_of(Some(&status)) {
+            telegram_api::EmojiStatus::inputEmojiStatusCollectible(status) => {
+                assert_eq!(status.flags, 0);
+                assert_eq!(status.collectible_id, 77);
+            }
+            other => panic!("the collectible form: {other:?}"),
+        }
     }
 
     #[test]
