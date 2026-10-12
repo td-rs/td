@@ -7,7 +7,7 @@
 //! reply-markup surfaces (unmerged); the four shortcut queries ride the
 //! client-side dispatcher under their `QuickReplyNetKind` — the answers
 //! drain through `Td::on_quick_reply_net_answer` (the ok values drop,
-//! Promise<Unit>; the delete-messages error tail's
+//! `Promise<Unit>`; the delete-messages error tail's
 //! `reload_quick_reply_messages` re-entry rides the messages plane and
 //! parks as a logged note). The `messages.getQuickReplies` load machine
 //! stays a parked seam (messages plane).

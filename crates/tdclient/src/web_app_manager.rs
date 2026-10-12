@@ -9,10 +9,12 @@
 //! - The eight `Td::ResultHandler` queries ride the
 //!   [`WebAppManagerEnv`] net seams — `[blocked: net]`, the promises park
 //!   (the M.41 convention); the answer handlers
-//!   ([`WebAppManager::on_get_popular_app_bots`], [`on_get_bot_app`],
-//!   [`on_get_app_web_view`], [`on_get_main_web_view`],
-//!   [`on_get_web_view`], [`on_prolong_web_view`],
-//!   [`on_get_custom_request_result`], [`on_check_download_file_params`])
+//!   ([`WebAppManager::on_get_popular_app_bots`],
+//!   [`WebAppManager::on_get_bot_app`], [`WebAppManager::on_get_app_web_view`],
+//!   [`WebAppManager::on_get_main_web_view`],
+//!   [`WebAppManager::on_get_web_view`], [`WebAppManager::on_prolong_web_view`],
+//!   [`WebAppManager::on_get_custom_request_result`],
+//!   [`WebAppManager::on_check_download_file_params`])
 //!   are real and unit-tested.
 //! - The `StateManager` online callback (WebAppManager.cpp:406-422) is
 //!   the [`WebAppManager::on_online`] entry — the StateManager lands

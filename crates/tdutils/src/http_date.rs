@@ -4,7 +4,7 @@
 //! The C++ parser rides `td::Parser` for the token walk; the same minimal
 //! token operations (`read_till`, `read_word`, `skip`, `skip_nofail`,
 //! `skip_whitespaces` with the shared status) live in the private
-//! [`Parser`] below. `to_integer_safe` maps to `str::parse` with the C++
+//! `Parser` below. `to_integer_safe` maps to `str::parse` with the C++
 //! failure behavior (an error surfaces through the parser status, or the
 //! explicit checks in [`to_unix_time`]).
 

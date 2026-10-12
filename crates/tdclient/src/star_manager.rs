@@ -32,7 +32,7 @@
 //!   client-side dispatcher under its `StarNetKind` (the answers drain
 //!   through `Td::on_star_net_answer` — the port of the C++ handler
 //!   halves of StarManager.cpp:49-1400): the topup/gift/giveaway option
-//!   families, subscriptions (the [`StarSubscription`] conversion + the
+//!   families, subscriptions (the `StarSubscription` conversion + the
 //!   owned-balance update), the subscription change/cancel/fulfill and
 //!   refund families, the revenue stats/withdrawal-url/ads-url set and
 //!   the paid-message revenue. The `GetStarsTransactionsQuery`/

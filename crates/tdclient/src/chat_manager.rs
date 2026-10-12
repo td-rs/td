@@ -3761,23 +3761,24 @@ impl BotVerification {
         let [has_description_entities] = parser.parse_flags()?;
         let bot_user_id_ = parse_user_id(parser)?;
         let icon_ = CustomEmojiId::new(parser.i64_()?);
-        let mut description_ = crate::message_entity::FormattedText::default();
-        description_.text = parser.string()?;
+        let description_text = parser.string()?;
+        let mut description_entities = Vec::new();
         if has_description_entities {
             let len = parser.i32_()?;
             if len < 0 || parser.left_len() < len as usize {
                 return Err("Wrong vector length");
             }
             for _ in 0..len {
-                description_
-                    .entities
-                    .push(crate::message_entity::MessageEntity::parse(parser)?);
+                description_entities.push(crate::message_entity::MessageEntity::parse(parser)?);
             }
         }
         Ok(BotVerification {
             bot_user_id_,
             icon_,
-            description_,
+            description_: crate::message_entity::FormattedText {
+                text: description_text,
+                entities: description_entities,
+            },
         })
     }
 }
@@ -12316,7 +12317,7 @@ impl ChatManager {
 
     /// Fire every expired deadline (the `on_*_timeout_callback` +
     /// `send_closure_later` hop collapses into a direct call, the M.4.7
-    /// convention); the caller re-arms from [`ChatManager::next_deadline`].
+    /// convention); the caller re-arms from `ChatManager::next_deadline`.
     pub fn tick_timeouts(&mut self, user_manager: &mut UserManager, env: &mut UserEnv) {
         let now = tdutils::time::now();
         let expired: Vec<i64> = self
@@ -12708,7 +12709,7 @@ impl ChatManager {
 
     /// `get_input_peer_channel` (ChatManager.cpp:2808-2829). The
     /// `channel_messages_` branch needs the M.5.43 message-id packing, so
-    /// it errors like [`ChatManager::get_input_channel`] until then.
+    /// it errors like `ChatManager::get_input_channel` until then.
     pub fn get_input_peer_channel(
         &self,
         env: &UserEnv,

@@ -2,17 +2,17 @@
 //! `G()->net_query_dispatcher().dispatch_with_callback(...)` sites
 //! (`ConfigManager.cpp:1027, :957, :986, :1002`) and the
 //! `Td.cpp:914-919` dispatcher creation, over the Track-F
-//! [`NetQueryDispatcher`] slice.
+//! `NetQueryDispatcher` slice.
 //!
 //! The C++ `NetQueryCreator::create/create_unauth` (NetQueryCreator.cpp:42-104)
-//! is mirrored by [`build_config_net_query`]: the serialized TL body with the
+//! is mirrored by `build_config_net_query`: the serialized TL body with the
 //! constructor id, the `DcId::main()` default of all four sites, the unauth /
 //! auth split, the gzip threshold, and the 60-second (8 for bots) creator
 //! default that the config sites overwrite with the 24-hour budget.
 //!
 //! The `actor_shared(this, N)` payloads — the link tokens the C++
 //! `ConfigManager::on_result` dispatches on via `get_link_token()` — ride
-//! with [`ConfigQueryCallback`]. M.3.8.2 routes the parked completions into
+//! with `ConfigQueryCallback`. M.3.8.2 routes the parked completions into
 //! `Td::on_config_query_result`; until then they accumulate in dispatch
 //! order in the shared buffers.
 

@@ -1007,31 +1007,36 @@ pub trait StoryManagerEnv {
         tdutils::log_info!("on_update_user_max_read_story_id — [blocked: user stories]");
     }
 
-    /// `UserManager::on_update_user_has_pinned_stories` — [blocked].
+    /// `UserManager::on_update_user_has_pinned_stories` — [blocked: user
+    /// stories].
     fn on_update_user_has_pinned_stories(&mut self, user_id: UserId, has_pinned_stories: bool) {
         let _ = (user_id, has_pinned_stories);
         tdutils::log_info!("on_update_user_has_pinned_stories — [blocked: user stories]");
     }
 
-    /// `UserManager::on_update_user_stories_hidden` — [blocked].
+    /// `UserManager::on_update_user_stories_hidden` — [blocked: user
+    /// stories].
     fn on_update_user_stories_hidden(&mut self, user_id: UserId, stories_hidden: bool) {
         let _ = (user_id, stories_hidden);
         tdutils::log_info!("on_update_user_stories_hidden — [blocked: user stories]");
     }
 
-    /// `ChatManager::on_update_channel_max_read_story_id` — [blocked].
+    /// `ChatManager::on_update_channel_max_read_story_id` — [blocked:
+    /// channel stories].
     fn on_update_channel_max_read_story_id(&mut self, channel_id: i64, max_read_story_id: StoryId) {
         let _ = (channel_id, max_read_story_id);
         tdutils::log_info!("on_update_channel_max_read_story_id — [blocked: channel stories]");
     }
 
-    /// `ChatManager::on_update_channel_has_pinned_stories` — [blocked].
+    /// `ChatManager::on_update_channel_has_pinned_stories` — [blocked:
+    /// channel stories].
     fn on_update_channel_has_pinned_stories(&mut self, channel_id: i64, has_pinned_stories: bool) {
         let _ = (channel_id, has_pinned_stories);
         tdutils::log_info!("on_update_channel_has_pinned_stories — [blocked: channel stories]");
     }
 
-    /// `ChatManager::on_update_channel_stories_hidden` — [blocked].
+    /// `ChatManager::on_update_channel_stories_hidden` — [blocked: channel
+    /// stories].
     fn on_update_channel_stories_hidden(&mut self, channel_id: i64, stories_hidden: bool) {
         let _ = (channel_id, stories_hidden);
         tdutils::log_info!("on_update_channel_stories_hidden — [blocked: channel stories]");
@@ -1043,7 +1048,8 @@ pub trait StoryManagerEnv {
         user_id.is_valid()
     }
 
-    /// `ChatManager::can_poll_channel_active_stories` — [blocked]; interim
+    /// `ChatManager::can_poll_channel_active_stories` — [blocked: channel
+    /// stories]; interim
     /// `false`.
     fn can_poll_channel_active_stories(&mut self, channel_id: i64) -> bool {
         let _ = channel_id;

@@ -10,7 +10,7 @@
 //! machine on the `Td` actor (the M.3.7.5 convention): its two queries
 //! dispatch through the same client-side dispatcher with a parking
 //! callback, and the `Td` drains the completions back into
-//! [`DcAuthManager::on_result`].
+//! `DcAuthManager::on_result`.
 
 use parking_lot::Mutex;
 use std::sync::Arc;

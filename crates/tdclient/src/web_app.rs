@@ -16,7 +16,7 @@
 //!   object builders).
 //! - The store/parse `FileId` rows ride [`PhotoStoreEnv`]
 //!   (FileId.hpp:16-23) and the animation row rides
-//!   [`WebAppEnv::store_animation_row`]/[`parse_animation_row`]
+//!   [`WebAppEnv::store_animation_row`]/[`WebAppEnv::parse_animation_row`]
 //!   (AnimationsManager.hpp:21-56, [blocked: AnimationsManager]).
 
 use crate::photo::{Photo, PhotoStoreEnv, parse_photo, store_photo};

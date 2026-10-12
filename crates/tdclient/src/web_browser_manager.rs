@@ -18,7 +18,7 @@ use tdutils::status::Status;
 
 /// The `G()`/`td_` surface of the manager. The cross-manager arms are the
 /// `[blocked: net]` query seams; the `send_update` outbox is drained by
-/// [`crate::td::Td::flush_user_updates`].
+/// `crate::td::Td::flush_user_updates`.
 pub trait WebBrowserManagerEnv {
     /// `td_->auth_manager_->is_authorized()`.
     fn is_authorized(&self) -> bool;

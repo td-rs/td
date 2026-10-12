@@ -182,7 +182,7 @@ impl KeyboardButtonStyle {
     }
 
     /// `operator<<` (KeyboardButtonStyle.cpp:88-114) — empty for the
-    /// default style, otherwise ", <Name>[<icon id>]".
+    /// default style, otherwise `", <Name>[<icon id>]"`.
     pub fn print(&self, out: &mut String) {
         if self.is_default() {
             return;

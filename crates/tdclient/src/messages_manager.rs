@@ -24492,7 +24492,7 @@ impl<T: ReadStateContext + SendMessageContext> MessageManagerContext for T {}
 /// (MessagesManager.cpp:30605-30637) — the container read with the
 /// scheduled-date rewrite and the LRU access touch. The C++ returns a
 /// mutable-or-const pointer; the Rust callers pick
-/// [`get_message_in_dialog`] for the shared read or re-borrow the dialog
+/// `get_message_in_dialog` for the shared read or re-borrow the dialog
 /// for the write paths.
 pub fn get_message_touched(
     d: &mut Dialog,
@@ -25055,6 +25055,7 @@ pub fn load_last_dialog_message(d: &mut Dialog, is_bot: bool, source: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors delete_message's C++ parameter list
 pub fn do_delete_message(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
@@ -25960,7 +25961,7 @@ pub struct TextMessageQueryParams {
     pub dialog_id: DialogId,
     /// `inputReplyToMessage` — the plain reply arm; the
     /// story/ephemeral/quote/topic arms ride their slices (documented in
-    /// [`get_input_reply_to_for_send`]).
+    /// `get_input_reply_to_for_send`).
     pub reply_to_message_id: Option<i32>,
     pub top_msg_id: i32,
     pub message: String,
@@ -41271,11 +41272,12 @@ mod tests {
         use crate::message_entity::MessageEntity;
 
         fn server_message(id: i32) -> Message {
-            let mut m = Message::default();
-            m.message_id = MessageId::from_server_message_id(ServerMessageId::new(id));
-            m.date = 1_700_000_000;
-            m.content = Some(MessageContent::Text(Default::default()));
-            m
+            Message {
+                message_id: MessageId::from_server_message_id(ServerMessageId::new(id)),
+                date: 1_700_000_000,
+                content: Some(MessageContent::Text(Default::default())),
+                ..Message::default()
+            }
         }
 
         fn text_with_custom_emoji(ids: &[i64]) -> MessageContent {
@@ -41321,8 +41323,10 @@ mod tests {
             let ctx = super::SendTestContext::default();
             let dialog_id = DialogId::from_user_id(UserId::new(10));
             // Local/yet-unsent messages delete (the local id band).
-            let mut local = Message::default();
-            local.message_id = MessageId::new((1 << 20) | 2);
+            let local = Message {
+                message_id: MessageId::new((1 << 20) | 2),
+                ..Message::default()
+            };
             assert!(local.message_id.is_local());
             assert!(can_delete_message(&ctx, dialog_id, &local));
             // A server user message deletes and revokes within the time limit.
@@ -41442,11 +41446,15 @@ mod tests {
         fn thread_full_id_bands() {
             let ctx = super::SendTestContext::default();
             let channel_id = crate::chat_manager::ChannelId::new(5);
-            let mut dialog = Dialog::default();
-            dialog.dialog_id = DialogId::from_channel_id(channel_id);
+            let dialog = Dialog {
+                dialog_id: DialogId::from_channel_id(channel_id),
+                ..Dialog::default()
+            };
             // A non-channel dialog has no threads.
-            let mut user_dialog = Dialog::default();
-            user_dialog.dialog_id = DialogId::from_user_id(UserId::new(1));
+            let user_dialog = Dialog {
+                dialog_id: DialogId::from_user_id(UserId::new(1)),
+                ..Dialog::default()
+            };
             let m = server_message(10);
             assert_eq!(
                 get_top_thread_message_full_id(&ctx, &user_dialog, &m, false)
@@ -41498,7 +41506,6 @@ mod tests {
         fn ephemeral_delete_split() {
             // 21c7e4c18: the scheduled/ephemeral delete bands.
             let m = server_message(90);
-            let dialog_id = DialogId::from_user_id(UserId::new(10));
             // The ephemeral split runs through the properties ladder; the
             // ephemeral helper pins the actual-content form.
             assert!(!is_ephemeral_message(&m));

@@ -7,8 +7,8 @@
 //! `DocumentsManager::on_get_document` collapse (the General-vs-Sticker
 //! type derivation reads the document attributes; the rest of the
 //! DocumentsManager stays its own track). The `FileId` store/parse ride
-//! [`crate::files::FileManager::store_file`]/[`parse_file`] through the
-//! env, exactly like the photo stores. The three `Td::ResultHandler`
+//! [`crate::files::FileManager::store_file`]/[`crate::files::FileManager::parse_file`]
+//! through the env, exactly like the photo stores. The three `Td::ResultHandler`
 //! query classes (`GetAttachMenuBotsQuery`, `GetAttachMenuBotQuery`,
 //! `ToggleBotInAttachMenuQuery`) collapse into the
 //! [`AttachMenuManagerEnv`] query seams — `[blocked: net]` with the
@@ -29,7 +29,7 @@ use tdutils::status::Status;
 
 /// The `G()`/`td_` surface of the manager. The net queries are the
 /// `[blocked: net]` query seams; the `send_update` outbox is drained by
-/// [`crate::td::Td::flush_user_updates`].
+/// `crate::td::Td::flush_user_updates`.
 pub trait AttachMenuManagerEnv {
     /// `G()->close_flag()`.
     fn close_flag(&self) -> bool;

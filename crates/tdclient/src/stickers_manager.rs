@@ -2195,7 +2195,7 @@ impl StickersManager {
     /// `get_stickers` (StickersManager.cpp:4259-4542) over the
     /// `GetStickersRequest` actor (Requests.cpp:1361-1388) — the local
     /// decision ladder is exact; the per-set record search collapses
-    /// (see [`Self::get_stickers_bands`]).
+    /// (see `Self::get_stickers_bands`).
     #[allow(clippy::too_many_arguments)]
     pub fn get_stickers(
         &mut self,

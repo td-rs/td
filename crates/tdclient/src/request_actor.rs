@@ -33,7 +33,7 @@
 //! - the per-function retry ladder lives inside the manager loaders
 //!   (`UserManager::load_user(id, tries)`), whose Ok(false) re-parks model
 //!   the re-`do_run`; the exhaustion answer is
-//!   [`TRIES_EXHAUSTED_ERROR`];
+//!   `TRIES_EXHAUSTED_ERROR`;
 //! - `RequestOnceActor` = the CREATE_OK_REQUEST_PROMISE arms: the promise
 //!   maps every ok to `td_api::ok` and the parked query completes it.
 //!

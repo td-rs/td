@@ -21,7 +21,7 @@
 //!   `wallPaperNoFile` local-id counter (`set_local_background_id`) is
 //!   [blocked: M.16 Backgrounds] and reports an unresolvable row.
 //! - The `BackgroundId` row bytes inside `BackgroundInfo::store/parse`
-//!   ride [`ThemeManagerEnv::store_background_row`]/[`parse_background_row`]
+//!   ride [`ThemeManagerEnv::store_background_row`]/[`ThemeManagerEnv::parse_background_row`]
 //!   (`BackgroundManager::store_background`/`parse_background`) — the full
 //!   `Background` row store is [blocked: M.16]; until then a theme whose
 //!   wallpaper row is unresolvable stores as background-less (the
@@ -33,8 +33,8 @@
 //! - `UpdatesManager::on_update(updateTheme)` →
 //!   [`ThemeManager::on_update_theme`] and the after-getDifference reload
 //!   block (UpdatesManager.cpp:2459-2461 →
-//!   [`ThemeManager::reload_accent_colors`]/[`reload_chat_themes`]/[
-//!   [`ThemeManager::reload_profile_accent_colors`]) are the M.7 seams,
+//!   [`ThemeManager::reload_accent_colors`]/[`ThemeManager::reload_chat_themes`]/[
+//!   `ThemeManager::reload_profile_accent_colors`]) are the M.7 seams,
 //!   wired at the updates integration.
 //! - `BoostManager::get_theme_counts` (BoostManager.cpp:374) and the
 //!   ChatManager/DialogEventLog accent-color object conversions
@@ -1338,7 +1338,7 @@ impl ThemeSettings {
 
 /// The `G()`/`td_` surface of the manager. The four net queries ride
 /// the dispatcher at the `ThemeEnv` arms; the `send_update` outbox is
-/// drained by [`crate::td::Td::flush_user_updates`].
+/// drained by `crate::td::Td::flush_user_updates`.
 pub trait ThemeManagerEnv {
     /// `td_->auth_manager_->is_authorized()`.
     fn is_authorized(&self) -> bool;

@@ -3,7 +3,7 @@
 //! intake, td_api intake, and the two output builders).
 //!
 //! URL validation goes through the landed
-//! [`link_manager`](crate::link_manager) surface (`check_link`,
+//! [`link_manager`] surface (`check_link`,
 //! `get_link_user_id`), so no link plane is ported here. The
 //! `user_manager->` reads (the UrlAuth/User `InputUser` builders and the
 //! td_api user-id rewrite) go through the

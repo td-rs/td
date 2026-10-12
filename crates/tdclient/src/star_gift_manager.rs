@@ -34,7 +34,7 @@
 //!   unknown one.
 //! - Every `td_->create_handler<...>->send(...)` query is the
 //!   `[blocked: net]` query seam: the send logs the query name and parks
-//!   the promise in [`StarGiftManager::pending`]. The answer halves that
+//!   the promise in `StarGiftManager::pending`. The answer halves that
 //!   only need the value plane and the user/chat intakes are real
 //!   (`on_get_available_gifts`, `on_get_saved_star_gifts`, the auction
 //!   plane, the collections, ...) and unit-tested; the payment-form query
@@ -2853,7 +2853,7 @@ pub trait StarGiftEnv {
     fn get_option_string(&mut self, name: &str, default_value: &str) -> String;
 
     /// `send_closure(G()->td(), &Td::send_update, ...)` — drained by
-    /// [`crate::td::Td::flush_user_updates`].
+    /// `crate::td::Td::flush_user_updates`.
     fn send_update(&mut self, update: td_api::Update);
 
     /// `td_->user_manager_->on_get_users(users, source)`.

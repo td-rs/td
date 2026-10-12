@@ -2284,7 +2284,7 @@ impl crate::messages_manager::SendMessageContext for Td {
     /// The `SendMessageQuery::send` wire leg (MessagesManager.cpp:1207-1249):
     /// the write peer resolves here (the dialog-manager read), the
     /// payload rides the params, and the answer drains through
-    /// [`Td::on_send_message_answer`].
+    /// `Td::on_send_message_answer`.
     fn send_text_message_query(&mut self, params: crate::messages_manager::TextMessageQueryParams) {
         // `input_peer == nullptr → on_error(400 "Have no write access to
         // the chat")` (MessagesManager.cpp:1209-1213).
@@ -26051,7 +26051,7 @@ pub(crate) fn star_env_split(td: &mut Td) -> (crate::star_manager::StarManager, 
     let env = TdStarEnv { td: &mut *td };
     (manager, env)
 }
-/// The `Td`-level [`MmRequestContext`] — the request-plane surface the
+/// The `Td`-level `MmRequestContext` — the request-plane surface the
 /// M.mmreq methods read. The landed manager tails run for real (the
 /// DialogManager server tails, the M.16 ReactionManager plane); the wire
 /// tails keep the trait's [blocked: net] default no-op bodies.

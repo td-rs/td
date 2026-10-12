@@ -2,7 +2,7 @@
 //! (M.3.8.2): the `ConfigManager::on_result` net entry
 //! (ConfigManager.cpp:1040-1140) — a completed `NetQuery` plus its
 //! `actor_shared` link token decodes into a
-//! [`ConfigQueryResult`](crate::config_manager::ConfigQueryResult) and feeds
+//! [`ConfigQueryResult`] and feeds
 //! the token dispatch in [`Td::on_config_query_result`](crate::td::Td).
 //!
 //! The decode is the C++ `fetch_result<T>` (NetQuery.h:339-362): a

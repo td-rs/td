@@ -416,7 +416,7 @@ impl<T: Send + 'static> Drop for PromiseActor<T> {
 }
 
 /// An owning handle to a heap [`FutureActor`] allocated from the
-/// scheduler's per-thread [`block_pool`](crate::actor_id::block_pool) —
+/// scheduler's per-thread `block_pool` —
 /// the port of the C++ `ObjectPool` block a stack `FutureActor` occupies.
 ///
 /// The C++ future lives on the caller's stack and its registration holds a

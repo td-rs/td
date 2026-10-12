@@ -683,7 +683,7 @@ impl SchedulerState {
     /// the member `unique_ptr` — the manager code is written against the
     /// owner's world.
     ///
-    /// The raw-pointer reach is what [`IdSlot::set_owner`] + the
+    /// The raw-pointer reach is what `IdSlot::set_owner` + the
     /// inline-dispatch guard are for: the scheduler never dispatches the
     /// bridge and its owner at the same time (sends that would re-enter
     /// the pair take the mailbox instead), so the handlers' `&mut` into
@@ -1523,7 +1523,7 @@ impl SchedulerState {
     /// run a bridge slice after the owner is gone. Unlike the `ActorOwn`
     /// drop (an async hangup event), this tears the registration down in
     /// the caller's frame: the actor's `tear_down` runs here, then
-    /// [`Self::destroy_actor`] unregisters it. The actor must not be the
+    /// `Self::destroy_actor` unregisters it. The actor must not be the
     /// one currently being dispatched.
     pub fn destroy_actor_sync<A: ?Sized>(&self, id: &ActorId<A>) {
         if !id.is_alive() {

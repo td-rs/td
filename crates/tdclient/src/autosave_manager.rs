@@ -29,7 +29,7 @@ const VIDEO_MAX_SIZE_MASK: i32 = 1 << 2;
 
 /// The `G()`/`td_` surface of the manager. The net queries are the
 /// `[blocked: net]` query seams; the `send_update` outbox is drained by
-/// [`crate::td::Td::flush_user_updates`].
+/// `crate::td::Td::flush_user_updates`.
 pub trait AutosaveManagerEnv {
     /// `G()->close_flag()`.
     fn close_flag(&self) -> bool;

@@ -10336,7 +10336,9 @@ mod tests {
     /// (check_parse_markdown_v3, test/message_entities.cpp).
     #[test]
     fn markdown_v3_url_and_email_absorption() {
-        let cases: &[(&str, &str, &[(Type, i32, i32)])] = &[
+        /// (input, expected output, expected entities) triple.
+        type Case<'a> = (&'a str, &'a str, &'a [(Type, i32, i32)]);
+        let cases: &[Case] = &[
             (
                 "🏟 https://a.com/__b__ 🏟 a__b__c@test.com __c.com/d__",
                 "🏟 https://a.com/__b__ 🏟 a__b__c@test.com c.com/d",

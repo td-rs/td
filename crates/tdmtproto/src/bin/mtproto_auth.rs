@@ -6,10 +6,12 @@
 //! session WITHOUT a second handshake — the persistence proof of the gate).
 //!
 //! Usage:
+//!   ```text
 //!   mtproto_auth --handshake                                              (live key creation only)
 //!   mtproto_auth <phone> <api_id> <api_hash> [port]                       (interactive one-shot)
 //!   mtproto_auth --send-code <phone> <api_id> <api_hash> <state-file>
 //!   mtproto_auth --sign-in <state-file> <code>
+//!   ```
 //!
 //! The two-phase form exists so the confirmation code can arrive between
 //! processes: `--send-code` persists the auth state plus the phone-code

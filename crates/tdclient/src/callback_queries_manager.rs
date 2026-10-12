@@ -8,9 +8,9 @@
 //!   [`CallbackQueriesManagerEnv`] net seams — `[blocked: net]` with the
 //!   promises parked (the M.41 convention); the answer handlers
 //!   ([`CallbackQueriesManager::on_get_bot_callback_answer`],
-//!   [`on_get_ephemeral_callback_answer`],
-//!   [`on_set_bot_callback_answer`]) are real and unit-tested, including
-//!   the `BOT_RESPONSE_TIMEOUT` → 502 remap and the
+//!   [`CallbackQueriesManager::on_get_ephemeral_callback_answer`],
+//!   [`CallbackQueriesManager::on_set_bot_callback_answer`]) are real and
+//!   unit-tested, including `BOT_RESPONSE_TIMEOUT` → 502 remap and the
 //!   `is_message_edited_recently(31)` empty-answer bail.
 //! - `td_->password_manager_->get_input_check_password_srp`
 //!   (CallbackQueriesManager.cpp:365-373) is the

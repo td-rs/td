@@ -3111,7 +3111,7 @@ impl fmt::Display for FileEncryptionKey {
 /// `FileReferenceManager::store_file_source`/`parse_file_source` pair
 /// that `FileData` serialization calls through. Implemented by
 /// [`FileReferenceManager`] (M.12.2a); the byte-level tests keep the
-/// [`TestFileSources`] stand-in.
+/// `TestFileSources` stand-in.
 pub trait FileSourceStorage: Send {
     fn store_file_source(&mut self, file_source_id: FileSourceId, out: &mut Vec<u8>);
     fn parse_file_source(&mut self, parser: &mut Parser) -> Result<FileSourceId, &'static str>;

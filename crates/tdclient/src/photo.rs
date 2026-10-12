@@ -1322,7 +1322,7 @@ pub fn register_photo_size(
 
 /// `get_photo_size` (PhotoSize.cpp:38-190) — the full FileManager-
 /// integrated form the media-metadata intakes use: the classification
-/// walk of [`get_photo_size`] plus the format guards, the sticker-set
+/// walk of `get_photo_size` plus the format guards, the sticker-set
 /// thumbnail type fixes, the thumbnail-source retyping, the size clamp
 /// and the content/registration tail. The minithumbnail half carries the
 /// module-wide lossy-String convention.

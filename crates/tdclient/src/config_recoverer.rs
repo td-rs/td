@@ -204,7 +204,7 @@ pub fn decode_config(input: &str) -> Result<telegram_api::help_ConfigSimple, Sta
     Ok(config)
 }
 
-/// The request half of a fetcher: what [`get_simple_config_impl`] sends
+/// The request half of a fetcher: what `get_simple_config_impl` sends
 /// (and what the recoverer's fetch action pins for the driver).
 #[derive(Clone, Debug)]
 pub struct SimpleConfigRequest {

@@ -7,7 +7,7 @@
 //! - The C++ `MultiPromiseActor` is registered lazily (`register_actor(name_,
 //!   this)` on the first `get_promise`) and *by pointer* — the object may be
 //!   a member of the calling actor (`Deleter::None`). The Rust [`MultiPromiseActor`]
-//!   mirrors this: the borrowed registration ([`Scheduler::register_actor_ptr`],
+//!   mirrors this: the borrowed registration (`Scheduler::register_actor_ptr`,
 //!   like S35's `Timeout`) happens inside `get_promise`, and the `ActorOwn`
 //!   lives inside the actor so that dropping the owning `Box` hangs it up.
 //! - C++ `MultiPromiseActorSafe` hands ownership to the scheduler in its

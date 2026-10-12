@@ -1170,7 +1170,7 @@ pub fn aes_ige_decrypt_in_place(aes_key: &[u8], aes_iv: &mut [u8], data: &mut [u
 /// CBC *encryption* chains through the cipher (block i's input depends on
 /// block i-1's output), so unlike [`aes_cbc_decrypt`] there is no wide pass
 /// to take — the loop is latency-bound on the AES chain. Native builds run
-/// one bulk EVP call (see [`cbc_native`], the exact C++ backend);
+/// one bulk EVP call (see `cbc_native`, the exact C++ backend);
 /// emscripten keeps the RustCrypto form below — copy in once, then per
 /// block one fixed-size XOR + one in-place `encrypt_block` through the
 /// same `&mut [aes::Block]` view the decrypt path uses.
@@ -1222,7 +1222,7 @@ pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
 /// last *input* block, then decrypts (the C++ saves the incoming iv first).
 ///
 /// Native builds run one bulk `EVP_DecryptUpdate` with `EVP_aes_256_cbc`
-/// (padding off — see [`cbc_native`], the exact C++ backend; the S97 wide
+/// (padding off — see `cbc_native`, the exact C++ backend; the S97 wide
 /// `decrypt_blocks` pass it replaces measured ~1.3× under the C++ row).
 /// Emscripten keeps the RustCrypto form below: one wide `decrypt_blocks`
 /// pass (the aes crate's pipelined AES-NI decrypt path) followed by a

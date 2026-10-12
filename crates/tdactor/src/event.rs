@@ -51,7 +51,7 @@ pub type BoxedThunk = Box<dyn FnOnce(&mut dyn Actor) + Send>;
 /// Oversized closures take the pooled arm — the C++ `ObjectPool` shape
 /// exactly.
 pub enum ActorThunk {
-    /// A closure stored in `data` (up to [`INLINE_WORDS`] words, at most
+    /// A closure stored in `data` (up to `INLINE_WORDS` words, at most
     /// `usize` alignment); `call` moves it out and runs it, `drop` drops it
     /// in place when the event is discarded without dispatch.
     Inline {
@@ -60,7 +60,7 @@ pub enum ActorThunk {
         drop: unsafe fn(*mut u8),
     },
     /// A closure too large for the inline slot, stored in a
-    /// [`block_pool`](crate::actor_id::block_pool) block (any alignment the
+    /// `block_pool` block (any alignment the
     /// closure needs, since buckets key on the full layout). `run`/`Drop`
     /// return the block to the pool — no global allocator traffic.
     Pooled {

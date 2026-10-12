@@ -5,7 +5,7 @@
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`TranslationManagerEnv`] trait carries the `G()`/auth/pmc/user
 //! surfaces, and the ten net queries ride the client-side dispatcher
-//! under their [`crate::td::TranslationNetKind`] — the answers drain
+//! under their `crate::td::TranslationNetKind` — the answers drain
 //! through `Td::on_translation_net_answer` into the landed
 //! `on_get_ai_compose_tones`/`on_get_translated_texts` intakes, the
 //! formatted-text/fixed-text answers (the proofread diff rides the

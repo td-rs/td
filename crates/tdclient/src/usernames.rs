@@ -731,6 +731,7 @@ mod tests {
         assert_eq!(deleted, base);
     }
 
+    #[test]
     fn toggle_disables_and_reenables() {
         let usernames = Usernames::from_telegram("main".to_owned(), Vec::new());
         let disabled = usernames.toggle(false, "main", false);

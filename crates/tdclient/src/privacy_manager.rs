@@ -11,7 +11,7 @@
 //! dispatcher under their `PrivacyNetKind` — the answers drain through
 //! `Td::on_privacy_net_answer` into the landed
 //! `on_get_user_privacy_settings`/`on_set_user_privacy_settings` halves
-//! (the caller promise queues ride the [`PrivacyManager`] state exactly
+//! (the caller promise queues ride the `PrivacyManager` state exactly
 //! like the C++ `PrivacyInfo`, the on_set tail re-sends the parked
 //! `pending_rules` through the join promise), and the wire legs
 //! (`get_input_privacy_key`, `get_input_privacy_rules`, the

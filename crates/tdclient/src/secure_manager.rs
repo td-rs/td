@@ -24,7 +24,7 @@
 //!   `FileManager::resume_upload(UploadCallback)` contract has no secure
 //!   variant on this base (`files.rs`'s [`crate::files::UploadCallback`]
 //!   carries no `on_upload_secure_ok`), so the upload legs record the
-//!   requests through [`SecureManagerEnv::file_resume_upload_secure`] and
+//!   requests through [`SecureValueEnv::file_resume_upload_secure`] and
 //!   the `on_upload_ok`-advance never fires: file-carrying values park at
 //!   the upload, exactly like the C++ before its uploads complete.
 //!
@@ -475,7 +475,8 @@ impl SetSecureValueQuery {
 
     /// `SetSecureValue::start_upload` (SecureManager.cpp:550-564) — the
     /// file slot is allocated and the upload request recorded; the
-    /// secure-upload callback contract is [blocked], so the slot stays
+    /// secure-upload callback contract is [blocked: files], so the slot
+    /// stays
     /// pending (see the module notes).
     fn start_upload(
         &mut self,

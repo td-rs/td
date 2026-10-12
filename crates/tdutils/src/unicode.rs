@@ -1,7 +1,7 @@
 //! Port of the `tdutils/td/utils/unicode.cpp` character-preparation functions
 //! used by the search machinery (M.4.4, `Hints`): `prepare_search_character`
 //! and `remove_diacritics`. The backing tables live in the generated
-//! [`crate::unicode_tables`] module (byte-extracted from tdlib 1.8.67).
+//! `crate::unicode_tables` module (byte-extracted from tdlib 1.8.67).
 
 use crate::unicode_tables::{
     PREPARE_SEARCH_CHARACTER_RANGES, PREPARE_SEARCH_CHARACTER_TABLE, TO_LOWER_RANGES,

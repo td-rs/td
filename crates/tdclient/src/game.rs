@@ -7,9 +7,10 @@
 //!   classification ride [`GameEnv`] (the
 //!   FileManager/AnimationsManager/DocumentsManager collapse; see the
 //!   `web_app` module doc for the same WebApp shape).
-//! - The store/parse `FileId` rows ride [`PhotoStoreEnv`] and the
-//!   animation row rides [`GameEnv::store_animation_row`]/[
-//!   `parse_animation_row`] ([blocked: AnimationsManager]); the
+//! - The store/parse `FileId` rows ride [`crate::photo::PhotoStoreEnv`] and
+//!   the animation row rides
+//!   [`WebAppEnv::store_animation_row`]/[`WebAppEnv::parse_animation_row`]
+//!   ([blocked: AnimationsManager]); the
 //!   `Version::FixStoreGameWithoutAnimation` version gate is real.
 //! - `Game::get_game_object` resolves the sender ids through
 //!   [`UserManagerLike`] (the C++ `td->user_manager_.get()`), skipped

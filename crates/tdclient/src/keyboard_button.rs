@@ -1,7 +1,7 @@
 //! Port of `td/telegram/KeyboardButton.{h,cpp,hpp}` — the private-chat
 //! keyboard button model: text, optional Web App URL, poll/phone/
 //! location/dialog request types, and the shared
-//! [`KeyboardButtonStyle`](crate::keyboard_button_style::KeyboardButtonStyle).
+//! [`KeyboardButtonStyle`].
 //!
 //! The td_api intake's Web App URL validation dereferences `G()` in the
 //! C++ (`!G()->is_test_dc()`, KeyboardButton.cpp:140); the port carries

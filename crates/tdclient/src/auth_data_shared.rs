@@ -10,8 +10,8 @@
 //! image lives in a mutex-guarded snapshot created client-side at
 //! `init_dc` (the pmc read the C++ constructor does, AuthDataShared.cpp:38-46)
 //! and pmc writes are marshalled to the `Td` actor as
-//! [`NetEvent::PersistAuthKey`]/[`NetEvent::PersistSalts`] through the
-//! [`NetEventQueue`]. The pmc bytes and the listener semantics are the
+//! `NetEvent::PersistAuthKey`/`NetEvent::PersistSalts` through the
+//! `NetEventQueue`. The pmc bytes and the listener semantics are the
 //! C++ ones.
 
 use parking_lot::Mutex;

@@ -9,8 +9,8 @@
 //! collapsed-line convention. The `StateManager::wait_first_sync` hop and
 //! the `MessagesManager::load_dialogs` hop are the same kind of seam (the
 //! first waits for the net-backed state machine, the second is the M.10
-//! dialog plane), so [`TopDialogManager::on_first_sync`] and
-//! [`TopDialogManager::on_load_dialogs`], like the query intakes, stay
+//! dialog plane), so `TopDialogManager::on_first_sync` and
+//! `TopDialogManager::on_load_dialogs`, like the query intakes, stay
 //! directly callable — and unit-tested — as the net-independent halves.
 //!
 //! The daily rating decay keeps the C++ recorded-time shape: every clock
@@ -22,7 +22,7 @@
 //! `topChatCategoryForwardUsers`, and the C++ maps
 //! `topChatCategoryForwardChats` onto [`TopDialogCategory::ForwardUsers`]
 //! — the bucket that then merges with ForwardChats in
-//! [`TopDialogManager::do_get_top_dialogs`].
+//! `TopDialogManager::do_get_top_dialogs`.
 
 use crate::dialog_id::DialogId;
 use crate::store_parse::{Parser, store_f64, store_i32};
@@ -341,21 +341,21 @@ pub trait TopDialogManagerEnv {
     /// `send_closure(td_->messages_manager_actor_,
     /// &MessagesManager::load_dialogs, dialog_ids, promise)` — the M.10
     /// dialog-load hop; the promise routes back to
-    /// [`TopDialogManager::on_load_dialogs`] and stays parked offline.
+    /// `TopDialogManager::on_load_dialogs` and stays parked offline.
     fn load_dialogs(&mut self, dialog_ids: Vec<DialogId>);
     /// `StateManager::wait_first_sync(create_event_promise(...))` — the
-    /// parked promise fires [`TopDialogManager::on_first_sync`]
+    /// parked promise fires `TopDialogManager::on_first_sync`
     /// (`[blocked: StateManager]` — the net-backed state machine).
     fn wait_first_sync(&mut self);
 
     // -- the `[blocked: net]` query tails; each one drops its promise,
     // -- which keeps the C++ request unanswered offline
     /// `ToggleTopPeersQuery` (TopDialogManager.cpp:70-93); the promise
-    /// routes back to [`TopDialogManager::on_toggle_top_peers`].
+    /// routes back to `TopDialogManager::on_toggle_top_peers`.
     fn send_toggle_top_peers_query(&mut self, is_enabled: bool);
     /// `GetTopPeersQuery` (TopDialogManager.cpp:43-68) with the
     /// `get_vector_hash` of the top-peer ids; the promise routes back to
-    /// [`TopDialogManager::on_get_top_peers`].
+    /// `TopDialogManager::on_get_top_peers`.
     fn send_get_top_peers_query(&mut self, hash: i64);
     /// `ResetTopPeerRatingQuery` (TopDialogManager.cpp:95-122) —
     /// fire-and-forget in the C++ (the result is ignored, errors are only

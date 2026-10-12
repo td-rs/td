@@ -14,9 +14,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// One regeneration target: the committed generated file (relative to the
+/// crate root) and the writer that regenerates it.
+type Target = (&'static str, fn() -> String);
+
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let targets: [(&str, fn() -> String); 5] = [
+    let targets: [Target; 5] = [
         (
             "../tdclient/src/generated/td_api.rs",
             tl_codegen::generate_td_api_rust,
@@ -52,10 +56,8 @@ fn main() {
 /// does not exist yet), keeping the mtime stable across syncs that
 /// produce identical output. Returns whether the file was written.
 fn write_if_changed(path: &PathBuf, contents: &str) -> bool {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == contents {
-            return false;
-        }
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+        return false;
     }
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, contents).unwrap();

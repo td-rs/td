@@ -18,7 +18,7 @@
 //! a plain field (the single-Td collapse — the C++ mutexes only guard
 //! cross-thread access), while [`get_language_pack_string`] — the
 //! `SynchronousRequests::do_request` tail — keeps the path-keyed static
-//! registry ([`SYNC_LANGUAGE_DATABASES`]). Both sides open the same file
+//! registry (`SYNC_LANGUAGE_DATABASES`). Both sides open the same file
 //! in WAL mode and write through committed transactions, so the
 //! observable byte content of every `kv_<pack>_<code>` table matches the
 //! C++ exactly (documented divergence: two connections instead of one
@@ -1250,7 +1250,7 @@ pub trait LanguagePackManagerEnv {
     );
     /// `langpack_getDifference` (cpp:433-458); the response half is
     /// `on_get_language_pack_strings(..., is_diff = true)`, the failure
-    /// half [`LanguagePackManager::on_failed_get_difference`]. The
+    /// half `LanguagePackManager::on_failed_get_difference`. The
     /// waiting promises park in the language's difference queue.
     fn send_get_difference_query(
         &mut self,

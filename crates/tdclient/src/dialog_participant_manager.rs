@@ -40,7 +40,7 @@ const MAX_GET_CHANNEL_PARTICIPANTS: i32 = 200;
 /// (DialogParticipantManager.cpp:1327).
 const MAX_PENDING_JOIN_REQUESTS: usize = 3;
 
-/// the vector<DialogAdministrator> log-event codec — the C++
+/// the `vector<DialogAdministrator>` log-event codec — the C++
 /// `log_event_store(vector)` shape: an i32 size, then each element's store.
 pub fn store_dialog_administrators(administrators: &[DialogAdministrator], out: &mut Vec<u8>) {
     store_i32(out, administrators.len() as i32);

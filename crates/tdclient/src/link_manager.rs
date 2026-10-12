@@ -1640,11 +1640,11 @@ impl InternalLink {
                 // LinkManager.cpp:1231-1244.
                 let receiver_object = if receiver.is_empty() {
                     None
-                } else if receiver.starts_with('@') {
+                } else if let Some(username) = receiver.strip_prefix('@') {
                     Some(
                         td_api::TonWalletTransferReceiver::tonWalletTransferReceiverUser(
                             td_api::tonWalletTransferReceiverUser {
-                                username: receiver[1..].to_owned(),
+                                username: username.to_owned(),
                             },
                         ),
                     )
@@ -2671,7 +2671,7 @@ fn get_ton_connect_connect_request_object(
     use tdutils::json::{JsonValue, JsonValueType, json_decode};
     let mut value = match json_decode(r) {
         tdutils::status::Result::Ok(value) => value,
-        tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+        tdutils::status::Result::Err(e) => return Err(Status::error(400, e.message())),
     };
     if value.ty() != JsonValueType::Object {
         return Err(Status::error(400, "Request must be an Object"));
@@ -2682,13 +2682,13 @@ fn get_ton_connect_connect_request_object(
     };
     let manifest_url = match request.get_required_string_field("manifestUrl") {
         tdutils::status::Result::Ok(url) => url,
-        tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+        tdutils::status::Result::Err(e) => return Err(Status::error(400, e.message())),
     };
     let checked_manifest_url = check_link(&manifest_url, false, false)?;
     let mut connect_items = Vec::new();
     let items = match request.extract_optional_field("items", JsonValueType::Array) {
         tdutils::status::Result::Ok(items) => items,
-        tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+        tdutils::status::Result::Err(e) => return Err(Status::error(400, e.message())),
     };
     if items.ty() == JsonValueType::Array {
         for item_value in items.get_array() {
@@ -2700,13 +2700,13 @@ fn get_ton_connect_connect_request_object(
             };
             let item_name = match item.get_required_string_field("name") {
                 tdutils::status::Result::Ok(name) => name,
-                tdutils::status::Result::Err(e) => return Err(Status::error(400, &e.message())),
+                tdutils::status::Result::Err(e) => return Err(Status::error(400, e.message())),
             };
             if item_name == "ton_addr" {
                 let network = match item.get_optional_string_field("network", "") {
                     tdutils::status::Result::Ok(network) => network,
                     tdutils::status::Result::Err(e) => {
-                        return Err(Status::error(400, &e.message()));
+                        return Err(Status::error(400, e.message()));
                     }
                 };
                 connect_items.push(td_api::TonConnectConnectItem::tonConnectConnectItemAddress(
@@ -2716,7 +2716,7 @@ fn get_ton_connect_connect_request_object(
                 let payload = match item.get_required_string_field("payload") {
                     tdutils::status::Result::Ok(payload) => payload,
                     tdutils::status::Result::Err(e) => {
-                        return Err(Status::error(400, &e.message()));
+                        return Err(Status::error(400, e.message()));
                     }
                 };
                 connect_items.push(td_api::TonConnectConnectItem::tonConnectConnectItemProof(
@@ -4346,7 +4346,7 @@ fn parse_t_me_link_query(
                 invoice_name: path[1].clone(),
             });
         }
-    } else if path[0].to_ascii_lowercase() == "getpremium" {
+    } else if path[0].eq_ignore_ascii_case("getpremium") {
         // /GetPremium?ref=<ref> (940933af7)
         let mut ref_ = get_arg("ref").to_ascii_lowercase();
         if !is_valid_premium_referrer(&ref_) || ref_.len() > 32 {

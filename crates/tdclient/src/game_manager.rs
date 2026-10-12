@@ -8,7 +8,7 @@
 //!   net seams — `[blocked: net]`, the promises park (the M.41
 //!   convention); the answer handlers
 //!   ([`GameManager::on_set_game_score_query`],
-//!   [`on_get_game_high_scores_query`]) are real and unit-tested.
+//!   [`GameManager::on_get_game_high_scores_query`]) are real and unit-tested.
 //! - `SetGameScoreQuery::on_result` hops into
 //!   `td_->updates_manager_->on_get_updates` (GameManager.cpp:60) — the
 //!   [`GameManagerEnv::on_get_updates`] seam; the production env calls
