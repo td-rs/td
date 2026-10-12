@@ -138,6 +138,7 @@ pub mod reaction_manager;
 pub mod reaction_type;
 pub mod referral_program;
 pub mod reply_markup;
+pub mod report_reason;
 pub mod request_actor;
 pub mod requested_dialog_type;
 pub mod requests;

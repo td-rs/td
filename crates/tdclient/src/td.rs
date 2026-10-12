@@ -7977,9 +7977,41 @@ impl Td {
     fn on_dialog_net_answer(
         &mut self,
         kind: crate::dialog_manager::DialogNetKind,
-        _query: NetQuery,
+        query: NetQuery,
     ) {
-        match kind {}
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `ReportProfilePhotoQuery` (DialogManager.cpp:543-613) — the
+            // Bool answer band (the false value is the C++ 400); the
+            // error tail logs and forwards (the file-reference repair
+            // chain — the kind's dialog — is the Files plane).
+            crate::dialog_manager::DialogNetKind::ReportProfilePhoto {
+                dialog_id: _dialog_id,
+            } => {
+                let Some(mut promise) = self.dialog_manager.take_report_profile_photo_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    // cpp:598-613 — LOG(INFO) then the file-reference
+                    // repair chain ([blocked: files]) and set_error
+                    tdutils::log_info!("Receive error for report chat photo: {}", query.error());
+                    promise.set_error(query.error().clone());
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            promise.set_error(Status::error(400, "Receive false as result"));
+                        }
+                        None => {
+                            promise.set_error(parse_error("account_reportProfilePhoto"));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Route one chat net answer by kind — the parse legs front the
@@ -33198,6 +33230,268 @@ mod tests {
 
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// Seed one file node with a full remote location — the photo form
+    /// (FileType::Photo + the `Photo` variant) or the document twin for
+    /// the type band; `with_remote: false` keeps the node local-only
+    /// (a full local photo location, so the type gate passes and the
+    /// missing-remote band fires).
+    fn seed_remote_file(td: &mut Td, file_id: i32, photo: bool, with_remote: bool) {
+        use crate::files::{
+            FileEncryptionKey, FileLocationSource, FullRemoteFileLocation, LocalFileLocation,
+            NewRemoteFileLocation, PhotoSizeSource,
+        };
+        let full = if photo {
+            FullRemoteFileLocation::from_photo(
+                PhotoSizeSource::thumbnail(FileType::Photo, b'a' as i32),
+                8,
+                9,
+                ChatDcId::internal(2),
+                "ref".to_owned(),
+            )
+        } else {
+            FullRemoteFileLocation::from_document(
+                FileType::Document,
+                10,
+                11,
+                ChatDcId::internal(2),
+                String::new(),
+            )
+        };
+        let remote = if with_remote {
+            NewRemoteFileLocation {
+                partial: None,
+                full: Some(full),
+                is_full_alive: true,
+                full_source: FileLocationSource::FromServer,
+            }
+        } else {
+            NewRemoteFileLocation::default()
+        };
+        let local = if with_remote {
+            LocalFileLocation::Empty
+        } else {
+            // the photo-typed local location keeps get_type() == Photo
+            LocalFileLocation::new(FileType::Photo, String::from("/tmp/x.jpg"), 0)
+        };
+        let node = FileNode::new(
+            local,
+            remote,
+            None,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            crate::messages_manager::DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(file_id, 0),
+            0,
+        );
+        td.file_manager
+            .lock()
+            .register_file_node(FileId::new(file_id, 0), 0, node);
+    }
+
+    #[test]
+    fn report_chat_photo_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(report_chat_photo_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn report_chat_photo_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-report-photo");
+        seed_dialog_chats(&mut td);
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(702),
+        )
+        .get();
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+
+        // 1. the happy path — the photo node rides the query with the
+        //    Read peer and the input report reason
+        seed_remote_file(&mut td, 10, true, true);
+        td.request(
+            1,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 10,
+                reason: Some(td_api::ReportReason::reportReasonSpam(
+                    td_api::reportReasonSpam,
+                )),
+                text: "it is spam".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_reportProfilePhoto::ID,
+        );
+        let body =
+            telegram_api::account_reportProfilePhoto::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 702);
+                assert_eq!(peer.access_hash, 777);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        match body.photo_id {
+            Some(telegram_api::InputPhoto::inputPhoto(photo)) => {
+                assert_eq!(photo.id, 8);
+                assert_eq!(photo.access_hash, 9);
+                assert_eq!(photo.file_reference, b"ref".to_vec());
+            }
+            other => panic!("the input photo: {other:?}"),
+        }
+        assert!(matches!(
+            body.reason,
+            Some(telegram_api::ReportReason::inputReportReasonSpam(_))
+        ));
+        assert_eq!(body.message, "it is spam");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the false Bool answer is the C++ 400
+        td.request(
+            2,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 10,
+                reason: Some(td_api::ReportReason::reportReasonFake(
+                    td_api::reportReasonFake,
+                )),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_reportProfilePhoto::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Receive false as result");
+
+        // 3. the error band forwards (the file-reference repair chain is
+        //    the Files plane)
+        td.request(
+            3,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 10,
+                reason: Some(td_api::ReportReason::reportReasonFake(
+                    td_api::reportReasonFake,
+                )),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_reportProfilePhoto::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_9");
+
+        // 4. the file-view gates — the unknown id, the document type and
+        //    the local-only node
+        td.request(
+            4,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 99,
+                reason: Some(td_api::ReportReason::reportReasonSpam(
+                    td_api::reportReasonSpam,
+                )),
+                text: String::new(),
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Unknown file identifier");
+
+        seed_remote_file(&mut td, 11, false, true);
+        td.request(
+            5,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 11,
+                reason: Some(td_api::ReportReason::reportReasonSpam(
+                    td_api::reportReasonSpam,
+                )),
+                text: String::new(),
+            }),
+        );
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Only full chat photos can be reported");
+
+        seed_remote_file(&mut td, 12, true, false);
+        td.request(
+            6,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 12,
+                reason: Some(td_api::ReportReason::reportReasonSpam(
+                    td_api::reportReasonSpam,
+                )),
+                text: String::new(),
+            }),
+        );
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Invalid photo identifier specified");
+
+        // 5. the non-reportable basic group (can_report_dialog is false)
+        td.request(
+            7,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: group_dialog,
+                file_id: 10,
+                reason: Some(td_api::ReportReason::reportReasonSpam(
+                    td_api::reportReasonSpam,
+                )),
+                text: String::new(),
+            }),
+        );
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat photo can't be reported");
+
+        // 6. the arm-level null-reason band
+        td.request(
+            8,
+            Function::reportChatPhoto(td_api::reportChatPhoto {
+                chat_id: channel_dialog,
+                file_id: 10,
+                reason: None,
+                text: String::new(),
+            }),
+        );
+        let error = error_of(&callback, 8);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat report reason must be non-empty");
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
     }
 
     fn premium_queries_ride_the_dispatcher_impl() {

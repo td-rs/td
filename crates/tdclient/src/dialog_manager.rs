@@ -293,8 +293,22 @@ pub fn have_input_peer(
             td.user_manager
                 .have_input_peer_user(&env, user_id, access_rights)
         }
-        // ChatManager peers arrive with its read surface (stub inventory).
-        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
+        crate::dialog_id::DialogType::Chat => td
+            .chat_manager
+            .have_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+        crate::dialog_id::DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let Some(options) = td.option_manager.as_mut() else {
+                return false;
+            };
+            let env = UserEnv {
+                global: &mut td.global,
+                options,
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.chat_manager
+                .have_input_peer_channel_id(&env, channel_id, access_rights)
+        }
         crate::dialog_id::DialogType::SecretChat => {
             if !allow_secret_chats {
                 return false;
@@ -1077,7 +1091,13 @@ const MAX_TITLE_LENGTH: usize = 128;
 /// the `DialogManager::net` handle; the answers drain through
 /// [`Td::dispatch_completed_dialog_net`](crate::td::Td::dispatch_completed_dialog_net).
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum DialogNetKind {}
+pub(crate) enum DialogNetKind {
+    /// `ReportProfilePhotoQuery` (DialogManager.cpp:543) — the kind
+    /// carries the dialog for the error tail.
+    ReportProfilePhoto {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+}
 
 /// `DialogManager` — the state of the C++ DialogManager actor that exists in
 /// this slice: the two recent-dialog lists (the ctor, DialogManager.cpp:1311-1312)
@@ -1103,6 +1123,9 @@ pub struct DialogManager {
     /// uses for its query sends, narrowed to the net plane (`None` in
     /// the net-inert tests; set at the dispatcher install).
     pub(crate) net: Option<crate::td::DialogNetHandle>,
+    /// The `ReportProfilePhotoQuery` promises (the C++ handler's
+    /// `promise_`, DialogManager.cpp:546).
+    pub(crate) pending_report_profile_photo: Vec<Promise<()>>,
 }
 
 impl Default for DialogManager {
@@ -1124,6 +1147,7 @@ impl DialogManager {
             found_on_server_dialogs: Default::default(),
             reload_video_chat_on_search_usernames: Default::default(),
             net: None,
+            pending_report_profile_photo: Vec::new(),
         }
     }
 
@@ -1717,13 +1741,15 @@ pub fn report_dialog(
     promise_unimplemented(&mut promise);
 }
 
-/// `DialogManager::report_dialog_photo` (DialogManager.cpp:2852-2875) — the
-/// file-view gates need the FileManager ([blocked: files], stub inventory),
-/// so the entry gates what it can and stops at the net-blocked query.
+/// `DialogManager::report_dialog_photo` (DialogManager.cpp:2852-2875) —
+/// the file-view gates run against the FileManager registry; the
+/// `ReportProfilePhotoQuery` send rides the dialog net handle (the §2
+/// flip).
 pub fn report_dialog_photo(
     td: &mut Td,
     dialog_id: DialogId,
-    _file_id: crate::user_manager::FileId,
+    file_id: crate::user_manager::FileId,
+    reason: crate::report_reason::ReportReason,
     mut promise: Promise<()>,
 ) {
     let mut access = check_dialog_access(
@@ -1743,10 +1769,48 @@ pub fn report_dialog_photo(
         return;
     }
 
-    // file_manager_->get_file_view gates (empty/type/remote-photo) —
-    // [blocked: files] (stub inventory); ReportProfilePhotoQuery —
-    // [blocked: net] (stub inventory).
-    promise_unimplemented(&mut promise);
+    // `FileManager::get_file_view` gates (DialogManager.cpp:2866-2876)
+    let file_manager = td.file_manager.lock();
+    let Some(file_view) = file_manager.get_file_view(file_id) else {
+        drop(file_manager);
+        return promise.set_error(Status::error(400, "Unknown file identifier"));
+    };
+    if crate::files::get_main_file_type(file_view.get_type()) != crate::files::FileType::Photo {
+        drop(file_manager);
+        return promise.set_error(Status::error(400, "Only full chat photos can be reported"));
+    }
+    let input_photo = match file_view.get_full_remote_location() {
+        Some(full_remote_location) if full_remote_location.is_photo() => {
+            tdmtproto::telegram_api::InputPhoto::inputPhoto(full_remote_location.as_input_photo())
+        }
+        _ => {
+            drop(file_manager);
+            return promise.set_error(Status::error(400, "Invalid photo identifier specified"));
+        }
+    };
+    drop(file_manager);
+
+    // `ReportProfilePhotoQuery::send` (DialogManager.cpp:556-573) — the
+    // Read input peer (CHECKed in the C++ — the access gate above
+    // guarantees it); the file reference rides the handler members for
+    // the error-tail repair ([blocked: files]).
+    let input_peer = get_input_peer(td, dialog_id, AccessRights::Read)
+        .expect("the access gate guaranteed the peer");
+    td.dialog_manager.pending_report_profile_photo.push(promise);
+    match &td.dialog_manager.net {
+        Some(net) => net.dispatch(
+            crate::dialog_manager::DialogNetKind::ReportProfilePhoto { dialog_id },
+            tdmtproto::telegram_api::Function::account_reportProfilePhoto(
+                tdmtproto::telegram_api::account_reportProfilePhoto {
+                    peer: Some(Box::new(input_peer)),
+                    photo_id: Some(input_photo),
+                    reason: Some(reason.get_input_report_reason()),
+                    message: reason.get_message().to_owned(),
+                },
+            ),
+        ),
+        None => tdutils::log_info!("Send account.reportProfilePhoto — [net-inert]"),
+    }
 }
 
 /// `BlockListId` (BlockListId.h) — the block-list facet of
@@ -3649,6 +3713,16 @@ pub enum CheckDialogUsernameResult {
 /// username intakes; their fan-ins arrive with those steps.
 #[allow(dead_code)]
 impl DialogManager {
+    /// `ReportProfilePhotoQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:575-588).
+    pub(crate) fn take_report_profile_photo_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_report_profile_photo.is_empty() {
+            None
+        } else {
+            Some(self.pending_report_profile_photo.remove(0))
+        }
+    }
+
     pub(crate) fn on_dialog_usernames_updated(
         &mut self,
         dialog_id: DialogId,

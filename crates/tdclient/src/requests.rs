@@ -15636,13 +15636,29 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
                 td.deferred_promise::<td_api::CommunityFullInfo, _>(id, Object::communityFullInfo);
         }
         Function::reportChatPhoto(request) => {
+            // Requests.cpp:7847-7855 — CHECK_IS_USER, the ReportReason
+            // conversion, then the manager flow (the promise settles from
+            // the ReportProfilePhotoQuery answer)
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(_text) = clean_or_utf8_error(td, id, &request.text) else {
-                return;
+            let reason = match crate::report_reason::ReportReason::get_report_reason(
+                request.reason.as_ref(),
+                request.text.clone(),
+            ) {
+                tdutils::status::Result::Ok(reason) => reason,
+                tdutils::status::Result::Err(status) => {
+                    return td.send_error_impl(id, status.code(), status.message());
+                }
             };
-            let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            crate::dialog_manager::report_dialog_photo(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::user_manager::FileId::new(request.file_id, 0),
+                reason,
+                promise,
+            );
         }
         Function::setArchiveChatListSettings(_) => {
             if !check_is_user(td, id) {
