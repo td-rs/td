@@ -198,6 +198,39 @@ pub trait PremiumEnv {
     fn send_get_premium_promo_query(&mut self) {
         tdutils::log_info!("Send help.getPremiumPromo — [net-inert]");
     }
+
+    /// `get_message_text(td_->user_manager_.get(), status_text,
+    /// status_entities, true, true, 0, false, …)` +
+    /// `get_formatted_text_object(td_->user_manager_.get(), state,
+    /// true, -1)` (Premium.cpp:335-337/382-383) over the formatted-text
+    /// surface.
+    fn premium_promo_status_text(
+        &mut self,
+        _status_text: String,
+        _status_entities: Vec<telegram_api::MessageEntity>,
+    ) -> td_api::FormattedText {
+        td_api::FormattedText::default()
+    }
+
+    /// `td_->documents_manager_->on_get_document(document, DialogId(),
+    /// false, false, nullptr, Document::Type::Animation)`
+    /// (Premium.cpp:360-362) over the documents intake.
+    fn on_get_document(&mut self, _document: telegram_api::document) -> crate::document::Document {
+        tdutils::log_info!("DocumentsManager::on_get_document — [blocked: files plane]");
+        crate::document::Document::default()
+    }
+
+    /// `td_->animations_manager_->get_animation_object(file_id)`
+    /// (Premium.cpp:371/377) — the animations record parks at the M.20
+    /// integration (`create_animation` is the collapsed seam), so the
+    /// object stays absent until that plane lands.
+    fn get_animation_object(
+        &mut self,
+        _file_id: crate::files::FileId,
+    ) -> Option<td_api::Animation> {
+        tdutils::log_info!("get_animation_object — [blocked: animations integration]");
+        None
+    }
     fn send_get_premium_gift_options_query(&mut self) {
         tdutils::log_info!("Send payments.getPremiumGiftCodeOptions — [net-inert]");
     }
@@ -562,6 +595,9 @@ pub(crate) enum PremiumNetKind {
     /// [`PremiumManager::on_premium_gift_payment_form`], then the send
     /// chain.
     GetPremiumGiftPaymentForm,
+    /// `GetPremiumPromoQuery` (cpp:312) — the promo answer routes
+    /// through [`PremiumManager::on_get_premium_promo`].
+    GetPremiumPromo,
     /// `SendPremiumGiftQuery` (cpp:605) — the `payments.paymentResult`
     /// answer re-enters `on_get_updates` with the promise.
     SendPremiumGift,
@@ -629,6 +665,29 @@ impl PremiumManager {
         PremiumManager::default()
     }
 
+    /// `view_premium_feature` (Premium.cpp:1500-1512) — the empty-feature
+    /// 400 band runs here (the `get_premium_source` string feeds only the
+    /// parked app-log data); the `save_app_log` promo-screen side effect
+    /// parks with the app-log plane.
+    pub fn view_premium_feature(
+        &mut self,
+        feature: Option<&td_api::PremiumFeature>,
+        mut promise: Promise<()>,
+    ) {
+        if feature.is_none() {
+            return promise.set_error(Status::error(400, "Feature must be non-empty"));
+        }
+        // `save_app_log(td, "premium.promo_screen_tap", …)` — the
+        // app-log plane
+        self.net_blocked_promises.push(promise);
+    }
+
+    /// `click_premium_subscription_button` (Premium.cpp:1514-1519) — the
+    /// `save_app_log` side effect parks with the app-log plane.
+    pub fn click_premium_subscription_button(&mut self, promise: Promise<()>) {
+        self.net_blocked_promises.push(promise);
+    }
+
     /// `get_premium_limit` (Premium.cpp:1264-1271) — the local answer.
     pub fn get_premium_limit(
         &self,
@@ -653,6 +712,83 @@ impl PremiumManager {
     ) {
         env.send_get_premium_promo_query();
         self.parked_premium_state.push(promise);
+    }
+
+    /// `GetPremiumPromoQuery::on_result` (Premium.cpp:329-386) — the
+    /// users intake, the status text, the video-section bands (the
+    /// count mismatch, the duplicates/empties, the non-document videos,
+    /// the non-Animation parses, the unknown features), and the
+    /// payment-option conversion; the animation objects park at the
+    /// M.20 animations integration.
+    pub(crate) fn on_get_premium_promo(
+        &mut self,
+        env: &mut impl PremiumEnv,
+        promo: telegram_api::help_PremiumPromo,
+        mut promise: Promise<td_api::PremiumState>,
+    ) {
+        env.on_get_users(promo.users, "GetPremiumPromoQuery");
+        let state = env.premium_promo_status_text(promo.status_text, promo.status_entities);
+        if promo.video_sections.len() != promo.videos.len() {
+            return promise.set_error(Status::error(500, "Receive wrong number of videos"));
+        }
+        let mut animations = Vec::new();
+        let mut business_animations = Vec::new();
+        let mut video_sections = std::collections::BTreeSet::new();
+        for (section, video) in promo.video_sections.iter().zip(promo.videos) {
+            // cpp:345-349 — the empty and duplicate sections log the C++
+            // message and drop the video
+            if section.is_empty() || !video_sections.insert(section.clone()) {
+                tdutils::log_error!("Receive duplicate Premium feature animation {section}");
+                continue;
+            }
+            let telegram_api::Document::document(document) = video else {
+                tdutils::log_error!("Receive non-document video for {section}");
+                continue;
+            };
+            let parsed_document = env.on_get_document(document);
+            if parsed_document.type_ != crate::document::DocumentType::Animation {
+                tdutils::log_error!(
+                    "Receive {:?} for Premium feature animation {section}",
+                    parsed_document.type_
+                );
+                continue;
+            }
+            if let Some(feature) = get_premium_feature_object(section) {
+                animations.push(td_api::PremiumFeaturePromotionAnimation {
+                    feature: Some(feature),
+                    animation: env.get_animation_object(parsed_document.file_id),
+                });
+            } else if let Some(business_feature) = get_business_feature_object(section) {
+                business_animations.push(td_api::BusinessFeaturePromotionAnimation {
+                    feature: Some(business_feature),
+                    animation: env.get_animation_object(parsed_document.file_id),
+                });
+            } else if section != "gifts" {
+                // cpp:381 — the test-dc-only log stays out (no env read
+                // at this layer); "gifts" is the known silent skip
+                tdutils::log_error!("Receive unsupported feature {section}");
+            }
+        }
+        let period_options =
+            crate::premium_gift_option::get_premium_gift_options(&promo.period_options);
+        promise.set_value(td_api::PremiumState {
+            state: Some(state),
+            payment_options: crate::premium_gift_option::get_premium_state_payment_options_object(
+                &period_options,
+            ),
+            animations,
+            business_animations,
+        });
+    }
+
+    /// `GetPremiumPromoQuery`'s promise pop (the promo answer routes
+    /// through the intake).
+    pub(crate) fn take_premium_state_promise(&mut self) -> Option<Promise<td_api::PremiumState>> {
+        if self.parked_premium_state.is_empty() {
+            None
+        } else {
+            Some(self.parked_premium_state.remove(0))
+        }
     }
 
     /// `get_premium_features` (Premium.cpp:1273-1291) — the local list
@@ -1518,6 +1654,49 @@ fn get_premium_feature_object(feature: &str) -> Option<td_api::PremiumFeature> {
     Some(object)
 }
 
+/// The business-feature-name → td_api mapping
+/// (`get_business_feature_object`, Premium.cpp:144-180) — the unknown
+/// names answer None (the C++ log is test-dc-only and stays out).
+fn get_business_feature_object(business_feature: &str) -> Option<td_api::BusinessFeature> {
+    let object = match business_feature {
+        "business_location" => {
+            td_api::BusinessFeature::businessFeatureLocation(td_api::businessFeatureLocation)
+        }
+        "business_hours" => td_api::BusinessFeature::businessFeatureOpeningHours(
+            td_api::businessFeatureOpeningHours,
+        ),
+        "quick_replies" => td_api::BusinessFeature::businessFeatureQuickReplies(
+            td_api::businessFeatureQuickReplies,
+        ),
+        "greeting_message" => td_api::BusinessFeature::businessFeatureGreetingMessage(
+            td_api::businessFeatureGreetingMessage,
+        ),
+        "away_message" => {
+            td_api::BusinessFeature::businessFeatureAwayMessage(td_api::businessFeatureAwayMessage)
+        }
+        "business_links" => td_api::BusinessFeature::businessFeatureAccountLinks(
+            td_api::businessFeatureAccountLinks,
+        ),
+        "business_intro" => {
+            td_api::BusinessFeature::businessFeatureStartPage(td_api::businessFeatureStartPage)
+        }
+        "business_bots" => {
+            td_api::BusinessFeature::businessFeatureBots(td_api::businessFeatureBots)
+        }
+        "emoji_status" => {
+            td_api::BusinessFeature::businessFeatureEmojiStatus(td_api::businessFeatureEmojiStatus)
+        }
+        "folder_tags" => td_api::BusinessFeature::businessFeatureChatFolderTags(
+            td_api::businessFeatureChatFolderTags,
+        ),
+        "stories" => td_api::BusinessFeature::businessFeatureUpgradedStories(
+            td_api::businessFeatureUpgradedStories,
+        ),
+        _ => return None,
+    };
+    Some(object)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +1828,16 @@ mod tests {
         ) -> Result<Option<telegram_api::TextWithEntities>> {
             Result::Ok(std::mem::take(&mut self.gift_text))
         }
+
+        fn on_get_document(
+            &mut self,
+            _document: telegram_api::document,
+        ) -> crate::document::Document {
+            crate::document::Document {
+                type_: crate::document::DocumentType::Animation,
+                file_id: crate::files::FileId::new(1, 7),
+            }
+        }
     }
 
     fn env_with_limits() -> TestEnv {
@@ -1710,6 +1899,123 @@ mod tests {
         manager.get_premium_features(&env, promise);
         let features = recorded.0.lock().unwrap().take().unwrap();
         assert!(!features.features.is_empty());
+    }
+
+    #[test]
+    fn the_promo_answer_builds_the_premium_state() {
+        let mut env = TestEnv {
+            options: std::collections::BTreeMap::new(),
+            option_strings: std::collections::BTreeMap::new(),
+            dialogs: std::collections::BTreeSet::new(),
+            users: std::collections::BTreeSet::new(),
+            gift_text: None,
+            queries: Vec::new(),
+        };
+        let mut manager = PremiumManager::new();
+        let promo = telegram_api::help_PremiumPromo {
+            status_text: "Status".to_string(),
+            status_entities: Vec::new(),
+            video_sections: vec![
+                "double_limits".to_string(),
+                // the duplicate drops (cpp:345-349)
+                "double_limits".to_string(),
+                "business_hours".to_string(),
+                // the known silent skip
+                "gifts".to_string(),
+                "unknown_feature".to_string(),
+            ],
+            videos: std::iter::repeat_with(|| {
+                telegram_api::Document::document(telegram_api::document::default())
+            })
+            .take(5)
+            .collect(),
+            period_options: vec![telegram_api::PremiumSubscriptionOption {
+                flags: 0,
+                current: false,
+                can_purchase_upgrade: false,
+                transaction: String::new(),
+                months: 12,
+                currency: "USD".to_string(),
+                amount: 2400,
+                bot_url: String::new(),
+                store_product: String::new(),
+            }],
+            users: Vec::new(),
+        };
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.on_get_premium_promo(&mut env, promo, promise);
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(state)) => {
+                // the TestEnv status seam answers the empty text
+                assert_eq!(state.state.unwrap().text, "");
+                assert_eq!(state.payment_options.len(), 1);
+                assert_eq!(state.animations.len(), 1, "the duplicate drops");
+                assert!(matches!(
+                    state.animations[0].feature,
+                    Some(td_api::PremiumFeature::premiumFeatureIncreasedLimits(_))
+                ));
+                assert!(
+                    state.animations[0].animation.is_none(),
+                    "the animation object parks at the M.20 integration"
+                );
+                assert_eq!(state.business_animations.len(), 1);
+                assert!(matches!(
+                    state.business_animations[0].feature,
+                    Some(td_api::BusinessFeature::businessFeatureOpeningHours(_))
+                ));
+            }
+            other => panic!("the promo answer: {other:?}"),
+        }
+
+        // the count mismatch — the C++ 500 band (cpp:339-341)
+        let promo = telegram_api::help_PremiumPromo {
+            status_text: String::new(),
+            status_entities: Vec::new(),
+            video_sections: vec!["double_limits".to_string()],
+            videos: Vec::new(),
+            period_options: Vec::new(),
+            users: Vec::new(),
+        };
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.on_get_premium_promo(&mut env, promo, promise);
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.code() == 500 && status.message() == "Receive wrong number of videos")
+        );
+    }
+
+    #[test]
+    fn view_and_click_run_the_promo_screen_bands() {
+        let mut manager = PremiumManager::new();
+        // the empty feature — the C++ 400 (cpp:1503-1505)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = slot.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+            *capture.lock().unwrap() = Some(r)
+        });
+        manager.view_premium_feature(None, promise);
+        assert!(manager.net_blocked_promises.is_empty());
+        assert!(
+            matches!(*slot.lock().unwrap(), Some(tdutils::status::Result::Err(ref status)) if status.message() == "Feature must be non-empty")
+        );
+
+        // a feature — the promise parks at the save_app_log seam; the
+        // click parks the same way
+        manager.view_premium_feature(
+            Some(&td_api::PremiumFeature::premiumFeatureIncreasedLimits(
+                td_api::premiumFeatureIncreasedLimits,
+            )),
+            Promise::default(),
+        );
+        manager.click_premium_subscription_button(Promise::default());
+        assert_eq!(manager.net_blocked_promises.len(), 2);
     }
 
     #[test]

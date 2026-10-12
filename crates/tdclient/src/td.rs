@@ -7821,6 +7821,28 @@ impl Td {
             Status::error(500, &format!("Failed to parse the {what} answer"))
         }
         match kind {
+            // `GetPremiumPromoQuery` (cpp:312-386) — the promo answer
+            // routes through the manager intake (the users intake, the
+            // status text, the video-section bands, the payment-option
+            // conversion).
+            PremiumNetKind::GetPremiumPromo => {
+                if let Some(mut promise) = self.premium_manager.take_premium_state_promise() {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::help_PremiumPromo::parse(query.ok()) {
+                            Ok(promo) => {
+                                let (mut manager, mut env) = premium_env_split(self);
+                                manager.on_get_premium_promo(&mut env, promo, promise);
+                                self.premium_manager = manager;
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("help_getPremiumPromo"));
+                            }
+                        }
+                    }
+                }
+            }
             // `ApplyGiftCodeQuery` (cpp:595-601) — the Updates answer
             // re-enters `on_get_updates` with the promise.
             PremiumNetKind::ApplyGiftCode => {
@@ -18351,6 +18373,19 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             .get_user_id_object(&mut env, user_id, source)
     }
 
+    // `GetPremiumPromoQuery::send` (Premium.cpp:321-323).
+    fn send_get_premium_promo_query(&mut self) {
+        match self.td.premium_net() {
+            Some(net) => net.dispatch(
+                PremiumNetKind::GetPremiumPromo,
+                telegram_api::Function::help_getPremiumPromo(telegram_api::help_getPremiumPromo),
+            ),
+            None => {
+                tdutils::log_info!("Send help.getPremiumPromo — [net-inert]");
+            }
+        }
+    }
+
     // The two landed sends (Premium.cpp:50-53/583-585) — the answers
     // drain through `Td::on_premium_net_answer`.
     fn send_get_premium_gift_options_query(&mut self) {
@@ -18662,6 +18697,46 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         )
     }
 
+    // `get_message_text(td_->user_manager_.get(), status_text,
+    // status_entities, true, true, 0, false, …)` +
+    // `get_formatted_text_object(td_->user_manager_.get(), state,
+    // true, -1)` (Premium.cpp:335-337/382-383) over the formatted-text
+    // surface (the PremiumTdEnv UserManagerLike).
+    fn premium_promo_status_text(
+        &mut self,
+        status_text: String,
+        status_entities: Vec<telegram_api::MessageEntity>,
+    ) -> td_api::FormattedText {
+        let state = crate::message_entity::get_message_text(
+            Some(self),
+            status_text,
+            status_entities,
+            true,
+            true,
+            0,
+            false,
+            "GetPremiumPromoQuery",
+        );
+        crate::message_entity::get_formatted_text_object(Some(self), &state, true, -1)
+    }
+
+    // `td_->documents_manager_->on_get_document(document, DialogId(),
+    // false, false, nullptr, Document::Type::Animation)`
+    // (Premium.cpp:360-362) — the real documents intake over the
+    // `documents_env` split.
+    fn on_get_document(&mut self, document: telegram_api::document) -> crate::document::Document {
+        let (mut env, documents) = self.td.documents_env();
+        documents.on_get_document(
+            &mut env,
+            crate::documents_manager::RemoteDocument::from_server_document(document),
+            DialogId::new(0),
+            false,
+            false,
+            crate::document::DocumentType::Animation,
+            crate::documents_manager::Subtype::Other,
+        )
+    }
+
     // `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
     // (Premium.cpp:1461-1465) over the suggested-action manager — the
     // `AccountEnv` build (the `hide_archive_and_mute_suggested_action`
@@ -18760,6 +18835,65 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             chat_manager,
         };
         crate::payments::GiveawayParameters::get_giveaway_parameters(&mut payments_env, parameters)
+    }
+}
+
+/// The `get_message_text`/`get_formatted_text_object` resolver half of
+/// [`PremiumTdEnv`] (the `SupportEnvTd` shape over the user manager).
+impl crate::message_entity::UserManagerLike for PremiumTdEnv<'_> {
+    fn resolve_user_id_object(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+        source: &str,
+    ) -> i64 {
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("premium answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: crate::user_manager::UserId) -> Result<(), Status> {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("premium answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_input_user(&env, user_id)
+            .map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.td.user_manager.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> telegram_api::InputUser {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("premium answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.get_input_user_force(&env, user_id)
     }
 }
 
@@ -31673,6 +31807,23 @@ mod tests {
         (Promise::from_interface(Rec(slot.clone())), slot)
     }
 
+    type PremiumStateSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::PremiumState>>>>;
+
+    fn record_premium_state() -> (Promise<td_api::PremiumState>, PremiumStateSlot) {
+        struct Rec(PremiumStateSlot);
+        impl tdutils::promise::PromiseInterface<td_api::PremiumState> for Rec {
+            fn set_value(&mut self, value: td_api::PremiumState) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: PremiumStateSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
     #[test]
     fn premium_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -32491,6 +32642,111 @@ mod tests {
                 assert_eq!(status.message(), "Receive invalid response");
             }
             other => panic!("the verification-needed band: {other:?}"),
+        }
+
+        // 21. getPremiumState — the promo round-trip over the real
+        //     documents intake: the status text converts through the
+        //     formatted-text surface, the animated document parses to
+        //     the Animation type (the real band), the feature/business
+        //     sections map, and the animation objects park at the M.20
+        //     integration.
+        let (promise, slot) = record_premium_state();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_state(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::help_getPremiumPromo::ID,
+        );
+        let animation_document = || {
+            telegram_api::Document::document(telegram_api::document {
+                flags: 0,
+                id: 10,
+                access_hash: 0,
+                file_reference: Vec::new(),
+                date: 0,
+                mime_type: "video/mp4".to_string(),
+                size: 100,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 1,
+                attributes: vec![telegram_api::DocumentAttribute::documentAttributeAnimated(
+                    telegram_api::documentAttributeAnimated,
+                )],
+            })
+        };
+        let mut answer = Vec::new();
+        telegram_api::help_PremiumPromo {
+            status_text: "Status".to_string(),
+            status_entities: Vec::new(),
+            video_sections: vec!["double_limits".to_string(), "business_hours".to_string()],
+            videos: vec![animation_document(), animation_document()],
+            period_options: vec![telegram_api::PremiumSubscriptionOption {
+                flags: 0,
+                current: false,
+                can_purchase_upgrade: false,
+                transaction: String::new(),
+                months: 12,
+                currency: "USD".to_string(),
+                amount: 2400,
+                bot_url: String::new(),
+                store_product: String::new(),
+            }],
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(state)) => {
+                assert_eq!(state.state.unwrap().text, "Status");
+                assert_eq!(state.payment_options.len(), 1);
+                assert_eq!(state.animations.len(), 1, "the real Animation parse");
+                assert!(matches!(
+                    state.animations[0].feature,
+                    Some(td_api::PremiumFeature::premiumFeatureIncreasedLimits(_))
+                ));
+                assert!(
+                    state.animations[0].animation.is_none(),
+                    "the animation object parks at M.20"
+                );
+                assert_eq!(state.business_animations.len(), 1);
+                assert!(matches!(
+                    state.business_animations[0].feature,
+                    Some(td_api::BusinessFeature::businessFeatureOpeningHours(_))
+                ));
+            }
+            other => panic!("unexpected premium state: {other:?}"),
+        }
+
+        // 22. getPremiumState — the count-mismatch band: the C++ 500
+        //     before any section runs.
+        let (promise, slot) = record_premium_state();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_state(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::help_getPremiumPromo::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::help_PremiumPromo {
+            status_text: String::new(),
+            status_entities: Vec::new(),
+            video_sections: vec!["double_limits".to_string()],
+            videos: Vec::new(),
+            period_options: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_premium_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(status.message(), "Receive wrong number of videos");
+            }
+            other => panic!("the count-mismatch band: {other:?}"),
         }
 
         assert!(td.premium_net_completed.lock().is_empty(), "drained");

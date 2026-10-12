@@ -9733,23 +9733,24 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             manager.get_business_features(&mut env, promise);
             td.premium_manager = manager;
         }
-        Function::viewPremiumFeature(_) => {
+        Function::viewPremiumFeature(request) => {
+            // Requests.cpp → Premium.cpp:1500-1512 — the empty-feature 400
+            // band; the save_app_log side effect parks with the app-log
+            // plane
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            // the view/click side effects join the premium promo surface;
-            // the promise parks with the seam
-            td.premium_manager.net_blocked_promises.push(promise);
+            td.premium_manager
+                .view_premium_feature(request.feature.as_ref(), promise);
         }
         Function::clickPremiumSubscriptionButton(_) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            // the view/click side effects join the premium promo surface;
-            // the promise parks with the seam
-            td.premium_manager.net_blocked_promises.push(promise);
+            td.premium_manager
+                .click_premium_subscription_button(promise);
         }
         Function::getPremiumState(_) => {
             if !check_is_user(td, id) {
