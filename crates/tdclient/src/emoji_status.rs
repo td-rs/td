@@ -302,9 +302,7 @@ impl EmojiStatus {
 
 /// `EmojiStatusCustomEmojis` (EmojiStatus.cpp:24-55) — the binlog-pmc
 /// cache behind the default-emoji-status lists: the server hash plus the
-/// collected custom emoji ids. The server-answer constructor (the C++
-/// `telegram_api::account_emojiStatuses` intake) lands with the net
-/// queries.
+/// collected custom emoji ids.
 #[derive(Clone, Debug, Default)]
 pub struct EmojiStatusCustomEmojisCache {
     pub hash: i64,
@@ -312,6 +310,35 @@ pub struct EmojiStatusCustomEmojisCache {
 }
 
 impl EmojiStatusCustomEmojisCache {
+    /// `EmojiStatusCustomEmojis(account_emojiStatuses &&)`
+    /// (EmojiStatus.cpp:34-50) — the server-answer intake: empty and
+    /// non-emoji statuses are skipped, temporary ones log and keep the
+    /// id.
+    pub fn from_account_emoji_statuses(
+        emoji_statuses: telegram_api::account_emojiStatuses,
+    ) -> EmojiStatusCustomEmojisCache {
+        let mut custom_emoji_ids = Vec::with_capacity(emoji_statuses.statuses.len());
+        for status in emoji_statuses.statuses {
+            let emoji_status = EmojiStatus::from_telegram(status);
+            if emoji_status.is_empty() {
+                tdutils::log_error!("Receive empty emoji status");
+                continue;
+            }
+            if emoji_status.get_until_date() != 0 {
+                tdutils::log_error!("Receive temporary emoji status");
+            }
+            let custom_emoji_id = emoji_status.get_custom_emoji_id();
+            if !custom_emoji_id.is_valid() {
+                tdutils::log_error!("Receive non-emoji status");
+                continue;
+            }
+            custom_emoji_ids.push(custom_emoji_id);
+        }
+        EmojiStatusCustomEmojisCache {
+            hash: emoji_statuses.hash,
+            custom_emoji_ids,
+        }
+    }
     /// `get_emoji_status_custom_emojis_object`
     /// (EmojiStatus.cpp:565-569).
     pub fn get_emoji_status_custom_emojis_object(&self) -> td_api::EmojiStatusCustomEmojis {
@@ -364,6 +391,30 @@ pub struct EmojiStatusesCache {
 }
 
 impl EmojiStatusesCache {
+    /// `EmojiStatuses(account_emojiStatuses &&)` (EmojiStatus.cpp:77-92)
+    /// — the server-answer intake: empty statuses are skipped,
+    /// temporary ones log and drop the expiry.
+    pub fn from_account_emoji_statuses(
+        emoji_statuses: telegram_api::account_emojiStatuses,
+    ) -> EmojiStatusesCache {
+        let mut statuses = Vec::with_capacity(emoji_statuses.statuses.len());
+        for status in emoji_statuses.statuses {
+            let mut emoji_status = EmojiStatus::from_telegram(status);
+            if emoji_status.is_empty() {
+                tdutils::log_error!("Receive empty emoji status");
+                continue;
+            }
+            if emoji_status.get_until_date() != 0 {
+                tdutils::log_error!("Receive temporary emoji status");
+                emoji_status.clear_until_date();
+            }
+            statuses.push(emoji_status);
+        }
+        EmojiStatusesCache {
+            hash: emoji_statuses.hash,
+            emoji_statuses: statuses,
+        }
+    }
     /// `get_emoji_statuses_object` (EmojiStatus.cpp:72-75); empty
     /// statuses are skipped (see
     /// [`EmojiStatus::get_emoji_status_object`](EmojiStatus::get_emoji_status_object)).

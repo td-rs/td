@@ -4284,8 +4284,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getDefaultEmojiStatuses(_) => {
             // Requests.cpp:6827-6831 → EmojiStatus.cpp:571-578: the
-            // cached list answers here; the hash-revalidation query is
-            // [blocked: net]
+            // cached list answers here; the miss rides the
+            // `UserManager::net` handle (the GetDefaultEmojiStatusesQuery
+            // kind)
             if !check_is_user(td, id) {
                 return;
             }
@@ -4333,8 +4334,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::clearRecentEmojiStatuses(_) => {
             // Requests.cpp:6851-6855 → EmojiStatus.cpp:621-624: the cache
-            // clears here; the ClearRecentEmojiStatusesQuery is
-            // [blocked: net]
+            // clears here; the ClearRecentEmojiStatusesQuery rides the
+            // user net kinds
             if !check_is_user(td, id) {
                 return;
             }

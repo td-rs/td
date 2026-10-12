@@ -1852,6 +1852,25 @@ impl<'a> UserEnv<'a> {
     }
 }
 
+/// The user-plane in-flight query kinds — the C++ ResultHandler classes
+/// of the emoji-status family (EmojiStatus.cpp:165-352). The kinds ride
+/// the `UserManager::net` handle (the `td_` back-pointer narrowed to
+/// the net plane); the answers drain through
+/// [`Td::dispatch_completed_user_net`](crate::td::Td::dispatch_completed_user_net).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UserNetKind {
+    /// `GetDefaultEmojiStatusesQuery` (cpp:165).
+    GetDefault,
+    /// `GetChannelDefaultEmojiStatusesQuery` (cpp:209).
+    GetChannelDefault,
+    /// `GetRecentEmojiStatusesQuery` (cpp:251).
+    GetRecent,
+    /// `ClearRecentEmojiStatusesQuery` (cpp:293).
+    ClearRecent,
+    /// `GetCollectibleEmojiStatusesQuery` (cpp:319).
+    GetCollectible,
+}
+
 /// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
 /// Know, Read, Edit, Write }`; the variants stay in-memory only here, so the
 /// declaration order keeps the pre-M.6 subset first.
@@ -2085,14 +2104,24 @@ pub struct UserManager {
     /// The parked `GetSupportUserQuery` promise (the tail is
     /// [blocked: net]; `on_get_support_user` is its ack intake).
     pending_support_user_queries: Vec<Promise<td_api::User>>,
-    /// The parked `GetDefaultEmojiStatusesQuery` /
-    /// `GetChannelDefaultEmojiStatusesQuery` promises (the tails are
-    /// [blocked: net]; the acks split by family at the net-query
-    /// integration).
+    /// The parked `GetDefaultEmojiStatusesQuery` promises (the acks
+    /// split from the channel family — the per-handler promise shape).
     pending_default_emoji_statuses_queries: Vec<Promise<td_api::EmojiStatusCustomEmojis>>,
-    /// The parked `GetRecentEmojiStatusesQuery` /
-    /// `GetCollectibleEmojiStatusesQuery` promises.
+    /// The parked `GetChannelDefaultEmojiStatusesQuery` promises —
+    /// `pending_channel_default_emoji_statuses_queries_` would be the
+    /// C++ field; the acks split by family at the query integration.
+    pending_channel_emoji_statuses_queries: Vec<Promise<td_api::EmojiStatusCustomEmojis>>,
+    /// The parked `GetRecentEmojiStatusesQuery` promises.
     pending_recent_emoji_statuses_queries: Vec<Promise<td_api::EmojiStatuses>>,
+    /// The parked `GetCollectibleEmojiStatusesQuery` promises — split
+    /// from the recent family like the channel twin.
+    pending_upgraded_gift_emoji_statuses_queries: Vec<Promise<td_api::EmojiStatuses>>,
+    /// The parked `ClearRecentEmojiStatusesQuery` promises (the ok tail).
+    pending_clear_recent_emoji_statuses_queries: Vec<Promise<()>>,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in
+    /// the net-inert tests; set at the dispatcher install).
+    pub(crate) net: Option<crate::td::UserNetHandle>,
 
     /// The FileReferenceManager stand-in: the allocator behind every
     /// `FileSourceId` this module hands out.
@@ -8110,6 +8139,26 @@ impl UserManager {
     // the cached lists answer here; the hash-revalidation query sends
     // are [blocked: net] ---
 
+    // ------------------------------------------------------------------
+    // The emoji-status family net slice (EmojiStatus.cpp:165-352) — the
+    // query sends ride the `net` handle; the intakes below run the
+    // C++ on_result halves (the cache save, the notModified 500 band,
+    // the promise flush).
+
+    /// The shared dispatch tail — `send_query(G()->net_query_creator()…)`
+    /// narrowed to the handle; the None arm is the net-inert log.
+    fn send_emoji_status_query(
+        &self,
+        kind: UserNetKind,
+        function: telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
     /// `get_default_emoji_statuses` (EmojiStatus.cpp:571-578).
     pub fn get_default_emoji_statuses(
         &mut self,
@@ -8125,7 +8174,15 @@ impl UserManager {
             return;
         }
         self.pending_default_emoji_statuses_queries.push(promise);
-        tdutils::log_info!("Send account.getDefaultEmojiStatuses — [blocked: net]");
+        self.send_emoji_status_query(
+            UserNetKind::GetDefault,
+            telegram_api::Function::account_getDefaultEmojiStatuses(
+                telegram_api::account_getDefaultEmojiStatuses {
+                    hash: statuses.hash,
+                },
+            ),
+            "account.getDefaultEmojiStatuses",
+        );
     }
 
     /// `get_default_channel_emoji_statuses` (EmojiStatus.cpp:580-588) —
@@ -8143,8 +8200,16 @@ impl UserManager {
             promise.set_value(statuses.get_emoji_status_custom_emojis_object());
             return;
         }
-        self.pending_default_emoji_statuses_queries.push(promise);
-        tdutils::log_info!("Send account.getChannelDefaultEmojiStatuses — [blocked: net]");
+        self.pending_channel_emoji_statuses_queries.push(promise);
+        self.send_emoji_status_query(
+            UserNetKind::GetChannelDefault,
+            telegram_api::Function::account_getChannelDefaultEmojiStatuses(
+                telegram_api::account_getChannelDefaultEmojiStatuses {
+                    hash: statuses.hash,
+                },
+            ),
+            "account.getChannelDefaultEmojiStatuses",
+        );
     }
 
     /// `get_recent_emoji_statuses` (EmojiStatus.cpp:590-597).
@@ -8162,12 +8227,20 @@ impl UserManager {
             return;
         }
         self.pending_recent_emoji_statuses_queries.push(promise);
-        tdutils::log_info!("Send account.getRecentEmojiStatuses — [blocked: net]");
+        self.send_emoji_status_query(
+            UserNetKind::GetRecent,
+            telegram_api::Function::account_getRecentEmojiStatuses(
+                telegram_api::account_getRecentEmojiStatuses {
+                    hash: statuses.hash,
+                },
+            ),
+            "account.getRecentEmojiStatuses",
+        );
     }
 
     /// `clear_recent_emoji_statuses` (EmojiStatus.cpp:621-624) — the
-    /// cache clears here; the `ClearRecentEmojiStatusesQuery` send is
-    /// [blocked: net].
+    /// cache clears here; the `ClearRecentEmojiStatusesQuery` ok tail
+    /// re-saves the empty record and answers.
     pub fn clear_recent_emoji_statuses(&mut self, env: &mut UserEnv, promise: Promise<()>) {
         let empty = crate::emoji_status::EmojiStatusesCache::default();
         let mut stored = Vec::new();
@@ -8177,8 +8250,15 @@ impl UserManager {
             crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY,
             &stored,
         );
-        self.net_blocked_promises.push(promise);
-        tdutils::log_info!("Send account.clearRecentEmojiStatuses — [blocked: net]");
+        self.pending_clear_recent_emoji_statuses_queries
+            .push(promise);
+        self.send_emoji_status_query(
+            UserNetKind::ClearRecent,
+            telegram_api::Function::account_clearRecentEmojiStatuses(
+                telegram_api::account_clearRecentEmojiStatuses,
+            ),
+            "account.clearRecentEmojiStatuses",
+        );
     }
 
     /// `get_upgraded_gift_emoji_statuses` (EmojiStatus.cpp:626-637) —
@@ -8199,8 +8279,134 @@ impl UserManager {
             promise.set_value(statuses.get_emoji_statuses_object());
             return;
         }
-        self.pending_recent_emoji_statuses_queries.push(promise);
-        tdutils::log_info!("Send account.getCollectibleEmojiStatuses — [blocked: net]");
+        self.pending_upgraded_gift_emoji_statuses_queries
+            .push(promise);
+        self.send_emoji_status_query(
+            UserNetKind::GetCollectible,
+            telegram_api::Function::account_getCollectibleEmojiStatuses(
+                telegram_api::account_getCollectibleEmojiStatuses {
+                    hash: statuses.hash,
+                },
+            ),
+            "account.getCollectibleEmojiStatuses",
+        );
+    }
+
+    /// `GetDefaultEmojiStatusesQuery::on_result` /
+    /// `GetChannelDefaultEmojiStatusesQuery::on_result`
+    /// (EmojiStatus.cpp:184-198, 228-242) — the notModified 500 band,
+    /// the cache save, the promise flush; `channel` picks the family's
+    /// queue and database key.
+    pub fn on_emoji_status_custom_emojis(
+        &mut self,
+        env: &mut UserEnv,
+        channel: bool,
+        result: Result<telegram_api::account_EmojiStatuses, Status>,
+    ) {
+        let promise = if channel {
+            self.pending_channel_emoji_statuses_queries.pop()
+        } else {
+            self.pending_default_emoji_statuses_queries.pop()
+        };
+        let Some(mut promise) = promise else {
+            return;
+        };
+        let key = if channel {
+            crate::emoji_status::DEFAULT_CHANNEL_EMOJI_STATUSES_DATABASE_KEY
+        } else {
+            crate::emoji_status::DEFAULT_EMOJI_STATUSES_DATABASE_KEY
+        };
+        match result {
+            Err(status) => promise.set_error(status),
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatusesNotModified(_)) => {
+                promise.set_error(Status::error(500, "Receive wrong server response"));
+            }
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatuses(statuses)) => {
+                let cache =
+                    crate::emoji_status::EmojiStatusCustomEmojisCache::from_account_emoji_statuses(
+                        statuses,
+                    );
+                let object = cache.get_emoji_status_custom_emojis_object();
+                let mut stored = Vec::new();
+                cache.store(&mut stored);
+                crate::emoji_status::save_emoji_statuses_cache(
+                    env.global.binlog_pmc(),
+                    key,
+                    &stored,
+                );
+                promise.set_value(object);
+            }
+        }
+    }
+
+    /// `GetRecentEmojiStatusesQuery::on_result` /
+    /// `GetCollectibleEmojiStatusesQuery::on_result`
+    /// (EmojiStatus.cpp:270-284, 338-352) — the statuses twin.
+    pub fn on_emoji_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        upgraded_gift: bool,
+        result: Result<telegram_api::account_EmojiStatuses, Status>,
+    ) {
+        let promise = if upgraded_gift {
+            self.pending_upgraded_gift_emoji_statuses_queries.pop()
+        } else {
+            self.pending_recent_emoji_statuses_queries.pop()
+        };
+        let Some(mut promise) = promise else {
+            return;
+        };
+        let key = if upgraded_gift {
+            crate::emoji_status::UPGRADED_GIFT_EMOJI_STATUSES_DATABASE_KEY
+        } else {
+            crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY
+        };
+        match result {
+            Err(status) => promise.set_error(status),
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatusesNotModified(_)) => {
+                promise.set_error(Status::error(500, "Receive wrong server response"));
+            }
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatuses(statuses)) => {
+                let cache =
+                    crate::emoji_status::EmojiStatusesCache::from_account_emoji_statuses(statuses);
+                let object = cache.get_emoji_statuses_object();
+                let mut stored = Vec::new();
+                cache.store(&mut stored);
+                crate::emoji_status::save_emoji_statuses_cache(
+                    env.global.binlog_pmc(),
+                    key,
+                    &stored,
+                );
+                promise.set_value(object);
+            }
+        }
+    }
+
+    /// `ClearRecentEmojiStatusesQuery::on_result` (EmojiStatus.cpp:293-317)
+    /// — the empty record re-save (the send already wrote it; the C++
+    /// writes it again) and the ok answer.
+    pub fn on_clear_recent_emoji_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        result: Result<(), Status>,
+    ) {
+        let Some(mut promise) = self.pending_clear_recent_emoji_statuses_queries.pop() else {
+            return;
+        };
+        match result {
+            Err(status) => promise.set_error(status),
+            Ok(()) => {
+                let empty = crate::emoji_status::EmojiStatusesCache::default();
+                let mut stored = Vec::new();
+                empty.store(&mut stored);
+                crate::emoji_status::save_emoji_statuses_cache(
+                    env.global.binlog_pmc(),
+                    crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY,
+                    &stored,
+                );
+                promise.set_value(());
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -17106,7 +17312,7 @@ mod tests {
         // clear_recent_emoji_statuses empties the cache and parks the ok
         let (promise, result) = promise_result();
         um.clear_recent_emoji_statuses(&mut env, promise);
-        assert_eq!(um.net_blocked_promises.len(), 1);
+        assert_eq!(um.pending_clear_recent_emoji_statuses_queries.len(), 1);
         let cleared = env
             .global
             .binlog_pmc()
@@ -17115,6 +17321,166 @@ mod tests {
         assert_eq!(parsed.hash, 0);
         assert!(parsed.emoji_statuses.is_empty());
         assert!((*result.lock().unwrap()).is_none());
-        um.net_blocked_promises.clear();
+        um.pending_clear_recent_emoji_statuses_queries.clear();
+    }
+
+    #[test]
+    fn the_emoji_status_intakes_run_the_answer_bands() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+
+        // the default family: the server list saves under its key and
+        // flushes its queue (EmojiStatus.cpp:184-198)
+        let (promise, result): (
+            _,
+            std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::EmojiStatusCustomEmojis>>>,
+            >,
+        ) = typed_promise_result();
+        um.pending_default_emoji_statuses_queries.push(promise);
+        um.on_emoji_status_custom_emojis(
+            &mut env,
+            false,
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatuses(
+                telegram_api::account_emojiStatuses {
+                    hash: 7,
+                    statuses: vec![telegram_api::EmojiStatus::emojiStatus(
+                        telegram_api::emojiStatus {
+                            flags: 0,
+                            document_id: 42,
+                            until: 0,
+                        },
+                    )],
+                },
+            )),
+        );
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(list)) => {
+                assert_eq!(list.custom_emoji_ids, vec![42]);
+            }
+            _ => panic!("the server list must flush the queue"),
+        }
+        let stored = env
+            .global
+            .binlog_pmc()
+            .get_raw(crate::emoji_status::DEFAULT_EMOJI_STATUSES_DATABASE_KEY);
+        assert_eq!(
+            crate::emoji_status::EmojiStatusCustomEmojisCache::parse(&stored)
+                .unwrap()
+                .custom_emoji_ids
+                .len(),
+            1
+        );
+
+        // the notModified band — the C++ 500
+        let (promise, result): (
+            _,
+            std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::EmojiStatusCustomEmojis>>>,
+            >,
+        ) = typed_promise_result();
+        um.pending_default_emoji_statuses_queries.push(promise);
+        um.on_emoji_status_custom_emojis(
+            &mut env,
+            false,
+            Ok(
+                telegram_api::account_EmojiStatuses::account_emojiStatusesNotModified(
+                    telegram_api::account_emojiStatusesNotModified,
+                ),
+            ),
+        );
+        assert!(
+            matches!(&*result.lock().unwrap(), Some(tdutils::status::Result::Err(s)) if s.message() == "Receive wrong server response")
+        );
+
+        // the channel family flushes its own queue under its key
+        let (promise, result): (
+            _,
+            std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::EmojiStatusCustomEmojis>>>,
+            >,
+        ) = typed_promise_result();
+        um.pending_channel_emoji_statuses_queries.push(promise);
+        um.on_emoji_status_custom_emojis(
+            &mut env,
+            true,
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatuses(
+                telegram_api::account_emojiStatuses {
+                    hash: 9,
+                    statuses: Vec::new(),
+                },
+            )),
+        );
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(_))
+        ));
+        assert!(
+            !env.global
+                .binlog_pmc()
+                .get_raw(crate::emoji_status::DEFAULT_CHANNEL_EMOJI_STATUSES_DATABASE_KEY)
+                .is_empty()
+        );
+
+        // the upgraded-gift family — the until-date band drops the expiry
+        let (promise, result): (
+            _,
+            std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::EmojiStatuses>>>,
+            >,
+        ) = typed_promise_result();
+        um.pending_upgraded_gift_emoji_statuses_queries
+            .push(promise);
+        um.on_emoji_statuses(
+            &mut env,
+            true,
+            Ok(telegram_api::account_EmojiStatuses::account_emojiStatuses(
+                telegram_api::account_emojiStatuses {
+                    hash: 3,
+                    statuses: vec![telegram_api::EmojiStatus::emojiStatus(
+                        telegram_api::emojiStatus {
+                            flags: 0,
+                            document_id: 5,
+                            until: 100,
+                        },
+                    )],
+                },
+            )),
+        );
+        match &*result.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(statuses)) => {
+                assert_eq!(statuses.emoji_statuses.len(), 1);
+            }
+            _ => panic!("the collectible list must flush the queue"),
+        }
+        let stored = env
+            .global
+            .binlog_pmc()
+            .get_raw(crate::emoji_status::UPGRADED_GIFT_EMOJI_STATUSES_DATABASE_KEY);
+        assert_eq!(
+            crate::emoji_status::EmojiStatusesCache::parse(&stored)
+                .unwrap()
+                .emoji_statuses[0]
+                .get_until_date(),
+            0,
+            "the temporary band drops the expiry"
+        );
+
+        // the clear ok tail re-saves the empty record
+        let (promise, result) = promise_result();
+        um.pending_clear_recent_emoji_statuses_queries.push(promise);
+        um.on_clear_recent_emoji_statuses(&mut env, Ok(()));
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // the error tail forwards
+        let (promise, result) = promise_result();
+        um.pending_clear_recent_emoji_statuses_queries.push(promise);
+        um.on_clear_recent_emoji_statuses(&mut env, Err(Status::error(420, "FLOOD_WAIT_5")));
+        assert!(
+            matches!(&*result.lock().unwrap(), Some(tdutils::status::Result::Err(s)) if s.message() == "FLOOD_WAIT_5")
+        );
     }
 }

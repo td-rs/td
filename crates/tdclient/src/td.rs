@@ -2577,7 +2577,7 @@ impl<K: NetAnswerKind> NetKindHandle<K> {
     /// Serialize + dispatch one query (the session prepends the shared
     /// `MtprotoHeader`; the NetQueryCreator defaults ride like the
     /// walking-skeleton dispatch — DcId::main, the 24-hour budget).
-    fn dispatch(&self, kind: K, function: telegram_api::Function) {
+    pub(crate) fn dispatch(&self, kind: K, function: telegram_api::Function) {
         self.dispatch_dc(kind, function, DcId::main());
     }
 
@@ -3027,6 +3027,11 @@ pub(crate) type ThemeNetHandle = NetKindHandle<crate::theme_manager::ThemeNetKin
 /// The cloned premium dispatch surface the [`PremiumTdEnv`] senders
 /// use — the answers drain through [`Td::on_premium_net_answer`].
 pub(crate) type PremiumNetHandle = NetKindHandle<PremiumNetKind>;
+
+/// The cloned user dispatch surface — the per-kind handle over the
+/// UserManager query kinds; the answers drain through
+/// [`Td::dispatch_completed_user_net`].
+pub(crate) type UserNetHandle = NetKindHandle<crate::user_manager::UserNetKind>;
 
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
@@ -3879,6 +3884,9 @@ pub struct Td {
     /// The callback-parked premium query answers (the
     /// `Td::on_premium_net_answer` drain).
     premium_net_completed: Arc<Mutex<Vec<(PremiumNetKind, NetQuery)>>>,
+    /// The callback-parked user query answers (the
+    /// `Td::on_user_net_answer` drain).
+    user_net_completed: Arc<Mutex<Vec<(crate::user_manager::UserNetKind, NetQuery)>>>,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4323,6 +4331,7 @@ impl Td {
             quick_reply_net_completed: Arc::new(Mutex::new(Vec::new())),
             theme_net_completed: Arc::new(Mutex::new(Vec::new())),
             premium_net_completed: Arc::new(Mutex::new(Vec::new())),
+            user_net_completed: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -4798,6 +4807,7 @@ impl Td {
             dispatcher.load_main_dc_id(main_dc_raw);
         }
         self.net_query_dispatcher = Some(Arc::new(dispatcher));
+        self.user_manager.net = self.user_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -6478,6 +6488,7 @@ impl Td {
         self.dispatch_completed_quick_reply_net();
         self.dispatch_completed_theme_net();
         self.dispatch_completed_premium_net();
+        self.dispatch_completed_user_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6633,6 +6644,16 @@ impl Td {
         Some(PremiumNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.premium_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned user dispatch surface (the `UserManager::net` handle —
+    /// the `td_` back-pointer narrowed to the net plane).
+    pub(crate) fn user_net(&self) -> Option<UserNetHandle> {
+        Some(UserNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.user_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -7812,6 +7833,84 @@ impl Td {
             self.on_premium_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked user answers — the C++ ResultHandler
+    /// halves of the emoji-status family (EmojiStatus.cpp:165-352).
+    fn dispatch_completed_user_net(&mut self) {
+        let completed = std::mem::take(&mut *self.user_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_user_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one user net answer by kind — the parse legs front the
+    /// manager intakes (the cache save, the notModified 500 band, the
+    /// promise flush).
+    fn on_user_net_answer(&mut self, kind: crate::user_manager::UserNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let is_bot = self.auth_manager.is_bot();
+        let Some(options) = self.option_manager.as_mut() else {
+            self.user_manager = user_manager;
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: is_bot,
+        };
+        match kind {
+            crate::user_manager::UserNetKind::GetDefault => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_EmojiStatuses::parse(query.ok())
+                        .map_err(|_| parse_error("account_getDefaultEmojiStatuses"))
+                };
+                user_manager.on_emoji_status_custom_emojis(&mut env, false, result);
+            }
+            crate::user_manager::UserNetKind::GetChannelDefault => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_EmojiStatuses::parse(query.ok())
+                        .map_err(|_| parse_error("account_getChannelDefaultEmojiStatuses"))
+                };
+                user_manager.on_emoji_status_custom_emojis(&mut env, true, result);
+            }
+            crate::user_manager::UserNetKind::GetRecent => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_EmojiStatuses::parse(query.ok())
+                        .map_err(|_| parse_error("account_getRecentEmojiStatuses"))
+                };
+                user_manager.on_emoji_statuses(&mut env, false, result);
+            }
+            crate::user_manager::UserNetKind::GetCollectible => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_EmojiStatuses::parse(query.ok())
+                        .map_err(|_| parse_error("account_getCollectibleEmojiStatuses"))
+                };
+                user_manager.on_emoji_statuses(&mut env, true, result);
+            }
+            crate::user_manager::UserNetKind::ClearRecent => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok())
+                        .ok_or_else(|| parse_error("account_clearRecentEmojiStatuses"))
+                };
+                user_manager.on_clear_recent_emoji_statuses(&mut env, result);
+            }
+        }
+        self.user_manager = user_manager;
     }
 
     /// Route one premium net answer by kind (the landed flows of
@@ -28971,6 +29070,7 @@ mod tests {
         );
         dispatcher.mark_dc_inited(1);
         td.net_query_dispatcher = Some(Arc::new(dispatcher));
+        td.user_manager.net = td.user_net();
 
         // the bot-token arm settles `is_bot` before completion — the
         // `was_check_bot_token_` marker follows it (AuthManager.cpp:1503-1507)
@@ -29474,6 +29574,7 @@ mod tests {
         );
         dispatcher.mark_dc_inited(1);
         td.net_query_dispatcher = Some(Arc::new(dispatcher));
+        td.user_manager.net = td.user_net();
         (td, rec)
     }
 
@@ -31832,6 +31933,242 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// The env over the disjoint Td fields — the `user_env!` shape at the
+    /// requests layer, inline for the netted harness.
+    fn with_user_manager(
+        td: &mut Td,
+        f: impl FnOnce(&mut crate::user_manager::UserManager, &mut crate::user_manager::UserEnv),
+    ) {
+        let mut user_manager = std::mem::take(&mut td.user_manager);
+        let auth_is_bot = td.auth_manager.is_bot();
+        let Some(options) = td.option_manager.as_mut() else {
+            panic!("the option manager is set for the netted td");
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot,
+        };
+        f(&mut user_manager, &mut env);
+        td.user_manager = user_manager;
+    }
+
+    type CustomEmojiListSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::EmojiStatusCustomEmojis>>>,
+    >;
+
+    fn record_custom_emoji_list() -> (
+        Promise<td_api::EmojiStatusCustomEmojis>,
+        CustomEmojiListSlot,
+    ) {
+        struct Rec(CustomEmojiListSlot);
+        impl tdutils::promise::PromiseInterface<td_api::EmojiStatusCustomEmojis> for Rec {
+            fn set_value(&mut self, value: td_api::EmojiStatusCustomEmojis) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: CustomEmojiListSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type StatusesListSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::EmojiStatuses>>>>;
+
+    fn record_statuses_list() -> (Promise<td_api::EmojiStatuses>, StatusesListSlot) {
+        struct Rec(StatusesListSlot);
+        impl tdutils::promise::PromiseInterface<td_api::EmojiStatuses> for Rec {
+            fn set_value(&mut self, value: td_api::EmojiStatuses) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: StatusesListSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn emoji_status_answer(hash: i64, document_id: i64) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::account_EmojiStatuses::account_emojiStatuses(
+            telegram_api::account_emojiStatuses {
+                hash,
+                statuses: vec![telegram_api::EmojiStatus::emojiStatus(
+                    telegram_api::emojiStatus {
+                        flags: 0,
+                        document_id,
+                        until: 0,
+                    },
+                )],
+            },
+        )
+        .store(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn user_emoji_status_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_emoji_status_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_emoji_status_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-user-emoji-statuses");
+
+        // 1. getDefaultEmojiStatuses — no cache: the query rides the
+        //    dispatcher (the fresh-record hash is -1), the answer saves
+        //    the record and flushes the queue.
+        let (promise, slot) = record_custom_emoji_list();
+        with_user_manager(&mut td, |manager, env| {
+            manager.get_default_emoji_statuses(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getDefaultEmojiStatuses::ID,
+        );
+        net_complete(sent, emoji_status_answer(7, 42));
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(list)) => {
+                assert_eq!(list.custom_emoji_ids, vec![42]);
+            }
+            other => panic!("the default list: {other:?}"),
+        }
+
+        // 2. the cached record answers without a query (the C++
+        //    set_value-then-send band).
+        let (promise, slot) = record_custom_emoji_list();
+        with_user_manager(&mut td, |manager, env| {
+            manager.get_default_emoji_statuses(env, promise);
+        });
+        assert!(rec.sent.lock().is_empty(), "the cache answers locally");
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(list)) => {
+                assert_eq!(list.custom_emoji_ids, vec![42]);
+            }
+            other => panic!("the cached list: {other:?}"),
+        }
+
+        // 3. getDefaultChatEmojiStatuses — the channel family rides its
+        //    own constructor and queue.
+        let (promise, slot) = record_custom_emoji_list();
+        with_user_manager(&mut td, |manager, env| {
+            manager.get_default_channel_emoji_statuses(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getChannelDefaultEmojiStatuses::ID,
+        );
+        net_complete(sent, emoji_status_answer(9, 100));
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(list)) => {
+                assert_eq!(list.custom_emoji_ids, vec![100]);
+            }
+            other => panic!("the channel list: {other:?}"),
+        }
+
+        // 4. the error band forwards — the query tail's on_error.
+        let (promise, slot) = record_statuses_list();
+        with_user_manager(&mut td, |manager, env| {
+            manager.get_recent_emoji_statuses(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getRecentEmojiStatuses::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 420);
+                assert_eq!(status.message(), "FLOOD_WAIT_7");
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        // 5. getRecentEmojiStatuses — the notModified band answers the
+        //    C++ 500 (the error band saved no record).
+        let (promise, slot) = record_statuses_list();
+        with_user_manager(&mut td, |manager, env| {
+            manager.get_recent_emoji_statuses(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getRecentEmojiStatuses::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_EmojiStatuses::account_emojiStatusesNotModified(
+            telegram_api::account_emojiStatusesNotModified,
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(status.message(), "Receive wrong server response");
+            }
+            other => panic!("the notModified band: {other:?}"),
+        }
+
+        // 6. getUpgradedGiftEmojiStatuses — the collectible family.
+        let (promise, slot) = record_statuses_list();
+        with_user_manager(&mut td, |manager, env| {
+            manager.get_upgraded_gift_emoji_statuses(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getCollectibleEmojiStatuses::ID,
+        );
+        net_complete(sent, emoji_status_answer(3, 5));
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(statuses)) => {
+                assert_eq!(statuses.emoji_statuses.len(), 1);
+            }
+            other => panic!("the collectible list: {other:?}"),
+        }
+
+        // 7. clearRecentEmojiStatuses — the Bool answer resolves the ok
+        //    (and writes the recent record's empty form).
+        let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = {
+            struct Rec(UnitSlot);
+            impl tdutils::promise::PromiseInterface<()> for Rec {
+                fn set_value(&mut self, value: ()) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            Promise::from_interface(Rec(slot.clone()))
+        };
+        with_user_manager(&mut td, |manager, env| {
+            manager.clear_recent_emoji_statuses(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_clearRecentEmojiStatuses::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_user_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
 
     fn premium_queries_ride_the_dispatcher_impl() {
