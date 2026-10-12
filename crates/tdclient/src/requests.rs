@@ -17006,61 +17006,6 @@ fn run_sticker_residue_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
             stickers_manager.clear_searched_for_tags(&mut env, request.clear_cashtags, promise);
         }
-        Function::getDefaultEmojiStatuses(_) => {
-            // Requests.cpp:6827-6832 — the EmojiStatus.cpp cached-record
-            // plane; the refresh query parks ([blocked: net]).
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
-                id,
-                Object::emojiStatusCustomEmojis,
-            );
-            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
-            crate::stickers_manager::get_default_emoji_statuses(&mut env, promise);
-        }
-        Function::getDefaultChatEmojiStatuses(_) => {
-            // Requests.cpp:6833-6838.
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = td.deferred_promise::<td_api::EmojiStatusCustomEmojis, _>(
-                id,
-                Object::emojiStatusCustomEmojis,
-            );
-            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
-            crate::stickers_manager::get_default_channel_emoji_statuses(&mut env, promise);
-        }
-        Function::getRecentEmojiStatuses(_) => {
-            // Requests.cpp:6839-6844.
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise =
-                td.deferred_promise::<td_api::EmojiStatuses, _>(id, Object::emojiStatuses);
-            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
-            crate::stickers_manager::get_recent_emoji_statuses(&mut env, promise);
-        }
-        Function::getUpgradedGiftEmojiStatuses(_) => {
-            // Requests.cpp:6845-6850.
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise =
-                td.deferred_promise::<td_api::EmojiStatuses, _>(id, Object::emojiStatuses);
-            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
-            crate::stickers_manager::get_upgraded_gift_emoji_statuses(&mut env, promise);
-        }
-        Function::clearRecentEmojiStatuses(_) => {
-            // Requests.cpp:6851-6855 — the local empty-record write is
-            // immediate; the query tail owns the promise.
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let (mut env, _stickers_manager) = crate::td::stickers_env_split(td);
-            crate::stickers_manager::clear_recent_emoji_statuses(&mut env, promise);
-        }
 
         _ => run_country_requests(td, id, function),
     }
