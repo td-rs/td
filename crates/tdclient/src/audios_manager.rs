@@ -196,7 +196,20 @@ impl AudiosManager {
     ) -> Option<telegram_api::InputMedia> {
         let file_manager = env.file_manager();
         let file_manager = file_manager.lock();
-        let file_view = file_manager.get_file_view(file_id)?;
+        self.get_input_media_with_files(&file_manager, file_id, input_file, input_thumbnail)
+    }
+
+    /// The `&FileManager` form of [`Self::get_input_media`] — the upload
+    /// tails that already hold the manager borrow (the C++ reaches the
+    /// same view through `td_` inside its single actor).
+    pub fn get_input_media_with_files(
+        &self,
+        files: &FileManager,
+        file_id: FileId,
+        input_file: Option<telegram_api::InputFile>,
+        input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        let file_view = files.get_file_view(file_id)?;
         if file_view.is_encrypted() {
             return None;
         }

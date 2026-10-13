@@ -112,6 +112,21 @@ macro_rules! user_env {
     };
 }
 
+/// The td-plane pair of the profile-photo arms — expanded at the call
+/// site so the field borrows stay disjoint (the `user_env!` shape; the
+/// guards and the callback clone are the caller's locals).
+macro_rules! set_profile_photo_td {
+    ($td:ident, $env:ident, $files:ident, $fllm:ident, $callback:ident) => {
+        crate::user_manager::SetProfilePhotoTd {
+            env: &$env,
+            files: &mut $files,
+            fllm: &mut $fllm,
+            upload_callback: &$callback,
+            stickers: &$td.stickers_manager,
+        }
+    };
+}
+
 /// `Requests::run_request` — the C++ `downcast_call` dispatch.
 pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
     match function {
@@ -3956,19 +3971,20 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             // Requests.cpp:7116-7119 → UserManager.cpp:5996-6002: the
             // non-bot UserpicSetup suggested-action dismissal is the
             // Payments-style seam; the validation bands answer in
-            // `set_profile_photo_impl`, the prev-photo query rides the
-            // user net kinds and the upload flow is [blocked: net/Files]
+            // `set_profile_photo_impl`, the prev-photo query and the
+            // three upload arms ride the user net kinds
             if !td.auth_manager.is_bot() {
                 tdutils::log_info!(
                     "dismiss_suggested_action(USERPIC_SETUP) — [blocked: SuggestedActionManager]"
                 );
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
-            let file_manager = td.file_manager.lock();
             let env = user_env!(td);
+            let mut files = td.file_manager.lock();
+            let mut fllm = td.file_load_manager.lock();
+            let upload_callback = td.profile_photo_upload_callback.clone();
             td.user_manager.set_profile_photo(
-                &env,
-                &file_manager,
+                set_profile_photo_td!(td, env, files, fllm, upload_callback),
                 request.photo.as_ref(),
                 request.is_public,
                 promise,
@@ -4102,17 +4118,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         Function::setUserPersonalProfilePhoto(request) => {
             // Requests.cpp:6681-6685 → UserManager.cpp:6071-6097: the
             // contact/self/bot ladder answers here; the delete query
-            // rides the user net kinds and the upload flow is
-            // [blocked: net/Files]
+            // and the upload arms ride the user net kinds
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
-            let file_manager = td.file_manager.lock();
             let env = user_env!(td);
+            let mut files = td.file_manager.lock();
+            let mut fllm = td.file_load_manager.lock();
+            let upload_callback = td.profile_photo_upload_callback.clone();
             td.user_manager.set_user_profile_photo(
-                &env,
-                &file_manager,
+                set_profile_photo_td!(td, env, files, fllm, upload_callback),
                 UserId::new(request.user_id),
                 request.photo.as_ref(),
                 false,
@@ -4125,11 +4141,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
-            let file_manager = td.file_manager.lock();
             let env = user_env!(td);
+            let mut files = td.file_manager.lock();
+            let mut fllm = td.file_load_manager.lock();
+            let upload_callback = td.profile_photo_upload_callback.clone();
             td.user_manager.set_user_profile_photo(
-                &env,
-                &file_manager,
+                set_profile_photo_td!(td, env, files, fllm, upload_callback),
                 UserId::new(request.user_id),
                 request.photo.as_ref(),
                 true,
@@ -4137,15 +4154,29 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::addProfileAudio(request) => {
-            // Requests.cpp:7143-7146 → UserManager.cpp:7178-7212: the
-            // input gates answer here; the get_input_file_id resolution,
-            // the encrypted/web gates and the create_audio/upload tail are
-            // the FileManager/AudiosManager seams
+            // Requests.cpp:7143-7146 → UserManager.cpp:7178-7216: the
+            // input gates, the file resolution and the
+            // create_audio/upload tail run in the manager over the
+            // td-plane pair; the `messages.uploadMedia` query rides the
+            // user net kinds
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
-            td.user_manager.add_new_saved_music(request.audio, promise);
+            let mut files = td.file_manager.lock();
+            let mut fllm = td.file_load_manager.lock();
+            let upload_callback = td.saved_music_upload_callback.clone();
+            td.user_manager.add_new_saved_music(
+                crate::user_manager::SavedMusicUploadTd {
+                    files: &mut files,
+                    fllm: &mut fllm,
+                    upload_callback: &upload_callback,
+                    audios: &mut td.audios_manager,
+                    close_flag: td.global.close_flag(),
+                },
+                request.audio,
+                promise,
+            );
         }
         Function::setUserNote(request) => {
             // Requests.cpp:6687-6691 → UserManager.cpp:6440-6466: the
@@ -4366,13 +4397,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     let user_id = td
                         .business_connection_manager
                         .get_business_connection_user_id(&connection_id);
-                    let file_manager = td.file_manager.lock();
                     let env = user_env!(td);
+                    let mut files = td.file_manager.lock();
+                    let mut fllm = td.file_load_manager.lock();
+                    let upload_callback = td.profile_photo_upload_callback.clone();
                     td.user_manager.set_profile_photo_impl(
-                        crate::user_manager::SetProfilePhotoTd {
-                            env: &env,
-                            files: &file_manager,
-                        },
+                        set_profile_photo_td!(td, env, files, fllm, upload_callback),
                         user_id,
                         Some(input_photo),
                         request.is_public,

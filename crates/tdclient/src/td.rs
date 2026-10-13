@@ -3823,6 +3823,15 @@ pub struct Td {
     /// the file manager (the DownloadManager callbacks pass it into the
     /// FileManager calls).
     pub(crate) file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
+    /// `UserManager::upload_profile_photo_callback_` (the ctor pair,
+    /// UserManager.cpp:2742-2743) — the Td-side outbox bridge the
+    /// profile-photo upload arms register.
+    pub(crate) profile_photo_upload_callback:
+        Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    /// `UserManager::upload_saved_music_callback_` — the saved-music
+    /// twin.
+    pub(crate) saved_music_upload_callback:
+        Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
     /// `Td::download_manager_` (Td.cpp:1219, the `init_managers` block).
     pub(crate) download_manager: Arc<parking_lot::Mutex<DownloadManager>>,
     /// The `Td *td_`/`G()` plane cell behind the stored file context/worker
@@ -4188,6 +4197,18 @@ impl Td {
                 events: Arc::clone(&file_shared.lock().user_download_finished_events),
             })));
         }
+        // the `UserManager` ctor's upload-callback pair
+        // (UserManager.cpp:2742-2743) — the profile-photo and saved-music
+        // outbox bridges
+        let profile_photo_upload_callback: Arc<
+            parking_lot::Mutex<dyn crate::files::UploadCallback>,
+        > = Arc::new(Mutex::new(TdProfilePhotoUploadCallback {
+            events: Arc::clone(&file_shared.lock().profile_photo_upload_events),
+        }));
+        let saved_music_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            Arc::new(Mutex::new(TdSavedMusicUploadCallback {
+                events: Arc::clone(&file_shared.lock().saved_music_upload_events),
+            }));
         {
             let mut download_manager = download_manager.lock();
             download_manager.set_callback(Box::new(TdFilePlane(Arc::clone(&file_shared))));
@@ -4338,6 +4359,8 @@ impl Td {
             file_manager,
             file_reference_manager: crate::files::FileReferenceManager::new(),
             file_load_manager,
+            profile_photo_upload_callback,
+            saved_music_upload_callback,
             download_manager,
             file_shared,
             use_message_database: false,
@@ -7978,7 +8001,176 @@ impl Td {
         fn parse_error(what: &str) -> Status {
             Status::error(500, &format!("Failed to parse the {what} answer"))
         }
+        /// The `on_uploaded_saved_music_file` 400 bands — the partial
+        /// remote drops before the parked promise fails
+        /// (cpp:7288-7305).
+        fn fail_uploaded_saved_music(
+            td: &Td,
+            user_manager: &mut crate::user_manager::UserManager,
+            file_upload_id: crate::files::FileUploadId,
+            message: &str,
+        ) {
+            {
+                let mut files = td.file_manager.lock();
+                let mut fllm = td.file_load_manager.lock();
+                files.delete_partial_remote_location(file_upload_id, &mut fllm);
+            }
+            if let Some(mut promise) = user_manager.take_upload_saved_music_query_promise() {
+                promise.set_error(Status::error(400, message));
+            }
+        }
         let mut user_manager = std::mem::take(&mut self.user_manager);
+        // Two arms touch only the documents/files planes (no UserEnv
+        // reads), so they run before the env borrow below: the
+        // saved-music upload arm (the documents intake + the files legs
+        // + the add_saved_music refire, cpp:505-527 + 7284-7316) and
+        // the by-id reload (the C++ on_result loop, cpp:1693-1708).
+        if let crate::user_manager::UserNetKind::UploadSavedMusicFile {
+            file_upload_id,
+            is_url,
+            was_uploaded,
+        } = kind
+        {
+            // `UploadSavedMusicFileQuery::on_result`/`on_error`
+            // (cpp:505-527) — the ok tail runs
+            // `on_uploaded_saved_music_file` (cpp:7284-7316); the
+            // `is_url` member is signature parity (the C++ body never
+            // reads it)
+            let _ = is_url;
+            let result = if query.is_error() {
+                Err(query.error().clone())
+            } else {
+                telegram_api::MessageMedia::parse(query.ok())
+                    .map_err(|_| parse_error("messages_uploadMedia"))
+            };
+            let file_id = file_upload_id.file_id;
+            match result {
+                Ok(telegram_api::MessageMedia::messageMediaDocument(media)) => {
+                    let Some(document) = media.document else {
+                        // the C++ `document_` null is the parse-failure band
+                        fail_uploaded_saved_music(
+                            self,
+                            &mut user_manager,
+                            file_upload_id,
+                            "Can't upload profile audio file: wrong file type",
+                        );
+                        self.user_manager = user_manager;
+                        return;
+                    };
+                    match document {
+                        telegram_api::Document::documentEmpty(_) => {
+                            fail_uploaded_saved_music(
+                                self,
+                                &mut user_manager,
+                                file_upload_id,
+                                "Can't upload profile audio file: empty file",
+                            );
+                        }
+                        telegram_api::Document::document(document) => {
+                            let document_id = document.id;
+                            let access_hash = document.access_hash;
+                            let (mut denv, documents) = self.documents_env();
+                            let parsed = documents.on_get_document(
+                                &mut denv,
+                                crate::documents_manager::RemoteDocument::from_server_document(
+                                    document,
+                                ),
+                                crate::messages_manager::DialogId::default(),
+                                false,
+                                false,
+                                crate::document::DocumentType::General,
+                                crate::documents_manager::Subtype::Other,
+                            );
+                            if parsed.type_ != crate::document::DocumentType::Audio {
+                                fail_uploaded_saved_music(
+                                    self,
+                                    &mut user_manager,
+                                    file_upload_id,
+                                    "Wrong file type",
+                                );
+                                self.user_manager = user_manager;
+                                return;
+                            }
+                            if parsed.file_id != file_id {
+                                // must not delete the old audio, because
+                                // the file_id could be used for
+                                // simultaneous URL uploads
+                                self.audios_manager.merge_audios(parsed.file_id, file_id);
+                            }
+                            let mut files = self.file_manager.lock();
+                            let mut fllm = self.file_load_manager.lock();
+                            files.cancel_upload(file_upload_id, &mut fllm);
+                            drop(files);
+                            drop(fllm);
+                            // the registry-stand-in read of the merged
+                            // node's document location feeds the
+                            // `add_saved_music` refire (the C++ reads it
+                            // off the FileView)
+                            user_manager.register_saved_music_file_location(
+                                file_id,
+                                document_id,
+                                access_hash,
+                            );
+                            if let Some(promise) =
+                                user_manager.take_upload_saved_music_query_promise()
+                            {
+                                // the `PromiseCreator` lambda's ok hop:
+                                // `send_closure(add_saved_music)`
+                                user_manager.add_saved_music(
+                                    file_id,
+                                    crate::files::FileId::default(),
+                                    promise,
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // `media->get_id() != messageMediaDocument::ID`
+                    fail_uploaded_saved_music(
+                        self,
+                        &mut user_manager,
+                        file_upload_id,
+                        "Can't upload profile audio file: wrong file type",
+                    );
+                }
+                Err(status) => {
+                    // `UploadSavedMusicFileQuery::on_error` (cpp:513-526)
+                    let close_flag = self.global.close_flag();
+                    let mut files = self.file_manager.lock();
+                    let mut fllm = self.file_load_manager.lock();
+                    if was_uploaded {
+                        debug_assert!(file_upload_id.is_valid());
+                        let bad_parts = crate::files::get_missing_file_parts(&status);
+                        if bad_parts.is_empty() {
+                            files.delete_partial_remote_location_on_error(
+                                file_upload_id,
+                                &status,
+                                close_flag,
+                                &mut fllm,
+                            );
+                        } else {
+                            // TODO on_upload_saved_music_file_parts_missing
+                            // (the C++ carries the same TODO)
+                        }
+                    } else if crate::files::is_file_reference_error(&status) {
+                        // `FileReferenceManager::is_file_reference_error`
+                        tdutils::log_error!(
+                            "Receive file reference error for UploadStickerFileQuery"
+                        );
+                    }
+                    files.cancel_upload(file_upload_id, &mut fllm);
+                    drop(files);
+                    drop(fllm);
+                    if let Some(mut promise) = user_manager.take_upload_saved_music_query_promise()
+                    {
+                        promise.set_error(status);
+                    }
+                }
+            }
+            self.user_manager = user_manager;
+            return;
+        }
         // The saved-music by-id arm touches only the documents plane (the
         // C++ on_result loop, cpp:1693-1708) — no UserEnv reads, so it
         // runs before the env borrow below.
@@ -8375,6 +8567,66 @@ impl Td {
                     }
                 }
             }
+            crate::user_manager::UserNetKind::UploadProfilePhoto {
+                user_id,
+                is_fallback,
+                only_suggest,
+                file_upload_id,
+            } => {
+                // `UploadProfilePhotoQuery::on_result`/`on_error`
+                // (cpp:613-633) — the ok tail is `on_set_profile_photo`
+                // (the net-drain 08 intake) or the only_suggest ok, then
+                // `delete_partial_remote_location`; the error tail
+                // drops the partial remote before failing the promise
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::photos_Photo::parse(query.ok())
+                        .map_err(|_| parse_error("photos_uploadProfilePhoto"))
+                };
+                match result {
+                    Ok(photo) => {
+                        // the C++ always runs the `on_set_profile_photo`
+                        // intake (cpp:622-630) — the promise rides the
+                        // query, so an empty family queue (the §5 FIFO
+                        // mispairing case) runs the intake over a no-op
+                        // promise instead of skipping it
+                        let promise = user_manager
+                            .take_upload_profile_photo_query_promise()
+                            .unwrap_or_default();
+                        if !only_suggest {
+                            user_manager.on_set_profile_photo(
+                                &mut env,
+                                user_id,
+                                photo,
+                                is_fallback,
+                                0,
+                                promise,
+                            );
+                        } else {
+                            let mut promise = promise;
+                            promise.set_value(());
+                        }
+                        if file_upload_id.is_valid() {
+                            let mut files = self.file_manager.lock();
+                            let mut fllm = self.file_load_manager.lock();
+                            files.delete_partial_remote_location(file_upload_id, &mut fllm);
+                        }
+                    }
+                    Err(status) => {
+                        if file_upload_id.is_valid() {
+                            let mut files = self.file_manager.lock();
+                            let mut fllm = self.file_load_manager.lock();
+                            files.delete_partial_remote_location(file_upload_id, &mut fllm);
+                        }
+                        if let Some(mut promise) =
+                            user_manager.take_upload_profile_photo_query_promise()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
             crate::user_manager::UserNetKind::SaveMusic {
                 file_id,
                 after_file_id,
@@ -8479,6 +8731,10 @@ impl Td {
             crate::user_manager::UserNetKind::GetUserSavedMusicById { .. } => {
                 // handled above — the env-free documents plane
                 unreachable!("GetUserSavedMusicById answered before the env construction")
+            }
+            crate::user_manager::UserNetKind::UploadSavedMusicFile { .. } => {
+                // handled above — the env-free documents plane
+                unreachable!("UploadSavedMusicFile answered before the env construction")
             }
             crate::user_manager::UserNetKind::GetSavedMusicIds => {
                 // `GetSavedMusicIdsQuery::on_result`/`on_error`
@@ -13058,6 +13314,19 @@ impl Td {
                 .lock()
                 .on_user_file_download_finished(file_id);
         }
+        // the `UploadProfilePhotoCallback`/`UploadSavedMusicCallback`
+        // hops — the `send_closure_later` re-entries of the C++ callbacks
+        // (UserManager.cpp:2715-2741) replay here
+        let profile_photo_uploads =
+            std::mem::take(&mut *self.file_shared.lock().profile_photo_upload_events.lock());
+        for event in profile_photo_uploads {
+            self.run_profile_photo_upload_event(event);
+        }
+        let saved_music_uploads =
+            std::mem::take(&mut *self.file_shared.lock().saved_music_upload_events.lock());
+        for event in saved_music_uploads {
+            self.run_saved_music_upload_event(event);
+        }
         let worker_events = std::mem::take(&mut self.file_shared.lock().worker_events);
         let mut merge_events = Vec::new();
         if !worker_events.is_empty() {
@@ -13097,6 +13366,102 @@ impl Td {
             self.apply_file_db_event(event);
         }
         self.flush_dlds();
+    }
+
+    /// One `UploadProfilePhotoCallback` hop — the C++
+    /// `UserManager::on_upload_profile_photo[_error]` re-entry
+    /// (UserManager.cpp:6145-6211): the ok continues over the file
+    /// plane (the reupload ladder or the `UploadProfilePhotoQuery`
+    /// send), the error fails the parked promise. The close gate keeps
+    /// the entry parked, like the C++ early return.
+    fn run_profile_photo_upload_event(&mut self, event: UserUploadEvent) {
+        if self.global.close_flag() {
+            return;
+        }
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        match event {
+            UserUploadEvent::Ok {
+                file_upload_id,
+                input_file,
+            } => {
+                let is_bot = self.auth_manager.is_bot();
+                let Some(options) = self.option_manager.as_mut() else {
+                    self.user_manager = user_manager;
+                    return;
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: &mut self.global,
+                    options,
+                    auth_is_bot: is_bot,
+                };
+                let mut files = self.file_manager.lock();
+                let mut fllm = self.file_load_manager.lock();
+                let upload_callback = self.profile_photo_upload_callback.clone();
+                user_manager.on_upload_profile_photo(
+                    crate::user_manager::SetProfilePhotoTd {
+                        env: &env,
+                        files: &mut files,
+                        fllm: &mut fllm,
+                        upload_callback: &upload_callback,
+                        stickers: &self.stickers_manager,
+                    },
+                    file_upload_id,
+                    input_file,
+                );
+            }
+            UserUploadEvent::Error {
+                file_upload_id,
+                status,
+            } => {
+                user_manager.on_upload_profile_photo_error(file_upload_id, status);
+            }
+        }
+        self.user_manager = user_manager;
+    }
+
+    /// One `UploadSavedMusicCallback` hop — the C++
+    /// `UserManager::on_upload_saved_music[_error]` re-entry
+    /// (UserManager.cpp:7230-7261): the ok resolves the audios input
+    /// media (the env locks the file manager, so it runs before the
+    /// manager tail takes the borrow) and continues in
+    /// `do_upload_saved_music`.
+    fn run_saved_music_upload_event(&mut self, event: UserUploadEvent) {
+        if self.global.close_flag() {
+            return;
+        }
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        match event {
+            UserUploadEvent::Ok {
+                file_upload_id,
+                input_file,
+            } => {
+                tdutils::log_info!("Profile audio {file_upload_id:?} has been uploaded");
+                let had_input_file = input_file.is_some();
+                let promise = user_manager.take_saved_music_upload_promise(file_upload_id);
+                let input_media = self
+                    .audios_manager
+                    .get_input_media(self, file_upload_id.file_id, input_file, None)
+                    .expect("CHECK(input_media != nullptr)");
+                let mut files = self.file_manager.lock();
+                let mut fllm = self.file_load_manager.lock();
+                user_manager.do_upload_saved_music(
+                    self.global.close_flag(),
+                    &mut files,
+                    &mut fllm,
+                    file_upload_id,
+                    had_input_file,
+                    input_media,
+                    promise,
+                );
+            }
+            UserUploadEvent::Error {
+                file_upload_id,
+                status,
+            } => {
+                user_manager.on_upload_saved_music_error(file_upload_id, status);
+            }
+        }
+        self.user_manager = user_manager;
     }
 
     /// The file-db replay: build the node's `FileData` (the C++
@@ -14894,6 +15259,14 @@ pub(crate) struct TdFileShared {
     /// both completions re-enter `on_user_file_download_finished` at the
     /// drive end.
     pub(crate) user_download_finished_events: Arc<parking_lot::Mutex<Vec<FileId>>>,
+    /// The `UploadProfilePhotoCallback` hops (UserManager.cpp:2715-2727)
+    /// — both completions re-enter
+    /// `UserManager::on_upload_profile_photo[_error]` at the drive end.
+    pub(crate) profile_photo_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+    /// The `UploadSavedMusicCallback` hops (UserManager.cpp:2729-2741) —
+    /// both completions re-enter
+    /// `UserManager::on_upload_saved_music[_error]` at the drive end.
+    pub(crate) saved_music_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
     // ── the snapshot (refreshed per drive) ──
     files_dir: String,
     secure_files_dir: String,
@@ -14940,6 +15313,8 @@ impl TdFileShared {
             file_db_events: Vec::new(),
             download_state_events: Arc::new(Mutex::new(Vec::new())),
             user_download_finished_events: Arc::new(Mutex::new(Vec::new())),
+            profile_photo_upload_events: Arc::new(Mutex::new(Vec::new())),
+            saved_music_upload_events: Arc::new(Mutex::new(Vec::new())),
             files_dir: String::new(),
             secure_files_dir: String::new(),
             is_bot: false,
@@ -15447,6 +15822,82 @@ impl DownloadCallback for TdUserDownloadCallback {
 
     fn on_download_error(&mut self, file_id: FileId, _status: tdutils::status::Status) {
         self.events.lock().push(file_id);
+    }
+}
+
+/// One user-upload completion hop — the ok carries the resolved
+/// `InputFile` (null on the early-complete path), the error the
+/// loader `Status`.
+#[derive(Debug)]
+pub(crate) enum UserUploadEvent {
+    Ok {
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    },
+    Error {
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    },
+}
+
+/// `UserManager::UploadProfilePhotoCallback` (UserManager.cpp:2715-2727)
+/// — the loader-side completions hop into
+/// `UserManager::on_upload_profile_photo[_error]` at the drive end.
+struct TdProfilePhotoUploadCallback {
+    events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+}
+
+impl crate::files::UploadCallback for TdProfilePhotoUploadCallback {
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        self.events.lock().push(UserUploadEvent::Ok {
+            file_upload_id,
+            input_file,
+        });
+    }
+
+    fn on_upload_error(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    ) {
+        self.events.lock().push(UserUploadEvent::Error {
+            file_upload_id,
+            status,
+        });
+    }
+}
+
+/// `UserManager::UploadSavedMusicCallback` (UserManager.cpp:2729-2741)
+/// — the saved-music twin of [`TdProfilePhotoUploadCallback`].
+struct TdSavedMusicUploadCallback {
+    events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+}
+
+impl crate::files::UploadCallback for TdSavedMusicUploadCallback {
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        self.events.lock().push(UserUploadEvent::Ok {
+            file_upload_id,
+            input_file,
+        });
+    }
+
+    fn on_upload_error(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    ) {
+        self.events.lock().push(UserUploadEvent::Error {
+            file_upload_id,
+            status,
+        });
     }
 }
 
@@ -32437,13 +32888,28 @@ mod tests {
     /// The [`netted_td`] form that also hands back the response collector
     /// — the live td_api arm round-trips assert through it.
     fn netted_td_with_callback(name: &str) -> (Td, Arc<RecNetSession>, CollectCallback) {
+        netted_td_with_callback_options(name, false)
+    }
+
+    /// The [`netted_td_with_callback`] form with the files database on —
+    /// the upload round-trips flush their file records (the FileDb
+    /// events need the files key-value).
+    fn netted_td_with_files(name: &str) -> (Td, Arc<RecNetSession>, CollectCallback) {
+        netted_td_with_callback_options(name, true)
+    }
+
+    fn netted_td_with_callback_options(
+        name: &str,
+        use_file_database: bool,
+    ) -> (Td, Arc<RecNetSession>, CollectCallback) {
         let callback = CollectCallback::default();
         let dir = temp_db_dir(name);
         let mut td = Td::new(Box::new(CollectCallback {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
-        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, false) else {
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir, use_file_database)
+        else {
             unreachable!("setTdlibParameters helper");
         };
         td.on_set_tdlib_parameters(20, parameters);
@@ -38038,6 +38504,607 @@ mod tests {
         let error = error_of(&callback, 1);
         assert_eq!((error.code, error.message.as_str()), (500, "INTERNAL"));
         assert!(!td.user_manager.are_contacts_loaded());
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- net-drain 11 (§3.1 #7, #10): the Files-gated user upload
+    // tails — uploadProfilePhoto's three arms and addProfileAudio's
+    // upload tail ride the dispatcher over the real file plane. The
+    // offline round-trip swaps the all-ok upload factory (the wire
+    // saveBigFilePart bytes are the M.12.6 gate, the live transfer the
+    // T.9 gate). ----
+
+    /// The all-ok upload factory — every part save answers true.
+    struct TestOkUploadNetFactory;
+
+    impl crate::files::FileLoadNetFactory for TestOkUploadNetFactory {
+        fn download_net(&mut self) -> Box<dyn crate::files::FileDownloaderNet> {
+            unimplemented!("the upload round-trips start no downloads")
+        }
+        fn upload_net(&mut self) -> Box<dyn crate::files::FileUploaderNet> {
+            Box::new(TestOkUploadNet)
+        }
+        fn hash_net(&mut self) -> Box<dyn crate::files::FileHashUploaderNet> {
+            unimplemented!("the upload round-trips start no hash uploads")
+        }
+        fn utils_net(&mut self) -> Box<dyn crate::files::FileDownloaderNet> {
+            unimplemented!("the upload round-trips touch no file io")
+        }
+    }
+
+    struct TestOkUploadNet;
+
+    impl crate::files::FileUploaderNet for TestOkUploadNet {
+        fn upload_part(&mut self, _query: crate::files::UploadPartQuery) -> Result<bool, Status> {
+            Ok(true)
+        }
+    }
+
+    /// A boxed `messageMediaDocument` answer (the messages.uploadMedia
+    /// result shape).
+    fn uploaded_media_document_answer(document: Option<telegram_api::Document>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::MessageMedia::messageMediaDocument(telegram_api::messageMediaDocument {
+            // `document:flags.0?Document` — the answer carries the bit
+            flags: if document.is_some() { 1 } else { 0 },
+            document,
+            ..telegram_api::messageMediaDocument::default()
+        })
+        .store(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn upload_saved_music_round_trips_messages_upload_media() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(upload_saved_music_round_trips_messages_upload_media_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn upload_saved_music_round_trips_messages_upload_media_impl() {
+        let (mut td, rec, callback) = netted_td_with_files("netfix-user-upload-music");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        td.file_load_manager
+            .lock()
+            .set_factory(Box::new(TestOkUploadNetFactory));
+        with_user_manager(&mut td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(900));
+        });
+        seed_dialog_user(&mut td);
+
+        // a real local audio file — the upload reads it from disk
+        let dir = temp_db_dir("netfix-user-upload-music-src");
+        let path = std::path::Path::new(&dir).join("song.mp3");
+        std::fs::write(&path, vec![7u8; 1024]).unwrap();
+
+        // 1. the happy path — the request's own drive pumps the upload
+        //    (the loader events, the callback outbox, the drain's
+        //    do_upload hop) and the query rides the dispatcher
+        td.request(
+            1,
+            Function::addProfileAudio(td_api::addProfileAudio {
+                audio: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                        path: path.to_string_lossy().into_owned(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 10,
+                    title: "Title".to_owned(),
+                    performer: "Performer".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_uploadMedia::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::messages_uploadMedia(payload) => {
+                assert!(
+                    matches!(
+                        payload.peer.as_deref(),
+                        Some(telegram_api::InputPeer::inputPeerSelf(_))
+                    ),
+                    "the upload rides inputPeerSelf"
+                );
+                match payload.media.as_deref() {
+                    Some(telegram_api::InputMedia::inputMediaUploadedDocument(media)) => {
+                        assert_eq!(media.mime_type, "audio/mpeg");
+                        assert!(
+                            media.attributes.iter().any(|attribute| matches!(
+                                attribute,
+                                telegram_api::DocumentAttribute::documentAttributeAudio(audio)
+                                    if !audio.voice && audio.duration == 10
+                            )),
+                            "the created audio rides the upload"
+                        );
+                        match media.file.as_ref() {
+                            Some(telegram_api::InputFile::inputFile(file)) => {
+                                assert_eq!(file.parts, 1, "one small-file part");
+                            }
+                            other => panic!("the uploaded file: {other:?}"),
+                        }
+                    }
+                    other => panic!("the uploaded media: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // the answer runs the documents intake, cancels the upload and
+        // refires add_saved_music (the PromiseCreator lambda hop)
+        net_complete(
+            sent,
+            uploaded_media_document_answer(Some(wire_audio_document(202, 22))),
+        );
+        td.dispatch_completed_user_net();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_saveMusic::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_saveMusic(payload) => {
+                assert!(!payload.unsave);
+                match payload.id {
+                    Some(telegram_api::InputDocument::inputDocument(document)) => {
+                        // the registry-stand-in read of the uploaded pair
+                        assert_eq!((document.id, document.access_hash), (202, 22));
+                    }
+                    other => panic!("the document: {other:?}"),
+                }
+                assert!(payload.after_id.is_none());
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the wrong-type band — a non-document media answers the
+        //    C++ 400
+        td.request(
+            2,
+            Function::addProfileAudio(td_api::addProfileAudio {
+                audio: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                        path: path.to_string_lossy().into_owned(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 10,
+                    title: "Title".to_owned(),
+                    performer: "Performer".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_uploadMedia::ID,
+        );
+        let mut empty_media = Vec::new();
+        telegram_api::MessageMedia::messageMediaEmpty(telegram_api::messageMediaEmpty)
+            .store(&mut empty_media);
+        net_complete(sent, empty_media);
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't upload profile audio file: wrong file type")
+        );
+
+        // 3. the empty-document band
+        td.request(
+            3,
+            Function::addProfileAudio(td_api::addProfileAudio {
+                audio: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                        path: path.to_string_lossy().into_owned(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 10,
+                    title: "Title".to_owned(),
+                    performer: "Performer".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_uploadMedia::ID,
+        );
+        net_complete(
+            sent,
+            uploaded_media_document_answer(Some(telegram_api::Document::documentEmpty(
+                telegram_api::documentEmpty { id: 0 },
+            ))),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't upload profile audio file: empty file")
+        );
+
+        // 4. the non-audio document band
+        td.request(
+            4,
+            Function::addProfileAudio(td_api::addProfileAudio {
+                audio: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                        path: path.to_string_lossy().into_owned(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 10,
+                    title: "Title".to_owned(),
+                    performer: "Performer".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_uploadMedia::ID,
+        );
+        let mut non_audio = wire_audio_document(303, 33);
+        let telegram_api::Document::document(ref mut document) = non_audio else {
+            unreachable!()
+        };
+        document.attributes.clear();
+        net_complete(sent, uploaded_media_document_answer(Some(non_audio)));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Wrong file type")
+        );
+
+        // 5. the query error band — the was_uploaded legs run the
+        //    delete_partial/cancel hops and fail the promise
+        td.request(
+            5,
+            Function::addProfileAudio(td_api::addProfileAudio {
+                audio: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                        path: path.to_string_lossy().into_owned(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 10,
+                    title: "Title".to_owned(),
+                    performer: "Performer".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_uploadMedia::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_5"));
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn upload_profile_photo_round_trips_photos_upload_profile_photo() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(upload_profile_photo_round_trips_photos_upload_profile_photo_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn upload_profile_photo_round_trips_photos_upload_profile_photo_impl() {
+        let (mut td, rec, callback) = netted_td_with_files("netfix-user-upload-photo");
+        td.file_load_manager
+            .lock()
+            .set_factory(Box::new(TestOkUploadNetFactory));
+        with_user_manager(&mut td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(900));
+        });
+        let dir = temp_db_dir("netfix-user-upload-photo-src");
+        let path = std::path::Path::new(&dir).join("photo.jpg");
+        std::fs::write(&path, vec![9u8; 2048]).unwrap();
+
+        // 1. the static arm — the FILE flag, no bot user (is_me), and
+        //    the ok answer runs the on_set_profile_photo intake
+        td.request(
+            1,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoStatic(
+                    td_api::inputChatPhotoStatic {
+                        photo: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                            path: path.to_string_lossy().into_owned(),
+                        })),
+                    },
+                )),
+                is_public: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_uploadProfilePhoto::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_uploadProfilePhoto(payload) => {
+                assert_eq!(payload.flags & 1, 1, "the FILE flag");
+                assert_eq!(payload.flags & (1 << 1), 0, "no VIDEO flag");
+                assert_eq!(payload.flags & (1 << 5), 0, "no BOT flag for is_me");
+                assert!(payload.bot.is_none());
+                assert!(
+                    matches!(
+                        payload.file.as_ref(),
+                        Some(telegram_api::InputFile::inputFile(_))
+                    ),
+                    "the static arm uploads the file"
+                );
+                assert!(payload.video.is_none());
+                assert!(payload.video_emoji_markup.is_none());
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            photos_photo_answer(Some(wire_photo(7)), vec![wire_user(900, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the animation arm — the VIDEO + VIDEO_START_TS flag pair
+        //    over the second upload
+        let path = std::path::Path::new(&dir).join("clip.mp4");
+        std::fs::write(&path, vec![5u8; 2048]).unwrap();
+        td.request(
+            2,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoAnimation(
+                    td_api::inputChatPhotoAnimation {
+                        animation: Some(td_api::InputFile::inputFileLocal(
+                            td_api::inputFileLocal {
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                        )),
+                        main_frame_timestamp: 1.5,
+                    },
+                )),
+                is_public: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_uploadProfilePhoto::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_uploadProfilePhoto(payload) => {
+                assert_eq!(payload.flags & 1, 0, "no FILE flag");
+                assert_eq!(payload.flags & (1 << 1), 1 << 1, "the VIDEO flag");
+                assert_eq!(payload.flags & (1 << 2), 1 << 2, "the START_TS flag");
+                assert_eq!(payload.video_start_ts, 1.5);
+                assert!(matches!(
+                    payload.video.as_ref(),
+                    Some(telegram_api::InputFile::inputFile(_))
+                ));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            photos_photo_answer(Some(wire_photo(8)), vec![wire_user(900, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the query error band — the promise fails (the partial
+        //    remote drop runs before)
+        td.request(
+            3,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoStatic(
+                    td_api::inputChatPhotoStatic {
+                        photo: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                            path: path.to_string_lossy().into_owned(),
+                        })),
+                    },
+                )),
+                is_public: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_uploadProfilePhoto::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn upload_sticker_profile_photo_rides_the_emoji_markup() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(upload_sticker_profile_photo_rides_the_emoji_markup_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn upload_sticker_profile_photo_rides_the_emoji_markup_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-upload-sticker-photo");
+        with_user_manager(&mut td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(900));
+        });
+        // the custom emoji must be known (the have_custom_emoji read)
+        td.stickers_manager.custom_emoji_to_sticker_id.insert(
+            crate::stickers_manager::CustomEmojiId::new(777),
+            crate::messages_manager::MessageId::new(1),
+        );
+
+        let sticker_photo =
+            |_custom_emoji_id: i64,
+             background_fill: Option<td_api::BackgroundFill>,
+             sticker_type: Option<td_api::ChatPhotoStickerType>| {
+                td_api::InputChatPhoto::inputChatPhotoSticker(td_api::inputChatPhotoSticker {
+                    sticker: Some(td_api::ChatPhotoSticker {
+                        r#type: sticker_type,
+                        background_fill,
+                    }),
+                })
+            };
+        let custom_emoji_type = |custom_emoji_id: i64| {
+            Some(
+                td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                    td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id },
+                ),
+            )
+        };
+        let solid_fill = |color: i32| {
+            Some(td_api::BackgroundFill::backgroundFillSolid(
+                td_api::backgroundFillSolid { color },
+            ))
+        };
+
+        // 1. the happy path — no upload, the query carries the
+        //    VIDEO_EMOJI_MARKUP pair over the resolved StickerPhotoSize
+        td.request(
+            1,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(sticker_photo(
+                    777,
+                    solid_fill(0x112233),
+                    custom_emoji_type(777),
+                )),
+                is_public: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_uploadProfilePhoto::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_uploadProfilePhoto(payload) => {
+                assert_eq!(payload.flags & (1 << 4), 1 << 4, "the EMOJI_MARKUP flag");
+                assert!(payload.file.is_none());
+                assert!(payload.video.is_none());
+                match payload.video_emoji_markup.as_ref() {
+                    Some(telegram_api::VideoSize::videoSizeEmojiMarkup(markup)) => {
+                        assert_eq!(markup.emoji_id, 777);
+                        assert_eq!(markup.background_colors, vec![0x112233]);
+                    }
+                    other => panic!("the markup: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            photos_photo_answer(Some(wire_photo(9)), vec![wire_user(900, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the unknown custom emoji answers the C++ 400, no query
+        td.request(
+            2,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(sticker_photo(999, solid_fill(0), custom_emoji_type(999))),
+                is_public: false,
+            }),
+        );
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unknown emoji answers locally"
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Custom emoji not found")
+        );
+
+        // 3. the regular-or-mask band — the set-record seam answers the
+        //    C++ "Sticker not found" (have_sticker over no records)
+        td.request(
+            3,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(sticker_photo(
+                    0,
+                    solid_fill(0),
+                    Some(
+                        td_api::ChatPhotoStickerType::chatPhotoStickerTypeRegularOrMask(
+                            td_api::chatPhotoStickerTypeRegularOrMask {
+                                sticker_set_id: 5,
+                                sticker_id: 6,
+                            },
+                        ),
+                    ),
+                )),
+                is_public: false,
+            }),
+        );
+        assert!(rec.sent.lock().is_empty());
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Sticker not found")
+        );
+
+        // 4. the null-type band
+        td.request(
+            4,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(sticker_photo(777, solid_fill(0), None)),
+                is_public: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Type must be non-null")
+        );
+
+        // 5. the null-fill band
+        td.request(
+            5,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(sticker_photo(777, None, custom_emoji_type(777))),
+                is_public: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Background must be non-null")
+        );
+
         assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
 
