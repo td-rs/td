@@ -12402,8 +12402,9 @@ impl UserManager {
     /// `UserManager::on_resolved_phone_number` (UserManager.cpp:8862-8888).
     pub fn on_resolved_phone_number(&mut self, phone_number: String, user_id: UserId) {
         if !user_id.is_valid() {
-            self.resolved_phone_numbers
-                .insert(phone_number, UserId::default()); // negative cache
+            // the C++ `emplace` keeps a previously resolved phone — the
+            // negative cache never downgrades it (cpp:8865-8867)
+            self.resolved_phone_numbers.entry(phone_number).or_default(); // negative cache
             return;
         }
 
@@ -18041,6 +18042,14 @@ mod tests {
 
         // a resolved user answers from the cache
         um.on_resolved_phone_number("777".to_owned(), UserId::new(42));
+        let (promise, done) = promise_flag();
+        let found = um.search_user_by_phone_number("777".to_owned(), false, promise);
+        assert_eq!(found, UserId::new(42));
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+
+        // the negative cache never downgrades a resolved phone (the C++
+        // `emplace` keep-first)
+        um.on_resolved_phone_number("777".to_owned(), UserId::default());
         let (promise, done) = promise_flag();
         let found = um.search_user_by_phone_number("777".to_owned(), false, promise);
         assert_eq!(found, UserId::new(42));

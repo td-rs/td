@@ -8608,14 +8608,24 @@ impl Td {
                                         tdutils::log_error!(
                                             "Receive a non-user peer by the phone number"
                                         );
-                                        promise.set_error(Status::error(
-                                            500,
-                                            "Receive invalid response",
-                                        ));
+                                        // the C++ re-enters on_error — the
+                                        // 500 fails the parked search
+                                        // requests too (do_send_error)
+                                        let status = Status::error(500, "Receive invalid response");
+                                        user_manager
+                                            .fail_search_phone_requests(&phone_number, &status);
+                                        promise.set_error(status);
                                     }
                                 }
                             }
-                            Err(_) => promise.set_error(parse_error("contacts_resolvePhone")),
+                            Err(_) => {
+                                // the fetch_result parse failure runs
+                                // on_error — the 500 fails the parked
+                                // search requests (do_send_error)
+                                let status = parse_error("contacts_resolvePhone");
+                                user_manager.fail_search_phone_requests(&phone_number, &status);
+                                promise.set_error(status);
+                            }
                         }
                     }
                 }
@@ -36690,6 +36700,55 @@ mod tests {
         td.flush_deferred_results();
         let error = error_of(&callback, 13);
         assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_7"));
+
+        // 8d. the non-user-peer band fails the parked request with the
+        //     C++ 500 (the on_error re-entry — do_send_error)
+        td.request(
+            20,
+            Function::searchUserByPhoneNumber(td_api::searchUserByPhoneNumber {
+                phone_number: "666".to_owned(),
+                only_local: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolvePhone::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::contacts_ResolvedPeer {
+            peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                channel_id: 9,
+            })),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 20);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 8e. the parse-failure band fails the parked request too
+        td.request(
+            21,
+            Function::searchUserByPhoneNumber(td_api::searchUserByPhoneNumber {
+                phone_number: "555".to_owned(),
+                only_local: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolvePhone::ID,
+        );
+        net_complete(sent, vec![0xde, 0xad, 0xbe, 0xef]);
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 21);
+        assert_eq!(error.code, 500, "the parse-failure 500");
 
         // 9. sharePhoneNumber — the accept-contact form
         td.request(
