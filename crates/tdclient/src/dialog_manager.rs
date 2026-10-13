@@ -3241,9 +3241,10 @@ pub fn set_dialog_permissions(
 /// The td_api → `EmojiStatus` conversion is M.8/M.9 residue, so the entry
 /// takes the value type directly (the C++ `unique_ptr<EmojiStatus>`). The
 /// C++ mutates the local user only in the `UpdateEmojiStatusQuery` SUCCESS
-/// callback (`on_set_emoji_status`, UserManager.cpp:6765-6773); with the
-/// query net-blocked the port runs only the premium gate and fails the
-/// promise, leaving `my_user` untouched — like every other failed call.
+/// callback (`on_set_emoji_status`, UserManager.cpp:6765-6773) — the
+/// user leg routes the whole flow (`set_emoji_status` over the user net
+/// handle), the channel leg dispatches the `UpdateChannelEmojiStatusQuery`
+/// over the ChatManager net handle.
 pub fn set_dialog_emoji_status(
     td: &mut Td,
     dialog_id: DialogId,
@@ -3257,28 +3258,23 @@ pub fn set_dialog_emoji_status(
 
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User if dialog_id == get_my_dialog_id(td) => {
-            // user_manager_->set_emoji_status — the premium gate is the
-            // local half. `add_recent_emoji_status` (UserManager.cpp:6750-6752)
-            // and `on_set_emoji_status` + the `UpdateEmojiStatusQuery`
-            // send ride their steps (stub inventory): on_set_emoji_status
-            // runs only from the query-success callback in the C++.
+            // user_manager_->set_emoji_status (UserManager.cpp:6746-6762)
+            // — the premium gate, `add_recent_emoji_status` and the
+            // `UpdateEmojiStatusQuery` send live in the manager flow;
+            // `on_set_emoji_status` runs from the query-success tail.
             let Some(options) = td.option_manager.as_mut() else {
                 // unreachable through the request gate — the manager is
                 // pinned by Td::init
                 promise_unimplemented(&mut promise);
                 return;
             };
-            let env = UserEnv {
+            let mut env = UserEnv {
                 global: &mut td.global,
                 options,
                 auth_is_bot: td.auth_manager.is_bot(),
             };
-            if let Err(status) = td.user_manager.set_emoji_status_local(&env) {
-                promise.set_error(status);
-                return;
-            }
-            let _ = emoji_status;
-            promise_unimplemented(&mut promise);
+            td.user_manager
+                .set_emoji_status(&mut env, emoji_status.cloned(), promise);
             return;
         }
         crate::dialog_id::DialogType::Channel => {

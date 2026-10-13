@@ -5,6 +5,8 @@
 //! the telegram `birthday` intake builds through `Birthdate::new` (the
 //! C++ `init`, which re-derives the year-0/absent rules).
 
+use tdmtproto::telegram_api;
+
 /// `td::Birthdate`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Birthdate {
@@ -40,6 +42,24 @@ impl Birthdate {
 
     pub fn get_year(&self) -> i32 {
         self.birthdate >> 9
+    }
+
+    /// `Birthdate::get_input_birthday` (Birthdate.cpp:44-51) — the wire
+    /// form of the query sends (`users.suggestBirthday`,
+    /// `account.updateBirthday`); the year rides only when present (the
+    /// `birthday::YEAR_MASK` flag bit).
+    pub fn get_input_birthday(&self) -> telegram_api::Birthday {
+        /// `telegram_api::birthday::YEAR_MASK` — the generated code
+        /// carries no constant; the flag bit is the year's presence.
+        const YEAR_MASK: i32 = 1;
+        let year = self.get_year();
+        let flags = if year != 0 { YEAR_MASK } else { 0 };
+        telegram_api::Birthday {
+            flags,
+            day: self.get_day(),
+            month: self.get_month(),
+            year,
+        }
     }
 
     /// `Birthdate::store` — the raw packed `int32` (Birthdate.hpp).

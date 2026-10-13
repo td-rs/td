@@ -3906,20 +3906,20 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             tdutils::log_info!("Update birthday query — [blocked: net]");
         }
         Function::setEmojiStatus(request) => {
-            // Requests.cpp:6711-6716: the premium gate answers here; the
-            // UpdateEmojiStatusQuery is [blocked: net]
-            let _ = request;
+            // Requests.cpp:6803-6807: the td_api → EmojiStatus
+            // conversion; the premium gate and the UpdateEmojiStatusQuery
+            // send live in the manager (`set_emoji_status`)
             if !check_is_user(td, id) {
                 return;
             }
-            let premium = {
-                let env = user_env!(td);
-                td.user_manager.set_emoji_status_local(&env)
-            };
-            match premium {
-                Ok(()) => tdutils::log_info!("Update emoji status query — [blocked: net]"),
-                Err(error) => send_error_status(td, id, error),
-            }
+            let emoji_status = crate::emoji_status::EmojiStatus::get_emoji_status_from_td_api(
+                request.emoji_status.as_ref(),
+                td.global.unix_time(),
+            );
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = user_env!(td);
+            td.user_manager
+                .set_emoji_status(&mut env, emoji_status, promise);
         }
         Function::setUserEmojiStatus(request) => {
             // Requests.cpp:6711-6716 (the bot variant): the
@@ -4154,7 +4154,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         Function::setUserNote(request) => {
             // Requests.cpp:6687-6691 → UserManager.cpp:6440-6466: the
             // contact/self gates and the formatted-text normalization
-            // answer here; the UpdateContactNoteQuery is [blocked: net]
+            // answer in the manager; the UpdateContactNoteQuery send
+            // rides the user net handle
             if !check_is_user(td, id) {
                 return;
             }
@@ -4170,8 +4171,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         Function::setMainProfileTab(request) => {
             // Requests.cpp:6791-6795 → UserManager.cpp:6688-6701: the
             // null gate and the Unknown-channel tab allow-list answer
-            // here; the SetMainProfileTabQuery send and the ack-gated
-            // user_full write are [blocked: net]
+            // in the manager; the SetMainProfileTabQuery send rides the
+            // user net handle and `on_set_main_profile_tab` is its ack
             if !check_is_user(td, id) {
                 return;
             }
@@ -4181,8 +4182,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::suggestUserBirthdate(request) => {
             // Requests.cpp:6699-6703 → UserManager.cpp:6471-6480: the
-            // self/bot gates answer here; the SuggestUserBirthdayQuery is
-            // [blocked: net]
+            // self/bot gates answer in the manager; the
+            // SuggestUserBirthdayQuery send rides the user net handle
+            // (the Updates answer re-enters on_get_updates)
             if !check_is_user(td, id) {
                 return;
             }
@@ -4216,8 +4218,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getSupportUser(_) => {
             // Requests.cpp:8893-8896 → UserManager.cpp:6798-6815: the
-            // cached id answers here; the GetSupportUserQuery is
-            // [blocked: net]
+            // cached id answers in the manager; the GetSupportUserQuery
+            // send rides the user net handle
             if !check_is_user(td, id) {
                 return;
             }

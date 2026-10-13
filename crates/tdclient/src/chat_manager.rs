@@ -3628,8 +3628,9 @@ impl DialogLocation {
 }
 
 /// `td::ProfileTab` (ProfileTab.h:19) — the main profile tab of a
-/// channel. The `get_profile_tab`/`get_input_profile_tab` conversions and
-/// the td_api builders land with the M.5.39/M.5.40 setter steps.
+/// channel or the current user. The `get_profile_tab` ladder serves the
+/// td_api request arms; `get_input_profile_tab` the account/channels
+/// setMainProfileTab query sends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProfileTab {
     #[default]
@@ -3669,6 +3670,39 @@ impl ProfileTab {
 
     pub fn as_raw(self) -> i32 {
         self as i32
+    }
+
+    /// `get_input_profile_tab` (ProfileTab.cpp:96-118) — the wire form
+    /// of the query send; `Default` is unreachable through the td_api
+    /// ladder (every constructor maps to a non-default tab).
+    pub fn get_input_profile_tab(self) -> telegram_api::ProfileTab {
+        match self {
+            ProfileTab::Posts => {
+                telegram_api::ProfileTab::profileTabPosts(telegram_api::profileTabPosts)
+            }
+            ProfileTab::Gifts => {
+                telegram_api::ProfileTab::profileTabGifts(telegram_api::profileTabGifts)
+            }
+            ProfileTab::Media => {
+                telegram_api::ProfileTab::profileTabMedia(telegram_api::profileTabMedia)
+            }
+            ProfileTab::Files => {
+                telegram_api::ProfileTab::profileTabFiles(telegram_api::profileTabFiles)
+            }
+            ProfileTab::Music => {
+                telegram_api::ProfileTab::profileTabMusic(telegram_api::profileTabMusic)
+            }
+            ProfileTab::Voice => {
+                telegram_api::ProfileTab::profileTabVoice(telegram_api::profileTabVoice)
+            }
+            ProfileTab::Links => {
+                telegram_api::ProfileTab::profileTabLinks(telegram_api::profileTabLinks)
+            }
+            ProfileTab::Gifs => {
+                telegram_api::ProfileTab::profileTabGifs(telegram_api::profileTabGifs)
+            }
+            ProfileTab::Default => unreachable!("get_input_profile_tab(Default)"),
+        }
     }
 }
 
@@ -15222,7 +15256,7 @@ fn is_allowed_profile_tab(profile_tab: ProfileTab, channel_type: ChannelType) ->
 /// `get_profile_tab` (ProfileTab.cpp:30-53) — takes the nullable wire
 /// object (the generated `Option` mirrors the C++ `object_ptr`); `None`
 /// is the C++ `nullptr → ProfileTab::Default` branch.
-fn get_profile_tab(
+pub(crate) fn get_profile_tab(
     profile_tab: Option<telegram_api::ProfileTab>,
     channel_type: ChannelType,
 ) -> ProfileTab {
@@ -15274,7 +15308,7 @@ fn get_profile_tab_tdapi(
     }
 }
 
-fn get_profile_tab_object(profile_tab: ProfileTab) -> td_api::ProfileTab {
+pub(crate) fn get_profile_tab_object(profile_tab: ProfileTab) -> td_api::ProfileTab {
     match profile_tab {
         ProfileTab::Default => td_api::ProfileTab::default(),
         ProfileTab::Posts => td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts {}),

@@ -8023,6 +8023,10 @@ impl Td {
             options,
             auth_is_bot: is_bot,
         };
+        // The SuggestUserBirthday Updates answer parks here — the
+        // re-entry into the updates engine runs after the manager is
+        // restored (the env borrows end at the match).
+        let mut pending_updates: Option<(telegram_api::Updates, Promise<()>)> = None;
         match kind {
             crate::user_manager::UserNetKind::GetUsers => {
                 // `GetUsersQuery::on_result`/`on_error` (cpp:1427-1445)
@@ -8277,8 +8281,130 @@ impl Td {
                 };
                 user_manager.on_get_my_saved_music_list(&mut env, result);
             }
+            crate::user_manager::UserNetKind::UpdateContactNote => {
+                // `UpdateContactNoteQuery::on_result`/`on_error`
+                // (cpp:844-858) — the Bool answer's value is dropped
+                // like the C++ `promise_.set_value(Unit())`; the ok
+                // band runs the `on_set_user_note` ack.
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok())
+                        .ok_or_else(|| parse_error("contacts_updateContactNote"))
+                };
+                if let Some((user_id, note, mut promise)) =
+                    user_manager.take_update_contact_note_query()
+                {
+                    match result {
+                        Ok(()) => user_manager.on_set_user_note(&mut env, user_id, note, promise),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::SetMainProfileTab => {
+                // `SetMainProfileTabQuery::on_result`/`on_error`
+                // (cpp:1304-1321) — the false band answers the 400, the
+                // ok band runs the `on_set_main_profile_tab` ack
+                // (cpp:6702).
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .ok_or_else(|| parse_error("account_setMainProfileTab"))
+                };
+                if let Some((profile_tab, mut promise)) =
+                    user_manager.take_set_main_profile_tab_query()
+                {
+                    match result {
+                        Ok(true) => {
+                            user_manager.on_set_main_profile_tab(&mut env, profile_tab, promise)
+                        }
+                        Ok(false) => promise
+                            .set_error(Status::error(400, "Failed to change main profile tab")),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::SuggestBirthday => {
+                // `SuggestUserBirthdayQuery::on_result`/`on_error`
+                // (cpp:870-883) — the promise rides the Updates answer
+                // into `on_get_updates` (the um bridge re-entry below).
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::Updates::parse(query.ok())
+                        .map_err(|_| parse_error("users_suggestBirthday"))
+                };
+                if let Some(mut promise) = user_manager.take_suggest_birthday_query() {
+                    match result {
+                        Ok(updates) => pending_updates = Some((updates, promise)),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::GetSupport => {
+                // `GetSupportUserQuery::on_result`/`on_error`
+                // (cpp:1753-1770) — the user registers, then the
+                // `on_get_support_user` ack flushes the parked promises
+                // with the fresh object.
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::help_Support::parse(query.ok())
+                        .map_err(|_| parse_error("help_getSupport"))
+                };
+                match result {
+                    Ok(support) => {
+                        let user_id = user_manager.on_get_user(
+                            &mut env,
+                            support.user.unwrap_or_default(),
+                            "GetSupportUserQuery",
+                        );
+                        user_manager.on_get_support_user(&env, user_id, Promise::default());
+                    }
+                    Err(status) => user_manager.fail_pending_support_user_queries(status),
+                }
+            }
+            crate::user_manager::UserNetKind::UpdateEmojiStatus => {
+                // `UpdateEmojiStatusQuery::on_result`/`on_error`
+                // (cpp:1380-1402) — the ok band applies the local user
+                // (`on_set_emoji_status`), the false band answers the
+                // 400, the error band refetches the recent list before
+                // failing the promise (cpp:1399-1401).
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .ok_or_else(|| parse_error("account_updateEmojiStatus"))
+                };
+                if let Some((emoji_status, mut promise)) =
+                    user_manager.take_update_emoji_status_query()
+                {
+                    match result {
+                        Ok(true) => {
+                            user_manager.on_set_emoji_status(&mut env, emoji_status);
+                            promise.set_value(());
+                        }
+                        Ok(false) => {
+                            promise.set_error(Status::error(400, "Failed to change Premium badge"))
+                        }
+                        Err(status) => {
+                            user_manager.get_recent_emoji_statuses(&mut env, Promise::default());
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
         }
         self.user_manager = user_manager;
+        if let Some((updates, promise)) = pending_updates {
+            // The re-entry rides the um bridge like the other
+            // Updates-typed answers (`td_->updates_manager_->on_get_updates`).
+            self.um_send(UmMessage::OnGetUpdates {
+                updates: Box::new(updates),
+                promise,
+            });
+        }
     }
 
     /// Drain the callback-parked chat answers — the C++ ResultHandler
@@ -33674,6 +33800,382 @@ mod tests {
             }
             other => panic!("the mismatch band: {other:?}"),
         }
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the user acks & setters net slice (§3.1 #4-#6, #8, #29): the
+    // note/tab/birthday setters, the support-user query and the emoji
+    // status ride the dispatcher through their live td_api arms. ----
+
+    #[test]
+    fn user_acks_and_setters_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_acks_and_setters_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_acks_and_setters_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-setters");
+
+        // me, a contact, a plain peer, and my full record (the
+        // main-profile-tab write target)
+        let wire_flags_user =
+            |id: i64, name: &str, extra_flags: i32, contact: bool, support: bool| {
+                telegram_api::User::user(telegram_api::user {
+                    flags: 1 | (1 << 1) | extra_flags,
+                    access_hash: 42,
+                    id,
+                    first_name: name.to_owned(),
+                    contact,
+                    support,
+                    ..telegram_api::user::default()
+                })
+            };
+        with_user_manager(&mut td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(700000001));
+            manager.on_get_user(env, wire_flags_user(700000001, "Me", 0, false, false), "t");
+            manager.on_get_user(env, wire_flags_user(5, "Alice", 1 << 11, true, false), "t");
+            manager.on_get_user(env, wire_flags_user(6, "Bob", 0, false, false), "t");
+            manager.on_get_user_full(
+                env,
+                telegram_api::UserFull {
+                    id: 700000001,
+                    ..telegram_api::UserFull::default()
+                },
+            );
+        });
+
+        // 1. setUserNote — the contact/self gates and the text
+        //    normalization pass; the query rides the concrete input user
+        //    and the wire note, the ok ack resolves the request.
+        td.request(
+            1,
+            Function::setUserNote(td_api::setUserNote {
+                user_id: 5,
+                note: Some(td_api::FormattedText {
+                    text: "the note".to_owned(),
+                    entities: Vec::new(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_updateContactNote::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_updateContactNote(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.id.expect("the input user rides the query")
+                else {
+                    panic!("the note peer must be a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (5, 42));
+                let note = payload.note.expect("the note rides the query");
+                assert_eq!(note.text, "the note");
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the query error band forwards to the request promise
+        td.request(
+            2,
+            Function::setUserNote(td_api::setUserNote {
+                user_id: 5,
+                note: Some(td_api::FormattedText {
+                    text: "again".to_owned(),
+                    entities: Vec::new(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_updateContactNote::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 2) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 420);
+                assert_eq!(error.message, "FLOOD_WAIT_9");
+            }
+            None => panic!("the note error band never fired"),
+        }
+
+        // 3. setMainProfileTab — the Gifts tab rides the query, the ok
+        //    ack writes my user_full record
+        td.request(
+            3,
+            Function::setMainProfileTab(td_api::setMainProfileTab {
+                main_profile_tab: Some(td_api::ProfileTab::profileTabGifts(
+                    td_api::profileTabGifts {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setMainProfileTab::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_setMainProfileTab(payload) => {
+                assert!(matches!(
+                    payload.tab,
+                    Some(telegram_api::ProfileTab::profileTabGifts(_))
+                ));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+        assert_eq!(
+            td.user_manager
+                .get_user_full(crate::user_manager::UserId::new(700000001))
+                .unwrap()
+                .main_profile_tab,
+            crate::chat_manager::ProfileTab::Gifts
+        );
+
+        // 4. the false band answers the C++ 400
+        td.request(
+            4,
+            Function::setMainProfileTab(td_api::setMainProfileTab {
+                main_profile_tab: Some(td_api::ProfileTab::profileTabPosts(
+                    td_api::profileTabPosts {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setMainProfileTab::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 4) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, "Failed to change main profile tab");
+            }
+            None => panic!("the tab false band never fired"),
+        }
+
+        // 5. suggestUserBirthdate — the birthday rides the query, the
+        //    Updates answer re-enters on_get_updates and resolves ok
+        td.request(
+            5,
+            Function::suggestUserBirthdate(td_api::suggestUserBirthdate {
+                user_id: 6,
+                birthdate: Some(td_api::Birthdate {
+                    day: 10,
+                    month: 6,
+                    year: 1990,
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_suggestBirthday::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::users_suggestBirthday(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.id.expect("the input user rides the query")
+                else {
+                    panic!("the birthday peer must be a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (6, 42));
+                let birthday = payload.birthday.expect("the birthday rides the query");
+                assert_eq!(birthday.flags, 1, "the year bit");
+                assert_eq!((birthday.day, birthday.month, birthday.year), (10, 6, 1990));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. getSupportUser — the query error band fails the parked
+        //    promises first (cpp:1766-1769 + the manager's lambda)
+        td.request(11, Function::getSupportUser(td_api::getSupportUser));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getSupport::ID,
+        );
+        net_fail(sent, 400, "SUPPORT_UNAVAILABLE");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 11) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, "SUPPORT_UNAVAILABLE");
+            }
+            None => panic!("the support error band never fired"),
+        }
+
+        // 7. the ok leg — the answer registers the support user and
+        //    resolves the object; the cached id answers without a query
+        td.request(6, Function::getSupportUser(td_api::getSupportUser));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getSupport::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::help_Support {
+            phone_number: String::new(),
+            user: Some(wire_flags_user(777, "Support", 1 << 23, false, true)),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 6).first() {
+            Some(Object::user(user)) => {
+                assert_eq!(user.id, 777);
+                assert!(user.is_support);
+            }
+            other => panic!("the support user object: {other:?}"),
+        }
+        td.request(7, Function::getSupportUser(td_api::getSupportUser));
+        assert!(rec.sent.lock().is_empty(), "the cached id answers locally");
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::user(user)) if user.id == 777
+        ));
+
+        // 8. setEmojiStatus without premium answers the 400 gate
+        td.request(
+            8,
+            Function::setEmojiStatus(td_api::setEmojiStatus { emoji_status: None }),
+        );
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the gate answers before the send"
+        );
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 8) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(
+                    error.message,
+                    "The method is available only to Telegram Premium users"
+                );
+            }
+            None => panic!("the premium gate never fired"),
+        }
+
+        // 9. the query error band refetches the recent list before
+        //    failing the promise (cpp:1399-1401) — the empty-promise
+        //    refire rides the GetRecentEmojiStatuses family
+        td.option_manager
+            .as_mut()
+            .expect("the option manager")
+            .set_option_boolean("is_premium", true);
+        td.request(
+            9,
+            Function::setEmojiStatus(td_api::setEmojiStatus { emoji_status: None }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateEmojiStatus::ID,
+        );
+        net_fail(sent, 500, "TESTERR");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 9) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 500);
+                assert_eq!(error.message, "TESTERR");
+            }
+            None => panic!("the emoji-status error band never fired"),
+        }
+        let recent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getRecentEmojiStatuses::ID,
+        );
+        net_complete(recent, emoji_status_answer(7, 42));
+        td.dispatch_completed_user_net();
+
+        // 10. the happy path — the status rides the wire form, the ok
+        //    ack applies my user, the recent registry gains the entry
+        td.request(
+            10,
+            Function::setEmojiStatus(td_api::setEmojiStatus {
+                emoji_status: Some(td_api::EmojiStatus {
+                    r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+                        td_api::emojiStatusTypeCustomEmoji {
+                            custom_emoji_id: 77,
+                        },
+                    )),
+                    expiration_date: 0,
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateEmojiStatus::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_updateEmojiStatus(payload) => {
+                match payload.emoji_status {
+                    Some(telegram_api::EmojiStatus::emojiStatus(status)) => {
+                        assert_eq!(status.document_id, 77);
+                    }
+                    other => panic!("the sent status: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 10).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(matches!(
+            td.user_manager
+                .get_user(crate::user_manager::UserId::new(700000001))
+                .unwrap()
+                .emoji_status,
+            Some(ref status) if status.get_custom_emoji_id().get() == 77
+        ));
+        let statuses = crate::emoji_status::load_emoji_statuses(
+            td.global.binlog_pmc(),
+            crate::emoji_status::RECENT_EMOJI_STATUSES_DATABASE_KEY,
+        );
+        assert_eq!(statuses.hash, 0);
+        assert_eq!(statuses.emoji_statuses.len(), 2);
+        assert_eq!(statuses.emoji_statuses[0].get_custom_emoji_id().get(), 77);
 
         assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
