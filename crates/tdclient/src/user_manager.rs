@@ -2519,11 +2519,6 @@ pub struct UserManager {
     /// the cloned status and the promise; the ok answer runs
     /// `on_set_emoji_status` (cpp:6765).
     pending_update_emoji_status_queries: Vec<(Option<EmojiStatus>, Promise<()>)>,
-    /// The `()`-typed promises parked at their `[blocked: net]` query
-    /// sends — the C++ promise rides the query actor until the server
-    /// ack, the Rust collapse parks it here until the net query actors
-    /// land (the same collapse the pending-load queue uses).
-    net_blocked_promises: Vec<Promise<()>>,
     /// The load-gated td_api requests (see
     /// [`PendingUserRequest`]) — the request-actor re-run analogue: parked
     /// with the request id while the contacts load, re-run to completion
@@ -20464,7 +20459,6 @@ mod tests {
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "InputFile is not specified")
         );
-        assert!(um.net_blocked_promises.is_empty());
     }
 
     #[test]
@@ -20822,7 +20816,6 @@ mod tests {
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "InputFile is not specified")
         );
-        assert!(um.net_blocked_promises.is_empty());
     }
 
     #[test]
