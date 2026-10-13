@@ -5109,14 +5109,19 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         // conversion and the ReportReason port landed with them.
 
         // --- the chat-manager request family (M.5.47, folded in at the
-        // integration-m6b merge) — each local-validating entry settles its
-        // promise synchronously; the net queries terminate in the
-        // blocked-net 500 until the net step lands. setChatDescription and
-        // deleteChat stay with the dialog_manager arms above: the C++
+        // integration-m6b merge) — the channel-identity eight ride the
+        // net dispatcher (their promises settle from the query answers);
+        // the rest still park at the [blocked: net] seams. setChatDescription
+        // and deleteChat stay with the dialog_manager arms above: the C++
         // routes them through the DialogManager dialog type-switch
         // (Requests.cpp:6093, :3655), unlike these channel-scoped ones.
         Function::setSupergroupUsername(request) => {
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:7253-7258` — CHECK_IS_USER + CLEAN_INPUT_STRING.
+            if !check_is_user(td, id) {
+                return;
+            }
+            // the promise settles from the UpdateChannelUsernameQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let username = crate::misc::clean_input_string(&request.username).unwrap_or_default();
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_username(
@@ -5126,10 +5131,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 &username,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupUsernameIsActive(request) => {
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:7260-7266`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            // the promise settles from the ToggleChannelUsernameQuery answer
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let username = crate::misc::clean_input_string(&request.username).unwrap_or_default();
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_username_is_active(
@@ -5140,7 +5149,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.is_active,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setChatLocation(request) => {
             let (promise, recorded) = record_unit_promise();
@@ -5362,12 +5370,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_request(id, td, recorded);
         }
         Function::setSupergroupMainProfileTab(request) => {
-            // `Requests.cpp:2231-2236`.
+            // `Requests.cpp:2231-2236` — the promise settles from the
+            // SetChannelMainProfileTabQuery answer (the lambda chain).
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
-            let main_profile_tab = request.main_profile_tab.clone().unwrap();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let main_profile_tab = request.main_profile_tab;
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_main_profile_tab(
                 user_manager,
@@ -5376,11 +5385,11 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 main_profile_tab,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setSupergroupUnrestrictBoostCount(request) => {
-            // `Requests.cpp:2237-2242`.
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:2237-2242` — the promise settles from the
+            // SetChannelBoostsToUnblockRestrictionsQuery answer.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_unrestrict_boost_count(
                 user_manager,
@@ -5389,11 +5398,11 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.unrestrict_boost_count,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setSupergroupCustomEmojiStickerSet(request) => {
-            // `Requests.cpp:2243-2248`.
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:2243-2248` — the promise settles from the
+            // SetChannelEmojiStickerSetQuery answer.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_emoji_sticker_set(
                 user_manager,
@@ -5402,11 +5411,11 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 StickerSetId::new(request.custom_emoji_sticker_set_id),
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setSupergroupStickerSet(request) => {
-            // `Requests.cpp:2249-2254`.
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:2249-2254` — the promise settles from the
+            // SetChannelStickerSetQuery answer.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_sticker_set(
                 user_manager,
@@ -5415,15 +5424,15 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 StickerSetId::new(request.sticker_set_id),
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::reorderSupergroupActiveUsernames(request) => {
             // `Requests.cpp:2259-2264` — CLEAN_INPUT_STRING on every
-            // username first.
+            // username first; the promise settles from the
+            // ReorderChannelUsernamesQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let usernames: Vec<String> = request
                 .usernames
                 .into_iter()
@@ -5437,14 +5446,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 usernames,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::disableAllSupergroupUsernames(request) => {
-            // `Requests.cpp:2265-2270`.
+            // `Requests.cpp:2265-2270` — the promise settles from the
+            // DeactivateAllChannelUsernamesQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.disable_all_channel_usernames(
                 user_manager,
@@ -5452,7 +5461,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 ChannelId::new(request.supergroup_id),
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setChatDirectMessagesGroup(request) => {
             // `Requests.cpp:3427-3432`.

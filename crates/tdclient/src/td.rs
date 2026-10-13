@@ -10184,6 +10184,212 @@ impl Td {
                     }
                 }
             }
+            // `UpdateChannelUsernameQuery` (ChatManager.cpp:149-193) —
+            // the Bool answer band, the editable-username intake (the
+            // true and the USERNAME_NOT_MODIFIED bands) and the
+            // channel-error tail.
+            crate::chat_manager::ChatNetKind::UpdateChannelUsername { channel_id } => {
+                let Some((username, mut promise)) =
+                    self.chat_manager.take_update_channel_username()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        Some(false) => {
+                            Err(Status::error(500, "Supergroup username is not updated"))
+                        }
+                        None => {
+                            promise.set_error(parse_error("channels_updateUsername"));
+                            return;
+                        }
+                    }
+                };
+                let not_modified = matches!(&result, Err(status) if status.message() == "USERNAME_NOT_MODIFIED"
+                    || status.message() == "CHAT_NOT_MODIFIED");
+                // the intake (cpp:178-179 and the cpp:184-185 band) —
+                // `on_update_channel_editable_username`
+                if result.is_ok() || not_modified {
+                    self.with_chat_intake(|chat_manager, user_manager, env| {
+                        chat_manager.on_update_channel_editable_username(
+                            user_manager,
+                            env,
+                            channel_id,
+                            username,
+                        );
+                    });
+                } else if let Err(status) = &result {
+                    self.chat_channel_error_head(channel_id, status, "UpdateChannelUsernameQuery");
+                }
+                match result {
+                    // the !bot NOT_MODIFIED band answers the value
+                    // (cpp:186-189); every other path settles the error
+                    Ok(()) => promise.set_value(()),
+                    Err(status) => {
+                        if not_modified && !self.auth_manager.is_bot() {
+                            promise.set_value(());
+                        } else {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `ToggleChannelUsernameQuery` (ChatManager.cpp:197-236) — the
+            // Bool answer (either value) routes the promise into the
+            // toggle intake; the error tail runs the channel-error head
+            // and the empty-promise reload. The USERNAME_NOT_MODIFIED /
+            // CHAT_NOT_MODIFIED band returns without settling — the C++
+            // drops the request promise and Td::send_error_impl
+            // LOG(FATAL)s the code-0 "Lost promise" (the Rust canary
+            // panics the same way; the band is never driven through the
+            // request surface).
+            crate::chat_manager::ChatNetKind::ToggleChannelUsername { channel_id } => {
+                let Some((username, is_active, mut promise)) =
+                    self.chat_manager.take_toggle_channel_username()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "USERNAME_NOT_MODIFIED"
+                        || status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified {
+                        return;
+                    }
+                    self.chat_channel_error_head(channel_id, &status, "ToggleChannelUsernameQuery");
+                    // reload_channel(channel_id, Promise<Unit>(), ...) —
+                    // the fire-and-forget refetch
+                    self.with_chat_intake(|chat_manager, _user_manager, env| {
+                        chat_manager.reload_channel(
+                            env,
+                            channel_id,
+                            Promise::default(),
+                            "ToggleChannelUsernameQuery",
+                        );
+                    });
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_update_channel_username_is_active(
+                                user_manager,
+                                env,
+                                channel_id,
+                                username,
+                                is_active,
+                                promise,
+                            );
+                        }),
+                        None => promise.set_error(parse_error("channels_toggleUsername")),
+                    }
+                }
+            }
+            // `DeactivateAllChannelUsernamesQuery` (ChatManager.cpp:239-
+            // 274) — the Bool answer (either value) routes the promise
+            // into the deactivate intake; the same error shape as the
+            // toggle twin.
+            crate::chat_manager::ChatNetKind::DeactivateAllChannelUsernames { channel_id } => {
+                let Some(mut promise) = self
+                    .chat_manager
+                    .take_deactivate_all_channel_usernames_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "USERNAME_NOT_MODIFIED"
+                        || status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified {
+                        return;
+                    }
+                    self.chat_channel_error_head(
+                        channel_id,
+                        &status,
+                        "DeactivateAllChannelUsernamesQuery",
+                    );
+                    self.with_chat_intake(|chat_manager, _user_manager, env| {
+                        chat_manager.reload_channel(
+                            env,
+                            channel_id,
+                            Promise::default(),
+                            "DeactivateAllChannelUsernamesQuery",
+                        );
+                    });
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_deactivate_channel_usernames(
+                                user_manager,
+                                env,
+                                channel_id,
+                                promise,
+                            );
+                        }),
+                        None => promise.set_error(parse_error("channels_deactivateAllUsernames")),
+                    }
+                }
+            }
+            // `ReorderChannelUsernamesQuery` (ChatManager.cpp:276-314) —
+            // the false answer is the C++ 500; the true answer routes
+            // the promise into the reorder intake; the same error shape
+            // as the toggle twin.
+            crate::chat_manager::ChatNetKind::ReorderChannelUsernames { channel_id } => {
+                let Some((usernames, mut promise)) =
+                    self.chat_manager.take_reorder_channel_usernames()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        Some(false) => {
+                            Err(Status::error(500, "Supergroup usernames weren't updated"))
+                        }
+                        None => {
+                            promise.set_error(parse_error("channels_reorderUsernames"));
+                            return;
+                        }
+                    }
+                };
+                match result {
+                    Ok(()) => self.with_chat_intake(|chat_manager, user_manager, env| {
+                        chat_manager.on_update_channel_active_usernames_order(
+                            user_manager,
+                            env,
+                            channel_id,
+                            usernames,
+                            promise,
+                        );
+                    }),
+                    Err(status) => {
+                        let not_modified = status.message() == "USERNAME_NOT_MODIFIED"
+                            || status.message() == "CHAT_NOT_MODIFIED";
+                        if not_modified {
+                            return;
+                        }
+                        self.chat_channel_error_head(
+                            channel_id,
+                            &status,
+                            "ReorderChannelUsernamesQuery",
+                        );
+                        self.with_chat_intake(|chat_manager, _user_manager, env| {
+                            chat_manager.reload_channel(
+                                env,
+                                channel_id,
+                                Promise::default(),
+                                "ReorderChannelUsernamesQuery",
+                            );
+                        });
+                        promise.set_error(status);
+                    }
+                }
+            }
             // `UpdateChannelColorQuery` (ChatManager.cpp:320-360) — the
             // Updates answer re-enters `on_get_updates` with the promise;
             // the error tail runs the CHAT_NOT_MODIFIED !bot value band
@@ -10266,6 +10472,212 @@ impl Td {
                     }
                 }
             }
+            // `SetChannelStickerSetQuery` (ChatManager.cpp:413-460) — the
+            // Bool answer band, the sticker-set intake (the on_ok and
+            // the CHAT_NOT_MODIFIED bands) and the channel-error tail.
+            crate::chat_manager::ChatNetKind::SetChannelStickerSet { channel_id } => {
+                let Some((sticker_set_id, mut promise)) =
+                    self.chat_manager.take_set_channel_sticker_set()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        Some(false) => {
+                            Err(Status::error(500, "Supergroup sticker set not updated"))
+                        }
+                        None => {
+                            promise.set_error(parse_error("channels_setStickers"));
+                            return;
+                        }
+                    }
+                };
+                let not_modified =
+                    matches!(&result, Err(status) if status.message() == "CHAT_NOT_MODIFIED");
+                if result.is_ok() || not_modified {
+                    self.with_chat_intake(|chat_manager, user_manager, env| {
+                        chat_manager.on_update_channel_sticker_set(
+                            user_manager,
+                            env,
+                            channel_id,
+                            sticker_set_id,
+                        );
+                    });
+                } else if let Err(status) = &result {
+                    self.chat_channel_error_head(channel_id, status, "SetChannelStickerSetQuery");
+                }
+                match result {
+                    Ok(()) => promise.set_value(()),
+                    Err(status) => {
+                        if not_modified && !self.auth_manager.is_bot() {
+                            promise.set_value(());
+                        } else {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `SetChannelEmojiStickerSetQuery` (ChatManager.cpp:462-510)
+            // — the emoji twin of the sticker-set family.
+            crate::chat_manager::ChatNetKind::SetChannelEmojiStickerSet { channel_id } => {
+                let Some((sticker_set_id, mut promise)) =
+                    self.chat_manager.take_set_channel_emoji_sticker_set()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        Some(false) => Err(Status::error(
+                            500,
+                            "Supergroup custom emoji sticker set not updated",
+                        )),
+                        None => {
+                            promise.set_error(parse_error("channels_setEmojiStickers"));
+                            return;
+                        }
+                    }
+                };
+                let not_modified =
+                    matches!(&result, Err(status) if status.message() == "CHAT_NOT_MODIFIED");
+                if result.is_ok() || not_modified {
+                    self.with_chat_intake(|chat_manager, user_manager, env| {
+                        chat_manager.on_update_channel_emoji_sticker_set(
+                            user_manager,
+                            env,
+                            channel_id,
+                            sticker_set_id,
+                        );
+                    });
+                } else if let Err(status) = &result {
+                    self.chat_channel_error_head(
+                        channel_id,
+                        status,
+                        "SetChannelEmojiStickerSetQuery",
+                    );
+                }
+                match result {
+                    Ok(()) => promise.set_value(()),
+                    Err(status) => {
+                        if not_modified && !self.auth_manager.is_bot() {
+                            promise.set_value(());
+                        } else {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `SetChannelBoostsToUnblockRestrictionsQuery`
+            // (ChatManager.cpp:512-555) — the Updates answer runs the
+            // unrestrict-boost intake and re-enters `on_get_updates` with
+            // the promise; the error tail runs the CHAT_NOT_MODIFIED
+            // !bot value band and the channel-error head.
+            crate::chat_manager::ChatNetKind::SetChannelBoostsToUnblockRestrictions {
+                channel_id,
+            } => {
+                let Some((unrestrict_boost_count, mut promise)) = self
+                    .chat_manager
+                    .take_set_channel_boosts_to_unblock_restrictions()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_update_channel_unrestrict_boost_count(
+                                user_manager,
+                                env,
+                                channel_id,
+                                unrestrict_boost_count,
+                            );
+                        });
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "SetChannelBoostsToUnblockRestrictionsQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.with_chat_intake(|chat_manager, user_manager, env| {
+                                chat_manager.on_update_channel_unrestrict_boost_count(
+                                    user_manager,
+                                    env,
+                                    channel_id,
+                                    unrestrict_boost_count,
+                                );
+                            });
+                            self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            });
+                        }
+                        Err(_) => promise
+                            .set_error(parse_error("channels_setBoostsToUnblockRestrictions")),
+                    }
+                }
+            }
+            // `SetChannelMainProfileTabQuery` (ChatManager.cpp:557-594) —
+            // the Bool answer (either value) and the !bot
+            // CHAT_NOT_MODIFIED band route the promise into the
+            // completion hook (the PromiseCreator::lambda chain).
+            crate::chat_manager::ChatNetKind::SetChannelMainProfileTab { channel_id } => {
+                let Some((profile_tab, mut promise)) =
+                    self.chat_manager.take_set_channel_main_profile_tab()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_set_channel_main_profile_tab(
+                                user_manager,
+                                env,
+                                channel_id,
+                                profile_tab,
+                                promise,
+                            );
+                        });
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "SetChannelMainProfileTabQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_set_channel_main_profile_tab(
+                                user_manager,
+                                env,
+                                channel_id,
+                                profile_tab,
+                                promise,
+                            );
+                        }),
+                        None => promise.set_error(parse_error("channels_setMainProfileTab")),
+                    }
+                }
+            }
             // `DeleteChatQuery` (ChatManager.cpp:1375-1399) — the Bool
             // answer (either value; the C++ only logs it) refires
             // get_difference and chains the empty `updates` container
@@ -10334,6 +10746,22 @@ impl Td {
         status: &Status,
         source: &str,
     ) {
+        self.with_chat_intake(|chat_manager, user_manager, env| {
+            chat_manager.on_get_channel_error(user_manager, env, channel_id, status, source);
+        });
+    }
+
+    /// Run one ChatManager intake under the taken-out managers (the
+    /// net-answer convention — the managers come out for the env borrow
+    /// and go back; a missing option manager skips the run).
+    fn with_chat_intake(
+        &mut self,
+        f: impl FnOnce(
+            &mut crate::chat_manager::ChatManager,
+            &mut crate::user_manager::UserManager,
+            &mut crate::user_manager::UserEnv<'_>,
+        ),
+    ) {
         let mut chat_manager = std::mem::take(&mut self.chat_manager);
         let mut user_manager = std::mem::take(&mut self.user_manager);
         if let Some(options) = self.option_manager.as_mut() {
@@ -10342,13 +10770,7 @@ impl Td {
                 options,
                 auth_is_bot: self.auth_manager.is_bot(),
             };
-            chat_manager.on_get_channel_error(
-                &mut user_manager,
-                &mut env,
-                channel_id,
-                status,
-                source,
-            );
+            f(&mut chat_manager, &mut user_manager, &mut env);
         }
         self.user_manager = user_manager;
         self.chat_manager = chat_manager;
@@ -43785,5 +44207,830 @@ mod tests {
         }
 
         assert!(td.bot_info_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// Seed one creator broadcast channel carrying the given username set
+    /// (the `username`-vector form — the empty legacy first name); the
+    /// access hash follows the seed_dialog_chats ladder.
+    fn seed_channel_with_usernames(td: &mut Td, id: i64, usernames: &[(&str, bool, bool)]) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                broadcast: true,
+                id,
+                access_hash: 777 + (id - 703).max(0),
+                title: "named".to_owned(),
+                usernames: usernames
+                    .iter()
+                    .map(|(username, editable, active)| telegram_api::Username {
+                        flags: 0,
+                        editable: *editable,
+                        active: *active,
+                        deletable: false,
+                        expired: false,
+                        username: username.to_string(),
+                    })
+                    .collect(),
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+    }
+
+    #[test]
+    fn channel_username_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_username_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn channel_username_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-usernames");
+        seed_dialog_chats(&mut td);
+        // 705 — the editable-username family; 706 — the toggle family;
+        // 707 — reorder + deactivate; 708 — the len<=1 band.
+        seed_channel_with_usernames(
+            &mut td,
+            705,
+            &[
+                ("alpha", true, true),
+                ("beta", false, true),
+                ("gamma", false, false),
+            ],
+        );
+        seed_channel_with_usernames(
+            &mut td,
+            706,
+            &[("alpha", true, true), ("beta", false, true)],
+        );
+        seed_channel_with_usernames(
+            &mut td,
+            707,
+            &[
+                ("alpha", true, true),
+                ("beta", false, true),
+                ("gamma", false, true),
+            ],
+        );
+        seed_channel_with_usernames(&mut td, 708, &[("solo", true, true)]);
+        let usernames_object = |td: &Td, id: i64| {
+            td.chat_manager
+                .get_channel(crate::chat_manager::ChannelId::new(id))
+                .unwrap()
+                .usernames
+                .get_usernames_object()
+        };
+
+        // 1. setSupergroupUsername — the live arm dispatches
+        //    channels.updateUsername; the boolTrue answer runs the
+        //    editable-username intake
+        td.request(
+            1,
+            Function::setSupergroupUsername(td_api::setSupergroupUsername {
+                supergroup_id: 705,
+                username: "renamed".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateUsername::ID,
+        );
+        let body =
+            telegram_api::channels_updateUsername::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (705, 779));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.username, "renamed");
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+        let object = usernames_object(&td, 705);
+        assert_eq!(object.active_usernames, ["renamed", "beta"]);
+        assert_eq!(object.editable_username, "renamed");
+
+        // 2. the USERNAME_NOT_MODIFIED band — the intake runs, the !bot
+        //    value answers
+        td.request(
+            2,
+            Function::setSupergroupUsername(td_api::setSupergroupUsername {
+                supergroup_id: 705,
+                username: "renamed2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateUsername::ID,
+        );
+        net_fail(sent, 400, "USERNAME_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+        assert_eq!(usernames_object(&td, 705).editable_username, "renamed2");
+
+        // 3. the hard error band — the channel-error head + the error
+        td.request(
+            3,
+            Function::setSupergroupUsername(td_api::setSupergroupUsername {
+                supergroup_id: 705,
+                username: "third".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updateUsername::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 4. the invalid-username band — the C++ 400, no query
+        td.request(
+            4,
+            Function::setSupergroupUsername(td_api::setSupergroupUsername {
+                supergroup_id: 705,
+                username: "bad name!".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Username is invalid")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 5. toggleSupergroupUsernameIsActive — the optimistic local
+        //    toggle lands before the answer (cpp:3204-3205)
+        td.request(
+            5,
+            Function::toggleSupergroupUsernameIsActive(td_api::toggleSupergroupUsernameIsActive {
+                supergroup_id: 706,
+                username: "beta".to_owned(),
+                is_active: false,
+            }),
+        );
+        let object = usernames_object(&td, 706);
+        assert_eq!(object.active_usernames, ["alpha"], "the optimistic apply");
+        assert_eq!(object.disabled_usernames, ["beta"], "the optimistic apply");
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleUsername::ID,
+        );
+        let body =
+            telegram_api::channels_toggleUsername::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (706, 780));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.username, "beta");
+        assert!(!body.active);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+        let object = usernames_object(&td, 706);
+        assert_eq!(object.active_usernames, ["alpha"]);
+        assert_eq!(object.disabled_usernames, ["beta"]);
+
+        // 6. the toggle hard error band — the head + the error
+        td.request(
+            6,
+            Function::toggleSupergroupUsernameIsActive(td_api::toggleSupergroupUsernameIsActive {
+                supergroup_id: 706,
+                username: "beta".to_owned(),
+                is_active: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleUsername::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 7. reorderSupergroupActiveUsernames — the optimistic reorder +
+        //    the round-trip
+        td.request(
+            7,
+            Function::reorderSupergroupActiveUsernames(td_api::reorderSupergroupActiveUsernames {
+                supergroup_id: 707,
+                usernames: vec!["gamma".to_owned(), "alpha".to_owned(), "beta".to_owned()],
+            }),
+        );
+        assert_eq!(
+            usernames_object(&td, 707).active_usernames,
+            ["gamma", "alpha", "beta"],
+            "the optimistic apply"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_reorderUsernames::ID,
+        );
+        let body =
+            telegram_api::channels_reorderUsernames::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (707, 781));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.order, ["gamma", "alpha", "beta"]);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. the stale reorder — a toggle answer changes the active set
+        //    between the send and the answer; the reorder intake rides
+        //    the promise into the reload
+        td.request(
+            8,
+            Function::reorderSupergroupActiveUsernames(td_api::reorderSupergroupActiveUsernames {
+                supergroup_id: 707,
+                usernames: vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            }),
+        );
+        let reorder_sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_reorderUsernames::ID,
+        );
+        // the interleaved toggle — its answer lands first
+        td.request(
+            9,
+            Function::toggleSupergroupUsernameIsActive(td_api::toggleSupergroupUsernameIsActive {
+                supergroup_id: 707,
+                username: "gamma".to_owned(),
+                is_active: false,
+            }),
+        );
+        let toggle_sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleUsername::ID,
+        );
+        net_complete(toggle_sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::ok(_))
+        ));
+        assert_eq!(
+            usernames_object(&td, 707).active_usernames,
+            ["alpha", "beta"]
+        );
+        // the reorder answer can no longer apply — the reload parks the
+        // promise (the reload seam rides net-drain 16)
+        net_complete(reorder_sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Network is not implemented yet")
+        );
+
+        // 9. the reorder hard error band — the head + the error
+        td.request(
+            10,
+            Function::reorderSupergroupActiveUsernames(td_api::reorderSupergroupActiveUsernames {
+                supergroup_id: 707,
+                usernames: vec!["beta".to_owned(), "alpha".to_owned()],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_reorderUsernames::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 10);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 10. the invalid-order band — the C++ 400, no query
+        td.request(
+            11,
+            Function::reorderSupergroupActiveUsernames(td_api::reorderSupergroupActiveUsernames {
+                supergroup_id: 707,
+                usernames: vec!["alpha".to_owned()],
+            }),
+        );
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid username order specified")
+        );
+
+        // 11. the len<=1 band — the value answers inline, no query
+        td.request(
+            12,
+            Function::reorderSupergroupActiveUsernames(td_api::reorderSupergroupActiveUsernames {
+                supergroup_id: 708,
+                usernames: vec!["solo".to_owned()],
+            }),
+        );
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(rec.sent.lock().is_empty(), "no query on the len band");
+
+        // 12. disableAllSupergroupUsernames — the optimistic deactivate
+        //     keeps the editable username active (the Usernames rule)
+        td.request(
+            13,
+            Function::disableAllSupergroupUsernames(td_api::disableAllSupergroupUsernames {
+                supergroup_id: 707,
+            }),
+        );
+        let object = usernames_object(&td, 707);
+        assert_eq!(object.active_usernames, ["alpha"], "the optimistic apply");
+        assert_eq!(object.disabled_usernames, ["beta", "gamma"]);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_deactivateAllUsernames::ID,
+        );
+        let body = telegram_api::channels_deactivateAllUsernames::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (707, 781));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. the rights band — the member channel answers the C++ 400
+        td.request(
+            14,
+            Function::setSupergroupUsername(td_api::setSupergroupUsername {
+                supergroup_id: 703,
+                username: "member".to_owned(),
+            }),
+        );
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Not enough rights to change supergroup username")
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn channel_settings_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_settings_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn channel_settings_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-settings");
+        seed_dialog_chats(&mut td);
+        // 702 — the creator broadcast channel; 703 — the member channel;
+        // 704 — the creator megagroup.
+
+        // 1. setSupergroupStickerSet — the invalid id dispatches the
+        //    inputStickerSetEmpty form; the boolTrue answer resolves ok
+        td.request(
+            1,
+            Function::setSupergroupStickerSet(td_api::setSupergroupStickerSet {
+                supergroup_id: 704,
+                sticker_set_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setStickers::ID,
+        );
+        let body = telegram_api::channels_setStickers::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetEmpty(_))
+        ));
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the boolFalse band — the C++ 500
+        td.request(
+            2,
+            Function::setSupergroupStickerSet(td_api::setSupergroupStickerSet {
+                supergroup_id: 704,
+                sticker_set_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setStickers::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Supergroup sticker set not updated")
+        );
+
+        // 3. the CHAT_NOT_MODIFIED band — the !bot value answer
+        td.request(
+            3,
+            Function::setSupergroupStickerSet(td_api::setSupergroupStickerSet {
+                supergroup_id: 704,
+                sticker_set_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setStickers::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the valid-id band — the StickersManager seam (§3.9) keeps
+        //    the C++ miss answer
+        td.request(
+            4,
+            Function::setSupergroupStickerSet(td_api::setSupergroupStickerSet {
+                supergroup_id: 704,
+                sticker_set_id: 5,
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Sticker set not found")
+        );
+
+        // 5. the broadcast band
+        td.request(
+            5,
+            Function::setSupergroupStickerSet(td_api::setSupergroupStickerSet {
+                supergroup_id: 702,
+                sticker_set_id: 0,
+            }),
+        );
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat sticker set can be set only for supergroups")
+        );
+
+        // 6. setSupergroupCustomEmojiStickerSet — the emoji twin
+        td.request(
+            6,
+            Function::setSupergroupCustomEmojiStickerSet(
+                td_api::setSupergroupCustomEmojiStickerSet {
+                    supergroup_id: 704,
+                    custom_emoji_sticker_set_id: 0,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setEmojiStickers::ID,
+        );
+        let body =
+            telegram_api::channels_setEmojiStickers::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetEmpty(_))
+        ));
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. the emoji boolFalse band — the C++ 500
+        td.request(
+            7,
+            Function::setSupergroupCustomEmojiStickerSet(
+                td_api::setSupergroupCustomEmojiStickerSet {
+                    supergroup_id: 704,
+                    custom_emoji_sticker_set_id: 0,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setEmojiStickers::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Supergroup custom emoji sticker set not updated")
+        );
+
+        // 8. setSupergroupUnrestrictBoostCount — the Updates answer
+        //    re-enters on_get_updates with the promise
+        td.request(
+            8,
+            Function::setSupergroupUnrestrictBoostCount(
+                td_api::setSupergroupUnrestrictBoostCount {
+                    supergroup_id: 704,
+                    unrestrict_boost_count: 4,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setBoostsToUnblockRestrictions::ID,
+        );
+        let body = telegram_api::channels_setBoostsToUnblockRestrictions::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.boosts, 4);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 9. the boosts CHAT_NOT_MODIFIED band — the intake + the !bot
+        //    value
+        td.request(
+            9,
+            Function::setSupergroupUnrestrictBoostCount(
+                td_api::setSupergroupUnrestrictBoostCount {
+                    supergroup_id: 704,
+                    unrestrict_boost_count: 5,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setBoostsToUnblockRestrictions::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 10. the range band — the C++ 400, no query
+        td.request(
+            10,
+            Function::setSupergroupUnrestrictBoostCount(
+                td_api::setSupergroupUnrestrictBoostCount {
+                    supergroup_id: 704,
+                    unrestrict_boost_count: 9,
+                },
+            ),
+        );
+        let error = error_of(&callback, 10);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                400,
+                "Invalid new value for the unrestrict boost count specified"
+            )
+        );
+
+        // 11. the broadcast band
+        td.request(
+            11,
+            Function::setSupergroupUnrestrictBoostCount(
+                td_api::setSupergroupUnrestrictBoostCount {
+                    supergroup_id: 702,
+                    unrestrict_boost_count: 4,
+                },
+            ),
+        );
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                400,
+                "Unrestrict boost count can be set only for supergroups"
+            )
+        );
+
+        // 12. setSupergroupMainProfileTab — the tab wire form + the
+        //     completion hook
+        td.request(
+            12,
+            Function::setSupergroupMainProfileTab(td_api::setSupergroupMainProfileTab {
+                supergroup_id: 702,
+                main_profile_tab: Some(td_api::ProfileTab::profileTabPosts(
+                    td_api::profileTabPosts {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setMainProfileTab::ID,
+        );
+        let body =
+            telegram_api::channels_setMainProfileTab::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (702, 777));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(matches!(
+            body.tab,
+            Some(telegram_api::ProfileTab::profileTabPosts(_))
+        ));
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. the main-tab CHAT_NOT_MODIFIED band — the !bot value
+        //     routes the same completion hook
+        td.request(
+            13,
+            Function::setSupergroupMainProfileTab(td_api::setSupergroupMainProfileTab {
+                supergroup_id: 702,
+                main_profile_tab: Some(td_api::ProfileTab::profileTabGifts(
+                    td_api::profileTabGifts {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setMainProfileTab::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 14. the null-tab band — the ladder's "must be non-empty" 400
+        td.request(
+            14,
+            Function::setSupergroupMainProfileTab(td_api::setSupergroupMainProfileTab {
+                supergroup_id: 702,
+                main_profile_tab: None,
+            }),
+        );
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Profile tab must be non-empty")
+        );
+
+        // 15. the megagroup band
+        td.request(
+            15,
+            Function::setSupergroupMainProfileTab(td_api::setSupergroupMainProfileTab {
+                supergroup_id: 704,
+                main_profile_tab: Some(td_api::ProfileTab::profileTabGifts(
+                    td_api::profileTabGifts {},
+                )),
+            }),
+        );
+        let error = error_of(&callback, 15);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Main profile tab can't be changed in supergroups")
+        );
+
+        // 16. the main-tab hard error band — the head + the error
+        td.request(
+            16,
+            Function::setSupergroupMainProfileTab(td_api::setSupergroupMainProfileTab {
+                supergroup_id: 702,
+                main_profile_tab: Some(td_api::ProfileTab::profileTabPosts(
+                    td_api::profileTabPosts {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setMainProfileTab::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 16);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 17. the main-tab rights band — the member channel
+        td.request(
+            17,
+            Function::setSupergroupMainProfileTab(td_api::setSupergroupMainProfileTab {
+                supergroup_id: 703,
+                main_profile_tab: Some(td_api::ProfileTab::profileTabPosts(
+                    td_api::profileTabPosts {},
+                )),
+            }),
+        );
+        let error = error_of(&callback, 17);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Not enough rights to change main profile tab")
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
     }
 }

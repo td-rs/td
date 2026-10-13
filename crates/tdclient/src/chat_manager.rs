@@ -5393,11 +5393,41 @@ pub(crate) enum ChatNetKind {
     EditChatAbout {
         dialog_id: crate::messages_manager::DialogId,
     },
+    /// `UpdateChannelUsernameQuery` (ChatManager.cpp:149) — the kind
+    /// carries the channel for the error tail; the username parks with
+    /// the promise (the handler's `username_` member).
+    UpdateChannelUsername { channel_id: ChannelId },
+    /// `ToggleChannelUsernameQuery` (ChatManager.cpp:197) — the username/
+    /// is_active park with the promise (the handler members); the
+    /// optimistic local toggle already happened at the send leg.
+    ToggleChannelUsername { channel_id: ChannelId },
+    /// `DeactivateAllChannelUsernamesQuery` (ChatManager.cpp:239) — the
+    /// optimistic local deactivate already happened at the send leg.
+    DeactivateAllChannelUsernames { channel_id: ChannelId },
+    /// `ReorderChannelUsernamesQuery` (ChatManager.cpp:276) — the order
+    /// parks with the promise (the handler's `usernames_` member); the
+    /// optimistic local reorder already happened at the send leg.
+    ReorderChannelUsernames { channel_id: ChannelId },
     /// `UpdateChannelColorQuery` (ChatManager.cpp:320) — the kind carries
     /// the channel for the error tail (both accent-color arms).
     UpdateChannelColor { channel_id: ChannelId },
     /// `UpdateChannelEmojiStatusQuery` (ChatManager.cpp:370).
     UpdateChannelEmojiStatus { channel_id: ChannelId },
+    /// `SetChannelStickerSetQuery` (ChatManager.cpp:413) — the sticker
+    /// set id parks with the promise (the handler's `sticker_set_id_`
+    /// member; the on_ok and CHAT_NOT_MODIFIED intakes read it).
+    SetChannelStickerSet { channel_id: ChannelId },
+    /// `SetChannelEmojiStickerSetQuery` (ChatManager.cpp:462).
+    SetChannelEmojiStickerSet { channel_id: ChannelId },
+    /// `SetChannelBoostsToUnblockRestrictionsQuery` (ChatManager.cpp:512)
+    /// — the count parks with the promise (the handler's member); the
+    /// Updates answer re-enters `on_get_updates` with it.
+    SetChannelBoostsToUnblockRestrictions { channel_id: ChannelId },
+    /// `SetChannelMainProfileTabQuery` (ChatManager.cpp:557) — the tab
+    /// parks with the promise (the PromiseCreator::lambda capture); the
+    /// completion hook runs for the ok and the !bot CHAT_NOT_MODIFIED
+    /// bands.
+    SetChannelMainProfileTab { channel_id: ChannelId },
     /// `DeleteChatQuery` (ChatManager.cpp:1375) — the basic-group delete;
     /// the answer tail refires `get_difference` and chains the empty
     /// `updates` container into `on_get_updates`.
@@ -5487,6 +5517,33 @@ pub struct ChatManager {
     pending_update_channel_color: Vec<Promise<()>>,
     /// The `UpdateChannelEmojiStatusQuery` promises (ChatManager.cpp:372).
     pending_update_channel_emoji_status: Vec<Promise<()>>,
+    /// The `UpdateChannelUsernameQuery` in-flight states (the handler's
+    /// `username_`/`promise_` members, ChatManager.cpp:151-153) — the
+    /// answer pops the head and runs the editable-username intake.
+    pending_update_channel_username: Vec<(String, Promise<()>)>,
+    /// The `ToggleChannelUsernameQuery` in-flight states (the handler's
+    /// `username_`/`is_active_`/`promise_` members, cpp:199-202) — the
+    /// answer pops the head and runs the toggle intake with the promise.
+    pending_toggle_channel_username: Vec<(String, bool, Promise<()>)>,
+    /// The `DeactivateAllChannelUsernamesQuery` promises (cpp:241).
+    pending_deactivate_all_channel_usernames: Vec<Promise<()>>,
+    /// The `ReorderChannelUsernamesQuery` in-flight states (the handler's
+    /// `usernames_`/`promise_` members, cpp:278-281).
+    pending_reorder_channel_usernames: Vec<(Vec<String>, Promise<()>)>,
+    /// The `SetChannelStickerSetQuery` in-flight states (the handler's
+    /// `sticker_set_id_`/`promise_` members, cpp:415-417).
+    pending_set_channel_sticker_set: Vec<(StickerSetId, Promise<()>)>,
+    /// The `SetChannelEmojiStickerSetQuery` in-flight states
+    /// (ChatManager.cpp:464-466).
+    pending_set_channel_emoji_sticker_set: Vec<(StickerSetId, Promise<()>)>,
+    /// The `SetChannelBoostsToUnblockRestrictionsQuery` in-flight states
+    /// (the handler's `unrestrict_boost_count_`/`promise_` members,
+    /// cpp:514-516).
+    pending_set_channel_boosts_to_unblock_restrictions: Vec<(i32, Promise<()>)>,
+    /// The `SetChannelMainProfileTabQuery` in-flight states (the
+    /// query_promise lambda's `profile_tab` capture + the caller promise,
+    /// cpp:559-561).
+    pending_set_channel_main_profile_tab: Vec<(ProfileTab, Promise<()>)>,
     /// The `DeleteChatQuery` promises (ChatManager.cpp:1377).
     pending_delete_chat: Vec<Promise<()>>,
     /// The `DeleteChannelQuery` promises (ChatManager.cpp:1404).
@@ -5529,6 +5586,14 @@ impl ChatManager {
             pending_edit_chat_about: Vec::new(),
             pending_update_channel_color: Vec::new(),
             pending_update_channel_emoji_status: Vec::new(),
+            pending_update_channel_username: Vec::new(),
+            pending_toggle_channel_username: Vec::new(),
+            pending_deactivate_all_channel_usernames: Vec::new(),
+            pending_reorder_channel_usernames: Vec::new(),
+            pending_set_channel_sticker_set: Vec::new(),
+            pending_set_channel_emoji_sticker_set: Vec::new(),
+            pending_set_channel_boosts_to_unblock_restrictions: Vec::new(),
+            pending_set_channel_main_profile_tab: Vec::new(),
             pending_delete_chat: Vec::new(),
             pending_delete_channel: Vec::new(),
         }
@@ -8580,6 +8645,99 @@ impl ChatManager {
         }
     }
 
+    /// `UpdateChannelUsernameQuery::on_result`'s in-flight pop (the
+    /// handler's `username_`/`promise_` members, ChatManager.cpp:151-153).
+    pub(crate) fn take_update_channel_username(&mut self) -> Option<(String, Promise<()>)> {
+        if self.pending_update_channel_username.is_empty() {
+            None
+        } else {
+            Some(self.pending_update_channel_username.remove(0))
+        }
+    }
+
+    /// `ToggleChannelUsernameQuery::on_result`'s in-flight pop (the
+    /// handler's `username_`/`is_active_`/`promise_` members, cpp:199-202).
+    pub(crate) fn take_toggle_channel_username(&mut self) -> Option<(String, bool, Promise<()>)> {
+        if self.pending_toggle_channel_username.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_channel_username.remove(0))
+        }
+    }
+
+    /// `DeactivateAllChannelUsernamesQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:241).
+    pub(crate) fn take_deactivate_all_channel_usernames_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_deactivate_all_channel_usernames.is_empty() {
+            None
+        } else {
+            Some(self.pending_deactivate_all_channel_usernames.remove(0))
+        }
+    }
+
+    /// `ReorderChannelUsernamesQuery::on_result`'s in-flight pop (the
+    /// handler's `usernames_`/`promise_` members, cpp:278-281).
+    pub(crate) fn take_reorder_channel_usernames(&mut self) -> Option<(Vec<String>, Promise<()>)> {
+        if self.pending_reorder_channel_usernames.is_empty() {
+            None
+        } else {
+            Some(self.pending_reorder_channel_usernames.remove(0))
+        }
+    }
+
+    /// `SetChannelStickerSetQuery::on_result`'s in-flight pop (the
+    /// handler's `sticker_set_id_`/`promise_` members, cpp:415-417).
+    pub(crate) fn take_set_channel_sticker_set(&mut self) -> Option<(StickerSetId, Promise<()>)> {
+        if self.pending_set_channel_sticker_set.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_channel_sticker_set.remove(0))
+        }
+    }
+
+    /// `SetChannelEmojiStickerSetQuery::on_result`'s in-flight pop
+    /// (ChatManager.cpp:464-466).
+    pub(crate) fn take_set_channel_emoji_sticker_set(
+        &mut self,
+    ) -> Option<(StickerSetId, Promise<()>)> {
+        if self.pending_set_channel_emoji_sticker_set.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_channel_emoji_sticker_set.remove(0))
+        }
+    }
+
+    /// `SetChannelBoostsToUnblockRestrictionsQuery::on_result`'s in-flight
+    /// pop (the handler's `unrestrict_boost_count_`/`promise_` members,
+    /// cpp:514-516).
+    pub(crate) fn take_set_channel_boosts_to_unblock_restrictions(
+        &mut self,
+    ) -> Option<(i32, Promise<()>)> {
+        if self
+            .pending_set_channel_boosts_to_unblock_restrictions
+            .is_empty()
+        {
+            None
+        } else {
+            Some(
+                self.pending_set_channel_boosts_to_unblock_restrictions
+                    .remove(0),
+            )
+        }
+    }
+
+    /// `SetChannelMainProfileTabQuery`'s in-flight pop (the query_promise
+    /// lambda's `profile_tab` capture + the caller promise, cpp:559-561).
+    pub(crate) fn take_set_channel_main_profile_tab(
+        &mut self,
+    ) -> Option<(ProfileTab, Promise<()>)> {
+        if self.pending_set_channel_main_profile_tab.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_channel_main_profile_tab.remove(0))
+        }
+    }
+
     /// `DeleteChatQuery::on_result`'s promise pop (ChatManager.cpp:1387-1397).
     pub(crate) fn take_delete_chat_promise(&mut self) -> Option<Promise<()>> {
         if self.pending_delete_chat.is_empty() {
@@ -8634,6 +8792,141 @@ impl ChatManager {
                 env,
                 channel_id,
                 "on_update_channel_description",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_channel_editable_username` (ChatManager.cpp:8015-8020)
+    /// — the `UpdateChannelUsernameQuery` intake (the on_ok and the
+    /// USERNAME_NOT_MODIFIED bands).
+    pub(crate) fn on_update_channel_editable_username(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        username: String,
+    ) {
+        let usernames = self
+            .get_channel(channel_id)
+            .expect("the answer flow read the channel record")
+            .usernames
+            .change_editable_username(&username);
+        self.on_update_channel_usernames(user_manager, env, channel_id, usernames);
+        self.update_channel(user_manager, env, channel_id, false, false);
+    }
+
+    /// `on_update_channel_sticker_set` (ChatManager.cpp:8079-8089) — the
+    /// `SetChannelStickerSetQuery` intake (the on_ok and the
+    /// CHAT_NOT_MODIFIED bands).
+    pub(crate) fn on_update_channel_sticker_set(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        sticker_set_id: StickerSetId,
+    ) {
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_sticker_set",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && f.sticker_set_id != sticker_set_id
+        {
+            f.sticker_set_id = sticker_set_id;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_sticker_set",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_channel_emoji_sticker_set` (ChatManager.cpp:8091-8101)
+    /// — the `SetChannelEmojiStickerSetQuery` intake.
+    pub(crate) fn on_update_channel_emoji_sticker_set(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        sticker_set_id: StickerSetId,
+    ) {
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_emoji_sticker_set",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && f.emoji_sticker_set_id != sticker_set_id
+        {
+            f.emoji_sticker_set_id = sticker_set_id;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_emoji_sticker_set",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_channel_unrestrict_boost_count`
+    /// (ChatManager.cpp:8103-8113) — the
+    /// `SetChannelBoostsToUnblockRestrictionsQuery` intake.
+    pub(crate) fn on_update_channel_unrestrict_boost_count(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        unrestrict_boost_count: i32,
+    ) {
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_unrestrict_boost_count",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && f.unrestrict_boost_count != unrestrict_boost_count
+        {
+            f.unrestrict_boost_count = unrestrict_boost_count;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_unrestrict_boost_count",
                 false,
             );
         }
@@ -11071,11 +11364,11 @@ impl ChatManager {
     }
 
     /// `set_channel_username` (ChatManager.cpp:3178-3191) — the
-    /// UpdateChannelUsernameQuery send is [blocked: net] (M.5.45).
+    /// `UpdateChannelUsernameQuery` send rides the `net` handle.
     pub fn set_channel_username(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         username: &str,
         mut promise: Promise<()>,
@@ -11092,12 +11385,29 @@ impl ChatManager {
         if !username.is_empty() && !crate::misc::is_allowed_username(username) {
             return promise.set_error(Status::error(400, "Username is invalid"));
         }
-        tdutils::log_info!("UpdateChannelUsernameQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `UpdateChannelUsernameQuery::send` (ChatManager.cpp:161-168) —
+        // the input channel exists by the record check (the C++ CHECKs
+        // it); `username_` parks with the promise (the handler members).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_update_channel_username
+            .push((username.to_owned(), promise));
+        self.send_chat_net_query(
+            ChatNetKind::UpdateChannelUsername { channel_id },
+            telegram_api::Function::channels_updateUsername(
+                telegram_api::channels_updateUsername {
+                    channel: Some(input_channel),
+                    username: username.to_owned(),
+                },
+            ),
+            "channels.updateUsername",
+        );
     }
 
     /// `toggle_channel_username_is_active` (ChatManager.cpp:3194-3208) —
-    /// the optimistic local update lands before the blocked-net query.
+    /// the optimistic local update lands before the query; the
+    /// `ToggleChannelUsernameQuery` send rides the `net` handle.
     pub fn toggle_channel_username_is_active(
         &mut self,
         user_manager: &mut UserManager,
@@ -11119,11 +11429,30 @@ impl ChatManager {
         let toggled = c.usernames.toggle(false, &username, is_active);
         self.on_update_channel_usernames(user_manager, env, channel_id, toggled);
         self.update_channel(user_manager, env, channel_id, false, false);
-        tdutils::log_info!("ToggleChannelUsernameQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ToggleChannelUsernameQuery::send` (cpp:208-215) — the username
+        // and is_active park with the promise (the handler members); the
+        // answer re-applies the toggle with the server's confirmation.
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_toggle_channel_username
+            .push((username.clone(), is_active, promise));
+        self.send_chat_net_query(
+            ChatNetKind::ToggleChannelUsername { channel_id },
+            telegram_api::Function::channels_toggleUsername(
+                telegram_api::channels_toggleUsername {
+                    channel: Some(input_channel),
+                    username,
+                    active: is_active,
+                },
+            ),
+            "channels.toggleUsername",
+        );
     }
 
-    /// `disable_all_channel_usernames` (ChatManager.cpp:3211-3221).
+    /// `disable_all_channel_usernames` (ChatManager.cpp:3211-3221) — the
+    /// optimistic local deactivate lands before the query; the
+    /// `DeactivateAllChannelUsernamesQuery` send rides the `net` handle.
     pub fn disable_all_channel_usernames(
         &mut self,
         user_manager: &mut UserManager,
@@ -11140,14 +11469,26 @@ impl ChatManager {
         let deactivated = c.usernames.deactivate_all();
         self.on_update_channel_usernames(user_manager, env, channel_id, deactivated);
         self.update_channel(user_manager, env, channel_id, false, false);
-        tdutils::log_info!(
-            "DeactivateAllChannelUsernamesQuery for {channel_id:?} — [blocked: net]"
+        // `DeactivateAllChannelUsernamesQuery::send` (cpp:246-252).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_deactivate_all_channel_usernames.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::DeactivateAllChannelUsernames { channel_id },
+            telegram_api::Function::channels_deactivateAllUsernames(
+                telegram_api::channels_deactivateAllUsernames {
+                    channel: Some(input_channel),
+                },
+            ),
+            "channels.deactivateAllUsernames",
         );
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
     }
 
     /// `reorder_channel_usernames` (ChatManager.cpp:3224-3240) — order
-    /// lists of one or zero resolve locally without a query.
+    /// lists of one or zero resolve locally without a query; otherwise
+    /// the optimistic local reorder lands before the query and the
+    /// `ReorderChannelUsernamesQuery` send rides the `net` handle.
     pub fn reorder_channel_usernames(
         &mut self,
         user_manager: &mut UserManager,
@@ -11168,11 +11509,26 @@ impl ChatManager {
         if usernames.len() <= 1 {
             return promise.set_value(());
         }
-        let reordered = c.usernames.reorder_to(usernames);
+        let reordered = c.usernames.reorder_to(usernames.clone());
         self.on_update_channel_usernames(user_manager, env, channel_id, reordered);
         self.update_channel(user_manager, env, channel_id, false, false);
-        tdutils::log_info!("ReorderChannelUsernamesQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ReorderChannelUsernamesQuery::send` (cpp:285-291) — the order
+        // parks with the promise (the handler's `usernames_` member).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_reorder_channel_usernames
+            .push((usernames.clone(), promise));
+        self.send_chat_net_query(
+            ChatNetKind::ReorderChannelUsernames { channel_id },
+            telegram_api::Function::channels_reorderUsernames(
+                telegram_api::channels_reorderUsernames {
+                    channel: Some(input_channel),
+                    order: usernames,
+                },
+            ),
+            "channels.reorderUsernames",
+        );
     }
 
     /// `set_channel_accent_color` (ChatManager.cpp:3275-3293) — the
@@ -11329,7 +11685,8 @@ impl ChatManager {
         );
     }
 
-    /// `set_channel_sticker_set` (ChatManager.cpp:3328-3356).
+    /// `set_channel_sticker_set` (ChatManager.cpp:3328-3356) — the
+    /// `SetChannelStickerSetQuery` send rides the `net` handle.
     pub fn set_channel_sticker_set(
         &mut self,
         _user_manager: &mut UserManager,
@@ -11356,22 +11713,40 @@ impl ChatManager {
                 "Not enough rights to change supergroup sticker set",
             ));
         }
-        if sticker_set_id.is_valid() {
-            // stickers_manager_->get_input_sticker_set — the StickersManager
-            // fan-out lands with wave 2; interim answers nothing to forward
+        // cpp:3343-3352 — the invalid id sends `inputStickerSetEmpty`; a
+        // valid id needs stickers_manager_->get_input_sticker_set — the
+        // StickersManager set-record cache rides §3.9, so the band keeps
+        // the C++ miss answer.
+        let input_sticker_set = if sticker_set_id.is_valid() {
             return promise.set_error(Status::error(400, "Sticker set not found"));
-        }
+        } else {
+            telegram_api::InputStickerSet::inputStickerSetEmpty(telegram_api::inputStickerSetEmpty)
+        };
         if let Some(f) = self.get_channel_full_const(channel_id)
             && !f.can_set_sticker_set
         {
             return promise.set_error(Status::error(400, "Can't set supergroup sticker set"));
         }
-        tdutils::log_info!("SetChannelStickerSetQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `SetChannelStickerSetQuery::send` (cpp:420-427) — the sticker
+        // set id parks with the promise (the handler member).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_set_channel_sticker_set
+            .push((sticker_set_id, promise));
+        self.send_chat_net_query(
+            ChatNetKind::SetChannelStickerSet { channel_id },
+            telegram_api::Function::channels_setStickers(telegram_api::channels_setStickers {
+                channel: Some(input_channel),
+                stickerset: Some(input_sticker_set),
+            }),
+            "channels.setStickers",
+        );
     }
 
     /// `set_channel_emoji_sticker_set` (ChatManager.cpp:3359-3383) — the
-    /// "Cuctom" typo is load-bearing (verbatim C++ string).
+    /// "Cuctom" typo is load-bearing (verbatim C++ string); the
+    /// `SetChannelEmojiStickerSetQuery` send rides the `net` handle.
     pub fn set_channel_emoji_sticker_set(
         &mut self,
         _user_manager: &mut UserManager,
@@ -11398,18 +11773,38 @@ impl ChatManager {
                 "Not enough rights to change custom emoji sticker set in the supergroup",
             ));
         }
-        if sticker_set_id.is_valid() {
+        // cpp:3374-3383 — the same input-sticker-set ladder; the valid-id
+        // arm waits on the §3.9 StickersManager cache.
+        let input_sticker_set = if sticker_set_id.is_valid() {
             return promise.set_error(Status::error(400, "Sticker set not found"));
-        }
-        tdutils::log_info!("SetChannelEmojiStickerSetQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        } else {
+            telegram_api::InputStickerSet::inputStickerSetEmpty(telegram_api::inputStickerSetEmpty)
+        };
+        // `SetChannelEmojiStickerSetQuery::send` (cpp:469-476).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_set_channel_emoji_sticker_set
+            .push((sticker_set_id, promise));
+        self.send_chat_net_query(
+            ChatNetKind::SetChannelEmojiStickerSet { channel_id },
+            telegram_api::Function::channels_setEmojiStickers(
+                telegram_api::channels_setEmojiStickers {
+                    channel: Some(input_channel),
+                    stickerset: Some(input_sticker_set),
+                },
+            ),
+            "channels.setEmojiStickers",
+        );
     }
 
-    /// `set_channel_unrestrict_boost_count` (ChatManager.cpp:3386-3403).
+    /// `set_channel_unrestrict_boost_count` (ChatManager.cpp:3386-3403) —
+    /// the `SetChannelBoostsToUnblockRestrictionsQuery` send rides the
+    /// `net` handle.
     pub fn set_channel_unrestrict_boost_count(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         unrestrict_boost_count: i32,
         mut promise: Promise<()>,
@@ -11435,21 +11830,36 @@ impl ChatManager {
                 "Invalid new value for the unrestrict boost count specified",
             ));
         }
-        tdutils::log_info!(
-            "SetChannelBoostsToUnblockRestrictionsQuery for {channel_id:?} — [blocked: net]"
+        // `SetChannelBoostsToUnblockRestrictionsQuery::send`
+        // (cpp:519-526) — the count parks with the promise (the handler
+        // member).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_set_channel_boosts_to_unblock_restrictions
+            .push((unrestrict_boost_count, promise));
+        self.send_chat_net_query(
+            ChatNetKind::SetChannelBoostsToUnblockRestrictions { channel_id },
+            telegram_api::Function::channels_setBoostsToUnblockRestrictions(
+                telegram_api::channels_setBoostsToUnblockRestrictions {
+                    channel: Some(input_channel),
+                    boosts: unrestrict_boost_count,
+                },
+            ),
+            "channels.setBoostsToUnblockRestrictions",
         );
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
     }
 
     /// `set_channel_main_profile_tab` (ChatManager.cpp:3406-3430) — the
-    /// SetChannelMainProfileTabQuery send is [blocked: net]; its on_ok
-    /// completion (`on_set_channel_main_profile_tab`) still lands.
+    /// `SetChannelMainProfileTabQuery` send rides the `net` handle; its
+    /// ok completion (`on_set_channel_main_profile_tab`) runs from the
+    /// net answer (the PromiseCreator::lambda chain).
     pub fn set_channel_main_profile_tab(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
-        main_profile_tab: td_api::ProfileTab,
+        main_profile_tab: Option<td_api::ProfileTab>,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -11467,24 +11877,38 @@ impl ChatManager {
                 "Not enough rights to change main profile tab",
             ));
         }
+        // TRY_RESULT_PROMISE(profile_tab, get_profile_tab(...)) — the
+        // null band and the not-allowed band carry their own messages
+        // (ProfileTab.cpp:61-90).
         let channel_type = Self::get_channel_type(c);
-        let Some(profile_tab) = get_profile_tab_tdapi(Some(&main_profile_tab), channel_type) else {
-            return promise.set_error(Status::error(400, "Profile tab must be non-empty"));
+        let profile_tab = match get_profile_tab_tdapi(main_profile_tab.as_ref(), channel_type) {
+            Ok(profile_tab) => profile_tab,
+            Err(status) => return promise.set_error(status),
         };
-        if !is_allowed_profile_tab(profile_tab, channel_type) {
-            return promise.set_error(Status::error(
-                400,
-                "Invalid profile tab specified for the chat",
-            ));
-        }
-        tdutils::log_info!("SetChannelMainProfileTabQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `SetChannelMainProfileTabQuery::send` (cpp:560-567) — the tab
+        // parks with the promise (the query_promise lambda capture).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_set_channel_main_profile_tab
+            .push((profile_tab, promise));
+        self.send_chat_net_query(
+            ChatNetKind::SetChannelMainProfileTab { channel_id },
+            telegram_api::Function::channels_setMainProfileTab(
+                telegram_api::channels_setMainProfileTab {
+                    channel: Some(input_channel),
+                    tab: Some(profile_tab.get_input_profile_tab()),
+                },
+            ),
+            "channels.setMainProfileTab",
+        );
     }
 
     /// `on_set_channel_main_profile_tab` (ChatManager.cpp:3433-3441) — the
-    /// query completion hook. Production caller: the net step (M.5.45).
-    #[allow(dead_code)]
-    fn on_set_channel_main_profile_tab(
+    /// `SetChannelMainProfileTabQuery` completion hook (the
+    /// PromiseCreator::lambda chain routes both the ok answer and the
+    /// !bot CHAT_NOT_MODIFIED band here).
+    pub(crate) fn on_set_channel_main_profile_tab(
         &mut self,
         user_manager: &mut UserManager,
         env: &mut UserEnv,
@@ -11492,7 +11916,18 @@ impl ChatManager {
         main_profile_tab: ProfileTab,
         mut promise: Promise<()>,
     ) {
-        if let Some(f) = self.get_channel_full_mut(channel_id)
+        let have_full = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_set_channel_main_profile_tab",
+                false,
+            )
+            .is_some();
+        if have_full
+            && let Some(f) = self.get_channel_full_mut(channel_id)
             && f.main_profile_tab != main_profile_tab
         {
             f.main_profile_tab = main_profile_tab;
@@ -11505,6 +11940,82 @@ impl ChatManager {
                 false,
             );
         }
+        promise.set_value(());
+    }
+
+    /// `on_update_channel_username_is_active` (ChatManager.cpp:3243-3253)
+    /// — the `ToggleChannelUsernameQuery` on_ok tail; a stale local
+    /// username set rides the promise into the reload.
+    pub(crate) fn on_update_channel_username_is_active(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        username: String,
+        is_active: bool,
+        mut promise: Promise<()>,
+    ) {
+        let c = self
+            .get_channel(channel_id)
+            .expect("the answer flow read the channel record");
+        if !c.usernames.can_toggle(false, &username) {
+            return self.reload_channel(
+                env,
+                channel_id,
+                promise,
+                "on_update_channel_username_is_active",
+            );
+        }
+        let toggled = c.usernames.toggle(false, &username, is_active);
+        self.on_update_channel_usernames(user_manager, env, channel_id, toggled);
+        self.update_channel(user_manager, env, channel_id, false, false);
+        promise.set_value(());
+    }
+
+    /// `on_deactivate_channel_usernames` (ChatManager.cpp:3255-3261) — the
+    /// `DeactivateAllChannelUsernamesQuery` on_ok tail.
+    pub(crate) fn on_deactivate_channel_usernames(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+    ) {
+        let deactivated = self
+            .get_channel(channel_id)
+            .expect("the answer flow read the channel record")
+            .usernames
+            .deactivate_all();
+        self.on_update_channel_usernames(user_manager, env, channel_id, deactivated);
+        self.update_channel(user_manager, env, channel_id, false, false);
+        promise.set_value(());
+    }
+
+    /// `on_update_channel_active_usernames_order` (ChatManager.cpp:3263-
+    /// 3273) — the `ReorderChannelUsernamesQuery` on_ok tail; a stale
+    /// local order rides the promise into the reload.
+    pub(crate) fn on_update_channel_active_usernames_order(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        usernames: Vec<String>,
+        mut promise: Promise<()>,
+    ) {
+        let c = self
+            .get_channel(channel_id)
+            .expect("the answer flow read the channel record");
+        if !c.usernames.can_reorder_to(&usernames) {
+            return self.reload_channel(
+                env,
+                channel_id,
+                promise,
+                "on_update_channel_active_usernames_order",
+            );
+        }
+        let reordered = c.usernames.reorder_to(usernames);
+        self.on_update_channel_usernames(user_manager, env, channel_id, reordered);
+        self.update_channel(user_manager, env, channel_id, false, false);
         promise.set_value(());
     }
 
@@ -13563,7 +14074,7 @@ impl ChatManager {
     /// `reload_channel` (ChatManager.cpp:8938-8946) — the GetChannels
     /// query send is [blocked: net] (M.5.44); the validation surfaces
     /// stay exact.
-    fn reload_channel(
+    pub(crate) fn reload_channel(
         &mut self,
         env: &mut UserEnv,
         channel_id: ChannelId,
@@ -15282,14 +15793,17 @@ pub(crate) fn get_profile_tab(
 }
 
 /// `get_profile_tab_tdapi` (ProfileTab.cpp:61-90) — the td_api → internal
-/// conversion with the allow-matrix gate. `None` input answers `None`
-/// (the caller errors "Profile tab must be non-empty" — kept at the call
-/// site to match the C++ promise flow).
+/// ladder of the setMainProfileTab flows: the null object is the C++
+/// "Profile tab must be non-empty" band and a not-allowed tab the
+/// "Invalid profile tab specified" band (both TRY_RESULT_PROMISE
+/// errors).
 fn get_profile_tab_tdapi(
     profile_tab: Option<&td_api::ProfileTab>,
     channel_type: ChannelType,
-) -> Option<ProfileTab> {
-    let profile_tab = profile_tab?;
+) -> Result<ProfileTab, Status> {
+    let Some(profile_tab) = profile_tab else {
+        return Err(Status::error(400, "Profile tab must be non-empty"));
+    };
     let result = match profile_tab {
         td_api::ProfileTab::profileTabPosts(_) => ProfileTab::Posts,
         td_api::ProfileTab::profileTabGifts(_) => ProfileTab::Gifts,
@@ -15302,10 +15816,12 @@ fn get_profile_tab_tdapi(
     };
     if !is_allowed_profile_tab(result, channel_type) {
         tdutils::log_error!("Receive {result:?} for {channel_type:?}");
-        None
-    } else {
-        Some(result)
+        return Err(Status::error(
+            400,
+            "Invalid profile tab specified for the chat",
+        ));
     }
+    Ok(result)
 }
 
 pub(crate) fn get_profile_tab_object(profile_tab: ProfileTab) -> td_api::ProfileTab {
@@ -18755,6 +19271,306 @@ mod tests {
 
         close(&mut global);
         let _ = std::fs::remove_dir_all(db_dir("m545-about-fulls"));
+    }
+
+    #[test]
+    fn channel_identity_intakes_mutate_the_channel_and_fulls() {
+        let (mut global, mut options) = open_db(&db_dir("netdrain14-identity"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let channel_id = ChannelId::new(702);
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                broadcast: true,
+                id: channel_id.get(),
+                access_hash: 777,
+                title: "channel".to_owned(),
+                usernames: vec![
+                    telegram_api::Username {
+                        flags: 0,
+                        editable: true,
+                        active: true,
+                        deletable: false,
+                        expired: false,
+                        username: "alpha".to_owned(),
+                    },
+                    telegram_api::Username {
+                        flags: 0,
+                        editable: false,
+                        active: true,
+                        deletable: false,
+                        expired: false,
+                        username: "beta".to_owned(),
+                    },
+                ],
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+        let mut channel_full = ChannelFull::new();
+        channel_full.sticker_set_id = StickerSetId::new(11);
+        channel_full.emoji_sticker_set_id = StickerSetId::new(22);
+        channel_full.unrestrict_boost_count = 3;
+        channel_full.main_profile_tab = ProfileTab::Posts;
+        cm.channels_full.insert(channel_id.get(), channel_full);
+
+        // on_update_channel_editable_username — the replace + the
+        // record save (update_channel)
+        cm.on_update_channel_editable_username(&mut um, &mut env, channel_id, "renamed".to_owned());
+        assert_eq!(cm.get_channel_editable_username(channel_id), "renamed");
+        let c = cm.get_channel(channel_id).expect("channel record");
+        assert!(!c.is_changed && !c.need_save_to_database);
+        assert!(
+            !env.global
+                .td_db()
+                .common_kv()
+                .get(&ChatManager::get_channel_database_key(channel_id))
+                .is_empty()
+        );
+
+        // on_update_channel_username_is_active — the re-apply and the
+        // value
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_username_is_active(
+            &mut um,
+            &mut env,
+            channel_id,
+            "beta".to_owned(),
+            false,
+            promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert_eq!(
+            cm.get_channel(channel_id)
+                .unwrap()
+                .usernames
+                .get_usernames_object()
+                .disabled_usernames,
+            ["beta"]
+        );
+
+        // the stale branch — an unknown username rides the promise into
+        // the reload (the seam parks with the net-drain-16 500)
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_username_is_active(
+            &mut um,
+            &mut env,
+            channel_id,
+            "ghost".to_owned(),
+            true,
+            promise,
+        );
+        assert_unit_error(&recorded, "Network is not implemented yet");
+
+        // on_deactivate_channel_usernames — the editable username stays
+        // active (the Usernames rule); the value resolves
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_deactivate_channel_usernames(&mut um, &mut env, channel_id, promise);
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        let object = cm
+            .get_channel(channel_id)
+            .unwrap()
+            .usernames
+            .get_usernames_object();
+        assert_eq!(object.active_usernames, ["renamed"]);
+        assert_eq!(object.disabled_usernames, ["beta"]);
+
+        // on_update_channel_sticker_set — the full mutation persists
+        cm.on_update_channel_sticker_set(&mut um, &mut env, channel_id, StickerSetId::new(33));
+        let full = cm.get_channel_full_const(channel_id).expect("channel full");
+        assert_eq!(full.sticker_set_id, StickerSetId::new(33));
+        assert!(!full.is_changed && !full.need_save_to_database);
+        // the same-value band is the no-op (no update_channel_full run)
+        cm.on_update_channel_sticker_set(&mut um, &mut env, channel_id, StickerSetId::new(33));
+
+        // on_update_channel_emoji_sticker_set — the emoji twin
+        cm.on_update_channel_emoji_sticker_set(
+            &mut um,
+            &mut env,
+            channel_id,
+            StickerSetId::new(44),
+        );
+        assert_eq!(
+            cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .emoji_sticker_set_id,
+            StickerSetId::new(44)
+        );
+
+        // on_update_channel_unrestrict_boost_count — the boost twin
+        cm.on_update_channel_unrestrict_boost_count(&mut um, &mut env, channel_id, 6);
+        assert_eq!(
+            cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .unrestrict_boost_count,
+            6
+        );
+
+        // on_set_channel_main_profile_tab — the completion hook writes
+        // the loaded full and resolves the value
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_set_channel_main_profile_tab(
+            &mut um,
+            &mut env,
+            channel_id,
+            ProfileTab::Gifts,
+            promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert_eq!(
+            cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .main_profile_tab,
+            ProfileTab::Gifts
+        );
+
+        // the missing-full band — the hook skips the write and still
+        // resolves the value (the C++ nullptr branch)
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_set_channel_main_profile_tab(
+            &mut um,
+            &mut env,
+            ChannelId::new(709),
+            ProfileTab::Gifts,
+            promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(cm.get_channel_full_const(ChannelId::new(709)).is_none());
+
+        // the missing-full bands of the three full intakes return
+        // before the mutation (the get_channel_full_force nullptr band)
+        cm.on_update_channel_sticker_set(
+            &mut um,
+            &mut env,
+            ChannelId::new(708),
+            StickerSetId::new(55),
+        );
+        cm.on_update_channel_emoji_sticker_set(
+            &mut um,
+            &mut env,
+            ChannelId::new(708),
+            StickerSetId::new(55),
+        );
+        cm.on_update_channel_unrestrict_boost_count(&mut um, &mut env, ChannelId::new(708), 7);
+        assert!(cm.get_channel_full_const(ChannelId::new(708)).is_none());
+
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("netdrain14-identity"));
+    }
+
+    #[test]
+    fn channel_username_order_intake_and_the_stale_reload() {
+        let (mut global, mut options) = open_db(&db_dir("netdrain14-order"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let channel_id = ChannelId::new(702);
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                broadcast: true,
+                id: channel_id.get(),
+                access_hash: 777,
+                title: "channel".to_owned(),
+                usernames: vec![
+                    telegram_api::Username {
+                        flags: 0,
+                        editable: true,
+                        active: true,
+                        deletable: false,
+                        expired: false,
+                        username: "alpha".to_owned(),
+                    },
+                    telegram_api::Username {
+                        flags: 0,
+                        editable: false,
+                        active: true,
+                        deletable: false,
+                        expired: false,
+                        username: "beta".to_owned(),
+                    },
+                    telegram_api::Username {
+                        flags: 0,
+                        editable: false,
+                        active: true,
+                        deletable: false,
+                        expired: false,
+                        username: "gamma".to_owned(),
+                    },
+                ],
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+
+        // the happy path — the order applies, the editable position
+        // follows the editable username, the value resolves
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_active_usernames_order(
+            &mut um,
+            &mut env,
+            channel_id,
+            vec!["gamma".to_owned(), "alpha".to_owned(), "beta".to_owned()],
+            promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        let object = cm
+            .get_channel(channel_id)
+            .unwrap()
+            .usernames
+            .get_usernames_object();
+        assert_eq!(object.active_usernames, ["gamma", "alpha", "beta"]);
+        assert_eq!(object.editable_username, "alpha");
+
+        // the stale branch — the local set no longer matches the order;
+        // the promise rides the reload (the net-drain-16 park)
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_active_usernames_order(
+            &mut um,
+            &mut env,
+            channel_id,
+            vec![
+                "alpha".to_owned(),
+                "beta".to_owned(),
+                "gamma".to_owned(),
+                "delta".to_owned(),
+            ],
+            promise,
+        );
+        assert_unit_error(&recorded, "Network is not implemented yet");
+        // the order is unchanged by the failed apply
+        assert_eq!(
+            cm.get_channel(channel_id)
+                .unwrap()
+                .usernames
+                .get_usernames_object()
+                .active_usernames,
+            ["gamma", "alpha", "beta"]
+        );
+
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("netdrain14-order"));
     }
 
     #[test]
