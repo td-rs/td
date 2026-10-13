@@ -283,6 +283,94 @@ impl StickerPhotoSize {
         Some(result)
     }
 
+    /// `StickerPhotoSize::get_sticker_photo_size(Td*, const
+    /// td_api::chatPhotoSticker&)` (StickerPhotoSize.cpp:14-69) — the
+    /// td_api input direction of the ctor. The
+    /// `stickers_manager_->have_sticker`/`have_custom_emoji` reads pass
+    /// as closures over the raw ids (the callers own the manager
+    /// borrow; the ids are the `StickerSetId`/`CustomEmojiId` wraps).
+    pub fn get_sticker_photo_size_td_api(
+        sticker: Option<&td_api::ChatPhotoSticker>,
+        have_sticker: impl FnOnce(i64, i64) -> bool,
+        have_custom_emoji: impl FnOnce(i64) -> bool,
+    ) -> Result<StickerPhotoSize, tdutils::status::Status> {
+        use tdutils::status::Status;
+        let Some(sticker) = sticker else {
+            return Err(Status::error(400, "Sticker must not be null"));
+        };
+        let mut result = StickerPhotoSize::default();
+        match sticker.r#type.as_ref() {
+            Some(td_api::ChatPhotoStickerType::chatPhotoStickerTypeRegularOrMask(type_)) => {
+                result.type_ = StickerPhotoSizeType::Sticker;
+                result.sticker_set_id = type_.sticker_set_id;
+                result.sticker_id = type_.sticker_id;
+                if !have_sticker(type_.sticker_set_id, type_.sticker_id) {
+                    return Err(Status::error(400, "Sticker not found"));
+                }
+            }
+            Some(td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(type_)) => {
+                result.type_ = StickerPhotoSizeType::CustomEmoji;
+                result.custom_emoji_id = type_.custom_emoji_id;
+                if !have_custom_emoji(type_.custom_emoji_id) {
+                    return Err(Status::error(400, "Custom emoji not found"));
+                }
+            }
+            None => return Err(Status::error(400, "Type must be non-null")),
+        }
+        let Some(fill) = sticker.background_fill.as_ref() else {
+            return Err(Status::error(400, "Background must be non-null"));
+        };
+        match fill {
+            td_api::BackgroundFill::backgroundFillSolid(solid) => {
+                result.background_colors.push(solid.color);
+            }
+            td_api::BackgroundFill::backgroundFillGradient(gradient) => {
+                result.background_colors.push(gradient.top_color);
+                result.background_colors.push(gradient.bottom_color);
+            }
+            td_api::BackgroundFill::backgroundFillFreeformGradient(freeform) => {
+                if freeform.colors.len() != 3 && freeform.colors.len() != 4 {
+                    return Err(Status::error(400, "Invalid number of colors specified"));
+                }
+                result.background_colors = freeform.colors.clone();
+            }
+        }
+        for color in &mut result.background_colors {
+            *color &= 0xFFFFFF;
+        }
+        Ok(result)
+    }
+
+    /// `StickerPhotoSize::get_input_video_size_object(Td*)`
+    /// (StickerPhotoSize.cpp:72-86) — the wire form of the send. The
+    /// Sticker arm's `stickers_manager_->get_input_sticker_set` read
+    /// passes as a closure over the raw set id; it is reachable only
+    /// past the ctor's `have_sticker` gate, which guarantees the set
+    /// record (the C++ relies on the same invariant).
+    pub fn get_input_video_size_object(
+        &self,
+        get_input_sticker_set: impl FnOnce(i64) -> Option<telegram_api::InputStickerSet>,
+    ) -> telegram_api::VideoSize {
+        match self.type_ {
+            StickerPhotoSizeType::Sticker => telegram_api::VideoSize::videoSizeStickerMarkup(
+                telegram_api::videoSizeStickerMarkup {
+                    stickerset: Some(
+                        get_input_sticker_set(self.sticker_set_id)
+                            .expect("have_sticker guaranteed the sticker set record"),
+                    ),
+                    sticker_id: self.sticker_id,
+                    background_colors: self.background_colors.clone(),
+                },
+            ),
+            StickerPhotoSizeType::CustomEmoji => {
+                telegram_api::VideoSize::videoSizeEmojiMarkup(telegram_api::videoSizeEmojiMarkup {
+                    emoji_id: self.custom_emoji_id,
+                    background_colors: self.background_colors.clone(),
+                })
+            }
+        }
+    }
+
     /// `StickerPhotoSize::store` (StickerPhotoSize.hpp:16-30).
     pub fn store(&self, out: &mut Vec<u8>) {
         let is_custom_emoji = self.type_ == StickerPhotoSizeType::CustomEmoji;
@@ -2006,5 +2094,165 @@ mod tests {
         assert_eq!(fake.minithumbnail, "mini");
         assert!(fake.has_animation);
         assert!(fake.is_personal);
+    }
+
+    #[test]
+    fn sticker_photo_size_td_api_ctor_runs_the_bands() {
+        let sticker = |r#type: Option<td_api::ChatPhotoStickerType>,
+                       background_fill: Option<td_api::BackgroundFill>| {
+            td_api::ChatPhotoSticker {
+                r#type,
+                background_fill,
+            }
+        };
+        let solid = td_api::BackgroundFill::backgroundFillSolid(td_api::backgroundFillSolid {
+            color: 0x112233,
+        });
+        let custom_emoji = td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+            td_api::chatPhotoStickerTypeCustomEmoji {
+                custom_emoji_id: 777,
+            },
+        );
+
+        // the null/type/fill bands
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(None, |_, _| true, |_| true)
+                .unwrap_err()
+                .message(),
+            "Sticker must not be null"
+        );
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(
+                Some(&sticker(None, Some(solid.clone()))),
+                |_, _| true,
+                |_| true,
+            )
+            .unwrap_err()
+            .message(),
+            "Type must be non-null"
+        );
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(
+                Some(&sticker(Some(custom_emoji.clone()), None)),
+                |_, _| true,
+                |_| true,
+            )
+            .unwrap_err()
+            .message(),
+            "Background must be non-null"
+        );
+
+        // the have_sticker/have_custom_emoji misses
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(
+                Some(&sticker(
+                    Some(
+                        td_api::ChatPhotoStickerType::chatPhotoStickerTypeRegularOrMask(
+                            td_api::chatPhotoStickerTypeRegularOrMask {
+                                sticker_set_id: 5,
+                                sticker_id: 6,
+                            },
+                        )
+                    ),
+                    Some(solid.clone()),
+                )),
+                |_, _| false,
+                |_| true,
+            )
+            .unwrap_err()
+            .message(),
+            "Sticker not found"
+        );
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(
+                Some(&sticker(Some(custom_emoji.clone()), Some(solid.clone()))),
+                |_, _| true,
+                |_| false,
+            )
+            .unwrap_err()
+            .message(),
+            "Custom emoji not found"
+        );
+
+        // the freeform color-count band
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(
+                Some(&sticker(
+                    Some(custom_emoji.clone()),
+                    Some(td_api::BackgroundFill::backgroundFillFreeformGradient(
+                        td_api::backgroundFillFreeformGradient { colors: vec![1, 2] },
+                    )),
+                )),
+                |_, _| true,
+                |_| true,
+            )
+            .unwrap_err()
+            .message(),
+            "Invalid number of colors specified"
+        );
+    }
+
+    #[test]
+    fn sticker_photo_size_td_api_ctor_builds_and_masks() {
+        let sticker = td_api::ChatPhotoSticker {
+            r#type: Some(
+                td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                    td_api::chatPhotoStickerTypeCustomEmoji {
+                        custom_emoji_id: 777,
+                    },
+                ),
+            ),
+            background_fill: Some(td_api::BackgroundFill::backgroundFillGradient(
+                td_api::backgroundFillGradient {
+                    top_color: 0x11_FF_22,
+                    bottom_color: 0x33_44_FF,
+                    rotation_angle: 0,
+                },
+            )),
+        };
+        let size =
+            StickerPhotoSize::get_sticker_photo_size_td_api(Some(&sticker), |_, _| true, |_| true)
+                .unwrap();
+        assert_eq!(size.get_type(), StickerPhotoSizeType::CustomEmoji);
+        assert_eq!(size.get_custom_emoji_id(), 777);
+        // the colors mask to 24 bits
+        assert_eq!(size.get_background_colors(), vec![0x11_FF_22, 0x33_44_FF]);
+
+        // the wire form over the masked colors
+        match size.get_input_video_size_object(|_| unreachable!("the emoji arm reads no set")) {
+            telegram_api::VideoSize::videoSizeEmojiMarkup(markup) => {
+                assert_eq!(markup.emoji_id, 777);
+                assert_eq!(markup.background_colors, vec![0x11_FF_22, 0x33_44_FF]);
+            }
+            other => panic!("the markup: {other:?}"),
+        }
+
+        // the solid fill takes one color, the freeform three
+        let solid = StickerPhotoSize::get_sticker_photo_size_td_api(
+            Some(&td_api::ChatPhotoSticker {
+                r#type: sticker.r#type.clone(),
+                background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
+                    td_api::backgroundFillSolid { color: 7 },
+                )),
+            }),
+            |_, _| true,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(solid.get_background_colors(), vec![7]);
+        let freeform = StickerPhotoSize::get_sticker_photo_size_td_api(
+            Some(&td_api::ChatPhotoSticker {
+                r#type: sticker.r#type.clone(),
+                background_fill: Some(td_api::BackgroundFill::backgroundFillFreeformGradient(
+                    td_api::backgroundFillFreeformGradient {
+                        colors: vec![1, 2, 3],
+                    },
+                )),
+            }),
+            |_, _| true,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(freeform.get_background_colors(), vec![1, 2, 3]);
     }
 }

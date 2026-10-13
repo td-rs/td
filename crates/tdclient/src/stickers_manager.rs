@@ -1003,8 +1003,9 @@ pub struct StickersManager {
     /// `installed_sticker_set_ids_[type]`.
     installed_sticker_set_ids: [Vec<StickerSetId>; MAX_STICKER_TYPE],
     /// `custom_emoji_to_sticker_id_` (the WaitFreeHashMap collapses to a
-    /// plain map).
-    custom_emoji_to_sticker_id: std::collections::HashMap<CustomEmojiId, MessageId>,
+    /// plain map). `pub(crate)` for the td-level test seeds (the wire
+    /// intakes fill it at their slices).
+    pub(crate) custom_emoji_to_sticker_id: std::collections::HashMap<CustomEmojiId, MessageId>,
     /// `found_stickers_[type][emoji]` — the `(sticker_ids,
     /// next_reload_time)` cache.
     found_stickers: [std::collections::HashMap<String, (Vec<MessageId>, f64)>; MAX_STICKER_TYPE],
@@ -1518,6 +1519,33 @@ impl StickersManager {
         // the sticker_set == nullptr band — the 400 error
         promise.set_error(tdutils::status::Status::error(400, "Sticker set not found"));
         let _ = env;
+    }
+
+    /// `StickersManager::have_sticker` (StickersManager.cpp:2075-2086) —
+    /// the set record's sticker walk. The record cache itself is the
+    /// stickers-plane seam (§3.9): with no records loaded, the
+    /// regular-or-mask photo-sticker band answers the C++ "Sticker not
+    /// found" 400 exactly like an unloaded C++ set.
+    pub(crate) fn have_sticker(&self, _sticker_set_id: StickerSetId, _sticker_id: i64) -> bool {
+        false
+    }
+
+    /// `StickersManager::have_custom_emoji`
+    /// (StickersManager.cpp:2088-2090) — the id map read.
+    pub(crate) fn have_custom_emoji(&self, custom_emoji_id: CustomEmojiId) -> bool {
+        self.custom_emoji_to_sticker_id
+            .contains_key(&custom_emoji_id)
+    }
+
+    /// `StickersManager::get_input_sticker_set(StickerSetId)`
+    /// (StickersManager.cpp:2806-2812) — the record's `inputStickerSetID`.
+    /// The record cache is the stickers-plane seam (§3.9): a miss is
+    /// reachable only past `have_sticker`, which guarantees the record.
+    pub(crate) fn get_input_sticker_set(
+        &self,
+        _sticker_set_id: StickerSetId,
+    ) -> Option<telegram_api::InputStickerSet> {
+        None
     }
 
     /// `get_suggested_sticker_set_name` (StickersManager.cpp:8095-8102).

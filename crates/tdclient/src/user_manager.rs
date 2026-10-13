@@ -341,7 +341,7 @@ impl SecretChatId {
 /// this module allocates still come from the local stand-in counter and
 /// never leave the manager boundary (the values only key the two
 /// file-source maps below) until the FileReferenceManager lands.
-pub use crate::files::{FileId, FileSourceId};
+pub use crate::files::{FileId, FileSourceId, FileUploadId};
 
 /// `td::StoryId` (StoryId.h) — the M.4.13 stand-in moved to the M.47
 /// canonical module (`crate::story_ids`).
@@ -1992,6 +1992,30 @@ pub(crate) enum UserNetKind {
     /// id for the `on_delete_profile_photo` cache delete (the
     /// handler's `profile_photo_id_` member).
     DeleteProfilePhoto { profile_photo_id: i64 },
+    /// `UploadProfilePhotoQuery` (cpp:531) — the kind carries the
+    /// handler's answer members (`user_id_`, `is_fallback_`,
+    /// `only_suggest_`) and the `file_upload_id_` of the
+    /// `delete_partial_remote_location` tail (invalid on the sticker
+    /// arm, which uploads no file); the ok answer runs
+    /// `on_set_profile_photo` (the net-drain 08 intake) or resolves
+    /// directly on `only_suggest`.
+    UploadProfilePhoto {
+        user_id: UserId,
+        is_fallback: bool,
+        only_suggest: bool,
+        file_upload_id: FileUploadId,
+    },
+    /// `UploadSavedMusicFileQuery` (cpp:482) — the kind carries the
+    /// handler members (`file_upload_id_`, `is_url_`, `was_uploaded_`)
+    /// for the `on_uploaded_saved_music_file` tail and the on_error
+    /// upload legs; the promise's ok refires `add_saved_music` (the
+    /// `PromiseCreator` lambda of `add_new_saved_music`,
+    /// cpp:7205-7212).
+    UploadSavedMusicFile {
+        file_upload_id: FileUploadId,
+        is_url: bool,
+        was_uploaded: bool,
+    },
 }
 
 /// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
@@ -2032,6 +2056,19 @@ pub struct PendingGetPhotoRequest {
     limit: i32,
     retry_count: i32,
     promise: Promise<td_api::ChatPhotos>,
+}
+
+/// `UserManager::UploadedProfilePhoto` (UserManager.h) — the registry
+/// entry of an in-flight profile-photo upload
+/// (`being_uploaded_profile_photos_`).
+pub(crate) struct UploadedProfilePhoto {
+    user_id: UserId,
+    is_fallback: bool,
+    only_suggest: bool,
+    main_frame_timestamp: f64,
+    is_animation: bool,
+    reupload_count: i32,
+    promise: Promise<()>,
 }
 
 /// `UserManager::UserPhotos` (UserManager.h:848) — the cached window of
@@ -2162,15 +2199,32 @@ pub(crate) enum PendingUserRequest {
     },
 }
 
-/// The td-plane pair the photo-set flow reads — the C++ reaches both
-/// through `td_`: the shared user env plus the file-manager view the
-/// prev-photo arm derives its input photo from
-/// (`send_update_profile_photo_query`, cpp:6094-6107). The `pub`
-/// visibility follows [`UserEnv`] (a param struct of the pub manager
-/// methods).
+/// The td-plane pair the photo-set flow reads — the C++ reaches all
+/// through `td_`: the shared user env, the file-manager surface the
+/// flows read and write (`get_input_file_id`, the upload registration)
+/// with its loader plane, the profile-photo upload callback (the
+/// Td-side outbox bridge standing in for
+/// `upload_profile_photo_callback_`) and the stickers read surface of
+/// the sticker arm (`have_sticker`/`have_custom_emoji`/`get_input_sticker_set`).
+/// The `pub` visibility follows [`UserEnv`] (a param struct of the pub
+/// manager methods).
 pub struct SetProfilePhotoTd<'a> {
     pub env: &'a UserEnv<'a>,
-    pub files: &'a crate::files::FileManager,
+    pub files: &'a mut crate::files::FileManager,
+    pub fllm: &'a mut crate::files::FileLoadManager,
+    pub upload_callback: &'a std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    pub stickers: &'a crate::stickers_manager::StickersManager,
+}
+
+/// The td-plane pair the saved-music upload flow reads — the C++
+/// `td_->file_manager_`/`td_->audios_manager_` reach of
+/// `add_new_saved_music` (`upload_saved_music_callback_` is the
+/// Td-side outbox bridge).
+pub struct SavedMusicUploadTd<'a> {
+    pub files: &'a mut crate::files::FileManager,
+    pub fllm: &'a mut crate::files::FileLoadManager,
+    pub upload_callback: &'a std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    pub audios: &'a mut crate::audios_manager::AudiosManager,
 }
 
 /// `td::UserManager` — the in-process manager (the C++ actor collapses
@@ -2226,6 +2280,18 @@ pub struct UserManager {
     pending_delete_contact_profile_photo_queries: Vec<Promise<()>>,
     /// The parked `DeleteProfilePhotoQuery` promises.
     pending_delete_profile_photo_queries: Vec<Promise<()>>,
+    /// the promise queue of the UploadProfilePhoto family — the C++
+    /// carries the promise on the query; the FIFO family queue is the
+    /// §5 convention of the landed kinds.
+    pending_upload_profile_photo_queries: Vec<Promise<()>>,
+    /// the promise queue of the UploadSavedMusicFile family (§5).
+    pending_upload_saved_music_queries: Vec<Promise<()>>,
+    /// `being_uploaded_profile_photos_` (UserManager.h) — the in-flight
+    /// profile-photo upload registry keyed by `FileUploadId`.
+    being_uploaded_profile_photos: BTreeMap<FileUploadId, UploadedProfilePhoto>,
+    /// `being_uploaded_saved_music_files_` (UserManager.h) — the
+    /// in-flight saved-music upload promises keyed by `FileUploadId`.
+    being_uploaded_saved_music_files: BTreeMap<FileUploadId, Promise<()>>,
     /// `pending_user_photos_` (UserManager.h:1262) — the bot
     /// without-chat-info-database photo hold.
     pending_user_photos: BTreeMap<i64, telegram_api::UserProfilePhoto>,
@@ -8626,18 +8692,24 @@ impl UserManager {
         );
     }
 
-    /// `UserManager::add_new_saved_music` (UserManager.cpp:7178-7212).
-    /// The null/title/performer gates answer here; the
-    /// `get_input_file_id(FileType::Audio, ...)` resolution, the
-    /// encrypted/web gates, the remote-location fast path
-    /// (`add_saved_music`) and the `create_audio`/`upload_saved_music`
-    /// tail are the FileManager/AudiosManager seams (they join the
-    /// FileManager env half of the M.4 tail).
+    /// `UserManager::add_new_saved_music` (UserManager.cpp:7178-7216):
+    /// the null/UTF-8 gates answer here, then the `get_input_file_id`
+    /// resolution, the encrypted/web gates, the remote fast path
+    /// (`add_saved_music`), the `create_audio` registration and the
+    /// upload tail over the td-plane pair. The url variant skips the
+    /// upload and runs `do_upload_saved_music` directly (cpp:7213).
     pub fn add_new_saved_music(
         &mut self,
+        td: SavedMusicUploadTd<'_>,
         input_audio: Option<td_api::InputAudio>,
         mut promise: Promise<()>,
     ) {
+        let SavedMusicUploadTd {
+            files,
+            fllm,
+            upload_callback,
+            audios,
+        } = td;
         let Some(input_audio) = input_audio else {
             return promise.set_error(Status::error(400, "Audio must be non-empty"));
         };
@@ -8646,8 +8718,174 @@ impl UserManager {
         {
             return promise.set_error(Status::error(400, "Strings must be encoded in UTF-8"));
         }
-        self.net_blocked_promises.push(promise);
-        tdutils::log_info!("upload_saved_music — [blocked: net]");
+        let file_id = match files.get_input_file_id(
+            crate::files::FileType::Audio,
+            input_audio.audio.as_ref(),
+            crate::message_id::DialogId::default(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(file_id) => file_id,
+            Err(error) => return promise.set_error(error),
+        };
+        debug_assert!(file_id.is_valid(), "CHECK(file_id.is_valid())");
+
+        let (is_encrypted, is_web, has_remote, has_url) = files
+            .get_file_view(file_id)
+            .map(|view| {
+                (
+                    view.is_encrypted(),
+                    view.get_main_remote_location().is_some_and(|l| l.is_web()),
+                    view.get_main_remote_location().is_some(),
+                    view.has_url(),
+                )
+            })
+            .unwrap_or((false, false, false, false));
+        if is_encrypted {
+            return promise.set_error(Status::error(400, "Can't use encrypted file"));
+        }
+        if is_web {
+            return promise.set_error(Status::error(
+                400,
+                "Can't use web file to create a profile audio",
+            ));
+        }
+
+        if has_remote {
+            return self.add_saved_music(file_id, FileId::default(), promise);
+        }
+
+        audios.create_audio(
+            file_id,
+            String::new(),
+            crate::photo::PhotoSize::default(),
+            String::new(),
+            String::new(),
+            input_audio.duration,
+            input_audio.title,
+            input_audio.performer,
+            0,
+            false,
+        );
+        if has_url {
+            let file_upload_id = FileUploadId::new(file_id, files.get_internal_upload_id());
+            let input_media = audios
+                .get_input_media_with_files(files, file_id, None, None)
+                .expect("CHECK(input_media != nullptr)");
+            self.do_upload_saved_music(files, fllm, file_upload_id, false, input_media, promise);
+        } else {
+            self.upload_saved_music(files, fllm, upload_callback, file_id, promise);
+        }
+    }
+
+    /// `UserManager::upload_saved_music` (UserManager.cpp:7220-7228) —
+    /// park the promise on the upload id and ask the file plane
+    /// (`upload_saved_music_callback_`, priority 2, order 0).
+    fn upload_saved_music(
+        &mut self,
+        files: &mut crate::files::FileManager,
+        fllm: &mut crate::files::FileLoadManager,
+        upload_callback: &std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+        file_id: FileId,
+        promise: Promise<()>,
+    ) {
+        let file_upload_id = FileUploadId::new(file_id, files.get_internal_upload_id());
+        debug_assert!(
+            self.being_uploaded_saved_music_files
+                .insert(file_upload_id, promise)
+                .is_none(),
+            "CHECK(is_inserted)"
+        );
+        tdutils::log_info!("Ask to upload profile audio {file_upload_id:?}");
+        files.upload(file_upload_id, upload_callback.clone(), 2, 0, fllm);
+    }
+
+    /// `UserManager::on_upload_saved_music` (UserManager.cpp:7230-7244)
+    /// — the `UploadSavedMusicCallback::on_upload_ok` hop: the parked
+    /// promise pops and the flow continues in
+    /// [`Self::do_upload_saved_music`]. The input media is resolved by
+    /// the Td-side caller (the audios env locks the file manager; the
+    /// C++ reaches both through the single actor); the close gate is
+    /// the drain site's (the entry stays parked at close, like the C++
+    /// early return).
+    pub(crate) fn take_saved_music_upload_promise(
+        &mut self,
+        file_upload_id: FileUploadId,
+    ) -> Promise<()> {
+        self.being_uploaded_saved_music_files
+            .remove(&file_upload_id)
+            .expect("the callback fires for a registered upload")
+    }
+
+    /// `UserManager::on_upload_saved_music_error`
+    /// (UserManager.cpp:7246-7261) — the error hop: the code band
+    /// (positive codes pass, anything else 500). The close gate is the
+    /// drain site's (the entry stays parked at close).
+    pub(crate) fn on_upload_saved_music_error(
+        &mut self,
+        file_upload_id: FileUploadId,
+        status: Status,
+    ) {
+        tdutils::log_warning!("Profile audio {file_upload_id:?} has upload error {status}");
+        debug_assert!(status.is_error(), "CHECK(status.is_error())");
+        let Some(mut promise) = self
+            .being_uploaded_saved_music_files
+            .remove(&file_upload_id)
+        else {
+            return;
+        };
+        promise.set_error(if status.code() > 0 {
+            status
+        } else {
+            Status::error(500, status.message())
+        });
+    }
+
+    /// `UserManager::do_upload_saved_music` (UserManager.cpp:7263-7282)
+    /// — the `messages.uploadMedia` send over the audios input media
+    /// (`CHECK(input_media != nullptr)` is the caller's expect).
+    /// `had_input_file` is the url-vs-upload split (`is_url_ =
+    /// !had_input_file`).
+    pub(crate) fn do_upload_saved_music(
+        &mut self,
+        files: &mut crate::files::FileManager,
+        fllm: &mut crate::files::FileLoadManager,
+        file_upload_id: FileUploadId,
+        had_input_file: bool,
+        input_media: telegram_api::InputMedia,
+        promise: Promise<()>,
+    ) {
+        let was_uploaded = crate::files::extract_was_uploaded(&input_media);
+        if had_input_file && !was_uploaded {
+            // if we had InputFile, but has failed to use it for
+            // input_media, then we need to immediately cancel file
+            // upload so the next upload with the same file can succeed
+            files.cancel_upload(file_upload_id, fllm);
+        }
+
+        self.pending_upload_saved_music_queries.push(promise);
+        match &self.net {
+            Some(net) => net.dispatch(
+                UserNetKind::UploadSavedMusicFile {
+                    file_upload_id,
+                    is_url: !had_input_file,
+                    was_uploaded,
+                },
+                telegram_api::Function::messages_uploadMedia(telegram_api::messages_uploadMedia {
+                    flags: 0,
+                    business_connection_id: String::new(),
+                    peer: Some(Box::new(telegram_api::InputPeer::inputPeerSelf(
+                        telegram_api::inputPeerSelf,
+                    ))),
+                    media: Some(Box::new(input_media)),
+                }),
+            ),
+            None => tdutils::log_info!("Send messages.uploadMedia — [net-inert]"),
+        }
     }
 
     /// `UserManager::get_support_user` (UserManager.cpp:6798-6815): the
@@ -8703,34 +8941,28 @@ impl UserManager {
     /// `UserManager::set_profile_photo` (UserManager.cpp:5996-6002); the
     /// `UserpicSetup` suggested-action dismissal is the caller's seam
     /// (the Td-level arm hosts it like the Payments-side dismiss). The
-    /// `files` handle is the `td_->file_manager_` read the C++ reaches
-    /// through `td_` (the prev-photo input-photo derivation).
+    /// td-plane pair is the `td_` reach of the flows (the prev-photo
+    /// file view, the upload arms' file plane, the sticker reads).
     pub fn set_profile_photo(
         &mut self,
-        env: &UserEnv,
-        files: &crate::files::FileManager,
+        td: SetProfilePhotoTd<'_>,
         input_photo: Option<&td_api::InputChatPhoto>,
         is_fallback: bool,
         promise: Promise<()>,
     ) {
         let my_id = self.get_my_id();
-        self.set_profile_photo_impl(
-            SetProfilePhotoTd { env, files },
-            my_id,
-            input_photo,
-            is_fallback,
-            false,
-            promise,
-        );
+        self.set_profile_photo_impl(td, my_id, input_photo, is_fallback, false, promise);
     }
 
     /// `UserManager::set_profile_photo_impl` (UserManager.cpp:6004-6070)
     /// — the validation bands answer here; the prev-photo arm rides the
     /// `UpdateProfilePhotoQuery` dispatcher (cpp:662) over the file
-    /// view's input photo. The static/animation upload flow is the
-    /// [blocked: net/Files] seam; the sticker arm needs
-    /// `StickerPhotoSize::get_sticker_photo_size` over the td_api input
-    /// (the M.st StickerPhotoSize seam).
+    /// view's input photo, the static/animation arms upload over the
+    /// file plane then ride the `UploadProfilePhotoQuery` dispatcher
+    /// (cpp:531), and the sticker arm resolves the
+    /// `StickerPhotoSize` over the td_api input (the C++
+    /// `get_sticker_photo_size`, StickerPhotoSize.cpp:14-69) before the
+    /// same query.
     pub fn set_profile_photo_impl(
         &mut self,
         td: SetProfilePhotoTd<'_>,
@@ -8743,8 +8975,16 @@ impl UserManager {
         let Some(input_photo) = input_photo else {
             return promise.set_error(Status::error(400, "New profile photo must be non-empty"));
         };
-        let _ = only_suggest;
-        let SetProfilePhotoTd { env, files } = td;
+        let SetProfilePhotoTd {
+            env,
+            files,
+            fllm,
+            upload_callback,
+            stickers,
+        } = td;
+        let input_file: Option<&td_api::InputFile>;
+        let mut main_frame_timestamp = 0.0;
+        let mut is_animation = false;
         match input_photo {
             td_api::InputChatPhoto::inputChatPhotoPrevious(photo) => {
                 if user_id != self.get_my_id() || env.auth_is_bot {
@@ -8780,27 +9020,93 @@ impl UserManager {
                     input_photo,
                     promise,
                 );
+                return;
             }
-            td_api::InputChatPhoto::inputChatPhotoStatic(_) => {
-                self.net_blocked_promises.push(promise);
-                tdutils::log_info!("Upload profile photo — [blocked: net/Files]");
+            td_api::InputChatPhoto::inputChatPhotoStatic(photo) => {
+                input_file = photo.photo.as_ref();
             }
             td_api::InputChatPhoto::inputChatPhotoAnimation(photo) => {
-                const MAX_ANIMATION_DURATION: f64 = 10.0;
-                if photo.main_frame_timestamp < 0.0
-                    || photo.main_frame_timestamp > MAX_ANIMATION_DURATION
-                {
-                    return promise
-                        .set_error(Status::error(400, "Wrong main frame timestamp specified"));
-                }
-                self.net_blocked_promises.push(promise);
-                tdutils::log_info!("Upload animated profile photo — [blocked: net/Files]");
+                input_file = photo.animation.as_ref();
+                main_frame_timestamp = photo.main_frame_timestamp;
+                is_animation = true;
             }
-            td_api::InputChatPhoto::inputChatPhotoSticker(_) => {
-                self.net_blocked_promises.push(promise);
-                tdutils::log_info!("Upload sticker profile photo — [blocked: net/Files]");
+            td_api::InputChatPhoto::inputChatPhotoSticker(photo) => {
+                // `StickerPhotoSize::get_sticker_photo_size(td_, sticker)`
+                // (StickerPhotoSize.cpp:14-69) — the null/type/fill bands
+                // and the have_sticker/have_custom_emoji reads over the
+                // stickers surface
+                let sticker_photo_size =
+                    match crate::photo::StickerPhotoSize::get_sticker_photo_size_td_api(
+                        photo.sticker.as_ref(),
+                        |sticker_set_id, sticker_id| {
+                            stickers.have_sticker(
+                                crate::stickers_manager::StickerSetId::new(sticker_set_id),
+                                sticker_id,
+                            )
+                        },
+                        |custom_emoji_id| {
+                            stickers.have_custom_emoji(crate::stickers_manager::CustomEmojiId::new(
+                                custom_emoji_id,
+                            ))
+                        },
+                    ) {
+                        Ok(sticker_photo_size) => sticker_photo_size,
+                        Err(error) => return promise.set_error(error),
+                    };
+                self.send_upload_profile_photo_query_sticker(
+                    env,
+                    user_id,
+                    stickers,
+                    sticker_photo_size,
+                    is_fallback,
+                    only_suggest,
+                    promise,
+                );
+                return;
             }
         }
+
+        const MAX_ANIMATION_DURATION: f64 = 10.0;
+        if !(0.0..=MAX_ANIMATION_DURATION).contains(&main_frame_timestamp) {
+            return promise.set_error(Status::error(400, "Wrong main frame timestamp specified"));
+        }
+
+        let file_type = if is_animation {
+            crate::files::FileType::Animation
+        } else {
+            crate::files::FileType::Photo
+        };
+        let file_id = match files.get_input_file_id(
+            file_type,
+            input_file,
+            crate::message_id::DialogId::from_user_id(user_id),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Ok(file_id) => file_id,
+            Err(error) => return promise.set_error(error),
+        };
+
+        let file_upload_id = FileUploadId::new(file_id, files.get_internal_upload_id());
+        self.upload_profile_photo(
+            env,
+            files,
+            fllm,
+            upload_callback,
+            user_id,
+            file_upload_id,
+            is_fallback,
+            only_suggest,
+            is_animation,
+            main_frame_timestamp,
+            promise,
+            0,
+            Vec::new(),
+        );
     }
 
     /// `UserManager::set_user_profile_photo` (UserManager.cpp:6071-6097)
@@ -8809,13 +9115,13 @@ impl UserManager {
     /// rides the `DeleteContactProfilePhotoQuery` dispatcher (cpp:766).
     pub fn set_user_profile_photo(
         &mut self,
-        env: &UserEnv,
-        files: &crate::files::FileManager,
+        td: SetProfilePhotoTd<'_>,
         user_id: UserId,
         input_photo: Option<&td_api::InputChatPhoto>,
         only_suggest: bool,
         mut promise: Promise<()>,
     ) {
+        let SetProfilePhotoTd { env, .. } = &td;
         let input_user = match self.get_input_user(env, user_id) {
             Ok(input_user) => input_user,
             Err(error) => return promise.set_error(error),
@@ -8842,14 +9148,7 @@ impl UserManager {
             self.send_delete_contact_profile_photo_query(user_id, input_user, promise);
             return;
         };
-        self.set_profile_photo_impl(
-            SetProfilePhotoTd { env, files },
-            user_id,
-            Some(input_photo),
-            false,
-            only_suggest,
-            promise,
-        );
+        self.set_profile_photo_impl(td, user_id, Some(input_photo), false, only_suggest, promise);
     }
 
     /// `UserManager::get_profile_photo_file_id` (UserManager.cpp — the
@@ -8906,6 +9205,384 @@ impl UserManager {
                 telegram_api::Function::photos_updateProfilePhoto(function),
             ),
             None => tdutils::log_info!("Send photos.updateProfilePhoto — [net-inert]"),
+        }
+    }
+
+    /// `UserManager::upload_profile_photo` (UserManager.cpp:6120-6143)
+    /// — park the `UploadedProfilePhoto` members on the upload id and
+    /// ask the file plane (`upload_profile_photo_callback_`, priority
+    /// 32, order 0; the `[-1]` bad-parts re-entry of the force-reupload
+    /// ladder rides `resume_upload`).
+    #[allow(clippy::too_many_arguments)]
+    fn upload_profile_photo(
+        &mut self,
+        env: &UserEnv,
+        files: &mut crate::files::FileManager,
+        fllm: &mut crate::files::FileLoadManager,
+        upload_callback: &std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+        user_id: UserId,
+        file_upload_id: FileUploadId,
+        is_fallback: bool,
+        only_suggest: bool,
+        is_animation: bool,
+        main_frame_timestamp: f64,
+        mut promise: Promise<()>,
+        reupload_count: i32,
+        bad_parts: Vec<i32>,
+    ) {
+        // `TRY_STATUS_PROMISE(promise, G()->close_status())` (cpp:6121)
+        if env.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        debug_assert!(
+            file_upload_id.is_valid(),
+            "CHECK(file_upload_id.is_valid())"
+        );
+        let is_inserted = self
+            .being_uploaded_profile_photos
+            .insert(
+                file_upload_id,
+                UploadedProfilePhoto {
+                    user_id,
+                    is_fallback,
+                    only_suggest,
+                    main_frame_timestamp,
+                    is_animation,
+                    reupload_count,
+                    promise,
+                },
+            )
+            .is_none();
+        debug_assert!(is_inserted, "CHECK(is_inserted)");
+        tdutils::log_info!(
+            "Ask to upload {} profile photo {file_upload_id:?} for user {user_id:?} with bad parts {bad_parts:?}",
+            if is_animation { "animated" } else { "static" }
+        );
+        // TODO use force_reupload if reupload_count >= 1, replace
+        // reupload_count with is_reupload (the C++ carries the same TODO)
+        files.resume_upload(
+            file_upload_id,
+            bad_parts,
+            upload_callback.clone(),
+            32,
+            0,
+            false,
+            false,
+            fllm,
+        );
+    }
+
+    /// `UserManager::on_upload_profile_photo` (UserManager.cpp:6145-6194)
+    /// — the `UploadProfilePhotoCallback::on_upload_ok` hop: the
+    /// reupload ladder over the main remote (the web band, the
+    /// reupload-count cap, the file-reference drop) or the query send
+    /// with the resolved `InputFile`. The close gate is the drain
+    /// site's (the entry stays parked at close).
+    pub(crate) fn on_upload_profile_photo(
+        &mut self,
+        td: SetProfilePhotoTd<'_>,
+        file_upload_id: FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        let SetProfilePhotoTd {
+            env,
+            files,
+            fllm,
+            upload_callback,
+            stickers,
+        } = td;
+        let UploadedProfilePhoto {
+            user_id,
+            is_fallback,
+            only_suggest,
+            main_frame_timestamp,
+            is_animation,
+            reupload_count,
+            mut promise,
+        } = self
+            .being_uploaded_profile_photos
+            .remove(&file_upload_id)
+            .expect("the callback fires for a registered upload");
+        tdutils::log_info!(
+            "Uploaded {} profile photo {file_upload_id:?} for user {user_id:?} with reupload_count = {reupload_count}",
+            if is_animation { "animated" } else { "static" }
+        );
+        let main_remote_location = files
+            .get_file_view(file_upload_id.file_id)
+            .and_then(|view| view.get_main_remote_location().cloned());
+        if let (Some(main_remote_location), None) = (&main_remote_location, &input_file) {
+            if main_remote_location.is_web() {
+                return promise
+                    .set_error(Status::error(400, "Can't use web photo as profile photo"));
+            }
+            if reupload_count == 3 {
+                // upload, ForceReupload repair file reference, reupload
+                return promise.set_error(Status::error(400, "Failed to reupload the file"));
+            }
+
+            // delete file reference and forcibly reupload the file
+            // (the C++ LOG_CHECKs are the log-only collapse's)
+            let file_reference = if is_animation {
+                main_remote_location.as_input_document().file_reference
+            } else {
+                main_remote_location.as_input_photo().file_reference
+            };
+            files.delete_file_reference(file_upload_id.file_id, &file_reference);
+            self.upload_profile_photo(
+                env,
+                files,
+                fllm,
+                upload_callback,
+                user_id,
+                file_upload_id,
+                is_fallback,
+                only_suggest,
+                is_animation,
+                main_frame_timestamp,
+                promise,
+                reupload_count + 1,
+                vec![-1],
+            );
+            return;
+        }
+        let Some(input_file) = input_file else {
+            // `CHECK(input_file != nullptr)` (cpp:6187) — the null file
+            // without a main remote is the upload-canceled race
+            return promise.set_error(Status::error(500, "Failed to upload the file"));
+        };
+        self.send_upload_profile_photo_query(
+            env,
+            user_id,
+            file_upload_id,
+            input_file,
+            is_fallback,
+            only_suggest,
+            is_animation,
+            main_frame_timestamp,
+            promise,
+        );
+        let _ = stickers;
+    }
+
+    /// `UserManager::on_upload_profile_photo_error`
+    /// (UserManager.cpp:6196-6211) — the error hop.
+    pub(crate) fn on_upload_profile_photo_error(
+        &mut self,
+        file_upload_id: FileUploadId,
+        status: Status,
+    ) {
+        tdutils::log_info!("Profile photo {file_upload_id:?} has upload error {status}");
+        debug_assert!(status.is_error(), "CHECK(status.is_error())");
+        let Some(UploadedProfilePhoto { mut promise, .. }) =
+            self.being_uploaded_profile_photos.remove(&file_upload_id)
+        else {
+            return;
+        };
+        // TODO check that status has valid error code (the C++ carries
+        // the same TODO)
+        promise.set_error(status);
+    }
+
+    /// `UploadProfilePhotoQuery::send` — the file form (cpp:539-584):
+    /// the own-photo ladder picks `photos.uploadProfilePhoto` over
+    /// `photos.uploadContactProfilePhoto` (the personal/suggest save).
+    #[allow(clippy::too_many_arguments)]
+    fn send_upload_profile_photo_query(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        file_upload_id: FileUploadId,
+        input_file: telegram_api::InputFile,
+        is_fallback: bool,
+        only_suggest: bool,
+        is_animation: bool,
+        main_frame_timestamp: f64,
+        mut promise: Promise<()>,
+    ) {
+        debug_assert!(
+            file_upload_id.is_valid(),
+            "CHECK(file_upload_id.is_valid())"
+        );
+        // the pinned scheme's flag bits (telegram_api.tl:2857-2860)
+        const FILE_MASK: i32 = 1 << 0;
+        const VIDEO_MASK: i32 = 1 << 1;
+        const VIDEO_START_TS_MASK: i32 = 1 << 2;
+        const BOT_MASK: i32 = 1 << 5;
+
+        let mut flags = 0;
+        let mut photo_input_file = None;
+        let mut video_input_file = None;
+        if is_animation {
+            flags |= VIDEO_MASK;
+            video_input_file = Some(input_file);
+            if main_frame_timestamp != 0.0 {
+                flags |= VIDEO_START_TS_MASK;
+            }
+        } else {
+            flags |= FILE_MASK;
+            photo_input_file = Some(input_file);
+        }
+        let is_me = user_id == self.get_my_id();
+        let input_user = if !is_me {
+            match self.get_input_user(env, user_id) {
+                Ok(input_user) => Some(input_user),
+                Err(error) => return promise.set_error(error),
+            }
+        } else {
+            None
+        };
+        if self.is_user_bot_of(user_id) != env.auth_is_bot || is_me {
+            if input_user.is_some() {
+                flags |= BOT_MASK;
+            }
+            self.pending_upload_profile_photo_queries.push(promise);
+            let function = telegram_api::photos_uploadProfilePhoto {
+                flags,
+                fallback: is_fallback,
+                bot: input_user,
+                file: photo_input_file,
+                video: video_input_file,
+                video_start_ts: main_frame_timestamp,
+                video_emoji_markup: None,
+            };
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    UserNetKind::UploadProfilePhoto {
+                        user_id,
+                        is_fallback,
+                        only_suggest,
+                        file_upload_id,
+                    },
+                    telegram_api::Function::photos_uploadProfilePhoto(function),
+                ),
+                None => tdutils::log_info!("Send photos.uploadProfilePhoto — [net-inert]"),
+            }
+        } else {
+            self.pending_upload_profile_photo_queries.push(promise);
+            // `suggest`/`save` ride their own flags bits (3/4) — the
+            // serializer ORs them in; the FILE/VIDEO/VIDEO_START_TS bits
+            // match the profile ctor's (the C++ static_asserts)
+            let function = telegram_api::photos_uploadContactProfilePhoto {
+                flags,
+                suggest: only_suggest,
+                save: !only_suggest,
+                user_id: input_user,
+                file: photo_input_file,
+                video: video_input_file,
+                video_start_ts: main_frame_timestamp,
+                video_emoji_markup: None,
+            };
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    UserNetKind::UploadProfilePhoto {
+                        user_id,
+                        is_fallback,
+                        only_suggest,
+                        file_upload_id,
+                    },
+                    telegram_api::Function::photos_uploadContactProfilePhoto(function),
+                ),
+                None => {
+                    tdutils::log_info!("Send photos.uploadContactProfilePhoto — [net-inert]")
+                }
+            }
+        }
+    }
+
+    /// `UploadProfilePhotoQuery::send` — the sticker form (cpp:586-611):
+    /// the `VIDEO_EMOJI_MARKUP` flag pair over the resolved
+    /// `StickerPhotoSize`.
+    #[allow(clippy::too_many_arguments)]
+    fn send_upload_profile_photo_query_sticker(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        stickers: &crate::stickers_manager::StickersManager,
+        sticker_photo_size: crate::photo::StickerPhotoSize,
+        is_fallback: bool,
+        only_suggest: bool,
+        mut promise: Promise<()>,
+    ) {
+        // the sticker form's flag bits
+        const VIDEO_EMOJI_MARKUP_MASK: i32 = 1 << 4;
+        const BOT_MASK: i32 = 1 << 5;
+        const CONTACT_VIDEO_EMOJI_MARKUP_MASK: i32 = 1 << 5;
+
+        let file_upload_id = FileUploadId::default();
+        let is_me = user_id == self.get_my_id();
+        let input_user = if !is_me {
+            match self.get_input_user(env, user_id) {
+                Ok(input_user) => Some(input_user),
+                Err(error) => return promise.set_error(error),
+            }
+        } else {
+            None
+        };
+        if self.is_user_bot_of(user_id) != env.auth_is_bot || is_me {
+            let mut flags = VIDEO_EMOJI_MARKUP_MASK;
+            if input_user.is_some() {
+                flags |= BOT_MASK;
+            }
+            self.pending_upload_profile_photo_queries.push(promise);
+            let function = telegram_api::photos_uploadProfilePhoto {
+                flags,
+                fallback: is_fallback,
+                bot: input_user,
+                file: None,
+                video: None,
+                video_start_ts: 0.0,
+                video_emoji_markup: Some(sticker_photo_size.get_input_video_size_object(
+                    |sticker_set_id| {
+                        stickers.get_input_sticker_set(crate::stickers_manager::StickerSetId::new(
+                            sticker_set_id,
+                        ))
+                    },
+                )),
+            };
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    UserNetKind::UploadProfilePhoto {
+                        user_id,
+                        is_fallback,
+                        only_suggest,
+                        file_upload_id,
+                    },
+                    telegram_api::Function::photos_uploadProfilePhoto(function),
+                ),
+                None => tdutils::log_info!("Send photos.uploadProfilePhoto — [net-inert]"),
+            }
+        } else {
+            self.pending_upload_profile_photo_queries.push(promise);
+            let function = telegram_api::photos_uploadContactProfilePhoto {
+                flags: CONTACT_VIDEO_EMOJI_MARKUP_MASK,
+                suggest: only_suggest,
+                save: !only_suggest,
+                user_id: input_user,
+                file: None,
+                video: None,
+                video_start_ts: 0.0,
+                video_emoji_markup: Some(sticker_photo_size.get_input_video_size_object(
+                    |sticker_set_id| {
+                        stickers.get_input_sticker_set(crate::stickers_manager::StickerSetId::new(
+                            sticker_set_id,
+                        ))
+                    },
+                )),
+            };
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    UserNetKind::UploadProfilePhoto {
+                        user_id,
+                        is_fallback,
+                        only_suggest,
+                        file_upload_id,
+                    },
+                    telegram_api::Function::photos_uploadContactProfilePhoto(function),
+                ),
+                None => {
+                    tdutils::log_info!("Send photos.uploadContactProfilePhoto — [net-inert]")
+                }
+            }
         }
     }
 
@@ -9748,6 +10425,24 @@ impl UserManager {
         }
     }
 
+    /// The promise pop of the UploadProfilePhoto family queue (§5).
+    pub(crate) fn take_upload_profile_photo_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_upload_profile_photo_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_upload_profile_photo_queries.remove(0))
+        }
+    }
+
+    /// The promise pop of the UploadSavedMusicFile family queue (§5).
+    pub(crate) fn take_upload_saved_music_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_upload_saved_music_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_upload_saved_music_queries.remove(0))
+        }
+    }
+
     /// `DeleteContactProfilePhotoQuery::on_result`'s promise pop
     /// (cpp:784-793).
     pub(crate) fn take_delete_contact_profile_photo_query_promise(
@@ -10425,6 +11120,21 @@ impl UserManager {
         self.saved_music_file_locations
             .insert(file_id.get(), (document.id, document.access_hash));
         Some(file_id)
+    }
+
+    /// The registry-stand-in half of the C++ `check_saved_music_file_id`
+    /// file-view read: an uploaded saved-music file registers its
+    /// document location for the `add_saved_music` refire (the C++ reads
+    /// the same pair off the merged file node,
+    /// `on_uploaded_saved_music_file` → `add_saved_music`).
+    pub(crate) fn register_saved_music_file_location(
+        &mut self,
+        file_id: FileId,
+        document_id: i64,
+        access_hash: i64,
+    ) {
+        self.saved_music_file_locations
+            .insert(file_id.get(), (document_id, access_hash));
     }
 
     /// `UserManager::check_saved_music_file_id`
@@ -13433,6 +14143,38 @@ mod tests {
 
     fn test_env() -> (TempEnv, UserManager) {
         TempEnv::new("unit")
+    }
+
+    /// A file-load factory whose nets never run (the band tests answer
+    /// before any upload starts).
+    struct PanicNetFactory;
+
+    impl crate::files::FileLoadNetFactory for PanicNetFactory {
+        fn download_net(&mut self) -> Box<dyn crate::files::FileDownloaderNet> {
+            unimplemented!("the band tests start no downloads")
+        }
+        fn upload_net(&mut self) -> Box<dyn crate::files::FileUploaderNet> {
+            unimplemented!("the band tests start no uploads")
+        }
+        fn hash_net(&mut self) -> Box<dyn crate::files::FileHashUploaderNet> {
+            unimplemented!("the band tests start no hash uploads")
+        }
+        fn utils_net(&mut self) -> Box<dyn crate::files::FileDownloaderNet> {
+            unimplemented!("the band tests touch no file io")
+        }
+    }
+
+    /// The null upload callback of the band tests.
+    struct NoopUserUploadCallback;
+
+    impl crate::files::UploadCallback for NoopUserUploadCallback {
+        fn on_upload_ok(
+            &mut self,
+            _file_upload_id: FileUploadId,
+            _input_file: Option<telegram_api::InputFile>,
+        ) {
+        }
+        fn on_upload_error(&mut self, _file_upload_id: FileUploadId, _status: Status) {}
     }
 
     /// A Global + OptionManager pair over a throwaway database.
@@ -19168,21 +19910,29 @@ mod tests {
         let (mut temp, mut um) = test_env();
         let env = temp.env(false);
         let my_id = um.get_my_id();
-        let files = crate::files::FileManager::new();
+        let mut files = crate::files::FileManager::new();
+        let mut fllm = crate::files::FileLoadManager::new(
+            Box::new(PanicNetFactory),
+            crate::files::FileLoadManagerOptions::default(),
+        );
+        let upload_callback: std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(NoopUserUploadCallback));
+        let stickers = crate::stickers_manager::StickersManager::new();
+        macro_rules! mk_td {
+            () => {
+                SetProfilePhotoTd {
+                    env: &env,
+                    files: &mut files,
+                    fllm: &mut fllm,
+                    upload_callback: &upload_callback,
+                    stickers: &stickers,
+                }
+            };
+        }
 
         // the null gate
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(
-            SetProfilePhotoTd {
-                env: &env,
-                files: &files,
-            },
-            my_id,
-            None,
-            false,
-            false,
-            promise,
-        );
+        um.set_profile_photo_impl(mk_td!(), my_id, None, false, false, promise);
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "New profile photo must be non-empty")
         );
@@ -19194,10 +19944,7 @@ mod tests {
             });
         let (promise, result) = promise_result();
         um.set_profile_photo_impl(
-            SetProfilePhotoTd {
-                env: &env,
-                files: &files,
-            },
+            mk_td!(),
             UserId::new(5),
             Some(&previous),
             false,
@@ -19210,17 +19957,7 @@ mod tests {
 
         // an unknown photo id is the cache-miss 400
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(
-            SetProfilePhotoTd {
-                env: &env,
-                files: &files,
-            },
-            my_id,
-            Some(&previous),
-            false,
-            false,
-            promise,
-        );
+        um.set_profile_photo_impl(mk_td!(), my_id, Some(&previous), false, false, promise);
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Unknown profile photo ID specified")
         );
@@ -19229,17 +19966,7 @@ mod tests {
         // (send_update_profile_photo_query's file-view gate, cpp:6100)
         um.my_photo_file_id.insert(7, FileId::new(0, 0));
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(
-            SetProfilePhotoTd {
-                env: &env,
-                files: &files,
-            },
-            my_id,
-            Some(&previous),
-            false,
-            false,
-            promise,
-        );
+        um.set_profile_photo_impl(mk_td!(), my_id, Some(&previous), false, false, promise);
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Failed to upload the file")
         );
@@ -19251,41 +19978,23 @@ mod tests {
                 main_frame_timestamp: 42.0,
             });
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(
-            SetProfilePhotoTd {
-                env: &env,
-                files: &files,
-            },
-            my_id,
-            Some(&animation),
-            false,
-            false,
-            promise,
-        );
+        um.set_profile_photo_impl(mk_td!(), my_id, Some(&animation), false, false, promise);
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Wrong main frame timestamp specified")
         );
 
-        // a static photo parks on the upload flow
+        // a static photo without a file is the get_input_file_id 400
+        // (the input gates answer before the upload flow)
         let static_photo =
             td_api::InputChatPhoto::inputChatPhotoStatic(td_api::inputChatPhotoStatic {
                 photo: None,
             });
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(
-            SetProfilePhotoTd {
-                env: &env,
-                files: &files,
-            },
-            my_id,
-            Some(&static_photo),
-            false,
-            false,
-            promise,
+        um.set_profile_photo_impl(mk_td!(), my_id, Some(&static_photo), false, false, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "InputFile is not specified")
         );
-        assert_eq!(um.net_blocked_promises.len(), 1);
-        assert!((*result.lock().unwrap()).is_none());
-        um.net_blocked_promises.clear();
+        assert!(um.net_blocked_promises.is_empty());
     }
 
     #[test]
@@ -19590,10 +20299,27 @@ mod tests {
     #[test]
     fn add_new_saved_music_runs_the_input_gates() {
         let (_temp, mut um) = test_env();
+        let mut files = crate::files::FileManager::new();
+        let mut fllm = crate::files::FileLoadManager::new(
+            Box::new(PanicNetFactory),
+            crate::files::FileLoadManagerOptions::default(),
+        );
+        let upload_callback: std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(NoopUserUploadCallback));
+        let mut audios = crate::audios_manager::AudiosManager::new();
 
         // the null gate
         let (promise, result) = promise_result();
-        um.add_new_saved_music(None, promise);
+        um.add_new_saved_music(
+            SavedMusicUploadTd {
+                files: &mut files,
+                fllm: &mut fllm,
+                upload_callback: &upload_callback,
+                audios: &mut audios,
+            },
+            None,
+            promise,
+        );
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Audio must be non-empty")
         );
@@ -19602,9 +20328,16 @@ mod tests {
         // typed Rust String is always valid UTF-8, so it is exercised at
         // the JSON plane, not here
 
-        // the clean input parks on the FileManager seam
+        // a clean input without a file is the get_input_file_id 400
+        // (the input gates answer before the upload flow)
         let (promise, result) = promise_result();
         um.add_new_saved_music(
+            SavedMusicUploadTd {
+                files: &mut files,
+                fllm: &mut fllm,
+                upload_callback: &upload_callback,
+                audios: &mut audios,
+            },
             Some(td_api::InputAudio {
                 audio: None,
                 album_cover_thumbnail: None,
@@ -19614,9 +20347,161 @@ mod tests {
             }),
             promise,
         );
-        assert_eq!(um.net_blocked_promises.len(), 1);
-        assert!((*result.lock().unwrap()).is_none());
-        um.net_blocked_promises.clear();
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "InputFile is not specified")
+        );
+        assert!(um.net_blocked_promises.is_empty());
+    }
+
+    #[test]
+    fn on_upload_saved_music_error_runs_the_code_band() {
+        let (_temp, mut um) = test_env();
+        let file_upload_id = FileUploadId::new(FileId::new(9, 0), 1);
+
+        // a coded status passes through
+        let (promise, result) = promise_result();
+        um.being_uploaded_saved_music_files
+            .insert(file_upload_id, promise);
+        um.on_upload_saved_music_error(file_upload_id, Status::error(420, "FLOOD_WAIT_5"));
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.code() == 420 && s.message() == "FLOOD_WAIT_5")
+        );
+
+        // a codeless status answers the C++ 500 band
+        let (promise, result) = promise_result();
+        um.being_uploaded_saved_music_files
+            .insert(file_upload_id, promise);
+        um.on_upload_saved_music_error(file_upload_id, Status::error_message("local error"));
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.code() == 500 && s.message() == "local error")
+        );
+    }
+
+    #[test]
+    fn on_upload_profile_photo_bands_the_web_remote_and_the_reupload_cap() {
+        let (mut temp, mut um) = test_env();
+        let env = temp.env(false);
+        let mut files = crate::files::FileManager::new();
+        let mut fllm = crate::files::FileLoadManager::new(
+            Box::new(PanicNetFactory),
+            crate::files::FileLoadManagerOptions::default(),
+        );
+        let upload_callback: std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(NoopUserUploadCallback));
+        let stickers = crate::stickers_manager::StickersManager::new();
+
+        // a web main remote — the early-complete (null InputFile) hop is
+        // the C++ web band (cpp:6163-6165)
+        let file_id = files.register_remote(
+            crate::files::FullRemoteFileLocation::from_web(
+                crate::files::FileType::Photo,
+                "https://example.com/x.jpg".to_owned(),
+                1,
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::default(),
+            0,
+            0,
+            String::new(),
+        );
+        let file_upload_id = FileUploadId::new(file_id, 1);
+        let (promise, result) = promise_result();
+        um.being_uploaded_profile_photos.insert(
+            file_upload_id,
+            UploadedProfilePhoto {
+                user_id: UserId::new(7),
+                is_fallback: false,
+                only_suggest: false,
+                main_frame_timestamp: 0.0,
+                is_animation: false,
+                reupload_count: 0,
+                promise,
+            },
+        );
+        um.on_upload_profile_photo(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &mut files,
+                fllm: &mut fllm,
+                upload_callback: &upload_callback,
+                stickers: &stickers,
+            },
+            file_upload_id,
+            None,
+        );
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Can't use web photo as profile photo")
+        );
+
+        // a common photo remote — the force-reupload ladder re-arms until
+        // the count cap answers the C++ 400 (cpp:6166-6168 + 6178-6185)
+        let file_id = files.register_remote(
+            crate::files::FullRemoteFileLocation::from_photo(
+                crate::files::PhotoSizeSource::StickerSetThumbnailVersion {
+                    sticker_set_id: 0,
+                    sticker_set_access_hash: 0,
+                    version: 0,
+                },
+                7,
+                77,
+                crate::chat_manager::DcId::main(),
+                "ref".to_owned(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::default(),
+            0,
+            0,
+            String::new(),
+        );
+        let file_upload_id = FileUploadId::new(file_id, 1);
+        let (promise, result) = promise_result();
+        um.being_uploaded_profile_photos.insert(
+            file_upload_id,
+            UploadedProfilePhoto {
+                user_id: UserId::new(7),
+                is_fallback: false,
+                only_suggest: false,
+                main_frame_timestamp: 0.0,
+                is_animation: false,
+                reupload_count: 0,
+                promise,
+            },
+        );
+        for _ in 0..3 {
+            um.on_upload_profile_photo(
+                SetProfilePhotoTd {
+                    env: &env,
+                    files: &mut files,
+                    fllm: &mut fllm,
+                    upload_callback: &upload_callback,
+                    stickers: &stickers,
+                },
+                file_upload_id,
+                None,
+            );
+            // each round re-arms the upload (the ForceUploadActor [-1]
+            // deferral consumes the callback without a result — the
+            // entry re-parks with the incremented count)
+            assert!(
+                um.being_uploaded_profile_photos
+                    .contains_key(&file_upload_id),
+                "the ladder re-arms"
+            );
+        }
+        um.on_upload_profile_photo(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &mut files,
+                fllm: &mut fllm,
+                upload_callback: &upload_callback,
+                stickers: &stickers,
+            },
+            file_upload_id,
+            None,
+        );
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Failed to reupload the file")
+        );
     }
 
     #[test]

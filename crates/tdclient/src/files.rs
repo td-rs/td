@@ -507,6 +507,87 @@ pub fn is_file_big(file_type: FileType, expected_size: i64) -> bool {
     expected_size > SMALL_FILE_MAX_SIZE
 }
 
+/// `FileManager::fix_file_extension` (FileManager.cpp:1340-1342).
+fn fix_file_extension(file_name: &str, file_type: &str, file_extension: &str) -> String {
+    format!(
+        "{}.{}",
+        if file_name.is_empty() {
+            file_type
+        } else {
+            file_name
+        },
+        file_extension
+    )
+}
+
+/// `FileManager::get_file_name` (FileManager.cpp:1344-1423) — the
+/// per-type extension ladder over the suggested path's file name.
+fn get_file_name(file_type: FileType, path: &str) -> String {
+    use tdutils::path_view::PathView;
+    let path_view = PathView::new(path);
+    let file_name = path_view.file_name().to_owned();
+    let extension = path_view.extension();
+    let is_jpeg = extension == "jpg" || extension == "jpeg";
+    let ogg_family = extension == "ogg" || extension == "oga";
+    let mp3_family = extension == "mp3" || extension == "mpeg3";
+    match file_type {
+        FileType::Thumbnail if !is_jpeg && extension != "webp" => {
+            fix_file_extension(&file_name, "thumbnail", "jpg")
+        }
+        FileType::ProfilePhoto
+        | FileType::Photo
+        | FileType::PhotoStory
+        | FileType::SelfDestructingPhoto
+            if !is_jpeg
+                && extension != "gif"
+                && extension != "png"
+                && extension != "tif"
+                && extension != "bmp" =>
+        {
+            fix_file_extension(&file_name, "photo", "jpg")
+        }
+        FileType::VoiceNote | FileType::SelfDestructingVoiceNote
+            if !ogg_family && !mp3_family && extension != "m4a" && extension != "opus" =>
+        {
+            fix_file_extension(&file_name, "voice", "oga")
+        }
+        FileType::Video
+        | FileType::VideoNote
+        | FileType::SelfDestructingVideo
+        | FileType::SelfDestructingVideoNote
+        | FileType::LivePhoto
+        | FileType::SelfDestructingLivePhoto
+            if extension != "mov"
+                && extension != "3gp"
+                && extension != "mpeg4"
+                && extension != "mp4"
+                && extension != "mkv" =>
+        {
+            fix_file_extension(&file_name, "video", "mp4")
+        }
+        FileType::VideoStory if extension != "mp4" => {
+            fix_file_extension(&file_name, "video", "mp4")
+        }
+        FileType::Audio if !ogg_family && !mp3_family && extension != "m4a" => {
+            fix_file_extension(&file_name, "audio", "mp3")
+        }
+        FileType::Wallpaper | FileType::Background if !is_jpeg && extension != "png" => {
+            fix_file_extension(&file_name, "wallpaper", "jpg")
+        }
+        FileType::Sticker if extension != "webp" && extension != "tgs" && extension != "webm" => {
+            fix_file_extension(&file_name, "sticker", "webp")
+        }
+        FileType::Ringtone if !ogg_family && !mp3_family => {
+            fix_file_extension(&file_name, "notification_sound", "mp3")
+        }
+        // the plain-document arms (Document, DocumentAsFile, Animation,
+        // Encrypted, Temp, EncryptedThumbnail, Secure*, CallLog) keep the
+        // name; the remaining C++ arms (Size, None) are unreachable over
+        // the wire types the upload path serves
+        _ => file_name,
+    }
+}
+
 /// `can_reuse_remote_file` (FileType.cpp:369-386).
 pub fn can_reuse_remote_file(file_type: FileType) -> bool {
     !matches!(
@@ -15582,7 +15663,7 @@ mod tests {
 
 /// `FileUploadId` (FileId.hpp) — a `FileId` plus the internal upload id
 /// (`0` for the user request; the default is the invalid id).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileUploadId {
     pub file_id: FileId,
     pub internal_upload_id: i64,
@@ -15594,6 +15675,44 @@ impl FileUploadId {
             file_id,
             internal_upload_id,
         }
+    }
+
+    /// `FileUploadId::is_valid` (FileManager.h) — the file id decides.
+    pub fn is_valid(&self) -> bool {
+        self.file_id.is_valid()
+    }
+}
+
+/// `FileManager::extract_was_uploaded` (FileManager.cpp:4478-4500) —
+/// true iff the media rides a just-uploaded file. The `inputMediaPaidMedia`
+/// and `inputMediaPoll` recursions (which the C++ CHECK-fails on for
+/// nested uploaded media) cannot occur over the audio/photo input media
+/// this serves.
+pub fn extract_was_uploaded(input_media: &telegram_api::InputMedia) -> bool {
+    matches!(
+        input_media,
+        telegram_api::InputMedia::inputMediaUploadedPhoto(_)
+            | telegram_api::InputMedia::inputMediaUploadedDocument(_)
+    )
+}
+
+/// `FileManager::get_missing_file_parts` (FileManager.cpp:1435-1449) —
+/// the `FILE_PART_*` error parse.
+pub fn get_missing_file_parts(error: &Status) -> Vec<i32> {
+    let error_message = error.message();
+    if error_message.starts_with("FILE_PART_") && error_message.ends_with("_MISSING") {
+        let inner = &error_message[10..error_message.len() - 8];
+        match inner.parse::<i32>() {
+            Ok(part) if part >= 0 => vec![part],
+            _ => {
+                tdutils::log_error!("Receive error {error}");
+                Vec::new()
+            }
+        }
+    } else if error_message == "FILE_PART_INVALID" || error_message == "FILE_PART_LENGTH_INVALID" {
+        vec![0]
+    } else {
+        Vec::new()
     }
 }
 
@@ -15621,17 +15740,27 @@ impl DownloadCallback for NoopDownloadCallback {
 struct NoopUploadCallback;
 
 impl UploadCallback for NoopUploadCallback {
-    fn on_upload_ok(&mut self, _file_upload_id: FileUploadId) {}
+    fn on_upload_ok(
+        &mut self,
+        _file_upload_id: FileUploadId,
+        _input_file: Option<telegram_api::InputFile>,
+    ) {
+    }
     fn on_upload_error(&mut self, _file_upload_id: FileUploadId, _status: Status) {}
 }
 
 /// `FileManager::UploadCallback` (FileManager.h:412-436). The C++
-/// `on_upload_ok` carries the resolved `InputFile`/`InputEncryptedFile`;
-/// the wire conversion belongs to the caller, so the collapsed callback
-/// receives only the id (the `on_upload_encrypted_ok` default arm folds
-/// into the same method).
+/// `on_upload_ok` carries the resolved `InputFile` (null on the
+/// early-complete path — `finish_uploads` fires it with no file); the
+/// encrypted/secure halves (`on_upload_encrypted_ok`/
+/// `on_upload_secure_ok`) stay folded into the same method with a null
+/// file until their planes need the distinction.
 pub trait UploadCallback: Send {
-    fn on_upload_ok(&mut self, file_upload_id: FileUploadId);
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    );
     fn on_upload_error(&mut self, file_upload_id: FileUploadId, status: Status);
 }
 
@@ -20743,7 +20872,9 @@ impl FileManager {
             let file_upload_id = FileUploadId::new(file_id, internal_upload_id);
             match &status {
                 None => {
-                    callback.lock().on_upload_ok(file_upload_id);
+                    // the C++ passes a null InputFile — the early-complete
+                    // path; the caller reads the main remote instead
+                    callback.lock().on_upload_ok(file_upload_id, None);
                     if is_preliminary {
                         // PreliminaryUploadFileCallback::on_upload_ok ->
                         // FileManager::cancel_upload
@@ -20905,7 +21036,8 @@ impl FileManager {
             )
         };
         if already_uploaded {
-            callback.lock().on_upload_ok(file_upload_id);
+            // the null-InputFile completion (FileManager.cpp:3528-3531)
+            callback.lock().on_upload_ok(file_upload_id, None);
             return;
         }
 
@@ -21266,6 +21398,108 @@ impl FileManager {
         }
     }
 
+    /// `FileManager::delete_file_reference` (FileManager.cpp:3634-3645)
+    /// — drop the given reference from the node's full remote (a no-op
+    /// over an unknown file).
+    pub fn delete_file_reference(&mut self, file_id: FileId, file_reference: &[u8]) {
+        if let Some(node_id) = self.node_id_of(file_id) {
+            self.file_nodes[node_id]
+                .as_mut()
+                .expect("node")
+                .delete_file_reference(file_reference);
+        }
+    }
+
+    /// `FileManager::delete_partial_remote_location`
+    /// (FileManager.cpp:3570-3606): drop the partial upload location,
+    /// cancel the registered callback with the `200 "Canceled"` hop and
+    /// re-arm the node's upload queue. The `check_local_location`
+    /// failure arm rides the log-only collapse of the local-location
+    /// check.
+    pub fn delete_partial_remote_location(
+        &mut self,
+        file_upload_id: FileUploadId,
+        fllm: &mut FileLoadManager,
+    ) -> bool {
+        let Some(node_id) = self.node_id_of(file_upload_id.file_id) else {
+            tdutils::log_info!("Wrong {file_upload_id:?}");
+            return false;
+        };
+        if self.file_nodes[node_id]
+            .as_ref()
+            .expect("node")
+            .upload_pause
+            == file_upload_id
+        {
+            self.file_nodes[node_id]
+                .as_mut()
+                .expect("node")
+                .set_upload_pause(FileUploadId::default());
+        }
+        if self.file_nodes[node_id]
+            .as_ref()
+            .expect("node")
+            .remote
+            .is_full_alive
+        {
+            tdutils::log_info!("Upload isn't needed for {file_upload_id:?}");
+            return true;
+        }
+        self.file_nodes[node_id]
+            .as_mut()
+            .expect("node")
+            .delete_partial_remote_location();
+        if let Some(callback) = self.extract_upload_callback(file_upload_id) {
+            callback
+                .lock()
+                .on_upload_error(file_upload_id, Status::error(200, "Canceled"));
+        }
+        if !matches!(
+            self.file_nodes[node_id].as_ref().expect("node").local,
+            LocalFileLocation::Full(_)
+        ) {
+            tdutils::log_info!("Need full local location to upload {file_upload_id:?}");
+            return false;
+        }
+        self.check_upload_local_location(node_id);
+        self.run_upload(node_id, Vec::new(), fllm);
+        self.try_flush_node(node_id);
+        true
+    }
+
+    /// `FileManager::delete_partial_remote_location_if_needed`
+    /// (FileManager.cpp:3610-3615) — the `was_uploaded` bool form.
+    pub fn delete_partial_remote_location_if_needed(
+        &mut self,
+        file_upload_id: FileUploadId,
+        was_uploaded: bool,
+        fllm: &mut FileLoadManager,
+    ) {
+        if was_uploaded {
+            debug_assert!(file_upload_id.file_id.is_valid());
+            self.delete_partial_remote_location(file_upload_id, fllm);
+        }
+    }
+
+    /// `FileManager::delete_partial_remote_location_if_needed`
+    /// (FileManager.cpp:3626-3632) — the error form: a likely-fatal error
+    /// drops the partial remote, a retryable one only cancels the
+    /// upload. The `G()->close_flag()` read is the caller's (the
+    /// manager cannot reach the Global).
+    pub fn delete_partial_remote_location_on_error(
+        &mut self,
+        file_upload_id: FileUploadId,
+        error: &Status,
+        close_flag: bool,
+        fllm: &mut FileLoadManager,
+    ) {
+        if error.code() != 429 && error.code() < 500 && !close_flag {
+            self.delete_partial_remote_location(file_upload_id, fllm);
+        } else {
+            self.cancel_upload(file_upload_id, fllm);
+        }
+    }
+
     /// `FileManager::external_file_generate_write_part`
     /// (FileManager.cpp:3656-3660) — the `writeGeneratedFilePart` arm.
     /// The C++ SafePromise "Generation has already been finished" race
@@ -21416,12 +21650,45 @@ impl FileManager {
             return;
         };
 
+        // the InputFile construction of the C++ `on_upload_ok` plain
+        // branch (FileManager.cpp:4946-4963): the encrypted/secure
+        // halves stay folded into the null-file completion until their
+        // planes need the distinction
+        let (is_secret, is_secure, file_name) = {
+            let node = self.file_nodes[node_id].as_ref().expect("node");
+            let view = FileView::new(node);
+            (
+                view.is_encrypted_secret(),
+                view.is_encrypted_secure(),
+                get_file_name(file_type, &view.suggested_path()),
+            )
+        };
+        let input_file = if is_secret || is_secure {
+            None
+        } else if partial_remote.is_big != 0 {
+            Some(telegram_api::InputFile::inputFileBig(
+                telegram_api::inputFileBig {
+                    id: partial_remote.file_id,
+                    parts: partial_remote.part_count,
+                    name: file_name,
+                },
+            ))
+        } else {
+            Some(telegram_api::InputFile::inputFile(
+                telegram_api::inputFile {
+                    id: partial_remote.file_id,
+                    parts: partial_remote.part_count,
+                    name: file_name,
+                    md5_checksum: String::new(),
+                },
+            ))
+        };
+
         self.file_nodes[node_id]
             .as_mut()
             .expect("node")
             .set_upload_pause(file_upload_id);
-        callback.lock().on_upload_ok(file_upload_id);
-        let _ = file_type;
+        callback.lock().on_upload_ok(file_upload_id, input_file);
         // don't flush node info, because nothing actually changed
         // (FileManager.cpp:4953)
     }
@@ -22400,7 +22667,12 @@ impl DownloadCallback for LoggingDownloadCallback {
 struct PreliminaryUploadCallback;
 
 impl UploadCallback for PreliminaryUploadCallback {
-    fn on_upload_ok(&mut self, _file_upload_id: FileUploadId) {}
+    fn on_upload_ok(
+        &mut self,
+        _file_upload_id: FileUploadId,
+        _input_file: Option<telegram_api::InputFile>,
+    ) {
+    }
     fn on_upload_error(&mut self, _file_upload_id: FileUploadId, _status: Status) {}
 }
 
@@ -25712,7 +25984,11 @@ mod file_load_manager_tests {
     struct UploadCallbackHandle(Arc<parking_lot::Mutex<UploadLog>>);
 
     impl UploadCallback for UploadCallbackHandle {
-        fn on_upload_ok(&mut self, file_upload_id: FileUploadId) {
+        fn on_upload_ok(
+            &mut self,
+            file_upload_id: FileUploadId,
+            _input_file: Option<telegram_api::InputFile>,
+        ) {
             self.0.lock().events.push((file_upload_id, "ok".to_owned()));
         }
         fn on_upload_error(&mut self, file_upload_id: FileUploadId, status: Status) {
