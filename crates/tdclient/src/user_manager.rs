@@ -154,8 +154,9 @@ const ACCOUNT_UPDATE_LAST_NAME: i32 = 1 << 1;
 const ACCOUNT_UPDATE_ABOUT: i32 = 1 << 2;
 /// `MAX_GET_PROFILE_PHOTOS` (UserManager.h:870).
 const MAX_GET_PROFILE_PHOTOS: i32 = 100;
-/// `MAX_GET_SAVED_MUSIC` (UserManager.h:871).
-const MAX_GET_SAVED_MUSIC: i32 = 100;
+/// `MAX_GET_SAVED_MUSIC` (UserManager.h:871) — pub(crate) for the
+/// netted round-trip asserts.
+pub(crate) const MAX_GET_SAVED_MUSIC: i32 = 100;
 
 // telegram_api::user flag masks (telegram_api.h, the `user` class:
 // ACCESS_HASH_MASK = 1, FIRST_NAME_MASK = 2, ..., PHONE_MASK = 16,
@@ -1888,6 +1889,35 @@ pub(crate) enum UserNetKind {
     ClearRecent,
     /// `GetCollectibleEmojiStatusesQuery` (cpp:319).
     GetCollectible,
+    /// `SaveMusicQuery` (cpp:1540) — the kind carries the anchor pair
+    /// for the `on_add_saved_music` tail (the handler's `file_id_`/
+    /// `after_file_id_` members); the file-reference repair of on_error
+    /// rides the Files plane (the plain error fails the promise).
+    SaveMusic {
+        file_id: FileId,
+        after_file_id: FileId,
+    },
+    /// `UnsaveMusicQuery` (cpp:1596) — the kind carries the removed
+    /// file for the `on_remove_saved_music` tail (the handler's
+    /// `file_id_`; the on_error file-reference log rides Files).
+    UnsaveMusic { file_id: FileId },
+    /// `GetUserSavedMusicQuery` (cpp:1630) — the kind carries the
+    /// handler's `user_id_`/`offset_`/`limit_` members for the intake;
+    /// the answer constructor gate (non-`users_savedMusic` → 500) and
+    /// the query-promise lambda (`finish_get_user_saved_music`) run on
+    /// the Td side.
+    GetUserSavedMusic {
+        user_id: UserId,
+        offset: i32,
+        limit: i32,
+    },
+    /// `GetUserSavedMusicByIdQuery` (cpp:1672) — the kind carries the
+    /// owner user for the document intake; the caller promise is
+    /// query-carried (the §5 fidelity item restored with net-drain 09).
+    GetUserSavedMusicById { user_id: UserId },
+    /// `GetSavedMusicIdsQuery` (cpp:1720) — no members; the answer
+    /// rides the `reload_my_saved_music_queries` family queue.
+    GetSavedMusicIds,
 }
 
 /// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
@@ -2091,6 +2121,14 @@ pub struct UserManager {
     user_photos: BTreeMap<i64, UserPhotos>,
     /// `pending_get_user_photos_requests_` (UserManager.h:1259).
     pending_get_user_photos_requests: BTreeMap<i64, Vec<PendingGetPhotoRequest>>,
+    /// The `SaveMusicQuery` promises (UserManager.cpp:1542).
+    pending_add_saved_music_queries: Vec<Promise<()>>,
+    /// The `UnsaveMusicQuery` promises (UserManager.cpp:1598).
+    pending_remove_saved_music_queries: Vec<Promise<()>>,
+    /// The `GetUserSavedMusicByIdQuery` promises (UserManager.cpp:1674)
+    /// — query-carried in the C++, restored here (the §5 fidelity
+    /// item).
+    pending_reload_saved_music_by_id_queries: Vec<Promise<()>>,
     /// `pending_user_photos_` (UserManager.h:1262) — the bot
     /// without-chat-info-database photo hold.
     pending_user_photos: BTreeMap<i64, telegram_api::UserProfilePhoto>,
@@ -2117,6 +2155,11 @@ pub struct UserManager {
     saved_music_file_locations: BTreeMap<i32, (i64, i64)>,
     /// `reload_my_saved_music_queries_` (UserManager.h:1297).
     reload_my_saved_music_queries: Vec<Promise<()>>,
+    /// The `is_saved_music` not-inited follow-ups — the C++ queues the
+    /// `check_is_saved_music` lambda into the reload queue
+    /// (cpp:7155-7163); the file ids ride here and the intake drains
+    /// them after the queue resolves (the collapsed actor hop).
+    pending_saved_music_checks: Vec<(FileId, Promise<()>)>,
 
     /// `support_user_id_` (UserManager.h:1318) — the cached support user.
     support_user_id: UserId,
@@ -8871,6 +8914,35 @@ impl UserManager {
         self.update_user(env, user_id, false, false);
     }
 
+    /// The FIFO pop behind the `SaveMusic` answer (the C++ handler's
+    /// `promise_`, UserManager.cpp:1542).
+    pub(crate) fn take_add_saved_music_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_add_saved_music_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_add_saved_music_queries.remove(0))
+        }
+    }
+
+    /// The FIFO pop behind the `UnsaveMusic` answer (cpp:1598).
+    pub(crate) fn take_remove_saved_music_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_remove_saved_music_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_remove_saved_music_queries.remove(0))
+        }
+    }
+
+    /// The FIFO pop behind the `GetUserSavedMusicById` answer — the
+    /// query-carried promise (§5).
+    pub(crate) fn take_reload_saved_music_by_id_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_reload_saved_music_by_id_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_reload_saved_music_by_id_queries.remove(0))
+        }
+    }
+
     /// `UserManager::get_user_profile_photos`
     /// (UserManager.cpp:6826-6885). The `photos.getUserPhotos` send is
     /// [blocked: net] (M.4.16); requests park in the pending queue.
@@ -9340,7 +9412,9 @@ impl UserManager {
         let value = binlog_pmc.get_raw(Self::get_my_saved_music_ids_database_key().as_bytes());
         let ids = Self::parse_my_saved_music_ids(&value);
         let Some(ids) = ids else {
-            // reload_my_saved_music_list — the net step
+            // `reload_my_saved_music_list(Auto())` (cpp:2836) — the
+            // fire-and-forget reload rides the dispatcher (net-drain 09)
+            self.reload_my_saved_music_list(Promise::default());
             return;
         };
         for saved_music_id in ids {
@@ -9395,11 +9469,20 @@ impl UserManager {
     }
 
     /// `UserManager::check_is_saved_music`'s local half
-    /// (UserManager.cpp:7168-7176): membership over the loaded set. The
-    /// `is_saved_music` not-inited reload and the `G()->close_status()`
-    /// gate are the net step (M.4.16); the FileId → document-id
+    /// (UserManager.cpp:7168-7176): the close gate, then membership
+    /// over the loaded set. The `is_saved_music` wrapper (net-drain 09)
+    /// handles the not-inited reload; the FileId → document-id
     /// conversion goes through the location registry.
-    pub fn check_is_saved_music(&mut self, file_id: FileId, promise: &mut Promise<()>) {
+    pub fn check_is_saved_music(
+        &mut self,
+        env: &UserEnv,
+        file_id: FileId,
+        promise: &mut Promise<()>,
+    ) {
+        if env.global.close_flag() {
+            promise.set_error(Status::error(500, "Request aborted"));
+            return;
+        }
         assert!(
             self.are_my_saved_music_ids_inited,
             "check_is_saved_music requires the loaded saved-music list"
@@ -9441,7 +9524,14 @@ impl UserManager {
     /// stand-in (the DocumentsManager step replaces it): a `document`
     /// carrying a non-voice `documentAttributeAudio` is saved music. It
     /// gets a placeholder FileId registered in the location registry.
-    fn parse_saved_music_document(&mut self, document: telegram_api::Document) -> Option<FileId> {
+    /// `AudiosManager::get_audio`'s document half over the registry
+    /// stand-in — the audio-attribute check plus the location-registry
+    /// insert. pub(crate) for the td-level netted round-trip seeds (the
+    /// client got the audio from a listing in the C++).
+    pub(crate) fn parse_saved_music_document(
+        &mut self,
+        document: telegram_api::Document,
+    ) -> Option<FileId> {
         let telegram_api::Document::document(document) = document else {
             return None;
         };
@@ -9487,8 +9577,10 @@ impl UserManager {
     }
 
     /// `UserManager::add_saved_music` (UserManager.cpp:7318-7332): the
-    /// validation is local; the `messages.saveMusic` send is [blocked:
-    /// net] (M.4.16).
+    /// validation is local; the `messages.saveMusic` send (the C++
+    /// `SaveMusicQuery`, cpp:1540) rides the `net` handle (net-drain 09)
+    /// — the answer feeds `on_add_saved_music` through the `SaveMusic`
+    /// kind (net-drain 09).
     pub fn add_saved_music(
         &mut self,
         file_id: FileId,
@@ -9497,20 +9589,61 @@ impl UserManager {
     ) {
         let mut file_id = file_id;
         let mut after_file_id = after_file_id;
-        if let Err(status) = self.check_saved_music_file_id(&mut file_id, false) {
-            promise.set_error(status);
-            return;
-        }
-        if let Err(status) = self.check_saved_music_file_id(&mut after_file_id, true) {
-            promise.set_error(status);
-            return;
-        }
+        let (document_id, access_hash) = match self.check_saved_music_file_id(&mut file_id, false) {
+            Ok(location) => location,
+            Err(status) => {
+                promise.set_error(status);
+                return;
+            }
+        };
+        let (after_document_id, after_access_hash) =
+            match self.check_saved_music_file_id(&mut after_file_id, true) {
+                Ok(location) => location,
+                Err(status) => {
+                    promise.set_error(status);
+                    return;
+                }
+            };
         if file_id == after_file_id {
             promise.set_error(Status::error(400, "Can't place saved music after self"));
             return;
         }
-        self.net_blocked_promises.push(promise);
-        tdutils::log_info!("Send messages.saveMusic — [blocked: net]");
+        let has_after = after_file_id.is_valid();
+        self.pending_add_saved_music_queries.push(promise);
+        // `telegram_api::account_saveMusic::AFTER_ID_MASK`
+        const SAVE_MUSIC_AFTER_ID_MASK: i32 = 1 << 1;
+        let input_document =
+            telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+                id: document_id,
+                access_hash,
+                file_reference: Vec::new(),
+            });
+        let after_input_document = has_after.then(|| {
+            telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+                id: after_document_id,
+                access_hash: after_access_hash,
+                file_reference: Vec::new(),
+            })
+        });
+        match &self.net {
+            Some(net) => net.dispatch(
+                UserNetKind::SaveMusic {
+                    file_id,
+                    after_file_id,
+                },
+                telegram_api::Function::account_saveMusic(telegram_api::account_saveMusic {
+                    flags: if has_after {
+                        SAVE_MUSIC_AFTER_ID_MASK
+                    } else {
+                        0
+                    },
+                    unsave: false,
+                    id: Some(input_document),
+                    after_id: after_input_document,
+                }),
+            ),
+            None => tdutils::log_info!("Send account.saveMusic — [net-inert]"),
+        }
     }
 
     /// `UserManager::on_add_saved_music` (UserManager.cpp:7334-7370).
@@ -9598,16 +9731,37 @@ impl UserManager {
     }
 
     /// `UserManager::remove_saved_music` (UserManager.cpp:7372-7378) —
-    /// the validation is local; the `messages.unsaveMusic` send is
-    /// [blocked: net] (M.4.16).
+    /// the validation is local; the `account.saveMusic(unsave)` send
+    /// (the C++ `UnsaveMusicQuery`, cpp:1596) rides the `net` handle
+    /// (net-drain 09).
     pub fn remove_saved_music(&mut self, file_id: FileId, mut promise: Promise<()>) {
         let mut file_id = file_id;
-        if let Err(status) = self.check_saved_music_file_id(&mut file_id, false) {
-            promise.set_error(status);
-            return;
+        let (document_id, access_hash) = match self.check_saved_music_file_id(&mut file_id, false) {
+            Ok(location) => location,
+            Err(status) => {
+                promise.set_error(status);
+                return;
+            }
+        };
+        self.pending_remove_saved_music_queries.push(promise);
+        match &self.net {
+            Some(net) => net.dispatch(
+                UserNetKind::UnsaveMusic { file_id },
+                telegram_api::Function::account_saveMusic(telegram_api::account_saveMusic {
+                    flags: 0,
+                    unsave: true,
+                    id: Some(telegram_api::InputDocument::inputDocument(
+                        telegram_api::inputDocument {
+                            id: document_id,
+                            access_hash,
+                            file_reference: Vec::new(),
+                        },
+                    )),
+                    after_id: None,
+                }),
+            ),
+            None => tdutils::log_info!("Send account.saveMusic(unsave) — [net-inert]"),
         }
-        self.net_blocked_promises.push(promise);
-        tdutils::log_info!("Send messages.unsaveMusic — [blocked: net]");
     }
 
     /// `UserManager::on_remove_saved_music` (UserManager.cpp:7380-7420).
@@ -9827,12 +9981,16 @@ impl UserManager {
             return;
         }
 
-        self.send_get_user_saved_music_query(user_id);
+        self.send_get_user_saved_music_query(env, user_id);
     }
 
     /// `UserManager::send_get_user_saved_music_query`
-    /// (UserManager.cpp:7492-7518) — the send is [blocked: net] (M.4.16).
-    fn send_get_user_saved_music_query(&self, user_id: UserId) {
+    /// (UserManager.cpp:7492-7518) — the `users.getSavedMusic` send
+    /// (the C++ `GetUserSavedMusicQuery`, cpp:1630) rides the `net`
+    /// handle (net-drain 09); the answer feeds `on_get_user_saved_music`
+    /// and the query promise lambda routes
+    /// `finish_get_user_saved_music`.
+    fn send_get_user_saved_music_query(&mut self, env: &UserEnv, user_id: UserId) {
         let Some(requests) = self
             .pending_get_user_saved_music_requests
             .get(&user_id.get())
@@ -9855,10 +10013,26 @@ impl UserManager {
                 offset = cache_end;
             }
         }
-        tdutils::log_info!(
-            "Send users.getSavedMusic for {user_id:?} at offset {offset} limit {} — [blocked: net]",
-            limit.max(MAX_GET_SAVED_MUSIC / 5)
-        );
+        let limit = limit.max(MAX_GET_SAVED_MUSIC / 5);
+        let input_user = self.get_input_user_force(env, user_id);
+        match &self.net {
+            Some(net) => net.dispatch(
+                UserNetKind::GetUserSavedMusic {
+                    user_id,
+                    offset,
+                    limit,
+                },
+                telegram_api::Function::users_getSavedMusic(telegram_api::users_getSavedMusic {
+                    id: Some(input_user),
+                    offset,
+                    limit,
+                    hash: 0,
+                }),
+            ),
+            None => tdutils::log_info!(
+                "Send users.getSavedMusic for {user_id:?} at offset {offset} limit {limit} — [net-inert]"
+            ),
+        }
     }
 
     /// `UserManager::finish_get_user_saved_music`
@@ -9902,7 +10076,7 @@ impl UserManager {
             }
             self.pending_get_user_saved_music_requests
                 .insert(user_id.get(), pending_requests);
-            self.send_get_user_saved_music_query(user_id);
+            self.send_get_user_saved_music_query(env, user_id);
             return;
         }
 
@@ -9974,7 +10148,7 @@ impl UserManager {
             let need_send = requests.is_empty();
             requests.extend(left_requests);
             if need_send {
-                self.send_get_user_saved_music_query(user_id);
+                self.send_get_user_saved_music_query(env, user_id);
             }
         }
     }
@@ -10101,24 +10275,47 @@ impl UserManager {
     }
 
     /// `UserManager::reload_user_saved_music`
-    /// (UserManager.cpp:7659-7666) — the send is [blocked: net] (M.4.16).
+    /// (UserManager.cpp:7659-7666) — the `users.getSavedMusicByID` send
+    /// (the C++ `GetUserSavedMusicByIdQuery`, cpp:1672) rides the `net`
+    /// handle (net-drain 09); the caller promise is query-carried (§5).
+    /// The caller is the FileReferenceManager repair leg (Files plane).
     pub fn reload_user_saved_music(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
         document_id: i64,
         access_hash: i64,
-        promise: &mut Promise<()>,
+        mut promise: Promise<()>,
     ) {
         self.get_user_force(env, user_id, "reload_user_saved_music");
-        if let Err(status) = self.get_input_user(env, user_id) {
-            promise.set_error(status);
-            return;
+        let input_user = match self.get_input_user(env, user_id) {
+            Ok(input_user) => input_user,
+            Err(status) => {
+                promise.set_error(status);
+                return;
+            }
+        };
+        self.pending_reload_saved_music_by_id_queries.push(promise);
+        match &self.net {
+            Some(net) => net.dispatch(
+                UserNetKind::GetUserSavedMusicById { user_id },
+                telegram_api::Function::users_getSavedMusicByID(
+                    telegram_api::users_getSavedMusicByID {
+                        id: Some(input_user),
+                        documents: vec![telegram_api::InputDocument::inputDocument(
+                            telegram_api::inputDocument {
+                                id: document_id,
+                                access_hash,
+                                file_reference: Vec::new(),
+                            },
+                        )],
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Reload saved music document {document_id} (hash {access_hash}) of {user_id:?} — [net-inert]"
+            ),
         }
-        tdutils::log_info!(
-            "Reload saved music document {document_id} (hash {access_hash}) of {user_id:?} — \
-             [blocked: net]"
-        );
     }
 
     /// `UserManager::get_user_saved_music_file_source_id`
@@ -10176,48 +10373,99 @@ impl UserManager {
 
     /// `UserManager::reload_my_saved_music_list`
     /// (UserManager.cpp:7683-7699): the promise queue is local; the
-    /// `account.getSavedMusicIds` send is [blocked: net] (M.4.16) — the
-    /// queued promises complete there.
+    /// first queued caller sends `account.getSavedMusicIds` over the
+    /// `net` handle (net-drain 09) — the answer feeds
+    /// `on_get_my_saved_music_list` through the `GetSavedMusicIds` kind.
     pub fn reload_my_saved_music_list(&mut self, promise: Promise<()>) {
         self.reload_my_saved_music_queries.push(promise);
         if self.reload_my_saved_music_queries.len() != 1 {
             return;
         }
-        tdutils::log_info!("Send account.getSavedMusicIds — [blocked: net]");
+        self.send_reload_my_saved_music_list_query();
+    }
+
+    /// The `account.getSavedMusicIds` send leg (cpp:7702-7706) — the
+    /// vector hash over the sorted id set (the BTreeSet iterates
+    /// ascending; the C++ sorts its copy).
+    fn send_reload_my_saved_music_list_query(&mut self) {
+        let numbers: Vec<u64> = self
+            .my_saved_music_ids
+            .iter()
+            .map(|&id| id as u64)
+            .collect();
+        let hash = get_vector_hash(&numbers);
+        match &self.net {
+            Some(net) => net.dispatch(
+                UserNetKind::GetSavedMusicIds,
+                telegram_api::Function::account_getSavedMusicIds(
+                    telegram_api::account_getSavedMusicIds { hash },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getSavedMusicIds — [net-inert]"),
+        }
+    }
+
+    /// `UserManager::is_saved_music` (UserManager.cpp:7154-7166): the
+    /// loaded set answers locally; the not-inited list queues the
+    /// follow-up check (the C++ lambda) and rides the reload.
+    pub fn is_saved_music(&mut self, env: &mut UserEnv, file_id: FileId, mut promise: Promise<()>) {
+        if !self.are_my_saved_music_ids_inited {
+            self.pending_saved_music_checks.push((file_id, promise));
+            self.reload_my_saved_music_list(Promise::default());
+            return;
+        }
+        self.check_is_saved_music(env, file_id, &mut promise);
     }
 
     /// `UserManager::on_get_my_saved_music_list`
     /// (UserManager.cpp:7701-7738). The close-path abort applies when
-    /// the result is ok; the not-modified form keeps the set.
+    /// the result is ok; the error arm fails the queue and the
+    /// `is_saved_music` follow-ups; the not-modified form keeps the set;
+    /// the ok tail re-runs the queued checks (the collapsed C++ lambda
+    /// hop).
     pub fn on_get_my_saved_music_list(
         &mut self,
         env: &mut UserEnv,
-        saved_music_ids: telegram_api::account_SavedMusicIds,
+        saved_music_ids: Result<telegram_api::account_SavedMusicIds, Status>,
     ) {
-        let mut promises = std::mem::take(&mut self.reload_my_saved_music_queries);
-        if env.global.close_flag() {
+        let saved_music_ids = if env.global.close_flag() && saved_music_ids.is_ok() {
             // the C++ turns an ok result into request_aborted_error
+            Err(Status::error(500, "Request aborted"))
+        } else {
+            saved_music_ids
+        };
+        let mut promises = std::mem::take(&mut self.reload_my_saved_music_queries);
+        if let Err(status) = saved_music_ids {
             for promise in &mut promises {
-                promise.set_error(Status::error(500, "Request aborted"));
+                promise.set_error(status.clone());
+            }
+            for (_, mut promise) in std::mem::take(&mut self.pending_saved_music_checks) {
+                promise.set_error(status.clone());
             }
             return;
         }
+        let saved_music_ids = saved_music_ids.as_ref().ok().unwrap();
         match saved_music_ids {
             telegram_api::account_SavedMusicIds::account_savedMusicIdsNotModified(_) => {}
             telegram_api::account_SavedMusicIds::account_savedMusicIds(ids) => {
                 self.my_saved_music_ids.clear();
-                for saved_music_id in ids.ids {
-                    if saved_music_id == 0 || self.my_saved_music_ids.contains(&saved_music_id) {
+                for saved_music_id in &ids.ids {
+                    if *saved_music_id == 0 || self.my_saved_music_ids.contains(saved_music_id) {
                         tdutils::log_error!("Receive {saved_music_id}");
                         continue;
                     }
-                    self.my_saved_music_ids.insert(saved_music_id);
+                    self.my_saved_music_ids.insert(*saved_music_id);
                 }
                 self.save_my_saved_music_ids(env);
             }
         }
         for promise in &mut promises {
             promise.set_value(());
+        }
+        // the `is_saved_music` not-inited follow-ups (the C++ lambda hop
+        // send_closure(actor_id, &UserManager::check_is_saved_music))
+        for (file_id, mut promise) in std::mem::take(&mut self.pending_saved_music_checks) {
+            self.check_is_saved_music(env, file_id, &mut promise);
         }
     }
 
@@ -16277,26 +16525,27 @@ mod tests {
         um.my_saved_music_ids.insert(201);
         um.are_my_saved_music_ids_inited = true;
         let (mut p4, a4) = recording_promise::<()>();
-        um.check_is_saved_music(file_id, &mut p4);
+        um.check_is_saved_music(&temp.env(false), file_id, &mut p4);
         assert!(matches!(a4.lock().unwrap().as_slice()[0], Ok(())));
         let other = um
             .parse_saved_music_document(audio_document(202, 22))
             .unwrap();
         let (mut p5, a5) = recording_promise::<()>();
-        um.check_is_saved_music(other, &mut p5);
+        um.check_is_saved_music(&temp.env(false), other, &mut p5);
         assert_eq!(a5.lock().unwrap().as_slice(), [Err("Not Found".to_owned())]);
 
-        // reload_my_saved_music_list parks the promise (the send is the
-        // net step); the ok intake replaces the set and completes it.
+        // reload_my_saved_music_list parks the promise (the send is
+        // net-inert at the manager level); the ok intake replaces the
+        // set and completes it.
         let (p6, a6) = recording_promise::<()>();
         um.reload_my_saved_music_list(p6);
         um.on_get_my_saved_music_list(
             &mut temp.env(false),
-            telegram_api::account_SavedMusicIds::account_savedMusicIds(
+            Ok(telegram_api::account_SavedMusicIds::account_savedMusicIds(
                 telegram_api::account_savedMusicIds {
                     ids: vec![0, 202, 202, 203],
                 },
-            ),
+            )),
         );
         assert!(matches!(a6.lock().unwrap().as_slice()[0], Ok(())));
         assert_eq!(
@@ -16317,12 +16566,28 @@ mod tests {
         um.reload_my_saved_music_list(p7);
         um.on_get_my_saved_music_list(
             &mut temp.env(false),
-            telegram_api::account_SavedMusicIds::account_savedMusicIdsNotModified(
-                telegram_api::account_savedMusicIdsNotModified {},
+            Ok(
+                telegram_api::account_SavedMusicIds::account_savedMusicIdsNotModified(
+                    telegram_api::account_savedMusicIdsNotModified {},
+                ),
             ),
         );
         assert!(matches!(a7.lock().unwrap().as_slice()[0], Ok(())));
         assert_eq!(um.my_saved_music_ids.len(), 2);
+
+        // The error arm fails the queue (the C++ on_error →
+        // fail_promises hop).
+        let (p8, a8) = recording_promise::<()>();
+        um.reload_my_saved_music_list(p8);
+        um.on_get_my_saved_music_list(
+            &mut temp.env(false),
+            Err(Status::error(429, "Too Many Requests")),
+        );
+        assert_eq!(
+            a8.lock().unwrap().as_slice(),
+            [Err("Too Many Requests".to_owned())]
+        );
+        assert!(um.reload_my_saved_music_queries.is_empty(), "drained");
     }
 
     #[test]

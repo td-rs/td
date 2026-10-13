@@ -7950,6 +7950,69 @@ impl Td {
             Status::error(500, &format!("Failed to parse the {what} answer"))
         }
         let mut user_manager = std::mem::take(&mut self.user_manager);
+        // The saved-music by-id arm touches only the documents plane (the
+        // C++ on_result loop, cpp:1693-1708) — no UserEnv reads, so it
+        // runs before the env borrow below.
+        if let crate::user_manager::UserNetKind::GetUserSavedMusicById { user_id } = kind {
+            // `GetUserSavedMusicByIdQuery::on_result`/`on_error`
+            // (cpp:1688-1716) — the constructor gate, the document
+            // intake loop and the query-carried promise (§5)
+            let result = if query.is_error() {
+                Err(query.error().clone())
+            } else {
+                telegram_api::users_SavedMusic::parse(query.ok())
+                    .map_err(|_| parse_error("users_getSavedMusicByID"))
+            };
+            match result {
+                Ok(telegram_api::users_SavedMusic::users_savedMusic(saved_music)) => {
+                    for document in saved_music.documents {
+                        let telegram_api::Document::document(document) = document else {
+                            continue;
+                        };
+                        let (mut env, documents) = self.documents_env();
+                        let parsed = documents.on_get_document(
+                            &mut env,
+                            crate::documents_manager::RemoteDocument::from_server_document(
+                                document,
+                            ),
+                            crate::messages_manager::DialogId::from_user_id(user_id),
+                            false,
+                            false,
+                            crate::document::DocumentType::General,
+                            crate::documents_manager::Subtype::Other,
+                        );
+                        if parsed.type_ != crate::document::DocumentType::Audio {
+                            tdutils::log_error!(
+                                "Receive non-audio saved music document {:?}",
+                                parsed.type_
+                            );
+                        }
+                    }
+                    if let Some(mut promise) =
+                        user_manager.take_reload_saved_music_by_id_query_promise()
+                    {
+                        promise.set_value(());
+                    }
+                }
+                Ok(telegram_api::users_SavedMusic::users_savedMusicNotModified(_)) => {
+                    // the C++ `get_id() != users_savedMusic::ID` band
+                    if let Some(mut promise) =
+                        user_manager.take_reload_saved_music_by_id_query_promise()
+                    {
+                        promise.set_error(Status::error(500, "Receive invalid response"));
+                    }
+                }
+                Err(status) => {
+                    if let Some(mut promise) =
+                        user_manager.take_reload_saved_music_by_id_query_promise()
+                    {
+                        promise.set_error(status);
+                    }
+                }
+            }
+            self.user_manager = user_manager;
+            return;
+        }
         let is_bot = self.auth_manager.is_bot();
         let Some(options) = self.option_manager.as_mut() else {
             self.user_manager = user_manager;
@@ -8096,6 +8159,123 @@ impl Td {
                         .ok_or_else(|| parse_error("account_clearRecentEmojiStatuses"))
                 };
                 user_manager.on_clear_recent_emoji_statuses(&mut env, result);
+            }
+            crate::user_manager::UserNetKind::SaveMusic {
+                file_id,
+                after_file_id,
+            } => {
+                // `SaveMusicQuery::on_result`/`on_error` (cpp:1567-1594)
+                // — the ok tail is `on_add_saved_music` with the handler
+                // members; the file-reference repair of on_error rides
+                // the Files plane, the plain error fails the promise
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok()).ok_or_else(|| parse_error("account_saveMusic"))
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(mut promise) = user_manager.take_add_saved_music_query_promise()
+                        {
+                            user_manager.on_add_saved_music(
+                                &mut env,
+                                file_id,
+                                after_file_id,
+                                &mut promise,
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) = user_manager.take_add_saved_music_query_promise()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::UnsaveMusic { file_id } => {
+                // `UnsaveMusicQuery::on_result`/`on_error` (cpp:1613-1628)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok()).ok_or_else(|| parse_error("account_saveMusic"))
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(mut promise) =
+                            user_manager.take_remove_saved_music_query_promise()
+                        {
+                            user_manager.on_remove_saved_music(&mut env, file_id, &mut promise);
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) =
+                            user_manager.take_remove_saved_music_query_promise()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::GetUserSavedMusic {
+                user_id,
+                offset,
+                limit,
+            } => {
+                // `GetUserSavedMusicQuery::on_result`/`on_error`
+                // (cpp:1650-1670) — the constructor gate, the intake,
+                // then the query-promise lambda's
+                // `finish_get_user_saved_music` routing
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::users_SavedMusic::parse(query.ok())
+                        .map_err(|_| parse_error("users_getSavedMusic"))
+                };
+                match result {
+                    Ok(telegram_api::users_SavedMusic::users_savedMusic(saved_music)) => {
+                        tdutils::log_info!(
+                            "Receive result for GetUserSavedMusicQuery: count {} documents {}",
+                            saved_music.count,
+                            saved_music.documents.len()
+                        );
+                        user_manager.on_get_user_saved_music(
+                            &mut env,
+                            user_id,
+                            offset,
+                            limit,
+                            saved_music.count,
+                            saved_music.documents,
+                        );
+                        user_manager.finish_get_user_saved_music(&env, user_id, Ok(()));
+                    }
+                    Ok(telegram_api::users_SavedMusic::users_savedMusicNotModified(_)) => {
+                        user_manager.finish_get_user_saved_music(
+                            &env,
+                            user_id,
+                            Err(Status::error(500, "Receive invalid response")),
+                        );
+                    }
+                    Err(status) => {
+                        user_manager.finish_get_user_saved_music(&env, user_id, Err(status));
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::GetUserSavedMusicById { .. } => {
+                // handled above — the env-free documents plane
+                unreachable!("GetUserSavedMusicById answered before the env construction")
+            }
+            crate::user_manager::UserNetKind::GetSavedMusicIds => {
+                // `GetSavedMusicIdsQuery::on_result`/`on_error`
+                // (cpp:1739-1754) — the raw answer rides the intake (the
+                // C++ query-promise lambda)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_SavedMusicIds::parse(query.ok())
+                        .map_err(|_| parse_error("account_getSavedMusicIds"))
+                };
+                user_manager.on_get_my_saved_music_list(&mut env, result);
             }
         }
         self.user_manager = user_manager;
@@ -32954,10 +33134,10 @@ mod tests {
 
     /// The env over the disjoint Td fields — the `user_env!` shape at the
     /// requests layer, inline for the netted harness.
-    fn with_user_manager(
+    fn with_user_manager<R>(
         td: &mut Td,
-        f: impl FnOnce(&mut crate::user_manager::UserManager, &mut crate::user_manager::UserEnv),
-    ) {
+        f: impl FnOnce(&mut crate::user_manager::UserManager, &mut crate::user_manager::UserEnv) -> R,
+    ) -> R {
         let mut user_manager = std::mem::take(&mut td.user_manager);
         let auth_is_bot = td.auth_manager.is_bot();
         let Some(options) = td.option_manager.as_mut() else {
@@ -32968,8 +33148,9 @@ mod tests {
             options,
             auth_is_bot,
         };
-        f(&mut user_manager, &mut env);
+        let f_result = f(&mut user_manager, &mut env);
         td.user_manager = user_manager;
+        f_result
     }
 
     type CustomEmojiListSlot = std::sync::Arc<
@@ -33625,6 +33806,431 @@ mod tests {
             let _ = user_full_info;
             assert!(callback.errors.lock().iter().all(|(id, _)| *id != 3));
         });
+    }
+
+    // ---- net-drain 09 (§3.1 #15-#19): the saved-music five ride the
+    // dispatcher — the four live td_api arms round-trip (the
+    // setProfileAudioPosition / removeProfileAudio / getUserProfileAudios
+    // / isProfileAudio request arms) and the by-id reload (the
+    // Files-plane repair caller) rides the manager seam with the
+    // query-carried promise restored (the §5 fidelity item). ----
+
+    /// One wire audio document (the `users_savedMusic` answer member).
+    fn wire_audio_document(id: i64, access_hash: i64) -> telegram_api::Document {
+        telegram_api::Document::document(telegram_api::document {
+            flags: 0,
+            id,
+            access_hash,
+            file_reference: Vec::new(),
+            date: 1234,
+            mime_type: "audio/mpeg".to_owned(),
+            size: 100_000,
+            thumbs: Vec::new(),
+            video_thumbs: Vec::new(),
+            dc_id: 2,
+            attributes: vec![telegram_api::DocumentAttribute::documentAttributeAudio(
+                telegram_api::documentAttributeAudio {
+                    flags: 0,
+                    voice: false,
+                    duration: 180,
+                    title: "Song".to_owned(),
+                    performer: "Artist".to_owned(),
+                    waveform: Vec::new(),
+                },
+            )],
+        })
+    }
+
+    /// A boxed `users_savedMusic` answer.
+    fn saved_music_answer(count: i32, documents: Vec<telegram_api::Document>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::users_SavedMusic::users_savedMusic(telegram_api::users_savedMusic {
+            count,
+            documents,
+        })
+        .store(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn saved_music_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(saved_music_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn saved_music_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-saved-music");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        with_user_manager(&mut td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(900));
+        });
+        seed_dialog_user(&mut td);
+        // the location-registry seeds — the client got these audios from
+        // a profile listing in the C++ (the parse registers the pair the
+        // inputDocument builders read back)
+        let file_id = with_user_manager(&mut td, |manager, _env| {
+            manager.parse_saved_music_document(wire_audio_document(202, 22))
+        })
+        .expect("the audio parses");
+        let after_file_id = with_user_manager(&mut td, |manager, _env| {
+            manager.parse_saved_music_document(wire_audio_document(204, 24))
+        })
+        .expect("the anchor audio parses");
+        let stranger_file_id = with_user_manager(&mut td, |manager, _env| {
+            manager.parse_saved_music_document(wire_audio_document(206, 26))
+        })
+        .expect("the stranger audio parses");
+
+        // 1. isProfileAudio — the not-inited list parks the check and
+        //    dispatches account.getSavedMusicIds (the vector hash over
+        //    the empty set is 0), the answer replaces the set and the
+        //    collapsed lambda hop re-runs the check.
+        td.request(
+            1,
+            Function::isProfileAudio(td_api::isProfileAudio {
+                file_id: file_id.get(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getSavedMusicIds::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_getSavedMusicIds(payload) => {
+                assert_eq!(payload.hash, 0, "the empty set hashes to 0");
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        let mut ids_answer = Vec::new();
+        telegram_api::account_SavedMusicIds::account_savedMusicIds(
+            telegram_api::account_savedMusicIds { ids: vec![202] },
+        )
+        .store(&mut ids_answer);
+        net_complete(sent, ids_answer);
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the isProfileAudio bands — the loaded set answers the
+        //    member locally (no query) and 404s the stranger.
+        td.request(
+            2,
+            Function::isProfileAudio(td_api::isProfileAudio {
+                file_id: file_id.get(),
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "the loaded set answers locally");
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        td.request(
+            3,
+            Function::isProfileAudio(td_api::isProfileAudio {
+                file_id: stranger_file_id.get(),
+            }),
+        );
+        assert!(rec.sent.lock().is_empty());
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+
+        // 4. setProfileAudioPosition — the live arm validates locally,
+        //    dispatches account.saveMusic with the anchor flag and the
+        //    inputDocument pair, and the Bool answer runs
+        //    on_add_saved_music (the save cache-side).
+        td.request(
+            4,
+            Function::setProfileAudioPosition(td_api::setProfileAudioPosition {
+                file_id: file_id.get(),
+                after_file_id: after_file_id.get(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_saveMusic::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_saveMusic(payload) => {
+                assert_eq!(payload.flags & (1 << 1), 1 << 1, "the anchor flag");
+                assert!(!payload.unsave);
+                match payload.id {
+                    Some(telegram_api::InputDocument::inputDocument(document)) => {
+                        assert_eq!(document.id, 202);
+                        assert_eq!(document.access_hash, 22);
+                    }
+                    other => panic!("the document: {other:?}"),
+                }
+                match payload.after_id {
+                    Some(telegram_api::InputDocument::inputDocument(document)) => {
+                        assert_eq!(document.id, 204);
+                        assert_eq!(document.access_hash, 24);
+                    }
+                    other => panic!("the anchor document: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 5. the save error band — the plain error fails the promise (the
+        //    file-reference repair leg rides the Files plane).
+        td.request(
+            5,
+            Function::setProfileAudioPosition(td_api::setProfileAudioPosition {
+                file_id: file_id.get(),
+                after_file_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_saveMusic::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_saveMusic(payload) => {
+                assert_eq!(payload.flags & (1 << 1), 0, "no anchor");
+                assert!(!payload.unsave);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_fail(sent, 420, "FLOOD_WAIT_3");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_3"));
+
+        // 6. removeProfileAudio — the unsave form of the same query, and
+        //    the on_remove_saved_music tail runs on the Bool answer.
+        td.request(
+            6,
+            Function::removeProfileAudio(td_api::removeProfileAudio {
+                file_id: file_id.get(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_saveMusic::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_saveMusic(payload) => {
+                assert!(payload.unsave);
+                match payload.id {
+                    Some(telegram_api::InputDocument::inputDocument(document)) => {
+                        assert_eq!(document.id, 202);
+                    }
+                    other => panic!("the document: {other:?}"),
+                }
+                assert!(payload.after_id.is_none());
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. getUserProfileAudios — the cache miss parks the request,
+        //    users.getSavedMusic rides the dispatcher (the limit bumps to
+        //    MAX_GET_SAVED_MUSIC / 5), the answer feeds the intake and
+        //    finish_get_user_saved_music completes the parked request.
+        td.request(
+            7,
+            Function::getUserProfileAudios(td_api::getUserProfileAudios {
+                user_id: 700000001,
+                offset: 0,
+                limit: 1,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getSavedMusic::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::users_getSavedMusic(payload) => {
+                match payload.id {
+                    Some(telegram_api::InputUser::inputUser(user)) => {
+                        assert_eq!(user.user_id, 700000001);
+                        assert_eq!(user.access_hash, 5);
+                    }
+                    other => panic!("the input user: {other:?}"),
+                }
+                assert_eq!(payload.offset, 0);
+                assert_eq!(payload.limit, crate::user_manager::MAX_GET_SAVED_MUSIC / 5);
+                assert_eq!(payload.hash, 0);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            saved_music_answer(30, vec![wire_audio_document(301, 33)]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 7);
+        let Object::audios(audios) = responses.first().unwrap() else {
+            panic!("the audios object, got {:?}", responses.first());
+        };
+        assert_eq!(audios.total_count, 30);
+        assert_eq!(audios.audios.len(), 1);
+
+        // 8. the getSavedMusic band — a cache-window miss (offset 20
+        //    with the cache covering [0, 1) of 30) parks the request,
+        //    the notModified answer breaks the constructor gate and the
+        //    parked request fails with the C++ 500.
+        td.request(
+            8,
+            Function::getUserProfileAudios(td_api::getUserProfileAudios {
+                user_id: 700000001,
+                offset: 20,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getSavedMusic::ID,
+        );
+        let mut not_modified = Vec::new();
+        telegram_api::users_SavedMusic::users_savedMusicNotModified(
+            telegram_api::users_savedMusicNotModified { count: 0 },
+        )
+        .store(&mut not_modified);
+        net_complete(sent, not_modified.clone());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 9. the beyond-total band — offset >= the known count answers
+        //    the empty audios locally (cpp:7449-7453), no query.
+        td.request(
+            9,
+            Function::getUserProfileAudios(td_api::getUserProfileAudios {
+                user_id: 700000001,
+                offset: 30,
+                limit: 10,
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "beyond-total answers locally");
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 9);
+        let Object::audios(audios) = responses.first().unwrap() else {
+            panic!("the empty audios object");
+        };
+        assert_eq!((audios.total_count, audios.audios.len()), (30, 0));
+
+        // 10. reload_user_saved_music — the manager seam (the caller is
+        //     the FileReferenceManager repair leg), users.getSavedMusicByID
+        //     with the one-element document vector, and the caller promise
+        //     is query-carried (the §5 fidelity item).
+        let (promise, slot) = record_ton_unit();
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_user_saved_music(
+                env,
+                crate::user_manager::UserId::new(700000001),
+                305,
+                35,
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getSavedMusicByID::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::users_getSavedMusicByID(payload) => match payload.id {
+                Some(telegram_api::InputUser::inputUser(user)) => {
+                    assert_eq!(user.user_id, 700000001);
+                    assert_eq!(user.access_hash, 5);
+                }
+                other => panic!("the input user: {other:?}"),
+            },
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            saved_music_answer(1, vec![wire_audio_document(305, 35)]),
+        );
+        td.dispatch_completed_user_net();
+        assert!(
+            matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the query-carried promise completes"
+        );
+
+        // 11. the by-id band — the wrong constructor and the query error
+        //     both fail the carried promise.
+        let (promise, slot) = record_ton_unit();
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_user_saved_music(
+                env,
+                crate::user_manager::UserId::new(700000001),
+                306,
+                36,
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getSavedMusicByID::ID,
+        );
+        net_complete(sent, not_modified);
+        td.dispatch_completed_user_net();
+        let failure = slot.lock().unwrap().clone().unwrap();
+        match failure {
+            tdutils::status::Result::Err(status) => {
+                assert_eq!(status.message(), "Receive invalid response");
+            }
+            tdutils::status::Result::Ok(()) => panic!("the carried promise fails"),
+        }
+
+        let (promise, slot) = record_ton_unit();
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_user_saved_music(
+                env,
+                crate::user_manager::UserId::new(700000001),
+                307,
+                37,
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_getSavedMusicByID::ID,
+        );
+        net_fail(sent, 400, "DOCUMENT_INVALID");
+        td.dispatch_completed_user_net();
+        let failure = slot.lock().unwrap().clone().unwrap();
+        match failure {
+            tdutils::status::Result::Err(status) => {
+                assert_eq!(status.message(), "DOCUMENT_INVALID");
+            }
+            tdutils::status::Result::Ok(()) => panic!("the carried promise fails"),
+        }
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
 
     // ---- the §2 flip slice: the ported-but-intercepted td_api arms ride

@@ -4017,13 +4017,15 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::isProfileAudio(request) => {
             // Requests.cpp:7137-7142: answers over the loaded my-saved-
-            // music list
+            // music list; the not-inited list rides the
+            // account.getSavedMusicIds reload (net-drain 09)
             if !check_is_user(td, id) {
                 return;
             }
-            let mut promise = td.deferred_promise(id, |()| ok_object());
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = user_env!(td);
             td.user_manager
-                .check_is_saved_music(FileId::new(request.file_id, 0), &mut promise);
+                .is_saved_music(&mut env, FileId::new(request.file_id, 0), promise);
         }
         Function::setProfileAudioPosition(request) => {
             // Requests.cpp:7149-7155: validation is local; the promise
