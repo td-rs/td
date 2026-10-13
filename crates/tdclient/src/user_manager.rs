@@ -1962,7 +1962,8 @@ pub(crate) enum UserNetKind {
     /// `on_get_contacts_statuses`.
     GetContactsStatuses,
     /// `AddContactQuery` (cpp:209) — the user id (the error tail's
-    /// reload refire) and the query-carried promise ride the family
+    /// dialog action-bar reload — the MessagesManager step parks with
+    /// its plane) and the query-carried promise ride the family
     /// queue (the §5 restore); the Updates answer re-enters
     /// `on_get_updates`.
     AddContact,
@@ -1996,7 +1997,8 @@ pub(crate) enum UserNetKind {
     /// ride the family queue (the §5 restore).
     ResolvePhone,
     /// `AcceptContactQuery` (cpp:322) — the user id (the error tail's
-    /// reload refire) and the promise ride the family queue (the §5
+    /// dialog action-bar reload — the MessagesManager step parks with
+    /// its plane) and the promise ride the family queue (the §5
     /// restore); the Updates answer re-enters `on_get_updates`.
     AcceptContact,
 }

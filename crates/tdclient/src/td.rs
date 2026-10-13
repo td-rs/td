@@ -8554,8 +8554,24 @@ impl Td {
                 // peer gate answers the 500 on a non-user peer, the ok
                 // band caches through `on_resolved_phone_number` then
                 // drains the parked search requests; the
-                // PHONE_NOT_OCCUPIED band caches the negative answer
-                if let Some((phone_number, mut promise)) = user_manager.take_resolve_phone_query() {
+                // PHONE_NOT_OCCUPIED band caches the negative answer.
+                // The cache write keys on the handler's `phone_number_`
+                // member — re-read off the serialized query (the
+                // NetQuery carries its own payload), so the phone→user
+                // pairing stays exact where the FIFO pop only drives
+                // the promise (the §5 shape)
+                let query_phone_number = match telegram_api::Function::parse(query.query()) {
+                    Ok(telegram_api::Function::contacts_resolvePhone(payload)) => {
+                        Some(payload.phone)
+                    }
+                    _ => None,
+                };
+                if let Some((parked_phone_number, mut promise)) =
+                    user_manager.take_resolve_phone_query()
+                {
+                    // the popped pair's phone is the fallback; the query's
+                    // own payload wins (the C++ member semantics)
+                    let phone_number = query_phone_number.unwrap_or(parked_phone_number);
                     if query.is_error() {
                         let status = query.error().clone();
                         if status.message() == "PHONE_NOT_OCCUPIED" {
@@ -36173,25 +36189,28 @@ mod tests {
     // searchUserByPhoneNumber / sharePhoneNumber / importContacts) with
     // the §5 query-carried promises restored over the family queues. ----
 
+    /// The wire `user` form of the contacts seed — access hash 42, a
+    /// first name and the contact flag (the answer builders reuse it).
+    fn contacts_wire_user(id: i64, name: &str, contact: bool) -> telegram_api::User {
+        telegram_api::User::user(telegram_api::user {
+            flags: 1 | (1 << 1), // access_hash + first_name
+            access_hash: 42,
+            id,
+            first_name: name.to_owned(),
+            contact,
+            ..telegram_api::user::default()
+        })
+    }
+
     /// The me + Alice + Bob seed — Alice is a contact (the delete/close-
     /// friends rounds read her flag), Bob a plain peer (the addContact /
     /// acceptContact targets).
     fn seed_contacts_users(td: &mut Td) {
-        let wire_flags_user = |id: i64, name: &str, contact: bool| {
-            telegram_api::User::user(telegram_api::user {
-                flags: 1 | (1 << 1), // access_hash + first_name
-                access_hash: 42,
-                id,
-                first_name: name.to_owned(),
-                contact,
-                ..telegram_api::user::default()
-            })
-        };
         with_user_manager(&mut *td, |manager, env| {
             manager.set_my_id(env, crate::user_manager::UserId::new(700000001));
-            manager.on_get_user(env, wire_flags_user(700000001, "Me", false), "t");
-            manager.on_get_user(env, wire_flags_user(5, "Alice", true), "t");
-            manager.on_get_user(env, wire_flags_user(6, "Bob", false), "t");
+            manager.on_get_user(env, contacts_wire_user(700000001, "Me", false), "t");
+            manager.on_get_user(env, contacts_wire_user(5, "Alice", true), "t");
+            manager.on_get_user(env, contacts_wire_user(6, "Bob", false), "t");
         });
     }
 
@@ -36286,16 +36305,6 @@ mod tests {
     fn contacts_families_ride_the_dispatcher_impl() {
         let (mut td, rec, callback) = netted_td_with_callback("netfix-user-contacts");
         seed_contacts_users(&mut td);
-        let wire_flags_user = |id: i64, name: &str, contact: bool| {
-            telegram_api::User::user(telegram_api::user {
-                flags: 1 | (1 << 1),
-                access_hash: 42,
-                id,
-                first_name: name.to_owned(),
-                contact,
-                ..telegram_api::user::default()
-            })
-        };
 
         // 1. getContacts — the request parks behind the load, the load
         //    dispatches contacts.getContacts (hash 0 while unloaded), the
@@ -36313,7 +36322,7 @@ mod tests {
         }
         net_complete(
             sent,
-            contacts_list_answer(1, vec![wire_flags_user(5, "Alice", true)]),
+            contacts_list_answer(1, vec![contacts_wire_user(5, "Alice", true)]),
         );
         td.dispatch_completed_user_net();
         td.flush_deferred_results();
@@ -36499,7 +36508,7 @@ mod tests {
         );
         net_complete(
             refire,
-            contacts_list_answer(1, vec![wire_flags_user(5, "Alice", true)]),
+            contacts_list_answer(1, vec![contacts_wire_user(5, "Alice", true)]),
         );
         td.dispatch_completed_user_net();
 
@@ -36523,11 +36532,17 @@ mod tests {
             0,
             "on_update_contacts_reset ran"
         );
-        // on_update_contacts_reset's own reload refire
-        take_sent(
+        // on_update_contacts_reset's own reload refire — answer it so
+        // the sync date re-arms (the later error tails refire through it)
+        let refire = take_sent(
             std::mem::take(&mut *rec.sent.lock()),
             telegram_api::contacts_getContacts::ID,
         );
+        net_complete(
+            refire,
+            contacts_list_answer(1, vec![contacts_wire_user(5, "Alice", true)]),
+        );
+        td.dispatch_completed_user_net();
 
         // 6. hideContactCloseBirthdays — the dismiss form rides the
         //    inputPeerEmpty + action pair
@@ -36626,7 +36641,7 @@ mod tests {
         }
         net_complete(
             sent,
-            resolved_phone_answer(5, vec![wire_flags_user(5, "Alice", true)]),
+            resolved_phone_answer(5, vec![contacts_wire_user(5, "Alice", true)]),
         );
         td.dispatch_completed_user_net();
         td.flush_deferred_results();
@@ -36912,6 +36927,125 @@ mod tests {
             telegram_api::contacts_getBirthdays::ID,
         );
 
+        // 12. the deleteContacts error band — the promise fails and the
+        //     reload refire re-sends the sync query
+        td.request(
+            18,
+            Function::removeContacts(td_api::removeContacts { user_ids: vec![5] }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_deleteContacts::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_3");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 18);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_3"));
+        let refire = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+        net_complete(refire, contacts_not_modified_answer());
+        td.dispatch_completed_user_net();
+
+        // 13. the dismiss error band forwards to the request promise
+        td.request(
+            19,
+            Function::hideContactCloseBirthdays(td_api::hideContactCloseBirthdays),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_dismissSuggestion::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_8");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 19);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_8"));
+
+        // 14. remove_contacts_by_phone_number over the manager seam —
+        //     the Bool true band runs on_deleted_contacts (the contact
+        //     drops from the tree and the hints)
+        with_user_manager(&mut td, |manager, env| {
+            manager.remove_contacts_by_phone_number(
+                env,
+                vec!["+15551234".to_owned()],
+                vec![crate::user_manager::UserId::new(5)],
+                Promise::default(),
+            )
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_deleteByPhones::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_deleteByPhones(payload) => {
+                assert_eq!(payload.phones, vec!["+15551234".to_owned()]);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        assert!(
+            !td.user_manager
+                .get_user(crate::user_manager::UserId::new(5))
+                .is_some_and(|u| u.is_contact),
+            "on_deleted_contacts dropped the flag"
+        );
+
+        // 14b. the false band answers the C++ 500 + refetches
+        with_user_manager(&mut td, |manager, env| {
+            manager.remove_contacts_by_phone_number(
+                env,
+                vec!["+15559999".to_owned()],
+                Vec::new(),
+                Promise::default(),
+            )
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_deleteByPhones::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_user_net();
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn contacts_load_failure_errors_the_parked_requests() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(contacts_load_failure_errors_the_parked_requests_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn contacts_load_failure_errors_the_parked_requests_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-contacts-fail");
+        seed_contacts_users(&mut td);
+
+        // the unloaded getContacts parks the request behind the load; the
+        // load query's error band runs on_get_contacts_failed — the load
+        // promises fail and the parked td_api requests error out (the
+        // C++ request actors' do_send_error)
+        td.request(1, Function::getContacts(td_api::getContacts));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+        net_fail(sent, 500, "INTERNAL");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!((error.code, error.message.as_str()), (500, "INTERNAL"));
+        assert!(!td.user_manager.are_contacts_loaded());
         assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
 
