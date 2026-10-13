@@ -4265,6 +4265,13 @@ impl FileReferenceManager {
         file_source_id
     }
 
+    /// Test-only: the interned source count (the netted bot-preview
+    /// round-trip asserts the file-source registration through it).
+    #[cfg(test)]
+    pub(crate) fn file_sources_len(&self) -> usize {
+        self.file_sources.len()
+    }
+
     /// `add_node` (FileReferenceManager.cpp:327-334).
     fn add_node(&mut self, node_id: FileId) -> &mut FileSourceNode {
         assert!(node_id.is_valid());

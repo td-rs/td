@@ -5509,6 +5509,41 @@ impl UserManager {
         }
     }
 
+    /// `UserManager::on_update_bot_has_preview_medias`
+    /// (UserManager.cpp:4589-4604) — the `GetPreviewMediasQuery` ok tail:
+    /// flips the bot's `UserFull::has_preview_medias` and re-runs the
+    /// full-update broadcast. The `on_update_user_full_has_preview_medias`
+    /// static helper (cpp:4608-4614) folds inline.
+    pub fn on_update_bot_has_preview_medias(
+        &mut self,
+        env: &mut UserEnv,
+        bot_user_id: UserId,
+        has_preview_medias: bool,
+    ) {
+        if !bot_user_id.is_valid() {
+            tdutils::log_error!("Receive updateBotHasPreviewMedias about invalid {bot_user_id:?}");
+            return;
+        }
+        if !self.have_user_force(env, bot_user_id, "on_update_bot_has_preview_medias")
+            || !self.is_user_bot_of(bot_user_id)
+        {
+            return;
+        }
+        if env.auth_is_bot {
+            return;
+        }
+        if self.get_user_full_force(env, bot_user_id, "on_update_bot_has_preview_medias") {
+            {
+                let user_full = self.users_full.get_mut(&bot_user_id.get()).unwrap();
+                if user_full.has_preview_medias != has_preview_medias {
+                    user_full.has_preview_medias = has_preview_medias;
+                    user_full.is_changed = true;
+                }
+            }
+            self.update_user_full(env, bot_user_id, "on_update_bot_has_preview_medias", false);
+        }
+    }
+
     fn update_user_full_impl(
         &mut self,
         env: &mut UserEnv,
@@ -16464,6 +16499,68 @@ mod tests {
                 .get(b"usf5")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn on_update_bot_has_preview_medias_bands() {
+        let (mut temp, mut um) = test_env();
+        // the bot wire bits: an access hash, the contact flag and the
+        // bot bit (flags.14 + the explicit bool)
+        let mut bot_user = telegram_user(5, "Bot", USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 14));
+        bot_user.bot = true;
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(bot_user),
+            "t",
+        );
+        um.take_updates();
+        // a plain user twin
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(6, "Human", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+
+        // the invalid id logs and returns before any cache work
+        um.on_update_bot_has_preview_medias(&mut temp.env(false), UserId::new(0), true);
+        assert!(um.get_user_full(UserId::new(0)).is_none());
+
+        // the unknown user and the non-bot twin return before the full
+        // read (no record materializes)
+        um.on_update_bot_has_preview_medias(&mut temp.env(false), UserId::new(999), true);
+        um.on_update_bot_has_preview_medias(&mut temp.env(false), UserId::new(6), true);
+        assert!(um.get_user_full(UserId::new(6)).is_none());
+
+        // the bot-mode auth guard: the record stays untouched even with
+        // the cache seeded
+        um.add_user_full(UserId::new(5));
+        um.on_update_bot_has_preview_medias(&mut temp.env(true), UserId::new(5), true);
+        assert!(!um.get_user_full(UserId::new(5)).unwrap().has_preview_medias);
+
+        // the ok tail flips the flag and broadcasts updateUserFullInfo
+        um.on_update_bot_has_preview_medias(&mut temp.env(false), UserId::new(5), true);
+        assert!(um.get_user_full(UserId::new(5)).unwrap().has_preview_medias);
+        assert!(um.take_updates().iter().any(|update| matches!(
+            update,
+            td_api::Update::updateUserFullInfo(f) if f.user_id == 5
+        )));
+
+        // the same value again is change-gated (no second broadcast)
+        um.on_update_bot_has_preview_medias(&mut temp.env(false), UserId::new(5), true);
+        assert!(
+            !um.take_updates()
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateUserFullInfo(_)))
+        );
+
+        // and the false value flips back
+        um.on_update_bot_has_preview_medias(&mut temp.env(false), UserId::new(5), false);
+        assert!(!um.get_user_full(UserId::new(5)).unwrap().has_preview_medias);
+        assert!(um.take_updates().iter().any(|update| matches!(
+            update,
+            td_api::Update::updateUserFullInfo(f) if f.user_id == 5
+        )));
     }
 
     #[test]
