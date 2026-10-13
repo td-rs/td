@@ -10589,7 +10589,10 @@ impl Td {
                 if query.is_error() {
                     let status = query.error().clone();
                     let not_modified = status.message() == "CHAT_NOT_MODIFIED";
-                    if not_modified && !self.auth_manager.is_bot() {
+                    // cpp:541-544 — the intake runs for both auth kinds
+                    // inside the CHAT_NOT_MODIFIED band, before the !bot
+                    // value check (a bot still gets the full write)
+                    if not_modified {
                         self.with_chat_intake(|chat_manager, user_manager, env| {
                             chat_manager.on_update_channel_unrestrict_boost_count(
                                 user_manager,
@@ -10598,15 +10601,16 @@ impl Td {
                                 unrestrict_boost_count,
                             );
                         });
+                    } else {
+                        self.chat_channel_error_head(
+                            channel_id,
+                            &status,
+                            "SetChannelBoostsToUnblockRestrictionsQuery",
+                        );
+                    }
+                    if not_modified && !self.auth_manager.is_bot() {
                         promise.set_value(());
                     } else {
-                        if !not_modified {
-                            self.chat_channel_error_head(
-                                channel_id,
-                                &status,
-                                "SetChannelBoostsToUnblockRestrictionsQuery",
-                            );
-                        }
                         promise.set_error(status);
                     }
                 } else {
@@ -44864,6 +44868,32 @@ mod tests {
             responses_of(&callback, 9).first(),
             Some(Object::ok(_))
         ));
+
+        // 9b. the bot twin of the band — cpp:541-544 runs the intake for
+        //     a bot too, but the promise settles the error
+        td.request(
+            18,
+            Function::setSupergroupUnrestrictBoostCount(
+                td_api::setSupergroupUnrestrictBoostCount {
+                    supergroup_id: 704,
+                    unrestrict_boost_count: 5,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setBoostsToUnblockRestrictions::ID,
+        );
+        td.auth_manager.restore_is_bot(true);
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        td.auth_manager.restore_is_bot(false);
+        let error = error_of(&callback, 18);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHAT_NOT_MODIFIED")
+        );
 
         // 10. the range band — the C++ 400, no query
         td.request(
