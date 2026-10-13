@@ -3956,17 +3956,19 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             // Requests.cpp:7116-7119 → UserManager.cpp:5996-6002: the
             // non-bot UserpicSetup suggested-action dismissal is the
             // Payments-style seam; the validation bands answer in
-            // `set_profile_photo_impl`, the upload flow is
-            // [blocked: net/Files]
+            // `set_profile_photo_impl`, the prev-photo query rides the
+            // user net kinds and the upload flow is [blocked: net/Files]
             if !td.auth_manager.is_bot() {
                 tdutils::log_info!(
                     "dismiss_suggested_action(USERPIC_SETUP) — [blocked: SuggestedActionManager]"
                 );
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let file_manager = td.file_manager.lock();
             let env = user_env!(td);
             td.user_manager.set_profile_photo(
                 &env,
+                &file_manager,
                 request.photo.as_ref(),
                 request.is_public,
                 promise,
@@ -4085,24 +4087,32 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::deleteProfilePhoto(request) => {
             // Requests.cpp:7121-7124 → UserManager.cpp:6395-6426: the
-            // cache bands answer here; the user_full reload, the reset
-            // query and the delete query are [blocked: net]
+            // cache bands answer here; the unloaded-full reload ladder,
+            // the reset query and the delete query ride the user net
+            // kinds
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let mut env = user_env!(td);
-            td.user_manager
-                .delete_profile_photo(&mut env, request.profile_photo_id, promise);
+            td.user_manager.delete_profile_photo(
+                &mut env,
+                request.profile_photo_id,
+                false,
+                promise,
+            );
         }
         Function::setUserPersonalProfilePhoto(request) => {
             // Requests.cpp:6681-6685 → UserManager.cpp:6071-6097: the
-            // contact/self/bot ladder answers here; the delete query and
-            // the upload flow are [blocked: net/Files]
+            // contact/self/bot ladder answers here; the delete query
+            // rides the user net kinds and the upload flow is
+            // [blocked: net/Files]
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let file_manager = td.file_manager.lock();
             let env = user_env!(td);
             td.user_manager.set_user_profile_photo(
                 &env,
+                &file_manager,
                 UserId::new(request.user_id),
                 request.photo.as_ref(),
                 false,
@@ -4115,9 +4125,11 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let file_manager = td.file_manager.lock();
             let env = user_env!(td);
             td.user_manager.set_user_profile_photo(
                 &env,
+                &file_manager,
                 UserId::new(request.user_id),
                 request.photo.as_ref(),
                 true,
@@ -4354,9 +4366,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     let user_id = td
                         .business_connection_manager
                         .get_business_connection_user_id(&connection_id);
+                    let file_manager = td.file_manager.lock();
                     let env = user_env!(td);
                     td.user_manager.set_profile_photo_impl(
-                        &env,
+                        crate::user_manager::SetProfilePhotoTd {
+                            env: &env,
+                            files: &file_manager,
+                        },
                         user_id,
                         Some(input_photo),
                         request.is_public,
