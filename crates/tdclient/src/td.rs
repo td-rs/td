@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::boost_manager::{BoostManager, BoostManagerEnv};
+use crate::bot_info_manager::BotInfoNetKind;
 use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 use crate::premium::{PremiumEnv, PremiumManager, PremiumNetKind};
 use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv, QuickReplyNetKind};
@@ -3043,91 +3044,9 @@ pub(crate) type ChatNetHandle = NetKindHandle<crate::chat_manager::ChatNetKind>;
 /// the answers drain through [`Td::dispatch_completed_dialog_net`].
 pub(crate) type DialogNetHandle = NetKindHandle<crate::dialog_manager::DialogNetKind>;
 
-/// The BotInfoManager in-flight query kinds — the C++ ResultHandler
-/// classes of the bot-administration plane (BotInfoManager.cpp:36-756,
-/// BotCommand.cpp:22-113, BotMenuButton.cpp:18-80, BotQueries.cpp:19-99).
-/// The payload-carrying variant keeps the handler's own members
-/// (`SetBotInfoQuery`'s `bot_user_id_`/`set_name_`/`set_info_`, the
-/// on_result/on_error tails key on them); the rest pop their parked
-/// `pending_*_replies` queues (the §5 shape).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BotInfoNetKind {
-    /// `SetBotCommandsQuery` (BotCommand.cpp:28-57) — `bots.setBotCommands`.
-    SetBotCommands,
-    /// `ResetBotCommandsQuery` (BotCommand.cpp:59-75) —
-    /// `bots.resetBotCommands`.
-    ResetBotCommands,
-    /// `GetBotCommandsQuery` (BotCommand.cpp:77-105) —
-    /// `bots.getBotCommands`; the answer resolves the bot id through
-    /// `get_my_id` like the C++ handler.
-    GetBotCommands,
-    /// `SetBotMenuButtonQuery` (BotMenuButton.cpp:18-46) —
-    /// `bots.setBotMenuButton`.
-    SetBotMenuButton,
-    /// `GetBotMenuButtonQuery` (BotMenuButton.cpp:48-80) —
-    /// `bots.getBotMenuButton`.
-    GetBotMenuButton,
-    /// `CreateBotQuery` (BotInfoManager.cpp:36-67) — `bots.createBot`;
-    /// the answer registers the user and answers its object.
-    CreateBot,
-    /// `ExportBotTokenQuery` (BotInfoManager.cpp:69-98) —
-    /// `bots.exportBotToken`.
-    ExportBotToken,
-    /// `GetAccessSettingsQuery` (BotInfoManager.cpp:100-130) —
-    /// `bots.getAccessSettings`.
-    GetAccessSettings,
-    /// `EditAccessSettingsQuery` (BotInfoManager.cpp:132-166) —
-    /// `bots.editAccessSettings`.
-    EditAccessSettings,
-    /// `GetAdminedBotsQuery` (BotInfoManager.cpp:168-194) —
-    /// `bots.getAdminedBots`.
-    GetAdminedBots,
-    /// `SetBotGroupDefaultAdminRightsQuery` (BotInfoManager.cpp:196-227)
-    /// — `bots.setBotGroupDefaultAdminRights`; both tails invalidate my
-    /// user_full (the RIGHTS_NOT_MODIFIED error band answers ok).
-    SetGroupDefaultAdminRights,
-    /// `SetBotBroadcastDefaultAdminRightsQuery`
-    /// (BotInfoManager.cpp:229-260) —
-    /// `bots.setBotBroadcastDefaultAdminRights` (the broadcast twin).
-    SetBroadcastDefaultAdminRights,
-    /// `CanBotSendMessageQuery` (BotInfoManager.cpp:509-541) —
-    /// `bots.canSendMessage`; the false band answers the C++ 404.
-    CanSendMessage,
-    /// `AllowBotSendMessageQuery` (BotInfoManager.cpp:543-572) —
-    /// `bots.allowSendMessage`; the Updates answer re-enters
-    /// `on_get_updates` with the promise.
-    AllowSendMessage,
-    /// `SetBotInfoQuery` (BotInfoManager.cpp:590-661) — `bots.setBotInfo`;
-    /// the kind carries the handler members the reload tails key on (the
-    /// reload queries themselves park at the `BotInfoManagerEnv` reload
-    /// seams, td.rs).
-    SetBotInfo {
-        bot_user_id: crate::user_manager::UserId,
-        set_name: bool,
-        set_info: bool,
-    },
-    /// `GetBotInfoQuery` (BotInfoManager.cpp:663-713) — `bots.getBotInfo`;
-    /// the answer fills the popped `PendingGetBotInfoReply`'s three
-    /// promise vectors.
-    GetBotInfo,
-    /// `SetCustomVerificationQuery` (BotInfoManager.cpp:715-756) —
-    /// `bots.setCustomVerification`; the error band runs the
-    /// dialog-error head over the parked reply's dialog id.
-    SetCustomVerification,
-    /// `SendCustomRequestQuery` (BotQueries.cpp:19-45) —
-    /// `bots.sendCustomRequest`.
-    SendCustomRequest,
-    /// `AnswerCustomQueryQuery` (BotQueries.cpp:47-75) —
-    /// `bots.answerWebhookJSONQuery`.
-    AnswerCustomQuery,
-    /// `SetBotUpdatesStatusQuery` (BotQueries.cpp:77-99) —
-    /// `help.setBotUpdatesStatus`, fire-and-forget (no parked promise).
-    SetBotUpdatesStatus,
-}
-
 /// The cloned bot-info dispatch surface the [`BotInfoEnv`] senders use —
 /// the answers drain through [`Td::dispatch_completed_bot_info_net`].
-pub(crate) type BotInfoNetHandle = NetKindHandle<BotInfoNetKind>;
+pub(crate) type BotInfoNetHandle = NetKindHandle<crate::bot_info_manager::BotInfoNetKind>;
 
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
@@ -8552,7 +8471,12 @@ impl Td {
                         promise.set_error(query.error().clone());
                     } else {
                         match telegram_api::Updates::parse(query.ok()) {
-                            Ok(updates) => pending_updates = Some((updates, promise)),
+                            Ok(updates) => {
+                                tdutils::log_info!(
+                                    "Receive result for AllowBotSendMessageQuery: {updates:?}"
+                                );
+                                pending_updates = Some((updates, promise));
+                            }
                             Err(_) => promise.set_error(parse_error("bots_allowSendMessage")),
                         }
                     }
@@ -8764,16 +8688,9 @@ impl Td {
                                         "Receive result for CreateBotQuery: {user:?}"
                                     );
                                     let user_id = env.on_get_user(user, "CreateBotQuery");
-                                    let user_env = crate::user_manager::UserEnv {
-                                        global: &mut *env.global,
-                                        options: env
-                                            .options
-                                            .as_deref_mut()
-                                            .expect("bot answers run with the option manager"),
-                                        auth_is_bot: env.auth_is_bot,
-                                    };
-                                    let object =
-                                        env.user_manager.get_user_object_of(&user_env, user_id);
+                                    let object = env.with_user_env(|user_manager, user_env| {
+                                        user_manager.get_user_object_of(user_env, user_id)
+                                    });
                                     promise.set_value(object);
                                 }
                                 Err(status) => promise.set_error(status),
@@ -23355,6 +23272,26 @@ pub(crate) struct BotInfoEnv<'a> {
     pub(crate) net: Option<BotInfoNetHandle>,
 }
 
+impl BotInfoEnv<'_> {
+    /// Run `f` over the disjoint `UserEnv` + user manager split (the
+    /// `bot_user_split` shape at the requests layer) — the shared
+    /// construction of the user-manager calls the env forwards to.
+    fn with_user_env<R>(
+        &mut self,
+        f: impl FnOnce(&mut UserManager, &mut crate::user_manager::UserEnv) -> R,
+    ) -> R {
+        let mut env = crate::user_manager::UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot flows run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        f(self.user_manager, &mut env)
+    }
+}
+
 impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
     fn is_authorized(&self) -> bool {
         self.auth_is_authorized
@@ -23524,31 +23461,17 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
         // on_result tail forwards the query promise into it
         // (cpp:652-654) — the combiner's net-inert posture answers
         // 500 "Request aborted" outside the scheduler context
-        let mut env = UserEnv {
-            global: self.global,
-            options: self
-                .options
-                .as_deref_mut()
-                .expect("bot requests run with the initialized option manager"),
-            auth_is_bot: self.auth_is_bot,
-        };
-        self.user_manager
-            .reload_user_full(&mut env, user_id, promise, "SetBotInfoQuery");
+        self.with_user_env(|user_manager, env| {
+            user_manager.reload_user_full(env, user_id, promise, "SetBotInfoQuery")
+        });
     }
 
     fn reload_user(&mut self, user_id: crate::user_manager::UserId, promise: Promise<()>) {
         // the SetBotInfoQuery name-only tail (cpp:656-657) — the same
         // forward over the GetUserMerger's reload park
-        let mut env = UserEnv {
-            global: self.global,
-            options: self
-                .options
-                .as_deref_mut()
-                .expect("bot requests run with the initialized option manager"),
-            auth_is_bot: self.auth_is_bot,
-        };
-        self.user_manager
-            .reload_user(&mut env, user_id, promise, "SetBotInfoQuery");
+        self.with_user_env(|user_manager, env| {
+            user_manager.reload_user(env, user_id, promise, "SetBotInfoQuery")
+        });
     }
 
     fn on_update_bot_has_preview_medias(
@@ -39703,6 +39626,147 @@ mod tests {
         }
         net_complete(sent, bool_answer(false));
         td.dispatch_completed_bot_info_net();
+
+        // 9-15. the error bands — one per family (the §7 gate): the
+        //     query error forwards to the parked promise (the C++
+        //     on_error halves).
+        for (what, drive) in [
+            (
+                "setCommands",
+                Box::new(|td: &mut Td, promise| {
+                    with_bot_info_manager(td, true, |manager, env| {
+                        crate::bot_command::set_commands(
+                            manager,
+                            env,
+                            None,
+                            "en".to_owned(),
+                            vec![td_api::BotCommand {
+                                command: "x".to_owned(),
+                                description: "Y".to_owned(),
+                                is_ephemeral: false,
+                            }],
+                            promise,
+                        );
+                    });
+                }) as Box<dyn FnOnce(&mut Td, Promise<()>)>,
+            ),
+            (
+                "deleteCommands",
+                Box::new(|td: &mut Td, promise| {
+                    with_bot_info_manager(td, true, |manager, env| {
+                        crate::bot_command::delete_commands(
+                            manager,
+                            env,
+                            None,
+                            "en".to_owned(),
+                            promise,
+                        );
+                    });
+                }) as Box<dyn FnOnce(&mut Td, Promise<()>)>,
+            ),
+            (
+                "setMenuButton",
+                Box::new(|td: &mut Td, promise| {
+                    with_bot_info_manager(td, true, |manager, env| {
+                        crate::bot_menu_button::set_menu_button(
+                            manager,
+                            env,
+                            crate::user_manager::UserId::default(),
+                            None,
+                            promise,
+                        );
+                    });
+                }) as Box<dyn FnOnce(&mut Td, Promise<()>)>,
+            ),
+        ] {
+            let (promise, slot) = record_ton_unit();
+            drive(&mut td, promise);
+            let sent = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("the {what} error-band query"));
+            net_fail(sent, 420, "FLOOD_WAIT_3");
+            td.dispatch_completed_bot_info_net();
+            match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(
+                        (status.code(), status.message()),
+                        (420, "FLOOD_WAIT_3"),
+                        "{what}"
+                    );
+                }
+                other => panic!("the {what} error band: {other:?}"),
+            }
+        }
+
+        // getCommands / getMenuButton / sendCustomRequest carry typed
+        // answers — the same error band over their own recorders
+        {
+            let (promise, slot) = record_bot_info_result::<td_api::BotCommands>();
+            with_bot_info_manager(&mut td, true, |manager, env| {
+                crate::bot_command::get_commands(manager, env, None, "en".to_owned(), promise);
+            });
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::bots_getBotCommands::ID,
+            );
+            net_fail(sent, 400, "BOT_COMMAND_INVALID");
+            td.dispatch_completed_bot_info_net();
+            match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "BOT_COMMAND_INVALID");
+                }
+                other => panic!("the getCommands error band: {other:?}"),
+            }
+        }
+        {
+            let (promise, slot) = record_bot_info_result::<td_api::BotMenuButton>();
+            with_bot_info_manager(&mut td, true, |manager, env| {
+                crate::bot_menu_button::get_menu_button(
+                    manager,
+                    env,
+                    crate::user_manager::UserId::default(),
+                    promise,
+                );
+            });
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::bots_getBotMenuButton::ID,
+            );
+            net_fail(sent, 400, "BUTTON_INVALID");
+            td.dispatch_completed_bot_info_net();
+            match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "BUTTON_INVALID");
+                }
+                other => panic!("the getMenuButton error band: {other:?}"),
+            }
+        }
+        {
+            let (promise, slot) = record_bot_info_result::<td_api::CustomRequestResult>();
+            with_bot_info_manager(&mut td, true, |manager, env| {
+                crate::bot_queries::send_bot_custom_query(
+                    manager,
+                    env,
+                    "getMe".to_owned(),
+                    "{}".to_owned(),
+                    promise,
+                );
+            });
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::bots_sendCustomRequest::ID,
+            );
+            net_fail(sent, 400, "METHOD_INVALID");
+            td.dispatch_completed_bot_info_net();
+            match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "METHOD_INVALID");
+                }
+                other => panic!("the sendCustomRequest error band: {other:?}"),
+            }
+        }
+
         assert!(td.bot_info_net_completed.lock().is_empty(), "drained");
     }
 
@@ -40044,6 +40108,128 @@ mod tests {
             other => panic!("the rights error band: {other:?}"),
         }
 
+        // 13-17. the error bands — one per family (the §7 gate):
+        //     createBot, getOwnedBots, allowBotToSendMessages,
+        //     exportBotToken and get/editAccessSettings forward the
+        //     query error to the request/parked promise.
+        td.request(
+            13,
+            Function::createBot(td_api::createBot {
+                manager_bot_user_id: 8,
+                name: "newbot".to_owned(),
+                username: "newbot".to_owned(),
+                via_link: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_createBot::ID,
+        );
+        net_fail(sent, 400, "USERNAME_INVALID");
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 13) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, "USERNAME_INVALID");
+            }
+            None => panic!("the createBot error band never fired"),
+        }
+
+        td.request(14, Function::getOwnedBots(td_api::getOwnedBots));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getAdminedBots::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_8");
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 14) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 420);
+                assert_eq!(error.message, "FLOOD_WAIT_8");
+            }
+            None => panic!("the getOwnedBots error band never fired"),
+        }
+
+        td.request(
+            15,
+            Function::allowBotToSendMessages(td_api::allowBotToSendMessages { bot_user_id: 8 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_allowSendMessage::ID,
+        );
+        net_fail(sent, 400, "BOT_BLOCKED");
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 15) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, "BOT_BLOCKED");
+            }
+            None => panic!("the allowSendMessage error band never fired"),
+        }
+
+        let (promise, slot) = record_star_url();
+        with_bot_info_manager(&mut td, true, |manager, env| {
+            manager.get_bot_token(env, crate::user_manager::UserId::new(8), false, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_exportBotToken::ID,
+        );
+        net_fail(sent, 400, "TOKEN_INVALID");
+        td.dispatch_completed_bot_info_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "TOKEN_INVALID");
+            }
+            other => panic!("the exportBotToken error band: {other:?}"),
+        }
+
+        let (promise, slot) = record_bot_info_result::<td_api::BotAccessSettings>();
+        with_bot_info_manager(&mut td, true, |manager, env| {
+            manager.get_bot_access_settings(env, crate::user_manager::UserId::new(8), promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getAccessSettings::ID,
+        );
+        net_fail(sent, 400, "BOT_NOT_OWNED");
+        td.dispatch_completed_bot_info_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "BOT_NOT_OWNED");
+            }
+            other => panic!("the getAccessSettings error band: {other:?}"),
+        }
+
+        let (promise, slot) = record_ton_unit();
+        with_bot_info_manager(&mut td, true, |manager, env| {
+            manager.set_bot_access_settings(
+                env,
+                crate::user_manager::UserId::new(8),
+                Some(td_api::BotAccessSettings {
+                    is_restricted: false,
+                    added_user_ids: Vec::new(),
+                }),
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_editAccessSettings::ID,
+        );
+        net_fail(sent, 400, "USERS_INVALID");
+        td.dispatch_completed_bot_info_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "USERS_INVALID");
+            }
+            other => panic!("the editAccessSettings error band: {other:?}"),
+        }
+
         assert!(td.bot_info_net_completed.lock().is_empty(), "drained");
     }
 
@@ -40293,6 +40479,31 @@ mod tests {
                 assert_eq!(error.message, "VERIFICATION_INVALID");
             }
             None => panic!("the verification error band never fired"),
+        }
+
+        // 7. the getBotInfo error band — the popped reply's three
+        //    promise vectors all fail with the query error.
+        td.request(
+            7,
+            Function::getBotName(td_api::getBotName {
+                bot_user_id: 8,
+                language_code: "en".to_owned(),
+            }),
+        );
+        with_bot_info_manager(&mut td, false, |manager, env| manager.timeout_expired(env));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getBotInfo::ID,
+        );
+        net_fail(sent, 400, "LANG_INVALID");
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 7) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, "LANG_INVALID");
+            }
+            None => panic!("the getBotInfo error band never fired"),
         }
 
         assert!(td.bot_info_net_completed.lock().is_empty(), "drained");

@@ -81,6 +81,88 @@ pub mod bots_set_bot_info_mask {
 /// `BotInfoManager::MAX_QUERY_DELAY` (BotInfoManager.h:108).
 const MAX_QUERY_DELAY: f64 = 0.01;
 
+/// The BotInfoManager in-flight query kinds — the C++ ResultHandler
+/// classes of the bot-administration plane (BotInfoManager.cpp:36-756,
+/// BotCommand.cpp:22-113, BotMenuButton.cpp:18-80, BotQueries.cpp:19-99).
+/// The payload-carrying variant keeps the handler's own members
+/// (`SetBotInfoQuery`'s `bot_user_id_`/`set_name_`/`set_info_`, the
+/// on_result/on_error tails key on them); the rest pop their parked
+/// `pending_*_replies` queues (the §5 shape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BotInfoNetKind {
+    /// `SetBotCommandsQuery` (BotCommand.cpp:28-57) — `bots.setBotCommands`.
+    SetBotCommands,
+    /// `ResetBotCommandsQuery` (BotCommand.cpp:59-75) —
+    /// `bots.resetBotCommands`.
+    ResetBotCommands,
+    /// `GetBotCommandsQuery` (BotCommand.cpp:77-105) —
+    /// `bots.getBotCommands`; the answer resolves the bot id through
+    /// `get_my_id` like the C++ handler.
+    GetBotCommands,
+    /// `SetBotMenuButtonQuery` (BotMenuButton.cpp:18-46) —
+    /// `bots.setBotMenuButton`.
+    SetBotMenuButton,
+    /// `GetBotMenuButtonQuery` (BotMenuButton.cpp:48-80) —
+    /// `bots.getBotMenuButton`.
+    GetBotMenuButton,
+    /// `CreateBotQuery` (BotInfoManager.cpp:36-67) — `bots.createBot`;
+    /// the answer registers the user and answers its object.
+    CreateBot,
+    /// `ExportBotTokenQuery` (BotInfoManager.cpp:69-98) —
+    /// `bots.exportBotToken`.
+    ExportBotToken,
+    /// `GetAccessSettingsQuery` (BotInfoManager.cpp:100-130) —
+    /// `bots.getAccessSettings`.
+    GetAccessSettings,
+    /// `EditAccessSettingsQuery` (BotInfoManager.cpp:132-166) —
+    /// `bots.editAccessSettings`.
+    EditAccessSettings,
+    /// `GetAdminedBotsQuery` (BotInfoManager.cpp:168-194) —
+    /// `bots.getAdminedBots`.
+    GetAdminedBots,
+    /// `SetBotGroupDefaultAdminRightsQuery` (BotInfoManager.cpp:196-227)
+    /// — `bots.setBotGroupDefaultAdminRights`; both tails invalidate my
+    /// user_full (the RIGHTS_NOT_MODIFIED error band answers ok).
+    SetGroupDefaultAdminRights,
+    /// `SetBotBroadcastDefaultAdminRightsQuery`
+    /// (BotInfoManager.cpp:229-260) —
+    /// `bots.setBotBroadcastDefaultAdminRights` (the broadcast twin).
+    SetBroadcastDefaultAdminRights,
+    /// `CanBotSendMessageQuery` (BotInfoManager.cpp:509-541) —
+    /// `bots.canSendMessage`; the false band answers the C++ 404.
+    CanSendMessage,
+    /// `AllowBotSendMessageQuery` (BotInfoManager.cpp:543-572) —
+    /// `bots.allowSendMessage`; the Updates answer re-enters
+    /// `on_get_updates` with the promise.
+    AllowSendMessage,
+    /// `SetBotInfoQuery` (BotInfoManager.cpp:590-661) — `bots.setBotInfo`;
+    /// the kind carries the handler members the reload tails key on (the
+    /// reload queries themselves park at the `BotInfoManagerEnv` reload
+    /// seams, td.rs).
+    SetBotInfo {
+        bot_user_id: crate::user_manager::UserId,
+        set_name: bool,
+        set_info: bool,
+    },
+    /// `GetBotInfoQuery` (BotInfoManager.cpp:663-713) — `bots.getBotInfo`;
+    /// the answer fills the popped `PendingGetBotInfoReply`'s three
+    /// promise vectors.
+    GetBotInfo,
+    /// `SetCustomVerificationQuery` (BotInfoManager.cpp:715-756) —
+    /// `bots.setCustomVerification`; the error band runs the
+    /// dialog-error head over the parked reply's dialog id.
+    SetCustomVerification,
+    /// `SendCustomRequestQuery` (BotQueries.cpp:19-45) —
+    /// `bots.sendCustomRequest`.
+    SendCustomRequest,
+    /// `AnswerCustomQueryQuery` (BotQueries.cpp:47-75) —
+    /// `bots.answerWebhookJSONQuery`.
+    AnswerCustomQuery,
+    /// `SetBotUpdatesStatusQuery` (BotQueries.cpp:77-99) —
+    /// `help.setBotUpdatesStatus`, fire-and-forget (no parked promise).
+    SetBotUpdatesStatus,
+}
+
 /// The env surface of `G()`/`td_` for the bot manager and the sibling bot
 /// flows. The query seams are the C++ `Td::ResultHandler` send legs —
 /// net-live over the `BotInfoNetHandle` in the `BotInfoEnv` impl, with
