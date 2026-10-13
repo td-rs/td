@@ -8311,6 +8311,327 @@ impl Td {
                 };
                 user_manager.on_get_my_saved_music_list(&mut env, result);
             }
+            crate::user_manager::UserNetKind::GetContacts => {
+                // `GetContactsQuery::on_result`/`on_error` (cpp:117-131)
+                // — the answer runs the `on_get_contacts` intake (the
+                // load promises flush through `on_get_contacts_finished`);
+                // the error band fails the load + the parked calls
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::contacts_Contacts::parse(query.ok())
+                        .map_err(|_| parse_error("contacts_getContacts"))
+                };
+                match result {
+                    Ok(contacts) => {
+                        tdutils::log_info!("Receive result for GetContactsQuery");
+                        user_manager.on_get_contacts(&mut env, contacts);
+                    }
+                    Err(status) => user_manager.on_get_contacts_failed(&mut env, status),
+                }
+            }
+            crate::user_manager::UserNetKind::GetContactsStatuses => {
+                // `GetContactsStatusesQuery::on_result`/`on_error`
+                // (cpp:187-205) — fire-and-forget: the statuses feed the
+                // online machinery, the error band logs the unexpected
+                // errors (`G()->is_expected_error` head)
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !env.global.is_expected_error(&status) {
+                        tdutils::log_error!(
+                            "Receive error for GetContactsStatusesQuery: {}",
+                            status.message()
+                        );
+                    }
+                } else if let Ok(statuses) = parse_vector_contact_status(query.ok()) {
+                    user_manager.on_get_contacts_statuses(&mut env, statuses);
+                } else {
+                    // the C++ fetch_result failure would run on_error
+                    tdutils::log_warning!("Receive wrong answer for GetContactsStatusesQuery");
+                }
+            }
+            crate::user_manager::UserNetKind::AddContact => {
+                // `AddContactQuery::on_result`/`on_error` (cpp:209-240)
+                // — the Updates answer re-enters `on_get_updates` with
+                // the query-carried promise; the error tail fails the
+                // promise, refetches the contacts and reloads the dialog
+                // action bar (the MessagesManager step parks with its
+                // plane)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::Updates::parse(query.ok())
+                        .map_err(|_| parse_error("contacts_addContact"))
+                };
+                if let Some((_user_id, mut promise)) = user_manager.take_add_contact_query() {
+                    match result {
+                        Ok(updates) => pending_updates = Some((updates, promise)),
+                        Err(status) => {
+                            promise.set_error(status);
+                            user_manager.reload_contacts(&mut env, true);
+                            // reload_dialog_action_bar — the
+                            // MessagesManager step parks with its plane
+                            tdutils::log_info!(
+                                "Reload dialog action bar — the MessagesManager step"
+                            );
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::ImportContacts {
+                random_id,
+                sent_size,
+            } => {
+                // `ImportContactsQuery::on_result`/`on_error`
+                // (cpp:353-380) — the all-retry band answers the C++
+                // 429; the plain answer/error routes into
+                // `on_imported_contacts` (the retry re-send rides the
+                // manager fn)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::contacts_ImportedContacts::parse(query.ok())
+                        .map_err(|_| parse_error("contacts_importContacts"))
+                };
+                match result {
+                    Ok(imported_contacts) => {
+                        if sent_size == imported_contacts.retry_contacts.len() {
+                            user_manager.on_imported_contacts(
+                                &mut env,
+                                random_id,
+                                Err(Status::error(429, "Too Many Requests: retry after 3600")),
+                            );
+                        } else {
+                            user_manager.on_imported_contacts(
+                                &mut env,
+                                random_id,
+                                Ok(imported_contacts),
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        user_manager.on_imported_contacts(&mut env, random_id, Err(status))
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::DeleteContacts => {
+                // `DeleteContactsQuery::on_result`/`on_error`
+                // (cpp:383-406) — the Updates answer re-enters
+                // `on_get_updates` with the query-carried promise (the
+                // §5 restore); the error tail fails the promise and
+                // refetches the contacts
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::Updates::parse(query.ok())
+                        .map_err(|_| parse_error("contacts_deleteContacts"))
+                };
+                if let Some(mut promise) = user_manager.take_delete_contacts_query() {
+                    match result {
+                        Ok(updates) => pending_updates = Some((updates, promise)),
+                        Err(status) => {
+                            promise.set_error(status);
+                            user_manager.reload_contacts(&mut env, true);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::DeleteContactsByPhones => {
+                // `DeleteContactsByPhoneNumberQuery::on_result`/
+                // `on_error` (cpp:411-432) — the false band answers the
+                // C++ 500, the true band runs `on_deleted_contacts`;
+                // both error tails share the `DeleteContacts`
+                // promise-error + contacts-refetch intake (the #25/#24
+                // shared handler halves)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .ok_or_else(|| parse_error("contacts_deleteByPhones"))
+                };
+                if let Some((user_ids, mut promise)) =
+                    user_manager.take_delete_contacts_by_phones_query()
+                {
+                    match result {
+                        Ok(true) => {
+                            user_manager.on_deleted_contacts(&mut env, &user_ids);
+                            promise.set_value(());
+                        }
+                        Ok(false) => {
+                            promise.set_error(Status::error(500, "Some contacts can't be deleted"));
+                            user_manager.reload_contacts(&mut env, true);
+                        }
+                        Err(status) => {
+                            promise.set_error(status);
+                            user_manager.reload_contacts(&mut env, true);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::ResetContacts => {
+                // `ResetContactsQuery::on_result`/`on_error`
+                // (cpp:448-472) — the true band runs
+                // `on_update_contacts_reset`, the false band logs and
+                // refetches; the promise resolves on both ok bands
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .ok_or_else(|| parse_error("contacts_resetSaved"))
+                };
+                if let Some(mut promise) = user_manager.take_reset_contacts_query() {
+                    match result {
+                        Ok(true) => {
+                            user_manager.on_update_contacts_reset(&mut env);
+                            promise.set_value(());
+                        }
+                        Ok(false) => {
+                            tdutils::log_error!("Failed to delete imported contacts");
+                            user_manager.reload_contacts(&mut env, true);
+                            promise.set_value(());
+                        }
+                        Err(status) => {
+                            promise.set_error(status);
+                            user_manager.reload_contacts(&mut env, true);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::GetBirthdays => {
+                // `GetContactsBirthdaysQuery::on_result`/`on_error`
+                // (cpp:139-155) — the answer feeds the birthdates
+                // intake; the error band runs the `None` form (the sync
+                // timer re-arm)
+                if query.is_error() {
+                    user_manager.on_get_contact_birthdates(&mut env, None);
+                } else {
+                    match telegram_api::contacts_ContactBirthdays::parse(query.ok()) {
+                        Ok(birthdays) => {
+                            user_manager.on_get_contact_birthdates(&mut env, Some(birthdays))
+                        }
+                        Err(_) => user_manager.on_get_contact_birthdates(&mut env, None),
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::DismissBirthdays => {
+                // `DismissContactBirthdaysSuggestionQuery::on_result`/
+                // `on_error` (cpp:161-180) — the Bool answer's value is
+                // dropped; the parse-failure band answers the 500
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok()).ok_or_else(|| parse_error("help_dismissSuggestion"))
+                };
+                if let Some(mut promise) = user_manager.take_dismiss_birthdays_query() {
+                    match result {
+                        Ok(()) => promise.set_value(()),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::EditCloseFriends => {
+                // `EditCloseFriendsQuery::on_result`/`on_error`
+                // (cpp:250-266) — the Bool answer's value is dropped;
+                // the ok band runs `on_set_close_friends` with the
+                // handler's user ids
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok())
+                        .ok_or_else(|| parse_error("contacts_editCloseFriends"))
+                };
+                if let Some((user_ids, mut promise)) = user_manager.take_edit_close_friends_query()
+                {
+                    match result {
+                        Ok(()) => user_manager.on_set_close_friends(&mut env, user_ids, promise),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::ResolvePhone => {
+                // `ResolvePhoneQuery::on_result`/`on_error`
+                // (cpp:278-316) — the users feed `on_get_users`, the
+                // peer gate answers the 500 on a non-user peer, the ok
+                // band caches through `on_resolved_phone_number` then
+                // drains the parked search requests; the
+                // PHONE_NOT_OCCUPIED band caches the negative answer
+                if let Some((phone_number, mut promise)) = user_manager.take_resolve_phone_query() {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        if status.message() == "PHONE_NOT_OCCUPIED" {
+                            user_manager.on_resolved_phone_number(
+                                phone_number.clone(),
+                                crate::user_manager::UserId::default(),
+                            );
+                            promise.set_value(());
+                            user_manager.drain_search_phone_requests(&env);
+                        } else {
+                            user_manager.fail_search_phone_requests(&phone_number, &status);
+                            promise.set_error(status);
+                        }
+                    } else {
+                        match telegram_api::contacts_ResolvedPeer::parse(query.ok()) {
+                            Ok(resolved) => {
+                                user_manager.on_get_users(
+                                    &mut env,
+                                    resolved.users,
+                                    "ResolvePhoneQuery",
+                                );
+                                // on_get_chats (cpp:298) — the chats
+                                // intake rides the chat-manager plane
+                                match resolved.peer {
+                                    Some(telegram_api::Peer::peerUser(peer)) => {
+                                        let user_id =
+                                            crate::user_manager::UserId::new(peer.user_id);
+                                        user_manager
+                                            .on_resolved_phone_number(phone_number, user_id);
+                                        promise.set_value(());
+                                        user_manager.drain_search_phone_requests(&env);
+                                    }
+                                    _ => {
+                                        tdutils::log_error!(
+                                            "Receive a non-user peer by the phone number"
+                                        );
+                                        promise.set_error(Status::error(
+                                            500,
+                                            "Receive invalid response",
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => promise.set_error(parse_error("contacts_resolvePhone")),
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::AcceptContact => {
+                // `AcceptContactQuery::on_result`/`on_error`
+                // (cpp:322-351) — the Updates answer re-enters
+                // `on_get_updates` with the query-carried promise (the
+                // §5 restore); the error tail fails the promise,
+                // refetches the contacts and reloads the dialog action
+                // bar (the MessagesManager step parks with its plane)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::Updates::parse(query.ok())
+                        .map_err(|_| parse_error("contacts_acceptContact"))
+                };
+                if let Some((_user_id, mut promise)) = user_manager.take_accept_contact_query() {
+                    match result {
+                        Ok(updates) => pending_updates = Some((updates, promise)),
+                        Err(status) => {
+                            promise.set_error(status);
+                            user_manager.reload_contacts(&mut env, true);
+                            // reload_dialog_action_bar — the
+                            // MessagesManager step parks with its plane
+                            tdutils::log_info!(
+                                "Reload dialog action bar — the MessagesManager step"
+                            );
+                        }
+                    }
+                }
+            }
             crate::user_manager::UserNetKind::UpdateContactNote => {
                 // `UpdateContactNoteQuery::on_result`/`on_error`
                 // (cpp:844-858) — the Bool answer's value is dropped
@@ -16237,6 +16558,21 @@ fn parse_vector_requirement_to_contact(
         requirements.push(telegram_api::RequirementToContact::read(&mut reader)?);
     }
     Ok(requirements)
+}
+/// `Vector<contactStatus>` — the `contacts_getStatuses` result.
+fn parse_vector_contact_status(
+    data: &[u8],
+) -> Result<Vec<telegram_api::ContactStatus>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut statuses = Vec::with_capacity(count);
+    for _ in 0..count {
+        statuses.push(telegram_api::ContactStatus::read(&mut reader)?);
+    }
+    Ok(statuses)
 }
 
 /// `Vector<fileHash>` (the `upload.getFileHashes`/`upload.reuploadCdnFile`
@@ -35826,6 +36162,755 @@ mod tests {
         td.flush_deferred_results();
         let error = error_of(&callback, 12);
         assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_4"));
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- net-drain 10 (§3.1 #20-#28): the contacts nine ride the
+    // dispatcher — the live td_api arms round-trip (getContacts /
+    // addContact / removeContacts / clearImportedContacts /
+    // hideContactCloseBirthdays / setCloseFriends /
+    // searchUserByPhoneNumber / sharePhoneNumber / importContacts) with
+    // the §5 query-carried promises restored over the family queues. ----
+
+    /// The me + Alice + Bob seed — Alice is a contact (the delete/close-
+    /// friends rounds read her flag), Bob a plain peer (the addContact /
+    /// acceptContact targets).
+    fn seed_contacts_users(td: &mut Td) {
+        let wire_flags_user = |id: i64, name: &str, contact: bool| {
+            telegram_api::User::user(telegram_api::user {
+                flags: 1 | (1 << 1), // access_hash + first_name
+                access_hash: 42,
+                id,
+                first_name: name.to_owned(),
+                contact,
+                ..telegram_api::user::default()
+            })
+        };
+        with_user_manager(&mut *td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(700000001));
+            manager.on_get_user(env, wire_flags_user(700000001, "Me", false), "t");
+            manager.on_get_user(env, wire_flags_user(5, "Alice", true), "t");
+            manager.on_get_user(env, wire_flags_user(6, "Bob", false), "t");
+        });
+    }
+
+    /// A boxed `contacts_contacts` answer.
+    fn contacts_list_answer(saved_count: i32, users: Vec<telegram_api::User>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::contacts_Contacts::contacts_contacts(telegram_api::contacts_contacts {
+            contacts: Vec::new(),
+            saved_count,
+            users,
+        })
+        .store(&mut answer);
+        answer
+    }
+
+    /// A boxed `contacts_contactsNotModified` answer.
+    fn contacts_not_modified_answer() -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::contacts_Contacts::contacts_contactsNotModified(
+            telegram_api::contacts_contactsNotModified,
+        )
+        .store(&mut answer);
+        answer
+    }
+
+    /// A boxed empty `updates` answer (the Updates-typed acks).
+    fn empty_updates_answer() -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        answer
+    }
+
+    /// A boxed `Vector<contactStatus>` answer.
+    fn contact_statuses_answer(statuses: Vec<telegram_api::ContactStatus>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::tl::__i32(&mut answer, telegram_api::tl::VECTOR_ID);
+        telegram_api::tl::__i32(&mut answer, statuses.len() as i32);
+        for status in statuses {
+            status.store_boxed(&mut answer);
+        }
+        answer
+    }
+
+    /// A boxed `contacts_resolvedPhone` answer.
+    fn resolved_phone_answer(user_id: i64, users: Vec<telegram_api::User>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::contacts_ResolvedPeer {
+            peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id,
+            })),
+            chats: Vec::new(),
+            users,
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    /// A boxed `contacts_importedContacts` answer.
+    fn imported_contacts_answer(
+        imported: Vec<telegram_api::ImportedContact>,
+        popular_invites: Vec<telegram_api::PopularContact>,
+        retry_contacts: Vec<i64>,
+    ) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::contacts_ImportedContacts {
+            imported,
+            popular_invites,
+            retry_contacts,
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn contacts_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(contacts_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn contacts_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-contacts");
+        seed_contacts_users(&mut td);
+        let wire_flags_user = |id: i64, name: &str, contact: bool| {
+            telegram_api::User::user(telegram_api::user {
+                flags: 1 | (1 << 1),
+                access_hash: 42,
+                id,
+                first_name: name.to_owned(),
+                contact,
+                ..telegram_api::user::default()
+            })
+        };
+
+        // 1. getContacts — the request parks behind the load, the load
+        //    dispatches contacts.getContacts (hash 0 while unloaded), the
+        //    answer finishes the load and resolves the parked users result
+        td.request(1, Function::getContacts(td_api::getContacts));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_getContacts(payload) => {
+                assert_eq!(payload.hash, 0, "the unloaded hash");
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            contacts_list_answer(1, vec![wire_flags_user(5, "Alice", true)]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::users(users)) => {
+                assert_eq!(users.total_count, 1);
+                assert_eq!(users.user_ids, vec![5]);
+            }
+            other => panic!("the contacts result, got {other:?}"),
+        }
+
+        // 2. addContact — the share bit + the contact fields ride the
+        //    query, the Updates answer resolves ok
+        td.request(
+            2,
+            Function::addContact(td_api::addContact {
+                user_id: 6,
+                contact: Some(td_api::ImportedContact {
+                    phone_number: "+15551234".to_owned(),
+                    first_name: "Bobby".to_owned(),
+                    last_name: String::new(),
+                    note: None,
+                }),
+                share_phone_number: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_addContact::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_addContact(payload) => {
+                assert!(payload.add_phone_privacy_exception, "the share bit");
+                assert!(
+                    payload.note.is_none(),
+                    "the note branch is the formatted-text plane"
+                );
+                assert_eq!(payload.first_name, "Bobby");
+                assert_eq!(payload.last_name, "");
+                assert_eq!(payload.phone, "+15551234");
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.id.expect("the concrete input user")
+                else {
+                    panic!("the add-contact peer must be a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (6, 42));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the addContact error band — the promise fails and the
+        //    reload refire re-sends the sync query; its notModified
+        //    answer chains the fire-and-forget statuses query (#21)
+        td.request(
+            3,
+            Function::addContact(td_api::addContact {
+                user_id: 6,
+                contact: Some(td_api::ImportedContact {
+                    phone_number: "+15551234".to_owned(),
+                    first_name: "Bobby".to_owned(),
+                    last_name: String::new(),
+                    note: None,
+                }),
+                share_phone_number: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_addContact::ID,
+        );
+        net_fail(sent, 500, "INTERNAL");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (500, "INTERNAL"));
+        let refire = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+        net_complete(refire, contacts_not_modified_answer());
+        td.dispatch_completed_user_net();
+        let statuses = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getStatuses::ID,
+        );
+        net_complete(
+            statuses,
+            contact_statuses_answer(vec![telegram_api::ContactStatus {
+                user_id: 5,
+                status: Some(telegram_api::UserStatus::userStatusOffline(
+                    telegram_api::userStatusOffline { was_online: 12345 },
+                )),
+            }]),
+        );
+        td.dispatch_completed_user_net();
+
+        // the second statuses site — the online-status-privacy update
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_update_online_status_privacy(env)
+        });
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getStatuses::ID,
+        );
+
+        // 4. removeContacts — the contact's input user rides the query
+        td.request(
+            4,
+            Function::removeContacts(td_api::removeContacts { user_ids: vec![5] }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_deleteContacts::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_deleteContacts(payload) => {
+                assert_eq!(payload.id.len(), 1, "only the contact rides");
+                let telegram_api::InputUser::inputUser(input_user) = &payload.id[0] else {
+                    panic!("the delete peer must be a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (5, 42));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4b. the empty band — no contact among the ids answers ok with
+        //     no query out
+        td.request(
+            5,
+            Function::removeContacts(td_api::removeContacts { user_ids: vec![6] }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+        assert_not_sent(
+            &rec,
+            telegram_api::contacts_deleteContacts::ID,
+            "the empty delete",
+        );
+
+        // 5. clearImportedContacts — the false band logs + refetches but
+        //    still resolves; the true band resets the store
+        td.request(
+            6,
+            Function::clearImportedContacts(td_api::clearImportedContacts),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resetSaved::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+        assert_eq!(
+            td.user_manager.saved_contact_count_for_test(),
+            1,
+            "the false band keeps the store"
+        );
+        // the false band's reload refire
+        let refire = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+        net_complete(
+            refire,
+            contacts_list_answer(1, vec![wire_flags_user(5, "Alice", true)]),
+        );
+        td.dispatch_completed_user_net();
+
+        td.request(
+            7,
+            Function::clearImportedContacts(td_api::clearImportedContacts),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resetSaved::ID,
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+        assert_eq!(
+            td.user_manager.saved_contact_count_for_test(),
+            0,
+            "on_update_contacts_reset ran"
+        );
+        // on_update_contacts_reset's own reload refire
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getContacts::ID,
+        );
+
+        // 6. hideContactCloseBirthdays — the dismiss form rides the
+        //    inputPeerEmpty + action pair
+        td.request(
+            8,
+            Function::hideContactCloseBirthdays(td_api::hideContactCloseBirthdays),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_dismissSuggestion::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::help_dismissSuggestion(payload) => {
+                assert!(matches!(
+                    payload.peer.as_deref(),
+                    Some(telegram_api::InputPeer::inputPeerEmpty(_))
+                ));
+                assert_eq!(payload.suggestion, "BIRTHDAY_CONTACTS_TODAY");
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. setCloseFriends — the ids ride the query; the ok band runs
+        //    the close-friends flip
+        td.request(
+            9,
+            Function::setCloseFriends(td_api::setCloseFriends { user_ids: vec![5] }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_editCloseFriends::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_editCloseFriends(payload) => {
+                assert_eq!(payload.id, vec![5]);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(
+            td.user_manager
+                .get_user(crate::user_manager::UserId::new(5))
+                .is_some_and(|u| u.is_close_friend)
+        );
+
+        // 7b. the gate band — an unknown user answers the C++ 400
+        td.request(
+            10,
+            Function::setCloseFriends(td_api::setCloseFriends {
+                user_ids: vec![999],
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 10);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "User not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::contacts_editCloseFriends::ID,
+            "the gate band",
+        );
+
+        // 8. searchUserByPhoneNumber — the cleaned digits ride the
+        //    query, the resolved peer answers the fresh user object
+        td.request(
+            11,
+            Function::searchUserByPhoneNumber(td_api::searchUserByPhoneNumber {
+                phone_number: "+9 (999)".to_owned(),
+                only_local: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolvePhone::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_resolvePhone(payload) => {
+                assert_eq!(payload.phone, "9999", "the digits-only cleaning");
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            resolved_phone_answer(5, vec![wire_flags_user(5, "Alice", true)]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 11).first() {
+            Some(Object::user(user)) => assert_eq!(user.id, 5),
+            other => panic!("the resolved user, got {other:?}"),
+        }
+
+        // 8b. the PHONE_NOT_OCCUPIED band — the negative cache answers
+        //     the 404
+        td.request(
+            12,
+            Function::searchUserByPhoneNumber(td_api::searchUserByPhoneNumber {
+                phone_number: "888".to_owned(),
+                only_local: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolvePhone::ID,
+        );
+        net_fail(sent, 400, "PHONE_NOT_OCCUPIED");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 12).first() {
+            Some(Object::error(error)) => {
+                assert_eq!((error.code, error.message.as_str()), (404, "Not Found"))
+            }
+            other => panic!("the negative-cache 404, got {other:?}"),
+        }
+
+        // 8c. the error band surfaces the status
+        td.request(
+            13,
+            Function::searchUserByPhoneNumber(td_api::searchUserByPhoneNumber {
+                phone_number: "777".to_owned(),
+                only_local: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolvePhone::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 13);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_7"));
+
+        // 9. sharePhoneNumber — the accept-contact form
+        td.request(
+            14,
+            Function::sharePhoneNumber(td_api::sharePhoneNumber { user_id: 6 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_acceptContact::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_acceptContact(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.id.expect("the concrete input user")
+                else {
+                    panic!("the accept peer must be a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (6, 42));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 14).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 10. importContacts — the inputPhoneContact payload rides the
+        //     query, the answer resolves the parked request with the
+        //     imported ids
+        td.request(
+            15,
+            Function::importContacts(td_api::importContacts {
+                contacts: vec![td_api::ImportedContact {
+                    phone_number: "+15550001".to_owned(),
+                    first_name: "Carol".to_owned(),
+                    last_name: String::new(),
+                    note: None,
+                }],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_importContacts::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::contacts_importContacts(payload) => {
+                assert_eq!(payload.contacts.len(), 1);
+                assert_eq!(payload.contacts[0].client_id, 0, "the position id");
+                assert_eq!(
+                    (
+                        payload.contacts[0].phone.as_str(),
+                        payload.contacts[0].first_name.as_str(),
+                        payload.contacts[0].last_name.as_str()
+                    ),
+                    ("+15550001", "Carol", "")
+                );
+                assert_eq!(
+                    payload.contacts[0].flags, 0,
+                    "the note branch is the formatted-text plane"
+                );
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            imported_contacts_answer(
+                vec![telegram_api::ImportedContact {
+                    user_id: 5,
+                    client_id: 0,
+                }],
+                vec![telegram_api::PopularContact {
+                    client_id: 0,
+                    importers: 3,
+                }],
+                Vec::new(),
+            ),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 15).first() {
+            Some(Object::importedContacts(imported)) => {
+                assert_eq!(imported.user_ids, vec![5]);
+                assert_eq!(imported.importer_count, vec![3]);
+            }
+            other => panic!("the imported result, got {other:?}"),
+        }
+
+        // 10b. the all-retry band — the C++ 429
+        td.request(
+            16,
+            Function::importContacts(td_api::importContacts {
+                contacts: vec![td_api::ImportedContact {
+                    phone_number: "+15550002".to_owned(),
+                    first_name: "Dan".to_owned(),
+                    last_name: String::new(),
+                    note: None,
+                }],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_importContacts::ID,
+        );
+        net_complete(
+            sent,
+            imported_contacts_answer(
+                Vec::new(),
+                Vec::new(),
+                vec![0], // the full retry — sent_size == retry len
+            ),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 16);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (429, "Too Many Requests: retry after 3600")
+        );
+
+        // 10c. the partial retry — the re-send carries the retry client
+        //      ids with the same random id, the final answer resolves
+        td.request(
+            17,
+            Function::importContacts(td_api::importContacts {
+                contacts: vec![
+                    td_api::ImportedContact {
+                        phone_number: "+15550003".to_owned(),
+                        first_name: "Eve".to_owned(),
+                        last_name: String::new(),
+                        note: None,
+                    },
+                    td_api::ImportedContact {
+                        phone_number: "+15550004".to_owned(),
+                        first_name: "Frank".to_owned(),
+                        last_name: String::new(),
+                        note: None,
+                    },
+                ],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_importContacts::ID,
+        );
+        net_complete(
+            sent,
+            imported_contacts_answer(
+                vec![telegram_api::ImportedContact {
+                    user_id: 5,
+                    client_id: 0,
+                }],
+                Vec::new(),
+                vec![1], // the partial retry
+            ),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 17).is_empty(),
+            "the task stays in flight"
+        );
+        let retry = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_importContacts::ID,
+        );
+        match sent_function(&retry) {
+            telegram_api::Function::contacts_importContacts(payload) => {
+                assert_eq!(payload.contacts.len(), 1, "only the retried contact");
+                assert_eq!(payload.contacts[0].client_id, 1, "the server's client id");
+                assert_eq!(payload.contacts[0].phone, "+15550004");
+            }
+            other => panic!("the retry function: {other:?}"),
+        }
+        net_complete(
+            retry,
+            imported_contacts_answer(
+                vec![telegram_api::ImportedContact {
+                    user_id: 6,
+                    client_id: 1,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 17).first() {
+            Some(Object::importedContacts(imported)) => {
+                assert_eq!(imported.user_ids, vec![5, 6]);
+                assert_eq!(imported.importer_count, vec![0, 0]);
+            }
+            other => panic!("the retry result, got {other:?}"),
+        }
+
+        // 11. the birthdays reload — the internal send + the None error
+        //     band (the sync flag re-arms). The dismiss option of step 6
+        //     suppresses the reload (the faithful dismiss branch) — reset
+        //     it first.
+        if let Some(option_manager) = td.option_manager.as_mut() {
+            option_manager.set_option_boolean("dismiss_birthday_contact_today", false);
+        }
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_contact_birthdates(env, true)
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getBirthdays::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::contacts_ContactBirthdays {
+            contacts: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_user_net();
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_contact_birthdates(env, true)
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getBirthdays::ID,
+        );
+        net_fail(sent, 500, "INTERNAL");
+        td.dispatch_completed_user_net();
+        // the None intake re-armed the flag — a further reload sends again
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_contact_birthdates(env, true)
+        });
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getBirthdays::ID,
+        );
 
         assert!(td.user_net_completed.lock().is_empty(), "drained");
     }

@@ -95,6 +95,21 @@ impl Contact {
         self.user_id
     }
 
+    /// `Contact::get_input_phone_contact` (Contact.cpp:90-101) — the
+    /// `contacts.importContacts` payload. The `edit_note_` note branch is
+    /// the formatted-text plane (the M.4.14 never-stored divergence), so
+    /// `flags` stays 0 and the note never rides.
+    pub fn get_input_phone_contact(&self, client_id: i64) -> tdmtproto::telegram_api::InputContact {
+        tdmtproto::telegram_api::InputContact {
+            flags: 0,
+            client_id,
+            phone: self.phone_number.clone(),
+            first_name: self.first_name.clone(),
+            last_name: self.last_name.clone(),
+            note: None,
+        }
+    }
+
     /// `Contact::get_input_media_contact` (Contact.cpp:81-83).
     pub fn get_input_media_contact(&self) -> Option<tdmtproto::telegram_api::InputMedia> {
         Some(tdmtproto::telegram_api::InputMedia::inputMediaContact(

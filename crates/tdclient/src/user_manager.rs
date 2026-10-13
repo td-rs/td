@@ -79,8 +79,7 @@
 //!   `get_web_app_placeholder` (bot_info absent until its subsystem, so
 //!   the answer is the C++ null), the freeze state
 //!   (`init_freeze_state`/`on_update_freeze_state`/`get_update_freeze_
-//!   state_object`), `on_update_online_status_privacy` (the statuses
-//!   re-fetch is [blocked: net]), `on_update_phone_number_privacy` and
+//!   state_object`), `on_update_phone_number_privacy` and
 //!   `on_ignored_restriction_reasons_changed` (+ `restricted_user_ids_`);
 //!   the `inputPeerUserFromMessage`/`inputUserFromMessage` conversions
 //!   wait for `ChatManager::get_simple_input_peer`;
@@ -1953,6 +1952,53 @@ pub(crate) enum UserNetKind {
     /// `GetSavedMusicIdsQuery` (cpp:1720) — no members; the answer
     /// rides the `reload_my_saved_music_queries` family queue.
     GetSavedMusicIds,
+    /// `GetContactsQuery` (cpp:117) — fire-and-forget; the load promises
+    /// park in `load_contacts_queries` (the `load_contacts` shape), the
+    /// answer runs the `on_get_contacts` intake.
+    GetContacts,
+    /// `GetContactsStatusesQuery` (cpp:187) — fire-and-forget at both
+    /// send sites (the `on_get_contacts` notModified arm and
+    /// `on_update_online_status_privacy`); the answer runs
+    /// `on_get_contacts_statuses`.
+    GetContactsStatuses,
+    /// `AddContactQuery` (cpp:209) — the user id (the error tail's
+    /// reload refire) and the query-carried promise ride the family
+    /// queue (the §5 restore); the Updates answer re-enters
+    /// `on_get_updates`.
+    AddContact,
+    /// `ImportContactsQuery` (cpp:353) — the kind carries the handler's
+    /// `random_id_`/`sent_size_` members (the 429 all-retry band reads
+    /// the sent size); the promise rides the task registry.
+    ImportContacts { random_id: i64, sent_size: usize },
+    /// `DeleteContactsQuery` (cpp:383) — the query-carried promise rides
+    /// the family queue (the §5 restore); the Updates answer re-enters
+    /// `on_get_updates`.
+    DeleteContacts,
+    /// `DeleteContactsByPhoneNumberQuery` (cpp:411) — the handler's
+    /// `user_ids_` (the `on_deleted_contacts` intake) and the promise
+    /// ride the family queue; shares the `DeleteContacts` error tail.
+    DeleteContactsByPhones,
+    /// `ResetContactsQuery` (cpp:448) — the promise rides the family
+    /// queue; the Bool true band runs `on_update_contacts_reset`.
+    ResetContacts,
+    /// `GetContactsBirthdaysQuery` (cpp:139) — fire-and-forget; the
+    /// answer (and the error band) runs `on_get_contact_birthdates`.
+    GetBirthdays,
+    /// `DismissContactBirthdaysSuggestionQuery` (cpp:161) — the promise
+    /// rides the family queue (the §5 restore).
+    DismissBirthdays,
+    /// `EditCloseFriendsQuery` (cpp:250) — the handler's `user_ids_`
+    /// (the `on_set_close_friends` intake) and the promise ride the
+    /// family queue (the §5 restore).
+    EditCloseFriends,
+    /// `ResolvePhoneQuery` (cpp:278) — the handler's `phone_number_`
+    /// (the `on_resolved_phone_number` cache write) and the promise
+    /// ride the family queue (the §5 restore).
+    ResolvePhone,
+    /// `AcceptContactQuery` (cpp:322) — the user id (the error tail's
+    /// reload refire) and the promise ride the family queue (the §5
+    /// restore); the Updates answer re-enters `on_get_updates`.
+    AcceptContact,
 }
 
 /// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
@@ -2056,12 +2102,11 @@ impl UserSavedMusic {
 
 /// `UserManager::ImportContactsTask` (UserManager.h:1345-1351) — the
 /// in-flight import: the caller promise, the input contacts and the two
-/// per-position result buffers.
+/// per-position result buffers. The retry round rebuilds the
+/// `inputPhoneContact`s from `input_contacts` with the server's client
+/// ids (cpp:8248-8259).
 struct ImportContactsTask {
     promise: Promise<()>,
-    // the retry round rebuilds `inputPhoneContact`s from these — the
-    // re-send is [blocked: net], so the field is write-only until then
-    #[allow(dead_code)]
     input_contacts: Vec<Contact>,
     imported_user_ids: Vec<UserId>,
     unimported_contact_invites: Vec<i32>,
@@ -2355,6 +2400,40 @@ pub struct UserManager {
     /// `saved_contact_count_` (UserManager.h:1365) — `-1` before the
     /// first load (the `new()` override).
     saved_contact_count: i32,
+
+    /// The `AddContactQuery` in-flight pairs (the handler's `user_id_`
+    /// member + the query-carried promise, the §5 restore) — popped FIFO
+    /// by the Updates answers.
+    pending_add_contact_queries: Vec<(UserId, Promise<()>)>,
+    /// The `DeleteContactsQuery` promises (the query-carried §5 restore)
+    /// — popped FIFO by the Updates answers.
+    pending_delete_contacts_queries: Vec<Promise<()>>,
+    /// The `DeleteContactsByPhoneNumberQuery` pairs (the handler's
+    /// `user_ids_` member + the promise) — popped FIFO by the Bool
+    /// answers; the true band runs `on_deleted_contacts` with them.
+    pending_delete_contacts_by_phones_queries: Vec<(Vec<UserId>, Promise<()>)>,
+    /// The `ResetContactsQuery` promises — popped FIFO by the Bool
+    /// answers; the true band runs `on_update_contacts_reset`.
+    pending_reset_contacts_queries: Vec<Promise<()>>,
+    /// The `DismissContactBirthdaysSuggestionQuery` promises — popped
+    /// FIFO by the Bool answers.
+    pending_dismiss_birthdays_queries: Vec<Promise<()>>,
+    /// The `EditCloseFriendsQuery` pairs (the handler's `user_ids_`
+    /// member + the promise) — popped FIFO by the Bool answers; the ok
+    /// band runs `on_set_close_friends` with them.
+    pending_edit_close_friends_queries: Vec<(Vec<UserId>, Promise<()>)>,
+    /// The `ResolvePhoneQuery` pairs (the handler's `phone_number_`
+    /// member + the promise) — popped FIFO by the
+    /// `contacts.resolvedPhone` answers.
+    pending_resolve_phone_queries: Vec<(String, Promise<()>)>,
+    /// The `AcceptContactQuery` pairs (the handler's `user_id_` member +
+    /// the promise) — popped FIFO by the Updates answers.
+    pending_accept_contact_queries: Vec<(UserId, Promise<()>)>,
+    /// The parked `searchUserByPhoneNumber` requests awaiting a resolve
+    /// answer — the `SearchUserByPhoneNumberRequest` do_run/do_send_result
+    /// re-run collapse (the answer caches the phone, the drain answers
+    /// from the cache).
+    pub(crate) pending_search_phone_requests: Vec<(String, Promise<Object>)>,
 
     /// `are_imported_contacts_loaded_` (UserManager.h:1370).
     are_imported_contacts_loaded: bool,
@@ -10709,15 +10788,16 @@ impl UserManager {
     }
 
     // ------------------------------------------------------------------
-    // Contacts (UserManager.cpp:7910-8889). The query senders are
-    // [blocked: net]: `reload_contacts` (GetContactsQuery),
-    // `add_contact` (AddContactQuery), `do_import_contacts`
-    // (ImportContactsQuery), `remove_contacts`/`remove_contacts_by_
-    // phone_number` (DeleteContacts(Query)), `clear_imported_contacts`
-    // (ResetContactsQuery), the close-friends editor (EditCloseFriends
-    // Query), `search_user_by_phone_number` (ResolvePhoneQuery),
-    // `reload_contact_birthdates` (GetContactsBirthdaysQuery) and
-    // `hide_contact_birthdays` (DismissContactBirthdaysSuggestionQuery).
+    // Contacts (UserManager.cpp:7910-8889). The query senders ride the
+    // `net` handle: `reload_contacts` (GetContactsQuery), `add_contact`
+    // (AddContactQuery), `do_import_contacts` (ImportContactsQuery),
+    // `remove_contacts`/`remove_contacts_by_phone_number`
+    // (DeleteContacts/DeleteContactsByPhoneNumber),
+    // `clear_imported_contacts` (ResetContactsQuery), the close-friends
+    // editor (EditCloseFriendsQuery), `search_user_by_phone_number`
+    // (ResolvePhoneQuery), `reload_contact_birthdates`
+    // (GetContactsBirthdaysQuery) and `hide_contact_birthdays`
+    // (DismissContactBirthdaysSuggestionQuery).
     // The load-gated entry points follow the C++ caller-retry contract:
     // they park the promise in the load queue and return the empty
     // result; `add_contact` and `get_imported_contact_count` re-dispatch
@@ -10805,8 +10885,10 @@ impl UserManager {
     }
 
     /// `UserManager::reload_contacts` (UserManager.cpp:7958-7965) — the
-    /// `GetContactsQuery` send is [blocked: net]; the sync-date gate
-    /// still advances to `i32::MAX` exactly like the C++ before the send.
+    /// `GetContactsQuery` send over the `net` handle; the sync-date gate
+    /// advances to `i32::MAX` exactly like the C++ before the send (the
+    /// C++ `create(…, {{DialogId(user_id)}}` chain-id arg rides the
+    /// sequencing plane the walking-skeleton dispatch drops).
     pub fn reload_contacts(&mut self, env: &mut UserEnv, force: bool) {
         if !env.global.close_flag()
             && !env.auth_is_bot
@@ -10814,9 +10896,13 @@ impl UserManager {
             && (self.next_contacts_sync_date < env.unix_time() || force)
         {
             self.next_contacts_sync_date = i32::MAX;
-            tdutils::log_info!(
-                "Get contacts with hash {} — [blocked: net]",
-                self.get_contacts_hash(env)
+            let hash = self.get_contacts_hash(env);
+            self.send_user_query(
+                UserNetKind::GetContacts,
+                telegram_api::Function::contacts_getContacts(telegram_api::contacts_getContacts {
+                    hash,
+                }),
+                "contacts.getContacts",
             );
         }
     }
@@ -10854,7 +10940,8 @@ impl UserManager {
     }
 
     /// `UserManager::on_get_contacts` (UserManager.cpp:8001-8054) — the
-    /// `GetContactsStatusesQuery` send is [blocked: net].
+    /// notModified arm re-sends `GetContactsStatusesQuery` (fire-and-
+    /// forget, like the C++ handler).
     pub fn on_get_contacts(
         &mut self,
         env: &mut UserEnv,
@@ -10870,7 +10957,13 @@ impl UserManager {
                     self.saved_contact_count = 0;
                 }
                 self.on_get_contacts_finished(env, self.contacts_hints.size());
-                tdutils::log_info!("Get contacts statuses — [blocked: net]");
+                self.send_user_query(
+                    UserNetKind::GetContactsStatuses,
+                    telegram_api::Function::contacts_getStatuses(
+                        telegram_api::contacts_getStatuses,
+                    ),
+                    "contacts.getStatuses",
+                );
             }
             telegram_api::contacts_Contacts::contacts_contacts(contacts) => {
                 let mut contact_user_ids: BTreeSet<i64> = BTreeSet::new();
@@ -10946,10 +11039,22 @@ impl UserManager {
         }
     }
 
-    /// `UserManager::on_get_contacts_failed` (UserManager.cpp:8056-8060).
+    /// `UserManager::on_get_contacts_failed` (UserManager.cpp:8056-8060)
+    /// — the load failure errors the parked promises (the request
+    /// actors' `do_send_error`) and the parked load-gated td_api
+    /// requests.
     pub fn on_get_contacts_failed(&mut self, env: &mut UserEnv, error: Status) {
         self.next_contacts_sync_date = env.unix_time() + random_fast(5, 10);
         fail_promises(&mut self.load_contacts_queries, &error);
+        for request in std::mem::take(&mut self.pending_user_requests) {
+            let mut promise = match request {
+                PendingUserRequest::GetCloseFriends { promise }
+                | PendingUserRequest::SearchContacts { promise, .. }
+                | PendingUserRequest::ImportContacts { promise, .. }
+                | PendingUserRequest::ChangeImportedContacts { promise, .. } => promise,
+            };
+            promise.set_error(error.clone());
+        }
         for call in std::mem::take(&mut self.pending_load_contacts_calls) {
             match call {
                 PendingLoadContactsCall::AddContact { mut promise, .. } => {
@@ -11013,7 +11118,10 @@ impl UserManager {
         self.on_get_contacts_finished(env, expected_contact_count);
     }
 
-    /// `UserManager::on_get_contacts_finished` (UserManager.cpp:8105-8112).
+    /// `UserManager::on_get_contacts_finished` (UserManager.cpp:8105-8112)
+    /// — the `set_promises(load_contacts_queries_)` completion re-runs
+    /// the parked load-gated td_api requests (the C++ request actors'
+    /// `do_run` re-run on the resolved load promise).
     fn on_get_contacts_finished(&mut self, env: &mut UserEnv, expected_contact_count: usize) {
         tdutils::log_info!(
             "Finished to get {} contacts out of expected {}",
@@ -11041,6 +11149,7 @@ impl UserManager {
                 }
             }
         }
+        self.drain_pending_user_requests(env);
     }
 
     /// `UserManager::on_get_contacts_statuses` (UserManager.cpp:8114-8123).
@@ -11059,9 +11168,11 @@ impl UserManager {
         self.save_next_contacts_sync_date(env);
     }
 
-    /// `UserManager::add_contact` (UserManager.cpp:8125-8153) — the note
-    /// branch (`on_set_user_note`) and the `AddContactQuery` send are
-    /// [blocked: net] (the note is the MessageEntity step).
+    /// `UserManager::add_contact` (UserManager.cpp:8125-8153) — the
+    /// promise rides the family queue onto the `AddContactQuery` (the §5
+    /// restore); the note branch (`edit_note_` → the `UpdateContactNote`
+    /// ack chain, #4) is the formatted-text plane — `Contact` never
+    /// carries `edit_note_`/`note_`, so flags stays 0 on the wire form.
     pub fn add_contact(
         &mut self,
         env: &mut UserEnv,
@@ -11074,7 +11185,6 @@ impl UserManager {
             Ok(input_user) => input_user,
             Err(error) => return promise.set_error(error),
         };
-        let _ = input_user; // the AddContactQuery payload — [blocked: net]
 
         if !self.are_contacts_loaded {
             self.pending_load_contacts_calls
@@ -11091,8 +11201,20 @@ impl UserManager {
         tdutils::log_info!(
             "Add contact {contact:?} for {user_id:?} with share_phone_number = {share_phone_number}"
         );
-        // AddContactQuery — [blocked: net]
-        tdutils::log_info!("Add contact query — [blocked: net]");
+        self.pending_add_contact_queries.push((user_id, promise));
+        self.send_user_query(
+            UserNetKind::AddContact,
+            telegram_api::Function::contacts_addContact(telegram_api::contacts_addContact {
+                flags: 0,
+                add_phone_privacy_exception: share_phone_number,
+                id: Some(input_user),
+                first_name: contact.get_first_name().to_owned(),
+                last_name: contact.get_last_name().to_owned(),
+                phone: contact.get_phone_number().to_owned(),
+                note: None,
+            }),
+            "contacts.addContact",
+        );
     }
 
     /// `UserManager::import_contacts` (UserManager.cpp:8155-8181) — the
@@ -11140,9 +11262,9 @@ impl UserManager {
     }
 
     /// `UserManager::do_import_contacts` (UserManager.cpp:8183-8206) —
-    /// the `ImportContactsQuery` send is [blocked: net]; the task is
-    /// registered and waits for `on_imported_contacts`/`on_import_
-    /// contacts_finished` like in the C++.
+    /// the task registers (the promise rides it, exactly like the C++)
+    /// and the `ImportContactsQuery` rides the `net` handle with the
+    /// `inputPhoneContact` payloads.
     fn do_import_contacts(
         &mut self,
         env: &mut UserEnv,
@@ -11166,13 +11288,45 @@ impl UserManager {
         let is_added = self.import_contact_tasks.insert(random_id, task).is_none();
         assert!(is_added);
 
-        // ImportContactsQuery — [blocked: net]
-        tdutils::log_info!("Import {} contacts query — [blocked: net]", size);
+        // the C++ builds the payloads before registering the task; both
+        // orders are unobservable (the query answers after the turn)
+        let input_phone_contacts = self
+            .import_contact_tasks
+            .get(&random_id)
+            .expect("the task registered above")
+            .input_contacts
+            .iter()
+            .enumerate()
+            .map(|(i, contact)| contact.get_input_phone_contact(i as i64))
+            .collect();
+        self.send_import_contacts_query(random_id, input_phone_contacts);
+    }
+
+    /// The `ImportContactsQuery` send (cpp:353-360) — the kind carries
+    /// the handler's `random_id_`/`sent_size_` members.
+    fn send_import_contacts_query(
+        &mut self,
+        random_id: i64,
+        input_phone_contacts: Vec<telegram_api::InputContact>,
+    ) {
+        let sent_size = input_phone_contacts.len();
+        self.send_user_query(
+            UserNetKind::ImportContacts {
+                random_id,
+                sent_size,
+            },
+            telegram_api::Function::contacts_importContacts(
+                telegram_api::contacts_importContacts {
+                    contacts: input_phone_contacts,
+                },
+            ),
+            "contacts.importContacts",
+        );
     }
 
     /// `UserManager::on_imported_contacts` (UserManager.cpp:8208-8268) —
-    /// the retry re-send is [blocked: net]; the task stays registered
-    /// exactly like the C++ between the retry rounds.
+    /// the retry round re-sends the `ImportContactsQuery` with the retry
+    /// client ids and keeps the task registered, exactly like the C++.
     pub fn on_imported_contacts(
         &mut self,
         env: &mut UserEnv,
@@ -11184,7 +11338,10 @@ impl UserManager {
                 .import_contact_tasks
                 .remove(&random_id)
                 .expect("import task exists");
-            task.promise.set_error(error);
+            task.promise.set_error(error.clone());
+            // the parked td_api import/change request of the task errors
+            // out (the C++ request-actor promise chain's `do_send_error`)
+            self.fail_pending_import_request(random_id, &error);
             return;
         }
         let imported_contacts = result.expect("checked above");
@@ -11223,11 +11380,28 @@ impl UserManager {
 
         if !imported_contacts.retry_contacts.is_empty() {
             // the C++ re-sends the retry client ids with the same
-            // random_id and keeps the task — [blocked: net]
-            tdutils::log_info!(
-                "Retry {} contacts import — [blocked: net]",
-                imported_contacts.retry_contacts.len()
-            );
+            // random_id and keeps the task
+            let input_phone_contacts = {
+                let task = self
+                    .import_contact_tasks
+                    .get(&random_id)
+                    .expect("import task exists");
+                let total_size = task.input_contacts.len() as i64;
+                let mut input_phone_contacts =
+                    Vec::with_capacity(imported_contacts.retry_contacts.len());
+                for client_id in &imported_contacts.retry_contacts {
+                    if *client_id < 0 || *client_id >= total_size {
+                        tdutils::log_error!("Wrong client_id {client_id} returned");
+                        continue;
+                    }
+                    input_phone_contacts.push(
+                        task.input_contacts[*client_id as usize]
+                            .get_input_phone_contact(*client_id),
+                    );
+                }
+                input_phone_contacts
+            };
+            self.send_import_contacts_query(random_id, input_phone_contacts);
             return;
         }
 
@@ -11242,6 +11416,32 @@ impl UserManager {
             std::mem::take(&mut task.unimported_contact_invites),
         );
         task.promise.set_value(());
+    }
+
+    /// The parked td_api import/change request of an errored task —
+    /// the C++ request-actor promise chain's `do_send_error` (the task
+    /// registry keyed the random id).
+    fn fail_pending_import_request(&mut self, random_id: i64, error: &Status) {
+        let mut index = 0;
+        while index < self.pending_user_requests.len() {
+            let matches = match &self.pending_user_requests[index] {
+                PendingUserRequest::ImportContacts { random_id: id, .. }
+                | PendingUserRequest::ChangeImportedContacts { random_id: id, .. } => {
+                    *id == random_id
+                }
+                _ => false,
+            };
+            if matches {
+                let mut promise = match self.pending_user_requests.remove(index) {
+                    PendingUserRequest::ImportContacts { promise, .. }
+                    | PendingUserRequest::ChangeImportedContacts { promise, .. } => promise,
+                    _ => unreachable!("the match above filtered the kind"),
+                };
+                promise.set_error(error.clone());
+            } else {
+                index += 1;
+            }
+        }
     }
 
     /// `UserManager::on_import_contacts_finished`
@@ -11326,7 +11526,8 @@ impl UserManager {
     }
 
     /// `UserManager::remove_contacts` (UserManager.cpp:8330-8353) — the
-    /// `DeleteContactsQuery` send is [blocked: net].
+    /// promise rides the family queue onto the `DeleteContactsQuery`
+    /// (the §5 restore).
     pub fn remove_contacts(
         &mut self,
         env: &mut UserEnv,
@@ -11353,22 +11554,26 @@ impl UserManager {
             return;
         }
 
-        // DeleteContactsQuery — [blocked: net]
-        tdutils::log_info!(
-            "Delete {} contacts query — [blocked: net]",
-            input_users.len()
+        self.pending_delete_contacts_queries.push(promise);
+        self.send_user_query(
+            UserNetKind::DeleteContacts,
+            telegram_api::Function::contacts_deleteContacts(
+                telegram_api::contacts_deleteContacts { id: input_users },
+            ),
+            "contacts.deleteContacts",
         );
     }
 
     /// `UserManager::remove_contacts_by_phone_number`
-    /// (UserManager.cpp:8355-8365) — the `DeleteContactsByPhoneNumberQuery`
-    /// send is [blocked: net].
+    /// (UserManager.cpp:8355-8365) — the `DeleteContactsByPhoneNumber
+    /// Query` send; the empty-phones early answer is the C++ handler
+    /// `send`'s promise resolution.
     pub fn remove_contacts_by_phone_number(
         &mut self,
         env: &mut UserEnv,
         user_phone_numbers: Vec<String>,
         user_ids: Vec<UserId>,
-        promise: Promise<()>,
+        mut promise: Promise<()>,
     ) {
         tdutils::log_info!("Delete contacts by phone number: {user_phone_numbers:?}");
         if !self.are_contacts_loaded {
@@ -11376,10 +11581,20 @@ impl UserManager {
             return;
         }
 
-        // DeleteContactsByPhoneNumberQuery — [blocked: net]
-        tdutils::log_info!(
-            "Delete contacts by phone number query ({} numbers, {user_ids:?}) — [blocked: net]",
-            user_phone_numbers.len()
+        if user_phone_numbers.is_empty() {
+            return promise.set_value(());
+        }
+
+        self.pending_delete_contacts_by_phones_queries
+            .push((user_ids, promise));
+        self.send_user_query(
+            UserNetKind::DeleteContactsByPhones,
+            telegram_api::Function::contacts_deleteByPhones(
+                telegram_api::contacts_deleteByPhones {
+                    phones: user_phone_numbers,
+                },
+            ),
+            "contacts.deleteByPhones",
         );
     }
 
@@ -11535,11 +11750,11 @@ impl UserManager {
     }
 
     /// `UserManager::change_imported_contacts`
-    /// (UserManager.cpp:8488-8598) — the
-    /// `remove_contacts_by_phone_number` continuation and the
-    /// `ImportContactsQuery` re-send are [blocked: net]; the dedup
-    /// machine, the to-delete/to-add diff and the
-    /// `are_imported_contacts_changing_` gate are ported.
+    /// (UserManager.cpp:8488-8598) — the dedup machine, the
+    /// to-delete/to-add diff and the `are_imported_contacts_changing_`
+    /// gate are ported; the removal continuation into
+    /// `on_clear_imported_contacts` rides the change-continuation
+    /// message slice.
     pub fn change_imported_contacts(
         &mut self,
         env: &mut UserEnv,
@@ -11664,15 +11879,19 @@ impl UserManager {
             to_delete_user_ids,
             Promise::default(),
         );
-        // the C++ chains the removal query into on_clear_imported_contacts
-        // → do_import_contacts(1); both ride the net step, so the
-        // continuation is driven explicitly by the callers (the tests) —
-        // [blocked: net]
+        // the C++ chains the removal query's promise into
+        // on_clear_imported_contacts → do_import_contacts(1)
+        // (cpp:8573-8597); the chain's actor hop needs an in-flight marker
+        // the drain can see (the parked request would otherwise answer
+        // between the removal answer and the chain arrival) — it rides
+        // the change-continuation message slice, and the continuation
+        // stays driven by the callers (the tests) until then
         (Vec::new(), Vec::new())
     }
 
     /// `UserManager::clear_imported_contacts` (UserManager.cpp:8600-8609)
-    /// — the `ResetContactsQuery` send is [blocked: net].
+    /// — the `ResetContactsQuery` send with the promise on the family
+    /// queue.
     pub fn clear_imported_contacts(&mut self, _env: &mut UserEnv, mut promise: Promise<()>) {
         tdutils::log_info!("Delete imported contacts");
 
@@ -11681,10 +11900,12 @@ impl UserManager {
             return;
         }
 
-        // ResetContactsQuery — [blocked: net]; the promise parks until
-        // the net query actors land
-        self.net_blocked_promises.push(promise);
-        tdutils::log_info!("Reset contacts query — [blocked: net]");
+        self.pending_reset_contacts_queries.push(promise);
+        self.send_user_query(
+            UserNetKind::ResetContacts,
+            telegram_api::Function::contacts_resetSaved(telegram_api::contacts_resetSaved),
+            "contacts.resetSaved",
+        );
     }
 
     /// `UserManager::on_clear_imported_contacts`
@@ -11824,8 +12045,9 @@ impl UserManager {
     }
 
     /// `UserManager::reload_contact_birthdates`
-    /// (UserManager.cpp:8735-8749) — the
-    /// `GetContactsBirthdaysQuery` send is [blocked: net].
+    /// (UserManager.cpp:8735-8749) — the `GetContactsBirthdaysQuery`
+    /// send over the `net` handle (fire-and-forget; the error band runs
+    /// the `None` intake that re-arms the sync timer).
     pub fn reload_contact_birthdates(&mut self, env: &mut UserEnv, force: bool) {
         if env
             .options
@@ -11844,8 +12066,11 @@ impl UserManager {
             && (self.contact_birthdates.next_sync_time < tdutils::time::now() || force)
         {
             self.contact_birthdates.is_being_synced = true;
-            // GetContactsBirthdaysQuery — [blocked: net]
-            tdutils::log_info!("Get contacts birthdays query — [blocked: net]");
+            self.send_user_query(
+                UserNetKind::GetBirthdays,
+                telegram_api::Function::contacts_getBirthdays(telegram_api::contacts_getBirthdays),
+                "contacts.getBirthdays",
+            );
         }
     }
 
@@ -11940,10 +12165,22 @@ impl UserManager {
     }
 
     /// `UserManager::hide_contact_birthdays` (UserManager.cpp:8789-8791)
-    /// — the `DismissContactBirthdaysSuggestionQuery` send is
-    /// [blocked: net].
-    pub fn hide_contact_birthdays(&mut self, _promise: Promise<()>) {
-        tdutils::log_info!("Dismiss contact birthdays suggestion query — [blocked: net]");
+    /// — the `DismissContactBirthdaysSuggestionQuery` send (the
+    /// `help.dismissSuggestion` form with `inputPeerEmpty` and the
+    /// `BIRTHDAY_CONTACTS_TODAY` action); the promise rides the family
+    /// queue (the §5 restore).
+    pub fn hide_contact_birthdays(&mut self, promise: Promise<()>) {
+        self.pending_dismiss_birthdays_queries.push(promise);
+        self.send_user_query(
+            UserNetKind::DismissBirthdays,
+            telegram_api::Function::help_dismissSuggestion(telegram_api::help_dismissSuggestion {
+                peer: Some(Box::new(telegram_api::InputPeer::inputPeerEmpty(
+                    telegram_api::inputPeerEmpty,
+                ))),
+                suggestion: "BIRTHDAY_CONTACTS_TODAY".to_owned(),
+            }),
+            "help.dismissSuggestion",
+        );
     }
 
     /// `UserManager::get_close_friends` (UserManager.cpp:8793-8813).
@@ -11972,8 +12209,10 @@ impl UserManager {
         user_ids
     }
 
-    /// `UserManager::set_close_friends` (UserManager.cpp:8815-8823) — the
-    /// `EditCloseFriendsQuery` send is [blocked: net].
+    /// `UserManager::set_close_friends` (UserManager.cpp:8815-8823) —
+    /// the `EditCloseFriendsQuery` send; the user ids (the
+    /// `on_set_close_friends` intake) and the promise ride the family
+    /// queue (the §5 restore).
     pub fn set_close_friends(&mut self, user_ids: Vec<UserId>, mut promise: Promise<()>) {
         for user_id in &user_ids {
             if !self.have_min_user(*user_id) {
@@ -11981,7 +12220,16 @@ impl UserManager {
             }
         }
 
-        tdutils::log_info!("Edit close friends query for {user_ids:?} — [blocked: net]");
+        self.pending_edit_close_friends_queries
+            .push((user_ids.clone(), promise));
+        let ids = user_ids.iter().map(|user_id| user_id.get()).collect();
+        self.send_user_query(
+            UserNetKind::EditCloseFriends,
+            telegram_api::Function::contacts_editCloseFriends(
+                telegram_api::contacts_editCloseFriends { id: ids },
+            ),
+            "contacts.editCloseFriends",
+        );
     }
 
     /// `UserManager::on_set_close_friends` (UserManager.cpp:8825-8839).
@@ -12019,8 +12267,9 @@ impl UserManager {
     }
 
     /// `UserManager::search_user_by_phone_number`
-    /// (UserManager.cpp:8841-8860) — the `ResolvePhoneQuery` send is
-    /// [blocked: net].
+    /// (UserManager.cpp:8841-8860) — the miss arm parks the phone and
+    /// the promise on the `ResolvePhoneQuery` family queue (the §5
+    /// restore) and sends the query.
     pub fn search_user_by_phone_number(
         &mut self,
         phone_number: String,
@@ -12041,39 +12290,109 @@ impl UserManager {
         if only_local {
             promise.set_value(());
         } else {
-            // ResolvePhoneQuery — [blocked: net]
-            tdutils::log_info!("Resolve phone number \"{phone_number}\" query — [blocked: net]");
+            self.send_resolve_phone_query(phone_number, promise);
         }
         UserId::default()
     }
 
+    /// The `ResolvePhoneQuery` send (cpp:278-290) — the handler's
+    /// `phone_number_` member and the promise park on the family queue.
+    fn send_resolve_phone_query(&mut self, phone_number: String, promise: Promise<()>) {
+        self.pending_resolve_phone_queries
+            .push((phone_number.clone(), promise));
+        self.send_user_query(
+            UserNetKind::ResolvePhone,
+            telegram_api::Function::contacts_resolvePhone(telegram_api::contacts_resolvePhone {
+                phone: phone_number,
+            }),
+            "contacts.resolvePhone",
+        );
+    }
+
     /// The request-facing `search_user_by_phone_number`
-    /// (SearchUserByPhoneNumberRequest, Requests.cpp:364-390) —
-    /// `Ok(Some(id))` when the C++ promise completed synchronously (the
-    /// resolved cache, possibly the negative default, or the only_local
-    /// form), `Ok(None)` when the ResolvePhoneQuery park answers nothing
-    /// ([blocked: net]), `Err` — the phone-number error.
+    /// (SearchUserByPhoneNumberRequest, Requests.cpp:364-390) — the local
+    /// arms answer through `answer_search_phone_request` (the
+    /// `do_send_result` form); the miss leg parks the request on the
+    /// resolve queue (the RequestActor do_run/do_send_result re-run
+    /// collapse: the resolve answer caches the phone, the drain answers
+    /// from the cache).
     pub(crate) fn search_user_by_phone_number_for_request(
         &mut self,
+        env: &UserEnv,
         phone_number: String,
         only_local: bool,
-    ) -> Result<Option<UserId>, Status> {
+        mut promise: Promise<Object>,
+    ) {
         let phone_number = clean_phone_number(phone_number);
         if phone_number.is_empty() {
-            return Err(Status::error(200, "Phone number is invalid"));
+            return promise.set_error(Status::error(200, "Phone number is invalid"));
         }
 
         if let Some(user_id) = self.resolved_phone_numbers.get(&phone_number) {
-            return Ok(Some(*user_id));
+            let user_id = *user_id;
+            return self.answer_search_phone_request(env, user_id, promise);
         }
 
         if only_local {
-            return Ok(Some(UserId::default()));
+            return self.answer_search_phone_request(env, UserId::default(), promise);
         }
 
-        // ResolvePhoneQuery — [blocked: net]
-        tdutils::log_info!("Resolve phone number \"{phone_number}\" query — [blocked: net]");
-        Ok(None)
+        self.pending_search_phone_requests
+            .push((phone_number.clone(), promise));
+        self.send_resolve_phone_query(phone_number, Promise::default());
+    }
+
+    /// The `SearchUserByPhoneNumberRequest::do_send_result` half — the
+    /// user object of the resolution, or the `send_result(nullptr)` 404
+    /// when the user is unknown (the negative-cache default included).
+    fn answer_search_phone_request(
+        &self,
+        env: &UserEnv,
+        user_id: UserId,
+        mut promise: Promise<Object>,
+    ) {
+        match self.get_user(user_id) {
+            Some(_) => promise.set_value(Object::user(self.get_user_object_of(env, user_id))),
+            None => promise.set_value(Object::error(td_api::Error {
+                code: 404,
+                message: "Not Found".to_owned(),
+            })),
+        }
+    }
+
+    /// Drain the parked `searchUserByPhoneNumber` requests whose phone a
+    /// resolve answer just cached (the RequestActor do_run/do_send_result
+    /// re-run); the rest stay parked for their own answers — the drain
+    /// is phone-exact on the ok path.
+    pub(crate) fn drain_search_phone_requests(&mut self, env: &UserEnv) {
+        let mut index = 0;
+        while index < self.pending_search_phone_requests.len() {
+            let phone = self.pending_search_phone_requests[index].0.clone();
+            if let Some(user_id) = self.resolved_phone_numbers.get(&phone).copied() {
+                let (_, promise) = self.pending_search_phone_requests.remove(index);
+                self.answer_search_phone_request(env, user_id, promise);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Fail the parked `searchUserByPhoneNumber` requests of one phone —
+    /// the resolve error band (the FIFO-popped pair's phone, the §5
+    /// pairing).
+    pub(crate) fn fail_search_phone_requests(&mut self, phone_number: &str, status: &Status) {
+        self.pending_search_phone_requests =
+            std::mem::take(&mut self.pending_search_phone_requests)
+                .into_iter()
+                .filter_map(|(phone, mut promise)| {
+                    if phone == phone_number {
+                        promise.set_error(status.clone());
+                        None
+                    } else {
+                        Some((phone, promise))
+                    }
+                })
+                .collect();
     }
 
     /// The request-facing `search_user_by_phone_number`
@@ -12520,6 +12839,94 @@ impl UserManager {
         }
     }
 
+    /// The test read of `saved_contact_count_` (the reset band assert).
+    #[cfg(test)]
+    pub(crate) fn saved_contact_count_for_test(&self) -> i32 {
+        self.saved_contact_count
+    }
+
+    /// Pop the head `AddContactQuery` state (cpp:209-240) — the handler's
+    /// `user_id_` member and the query-carried promise (the §5 restore).
+    pub(crate) fn take_add_contact_query(&mut self) -> Option<(UserId, Promise<()>)> {
+        if self.pending_add_contact_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_add_contact_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `DeleteContactsQuery` promise (cpp:383-406, the §5
+    /// restore).
+    pub(crate) fn take_delete_contacts_query(&mut self) -> Option<Promise<()>> {
+        if self.pending_delete_contacts_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_delete_contacts_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `DeleteContactsByPhoneNumberQuery` state (cpp:411-432)
+    /// — the handler's `user_ids_` member and the promise.
+    pub(crate) fn take_delete_contacts_by_phones_query(
+        &mut self,
+    ) -> Option<(Vec<UserId>, Promise<()>)> {
+        if self.pending_delete_contacts_by_phones_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_delete_contacts_by_phones_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `ResetContactsQuery` promise (cpp:448-472).
+    pub(crate) fn take_reset_contacts_query(&mut self) -> Option<Promise<()>> {
+        if self.pending_reset_contacts_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_reset_contacts_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `DismissContactBirthdaysSuggestionQuery` promise
+    /// (cpp:161-180).
+    pub(crate) fn take_dismiss_birthdays_query(&mut self) -> Option<Promise<()>> {
+        if self.pending_dismiss_birthdays_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_dismiss_birthdays_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `EditCloseFriendsQuery` state (cpp:250-266) — the
+    /// handler's `user_ids_` member and the promise (the §5 restore).
+    pub(crate) fn take_edit_close_friends_query(&mut self) -> Option<(Vec<UserId>, Promise<()>)> {
+        if self.pending_edit_close_friends_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_edit_close_friends_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `ResolvePhoneQuery` state (cpp:278-316) — the
+    /// handler's `phone_number_` member and the promise (the §5
+    /// restore).
+    pub(crate) fn take_resolve_phone_query(&mut self) -> Option<(String, Promise<()>)> {
+        if self.pending_resolve_phone_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_resolve_phone_queries.remove(0))
+        }
+    }
+
+    /// Pop the head `AcceptContactQuery` state (cpp:322-351) — the
+    /// handler's `user_id_` member and the promise (the §5 restore).
+    pub(crate) fn take_accept_contact_query(&mut self) -> Option<(UserId, Promise<()>)> {
+        if self.pending_accept_contact_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_accept_contact_queries.remove(0))
+        }
+    }
+
     /// `UserManager::on_get_is_premium_required_to_contact_users`
     /// (UserManager.cpp:7854-7882) — the merged-query answer: cache the
     /// price per user that has no `UserFull` yet.
@@ -12568,7 +12975,8 @@ impl UserManager {
 
     /// `UserManager::share_phone_number` (UserManager.cpp:7896-7909). The
     /// load-gated re-dispatch rides the parked-call queue (the C++ actor
-    /// message); the `AcceptContactQuery` send is [blocked: net] and the
+    /// message); the `AcceptContactQuery` send rides the `net` handle
+    /// with the promise on the family queue (the §5 restore); the
     /// `hide_dialog_action_bar` fan-out is MessagesManager's.
     pub fn share_phone_number(
         &mut self,
@@ -12591,10 +12999,16 @@ impl UserManager {
             Ok(input_user) => input_user,
             Err(error) => return promise.set_error(error),
         };
-        let _ = input_user; // the AcceptContactQuery payload — [blocked: net]
-        self.net_blocked_promises.push(promise);
         // MessagesManager::hide_dialog_action_bar — with its step
-        tdutils::log_info!("Accept contact query — [blocked: net]");
+        tdutils::log_info!("Hide dialog action bar — the MessagesManager step");
+        self.pending_accept_contact_queries.push((user_id, promise));
+        self.send_user_query(
+            UserNetKind::AcceptContact,
+            telegram_api::Function::contacts_acceptContact(telegram_api::contacts_acceptContact {
+                id: Some(input_user),
+            }),
+            "contacts.acceptContact",
+        );
     }
 
     /// `UserManager::register_noforwards_request` (UserManager.cpp:9438-9450)
@@ -12719,10 +13133,14 @@ impl UserManager {
     }
 
     /// `UserManager::on_update_online_status_privacy`
-    /// (UserManager.cpp:4768-4770). The `GetContactsStatusesQuery` send is
-    /// [blocked: net] (the M.4.16 un-stub).
+    /// (UserManager.cpp:4768-4770) — the `GetContactsStatusesQuery`
+    /// re-fetch (fire-and-forget, like the C++ handler).
     pub fn on_update_online_status_privacy(&mut self, _env: &mut UserEnv) {
-        tdutils::log_info!("Get contacts statuses — [blocked: net]");
+        self.send_user_query(
+            UserNetKind::GetContactsStatuses,
+            telegram_api::Function::contacts_getStatuses(telegram_api::contacts_getStatuses),
+            "contacts.getStatuses",
+        );
     }
 
     /// `UserManager::on_update_phone_number_privacy`
@@ -18816,5 +19234,195 @@ mod tests {
         assert!(
             matches!(&*result.lock().unwrap(), Some(tdutils::status::Result::Err(s)) if s.message() == "FLOOD_WAIT_5")
         );
+    }
+
+    #[test]
+    fn contacts_query_families_answer_the_local_bands() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        um.set_my_id(&mut env, UserId::new(1));
+
+        // remove_contacts before the load parks on the load promise
+        let (promise, result) = promise_result();
+        um.remove_contacts(&mut env, vec![UserId::new(5)], promise);
+        assert!((*result.lock().unwrap()).is_none(), "the load gate parks");
+        assert!(!um.are_contacts_loaded);
+
+        // the loaded tree over the empty store
+        load_contacts_via_on_get_contacts(&mut um, &mut env, Vec::new(), 0);
+
+        // remove_contacts with no contacts among the ids answers ok
+        // with no query out (the empty input_users band)
+        let (promise, result) = promise_result();
+        um.remove_contacts(&mut env, vec![UserId::new(7)], promise);
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            um.pending_delete_contacts_queries.is_empty(),
+            "no query parked"
+        );
+
+        // remove_contacts_by_phone_number with no phones answers ok (the
+        // C++ handler send's early promise resolution)
+        let (promise, result) = promise_result();
+        um.remove_contacts_by_phone_number(&mut env, Vec::new(), Vec::new(), promise);
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(um.pending_delete_contacts_by_phones_queries.is_empty());
+
+        // clear_imported_contacts over the empty store answers ok
+        let (promise, result) = promise_result();
+        um.clear_imported_contacts(&mut env, promise);
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(um.pending_reset_contacts_queries.is_empty());
+
+        // set_close_friends with an unknown user answers the C++ 400
+        let (promise, result) = promise_result();
+        um.set_close_friends(vec![UserId::new(999)], promise);
+        let error = result.lock().unwrap().take().expect("the promise failed");
+        let error = error.error().clone();
+        assert_eq!((error.code(), error.message()), (400, "User not found"));
+        assert!(um.pending_edit_close_friends_queries.is_empty());
+
+        // add_contact with an inaccessible user answers the input error
+        let (promise, result) = promise_result();
+        um.add_contact(
+            &mut env,
+            UserId::new(999),
+            Contact::new(
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                UserId::default(),
+            ),
+            false,
+            promise,
+        );
+        let error = result.lock().unwrap().take().expect("the promise failed");
+        let error = error.error().clone();
+        assert_eq!(error.code(), 400);
+        assert!(um.pending_add_contact_queries.is_empty());
+
+        // search_user_by_phone_number with the empty number answers the
+        // 200 band
+        let (promise, result) = promise_result();
+        let found = um.search_user_by_phone_number("+#".to_owned(), false, promise);
+        assert_eq!(found, UserId::default());
+        let error = result.lock().unwrap().take().expect("the promise failed");
+        let error = error.error().clone();
+        assert_eq!(
+            (error.code(), error.message()),
+            (200, "Phone number is invalid")
+        );
+        assert!(um.pending_resolve_phone_queries.is_empty());
+    }
+
+    #[test]
+    fn contacts_query_families_park_the_promises_and_handler_state() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        um.set_my_id(&mut env, UserId::new(1));
+        // the contact pre-seed — the helper's walk refires the load when
+        // the contact arrives fresh (is_is_contact_changed)
+        let contact = telegram_contact(2, "Alice", "Cooper");
+        um.on_get_user(&mut env, telegram_api::User::user(contact.clone()), "test");
+        load_contacts_via_on_get_contacts(&mut um, &mut env, vec![contact], 1);
+
+        // remove_contacts parks the query-carried promise (the §5
+        // restore) and pops FIFO
+        let (promise, result) = promise_result();
+        um.remove_contacts(&mut env, vec![UserId::new(2)], promise);
+        assert!(
+            (*result.lock().unwrap()).is_none(),
+            "the answer completes it"
+        );
+        assert_eq!(um.pending_delete_contacts_queries.len(), 1);
+        // the pop shape: the take fn drains head-first
+        let _parked = um
+            .take_delete_contacts_query()
+            .expect("the parked promise pops");
+        assert!(um.take_delete_contacts_query().is_none(), "drained");
+
+        // remove_contacts_by_phone_number parks the user ids with the
+        // promise (the on_deleted_contacts intake state)
+        let (promise, _result) = promise_result();
+        um.remove_contacts_by_phone_number(
+            &mut env,
+            vec!["+123".to_owned()],
+            vec![UserId::new(2)],
+            promise,
+        );
+        let (user_ids, _promise) = um
+            .take_delete_contacts_by_phones_query()
+            .expect("the pair pops");
+        assert_eq!(user_ids, vec![UserId::new(2)]);
+
+        // clear_imported_contacts over a non-empty store parks (the
+        // ResetContacts promise)
+        let (promise, _result) = promise_result();
+        um.clear_imported_contacts(&mut env, promise);
+        assert!(
+            um.take_reset_contacts_query().is_some(),
+            "the reset promise parks"
+        );
+
+        // set_close_friends over the seeded contact parks the ids
+        let (promise, _result) = promise_result();
+        um.set_close_friends(vec![UserId::new(2)], promise);
+        let (user_ids, _promise) = um
+            .take_edit_close_friends_query()
+            .expect("the close-friends pair pops");
+        assert_eq!(user_ids, vec![UserId::new(2)]);
+
+        // hide_contact_birthdays parks the dismiss promise
+        let (promise, _result) = promise_result();
+        um.hide_contact_birthdays(promise);
+        assert!(
+            um.take_dismiss_birthdays_query().is_some(),
+            "the dismiss promise parks"
+        );
+
+        // share_phone_number over the loaded tree parks the accept pair
+        let (promise, _result) = promise_result();
+        um.share_phone_number(&mut env, UserId::new(2), promise);
+        let (user_id, _promise) = um
+            .take_accept_contact_query()
+            .expect("the accept pair pops");
+        assert_eq!(user_id, UserId::new(2));
+
+        // add_contact parks the user id with the promise
+        let (promise, _result) = promise_result();
+        um.add_contact(
+            &mut env,
+            UserId::new(2),
+            Contact::new(
+                "+123".to_owned(),
+                "Alice".to_owned(),
+                "Cooper".to_owned(),
+                String::new(),
+                UserId::default(),
+            ),
+            false,
+            promise,
+        );
+        let (user_id, _promise) = um.take_add_contact_query().expect("the add pair pops");
+        assert_eq!(user_id, UserId::new(2));
+
+        // the miss leg of the phone search parks the cleaned phone
+        let (promise, _result) = promise_result();
+        let found = um.search_user_by_phone_number("+9 (555)".to_owned(), false, promise);
+        assert_eq!(found, UserId::default());
+        let (phone, _promise) = um
+            .take_resolve_phone_query()
+            .expect("the resolve pair pops");
+        assert_eq!(phone, "9555", "the digits-only cleaning");
     }
 }

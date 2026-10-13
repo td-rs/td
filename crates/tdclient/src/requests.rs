@@ -1148,41 +1148,25 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::searchUserByPhoneNumber(request) => {
             // SearchUserByPhoneNumberRequest (Requests.cpp:364-390): the
-            // resolved cache answers locally; the ResolvePhoneQuery tail is
-            // [blocked: net]. The completed future with no user record
-            // answers the `send_result(nullptr)` 404.
+            // resolved cache and the only_local form answer synchronously
+            // (the `do_send_result` object); the miss leg parks the
+            // request on the ResolvePhoneQuery family queue — the answer
+            // caches the phone and drains the park with the fresh object
+            // (the RequestActor do_run re-run collapse).
             if !check_is_user(td, id) {
                 return;
             }
             let Some(phone_number) = crate::misc::clean_input_string(&request.phone_number) else {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
-            let resolved = td
-                .user_manager
-                .search_user_by_phone_number_for_request(phone_number, request.only_local);
-            match resolved {
-                Err(status) => send_error_status(td, id, status),
-                Ok(None) => {} // the resolve query — [blocked: net]
-                Ok(Some(user_id)) => {
-                    let have = td.user_manager.get_user(user_id).is_some();
-                    if have {
-                        let user = {
-                            let env = user_env!(td);
-                            td.user_manager.get_user_object_of(&env, user_id)
-                        };
-                        td.send_result(id, Object::user(user));
-                    } else {
-                        // `get_user_object(nullptr)` → the 404 in `Td::send_result`
-                        td.send_result(
-                            id,
-                            Object::error(td_api::Error {
-                                code: 404,
-                                message: "Not Found".to_string(),
-                            }),
-                        );
-                    }
-                }
-            }
+            let promise: Promise<Object> = td.deferred_promise(id, |object| object);
+            let env = user_env!(td);
+            td.user_manager.search_user_by_phone_number_for_request(
+                &env,
+                phone_number,
+                request.only_local,
+                promise,
+            );
         }
 
         // --- the contacts family ---
