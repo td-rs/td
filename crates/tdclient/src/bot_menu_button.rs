@@ -3,11 +3,12 @@
 //! the `setMenuButton`/`getMenuButton` request flows.
 //!
 //! Seams: the flows end in the `Td::ResultHandler` sends
-//! ([`BotInfoManagerEnv`] query seams, [blocked: net]) — the promises park
-//! in [`crate::bot_info_manager::BotInfoManager`], whose
-//! `get_menu_button` answer half (`GetBotMenuButtonQuery::on_result`,
-//! BotMenuButton.cpp:69-80) reduces to [`get_bot_menu_button`] +
-//! [`get_bot_menu_button_object`] once the net step lands.
+//! ([`BotInfoManagerEnv`] query seams, net-live over the
+//! `BotInfoNetHandle` dispatcher) — the promises park in
+//! [`crate::bot_info_manager::BotInfoManager`] and the answers drain
+//! through `Td::on_bot_info_net_answer`; the `get_menu_button` answer
+//! half (`GetBotMenuButtonQuery::on_result`, BotMenuButton.cpp:69-80)
+//! reduces to [`get_bot_menu_button`] + [`get_bot_menu_button_object`].
 //!
 //! Divergence: the C++ `LinkManager::check_link` failure is reported as
 //! `400 "Menu button Web App " + message` (BotMenuButton.cpp:148-150).
@@ -372,7 +373,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries,
-            vec!["Send bots.setBotMenuButton — [blocked: net]"]
+            vec!["Send bots.setBotMenuButton — [net-inert]"]
         );
     }
 
@@ -393,7 +394,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries,
-            vec!["Send bots.getBotMenuButton — [blocked: net]"]
+            vec!["Send bots.getBotMenuButton — [net-inert]"]
         );
     }
 }

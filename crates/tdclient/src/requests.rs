@@ -10040,6 +10040,7 @@ fn bot_env_split(
     &mut crate::bot_info_manager::BotInfoManager,
     crate::td::BotInfoEnv<'_>,
 ) {
+    let net = td.bot_info_net();
     let crate::td::Td {
         bot_info_manager,
         global,
@@ -10054,6 +10055,7 @@ fn bot_env_split(
         auth_is_authorized: auth_manager.is_authorized(),
         auth_is_bot: auth_manager.is_bot(),
         user_manager,
+        net,
     };
     (bot_info_manager, env)
 }

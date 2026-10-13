@@ -2,9 +2,10 @@
 //! bot-side custom request surface (`sendCustomRequest`,
 //! `answerCustomQuery`, `setBotUpdatesStatus`).
 //!
-//! Seams: the query sends are the [`BotInfoManagerEnv`] seams
-//! ([blocked: net]); the promises park in
-//! [`crate::bot_info_manager::BotInfoManager`] — except
+//! Seams: the query sends are the [`BotInfoManagerEnv`] seams, net-live
+//! over the `BotInfoNetHandle` dispatcher; the promises park in
+//! [`crate::bot_info_manager::BotInfoManager`] and the answers drain
+//! through `Td::on_bot_info_net_answer` — except
 //! `set_bot_updates_status`, whose C++ handler has no promise
 //! (BotQueries.cpp:77-100): the fire-and-forget send answers `ok`
 //! immediately, exactly like the C++ `promise.set_value(Unit())`.
@@ -108,7 +109,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries,
-            vec!["Send bots.sendCustomRequest — [blocked: net]"]
+            vec!["Send bots.sendCustomRequest — [net-inert]"]
         );
 
         // the webhook answer parks too
@@ -124,7 +125,7 @@ mod tests {
         assert!(recorded.unwrap().is_ok());
         assert_eq!(
             env.queries.last().unwrap(),
-            "Send help.setBotUpdatesStatus — [blocked: net]"
+            "Send help.setBotUpdatesStatus — [net-inert]"
         );
     }
 }

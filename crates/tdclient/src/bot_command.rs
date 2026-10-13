@@ -4,12 +4,13 @@
 //! `getCommands` request flows.
 //!
 //! Seams: the three flows end in the `Td::ResultHandler` sends
-//! ([`BotInfoManagerEnv`] query seams, [blocked: net]) — the promises park
-//! in [`crate::bot_info_manager::BotInfoManager`], whose
-//! `get_bot_commands` answer half
-//! (`GetBotCommandsQuery::on_result`, BotCommand.cpp:97-105) reduces to
-//! [`BotCommands::from_telegram`] + [`BotCommands::get_bot_commands_object`]
-//! once the net step lands.
+//! ([`BotInfoManagerEnv`] query seams, net-live over the
+//! `BotInfoNetHandle` dispatcher) — the promises park
+//! in [`crate::bot_info_manager::BotInfoManager`] and the answers drain
+//! through `Td::on_bot_info_net_answer`; the `get_bot_commands` answer
+//! half (`GetBotCommandsQuery::on_result`, BotCommand.cpp:97-105) reduces
+//! to [`BotCommands::from_telegram`] +
+//! [`BotCommands::get_bot_commands_object`].
 //!
 //! Divergences: the C++ `set_commands` loop checks
 //! `command == nullptr` per element (BotCommand.cpp:175-177); the Rust
@@ -601,10 +602,7 @@ mod tests {
             promise,
         );
         assert!(recorded.0.lock().unwrap().is_none(), "the promise parks");
-        assert_eq!(
-            env.queries,
-            vec!["Send bots.setBotCommands — [blocked: net]"]
-        );
+        assert_eq!(env.queries, vec!["Send bots.setBotCommands — [net-inert]"]);
     }
 
     #[test]
@@ -628,7 +626,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries,
-            vec!["Send bots.resetBotCommands — [blocked: net]"]
+            vec!["Send bots.resetBotCommands — [net-inert]"]
         );
 
         let (promise, recorded) = recording_promise();
@@ -636,7 +634,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries.last().unwrap(),
-            "Send bots.getBotCommands — [blocked: net]"
+            "Send bots.getBotCommands — [net-inert]"
         );
     }
 

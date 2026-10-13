@@ -10,22 +10,23 @@
 //! call (the `ThemeManagerEnv` convention, M.41).
 //!
 //! Seams:
-//! - Every `Td::ResultHandler` send is a [`BotInfoManagerEnv`] query seam —
-//!   `tdutils::log_info!` of the query name + the promise parked in the
-//!   manager (`[blocked: net]`, the M.31 SetBotCommandsQuery
-//!   convention; the former GetUniqueGiftChatThemesQuery example is
-//!   net-live). The C++ keeps the free-function families' promises
-//!   (BotCommand.cpp/BotMenuButton.cpp/BotQueries.cpp handlers) in
-//!   Td-owned ResultHandlers; the manager is the bot state home in the
-//!   collapsed Rust Td, so those park here too — `hangup` fails them with
-//!   the same `Global::request_aborted_error()` surface.
+//! - The twenty bot-administration query seams are net-live over the
+//!   `BotInfoNetHandle` dispatcher (`Td::dispatch_completed_bot_info_net`
+//!   runs the C++ `on_result`/`on_error` halves, the `pending_*_replies`
+//!   park shape preserved): the flows park the promise first, the
+//!   `BotInfoManagerEnv` send arms dispatch (the `[net-inert]` log is
+//!   the `None` arm). `hangup` still fails the parked replies with
+//!   `Global::request_aborted_error()` like the C++ handler teardown.
 //! - `BotInfoManager::hangup`/`timeout_expired` ride the Td's single
 //!   timeout slot through [`BotInfoManager::next_deadline`] (the M.13
 //!   plumbing); `MAX_QUERY_DELAY` keeps the C++ 0.01 value.
 //! - `SetBotInfoQuery`'s post-result reload tails
 //!   (`reload_user_full`/`reload_user`) are [`BotInfoManagerEnv`]
-//!   required seams: the C++ forwards the query promise to the reload, and
-//!   the reload queries are [blocked: net].
+//!   required seams: the C++ forwards the query promise to the reload;
+//!   the `BotInfoEnv` impl forwards into the live `UserManager` reloads
+//!   (the GetUserFullCombiner/GetUserMerger parks answer 500
+//!   "Request aborted" outside the scheduler context — the C++
+//!   query-carried forward shape).
 //! - The bot media preview upload machinery
 //!   (`PendingBotMediaPreview`/`UploadMediaCallback`/`AddPreviewMediaQuery`,
 //!   BotInfoManager.h:110-123 + BotInfoManager.cpp:371-446 + 758-769) is
@@ -81,9 +82,11 @@ pub mod bots_set_bot_info_mask {
 const MAX_QUERY_DELAY: f64 = 0.01;
 
 /// The env surface of `G()`/`td_` for the bot manager and the sibling bot
-/// flows. The blocked seams are the `[blocked: net]`/`[blocked: …]`
-/// conventions: the query seams log the query name and own nothing — the
-/// caller parks the promise in [`BotInfoManager`] first.
+/// flows. The query seams are the C++ `Td::ResultHandler` send legs —
+/// net-live over the `BotInfoNetHandle` in the `BotInfoEnv` impl, with
+/// the net-inert default logs for the test envs and the pre-init
+/// windows; the seams own nothing — the caller parks the promise in
+/// [`BotInfoManager`] first.
 pub trait BotInfoManagerEnv {
     /// `td_->auth_manager_->is_authorized()`.
     fn is_authorized(&self) -> bool;
@@ -150,7 +153,7 @@ pub trait BotInfoManagerEnv {
     fn have_user_force(&mut self, user_id: UserId, source: &str) -> bool;
 
     /// `td_->user_manager_->reload_user_full(user_id, promise)` — the
-    /// reload query is [blocked: net]; the impl owns the forwarded
+    /// reload rides the GetUserFullCombiner; the impl forwards the
     /// promise (the C++ `SetBotInfoQuery::on_result` tail).
     fn reload_user_full(&mut self, user_id: UserId, promise: Promise<()>);
 
@@ -254,9 +257,11 @@ pub trait BotInfoManagerEnv {
     }
 
     // ------------------------------------------------------------------
-    // The [blocked: net] query seams. Each one is the `send` half of the
-    // C++ `Td::ResultHandler` of the same name; the answers land with the
-    // net step.
+    // The query seams. The twenty net-live families dispatch over the
+    // `BotInfoNetHandle` (the `BotInfoEnv` impl); the defaults are the
+    // net-inert logs the test envs and the pre-init windows take. The
+    // preview families stay [blocked: StoryContent] (the answer halves
+    // reduce to the preview conversion).
     // ------------------------------------------------------------------
 
     /// `SetBotCommandsQuery::send` (BotCommand.cpp:35-39) —
@@ -268,7 +273,7 @@ pub trait BotInfoManagerEnv {
         commands: Vec<telegram_api::BotCommand>,
     ) {
         let _ = (scope, language_code, commands);
-        tdutils::log_info!("Send bots.setBotCommands — [blocked: net]");
+        tdutils::log_info!("Send bots.setBotCommands — [net-inert]");
     }
 
     /// `ResetBotCommandsQuery::send` (BotCommand.cpp:65-68) —
@@ -279,7 +284,7 @@ pub trait BotInfoManagerEnv {
         language_code: &str,
     ) {
         let _ = (scope, language_code);
-        tdutils::log_info!("Send bots.resetBotCommands — [blocked: net]");
+        tdutils::log_info!("Send bots.resetBotCommands — [net-inert]");
     }
 
     /// `GetBotCommandsQuery::send` (BotCommand.cpp:92-95) —
@@ -290,7 +295,7 @@ pub trait BotInfoManagerEnv {
         language_code: &str,
     ) {
         let _ = (scope, language_code);
-        tdutils::log_info!("Send bots.getBotCommands — [blocked: net]");
+        tdutils::log_info!("Send bots.getBotCommands — [net-inert]");
     }
 
     /// `SetBotMenuButtonQuery::send` (BotMenuButton.cpp:31-36) —
@@ -301,14 +306,14 @@ pub trait BotInfoManagerEnv {
         button: telegram_api::BotMenuButton,
     ) {
         let _ = (user_id, button);
-        tdutils::log_info!("Send bots.setBotMenuButton — [blocked: net]");
+        tdutils::log_info!("Send bots.setBotMenuButton — [net-inert]");
     }
 
     /// `GetBotMenuButtonQuery::send` (BotMenuButton.cpp:63-67) —
     /// `bots.getBotMenuButton`.
     fn send_get_bot_menu_button_query(&mut self, user_id: Option<telegram_api::InputUser>) {
         let _ = user_id;
-        tdutils::log_info!("Send bots.getBotMenuButton — [blocked: net]");
+        tdutils::log_info!("Send bots.getBotMenuButton — [net-inert]");
     }
 
     /// `CreateBotQuery::send` (BotInfoManager.cpp:43-50) —
@@ -321,21 +326,21 @@ pub trait BotInfoManagerEnv {
         manager_bot_user_id: telegram_api::InputUser,
     ) {
         let _ = (name, username, via_deeplink, manager_bot_user_id);
-        tdutils::log_info!("Send bots.createBot — [blocked: net]");
+        tdutils::log_info!("Send bots.createBot — [net-inert]");
     }
 
     /// `ExportBotTokenQuery::send` (BotInfoManager.cpp:76-82) —
     /// `bots.exportBotToken`.
     fn send_export_bot_token_query(&mut self, bot_user_id: telegram_api::InputUser, revoke: bool) {
         let _ = (bot_user_id, revoke);
-        tdutils::log_info!("Send bots.exportBotToken — [blocked: net]");
+        tdutils::log_info!("Send bots.exportBotToken — [net-inert]");
     }
 
     /// `GetAccessSettingsQuery::send` (BotInfoManager.cpp:108-114) —
     /// `bots.getAccessSettings`.
     fn send_get_access_settings_query(&mut self, bot_user_id: telegram_api::InputUser) {
         let _ = bot_user_id;
-        tdutils::log_info!("Send bots.getAccessSettings — [blocked: net]");
+        tdutils::log_info!("Send bots.getAccessSettings — [net-inert]");
     }
 
     /// `EditAccessSettingsQuery::send` (BotInfoManager.cpp:139-152) —
@@ -348,13 +353,13 @@ pub trait BotInfoManagerEnv {
         added_users: Vec<telegram_api::InputUser>,
     ) {
         let _ = (restricted, bot_user_id, added_users);
-        tdutils::log_info!("Send bots.editAccessSettings — [blocked: net]");
+        tdutils::log_info!("Send bots.editAccessSettings — [net-inert]");
     }
 
     /// `GetAdminedBotsQuery::send` (BotInfoManager.cpp:176-178) —
     /// `bots.getAdminedBots`.
     fn send_get_admined_bots_query(&mut self) {
-        tdutils::log_info!("Send bots.getAdminedBots — [blocked: net]");
+        tdutils::log_info!("Send bots.getAdminedBots — [net-inert]");
     }
 
     /// `SetBotGroupDefaultAdminRightsQuery::send`
@@ -364,7 +369,7 @@ pub trait BotInfoManagerEnv {
         admin_rights: telegram_api::ChatAdminRights,
     ) {
         let _ = admin_rights;
-        tdutils::log_info!("Send bots.setBotGroupDefaultAdminRights — [blocked: net]");
+        tdutils::log_info!("Send bots.setBotGroupDefaultAdminRights — [net-inert]");
     }
 
     /// `SetBotBroadcastDefaultAdminRightsQuery::send`
@@ -375,21 +380,21 @@ pub trait BotInfoManagerEnv {
         admin_rights: telegram_api::ChatAdminRights,
     ) {
         let _ = admin_rights;
-        tdutils::log_info!("Send bots.setBotBroadcastDefaultAdminRights — [blocked: net]");
+        tdutils::log_info!("Send bots.setBotBroadcastDefaultAdminRights — [net-inert]");
     }
 
     /// `CanBotSendMessageQuery::send` (BotInfoManager.cpp:516-523) —
     /// `bots.canSendMessage`.
     fn send_can_bot_send_message_query(&mut self, bot_user_id: telegram_api::InputUser) {
         let _ = bot_user_id;
-        tdutils::log_info!("Send bots.canSendMessage — [blocked: net]");
+        tdutils::log_info!("Send bots.canSendMessage — [net-inert]");
     }
 
     /// `AllowBotSendMessageQuery::send` (BotInfoManager.cpp:550-557) —
     /// `bots.allowSendMessage`.
     fn send_allow_bot_send_message_query(&mut self, bot_user_id: telegram_api::InputUser) {
         let _ = bot_user_id;
-        tdutils::log_info!("Send bots.allowSendMessage — [blocked: net]");
+        tdutils::log_info!("Send bots.allowSendMessage — [net-inert]");
     }
 
     /// `GetPreviewMediasQuery::send` (BotInfoManager.cpp:284-288) —
@@ -419,7 +424,7 @@ pub trait BotInfoManagerEnv {
     /// `bots.setBotInfo`; the flags bundle is [`SetBotInfoQuery`].
     fn send_set_bot_info_query(&mut self, bot_user_id: UserId, query: SetBotInfoQuery) {
         let _ = (bot_user_id, query);
-        tdutils::log_info!("Send bots.setBotInfo — [blocked: net]");
+        tdutils::log_info!("Send bots.setBotInfo — [net-inert]");
     }
 
     /// `GetBotInfoQuery::send` (BotInfoManager.cpp:676-687) —
@@ -431,7 +436,7 @@ pub trait BotInfoManagerEnv {
         language_code: &str,
     ) {
         let _ = (bot_user_id, bot, language_code);
-        tdutils::log_info!("Send bots.getBotInfo — [blocked: net]");
+        tdutils::log_info!("Send bots.getBotInfo — [net-inert]");
     }
 
     /// `SetCustomVerificationQuery::send`
@@ -445,21 +450,21 @@ pub trait BotInfoManagerEnv {
         custom_description: crate::message_entity::FormattedText,
     ) {
         let _ = (dialog_id, bot, is_verified, custom_description);
-        tdutils::log_info!("Send bots.setCustomVerification — [blocked: net]");
+        tdutils::log_info!("Send bots.setCustomVerification — [net-inert]");
     }
 
     /// `SendCustomRequestQuery::send` (BotQueries.cpp:27-30) —
     /// `bots.sendCustomRequest`.
     fn send_bots_send_custom_request_query(&mut self, method: &str, parameters: &str) {
         let _ = (method, parameters);
-        tdutils::log_info!("Send bots.sendCustomRequest — [blocked: net]");
+        tdutils::log_info!("Send bots.sendCustomRequest — [net-inert]");
     }
 
     /// `AnswerCustomQueryQuery::send` (BotQueries.cpp:54-57) —
     /// `bots.answerWebhookJSONQuery`.
     fn send_bots_answer_webhook_json_query(&mut self, custom_query_id: i64, data: &str) {
         let _ = (custom_query_id, data);
-        tdutils::log_info!("Send bots.answerWebhookJSONQuery — [blocked: net]");
+        tdutils::log_info!("Send bots.answerWebhookJSONQuery — [net-inert]");
     }
 
     /// `SetBotUpdatesStatusQuery::send` (BotQueries.cpp:79-82) —
@@ -470,7 +475,7 @@ pub trait BotInfoManagerEnv {
         error_message: &str,
     ) {
         let _ = (pending_update_count, error_message);
-        tdutils::log_info!("Send help.setBotUpdatesStatus — [blocked: net]");
+        tdutils::log_info!("Send help.setBotUpdatesStatus — [net-inert]");
     }
 }
 
@@ -580,8 +585,8 @@ pub struct BotInfoManager {
     bot_media_preview_info_file_source_ids: HashMap<MediaPreviewSource, FileSourceId>,
 
     // The parked query promises, one list per C++ ResultHandler family
-    // (the [blocked: net] convention; hangup fails them with
-    // request_aborted_error like the C++ handler teardown).
+    // (the §5 park shape; hangup fails them with request_aborted_error
+    // like the C++ handler teardown, the answers pop them FIFO per kind).
     pending_set_bot_info_replies: Vec<Promise<()>>,
     pending_get_bot_info_replies: Vec<PendingGetBotInfoReply>,
     pending_set_bot_commands_replies: Vec<Promise<()>>,
@@ -1704,6 +1709,228 @@ impl BotInfoManager {
     }
 }
 
+// The drain-completeness probe (the netted tests assert the parked
+// queues emptied).
+impl BotInfoManager {
+    /// `true` when every `pending_*_replies` queue is empty (the
+    /// fan-in/out queues and the preview parks included — the fire-and-
+    /// forget families park nothing).
+    #[cfg(test)]
+    pub(crate) fn pending_replies_empty(&self) -> bool {
+        self.pending_set_bot_info_replies.is_empty()
+            && self.pending_get_bot_info_replies.is_empty()
+            && self.pending_set_bot_commands_replies.is_empty()
+            && self.pending_reset_bot_commands_replies.is_empty()
+            && self.pending_get_bot_commands_replies.is_empty()
+            && self.pending_set_menu_button_replies.is_empty()
+            && self.pending_get_menu_button_replies.is_empty()
+            && self.pending_create_bot_replies.is_empty()
+            && self.pending_get_bot_token_replies.is_empty()
+            && self.pending_get_access_settings_replies.is_empty()
+            && self.pending_edit_access_settings_replies.is_empty()
+            && self.pending_get_admined_bots_replies.is_empty()
+            && self.pending_group_rights_replies.is_empty()
+            && self.pending_broadcast_rights_replies.is_empty()
+            && self.pending_can_send_messages_replies.is_empty()
+            && self.pending_allow_send_messages_replies.is_empty()
+            && self.pending_get_preview_medias_replies.is_empty()
+            && self.pending_get_preview_info_replies.is_empty()
+            && self.pending_add_preview_media_replies.is_empty()
+            && self.pending_edit_preview_media_replies.is_empty()
+            && self.pending_reorder_preview_media_replies.is_empty()
+            && self.pending_delete_preview_media_replies.is_empty()
+            && self.pending_set_custom_verification_replies.is_empty()
+            && self.pending_send_custom_request_replies.is_empty()
+            && self.pending_answer_custom_query_replies.is_empty()
+    }
+}
+
+// The answer-side pops — the net answers drain the parked replies FIFO
+// per kind (the §5 shape; the C++ handlers carry their promises on the
+// queries themselves).
+impl BotInfoManager {
+    /// Pop the first parked `SetBotCommandsQuery` reply.
+    pub(crate) fn take_set_bot_commands_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_set_bot_commands_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_bot_commands_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `ResetBotCommandsQuery` reply.
+    pub(crate) fn take_reset_bot_commands_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_reset_bot_commands_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_reset_bot_commands_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `GetBotCommandsQuery` reply.
+    pub(crate) fn take_get_bot_commands_promise(&mut self) -> Option<Promise<td_api::BotCommands>> {
+        if self.pending_get_bot_commands_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_bot_commands_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `SetBotMenuButtonQuery` reply.
+    pub(crate) fn take_set_menu_button_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_set_menu_button_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_menu_button_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `GetBotMenuButtonQuery` reply.
+    pub(crate) fn take_get_menu_button_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::BotMenuButton>> {
+        if self.pending_get_menu_button_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_menu_button_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `CreateBotQuery` reply.
+    pub(crate) fn take_create_bot_promise(&mut self) -> Option<Promise<td_api::User>> {
+        if self.pending_create_bot_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_create_bot_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `ExportBotTokenQuery` reply.
+    pub(crate) fn take_get_bot_token_promise(&mut self) -> Option<Promise<String>> {
+        if self.pending_get_bot_token_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_bot_token_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `GetAccessSettingsQuery` reply.
+    pub(crate) fn take_get_access_settings_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::BotAccessSettings>> {
+        if self.pending_get_access_settings_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_access_settings_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `EditAccessSettingsQuery` reply.
+    pub(crate) fn take_edit_access_settings_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_edit_access_settings_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_edit_access_settings_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `GetAdminedBotsQuery` reply.
+    pub(crate) fn take_get_admined_bots_promise(&mut self) -> Option<Promise<td_api::Users>> {
+        if self.pending_get_admined_bots_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_admined_bots_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `SetBotGroupDefaultAdminRightsQuery` reply.
+    pub(crate) fn take_group_rights_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_group_rights_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_group_rights_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `SetBotBroadcastDefaultAdminRightsQuery`
+    /// reply.
+    pub(crate) fn take_broadcast_rights_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_broadcast_rights_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_broadcast_rights_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `CanBotSendMessageQuery` reply.
+    pub(crate) fn take_can_send_messages_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_can_send_messages_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_can_send_messages_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `AllowBotSendMessageQuery` reply.
+    pub(crate) fn take_allow_send_messages_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_allow_send_messages_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_allow_send_messages_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `SetBotInfoQuery` reply (the flush groups'
+    /// combined promises, one per fanned-in group).
+    pub(crate) fn take_set_bot_info_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_set_bot_info_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_bot_info_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `GetBotInfoQuery` reply.
+    pub(crate) fn take_get_bot_info_reply(&mut self) -> Option<PendingGetBotInfoReply> {
+        if self.pending_get_bot_info_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_bot_info_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `SetCustomVerificationQuery` reply.
+    pub(crate) fn take_set_custom_verification_reply(
+        &mut self,
+    ) -> Option<PendingSetCustomVerificationReply> {
+        if self.pending_set_custom_verification_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_custom_verification_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `SendCustomRequestQuery` reply.
+    pub(crate) fn take_send_custom_request_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::CustomRequestResult>> {
+        if self.pending_send_custom_request_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_send_custom_request_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `AnswerCustomQueryQuery` reply.
+    pub(crate) fn take_answer_custom_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_answer_custom_query_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_answer_custom_query_replies.remove(0))
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_env {
     //! The shared recording env for the bot-family module tests: the
@@ -1941,7 +2168,8 @@ pub(crate) mod test_env {
         fn reload_user_full(&mut self, user_id: UserId, _promise: Promise<()>) {
             self.queries
                 .push(format!("reload_user_full:{}", user_id.get()));
-            // [blocked: net] — the forwarded promise dies with the test seam
+            // the test seam parks the forwarded promise (the recording
+            // env has no combiner)
         }
 
         fn reload_user(&mut self, user_id: UserId, _promise: Promise<()>) {
@@ -2024,7 +2252,7 @@ pub(crate) mod test_env {
             _commands: Vec<telegram_api::BotCommand>,
         ) {
             self.queries
-                .push("Send bots.setBotCommands — [blocked: net]".to_owned());
+                .push("Send bots.setBotCommands — [net-inert]".to_owned());
         }
 
         fn send_reset_bot_commands_query(
@@ -2033,7 +2261,7 @@ pub(crate) mod test_env {
             _language_code: &str,
         ) {
             self.queries
-                .push("Send bots.resetBotCommands — [blocked: net]".to_owned());
+                .push("Send bots.resetBotCommands — [net-inert]".to_owned());
         }
 
         fn send_get_bot_commands_query(
@@ -2042,7 +2270,7 @@ pub(crate) mod test_env {
             _language_code: &str,
         ) {
             self.queries
-                .push("Send bots.getBotCommands — [blocked: net]".to_owned());
+                .push("Send bots.getBotCommands — [net-inert]".to_owned());
         }
 
         fn send_set_bot_menu_button_query(
@@ -2051,12 +2279,12 @@ pub(crate) mod test_env {
             _button: telegram_api::BotMenuButton,
         ) {
             self.queries
-                .push("Send bots.setBotMenuButton — [blocked: net]".to_owned());
+                .push("Send bots.setBotMenuButton — [net-inert]".to_owned());
         }
 
         fn send_get_bot_menu_button_query(&mut self, _user_id: Option<telegram_api::InputUser>) {
             self.queries
-                .push("Send bots.getBotMenuButton — [blocked: net]".to_owned());
+                .push("Send bots.getBotMenuButton — [net-inert]".to_owned());
         }
 
         fn send_create_bot_query(
@@ -2067,7 +2295,7 @@ pub(crate) mod test_env {
             _manager_bot_user_id: telegram_api::InputUser,
         ) {
             self.queries
-                .push("Send bots.createBot — [blocked: net]".to_owned());
+                .push("Send bots.createBot — [net-inert]".to_owned());
         }
 
         fn send_export_bot_token_query(
@@ -2076,12 +2304,12 @@ pub(crate) mod test_env {
             _revoke: bool,
         ) {
             self.queries
-                .push("Send bots.exportBotToken — [blocked: net]".to_owned());
+                .push("Send bots.exportBotToken — [net-inert]".to_owned());
         }
 
         fn send_get_access_settings_query(&mut self, _bot_user_id: telegram_api::InputUser) {
             self.queries
-                .push("Send bots.getAccessSettings — [blocked: net]".to_owned());
+                .push("Send bots.getAccessSettings — [net-inert]".to_owned());
         }
 
         fn send_edit_access_settings_query(
@@ -2091,12 +2319,12 @@ pub(crate) mod test_env {
             _added_users: Vec<telegram_api::InputUser>,
         ) {
             self.queries
-                .push("Send bots.editAccessSettings — [blocked: net]".to_owned());
+                .push("Send bots.editAccessSettings — [net-inert]".to_owned());
         }
 
         fn send_get_admined_bots_query(&mut self) {
             self.queries
-                .push("Send bots.getAdminedBots — [blocked: net]".to_owned());
+                .push("Send bots.getAdminedBots — [net-inert]".to_owned());
         }
 
         fn send_set_bot_group_default_admin_rights_query(
@@ -2104,7 +2332,7 @@ pub(crate) mod test_env {
             _admin_rights: telegram_api::ChatAdminRights,
         ) {
             self.queries
-                .push("Send bots.setBotGroupDefaultAdminRights — [blocked: net]".to_owned());
+                .push("Send bots.setBotGroupDefaultAdminRights — [net-inert]".to_owned());
         }
 
         fn send_set_bot_broadcast_default_admin_rights_query(
@@ -2112,17 +2340,17 @@ pub(crate) mod test_env {
             _admin_rights: telegram_api::ChatAdminRights,
         ) {
             self.queries
-                .push("Send bots.setBotBroadcastDefaultAdminRights — [blocked: net]".to_owned());
+                .push("Send bots.setBotBroadcastDefaultAdminRights — [net-inert]".to_owned());
         }
 
         fn send_can_bot_send_message_query(&mut self, _bot_user_id: telegram_api::InputUser) {
             self.queries
-                .push("Send bots.canSendMessage — [blocked: net]".to_owned());
+                .push("Send bots.canSendMessage — [net-inert]".to_owned());
         }
 
         fn send_allow_bot_send_message_query(&mut self, _bot_user_id: telegram_api::InputUser) {
             self.queries
-                .push("Send bots.allowSendMessage — [blocked: net]".to_owned());
+                .push("Send bots.allowSendMessage — [net-inert]".to_owned());
         }
 
         fn send_get_preview_medias_query(
@@ -2150,7 +2378,7 @@ pub(crate) mod test_env {
             _query: super::SetBotInfoQuery,
         ) {
             self.queries
-                .push("Send bots.setBotInfo — [blocked: net]".to_owned());
+                .push("Send bots.setBotInfo — [net-inert]".to_owned());
         }
 
         fn send_get_bot_info_query(
@@ -2160,7 +2388,7 @@ pub(crate) mod test_env {
             _language_code: &str,
         ) {
             self.queries
-                .push("Send bots.getBotInfo — [blocked: net]".to_owned());
+                .push("Send bots.getBotInfo — [net-inert]".to_owned());
         }
 
         fn send_set_custom_verification_query(
@@ -2171,17 +2399,17 @@ pub(crate) mod test_env {
             _custom_description: crate::message_entity::FormattedText,
         ) {
             self.queries
-                .push("Send bots.setCustomVerification — [blocked: net]".to_owned());
+                .push("Send bots.setCustomVerification — [net-inert]".to_owned());
         }
 
         fn send_bots_send_custom_request_query(&mut self, _method: &str, _parameters: &str) {
             self.queries
-                .push("Send bots.sendCustomRequest — [blocked: net]".to_owned());
+                .push("Send bots.sendCustomRequest — [net-inert]".to_owned());
         }
 
         fn send_bots_answer_webhook_json_query(&mut self, _custom_query_id: i64, _data: &str) {
             self.queries
-                .push("Send bots.answerWebhookJSONQuery — [blocked: net]".to_owned());
+                .push("Send bots.answerWebhookJSONQuery — [net-inert]".to_owned());
         }
 
         fn send_help_set_bot_updates_status_query(
@@ -2190,7 +2418,7 @@ pub(crate) mod test_env {
             _error_message: &str,
         ) {
             self.queries
-                .push("Send help.setBotUpdatesStatus — [blocked: net]".to_owned());
+                .push("Send help.setBotUpdatesStatus — [net-inert]".to_owned());
         }
     }
 }
@@ -2361,7 +2589,7 @@ mod tests {
             let (promise, recorded) = recording_promise();
             manager.create_bot(&mut env, UserId::new(77), "name", "user", true, promise);
             assert!(recorded.0.lock().unwrap().is_none(), "the promise parks");
-            assert_eq!(env.queries, vec!["Send bots.createBot — [blocked: net]"]);
+            assert_eq!(env.queries, vec!["Send bots.createBot — [net-inert]"]);
             assert_eq!(manager.pending_create_bot_replies.len(), 1);
         }
     }
@@ -2463,7 +2691,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries,
-            vec!["Send bots.editAccessSettings — [blocked: net]"]
+            vec!["Send bots.editAccessSettings — [net-inert]"]
         );
         assert_eq!(manager.pending_edit_access_settings_replies.len(), 1);
     }
@@ -2492,7 +2720,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries,
-            vec!["Send bots.setBotGroupDefaultAdminRights — [blocked: net]"]
+            vec!["Send bots.setBotGroupDefaultAdminRights — [net-inert]"]
         );
 
         let (promise, recorded) = recording_promise();
@@ -2504,7 +2732,7 @@ mod tests {
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(
             env.queries.last().unwrap(),
-            "Send bots.setBotBroadcastDefaultAdminRights — [blocked: net]"
+            "Send bots.setBotBroadcastDefaultAdminRights — [net-inert]"
         );
     }
 
