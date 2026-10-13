@@ -8165,6 +8165,187 @@ impl Td {
                 };
                 user_manager.on_clear_recent_emoji_statuses(&mut env, result);
             }
+            crate::user_manager::UserNetKind::GetUserPhotos {
+                user_id,
+                offset,
+                limit,
+            } => {
+                // `GetUserPhotosQuery::on_result`/`on_error` (cpp:1494-1535):
+                // the intakes run first, then the query-carried promise —
+                // the retry-machine routing lambda for offset >= 0, the
+                // reload leg's caller promise for offset == -1
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::photos_Photos::parse(query.ok())
+                        .map_err(|_| parse_error("photos_getUserPhotos"))
+                };
+                match result {
+                    Ok(answer) => {
+                        match answer {
+                            telegram_api::photos_Photos::photos_photos(photos) => {
+                                let photos_size = photos.photos.len() as i32;
+                                user_manager.on_get_users(
+                                    &mut env,
+                                    photos.users,
+                                    "GetUserPhotosQuery",
+                                );
+                                user_manager.on_get_user_photos(
+                                    user_id,
+                                    offset,
+                                    limit,
+                                    photos_size,
+                                    photos.photos,
+                                );
+                            }
+                            telegram_api::photos_Photos::photos_photosSlice(photos) => {
+                                let count = photos.count;
+                                user_manager.on_get_users(
+                                    &mut env,
+                                    photos.users,
+                                    "GetUserPhotosQuery slice",
+                                );
+                                user_manager.on_get_user_photos(
+                                    user_id,
+                                    offset,
+                                    limit,
+                                    count,
+                                    photos.photos,
+                                );
+                            }
+                        }
+                        if offset == -1 {
+                            if let Some(mut promise) =
+                                user_manager.take_get_user_photos_reload_promise()
+                            {
+                                promise.set_value(());
+                            }
+                        } else {
+                            user_manager.on_get_user_profile_photos(&env, user_id, Ok(()));
+                        }
+                    }
+                    Err(status) => {
+                        if offset == -1 {
+                            if let Some(mut promise) =
+                                user_manager.take_get_user_photos_reload_promise()
+                            {
+                                promise.set_error(status);
+                            }
+                        } else {
+                            user_manager.on_get_user_profile_photos(&env, user_id, Err(status));
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::UpdateProfilePhoto {
+                user_id,
+                old_photo_id,
+                is_fallback,
+            } => {
+                // `UpdateProfilePhotoQuery::on_result`/`on_error`
+                // (cpp:677-688) — the ok tail is `on_set_profile_photo`
+                // with the handler members; the file-reference repair
+                // chain of on_error rides the Files plane
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::photos_Photo::parse(query.ok())
+                        .map_err(|_| parse_error("photos_updateProfilePhoto"))
+                };
+                match result {
+                    Ok(photo) => {
+                        if let Some(promise) =
+                            user_manager.take_update_profile_photo_query_promise()
+                        {
+                            user_manager.on_set_profile_photo(
+                                &mut env,
+                                user_id,
+                                photo,
+                                is_fallback,
+                                old_photo_id,
+                                promise,
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) =
+                            user_manager.take_update_profile_photo_query_promise()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::DeleteContactProfilePhoto { user_id } => {
+                // `DeleteContactProfilePhotoQuery::on_result`/`on_error`
+                // (cpp:784-797) — the photo is nulled before the
+                // `on_set_profile_photo` tail (the personal-photo reset)
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::photos_Photo::parse(query.ok())
+                        .map_err(|_| parse_error("photos_uploadContactProfilePhoto"))
+                };
+                match result {
+                    Ok(mut photo) => {
+                        photo.photo = None;
+                        if let Some(promise) =
+                            user_manager.take_delete_contact_profile_photo_query_promise()
+                        {
+                            user_manager
+                                .on_set_profile_photo(&mut env, user_id, photo, false, 0, promise);
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) =
+                            user_manager.take_delete_contact_profile_photo_query_promise()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            crate::user_manager::UserNetKind::DeleteProfilePhoto { profile_photo_id } => {
+                // `DeleteProfilePhotoQuery::on_result`/`on_error`
+                // (cpp:806-820) — the one-element `Vector<long>` gate,
+                // then the `on_delete_profile_photo` cache tail
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_vector(query.ok(), |reader| reader.i64())
+                        .ok_or_else(|| parse_error("photos_deletePhotos"))
+                };
+                match result {
+                    Ok(deleted_ids) => {
+                        tdutils::log_info!(
+                            "Receive result for DeleteProfilePhotoQuery: {deleted_ids:?}"
+                        );
+                        if deleted_ids.len() != 1 {
+                            tdutils::log_warning!("Photo can't be deleted");
+                            if let Some(mut promise) =
+                                user_manager.take_delete_profile_photo_query_promise()
+                            {
+                                promise.set_error(Status::error(400, "Photo can't be deleted"));
+                            }
+                        } else if let Some(promise) =
+                            user_manager.take_delete_profile_photo_query_promise()
+                        {
+                            user_manager.on_delete_profile_photo(
+                                &mut env,
+                                profile_photo_id,
+                                promise,
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) =
+                            user_manager.take_delete_profile_photo_query_promise()
+                        {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
             crate::user_manager::UserNetKind::SaveMusic {
                 file_id,
                 after_file_id,
@@ -34177,6 +34358,758 @@ mod tests {
         assert_eq!(statuses.hash, 0);
         assert_eq!(statuses.emoji_statuses.len(), 2);
         assert_eq!(statuses.emoji_statuses[0].get_custom_emoji_id().get(), 77);
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the profile-photo plane net slice (§3.1 #9, #11-#14): the
+    // getUserPhotos listing/reload queries, the prev-photo
+    // UpdateProfilePhoto, the contact-photo delete and the
+    // DeleteProfilePhoto arms ride the dispatcher; the intakes
+    // (on_get_user_photos, on_set_profile_photo,
+    // on_delete_profile_photo) run in the drain. ----
+
+    /// One wire photo record with the 'a'/'c' size pair
+    /// (`as_profile_photo`'s selection).
+    fn wire_photo(id: i64) -> telegram_api::Photo {
+        let size = |r#type: &str, dim: i32| {
+            telegram_api::PhotoSize::photoSize(telegram_api::photoSize {
+                r#type: r#type.to_owned(),
+                w: dim,
+                h: dim,
+                size: dim * dim,
+            })
+        };
+        telegram_api::Photo::photo(telegram_api::photo {
+            flags: 0,
+            has_stickers: false,
+            id,
+            access_hash: 5,
+            file_reference: b"fr".to_vec(),
+            date: 1234,
+            sizes: vec![size("a", 5), size("c", 9)],
+            video_sizes: Vec::new(),
+            dc_id: 2,
+        })
+    }
+
+    /// A `wire_user` with the contact flag set (the
+    /// setUserPersonalProfilePhoto contact gate).
+    fn wire_contact_user(id: i64, first_name: &str) -> telegram_api::User {
+        let telegram_api::User::user(user) = wire_user(id, first_name) else {
+            unreachable!()
+        };
+        telegram_api::User::user(telegram_api::user {
+            flags: user.flags | (1 << 11),
+            contact: true,
+            ..user
+        })
+    }
+
+    /// A boxed `photos.photosSlice` answer (the photos.getUserPhotos
+    /// result shape).
+    fn photos_slice_answer(
+        count: i32,
+        photos: Vec<telegram_api::Photo>,
+        users: Vec<telegram_api::User>,
+    ) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::photos_Photos::photos_photosSlice(telegram_api::photos_photosSlice {
+            count,
+            photos,
+            users,
+        })
+        .store(&mut answer);
+        answer
+    }
+
+    /// A boxed `photos.photos` answer (the count-less listing shape).
+    fn photos_photos_answer(
+        photos: Vec<telegram_api::Photo>,
+        users: Vec<telegram_api::User>,
+    ) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::photos_Photos::photos_photos(telegram_api::photos_photos { photos, users })
+            .store(&mut answer);
+        answer
+    }
+
+    /// A boxed `photos.photo` answer (the updateProfilePhoto/
+    /// uploadContactProfilePhoto result shape).
+    fn photos_photo_answer(
+        photo: Option<telegram_api::Photo>,
+        users: Vec<telegram_api::User>,
+    ) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::photos_Photo { photo, users }.store_boxed(&mut answer);
+        answer
+    }
+
+    /// A boxed `Vector<long>` answer (the photos.deletePhotos result
+    /// shape).
+    fn long_vector_answer(ids: &[i64]) -> Vec<u8> {
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&(ids.len() as i32).to_le_bytes());
+        for id in ids {
+            answer.extend_from_slice(&id.to_le_bytes());
+        }
+        answer
+    }
+
+    /// Register the photo's remote file node under the id the manager's
+    /// photo registration parked — the placeholder photo file ids are
+    /// all the invalid `FileId(0, 0)` (the Files step makes them real),
+    /// so the node stands in for the C++ `get_photo_size` registration
+    /// `send_update_profile_photo_query` reads through the file view
+    /// (cpp:6094-6107).
+    fn seed_profile_photo_file_node(td: &mut Td, photo_id: i64, access_hash: i64) {
+        use crate::files::{
+            FileEncryptionKey, FileLocationSource, FileNode, FullRemoteFileLocation,
+            LocalFileLocation, NewRemoteFileLocation, PhotoSizeSource,
+        };
+        let full = FullRemoteFileLocation::from_photo(
+            PhotoSizeSource::thumbnail(crate::files::FileType::Photo, b'a' as i32),
+            photo_id,
+            access_hash,
+            ChatDcId::internal(2),
+            "ref7".to_owned(),
+        );
+        let node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation {
+                partial: None,
+                full: Some(full),
+                is_full_alive: true,
+                full_source: FileLocationSource::FromServer,
+            },
+            None,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            crate::messages_manager::DialogId::default(),
+            FileEncryptionKey::default(),
+            crate::files::FileId::new(0, 0),
+            0,
+        );
+        td.file_manager
+            .lock()
+            .register_file_node(crate::files::FileId::new(0, 0), 0, node);
+    }
+
+    #[test]
+    fn user_get_user_photos_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_get_user_photos_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_get_user_photos_round_trips_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-get-photos");
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(5, "Alice")], "t");
+        });
+
+        // 1. the live getUserProfilePhotos arm: the cache miss parks the
+        //    request and the query rides the input user with the raised
+        //    limit (cpp:6890-6911 — max(limit, MAX_GET_PROFILE_PHOTOS/5))
+        td.request(
+            1,
+            Function::getUserProfilePhotos(td_api::getUserProfilePhotos {
+                user_id: 5,
+                offset: 0,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_getUserPhotos::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_getUserPhotos(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.user_id.expect("the input user rides the query")
+                else {
+                    panic!("the photos query rides a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (5, 42));
+                assert_eq!((payload.offset, payload.max_id, payload.limit), (0, 0, 20));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the answer: the users intake, the photos cache fill and the
+        //    retry machine answer the request from the fresh cache
+        //    (cpp:1494-1531)
+        net_complete(
+            sent,
+            photos_slice_answer(1, vec![wire_photo(31)], vec![wire_user(5, "Alice")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let Object::chatPhotos(photos) = &responses[0] else {
+            panic!("getUserProfilePhotos answers chatPhotos, got {responses:?}");
+        };
+        assert_eq!(photos.total_count, 1);
+        assert_eq!(photos.photos.len(), 1);
+        assert!(
+            td.user_manager
+                .get_user(crate::user_manager::UserId::new(5))
+                .expect("the user record")
+                .photo_ids
+                .contains(&31)
+        );
+
+        // 3. the cached window answers without a query
+        td.request(
+            2,
+            Function::getUserProfilePhotos(td_api::getUserProfilePhotos {
+                user_id: 5,
+                offset: 0,
+                limit: 1,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "the cache answers locally");
+        let responses = responses_of(&callback, 2);
+        let Object::chatPhotos(photos) = &responses[0] else {
+            panic!("the cached window answers chatPhotos, got {responses:?}");
+        };
+        assert_eq!(photos.total_count, 1);
+
+        // 4. the error band forwards to the parked request (the
+        //    handler's on_error → the retry machine error arm)
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(6, "Bob")], "t");
+        });
+        td.request(
+            3,
+            Function::getUserProfilePhotos(td_api::getUserProfilePhotos {
+                user_id: 6,
+                offset: 0,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_getUserPhotos::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_7");
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn user_profile_photo_reload_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_profile_photo_reload_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_profile_photo_reload_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-user-photo-reload");
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(5, "Alice")], "t");
+        });
+
+        // 1. the offset -1 reload: the query carries the photo id and
+        //    the caller promise rides the query (cpp:6988-6992 — the §5
+        //    fidelity restore)
+        let (promise, slot) = record_ton_unit();
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_user_profile_photo(
+                env,
+                crate::user_manager::UserId::new(5),
+                31,
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_getUserPhotos::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_getUserPhotos(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.user_id.expect("the input user rides the query")
+                else {
+                    panic!("the reload query rides a concrete input user");
+                };
+                assert_eq!(input_user.user_id, 5);
+                assert_eq!((payload.offset, payload.max_id, payload.limit), (-1, 31, 1));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the answer: the offset -1 intake registers the photo and
+        //    the query-carried promise resolves (cpp:7044-7064)
+        net_complete(sent, photos_photos_answer(vec![wire_photo(31)], Vec::new()));
+        td.dispatch_completed_user_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.user_manager
+                .get_user(crate::user_manager::UserId::new(5))
+                .expect("the user record")
+                .photo_ids
+                .contains(&31)
+        );
+
+        // 3. the error band fails the query-carried promise
+        let (promise, slot) = record_ton_unit();
+        with_user_manager(&mut td, |manager, env| {
+            manager.reload_user_profile_photo(
+                env,
+                crate::user_manager::UserId::new(5),
+                99,
+                promise,
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_getUserPhotos::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_3");
+        td.dispatch_completed_user_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (420, "FLOOD_WAIT_3"));
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn user_prev_profile_photo_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_prev_profile_photo_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_prev_profile_photo_round_trips_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-prev-photo");
+        tdactor::ActorMessage::dispatch(SeedMyId(500), &mut td);
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(500, "Me")], "t");
+        });
+
+        // seed my photo registration through the getUserPhotos flow (the
+        // natural intake — register_user_photo's my_photo_file_id row)
+        td.request(
+            1,
+            Function::getUserProfilePhotos(td_api::getUserProfilePhotos {
+                user_id: 500,
+                offset: 0,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_getUserPhotos::ID,
+        );
+        net_complete(
+            sent,
+            photos_slice_answer(1, vec![wire_photo(7)], vec![wire_user(500, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert_eq!(responses_of(&callback, 1).len(), 1);
+
+        // 1. the registered photo without a file node is the C++ 500
+        //    (the file-view gate of send_update_profile_photo_query,
+        //    cpp:6100-6103 — the registration the Files step provides)
+        td.request(
+            2,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoPrevious(
+                    td_api::inputChatPhotoPrevious { chat_photo_id: 7 },
+                )),
+                is_public: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Failed to upload the file");
+
+        // 2. with the node the prev-photo arm sends
+        //    photos.updateProfilePhoto with the file view's input photo
+        //    (cpp:6027-6030 + 671-691)
+        seed_profile_photo_file_node(&mut td, 7, 77);
+        td.request(
+            3,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoPrevious(
+                    td_api::inputChatPhotoPrevious { chat_photo_id: 7 },
+                )),
+                is_public: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_updateProfilePhoto::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_updateProfilePhoto(payload) => {
+                assert!(!payload.fallback, "the own-photo arm carries no bot");
+                assert!(payload.bot.is_none());
+                match payload.id {
+                    Some(telegram_api::InputPhoto::inputPhoto(photo)) => {
+                        assert_eq!((photo.id, photo.access_hash), (7, 77));
+                        assert_eq!(photo.file_reference, b"ref7".to_vec());
+                    }
+                    other => panic!("the input photo: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 3. the answer: on_set_profile_photo deletes the replaced
+        //    photo from the cache, re-adds the new one and completes
+        //    the promise with the user riding the answer (cpp:6190-6214)
+        net_complete(
+            sent,
+            photos_photo_answer(Some(wire_photo(7)), vec![wire_user(500, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the unknown photo id band answers the C++ 400 with no query
+        td.request(
+            4,
+            Function::setProfilePhoto(td_api::setProfilePhoto {
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoPrevious(
+                    td_api::inputChatPhotoPrevious { chat_photo_id: 99 },
+                )),
+                is_public: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Unknown profile photo ID specified");
+        assert!(rec.sent.lock().is_empty(), "no query went out");
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn user_contact_profile_photo_delete_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_contact_profile_photo_delete_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_contact_profile_photo_delete_round_trips_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-contact-photo-del");
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_contact_user(5, "Alice")], "t");
+            manager.on_get_user_full(
+                env,
+                telegram_api::UserFull {
+                    id: 5,
+                    flags: 1 << 21, // personal_photo present
+                    personal_photo: Some(wire_photo(31)),
+                    ..telegram_api::UserFull::default()
+                },
+            );
+        });
+
+        // 1. the null-photo arm of setUserPersonalProfilePhoto sends
+        //    photos.uploadContactProfilePhoto with save=true
+        //    (cpp:766-786)
+        td.request(
+            1,
+            Function::setUserPersonalProfilePhoto(td_api::setUserPersonalProfilePhoto {
+                user_id: 5,
+                photo: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_uploadContactProfilePhoto::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_uploadContactProfilePhoto(payload) => {
+                assert!(!payload.suggest);
+                assert!(payload.save, "the delete arm is the save-only form");
+                assert!(payload.file.is_none() && payload.video.is_none());
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.user_id.expect("the input user rides the query")
+                else {
+                    panic!("the delete query rides a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (5, 42));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the answer: the photo is nulled before the
+        //    on_set_profile_photo tail (cpp:789-793) — the empty photo
+        //    always applies to the personal slot (cpp:6246-6249)
+        net_complete(
+            sent,
+            photos_photo_answer(Some(wire_photo(31)), vec![wire_contact_user(5, "Alice")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+        let user_full = td
+            .user_manager
+            .get_user_full(crate::user_manager::UserId::new(5))
+            .expect("the seeded user full");
+        assert!(
+            user_full.personal_photo.is_empty(),
+            "the personal photo resets"
+        );
+
+        // 3. the error band forwards (cpp:795-797)
+        td.request(
+            2,
+            Function::setUserPersonalProfilePhoto(td_api::setUserPersonalProfilePhoto {
+                user_id: 5,
+                photo: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_uploadContactProfilePhoto::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_5");
+
+        // 4. a non-contact user answers the C++ 400
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(6, "Bob")], "t");
+        });
+        td.request(
+            3,
+            Function::setUserPersonalProfilePhoto(td_api::setUserPersonalProfilePhoto {
+                user_id: 6,
+                photo: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "User isn't a contact");
+
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn user_delete_profile_photo_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(user_delete_profile_photo_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn user_delete_profile_photo_round_trips_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-user-del-photo");
+        tdactor::ActorMessage::dispatch(SeedMyId(500), &mut td);
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(500, "Me")], "t");
+        });
+
+        // 1. the unloaded UserFull without the Td-actor hop answers the
+        //    net-inert 500 (the uncached-consumer convention — the
+        //    reload ladder's combiner ride needs the scheduler context)
+        td.request(
+            1,
+            Function::deleteProfilePhoto(td_api::deleteProfilePhoto {
+                profile_photo_id: 7,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Request aborted");
+
+        // seed the photos cache through the listing flow and the full
+        // record with the main photo (in that order — a photo-less user
+        // intake would drop the full photos, the C++ drop path)
+        td.request(
+            2,
+            Function::getUserProfilePhotos(td_api::getUserProfilePhotos {
+                user_id: 500,
+                offset: 0,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_getUserPhotos::ID,
+        );
+        net_complete(
+            sent,
+            photos_slice_answer(1, vec![wire_photo(7)], vec![wire_user(500, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert_eq!(responses_of(&callback, 2).len(), 1);
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_user_full(
+                env,
+                telegram_api::UserFull {
+                    id: 500,
+                    flags: 1 << 2, // profile_photo present
+                    profile_photo: Some(wire_photo(7)),
+                    ..telegram_api::UserFull::default()
+                },
+            );
+        });
+
+        // 2. the reset arm: deleting the main photo refires the
+        //    UpdateProfilePhotoQuery with inputPhotoEmpty (cpp:6418-6422
+        //    — the #9 machinery)
+        td.request(
+            3,
+            Function::deleteProfilePhoto(td_api::deleteProfilePhoto {
+                profile_photo_id: 7,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_updateProfilePhoto::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_updateProfilePhoto(payload) => {
+                assert!(
+                    !payload.fallback,
+                    "the main photo resets the non-fallback form"
+                );
+                assert!(payload.bot.is_none());
+                assert!(
+                    matches!(
+                        payload.id,
+                        Some(telegram_api::InputPhoto::inputPhotoEmpty(_))
+                    ),
+                    "the reset arm carries the empty input photo"
+                );
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 3. the answer: the cache delete empties the list (count 0 →
+        //    the User record keeps the empty photo, no re-get needed)
+        //    and the re-add restores the photo at the head (cpp:6190+
+        //    6216+)
+        net_complete(
+            sent,
+            photos_photo_answer(Some(wire_photo(7)), vec![wire_user(500, "Me")]),
+        );
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the plain arm: photos.deletePhotos over the one-element id
+        //    list (cpp:799-816)
+        td.request(
+            4,
+            Function::deleteProfilePhoto(td_api::deleteProfilePhoto {
+                profile_photo_id: 9,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_deletePhotos::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::photos_deletePhotos(payload) => match &payload.id[..] {
+                [telegram_api::InputPhoto::inputPhoto(photo)] => {
+                    assert_eq!(photo.id, 9);
+                    assert_eq!(photo.access_hash, 0);
+                }
+                other => panic!("the delete payload: {other:?}"),
+            },
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 5. the one-element Vector<long> answer runs the cache delete
+        //    (the unknown id drops the photos cache — cpp:6300-6310)
+        net_complete(sent, long_vector_answer(&[9]));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. the length-mismatch band answers the C++ 400 (cpp:808-814)
+        td.request(
+            5,
+            Function::deleteProfilePhoto(td_api::deleteProfilePhoto {
+                profile_photo_id: 11,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_deletePhotos::ID,
+        );
+        net_complete(sent, long_vector_answer(&[11, 12]));
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Photo can't be deleted");
+
+        // 7. the error band forwards (cpp:816-819)
+        td.request(
+            6,
+            Function::deleteProfilePhoto(td_api::deleteProfilePhoto {
+                profile_photo_id: 13,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::photos_deletePhotos::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_9");
 
         assert!(td.user_net_completed.lock().is_empty(), "drained");
     }

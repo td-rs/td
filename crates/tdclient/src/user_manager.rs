@@ -437,6 +437,15 @@ fn get_profile_photo_id(profile_photo: &telegram_api::UserProfilePhoto) -> i64 {
     }
 }
 
+/// `get_user_id(const telegram_api::User *)` — the id read of the wire
+/// user records (the `on_set_profile_photo` have-user scan).
+fn get_wire_user_id(user: &telegram_api::User) -> UserId {
+    match user {
+        telegram_api::User::user(user) => UserId::new(user.id),
+        telegram_api::User::userEmpty(user) => UserId::new(user.id),
+    }
+}
+
 /// The `UserManager::drop_user_saved_music` map mutation
 /// (UserManager.cpp:9535-9550) — a free fn so the &mut self callers
 /// inside the add/remove state machines stay borrow-clean.
@@ -1870,7 +1879,8 @@ impl<'a> UserEnv<'a> {
 
 /// The user-plane in-flight query kinds — the C++ ResultHandler classes
 /// of the landed families (the users core cpp:1432-1803, the emoji-status
-/// family EmojiStatus.cpp:165-352). The kinds ride the
+/// family EmojiStatus.cpp:165-352, the profile-photo plane
+/// UserManager.cpp:662-816/1489). The kinds ride the
 /// `UserManager::net` handle (the `td_` back-pointer narrowed to
 /// the net plane); the answers drain through
 /// [`Td::dispatch_completed_user_net`](crate::td::Td::dispatch_completed_user_net).
@@ -1945,6 +1955,16 @@ pub(crate) enum UserNetKind {
         offset: i32,
         limit: i32,
     },
+    /// `GetUserPhotosQuery` (cpp:1489) — the kind carries the answer
+    /// members the handler kept (`user_id_`, `offset_`, `limit_`); the
+    /// offset `>= 0` answer routes to the pending-request retry machine
+    /// (`on_get_user_profile_photos`), the offset `-1` answer to the
+    /// reload leg's query-carried promise (cpp:6988-6992).
+    GetUserPhotos {
+        user_id: UserId,
+        offset: i32,
+        limit: i32,
+    },
     /// `GetUserSavedMusicByIdQuery` (cpp:1672) — the kind carries the
     /// owner user for the document intake; the caller promise rides the
     /// family queue (the C++ carries it on the query — the §5 item
@@ -1953,6 +1973,25 @@ pub(crate) enum UserNetKind {
     /// `GetSavedMusicIdsQuery` (cpp:1720) — no members; the answer
     /// rides the `reload_my_saved_music_queries` family queue.
     GetSavedMusicIds,
+    /// `UpdateProfilePhotoQuery` (cpp:662) — the kind carries the
+    /// answer's `on_set_profile_photo` members: the user, the replaced
+    /// photo (the `delete_my_profile_photo_from_cache` head) and the
+    /// fallback flag. Serves the prev-photo arm (cpp:6027-6030) and the
+    /// delete reset arm (cpp:6418-6422).
+    UpdateProfilePhoto {
+        user_id: UserId,
+        old_photo_id: i64,
+        is_fallback: bool,
+    },
+    /// `DeleteContactProfilePhotoQuery` (cpp:766) — the kind carries
+    /// the user for the `on_set_profile_photo` tail (the handler nulls
+    /// the photo and passes `old_photo_id` 0 / `is_fallback` false,
+    /// cpp:789-793).
+    DeleteContactProfilePhoto { user_id: UserId },
+    /// `DeleteProfilePhotoQuery` (cpp:799) — the kind carries the photo
+    /// id for the `on_delete_profile_photo` cache delete (the
+    /// handler's `profile_photo_id_` member).
+    DeleteProfilePhoto { profile_photo_id: i64 },
 }
 
 /// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
@@ -2123,6 +2162,17 @@ pub(crate) enum PendingUserRequest {
     },
 }
 
+/// The td-plane pair the photo-set flow reads — the C++ reaches both
+/// through `td_`: the shared user env plus the file-manager view the
+/// prev-photo arm derives its input photo from
+/// (`send_update_profile_photo_query`, cpp:6094-6107). The `pub`
+/// visibility follows [`UserEnv`] (a param struct of the pub manager
+/// methods).
+pub struct SetProfilePhotoTd<'a> {
+    pub env: &'a UserEnv<'a>,
+    pub files: &'a crate::files::FileManager,
+}
+
 /// `td::UserManager` — the in-process manager (the C++ actor collapses
 /// into the Td actor, like the M.1 AuthManager).
 #[derive(Default)]
@@ -2164,6 +2214,18 @@ pub struct UserManager {
     /// — the C++ carries the promise on the query; ours rides this
     /// FIFO queue (the §5 pairing shape).
     pending_reload_saved_music_by_id_queries: Vec<Promise<()>>,
+    /// The parked `GetUserPhotosQuery` promises of the offset `-1`
+    /// reload leg (the query-carried form, cpp:6990 — the §5 fidelity
+    /// restore): every offset `-1` send parks exactly one and every
+    /// offset `-1` answer pops the head, so the pairing is exact.
+    pending_get_user_photos_reload_queries: Vec<Promise<()>>,
+    /// The parked `UpdateProfilePhotoQuery` promises (the handler's
+    /// `promise_` member; FIFO per kind per the §5 note).
+    pending_update_profile_photo_queries: Vec<Promise<()>>,
+    /// The parked `DeleteContactProfilePhotoQuery` promises.
+    pending_delete_contact_profile_photo_queries: Vec<Promise<()>>,
+    /// The parked `DeleteProfilePhotoQuery` promises.
+    pending_delete_profile_photo_queries: Vec<Promise<()>>,
     /// `pending_user_photos_` (UserManager.h:1262) — the bot
     /// without-chat-info-database photo hold.
     pending_user_photos: BTreeMap<i64, telegram_api::UserProfilePhoto>,
@@ -8381,9 +8443,10 @@ impl UserManager {
     // M.4 tails: the profile-note/tab/birthdate setters, the photo-set
     // family and the support-user query planes
     // (UserManager.cpp:5981-6835, 7178-7212). The setters' and
-    // support-user sends ride the `net` handle (the emoji-status
-    // planes since d5c9b66, these families since this slice); the
-    // file-coupled photo legs stay the Files-slice seams.
+    // support-user sends and the profile-photo families ride the `net`
+    // handle (the emoji-status planes since d5c9b66, the setters and
+    // support-user since 43539e1, the §3.1 #9/#11-#14 plane here); the
+    // upload tails stay the Files-slice seams.
 
     /// `UserManager::set_user_note` (UserManager.cpp:6440-6466). The
     /// contact/self gates and the formatted-text normalization answer
@@ -8639,27 +8702,38 @@ impl UserManager {
 
     /// `UserManager::set_profile_photo` (UserManager.cpp:5996-6002); the
     /// `UserpicSetup` suggested-action dismissal is the caller's seam
-    /// (the Td-level arm hosts it like the Payments-side dismiss).
+    /// (the Td-level arm hosts it like the Payments-side dismiss). The
+    /// `files` handle is the `td_->file_manager_` read the C++ reaches
+    /// through `td_` (the prev-photo input-photo derivation).
     pub fn set_profile_photo(
         &mut self,
         env: &UserEnv,
+        files: &crate::files::FileManager,
         input_photo: Option<&td_api::InputChatPhoto>,
         is_fallback: bool,
         promise: Promise<()>,
     ) {
         let my_id = self.get_my_id();
-        self.set_profile_photo_impl(env, my_id, input_photo, is_fallback, false, promise);
+        self.set_profile_photo_impl(
+            SetProfilePhotoTd { env, files },
+            my_id,
+            input_photo,
+            is_fallback,
+            false,
+            promise,
+        );
     }
 
     /// `UserManager::set_profile_photo_impl` (UserManager.cpp:6004-6070)
-    /// — the validation bands answer here. The static/animation upload
-    /// flow and the `UpdateProfilePhotoQuery`/`UploadProfilePhotoQuery`
-    /// sends are the [blocked: net/Files] seams; the sticker arm needs
+    /// — the validation bands answer here; the prev-photo arm rides the
+    /// `UpdateProfilePhotoQuery` dispatcher (cpp:662) over the file
+    /// view's input photo. The static/animation upload flow is the
+    /// [blocked: net/Files] seam; the sticker arm needs
     /// `StickerPhotoSize::get_sticker_photo_size` over the td_api input
     /// (the M.st StickerPhotoSize seam).
     pub fn set_profile_photo_impl(
         &mut self,
-        env: &UserEnv,
+        td: SetProfilePhotoTd<'_>,
         user_id: UserId,
         input_photo: Option<&td_api::InputChatPhoto>,
         is_fallback: bool,
@@ -8669,7 +8743,8 @@ impl UserManager {
         let Some(input_photo) = input_photo else {
             return promise.set_error(Status::error(400, "New profile photo must be non-empty"));
         };
-        let _ = (is_fallback, only_suggest);
+        let _ = only_suggest;
+        let SetProfilePhotoTd { env, files } = td;
         match input_photo {
             td_api::InputChatPhoto::inputChatPhotoPrevious(photo) => {
                 if user_id != self.get_my_id() || env.auth_is_bot {
@@ -8677,12 +8752,34 @@ impl UserManager {
                         .set_error(Status::error(400, "Can't use inputChatPhotoPrevious"));
                 }
                 let photo_id = photo.chat_photo_id;
+                let file_id = self.get_profile_photo_file_id(photo_id);
+                // the C++ gate is `get_profile_photo_file_id().is_valid()`;
+                // the map membership is the placeholder-world equivalent —
+                // the registered photo file ids stay the invalid
+                // placeholders until the Files step wires the registration
                 if !self.my_photo_file_id.contains_key(&photo_id) {
                     return promise
                         .set_error(Status::error(400, "Unknown profile photo ID specified"));
                 }
-                self.net_blocked_promises.push(promise);
-                tdutils::log_info!("Send photos.updateProfilePhoto — [blocked: net]");
+                // `send_update_profile_photo_query`'s file-view read
+                // (cpp:6094-6107): the input photo comes from the
+                // registered photo's main remote location
+                let input_photo = files.get_file_view(file_id).and_then(|file_view| {
+                    file_view.get_main_remote_location().map(|location| {
+                        telegram_api::InputPhoto::inputPhoto(location.as_input_photo())
+                    })
+                });
+                let Some(input_photo) = input_photo else {
+                    return promise.set_error(Status::error(500, "Failed to upload the file"));
+                };
+                self.send_update_profile_photo_query(
+                    env,
+                    user_id,
+                    photo_id,
+                    is_fallback,
+                    input_photo,
+                    promise,
+                );
             }
             td_api::InputChatPhoto::inputChatPhotoStatic(_) => {
                 self.net_blocked_promises.push(promise);
@@ -8708,18 +8805,21 @@ impl UserManager {
 
     /// `UserManager::set_user_profile_photo` (UserManager.cpp:6071-6097)
     /// — serves both setUserPersonalProfilePhoto and
-    /// suggestUserProfilePhoto (`only_suggest`).
+    /// suggestUserProfilePhoto (`only_suggest`); the null-photo arm
+    /// rides the `DeleteContactProfilePhotoQuery` dispatcher (cpp:766).
     pub fn set_user_profile_photo(
         &mut self,
         env: &UserEnv,
+        files: &crate::files::FileManager,
         user_id: UserId,
         input_photo: Option<&td_api::InputChatPhoto>,
         only_suggest: bool,
         mut promise: Promise<()>,
     ) {
-        if let Err(error) = self.get_input_user(env, user_id) {
-            return promise.set_error(error);
-        }
+        let input_user = match self.get_input_user(env, user_id) {
+            Ok(input_user) => input_user,
+            Err(error) => return promise.set_error(error),
+        };
         if !only_suggest && !self.is_user_contact_of(user_id, false) {
             return promise.set_error(Status::error(400, "User isn't a contact"));
         }
@@ -8736,16 +8836,14 @@ impl UserManager {
             ));
         }
         let Some(input_photo) = input_photo else {
-            let mut promise = promise;
             if only_suggest {
                 return promise.set_error(Status::error(400, "Photo must be non-empty"));
             }
-            self.net_blocked_promises.push(promise);
-            tdutils::log_info!("Send contacts.deleteContactProfilePhoto — [blocked: net]");
+            self.send_delete_contact_profile_photo_query(user_id, input_user, promise);
             return;
         };
         self.set_profile_photo_impl(
-            env,
+            SetProfilePhotoTd { env, files },
             user_id,
             Some(input_photo),
             false,
@@ -8754,23 +8852,160 @@ impl UserManager {
         );
     }
 
-    /// `UserManager::delete_profile_photo` (UserManager.cpp:6395-6426) —
-    /// the cache bands answer here; the user_full reload retry ladder,
-    /// the `UpdateProfilePhotoQuery` reset and the
-    /// `DeleteProfilePhotoQuery` send are [blocked: net].
+    /// `UserManager::get_profile_photo_file_id` (UserManager.cpp — the
+    /// `my_photo_file_id_` lookup).
+    fn get_profile_photo_file_id(&self, photo_id: i64) -> FileId {
+        self.my_photo_file_id
+            .get(&photo_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// `UpdateProfilePhotoQuery::send` (cpp:671-691) over an already
+    /// built input photo — the prev-photo arm reads the file view first
+    /// (`send_update_profile_photo_query`, cpp:6094-6107), the
+    /// `inputPhotoEmpty` reset arm of `delete_profile_photo` bypasses
+    /// it (cpp:6418). The file-reference repair chain of the handler's
+    /// `on_error` (cpp:696-718) rides the Files plane.
+    fn send_update_profile_photo_query(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        old_photo_id: i64,
+        is_fallback: bool,
+        input_photo: telegram_api::InputPhoto,
+        mut promise: Promise<()>,
+    ) {
+        // `TRY_STATUS_PROMISE(promise, G()->close_status())` (cpp:6096)
+        if env.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        let bot = if user_id != self.get_my_id() {
+            match self.get_input_user(env, user_id) {
+                Ok(input_user) => Some(input_user),
+                Err(error) => return promise.set_error(error),
+            }
+        } else {
+            None
+        };
+        self.pending_update_profile_photo_queries.push(promise);
+        let function = telegram_api::photos_updateProfilePhoto {
+            // the bot field rides the flags bit 1 (the C++ BOT_MASK)
+            flags: if bot.is_some() { 1 << 1 } else { 0 },
+            fallback: is_fallback,
+            bot,
+            id: Some(input_photo),
+        };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::UpdateProfilePhoto {
+                    user_id,
+                    old_photo_id,
+                    is_fallback,
+                },
+                telegram_api::Function::photos_updateProfilePhoto(function),
+            ),
+            None => tdutils::log_info!("Send photos.updateProfilePhoto — [net-inert]"),
+        }
+    }
+
+    /// `DeleteContactProfilePhotoQuery::send` (cpp:766-786).
+    fn send_delete_contact_profile_photo_query(
+        &mut self,
+        user_id: UserId,
+        input_user: telegram_api::InputUser,
+        promise: Promise<()>,
+    ) {
+        self.pending_delete_contact_profile_photo_queries
+            .push(promise);
+        let function = telegram_api::photos_uploadContactProfilePhoto {
+            flags: 0,
+            suggest: false,
+            save: true,
+            user_id: Some(input_user),
+            file: None,
+            video: None,
+            video_start_ts: 0.0,
+            video_emoji_markup: None,
+        };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::DeleteContactProfilePhoto { user_id },
+                telegram_api::Function::photos_uploadContactProfilePhoto(function),
+            ),
+            None => tdutils::log_info!("Send contacts.deleteContactProfilePhoto — [net-inert]"),
+        }
+    }
+
+    /// `UserManager::delete_profile_photo` (UserManager.cpp:6395-6426)
+    /// — the cache bands answer here; the unloaded-full reload ladder
+    /// re-enters through the Td actor (the C++
+    /// `PromiseCreator::lambda` chain, cpp:6405-6414), the reset arm
+    /// refires the `UpdateProfilePhotoQuery` with `inputPhotoEmpty`
+    /// (cpp:6418-6422) and the plain arm rides the
+    /// `DeleteProfilePhotoQuery` (cpp:799-816).
     pub fn delete_profile_photo(
         &mut self,
         env: &mut UserEnv,
         profile_photo_id: i64,
+        is_recursive: bool,
         mut promise: Promise<()>,
     ) {
+        // `TRY_STATUS_PROMISE(promise, G()->close_status())` (cpp:6396)
+        if env.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
         let my_id = self.get_my_id();
-        if !self.get_user_full_force(env, my_id, "delete_profile_photo") {
-            // the C++ loads the UserFull first (the fallback photo can't
-            // be deleted via the plain query); the reload half is the net
-            // step
-            self.net_blocked_promises.push(promise);
-            tdutils::log_info!("Reload UserFullInfo — [blocked: net]");
+        let have_user_full = self.get_user_full_force(env, my_id, "delete_profile_photo");
+        if !have_user_full || (env.auth_is_bot && !is_recursive) {
+            // must load UserFull first, because fallback photo can't be
+            // deleted via DeleteProfilePhotoQuery
+            if is_recursive {
+                return promise.set_error(Status::error(500, "Failed to load UserFullInfo"));
+            }
+            // the reload ladder: `reload_user_full(my_id, lambda)` where
+            // the lambda re-enters delete_profile_photo with
+            // `is_recursive = true` (cpp:6405-6414); the Td-actor hop is
+            // the re-entry path (the promise_send_closure form), the
+            // net-inert None arm the uncached-consumer convention
+            match self.td_actor_id.clone() {
+                Some(td_actor_id) => {
+                    let reload_promise =
+                        PromiseCreator::lambda_result(tdactor::promise_send_closure(
+                            td_actor_id,
+                            move |td: &mut crate::td::Td, result: tdutils::status::Result<()>| {
+                                let mut promise = promise;
+                                match result {
+                                    tdutils::status::Result::Ok(()) => {
+                                        let Some(options) = td.option_manager.as_mut() else {
+                                            return promise
+                                                .set_error(Status::error(500, "Request aborted"));
+                                        };
+                                        let mut env = UserEnv {
+                                            global: &mut td.global,
+                                            options,
+                                            auth_is_bot: td.auth_manager.is_bot(),
+                                        };
+                                        td.user_manager.delete_profile_photo(
+                                            &mut env,
+                                            profile_photo_id,
+                                            true,
+                                            promise,
+                                        );
+                                    }
+                                    tdutils::status::Result::Err(error) => {
+                                        promise.set_error(error);
+                                    }
+                                }
+                            },
+                        ));
+                    self.reload_user_full(env, my_id, reload_promise, "delete_profile_photo");
+                }
+                None => {
+                    tdutils::log_info!("Reload UserFullInfo — [net-inert]");
+                    promise.set_error(Status::error(500, "Request aborted"));
+                }
+            }
             return;
         }
         let mut profile_photo_id = profile_photo_id;
@@ -8791,13 +9026,361 @@ impl UserManager {
                 user_full.fallback_photo.id != 0 && user_full.fallback_photo.id == profile_photo_id,
             )
         };
-        let _ = profile_photo_id;
-        self.net_blocked_promises.push(promise);
         if update_main_photo || update_fallback_photo {
-            tdutils::log_info!("Send photos.updateProfilePhoto (reset) — [blocked: net]");
-        } else {
-            tdutils::log_info!("Send photos.deleteProfilePhoto — [blocked: net]");
+            self.send_update_profile_photo_query(
+                env,
+                my_id,
+                profile_photo_id,
+                update_fallback_photo,
+                telegram_api::InputPhoto::inputPhotoEmpty(telegram_api::inputPhotoEmpty),
+                promise,
+            );
+            return;
         }
+        self.send_delete_profile_photo_query(profile_photo_id, promise);
+    }
+
+    /// `DeleteProfilePhotoQuery::send` (cpp:799-816) — the
+    /// `photos.deletePhotos` query over the one-element id list.
+    fn send_delete_profile_photo_query(&mut self, profile_photo_id: i64, promise: Promise<()>) {
+        self.pending_delete_profile_photo_queries.push(promise);
+        let function = telegram_api::photos_deletePhotos {
+            id: vec![telegram_api::InputPhoto::inputPhoto(
+                telegram_api::inputPhoto {
+                    id: profile_photo_id,
+                    access_hash: 0,
+                    file_reference: Vec::new(),
+                },
+            )],
+        };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::DeleteProfilePhoto { profile_photo_id },
+                telegram_api::Function::photos_deletePhotos(function),
+            ),
+            None => tdutils::log_info!("Send photos.deletePhotos — [net-inert]"),
+        }
+    }
+
+    /// `UserManager::on_delete_profile_photo` (UserManager.cpp:6431-6438)
+    /// — the `DeleteProfilePhotoQuery` ok tail: the cache delete, then
+    /// the re-get ladder when the User record needs the new photo.
+    pub fn on_delete_profile_photo(
+        &mut self,
+        env: &mut UserEnv,
+        profile_photo_id: i64,
+        mut promise: Promise<()>,
+    ) {
+        let need_reget_user = self.delete_my_profile_photo_from_cache(env, profile_photo_id);
+        if need_reget_user && !env.global.close_flag() {
+            let my_id = self.get_my_id();
+            return self.reload_user(env, my_id, promise, "on_delete_profile_photo");
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::on_set_profile_photo` (UserManager.cpp:6190-6214) —
+    /// the `UpdateProfilePhotoQuery`/`DeleteContactProfilePhotoQuery`
+    /// ok tail: the replaced-photo cache delete, the users intake, the
+    /// set-photo cache add, then the promise (or the re-get when the
+    /// answer carried no matching user).
+    pub fn on_set_profile_photo(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        photo: telegram_api::photos_Photo,
+        is_fallback: bool,
+        old_photo_id: i64,
+        mut promise: Promise<()>,
+    ) {
+        tdutils::log_info!("Changed profile photo to {}", photo.to_debug_string());
+        let is_bot = self.is_user_bot_of(user_id);
+        let is_my = user_id == self.get_my_id();
+        if is_my && !is_fallback {
+            self.delete_my_profile_photo_from_cache(env, old_photo_id);
+        }
+        let mut have_user = false;
+        for user in &photo.users {
+            if get_wire_user_id(user) == user_id {
+                have_user = true;
+            }
+        }
+        let telegram_api::photos_Photo {
+            photo: photo_ptr,
+            users,
+        } = photo;
+        self.on_get_users(env, users, "on_set_profile_photo");
+        if !is_bot {
+            // the C++ `get_photo(td_, std::move(photo->photo_), …)` — a
+            // null payload (the DeleteContactProfilePhotoQuery band,
+            // cpp:789) reads as the empty photo
+            let photo = get_photo(photo_ptr.unwrap_or(telegram_api::Photo::photoEmpty(
+                telegram_api::photoEmpty { id: 0 },
+            )));
+            self.add_set_profile_photo_to_cache(env, user_id, photo, is_fallback);
+        }
+        if have_user {
+            promise.set_value(());
+        } else {
+            self.reload_user(env, user_id, promise, "on_set_profile_photo");
+        }
+    }
+
+    /// `UserManager::add_set_profile_photo_to_cache`
+    /// (UserManager.cpp:6216-6271). The `UserFull` photos store the
+    /// reduced `as_profile_photo` form (module docs); the file-manager
+    /// registration inside the C++ conversions is the Files step.
+    fn add_set_profile_photo_to_cache(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        photo: Photo,
+        is_fallback: bool,
+    ) {
+        if !self.get_user_force(env, user_id, "add_set_profile_photo_to_cache") {
+            return;
+        }
+        tdutils::log_info!("Add profile photo {} to cache", photo.id);
+        let is_me = user_id == self.get_my_id();
+
+        // update photo list — we have subsequence of user photos in
+        // user_photos_
+        if is_me && !is_fallback && !photo.is_empty() {
+            let mut registered: Option<Photo> = None;
+            if let Some(user_photos) = self.user_photos.get_mut(&user_id.get())
+                && user_photos.count != -1
+            {
+                if user_photos.offset == 0 {
+                    if user_photos.photos.is_empty() || user_photos.photos[0].id != photo.id {
+                        user_photos.photos.insert(0, photo.clone());
+                        user_photos.count += 1;
+                        registered = Some(user_photos.photos[0].clone());
+                    }
+                } else {
+                    user_photos.count += 1;
+                    user_photos.offset += 1;
+                }
+            }
+            if let Some(back) = registered {
+                self.register_user_photo(user_id, &back);
+            }
+        }
+
+        // update ProfilePhoto in User
+        let old_photo_id = self.users.get(&user_id.get()).unwrap().photo.id;
+        if (!is_fallback || old_photo_id == 0) && !photo.is_empty() {
+            self.do_update_user_photo(
+                env,
+                user_id,
+                as_profile_photo(&photo, !is_me),
+                false,
+                "add_set_profile_photo_to_cache",
+            );
+            self.update_user(env, user_id, false, false);
+        }
+
+        // update Photo in UserFull
+        if self.get_user_full_force(env, user_id, "add_set_profile_photo_to_cache") {
+            let mut user_full = self.users_full.remove(&user_id.get()).unwrap();
+            let mut current_photo_is_personal = false;
+            let mut need_apply = Self::get_user_full_profile_photo_id(&user_full) > 0;
+            if !is_me {
+                current_photo_is_personal = true;
+                if photo.is_empty() {
+                    // always can apply empty personal photo
+                    need_apply = true;
+                }
+            } else if !is_fallback {
+                current_photo_is_personal = false;
+                if photo.is_empty() {
+                    // never can apply empty photo
+                    need_apply = false;
+                }
+            } else if photo.is_empty() {
+                // always can apply empty fallback photo
+                need_apply = true;
+            }
+            let new_photo = as_profile_photo(&photo, current_photo_is_personal);
+            let current_photo = if current_photo_is_personal {
+                &mut user_full.personal_photo
+            } else if is_me && !is_fallback {
+                &mut user_full.photo
+            } else {
+                &mut user_full.fallback_photo
+            };
+            if *current_photo != new_photo && need_apply {
+                tdutils::log_info!("Update full photo of {user_id:?} to {}", photo.id);
+                *current_photo = new_photo;
+                user_full.is_changed = true;
+                if is_me && !photo.is_empty() {
+                    if !is_fallback {
+                        self.register_user_photo(user_id, &photo);
+                    } else {
+                        self.register_suggested_profile_photo(&photo);
+                    }
+                }
+                // just in case — the expected id reads the User record the
+                // ProfilePhoto update may have changed
+                let expected_photo_id = self.users.get(&user_id.get()).unwrap().photo.id;
+                self.drop_user_full_photos(
+                    env,
+                    user_id,
+                    expected_photo_id,
+                    "add_set_profile_photo_to_cache",
+                );
+            }
+            if user_full.expires_at > 0.0 {
+                user_full.expires_at = 0.0;
+                user_full.need_save_to_database = true;
+            }
+            self.users_full.insert(user_id.get(), user_full);
+            self.update_user_full(env, user_id, "add_set_profile_photo_to_cache", false);
+            self.reload_user_full(
+                env,
+                user_id,
+                Promise::default(),
+                "add_set_profile_photo_to_cache",
+            );
+        }
+    }
+
+    /// `UserManager::delete_my_profile_photo_from_cache`
+    /// (UserManager.cpp:6273-6393) — the photo-list surgery, the User
+    /// photo repair and the UserFull photo repair; returns the
+    /// `need_reget_user` flag.
+    fn delete_my_profile_photo_from_cache(
+        &mut self,
+        env: &mut UserEnv,
+        profile_photo_id: i64,
+    ) -> bool {
+        if profile_photo_id == 0 || profile_photo_id == -2 {
+            return false;
+        }
+        // we have subsequence of user photos in user_photos_
+        tdutils::log_info!("Delete profile photo {profile_photo_id} from cache");
+        let user_id = self.get_my_id();
+        let have_user = self.get_user_force(env, user_id, "delete_my_profile_photo_from_cache");
+        let is_main_photo_deleted = have_user
+            && self
+                .users
+                .get(&user_id.get())
+                .is_some_and(|u| u.photo.id == profile_photo_id);
+
+        // update photo list
+        let mut user_photos = self.user_photos.remove(&user_id.get());
+        if let Some(user_photos) = user_photos.as_mut()
+            && user_photos.count > 0
+        {
+            let old_size = user_photos.photos.len();
+            user_photos
+                .photos
+                .retain(|photo| photo.id != profile_photo_id);
+            let removed_photos = old_size - user_photos.photos.len();
+            if removed_photos > 0 {
+                if removed_photos != 1 {
+                    tdutils::log_error!("Had {removed_photos} photos with ID {profile_photo_id}");
+                }
+                user_photos.count -= removed_photos as i32;
+                // offset was not changed
+                debug_assert!(user_photos.count >= 0);
+                if user_photos.count == 0 {
+                    debug_assert!(user_photos.photos.is_empty());
+                    user_photos.offset = 0;
+                }
+            } else if user_photos.offset == 0 && user_photos.count > user_photos.photos.len() as i32
+            {
+                // failed to find photo to remove from cache, but offset
+                // doesn't need to be adjusted
+                user_photos.count -= 1;
+            } else {
+                // failed to find photo to remove from cache — don't know
+                // how to adjust offset, so drop the photos cache
+                tdutils::log_info!("Drop photos of {user_id:?}");
+                user_photos.photos.clear();
+                user_photos.count = -1;
+                user_photos.offset = -1;
+            }
+        }
+        let have_new_photo = user_photos.as_ref().is_some_and(|photos| {
+            photos.count != -1 && photos.offset == 0 && !photos.photos.is_empty()
+        });
+
+        let have_user_full =
+            self.get_user_full_force(env, user_id, "delete_my_profile_photo_from_cache");
+
+        // update ProfilePhoto in User
+        let mut need_reget_user = false;
+        if is_main_photo_deleted {
+            if have_new_photo {
+                let new_photo = as_profile_photo(&user_photos.as_ref().unwrap().photos[0], false);
+                self.do_update_user_photo(
+                    env,
+                    user_id,
+                    new_photo,
+                    false,
+                    "delete_my_profile_photo_from_cache",
+                );
+            } else {
+                self.do_update_user_photo(
+                    env,
+                    user_id,
+                    ProfilePhoto::default(),
+                    false,
+                    "delete_my_profile_photo_from_cache 2",
+                );
+                need_reget_user = user_photos.is_none() || user_photos.as_ref().unwrap().count != 0;
+            }
+            self.update_user(env, user_id, false, false);
+
+            // update Photo in UserFull
+            if have_user_full {
+                let mut user_full = self.users_full.remove(&user_id.get()).unwrap();
+                if !user_full.fallback_photo.is_empty()
+                    && user_full.fallback_photo.id == profile_photo_id
+                {
+                    tdutils::log_info!("Drop full public photo of {user_id:?}");
+                    user_full.fallback_photo = ProfilePhoto::default();
+                    user_full.is_changed = true;
+                } else if have_new_photo {
+                    let new_photo =
+                        as_profile_photo(&user_photos.as_ref().unwrap().photos[0], false);
+                    if !user_full.photo.is_empty()
+                        && user_full.photo.id == profile_photo_id
+                        && user_full.photo != new_photo
+                    {
+                        tdutils::log_info!("Update full photo of {user_id:?}");
+                        user_full.photo = new_photo;
+                        user_full.is_changed = true;
+                    }
+                } else {
+                    // repair UserFull photo
+                    if !user_full.photo.is_empty() {
+                        user_full.photo = ProfilePhoto::default();
+                        user_full.is_changed = true;
+                    }
+                    if !user_full.fallback_photo.is_empty() {
+                        user_full.fallback_photo = ProfilePhoto::default();
+                        user_full.is_changed = true;
+                    }
+                }
+                if user_full.expires_at > 0.0 {
+                    user_full.expires_at = 0.0;
+                    user_full.need_save_to_database = true;
+                }
+                self.users_full.insert(user_id.get(), user_full);
+                self.reload_user_full(
+                    env,
+                    user_id,
+                    Promise::default(),
+                    "delete_my_profile_photo_from_cache",
+                );
+                self.update_user_full(env, user_id, "delete_my_profile_photo_from_cache", false);
+            }
+        }
+        if let Some(user_photos) = user_photos {
+            self.user_photos.insert(user_id.get(), user_photos);
+        }
+        need_reget_user
     }
 
     // --- the emoji-status query planes (EmojiStatus.cpp:571-637) —
@@ -9155,9 +9738,51 @@ impl UserManager {
         }
     }
 
+    /// `UpdateProfilePhotoQuery::on_result`'s promise pop (cpp:684-688) —
+    /// the head in-flight query promise.
+    pub(crate) fn take_update_profile_photo_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_update_profile_photo_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_update_profile_photo_queries.remove(0))
+        }
+    }
+
+    /// `DeleteContactProfilePhotoQuery::on_result`'s promise pop
+    /// (cpp:784-793).
+    pub(crate) fn take_delete_contact_profile_photo_query_promise(
+        &mut self,
+    ) -> Option<Promise<()>> {
+        if self.pending_delete_contact_profile_photo_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_delete_contact_profile_photo_queries.remove(0))
+        }
+    }
+
+    /// `DeleteProfilePhotoQuery::on_result`'s promise pop (cpp:808-815).
+    pub(crate) fn take_delete_profile_photo_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_delete_profile_photo_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_delete_profile_photo_queries.remove(0))
+        }
+    }
+
+    /// The offset `-1` `GetUserPhotosQuery` promise pop — the reload
+    /// leg's query-carried promise (cpp:6990).
+    pub(crate) fn take_get_user_photos_reload_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_user_photos_reload_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_user_photos_reload_queries.remove(0))
+        }
+    }
+
     /// `UserManager::get_user_profile_photos`
-    /// (UserManager.cpp:6826-6885). The `photos.getUserPhotos` send is
-    /// [blocked: net] (M.4.16); requests park in the pending queue.
+    /// (UserManager.cpp:6826-6885). The cache window answers here; a
+    /// miss parks in the pending queue and the `photos.getUserPhotos`
+    /// query rides the `net` handle.
     pub fn get_user_profile_photos(
         &mut self,
         env: &mut UserEnv,
@@ -9242,14 +9867,15 @@ impl UserManager {
             return;
         }
 
-        self.send_get_user_photos_query(user_id);
+        self.send_get_user_photos_query(env, user_id);
     }
 
     /// `UserManager::send_get_user_photos_query`
-    /// (UserManager.cpp:6887-6913) — the cache-end offset adjustment is
-    /// computed with the query; the `photos.getUserPhotos` send itself is
-    /// [blocked: net] (M.4.16).
-    fn send_get_user_photos_query(&self, user_id: UserId) {
+    /// (UserManager.cpp:6890-6911) — the cache-end offset adjustment is
+    /// computed with the query; the `GetUserPhotosQuery` promise is the
+    /// retry-machine routing lambda (the answer drain runs
+    /// [`UserManager::on_get_user_profile_photos`]).
+    fn send_get_user_photos_query(&mut self, env: &UserEnv, user_id: UserId) {
         let Some(requests) = self.pending_get_user_photos_requests.get(&user_id.get()) else {
             return;
         };
@@ -9268,10 +9894,27 @@ impl UserManager {
                 offset = cache_end;
             }
         }
+        let limit = limit.max(MAX_GET_PROFILE_PHOTOS / 5);
         tdutils::log_info!(
-            "Send photos.getUserPhotos for {user_id:?} at offset {offset} limit {} — [blocked: net]",
-            limit.max(MAX_GET_PROFILE_PHOTOS / 5)
+            "Send photos.getUserPhotos for {user_id:?} at offset {offset} limit {limit}"
         );
+        let input_user = self.get_input_user_force(env, user_id);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::GetUserPhotos {
+                    user_id,
+                    offset,
+                    limit,
+                },
+                telegram_api::Function::photos_getUserPhotos(telegram_api::photos_getUserPhotos {
+                    user_id: Some(input_user),
+                    offset,
+                    max_id: 0,
+                    limit,
+                }),
+            ),
+            None => tdutils::log_info!("Send photos.getUserPhotos — [net-inert]"),
+        }
     }
 
     /// `UserManager::on_get_user_profile_photos`
@@ -9315,7 +9958,7 @@ impl UserManager {
             }
             self.pending_get_user_photos_requests
                 .insert(user_id.get(), pending_requests);
-            self.send_get_user_photos_query(user_id);
+            self.send_get_user_photos_query(env, user_id);
             return;
         }
 
@@ -9386,7 +10029,7 @@ impl UserManager {
             let need_send = requests.is_empty();
             requests.extend(left_requests);
             if need_send {
-                self.send_get_user_photos_query(user_id);
+                self.send_get_user_photos_query(env, user_id);
             }
         }
     }
@@ -9503,23 +10146,43 @@ impl UserManager {
     }
 
     /// `UserManager::reload_user_profile_photo`
-    /// (UserManager.cpp:6982-6992) — the `photos.getUserPhotos` send with
-    /// offset -1 is [blocked: net] (M.4.16).
+    /// (UserManager.cpp:6988-6992) — the `photos.getUserPhotos` query
+    /// with offset -1 rides the `net` handle; the caller promise rides
+    /// the query (the §5 fidelity restore — the C++
+    /// `GetUserPhotosQuery` carries it, the park used to drop it).
+    /// This request will be needed only to download the photo, so
+    /// there is no reason to combine different requests for a photo
+    /// into one request.
     pub fn reload_user_profile_photo(
         &mut self,
         env: &mut UserEnv,
         user_id: UserId,
         photo_id: i64,
-        promise: Promise<()>,
+        mut promise: Promise<()>,
     ) {
         self.get_user_force(env, user_id, "reload_user_profile_photo");
-        let input_user = self.get_input_user(env, user_id);
-        if let Err(status) = input_user {
-            let mut promise = promise;
-            promise.set_error(status);
-            return;
+        let input_user = match self.get_input_user(env, user_id) {
+            Ok(input_user) => input_user,
+            Err(status) => return promise.set_error(status),
+        };
+        tdutils::log_info!("Reload profile photo {photo_id} of {user_id:?}");
+        self.pending_get_user_photos_reload_queries.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                UserNetKind::GetUserPhotos {
+                    user_id,
+                    offset: -1,
+                    limit: 1,
+                },
+                telegram_api::Function::photos_getUserPhotos(telegram_api::photos_getUserPhotos {
+                    user_id: Some(input_user),
+                    offset: -1,
+                    max_id: photo_id,
+                    limit: 1,
+                }),
+            ),
+            None => tdutils::log_info!("Reload profile photo — [net-inert]"),
         }
-        tdutils::log_info!("Reload profile photo {photo_id} of {user_id:?} — [blocked: net]");
     }
 
     /// `UserManager::get_user_profile_photo_file_source_id`
@@ -10875,10 +11538,7 @@ impl UserManager {
             telegram_api::contacts_Contacts::contacts_contacts(contacts) => {
                 let mut contact_user_ids: BTreeSet<i64> = BTreeSet::new();
                 for user in &contacts.users {
-                    let user_id = match user {
-                        telegram_api::User::user(user) => UserId::new(user.id),
-                        telegram_api::User::userEmpty(user) => UserId::new(user.id),
-                    };
+                    let user_id = get_wire_user_id(user);
                     if !user_id.is_valid() {
                         tdutils::log_error!("Receive invalid {user_id:?}");
                         continue;
@@ -18508,10 +19168,21 @@ mod tests {
         let (mut temp, mut um) = test_env();
         let env = temp.env(false);
         let my_id = um.get_my_id();
+        let files = crate::files::FileManager::new();
 
         // the null gate
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(&env, my_id, None, false, false, promise);
+        um.set_profile_photo_impl(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &files,
+            },
+            my_id,
+            None,
+            false,
+            false,
+            promise,
+        );
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "New profile photo must be non-empty")
         );
@@ -18522,16 +19193,55 @@ mod tests {
                 chat_photo_id: 7,
             });
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(&env, UserId::new(5), Some(&previous), false, false, promise);
+        um.set_profile_photo_impl(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &files,
+            },
+            UserId::new(5),
+            Some(&previous),
+            false,
+            false,
+            promise,
+        );
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Can't use inputChatPhotoPrevious")
         );
 
         // an unknown photo id is the cache-miss 400
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(&env, my_id, Some(&previous), false, false, promise);
+        um.set_profile_photo_impl(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &files,
+            },
+            my_id,
+            Some(&previous),
+            false,
+            false,
+            promise,
+        );
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Unknown profile photo ID specified")
+        );
+
+        // a registered photo whose file view is missing is the C++ 500
+        // (send_update_profile_photo_query's file-view gate, cpp:6100)
+        um.my_photo_file_id.insert(7, FileId::new(0, 0));
+        let (promise, result) = promise_result();
+        um.set_profile_photo_impl(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &files,
+            },
+            my_id,
+            Some(&previous),
+            false,
+            false,
+            promise,
+        );
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Failed to upload the file")
         );
 
         // the animation timestamp band
@@ -18541,7 +19251,17 @@ mod tests {
                 main_frame_timestamp: 42.0,
             });
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(&env, my_id, Some(&animation), false, false, promise);
+        um.set_profile_photo_impl(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &files,
+            },
+            my_id,
+            Some(&animation),
+            false,
+            false,
+            promise,
+        );
         assert!(
             matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Wrong main frame timestamp specified")
         );
@@ -18552,23 +19272,319 @@ mod tests {
                 photo: None,
             });
         let (promise, result) = promise_result();
-        um.set_profile_photo_impl(&env, my_id, Some(&static_photo), false, false, promise);
+        um.set_profile_photo_impl(
+            SetProfilePhotoTd {
+                env: &env,
+                files: &files,
+            },
+            my_id,
+            Some(&static_photo),
+            false,
+            false,
+            promise,
+        );
         assert_eq!(um.net_blocked_promises.len(), 1);
         assert!((*result.lock().unwrap()).is_none());
         um.net_blocked_promises.clear();
     }
 
     #[test]
-    fn delete_profile_photo_parks_on_the_unloaded_user_full() {
+    fn delete_profile_photo_bands_the_unloaded_user_full() {
         let (mut temp, mut um) = test_env();
-        let mut env = temp.env(false);
+        {
+            let mut env = temp.env(false);
 
-        // no cached UserFull: the C++ reloads first ([blocked: net])
+            // no cached UserFull and no Td-actor hop: the net-inert
+            // posture answers the C++ close-state surface (the
+            // uncached-consumer convention — the ladder's combiner ride
+            // needs the scheduler context)
+            let (promise, result) = promise_result();
+            um.delete_profile_photo(&mut env, 7, false, promise);
+            assert!(
+                matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Request aborted")
+            );
+
+            // the re-entry arm answers the C++ 500 (cpp:6405)
+            let (promise, result) = promise_result();
+            um.delete_profile_photo(&mut env, 7, true, promise);
+            assert!(
+                matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Failed to load UserFullInfo")
+            );
+        }
+
+        // the close gate answers the C++ synchronous 500 (cpp:6396)
+        temp.global.close_all(false);
+        let mut env = temp.env(false);
         let (promise, result) = promise_result();
-        um.delete_profile_photo(&mut env, 7, promise);
-        assert_eq!(um.net_blocked_promises.len(), 1);
-        assert!((*result.lock().unwrap()).is_none());
-        um.net_blocked_promises.clear();
+        um.delete_profile_photo(&mut env, 7, false, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Request aborted")
+        );
+    }
+
+    #[test]
+    fn on_set_profile_photo_updates_the_caches() {
+        let (mut temp, mut um) = test_env();
+        let my_id = UserId::new(7);
+        um.set_my_id(&mut temp.env(false), my_id);
+        seed_received_user(&mut temp, &mut um, 7);
+        um.take_updates();
+
+        // the photos cache through the natural retry-machine drive (one
+        // parked request, the listing answer, the completion)
+        let (p, _a) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), my_id, 0, 10, p);
+        um.on_get_user_photos(my_id, 0, 10, 1, vec![telegram_photo(31)]);
+        um.on_get_user_profile_photos(&temp.env(false), my_id, Ok(()));
+        assert_eq!(um.user_photos[&7].photos.len(), 1);
+
+        // the full record with the same photo (the profile_photo apply
+        // path needs a known full photo)
+        um.on_get_user_full(
+            &mut temp.env(false),
+            telegram_api::UserFull {
+                id: 7,
+                flags: 1 << 2, // profile_photo present
+                profile_photo: Some(telegram_photo(31)),
+                ..telegram_api::UserFull::default()
+            },
+        );
+        assert_eq!(um.users_full[&7].photo.id, 31);
+
+        // on_set_profile_photo: the main-photo set takes the cache head
+        // (cpp:6190-6214 + 6216-6271; the replaced-id delete arm is the
+        // re-add band of the delete test). The answer's user carries
+        // the pre-change photo — the photo-less form would wipe the
+        // User photo first (the C++ drop path).
+        let answer_user_with_photo = |photo_id: i64| {
+            telegram_api::User::user(telegram_api::user {
+                flags: USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 5) | (1 << 20),
+                access_hash: 123,
+                id: 7,
+                first_name: "Alice".to_owned(),
+                photo: Some(telegram_api::UserProfilePhoto::userProfilePhoto(
+                    telegram_api::userProfilePhoto {
+                        flags: 0,
+                        photo_id,
+                        dc_id: 2,
+                        ..telegram_api::userProfilePhoto::default()
+                    },
+                )),
+                ..telegram_api::user::default()
+            })
+        };
+        let (promise, result) = promise_result();
+        um.on_set_profile_photo(
+            &mut temp.env(false),
+            my_id,
+            telegram_api::photos_Photo {
+                photo: Some(telegram_photo(34)),
+                users: vec![answer_user_with_photo(31)],
+            },
+            false,
+            0,
+            promise,
+        );
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        let user_photos = &um.user_photos[&7];
+        assert_eq!(user_photos.count, 2);
+        assert_eq!(user_photos.photos[0].id, 34);
+        // the User photo change dropped the full photos (the C++
+        // `do_update_user_photo` mismatch drop, cpp:4065-4069) — the
+        // full slot re-syncs on the next full load
+        assert!(um.users_full[&7].photo.is_empty());
+        assert!(um.users.get(&7).unwrap().photo_ids.contains(&34));
+
+        // the fallback arm reaches the full-slot apply (the User-photo
+        // arm is skipped for fallbacks — no drop precedes it)
+        um.on_get_user_full(
+            &mut temp.env(false),
+            telegram_api::UserFull {
+                id: 7,
+                flags: 1 << 2, // profile_photo present
+                profile_photo: Some(telegram_photo(31)),
+                ..telegram_api::UserFull::default()
+            },
+        );
+        let answer_user_with_photo = |photo_id: i64| {
+            telegram_api::User::user(telegram_api::user {
+                flags: USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 5) | (1 << 20),
+                access_hash: 123,
+                id: 7,
+                first_name: "Alice".to_owned(),
+                photo: Some(telegram_api::UserProfilePhoto::userProfilePhoto(
+                    telegram_api::userProfilePhoto {
+                        flags: 0,
+                        photo_id,
+                        dc_id: 2,
+                        ..telegram_api::userProfilePhoto::default()
+                    },
+                )),
+                ..telegram_api::user::default()
+            })
+        };
+        let (promise, result) = promise_result();
+        um.on_set_profile_photo(
+            &mut temp.env(false),
+            my_id,
+            telegram_api::photos_Photo {
+                photo: Some(telegram_photo(35)),
+                users: vec![answer_user_with_photo(31)],
+            },
+            true, // is_fallback
+            0,
+            promise,
+        );
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert_eq!(um.users_full[&7].fallback_photo.id, 35);
+        assert_eq!(um.users_full[&7].photo.id, 31);
+        assert!(um.my_photo_file_id.contains_key(&35));
+
+        // the answer without the user rides the re-get (the merger is
+        // unwired without the scheduler — the net-inert band)
+        let (promise, result) = promise_result();
+        um.on_set_profile_photo(
+            &mut temp.env(false),
+            my_id,
+            telegram_api::photos_Photo {
+                photo: Some(telegram_photo(35)),
+                users: Vec::new(),
+            },
+            false,
+            0,
+            promise,
+        );
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Request aborted")
+        );
+    }
+
+    #[test]
+    fn delete_my_profile_photo_from_cache_runs_the_list_bands() {
+        let (mut temp, mut um) = test_env();
+        let my_id = UserId::new(7);
+        um.set_my_id(&mut temp.env(false), my_id);
+        seed_received_user(&mut temp, &mut um, 7);
+        um.take_updates();
+
+        // the 0/-2 ids never touch the caches
+        assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 0));
+        assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), -2));
+
+        // a known photo with an unknown cache id decrements the count
+        // (the offset-0 partial window, cpp:6300-6305)
+        um.user_photos.insert(
+            7,
+            UserPhotos {
+                photos: vec![photo_with_id(31)],
+                count: 2,
+                offset: 0,
+            },
+        );
+        assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 99));
+        let user_photos = &um.user_photos[&7];
+        assert_eq!((user_photos.count, user_photos.photos.len()), (1, 1));
+
+        // the main photo delete empties the User photo and answers the
+        // re-get flag only when photos remain unknown (cpp:6345-6360) —
+        // here the cache drains to the known-empty state
+        um.user_photos.get_mut(&7).unwrap().count = 1;
+        let need_reget = um.delete_my_profile_photo_from_cache(&mut temp.env(false), 31);
+        assert!(!need_reget);
+        let user_photos = &um.user_photos[&7];
+        assert_eq!(
+            (
+                user_photos.count,
+                user_photos.offset,
+                user_photos.photos.len()
+            ),
+            (0, 0, 0)
+        );
+
+        // the main photo delete with a non-empty remainder answers the
+        // re-get flag (the count stays above the window)
+        um.user_photos.insert(
+            7,
+            UserPhotos {
+                photos: vec![photo_with_id(41)],
+                count: 3,
+                offset: 1,
+            },
+        );
+        um.users.get_mut(&7).unwrap().photo = as_profile_photo(&photo_with_id(41), false);
+        let need_reget = um.delete_my_profile_photo_from_cache(&mut temp.env(false), 41);
+        assert!(need_reget);
+        let user_photos = &um.user_photos[&7];
+        assert_eq!(user_photos.count, 2);
+
+        // an unknown id with the full window known drops the photos
+        // cache entirely (cpp:6306-6310)
+        um.user_photos.insert(
+            7,
+            UserPhotos {
+                photos: vec![photo_with_id(51)],
+                count: 1,
+                offset: 0,
+            },
+        );
+        assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 99));
+        let user_photos = &um.user_photos[&7];
+        assert_eq!(
+            (
+                user_photos.count,
+                user_photos.offset,
+                user_photos.photos.len()
+            ),
+            (-1, -1, 0)
+        );
+    }
+
+    #[test]
+    fn on_delete_profile_photo_answers_the_reget_ladder() {
+        let (mut temp, mut um) = test_env();
+        let my_id = UserId::new(7);
+        um.set_my_id(&mut temp.env(false), my_id);
+        seed_received_user(&mut temp, &mut um, 7);
+        um.take_updates();
+
+        // the known-empty cache completes the promise (cpp:6431-6438)
+        um.user_photos.insert(
+            7,
+            UserPhotos {
+                photos: vec![photo_with_id(31)],
+                count: 1,
+                offset: 0,
+            },
+        );
+        let (promise, result) = promise_result();
+        um.on_delete_profile_photo(&mut temp.env(false), 31, promise);
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // the unknown-remainder state rides the reload (the merger is
+        // unwired without the scheduler — the net-inert band)
+        um.user_photos.insert(
+            7,
+            UserPhotos {
+                photos: vec![photo_with_id(41)],
+                count: 3,
+                offset: 1,
+            },
+        );
+        um.users.get_mut(&7).unwrap().photo = as_profile_photo(&photo_with_id(41), false);
+        let (promise, result) = promise_result();
+        um.on_delete_profile_photo(&mut temp.env(false), 41, promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.message() == "Request aborted")
+        );
     }
 
     #[test]
