@@ -7956,7 +7956,8 @@ impl Td {
         if let crate::user_manager::UserNetKind::GetUserSavedMusicById { user_id } = kind {
             // `GetUserSavedMusicByIdQuery::on_result`/`on_error`
             // (cpp:1688-1716) — the constructor gate, the document
-            // intake loop and the query-carried promise (§5)
+            // intake loop, then the carried promise (the C++ query
+            // carrier; ours pops the family queue, §5)
             let result = if query.is_error() {
                 Err(query.error().clone())
             } else {
@@ -34315,7 +34316,8 @@ mod tests {
     // setProfileAudioPosition / removeProfileAudio / getUserProfileAudios
     // / isProfileAudio request arms) and the by-id reload (the
     // Files-plane repair caller) rides the manager seam with the
-    // query-carried promise restored (the §5 fidelity item). ----
+    // carried promise restored (the C++ query carrier; ours is the §5
+    // FIFO shape). ----
 
     /// One wire audio document (the `users_savedMusic` answer member).
     fn wire_audio_document(id: i64, access_hash: i64) -> telegram_api::Document {
@@ -34643,8 +34645,8 @@ mod tests {
 
         // 10. reload_user_saved_music — the manager seam (the caller is
         //     the FileReferenceManager repair leg), users.getSavedMusicByID
-        //     with the one-element document vector, and the caller promise
-        //     is query-carried (the §5 fidelity item).
+        //     with the one-element document vector, and the caller
+        //     promise completes from the answer (the §5 item).
         let (promise, slot) = record_ton_unit();
         with_user_manager(&mut td, |manager, env| {
             manager.reload_user_saved_music(
@@ -34679,7 +34681,7 @@ mod tests {
                 &*slot.lock().unwrap(),
                 Some(tdutils::status::Result::Ok(()))
             ),
-            "the query-carried promise completes"
+            "the carried promise completes"
         );
 
         // 11. the by-id band — the wrong constructor and the query error

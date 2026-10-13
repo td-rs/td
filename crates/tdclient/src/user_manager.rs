@@ -1946,8 +1946,9 @@ pub(crate) enum UserNetKind {
         limit: i32,
     },
     /// `GetUserSavedMusicByIdQuery` (cpp:1672) — the kind carries the
-    /// owner user for the document intake; the caller promise is
-    /// query-carried (the §5 fidelity item restored with net-drain 09).
+    /// owner user for the document intake; the caller promise rides the
+    /// family queue (the C++ carries it on the query — the §5 item
+    /// restored with net-drain 09).
     GetUserSavedMusicById { user_id: UserId },
     /// `GetSavedMusicIdsQuery` (cpp:1720) — no members; the answer
     /// rides the `reload_my_saved_music_queries` family queue.
@@ -2160,8 +2161,8 @@ pub struct UserManager {
     /// The `UnsaveMusicQuery` promises (UserManager.cpp:1598).
     pending_remove_saved_music_queries: Vec<Promise<()>>,
     /// The `GetUserSavedMusicByIdQuery` promises (UserManager.cpp:1674)
-    /// — query-carried in the C++, restored here (the §5 fidelity
-    /// item).
+    /// — the C++ carries the promise on the query; ours rides this
+    /// FIFO queue (the §5 pairing shape).
     pending_reload_saved_music_by_id_queries: Vec<Promise<()>>,
     /// `pending_user_photos_` (UserManager.h:1262) — the bot
     /// without-chat-info-database photo hold.
@@ -9145,7 +9146,7 @@ impl UserManager {
     }
 
     /// The FIFO pop behind the `GetUserSavedMusicById` answer — the
-    /// query-carried promise (§5).
+    /// caller promise (the C++ query-carried one, §5).
     pub(crate) fn take_reload_saved_music_by_id_query_promise(&mut self) -> Option<Promise<()>> {
         if self.pending_reload_saved_music_by_id_queries.is_empty() {
             None
@@ -10488,8 +10489,9 @@ impl UserManager {
     /// `UserManager::reload_user_saved_music`
     /// (UserManager.cpp:7659-7666) — the `users.getSavedMusicByID` send
     /// (the C++ `GetUserSavedMusicByIdQuery`, cpp:1672) rides the `net`
-    /// handle (net-drain 09); the caller promise is query-carried (§5).
-    /// The caller is the FileReferenceManager repair leg (Files plane).
+    /// handle (net-drain 09); the caller promise parks in the by-id
+    /// family queue until the answer (the C++ query carrier, §5). The
+    /// caller is the FileReferenceManager repair leg (Files plane).
     pub fn reload_user_saved_music(
         &mut self,
         env: &mut UserEnv,
