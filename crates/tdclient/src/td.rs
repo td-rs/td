@@ -34734,6 +34734,38 @@ mod tests {
             tdutils::status::Result::Ok(()) => panic!("the carried promise fails"),
         }
 
+        // 12. the unsave error band — the Err arm of case 6's family
+        //     (UnsaveMusicQuery::on_error, cpp:1613-1628): the plain
+        //     error fails the promise (the file-reference repair leg
+        //     rides the Files plane).
+        td.request(
+            12,
+            Function::removeProfileAudio(td_api::removeProfileAudio {
+                file_id: file_id.get(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_saveMusic::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::account_saveMusic(payload) => {
+                assert!(payload.unsave, "the unsave form");
+                match payload.id {
+                    Some(telegram_api::InputDocument::inputDocument(document)) => {
+                        assert_eq!(document.id, 202);
+                    }
+                    other => panic!("the document: {other:?}"),
+                }
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_fail(sent, 420, "FLOOD_WAIT_4");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_4"));
+
         assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
 
