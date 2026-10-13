@@ -298,6 +298,14 @@ impl StickerPhotoSize {
         let Some(sticker) = sticker else {
             return Err(Status::error(400, "Sticker must not be null"));
         };
+        // the C++ null checks all run before the have-reads
+        // (StickerPhotoSize.cpp:16-22)
+        if sticker.r#type.is_none() {
+            return Err(Status::error(400, "Type must be non-null"));
+        }
+        if sticker.background_fill.is_none() {
+            return Err(Status::error(400, "Background must be non-null"));
+        }
         let mut result = StickerPhotoSize::default();
         match sticker.r#type.as_ref() {
             Some(td_api::ChatPhotoStickerType::chatPhotoStickerTypeRegularOrMask(type_)) => {
@@ -315,10 +323,10 @@ impl StickerPhotoSize {
                     return Err(Status::error(400, "Custom emoji not found"));
                 }
             }
-            None => return Err(Status::error(400, "Type must be non-null")),
+            None => unreachable!("the null-type band answered above"),
         }
         let Some(fill) = sticker.background_fill.as_ref() else {
-            return Err(Status::error(400, "Background must be non-null"));
+            unreachable!("the null-fill band answered above")
         };
         match fill {
             td_api::BackgroundFill::backgroundFillSolid(solid) => {
@@ -2120,6 +2128,29 @@ mod tests {
                 .unwrap_err()
                 .message(),
             "Sticker must not be null"
+        );
+        // the null checks all run before the have-reads — a missing
+        // sticker AND a null fill answers the fill band
+        // (StickerPhotoSize.cpp:16-22)
+        assert_eq!(
+            StickerPhotoSize::get_sticker_photo_size_td_api(
+                Some(&sticker(
+                    Some(
+                        td_api::ChatPhotoStickerType::chatPhotoStickerTypeRegularOrMask(
+                            td_api::chatPhotoStickerTypeRegularOrMask {
+                                sticker_set_id: 5,
+                                sticker_id: 6,
+                            },
+                        )
+                    ),
+                    None,
+                )),
+                |_, _| false,
+                |_| false,
+            )
+            .unwrap_err()
+            .message(),
+            "Background must be non-null"
         );
         assert_eq!(
             StickerPhotoSize::get_sticker_photo_size_td_api(

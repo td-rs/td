@@ -112,6 +112,21 @@ macro_rules! user_env {
     };
 }
 
+/// The td-plane pair of the profile-photo arms — expanded at the call
+/// site so the field borrows stay disjoint (the `user_env!` shape; the
+/// guards and the callback clone are the caller's locals).
+macro_rules! set_profile_photo_td {
+    ($td:ident, $env:ident, $files:ident, $fllm:ident, $callback:ident) => {
+        crate::user_manager::SetProfilePhotoTd {
+            env: &$env,
+            files: &mut $files,
+            fllm: &mut $fllm,
+            upload_callback: &$callback,
+            stickers: &$td.stickers_manager,
+        }
+    };
+}
+
 /// `Requests::run_request` — the C++ `downcast_call` dispatch.
 pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
     match function {
@@ -3985,13 +4000,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let mut fllm = td.file_load_manager.lock();
             let upload_callback = td.profile_photo_upload_callback.clone();
             td.user_manager.set_profile_photo(
-                crate::user_manager::SetProfilePhotoTd {
-                    env: &env,
-                    files: &mut files,
-                    fllm: &mut fllm,
-                    upload_callback: &upload_callback,
-                    stickers: &td.stickers_manager,
-                },
+                set_profile_photo_td!(td, env, files, fllm, upload_callback),
                 request.photo.as_ref(),
                 request.is_public,
                 promise,
@@ -4135,13 +4144,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let mut fllm = td.file_load_manager.lock();
             let upload_callback = td.profile_photo_upload_callback.clone();
             td.user_manager.set_user_profile_photo(
-                crate::user_manager::SetProfilePhotoTd {
-                    env: &env,
-                    files: &mut files,
-                    fllm: &mut fllm,
-                    upload_callback: &upload_callback,
-                    stickers: &td.stickers_manager,
-                },
+                set_profile_photo_td!(td, env, files, fllm, upload_callback),
                 UserId::new(request.user_id),
                 request.photo.as_ref(),
                 false,
@@ -4159,13 +4162,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let mut fllm = td.file_load_manager.lock();
             let upload_callback = td.profile_photo_upload_callback.clone();
             td.user_manager.set_user_profile_photo(
-                crate::user_manager::SetProfilePhotoTd {
-                    env: &env,
-                    files: &mut files,
-                    fllm: &mut fllm,
-                    upload_callback: &upload_callback,
-                    stickers: &td.stickers_manager,
-                },
+                set_profile_photo_td!(td, env, files, fllm, upload_callback),
                 UserId::new(request.user_id),
                 request.photo.as_ref(),
                 true,
@@ -4191,6 +4188,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     fllm: &mut fllm,
                     upload_callback: &upload_callback,
                     audios: &mut td.audios_manager,
+                    close_flag: td.global.close_flag(),
                 },
                 request.audio,
                 promise,
@@ -4420,13 +4418,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     let mut fllm = td.file_load_manager.lock();
                     let upload_callback = td.profile_photo_upload_callback.clone();
                     td.user_manager.set_profile_photo_impl(
-                        crate::user_manager::SetProfilePhotoTd {
-                            env: &env,
-                            files: &mut files,
-                            fllm: &mut fllm,
-                            upload_callback: &upload_callback,
-                            stickers: &td.stickers_manager,
-                        },
+                        set_profile_photo_td!(td, env, files, fllm, upload_callback),
                         user_id,
                         Some(input_photo),
                         request.is_public,

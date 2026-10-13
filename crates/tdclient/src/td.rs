@@ -7972,12 +7972,30 @@ impl Td {
         fn parse_error(what: &str) -> Status {
             Status::error(500, &format!("Failed to parse the {what} answer"))
         }
+        /// The `on_uploaded_saved_music_file` 400 bands — the partial
+        /// remote drops before the parked promise fails
+        /// (cpp:7288-7305).
+        fn fail_uploaded_saved_music(
+            td: &Td,
+            user_manager: &mut crate::user_manager::UserManager,
+            file_upload_id: crate::files::FileUploadId,
+            message: &str,
+        ) {
+            {
+                let mut files = td.file_manager.lock();
+                let mut fllm = td.file_load_manager.lock();
+                files.delete_partial_remote_location(file_upload_id, &mut fllm);
+            }
+            if let Some(mut promise) = user_manager.take_upload_saved_music_query_promise() {
+                promise.set_error(Status::error(400, message));
+            }
+        }
         let mut user_manager = std::mem::take(&mut self.user_manager);
-        // The saved-music by-id arm touches only the documents plane (the
-        // C++ on_result loop, cpp:1693-1708) — no UserEnv reads, so it
-        // runs before the env borrow below. Same for the upload arm
-        // (the documents intake + the files legs + the add_saved_music
-        // refire, cpp:505-527 + 7284-7316).
+        // Two arms touch only the documents/files planes (no UserEnv
+        // reads), so they run before the env borrow below: the
+        // saved-music upload arm (the documents intake + the files legs
+        // + the add_saved_music refire, cpp:505-527 + 7284-7316) and
+        // the by-id reload (the C++ on_result loop, cpp:1693-1708).
         if let crate::user_manager::UserNetKind::UploadSavedMusicFile {
             file_upload_id,
             is_url,
@@ -8001,37 +8019,23 @@ impl Td {
                 Ok(telegram_api::MessageMedia::messageMediaDocument(media)) => {
                     let Some(document) = media.document else {
                         // the C++ `document_` null is the parse-failure band
-                        let mut files = self.file_manager.lock();
-                        let mut fllm = self.file_load_manager.lock();
-                        files.delete_partial_remote_location(file_upload_id, &mut fllm);
-                        drop(files);
-                        drop(fllm);
-                        if let Some(mut promise) =
-                            user_manager.take_upload_saved_music_query_promise()
-                        {
-                            promise.set_error(Status::error(
-                                400,
-                                "Can't upload profile audio file: wrong file type",
-                            ));
-                        }
+                        fail_uploaded_saved_music(
+                            self,
+                            &mut user_manager,
+                            file_upload_id,
+                            "Can't upload profile audio file: wrong file type",
+                        );
                         self.user_manager = user_manager;
                         return;
                     };
                     match document {
                         telegram_api::Document::documentEmpty(_) => {
-                            let mut files = self.file_manager.lock();
-                            let mut fllm = self.file_load_manager.lock();
-                            files.delete_partial_remote_location(file_upload_id, &mut fllm);
-                            drop(files);
-                            drop(fllm);
-                            if let Some(mut promise) =
-                                user_manager.take_upload_saved_music_query_promise()
-                            {
-                                promise.set_error(Status::error(
-                                    400,
-                                    "Can't upload profile audio file: empty file",
-                                ));
-                            }
+                            fail_uploaded_saved_music(
+                                self,
+                                &mut user_manager,
+                                file_upload_id,
+                                "Can't upload profile audio file: empty file",
+                            );
                         }
                         telegram_api::Document::document(document) => {
                             let document_id = document.id;
@@ -8049,16 +8053,12 @@ impl Td {
                                 crate::documents_manager::Subtype::Other,
                             );
                             if parsed.type_ != crate::document::DocumentType::Audio {
-                                let mut files = self.file_manager.lock();
-                                let mut fllm = self.file_load_manager.lock();
-                                files.delete_partial_remote_location(file_upload_id, &mut fllm);
-                                drop(files);
-                                drop(fllm);
-                                if let Some(mut promise) =
-                                    user_manager.take_upload_saved_music_query_promise()
-                                {
-                                    promise.set_error(Status::error(400, "Wrong file type"));
-                                }
+                                fail_uploaded_saved_music(
+                                    self,
+                                    &mut user_manager,
+                                    file_upload_id,
+                                    "Wrong file type",
+                                );
                                 self.user_manager = user_manager;
                                 return;
                             }
@@ -8098,18 +8098,12 @@ impl Td {
                 }
                 Ok(_) => {
                     // `media->get_id() != messageMediaDocument::ID`
-                    let mut files = self.file_manager.lock();
-                    let mut fllm = self.file_load_manager.lock();
-                    files.delete_partial_remote_location(file_upload_id, &mut fllm);
-                    drop(files);
-                    drop(fllm);
-                    if let Some(mut promise) = user_manager.take_upload_saved_music_query_promise()
-                    {
-                        promise.set_error(Status::error(
-                            400,
-                            "Can't upload profile audio file: wrong file type",
-                        ));
-                    }
+                    fail_uploaded_saved_music(
+                        self,
+                        &mut user_manager,
+                        file_upload_id,
+                        "Can't upload profile audio file: wrong file type",
+                    );
                 }
                 Err(status) => {
                     // `UploadSavedMusicFileQuery::on_error` (cpp:513-526)
@@ -8130,9 +8124,7 @@ impl Td {
                             // TODO on_upload_saved_music_file_parts_missing
                             // (the C++ carries the same TODO)
                         }
-                    } else if status.code() == 400
-                        && status.message().starts_with("FILE_REFERENCE_")
-                    {
+                    } else if crate::files::is_file_reference_error(&status) {
                         // `FileReferenceManager::is_file_reference_error`
                         tdutils::log_error!(
                             "Receive file reference error for UploadStickerFileQuery"
@@ -8565,19 +8557,25 @@ impl Td {
                 };
                 match result {
                     Ok(photo) => {
-                        let promise = user_manager.take_upload_profile_photo_query_promise();
+                        // the C++ always runs the `on_set_profile_photo`
+                        // intake (cpp:622-630) — the promise rides the
+                        // query, so an empty family queue (the §5 FIFO
+                        // mispairing case) runs the intake over a no-op
+                        // promise instead of skipping it
+                        let promise = user_manager
+                            .take_upload_profile_photo_query_promise()
+                            .unwrap_or_default();
                         if !only_suggest {
-                            if let Some(promise) = promise {
-                                user_manager.on_set_profile_photo(
-                                    &mut env,
-                                    user_id,
-                                    photo,
-                                    is_fallback,
-                                    0,
-                                    promise,
-                                );
-                            }
-                        } else if let Some(mut promise) = promise {
+                            user_manager.on_set_profile_photo(
+                                &mut env,
+                                user_id,
+                                photo,
+                                is_fallback,
+                                0,
+                                promise,
+                            );
+                        } else {
+                            let mut promise = promise;
                             promise.set_value(());
                         }
                         if file_upload_id.is_valid() {
@@ -12492,6 +12490,7 @@ impl Td {
                 let mut files = self.file_manager.lock();
                 let mut fllm = self.file_load_manager.lock();
                 user_manager.do_upload_saved_music(
+                    self.global.close_flag(),
                     &mut files,
                     &mut fllm,
                     file_upload_id,

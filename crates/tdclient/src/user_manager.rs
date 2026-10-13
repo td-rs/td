@@ -2219,12 +2219,14 @@ pub struct SetProfilePhotoTd<'a> {
 /// The td-plane pair the saved-music upload flow reads — the C++
 /// `td_->file_manager_`/`td_->audios_manager_` reach of
 /// `add_new_saved_music` (`upload_saved_music_callback_` is the
-/// Td-side outbox bridge).
+/// Td-side outbox bridge; `close_flag` is the `G()->close_status()`
+/// read of the `do_upload_saved_music` gate).
 pub struct SavedMusicUploadTd<'a> {
     pub files: &'a mut crate::files::FileManager,
     pub fllm: &'a mut crate::files::FileLoadManager,
     pub upload_callback: &'a std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
     pub audios: &'a mut crate::audios_manager::AudiosManager,
+    pub close_flag: bool,
 }
 
 /// `td::UserManager` — the in-process manager (the C++ actor collapses
@@ -8709,6 +8711,7 @@ impl UserManager {
             fllm,
             upload_callback,
             audios,
+            close_flag,
         } = td;
         let Some(input_audio) = input_audio else {
             return promise.set_error(Status::error(400, "Audio must be non-empty"));
@@ -8776,7 +8779,15 @@ impl UserManager {
             let input_media = audios
                 .get_input_media_with_files(files, file_id, None, None)
                 .expect("CHECK(input_media != nullptr)");
-            self.do_upload_saved_music(files, fllm, file_upload_id, false, input_media, promise);
+            self.do_upload_saved_music(
+                close_flag,
+                files,
+                fllm,
+                file_upload_id,
+                false,
+                input_media,
+                promise,
+            );
         } else {
             self.upload_saved_music(files, fllm, upload_callback, file_id, promise);
         }
@@ -8832,12 +8843,10 @@ impl UserManager {
     ) {
         tdutils::log_warning!("Profile audio {file_upload_id:?} has upload error {status}");
         debug_assert!(status.is_error(), "CHECK(status.is_error())");
-        let Some(mut promise) = self
+        let mut promise = self
             .being_uploaded_saved_music_files
             .remove(&file_upload_id)
-        else {
-            return;
-        };
+            .expect("the callback fires for a registered upload");
         promise.set_error(if status.code() > 0 {
             status
         } else {
@@ -8849,16 +8858,23 @@ impl UserManager {
     /// — the `messages.uploadMedia` send over the audios input media
     /// (`CHECK(input_media != nullptr)` is the caller's expect).
     /// `had_input_file` is the url-vs-upload split (`is_url_ =
-    /// !had_input_file`).
+    /// !had_input_file`). The `close_flag` is the
+    /// `TRY_STATUS_PROMISE(promise, G()->close_status())` gate
+    /// (cpp:7264).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn do_upload_saved_music(
         &mut self,
+        close_flag: bool,
         files: &mut crate::files::FileManager,
         fllm: &mut crate::files::FileLoadManager,
         file_upload_id: FileUploadId,
         had_input_file: bool,
         input_media: telegram_api::InputMedia,
-        promise: Promise<()>,
+        mut promise: Promise<()>,
     ) {
+        if close_flag {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
         let was_uploaded = crate::files::extract_was_uploaded(&input_media);
         if had_input_file && !was_uploaded {
             // if we had InputFile, but has failed to use it for
@@ -9055,6 +9071,8 @@ impl UserManager {
                     };
                 self.send_upload_profile_photo_query_sticker(
                     env,
+                    files,
+                    fllm,
                     user_id,
                     stickers,
                     sticker_photo_size,
@@ -9352,6 +9370,8 @@ impl UserManager {
         };
         self.send_upload_profile_photo_query(
             env,
+            files,
+            fllm,
             user_id,
             file_upload_id,
             input_file,
@@ -9386,10 +9406,14 @@ impl UserManager {
     /// `UploadProfilePhotoQuery::send` — the file form (cpp:539-584):
     /// the own-photo ladder picks `photos.uploadProfilePhoto` over
     /// `photos.uploadContactProfilePhoto` (the personal/suggest save).
+    /// The `files`/`fllm` pair serves the handler's `on_error` tail
+    /// (cpp:628-633) on the `get_input_user` failure.
     #[allow(clippy::too_many_arguments)]
     fn send_upload_profile_photo_query(
         &mut self,
         env: &UserEnv,
+        files: &mut crate::files::FileManager,
+        fllm: &mut crate::files::FileLoadManager,
         user_id: UserId,
         file_upload_id: FileUploadId,
         input_file: telegram_api::InputFile,
@@ -9426,7 +9450,14 @@ impl UserManager {
         let input_user = if !is_me {
             match self.get_input_user(env, user_id) {
                 Ok(input_user) => Some(input_user),
-                Err(error) => return promise.set_error(error),
+                Err(error) => {
+                    // the handler's `on_error` tail (cpp:628-633): the
+                    // partial remote drops before the promise fails
+                    if file_upload_id.is_valid() {
+                        files.delete_partial_remote_location(file_upload_id, fllm);
+                    }
+                    return promise.set_error(error);
+                }
             }
         } else {
             None
@@ -9491,11 +9522,15 @@ impl UserManager {
 
     /// `UploadProfilePhotoQuery::send` — the sticker form (cpp:586-611):
     /// the `VIDEO_EMOJI_MARKUP` flag pair over the resolved
-    /// `StickerPhotoSize`.
+    /// `StickerPhotoSize`. The `files`/`fllm` pair serves the
+    /// `on_error` tail (the upload id is invalid on this form, so the
+    /// drop is the no-op the C++ `is_valid` gate makes it).
     #[allow(clippy::too_many_arguments)]
     fn send_upload_profile_photo_query_sticker(
         &mut self,
         env: &UserEnv,
+        files: &mut crate::files::FileManager,
+        fllm: &mut crate::files::FileLoadManager,
         user_id: UserId,
         stickers: &crate::stickers_manager::StickersManager,
         sticker_photo_size: crate::photo::StickerPhotoSize,
@@ -9513,7 +9548,13 @@ impl UserManager {
         let input_user = if !is_me {
             match self.get_input_user(env, user_id) {
                 Ok(input_user) => Some(input_user),
-                Err(error) => return promise.set_error(error),
+                Err(error) => {
+                    // the handler's `on_error` tail (cpp:628-633)
+                    if file_upload_id.is_valid() {
+                        files.delete_partial_remote_location(file_upload_id, fllm);
+                    }
+                    return promise.set_error(error);
+                }
             }
         } else {
             None
@@ -20316,6 +20357,7 @@ mod tests {
                 fllm: &mut fllm,
                 upload_callback: &upload_callback,
                 audios: &mut audios,
+                close_flag: false,
             },
             None,
             promise,
@@ -20337,6 +20379,7 @@ mod tests {
                 fllm: &mut fllm,
                 upload_callback: &upload_callback,
                 audios: &mut audios,
+                close_flag: false,
             },
             Some(td_api::InputAudio {
                 audio: None,

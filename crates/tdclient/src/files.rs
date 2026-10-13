@@ -15696,6 +15696,12 @@ pub fn extract_was_uploaded(input_media: &telegram_api::InputMedia) -> bool {
     )
 }
 
+/// `FileReferenceManager::is_file_reference_error`
+/// (FileReferenceManager.cpp:60-62).
+pub fn is_file_reference_error(status: &Status) -> bool {
+    status.is_error() && status.code() == 400 && status.message().starts_with("FILE_REFERENCE_")
+}
+
 /// `FileManager::get_missing_file_parts` (FileManager.cpp:1435-1449) —
 /// the `FILE_PART_*` error parse.
 pub fn get_missing_file_parts(error: &Status) -> Vec<i32> {
@@ -21436,35 +21442,41 @@ impl FileManager {
                 .expect("node")
                 .set_upload_pause(FileUploadId::default());
         }
-        if self.file_nodes[node_id]
+        // the C++ `SCOPE_EXIT try_flush_node` runs on every exit past
+        // the node lookup (FileManager.cpp:3575-3578) — the result ladder
+        // below funnels into the tail flush
+        let result = if self.file_nodes[node_id]
             .as_ref()
             .expect("node")
             .remote
             .is_full_alive
         {
             tdutils::log_info!("Upload isn't needed for {file_upload_id:?}");
-            return true;
-        }
-        self.file_nodes[node_id]
-            .as_mut()
-            .expect("node")
-            .delete_partial_remote_location();
-        if let Some(callback) = self.extract_upload_callback(file_upload_id) {
-            callback
-                .lock()
-                .on_upload_error(file_upload_id, Status::error(200, "Canceled"));
-        }
-        if !matches!(
-            self.file_nodes[node_id].as_ref().expect("node").local,
-            LocalFileLocation::Full(_)
-        ) {
-            tdutils::log_info!("Need full local location to upload {file_upload_id:?}");
-            return false;
-        }
-        self.check_upload_local_location(node_id);
-        self.run_upload(node_id, Vec::new(), fllm);
+            true
+        } else {
+            self.file_nodes[node_id]
+                .as_mut()
+                .expect("node")
+                .delete_partial_remote_location();
+            if let Some(callback) = self.extract_upload_callback(file_upload_id) {
+                callback
+                    .lock()
+                    .on_upload_error(file_upload_id, Status::error(200, "Canceled"));
+            }
+            if !matches!(
+                self.file_nodes[node_id].as_ref().expect("node").local,
+                LocalFileLocation::Full(_)
+            ) {
+                tdutils::log_info!("Need full local location to upload {file_upload_id:?}");
+                false
+            } else {
+                self.check_upload_local_location(node_id);
+                self.run_upload(node_id, Vec::new(), fllm);
+                true
+            }
+        };
         self.try_flush_node(node_id);
-        true
+        result
     }
 
     /// `FileManager::delete_partial_remote_location_if_needed`
