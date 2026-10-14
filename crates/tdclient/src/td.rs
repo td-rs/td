@@ -9209,6 +9209,39 @@ impl Td {
                     }
                 }
             }
+            crate::user_manager::UserNetKind::UpdateColor {
+                for_profile,
+                accent_color_id,
+                background_custom_emoji_id,
+            } => {
+                // `UpdateColorQuery::on_result`/`on_error`
+                // (UserManager.cpp:920-931) — the Bool answer runs the
+                // local-user color apply, then flushes the promise; the
+                // error band forwards.
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .ok_or_else(|| parse_error("account_updateColor"))
+                };
+                if let Some(mut promise) = user_manager.take_update_color_query() {
+                    match result {
+                        Ok(_) => {
+                            // the C++ reads the Bool but never checks it
+                            // (UserManager.cpp:924-929) — the local apply
+                            // runs for both values
+                            user_manager.on_update_accent_color_success(
+                                &mut env,
+                                for_profile,
+                                accent_color_id,
+                                background_custom_emoji_id,
+                            );
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
         }
         self.user_manager = user_manager;
         if let Some((updates, promise)) = pending_updates {
@@ -10012,6 +10045,469 @@ impl Td {
                     return;
                 };
                 self.check_username_answer_tail(query, channel_id, promise);
+            }
+            // `GetDialogUnreadMarksQuery` (DialogManager.cpp:450-470) —
+            // the marked-as-unread fan-in over the answer ids, then the
+            // pmc flag set; the error band (and the parse failure, which
+            // routes through the same `on_error`) logs expected errors
+            // and ignores (the retry rides the next load).
+            crate::dialog_manager::DialogNetKind::GetDialogUnreadMarks => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_vector_i64(query.ok())
+                        .map_err(|_| parse_error("messages_getDialogUnreadMarks"))
+                };
+                match result {
+                    Ok(dialog_ids) => {
+                        for dialog_id in dialog_ids {
+                            // messages_manager_->on_update_dialog_is_marked_as_unread
+                            // (MessagesManager.cpp:28714-28734) — the
+                            // saved-messages topic arm of the C++ is not
+                            // reachable (the fetch is dialog-scoped)
+                            self.apply_mm_dialog_marked_as_unread(
+                                crate::messages_manager::DialogId::new(dialog_id),
+                                true,
+                            );
+                        }
+                        self.global.binlog_pmc().set("fetched_marks_as_unread", "1");
+                    }
+                    Err(status) => {
+                        if !self.global.is_expected_error(&status) {
+                            tdutils::log_error!(
+                                "Receive error for GetDialogUnreadMarksQuery: {status}"
+                            );
+                        }
+                        // C++ status.ignore()
+                    }
+                }
+            }
+            // `ReportPeerQuery` (DialogManager.cpp:478-541) — the
+            // ReportResult mapping (reported/chooseOption/addComment);
+            // the MESSAGE_ID_REQUIRED error maps to the messages-required
+            // value, the plain error runs the dialog-error head (the
+            // reload_dialog_action_bar refire rides the MessagesManager
+            // step — documented drop).
+            crate::dialog_manager::DialogNetKind::ReportPeer { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_report_peer_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "MESSAGE_ID_REQUIRED" {
+                        promise.set_value(crate::td_api::Object::reportChatResultMessagesRequired(
+                            crate::td_api::reportChatResultMessagesRequired,
+                        ));
+                        return;
+                    }
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "ReportPeerQuery",
+                    );
+                    promise.set_error(status);
+                } else {
+                    let result = tdmtproto::telegram_api::ReportResult::parse(query.ok())
+                        .map_err(|_| parse_error("messages_report"));
+                    match result {
+                        Ok(tdmtproto::telegram_api::ReportResult::reportResultReported(_)) => {
+                            promise.set_value(crate::td_api::Object::reportChatResultOk(
+                                crate::td_api::reportChatResultOk,
+                            ));
+                        }
+                        Ok(tdmtproto::telegram_api::ReportResult::reportResultChooseOption(
+                            options,
+                        )) => {
+                            if options.options.is_empty() {
+                                promise.set_value(crate::td_api::Object::reportChatResultOk(
+                                    crate::td_api::reportChatResultOk,
+                                ));
+                                return;
+                            }
+                            let report_options = options
+                                .options
+                                .into_iter()
+                                .map(|option| crate::td_api::ReportOption {
+                                    id: option.option,
+                                    text: option.text,
+                                })
+                                .collect();
+                            promise.set_value(
+                                crate::td_api::Object::reportChatResultOptionRequired(
+                                    crate::td_api::reportChatResultOptionRequired {
+                                        title: options.title,
+                                        options: report_options,
+                                    },
+                                ),
+                            );
+                        }
+                        Ok(tdmtproto::telegram_api::ReportResult::reportResultAddComment(
+                            comment,
+                        )) => {
+                            promise.set_value(crate::td_api::Object::reportChatResultTextRequired(
+                                crate::td_api::reportChatResultTextRequired {
+                                    option_id: comment.option,
+                                    is_optional: comment.optional,
+                                },
+                            ));
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `GetBlockedDialogsQuery` (DialogManager.cpp:728-782) — the
+            // users/chats pre-application, then the
+            // `on_get_blocked_dialogs` intake; the error band forwards.
+            crate::dialog_manager::DialogNetKind::GetBlockedDialogs { offset, limit } => {
+                let Some(mut promise) = self.dialog_manager.take_get_blocked_dialogs_promise()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    tdmtproto::telegram_api::contacts_Blocked::parse(query.ok())
+                        .map_err(|_| parse_error("contacts_getBlocked"))
+                };
+                match result {
+                    Ok(tdmtproto::telegram_api::contacts_Blocked::contacts_blocked(blocked)) => {
+                        let total_count = blocked.blocked.len() as i32;
+                        self.apply_blocked_dialogs_answer(
+                            blocked.blocked,
+                            blocked.users,
+                            blocked.chats,
+                            total_count,
+                            offset,
+                            limit,
+                            "GetBlockedDialogsQuery",
+                            promise,
+                        );
+                    }
+                    Ok(tdmtproto::telegram_api::contacts_Blocked::contacts_blockedSlice(slice)) => {
+                        let count = slice.count;
+                        self.apply_blocked_dialogs_answer(
+                            slice.blocked,
+                            slice.users,
+                            slice.chats,
+                            count,
+                            offset,
+                            limit,
+                            "GetBlockedDialogsQuery slice",
+                            promise,
+                        );
+                    }
+                    Err(status) => promise.set_error(status),
+                }
+            }
+            // `UpdatePeerSettingsQuery` (DialogManager.cpp:641-679) — the
+            // empty-peerSettings reset intake (the MessagesManager
+            // `on_get_peer_settings` step — documented drop), then the
+            // ok; the error tail runs the dialog-error head (the
+            // reload_dialog_action_bar refire rides the MessagesManager
+            // step — documented drop).
+            crate::dialog_manager::DialogNetKind::UpdatePeerSettings { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_update_peer_settings_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    tdutils::log_info!("Receive error for update peer settings: {status}");
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "UpdatePeerSettingsQuery",
+                    );
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        // messages_manager_->on_get_peer_settings(dialog_id,
+                        // peerSettings(), true) — the receive plane
+                        // (documented drop); the promise completes
+                        Some(_) => promise.set_value(()),
+                        None => promise.set_error(parse_error("messages_reportSpam")),
+                    }
+                }
+            }
+            // `ReportEncryptedSpamQuery` (DialogManager.cpp:688-722) — the
+            // same ok/error shape over the secret dialog (the
+            // action-bar reload resolves the user from it — the
+            // MessagesManager step, documented drop).
+            crate::dialog_manager::DialogNetKind::ReportEncryptedSpam { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_report_encrypted_spam_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    tdutils::log_info!("Receive error for report encrypted spam: {status}");
+                    crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "ReportEncryptedSpamQuery",
+                    );
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        // messages_manager_->on_get_peer_settings(dialog_id,
+                        // peerSettings(), true) — documented drop
+                        Some(_) => promise.set_value(()),
+                        None => promise.set_error(parse_error("messages_reportEncryptedSpam")),
+                    }
+                }
+            }
+            // `ReorderPinnedDialogsQuery` (DialogManager.cpp:784-817) —
+            // the Bool answer (the false value is the C++ 400); the error
+            // tail logs expected errors and refires
+            // `on_update_pinned_dialogs` (the MessagesManager step —
+            // documented drop).
+            crate::dialog_manager::DialogNetKind::ReorderPinnedDialogs { folder_id } => {
+                let Some(mut promise) = self.dialog_manager.take_reorder_pinned_dialogs_promise()
+                else {
+                    return;
+                };
+                let _ = folder_id;
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !self.global.is_expected_error(&status) {
+                        tdutils::log_error!(
+                            "Receive error for ReorderPinnedDialogsQuery: {status}"
+                        );
+                    }
+                    // messages_manager_->on_update_pinned_dialogs(folder_id)
+                    // — the dialog-list plane (documented drop)
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            promise.set_error(Status::error(400, "Result is false"));
+                        }
+                        None => promise.set_error(parse_error("messages_reorderPinnedDialogs")),
+                    }
+                }
+            }
+            // `ToggleDialogIsBlockedQuery` (DialogManager.cpp:1043-1086)
+            // — the Bool answer band (the false value only warns); the
+            // error tail runs the dialog-error head (the
+            // get_dialog_info_full + reload_dialog_action_bar refires
+            // ride the reload/MessagesManager steps — documented drops).
+            crate::dialog_manager::DialogNetKind::ToggleDialogIsBlocked { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_toggle_dialog_is_blocked_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "ToggleDialogIsBlockedQuery",
+                    ) {
+                        tdutils::log_error!(
+                            "Receive error for ToggleDialogIsBlockedQuery: {status}"
+                        );
+                    }
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(result) => {
+                            if !result {
+                                tdutils::log_warning!("Block/Unblock {dialog_id:?} has failed");
+                            }
+                            promise.set_value(());
+                        }
+                        None => promise.set_error(parse_error("contacts_block")),
+                    }
+                }
+            }
+            // `ToggleDialogUnreadMarkQuery` (DialogManager.cpp:1094-1152)
+            // — the Bool answer (the false value is the C++ 400 through
+            // the SAME on_error tail, so the local mark reverts); the
+            // topic-id gate of the log band mirrors the handler member.
+            crate::dialog_manager::DialogNetKind::ToggleDialogUnreadMark {
+                dialog_id,
+                saved_messages_topic_id,
+                is_marked_as_unread,
+            } => {
+                let Some(mut promise) =
+                    self.dialog_manager.take_toggle_dialog_unread_mark_promise()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        // the C++ false band funnels through on_error
+                        // (cpp:1140-1142), so the revert runs for it too
+                        Some(false) => Err(Status::error(400, "Toggle dialog mark failed")),
+                        None => Err(parse_error("messages_markDialogUnread")),
+                    }
+                };
+                match result {
+                    Ok(()) => promise.set_value(()),
+                    Err(status) => {
+                        if saved_messages_topic_id != 0
+                            || !crate::dialog_manager::on_get_dialog_error(
+                                self,
+                                crate::dialog_id::DialogId::new(dialog_id.get()),
+                                &status,
+                                "ToggleDialogUnreadMarkQuery",
+                            )
+                        {
+                            tdutils::log_error!(
+                                "Receive error for ToggleDialogUnreadMarkQuery: {status}"
+                            );
+                        }
+                        if !self.global.close_flag() {
+                            // messages_manager_->on_update_dialog_is_marked_as_unread(
+                            // dialog_id, !is_marked_as_unread) — the revert
+                            self.apply_mm_dialog_marked_as_unread(dialog_id, !is_marked_as_unread);
+                        }
+                        promise.set_error(status);
+                    }
+                }
+            }
+            // `ToggleDialogPinQuery` (DialogManager.cpp:1161-1202) — the
+            // Bool answer (the false value is the C++ 400); the error
+            // tail runs the dialog-error head (the
+            // `on_update_pinned_dialogs` refires ride the dialog-list
+            // plane — documented drop).
+            crate::dialog_manager::DialogNetKind::ToggleDialogPin { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_toggle_dialog_pin_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "ToggleDialogPinQuery",
+                    ) {
+                        tdutils::log_error!("Receive error for ToggleDialogPinQuery: {status}");
+                    }
+                    // on_update_pinned_dialogs(main/archive) — the
+                    // dialog-list plane (documented drop)
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            promise.set_error(Status::error(400, "Toggle dialog pin failed"));
+                        }
+                        None => promise.set_error(parse_error("messages_toggleDialogPin")),
+                    }
+                }
+            }
+            // `ToggleDialogTranslationsQuery` (DialogManager.cpp:1207-1249)
+            // — the Bool answer (the false value is the C++ 400 through
+            // the SAME on_error tail, so the local flag reverts).
+            crate::dialog_manager::DialogNetKind::ToggleDialogTranslations {
+                dialog_id,
+                is_translatable,
+            } => {
+                let Some(mut promise) = self
+                    .dialog_manager
+                    .take_toggle_dialog_translations_promise()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(()),
+                        // the C++ false band funnels through on_error
+                        // (cpp:1235-1237), so the revert runs for it too
+                        Some(false) => Err(Status::error(400, "Toggle dialog translations failed")),
+                        None => Err(parse_error("messages_togglePeerTranslations")),
+                    }
+                };
+                match result {
+                    Ok(()) => promise.set_value(()),
+                    Err(status) => {
+                        if !crate::dialog_manager::on_get_dialog_error(
+                            self,
+                            crate::dialog_id::DialogId::new(dialog_id.get()),
+                            &status,
+                            "ToggleDialogTranslationsQuery",
+                        ) {
+                            tdutils::log_error!(
+                                "Receive error for ToggleDialogTranslationsQuery: {status}"
+                            );
+                        }
+                        if !self.global.close_flag() {
+                            self.apply_mm_dialog_is_translatable(dialog_id, !is_translatable);
+                        }
+                        promise.set_error(status);
+                    }
+                }
+            }
+            // `ToggleViewForumAsMessagesQuery`
+            // (DialogManager.cpp:1254-1296) — the Updates answer
+            // re-enters `on_get_updates` with the promise; the error
+            // tail reverts the local flag.
+            crate::dialog_manager::DialogNetKind::ToggleViewForumAsMessages {
+                dialog_id,
+                view_as_messages,
+            } => {
+                let Some(mut promise) = self
+                    .dialog_manager
+                    .take_toggle_view_forum_as_messages_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !crate::dialog_manager::on_get_dialog_error(
+                        self,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "ToggleViewForumAsMessagesQuery",
+                    ) {
+                        tdutils::log_error!(
+                            "Receive error for ToggleViewForumAsMessagesQuery: {status}"
+                        );
+                    }
+                    if !self.global.close_flag() {
+                        self.apply_mm_dialog_view_as_messages(dialog_id, !view_as_messages);
+                    }
+                    promise.set_error(status);
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => {
+                            promise.set_error(parse_error("channels_toggleViewForumAsMessages"))
+                        }
+                    }
+                }
+            }
+            // `SetChatThemeQuery` (DialogManager.cpp:995-1036) — the
+            // Updates answer re-enters `on_get_updates` with the
+            // promise; the error tail runs the CHAT_NOT_MODIFIED !bot
+            // value band and the dialog-error head (the
+            // `EditDialogTitleQuery` shape).
+            crate::dialog_manager::DialogNetKind::SetChatTheme { dialog_id } => {
+                let Some(promise) = self.dialog_manager.take_set_chat_theme_promise() else {
+                    return;
+                };
+                self.edit_updates_answer_tail(
+                    query,
+                    crate::dialog_id::DialogId::new(dialog_id.get()),
+                    promise,
+                    "messages_setChatTheme",
+                    "SetChatThemeQuery",
+                );
             }
         }
     }
@@ -15316,8 +15812,32 @@ impl Td {
             return;
         };
         let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
-        if !dialog_id.is_valid() {
+        self.apply_mm_dialog_marked_as_unread(dialog_id, update.unread);
+    }
+
+    /// `MessagesManager::on_update_dialog_is_marked_as_unread`
+    /// (MessagesManager.cpp:28714-28734) — the direct-call form the
+    /// dialog-net tails use (the bot/validity/existence/equality gates,
+    /// then the `set_dialog_is_marked_as_unread` core).
+    fn apply_mm_dialog_marked_as_unread(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_marked_as_unread: bool,
+    ) {
+        if self.auth_manager.is_bot() {
+            // just in case
             return;
+        }
+        if !dialog_id.is_valid() {
+            tdutils::log_error!("Receive marking as unread of invalid {}", dialog_id.get());
+            return;
+        }
+        // get_dialog_force — the in-memory half; the db-load leg is the
+        // dialog-db receive seam
+        match self.messages_manager.get_dialog(dialog_id) {
+            Some(d) if d.is_marked_as_unread != is_marked_as_unread => {}
+            Some(_) => return, // equal — nothing to do
+            None => return,    // nothing to do
         }
         // SAFETY: the alias trio derives from `td_ptr` and the callee uses
         // them strictly one at a time (the split_context_alias contract).
@@ -15332,7 +15852,91 @@ impl Td {
             ctx,
             state,
             dialog_id,
-            update.unread,
+            is_marked_as_unread,
+        );
+    }
+
+    /// `MessagesManager::on_update_dialog_is_translatable`
+    /// (MessagesManager.cpp:28775-28793) — the error-tail revert of the
+    /// translations toggle.
+    fn apply_mm_dialog_is_translatable(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        is_translatable: bool,
+    ) {
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        // SAFETY: the ctx view aliases one Td and is used strictly
+        // sequentially inside the callee (the split_context_alias
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+        crate::messages_manager::on_update_dialog_is_translatable(
+            &mut manager,
+            ctx,
+            dialog_id,
+            is_translatable,
+        );
+        self.messages_manager = manager;
+    }
+
+    /// `MessagesManager::on_update_dialog_view_as_messages`
+    /// (MessagesManager.cpp:28672-28690) — the error-tail revert of the
+    /// view-as-messages toggle.
+    fn apply_mm_dialog_view_as_messages(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        view_as_messages: bool,
+    ) {
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        // SAFETY: the ctx view aliases one Td and is used strictly
+        // sequentially inside the callee (the split_context_alias
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+        crate::messages_manager::on_update_dialog_view_as_messages(
+            &mut manager,
+            ctx,
+            dialog_id,
+            view_as_messages,
+        );
+        self.messages_manager = manager;
+    }
+
+    /// The `GetBlockedDialogsQuery::on_result` pre-application
+    /// (DialogManager.cpp:746-770) — the users/chats intakes, then the
+    /// `on_get_blocked_dialogs` intake with the promise.
+    #[allow(clippy::too_many_arguments)] // the C++ handler passes the same set
+    fn apply_blocked_dialogs_answer(
+        &mut self,
+        blocked: Vec<tdmtproto::telegram_api::PeerBlocked>,
+        users: Vec<tdmtproto::telegram_api::User>,
+        chats: Vec<tdmtproto::telegram_api::Chat>,
+        total_count: i32,
+        offset: i32,
+        limit: i32,
+        source: &str,
+        promise: Promise<crate::td_api::Object>,
+    ) {
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        if let Some(options) = self.option_manager.as_mut() {
+            let mut env = crate::user_manager::UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            user_manager.on_get_users(&mut env, users, source);
+            let mut chat_manager = std::mem::take(&mut self.chat_manager);
+            chat_manager.on_get_chats(&mut user_manager, &mut env, chats, source);
+            self.chat_manager = chat_manager;
+        }
+        self.user_manager = user_manager;
+        crate::dialog_manager::on_get_blocked_dialogs(
+            self,
+            offset,
+            limit,
+            total_count,
+            blocked,
+            promise,
         );
     }
 
@@ -17642,6 +18246,21 @@ fn parse_vector_requirement_to_contact(
         requirements.push(telegram_api::RequirementToContact::read(&mut reader)?);
     }
     Ok(requirements)
+}
+
+/// `Vector<long>` — the `messages_getDialogUnreadMarks` result (the raw
+/// dialog ids).
+fn parse_vector_i64(data: &[u8]) -> Result<Vec<i64>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(reader.i64()?);
+    }
+    Ok(ids)
 }
 /// `Vector<contactStatus>` — the `contacts_getStatuses` result.
 fn parse_vector_contact_status(
@@ -29878,6 +30497,27 @@ impl crate::messages_manager::MmRequestContext for Td {
         );
     }
 
+    fn on_update_user_is_blocked(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+        is_blocked: bool,
+        is_blocked_for_stories: bool,
+    ) {
+        if let Some(options) = self.option_manager.as_mut() {
+            let mut env = crate::user_manager::UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            self.user_manager.on_update_user_is_blocked(
+                &mut env,
+                user_id,
+                is_blocked,
+                is_blocked_for_stories,
+            );
+        }
+    }
+
     fn reaction_manager_get_sorted_available_reactions(
         &mut self,
         available_reactions: crate::chat_reactions::ChatReactions,
@@ -33031,7 +33671,8 @@ mod tests {
         assert!(!resp207.is_empty());
         assert!(matches!(resp207[0], Object::ok(_)));
 
-        // 8. setMessageSenderBlockList: returns ok
+        // 8. setMessageSenderBlockList: the null sender is the C++ 400
+        //    (the arm now runs the set_message_sender_block_list ladder)
         td.request(
             208,
             Function::setMessageSenderBlockList(td_api::setMessageSenderBlockList {
@@ -33039,9 +33680,9 @@ mod tests {
                 block_list: None,
             }),
         );
-        let resp208 = responses_of(&callback, 208);
-        assert!(!resp208.is_empty());
-        assert!(matches!(resp208[0], Object::ok(_)));
+        let err208 = error_of(&callback, 208);
+        assert_eq!(err208.code, 400);
+        assert_eq!(err208.message, "Message sender must be non-empty");
 
         // 9. editMessageReplyMarkup: non-bot gets 400
         td.request(
@@ -33414,6 +34055,17 @@ mod tests {
             .unwrap();
     }
 
+    /// Drop the GetDialogUnreadMarksQuery the after-difference marks load
+    /// now dispatches — the difference-flow tests count only their own
+    /// payloads.
+    fn without_unread_marks_queries(sent: Vec<NetQuery>) -> Vec<NetQuery> {
+        sent.into_iter()
+            .filter(|query| {
+                query.tl_constructor() != telegram_api::messages_getDialogUnreadMarks::ID
+            })
+            .collect()
+    }
+
     fn get_updates_state_then_get_difference_rides_the_dispatcher_impl() {
         let (mut td, rec) = netted_td("netfix-gus-gd");
 
@@ -33434,12 +34086,17 @@ mod tests {
         td.dispatch_completed_updates_net();
 
         // 2. With the pts known, the next get_difference dispatches the
-        //    real query.
+        //    real query. The empty-difference intake arms the marks load
+        //    (`after_get_difference`), whose GetDialogUnreadMarksQuery
+        //    now rides the net too — the drain in step 2.5 answers it;
+        //    here the getDifference payload is the only query in flight
+        //    (the marks load fires on the next difference drain).
         {
             let mut env = mk_env!(td);
             td.updates_manager.get_difference(&mut env, "test");
         }
         let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
         assert_eq!(sent.len(), 1, "one getDifference dispatch");
         assert_eq!(
             sent[0].tl_constructor(),
@@ -33457,6 +34114,7 @@ mod tests {
             td.updates_manager.get_difference(&mut env, "test");
         }
         let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
         assert_eq!(sent.len(), 1, "re-armed after the empty difference");
         let function = match telegram_api::Function::parse(sent[0].query()) {
             Ok(telegram_api::Function::updates_getDifference(d)) => d,
@@ -33482,6 +34140,7 @@ mod tests {
             td.updates_manager.get_difference(&mut env, "test");
         }
         let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
         assert_eq!(sent.len(), 1, "the state-fed engine re-sends");
         let function = match telegram_api::Function::parse(sent[0].query()) {
             Ok(telegram_api::Function::updates_getDifference(d)) => d,
@@ -33511,6 +34170,7 @@ mod tests {
             td.updates_manager.get_difference(&mut env, "test");
         }
         let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
         assert_eq!(sent.len(), 1);
         // A pts-0 answer would leave the unknown sentinel in place
         // (`add_pts` only moves on pts > 0, exactly like the C++) — seed
@@ -33523,6 +34183,7 @@ mod tests {
             td.updates_manager.get_difference(&mut env, "test");
         }
         let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
         assert_eq!(sent.len(), 1);
         net_fail(sent.into_iter().next().unwrap(), 500, "boom");
         // the error drains through on_failed_get_difference, which clears
@@ -41764,6 +42425,1608 @@ mod tests {
         assert_eq!(error.message, "Network is not implemented yet");
 
         assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn get_dialog_unread_marks_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_dialog_unread_marks_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_dialog_unread_marks_query_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-unread-marks");
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+        {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = user_dialog;
+            d.is_update_new_chat_sent = true;
+            td.messages_manager.dialogs.insert(user_dialog, d);
+        }
+
+        // 1. the load dispatches messages.getDialogUnreadMarks once
+        crate::dialog_manager::load_dialog_marks_as_unread(&mut td);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getDialogUnreadMarks::ID,
+        );
+        // the answer — a vector of two dialog ids (the seeded user and an
+        // unknown one); the unknown entry drops at the intake gates
+        let mut answer = Vec::new();
+        telegram_api::tl::__i32(&mut answer, telegram_api::tl::VECTOR_ID);
+        telegram_api::tl::__i32(&mut answer, 2);
+        telegram_api::tl::__i64(&mut answer, user_dialog.get());
+        telegram_api::tl::__i64(&mut answer, 999999999);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        assert!(
+            td.messages_manager
+                .get_dialog(user_dialog)
+                .is_some_and(|d| d.is_marked_as_unread),
+            "the marked entry flipped"
+        );
+        // the pmc flag settled — the next load is a no-op
+        assert_eq!(td.global.binlog_pmc().get("fetched_marks_as_unread"), "1");
+        crate::dialog_manager::load_dialog_marks_as_unread(&mut td);
+        assert!(rec.sent.lock().is_empty(), "no re-fetch after the flag");
+
+        // 2. the error band — expected errors log and the load re-arms
+        let (mut td, rec) = netted_td("netfix-unread-marks-err");
+        crate::dialog_manager::load_dialog_marks_as_unread(&mut td);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getDialogUnreadMarks::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_dialog_net();
+        assert_eq!(
+            td.global.binlog_pmc().get("fetched_marks_as_unread"),
+            String::new(),
+            "the flag stays unset on error"
+        );
+        // the retry dispatches again
+        crate::dialog_manager::load_dialog_marks_as_unread(&mut td);
+        assert_eq!(rec.sent.lock().len(), 1, "the load re-armed");
+    }
+
+    #[test]
+    fn report_chat_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(report_chat_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn report_chat_query_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-report-chat");
+        seed_dialog_chats(&mut td);
+        // a bot user — can_report_dialog admits only bot users
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = &mut td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager
+                    .as_mut()
+                    .expect("option manager exists after init"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.on_get_user(
+                &mut env,
+                telegram_api::User::user(telegram_api::user {
+                    id: 700000002,
+                    flags: 1,
+                    access_hash: 6,
+                    first_name: "Bot".to_owned(),
+                    bot: true,
+                    ..telegram_api::user::default()
+                }),
+                "test",
+            );
+        }
+        let bot_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000002),
+        )
+        .get();
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+
+        // 1. the happy path — messages.report with the Read peer, the
+        //    server message ids and the raw option bytes; the reported
+        //    answer maps to reportChatResultOk
+        td.request(
+            1,
+            Function::reportChat(td_api::reportChat {
+                chat_id: bot_dialog,
+                option_id: b"spam".to_vec(),
+                message_ids: vec![100 << 20, 250 << 20],
+                text: "it is spam".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_report::ID,
+        );
+        let body = telegram_api::messages_report::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000002);
+                assert_eq!(peer.access_hash, 6);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        assert_eq!(body.id, vec![100, 250]);
+        assert_eq!(body.option, b"spam".to_vec());
+        assert_eq!(body.message, "it is spam");
+        let mut answer = Vec::new();
+        telegram_api::ReportResult::reportResultReported(telegram_api::reportResultReported)
+            .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::reportChatResultOk(_))
+        ));
+
+        // 2. the chooseOption answer — the option list maps (the empty
+        //    options band answers Ok)
+        td.request(
+            2,
+            Function::reportChat(td_api::reportChat {
+                chat_id: bot_dialog,
+                option_id: Vec::new(),
+                message_ids: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_report::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::ReportResult::reportResultChooseOption(
+            telegram_api::reportResultChooseOption {
+                title: "Choose".to_owned(),
+                options: vec![telegram_api::MessageReportOption {
+                    text: "Spam".to_owned(),
+                    option: b"opt1".to_vec(),
+                }],
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::reportChatResultOptionRequired(result)) => {
+                assert_eq!(result.title, "Choose");
+                assert_eq!(result.options.len(), 1);
+                assert_eq!(result.options[0].id, b"opt1".to_vec());
+                assert_eq!(result.options[0].text, "Spam");
+            }
+            other => panic!("the choose-option result: {other:?}"),
+        }
+
+        // 3. the empty-options chooseOption answer answers Ok
+        td.request(
+            3,
+            Function::reportChat(td_api::reportChat {
+                chat_id: bot_dialog,
+                option_id: Vec::new(),
+                message_ids: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_report::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::ReportResult::reportResultChooseOption(
+            telegram_api::reportResultChooseOption {
+                title: String::new(),
+                options: Vec::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::reportChatResultOk(_))
+        ));
+
+        // 4. the addComment answer maps to the text-required result
+        td.request(
+            4,
+            Function::reportChat(td_api::reportChat {
+                chat_id: bot_dialog,
+                option_id: Vec::new(),
+                message_ids: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_report::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::ReportResult::reportResultAddComment(telegram_api::reportResultAddComment {
+            flags: 0,
+            optional: true,
+            option: b"spam".to_vec(),
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 4).first() {
+            Some(Object::reportChatResultTextRequired(result)) => {
+                assert_eq!(result.option_id, b"spam".to_vec());
+                assert!(result.is_optional);
+            }
+            other => panic!("the text-required result: {other:?}"),
+        }
+
+        // 5. the MESSAGE_ID_REQUIRED error maps to the messages-required
+        //    VALUE (not an error)
+        td.request(
+            5,
+            Function::reportChat(td_api::reportChat {
+                chat_id: bot_dialog,
+                option_id: Vec::new(),
+                message_ids: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_report::ID,
+        );
+        net_fail(sent, 400, "MESSAGE_ID_REQUIRED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::reportChatResultMessagesRequired(_))
+        ));
+
+        // 6. the plain error forwards
+        td.request(
+            6,
+            Function::reportChat(td_api::reportChat {
+                chat_id: bot_dialog,
+                option_id: Vec::new(),
+                message_ids: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_report::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "FLOOD_WAIT_9");
+
+        // 7. the basic-group band — can_report_dialog rejects it
+        td.request(
+            7,
+            Function::reportChat(td_api::reportChat {
+                chat_id: group_dialog,
+                option_id: Vec::new(),
+                message_ids: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat can't be reported");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn get_blocked_message_senders_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_blocked_message_senders_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_blocked_message_senders_query_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-blocked-dialogs");
+        seed_dialog_user(&mut td);
+        let the_user = || {
+            telegram_api::User::user(telegram_api::user {
+                id: 700000001,
+                flags: 1,
+                access_hash: 5,
+                first_name: "User".to_owned(),
+                ..telegram_api::user::default()
+            })
+        };
+
+        // 1. the main block list — contacts.getBlocked with the offset
+        //    and limit; the contacts_blocked answer runs the users/chats
+        //    intakes then the senders builder
+        td.request(
+            1,
+            Function::getBlockedMessageSenders(td_api::getBlockedMessageSenders {
+                block_list: Some(td_api::BlockList::blockListMain(td_api::blockListMain)),
+                offset: 0,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getBlocked::ID,
+        );
+        let body = telegram_api::contacts_getBlocked::parse(sent.query()).expect("the sent body");
+        assert!(!body.my_stories_from, "the main list flag");
+        assert_eq!(body.offset, 0);
+        assert_eq!(body.limit, 10);
+        let mut answer = Vec::new();
+        telegram_api::contacts_Blocked::contacts_blocked(telegram_api::contacts_blocked {
+            blocked: vec![telegram_api::PeerBlocked {
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 700000001,
+                })),
+                date: 100,
+            }],
+            chats: Vec::new(),
+            users: vec![the_user()],
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::messageSenders(senders)) => {
+                assert_eq!(senders.total_count, 1);
+                assert_eq!(senders.senders.len(), 1);
+                assert!(matches!(
+                    senders.senders[0],
+                    td_api::MessageSender::messageSenderUser(_)
+                ));
+            }
+            other => panic!("the message senders: {other:?}"),
+        }
+
+        // 2. the slice form — the server count wins (and the
+        //    count-repair band never triggers for a consistent answer)
+        td.request(
+            2,
+            Function::getBlockedMessageSenders(td_api::getBlockedMessageSenders {
+                block_list: Some(td_api::BlockList::blockListMain(td_api::blockListMain)),
+                offset: 10,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getBlocked::ID,
+        );
+        let body = telegram_api::contacts_getBlocked::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.offset, 10);
+        let mut answer = Vec::new();
+        telegram_api::contacts_Blocked::contacts_blockedSlice(
+            telegram_api::contacts_blockedSlice {
+                count: 42,
+                blocked: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::messageSenders(senders)) => {
+                assert_eq!(senders.total_count, 42);
+                assert!(senders.senders.is_empty());
+            }
+            other => panic!("the slice senders: {other:?}"),
+        }
+
+        // 3. the stories block list flag
+        td.request(
+            3,
+            Function::getBlockedMessageSenders(td_api::getBlockedMessageSenders {
+                block_list: Some(td_api::BlockList::blockListStories(
+                    td_api::blockListStories,
+                )),
+                offset: 0,
+                limit: 100,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getBlocked::ID,
+        );
+        let body = telegram_api::contacts_getBlocked::parse(sent.query()).expect("the sent body");
+        assert!(body.my_stories_from, "the stories list flag");
+        net_fail(sent, 500, "Blocked flood");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Blocked flood");
+
+        // 4. the parameter bands — no query out
+        td.request(
+            4,
+            Function::getBlockedMessageSenders(td_api::getBlockedMessageSenders {
+                block_list: Some(td_api::BlockList::blockListMain(td_api::blockListMain)),
+                offset: -1,
+                limit: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Parameter offset must be non-negative");
+        td.request(
+            5,
+            Function::getBlockedMessageSenders(td_api::getBlockedMessageSenders {
+                block_list: None,
+                offset: 0,
+                limit: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Block list must be non-empty");
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn toggle_dialog_report_spam_state_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(toggle_dialog_report_spam_state_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn toggle_dialog_report_spam_state_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-report-spam-state");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the report-spam form — messages.reportSpam with the Read
+        //    peer; the ok answer completes the (erase-wrapped) promise
+        let (promise, result) = record_ton_unit();
+        crate::dialog_manager::toggle_dialog_report_spam_state_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            0,
+            promise,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportSpam::ID,
+        );
+        let body = telegram_api::messages_reportSpam::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+                assert_eq!(peer.access_hash, 5);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        assert!(matches!(
+            result.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. the hide-bar form — messages.hidePeerSettingsBar
+        let (promise, result) = record_ton_unit();
+        crate::dialog_manager::toggle_dialog_report_spam_state_on_server(
+            &mut td,
+            user_dialog,
+            false,
+            0,
+            promise,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_hidePeerSettingsBar::ID,
+        );
+        drop(
+            telegram_api::messages_hidePeerSettingsBar::parse(sent.query()).expect("the sent body"),
+        );
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        assert!(matches!(
+            result.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the null input peer — the net-free SUCCESS band (no query)
+        let (promise, result) = record_ton_unit();
+        crate::dialog_manager::toggle_dialog_report_spam_state_on_server(
+            &mut td,
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                700000099,
+            )),
+            true,
+            0,
+            promise,
+        );
+        assert!(rec.sent.lock().is_empty(), "no query without a peer");
+        assert!(matches!(
+            result.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 4. the error band forwards (the action-bar reload is the
+        //    MessagesManager step — documented drop)
+        let (promise, result) = record_ton_unit();
+        crate::dialog_manager::toggle_dialog_report_spam_state_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            0,
+            promise,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportSpam::ID,
+        );
+        net_fail(sent, 420, "PEER_ID_INVALID");
+        td.dispatch_completed_dialog_net();
+        match result.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 420);
+                assert_eq!(status.message(), "PEER_ID_INVALID");
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        // 5. the secret-chat spam leg — messages.reportEncryptedSpam
+        //    over the Read input encrypted chat
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = &mut td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager
+                    .as_mut()
+                    .expect("option manager exists after init"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.on_update_secret_chat(
+                &mut env,
+                crate::user_manager::SecretChatId::new(33),
+                4321,
+                crate::user_manager::UserId::new(700000001),
+                crate::user_manager::SecretChatState::Active,
+                true,
+                -1,
+                0,
+                String::new(),
+                0,
+                0,
+            );
+        }
+        let secret_dialog = crate::messages_manager::DialogId::from_secret_chat_id(
+            crate::user_manager::SecretChatId::new(33),
+        );
+        let (promise, result) = record_ton_unit();
+        crate::dialog_manager::toggle_dialog_report_spam_state_on_server(
+            &mut td,
+            secret_dialog,
+            true,
+            0,
+            promise,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportEncryptedSpam::ID,
+        );
+        let body =
+            telegram_api::messages_reportEncryptedSpam::parse(sent.query()).expect("the sent body");
+        match body.peer {
+            Some(telegram_api::InputEncryptedChat {
+                chat_id,
+                access_hash,
+            }) => {
+                assert_eq!(chat_id, 33);
+                assert_eq!(access_hash, 4321);
+            }
+            other => panic!("the encrypted peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        assert!(matches!(
+            result.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 6. the secret-chat hide-bar leg — the user-not-found 400
+        let (promise, result) = record_ton_unit();
+        crate::dialog_manager::toggle_dialog_report_spam_state_on_server(
+            &mut td,
+            crate::messages_manager::DialogId::from_secret_chat_id(
+                crate::user_manager::SecretChatId::new(77),
+            ),
+            false,
+            0,
+            promise,
+        );
+        assert!(rec.sent.lock().is_empty(), "no query for the unknown chat");
+        match result.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "Peer user not found");
+            }
+            other => panic!("the unknown-secret-chat band: {other:?}"),
+        }
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn reorder_pinned_dialogs_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(reorder_pinned_dialogs_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn reorder_pinned_dialogs_query_rides_the_dispatcher_impl() {
+        let (mut td, rec, _callback) = netted_td_with_files("netfix-reorder-pinned");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the live send — force + the folder id + the Read input
+        //    dialog peers; the binlog mirror is saved (use_message_database
+        //    is on in the files form) and the answer resolves the
+        //    erase-wrapped promise
+        crate::dialog_manager::reorder_pinned_dialogs_on_server(&mut td, 1, &[user_dialog], 0);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reorderPinnedDialogs::ID,
+        );
+        let body = telegram_api::messages_reorderPinnedDialogs::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.force);
+        assert_eq!(body.folder_id, 1);
+        match body.order.as_slice() {
+            [telegram_api::InputDialogPeer::inputDialogPeer(peer)] => match peer.peer.as_deref() {
+                Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                    assert_eq!(peer.user_id, 700000001);
+                }
+                other => panic!("the reorder peer: {other:?}"),
+            },
+            other => panic!("the reorder order: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 2. the false answer is the C++ 400 ("Result is false") — the
+        //    promise settles through the erase wrapper (the mirror
+        //    retires either way)
+        crate::dialog_manager::reorder_pinned_dialogs_on_server(&mut td, 0, &[user_dialog], 0);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reorderPinnedDialogs::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 3. the error band (the on_update_pinned_dialogs refire is the
+        //    dialog-list plane — documented drop)
+        crate::dialog_manager::reorder_pinned_dialogs_on_server(&mut td, 0, &[user_dialog], 0);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reorderPinnedDialogs::ID,
+        );
+        net_fail(sent, 500, "FOLDER_SAVE_FAILED");
+        td.dispatch_completed_dialog_net();
+
+        // 4. the no-database form — no mirror, the same query
+        crate::dialog_manager::reorder_pinned_dialogs_on_server(&mut td, 1, &[user_dialog], 12345);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reorderPinnedDialogs::ID,
+        );
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn toggle_dialog_is_blocked_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(toggle_dialog_is_blocked_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn toggle_dialog_is_blocked_query_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-toggle-blocked");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        seed_dialog_user(&mut td);
+        seed_dialog_basic_group(&mut td, 701, true);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+
+        // 1. the block send — contacts.block with the stories flag off;
+        //    the ok answer completes even for the false bool (the warning
+        //    band)
+        crate::dialog_manager::toggle_dialog_is_blocked_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            false,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_block::ID,
+        );
+        let body = telegram_api::contacts_block::parse(sent.query()).expect("the sent body");
+        assert!(!body.my_stories_from);
+        match body.id.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+            }
+            other => panic!("the block peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 2. the stories-only variant — the block twin still fires with
+        //    the my_stories_from flag (the C++ twin choice is
+        //    is_blocked || is_blocked_for_stories)
+        crate::dialog_manager::toggle_dialog_is_blocked_on_server(
+            &mut td,
+            user_dialog,
+            false,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_block::ID,
+        );
+        let body = telegram_api::contacts_block::parse(sent.query()).expect("the sent body");
+        assert!(body.my_stories_from);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 2b. the full unblock — contacts.unblock with the stories flag
+        //     off
+        crate::dialog_manager::toggle_dialog_is_blocked_on_server(
+            &mut td,
+            user_dialog,
+            false,
+            false,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_unblock::ID,
+        );
+        let body = telegram_api::contacts_unblock::parse(sent.query()).expect("the sent body");
+        assert!(!body.my_stories_from);
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 3. the error band forwards (the reload refires are documented
+        //    drops)
+        crate::dialog_manager::toggle_dialog_is_blocked_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            false,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_block::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_2");
+        td.dispatch_completed_dialog_net();
+
+        // 4. the live td_api arm — setMessageSenderBlockList on the
+        //    bot-user sender: the local user-full fan-in (no dialog
+        //    record) then the same net send
+        td.request(
+            1,
+            Function::setMessageSenderBlockList(td_api::setMessageSenderBlockList {
+                sender_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 700000001 },
+                )),
+                block_list: Some(td_api::BlockList::blockListMain(td_api::blockListMain)),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_block::ID,
+        );
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 5. the ladder bands — the basic group 400 and the self block
+        td.request(
+            2,
+            Function::setMessageSenderBlockList(td_api::setMessageSenderBlockList {
+                sender_id: Some(td_api::MessageSender::messageSenderChat(
+                    td_api::messageSenderChat {
+                        chat_id: group_dialog,
+                    },
+                )),
+                block_list: Some(td_api::BlockList::blockListMain(td_api::blockListMain)),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Basic group chats can't be blocked");
+
+        tdactor::ActorMessage::dispatch(SeedMyId(700000001), &mut td);
+        td.request(
+            3,
+            Function::setMessageSenderBlockList(td_api::setMessageSenderBlockList {
+                sender_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 700000001 },
+                )),
+                block_list: Some(td_api::BlockList::blockListStories(
+                    td_api::blockListStories,
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Can't block self");
+
+        // the unknown sender band
+        td.request(
+            4,
+            Function::setMessageSenderBlockList(td_api::setMessageSenderBlockList {
+                sender_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 987654 },
+                )),
+                block_list: Some(td_api::BlockList::blockListMain(td_api::blockListMain)),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Unknown user identifier specified");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn toggle_dialog_unread_mark_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(toggle_dialog_unread_mark_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn toggle_dialog_unread_mark_query_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-toggle-unread-mark");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the send — messages.markDialogUnread with the Read input
+        //    dialog peer (no PARENT_PEER flag; the topic leg rides the
+        //    SavedMessagesManager plane)
+        crate::dialog_manager::toggle_dialog_is_marked_as_unread_on_server(
+            &mut td,
+            user_dialog,
+            0,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_markDialogUnread::ID,
+        );
+        let body =
+            telegram_api::messages_markDialogUnread::parse(sent.query()).expect("the sent body");
+        assert!(body.unread);
+        assert!(body.parent_peer.is_none());
+        match body.peer.as_ref() {
+            Some(telegram_api::InputDialogPeer::inputDialogPeer(peer)) => {
+                match peer.peer.as_deref() {
+                    Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                        assert_eq!(peer.user_id, 700000001);
+                    }
+                    other => panic!("the mark peer: {other:?}"),
+                }
+            }
+            other => panic!("the mark dialog peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 2. the false answer is the C++ 400
+        crate::dialog_manager::toggle_dialog_is_marked_as_unread_on_server(
+            &mut td,
+            user_dialog,
+            0,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_markDialogUnread::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 3. the error band — the local mark reverts (the seeded dialog
+        //    record flips back)
+        {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = user_dialog;
+            d.is_update_new_chat_sent = true;
+            td.messages_manager.dialogs.insert(user_dialog, d);
+        }
+        crate::dialog_manager::toggle_dialog_is_marked_as_unread_on_server(
+            &mut td,
+            user_dialog,
+            0,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_markDialogUnread::ID,
+        );
+        net_fail(sent, 500, "mark failed");
+        td.dispatch_completed_dialog_net();
+        assert!(
+            !td.messages_manager
+                .get_dialog(user_dialog)
+                .is_some_and(|d| d.is_marked_as_unread),
+            "the revert intake ran"
+        );
+
+        // 4. the peer-less band — the send-site 400 with no query
+        crate::dialog_manager::toggle_dialog_is_marked_as_unread_on_server(
+            &mut td,
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                700000099,
+            )),
+            0,
+            true,
+            0,
+        );
+        assert!(rec.sent.lock().is_empty(), "no query without a peer");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn toggle_dialog_pin_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(toggle_dialog_pin_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn toggle_dialog_pin_query_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-toggle-pin");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the send — messages.toggleDialogPin with the pinned flag
+        crate::dialog_manager::toggle_dialog_is_pinned_on_server(&mut td, user_dialog, true, 0);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleDialogPin::ID,
+        );
+        let body =
+            telegram_api::messages_toggleDialogPin::parse(sent.query()).expect("the sent body");
+        assert!(body.pinned);
+        match body.peer.as_ref() {
+            Some(telegram_api::InputDialogPeer::inputDialogPeer(peer)) => {
+                match peer.peer.as_deref() {
+                    Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                        assert_eq!(peer.user_id, 700000001);
+                    }
+                    other => panic!("the pin peer: {other:?}"),
+                }
+            }
+            other => panic!("the pin dialog peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 2. the false answer is the C++ 400
+        crate::dialog_manager::toggle_dialog_is_pinned_on_server(&mut td, user_dialog, false, 0);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleDialogPin::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 3. the error band (the on_update_pinned_dialogs refires are the
+        //    dialog-list plane — documented drop)
+        crate::dialog_manager::toggle_dialog_is_pinned_on_server(&mut td, user_dialog, true, 0);
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleDialogPin::ID,
+        );
+        net_fail(sent, 420, "CHAT_ID_INVALID");
+        td.dispatch_completed_dialog_net();
+
+        // 4. the peer-less band — the send-site 400 with no query
+        crate::dialog_manager::toggle_dialog_is_pinned_on_server(
+            &mut td,
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                700000099,
+            )),
+            true,
+            0,
+        );
+        assert!(rec.sent.lock().is_empty(), "no query without a peer");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn toggle_dialog_translations_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(toggle_dialog_translations_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn toggle_dialog_translations_query_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-toggle-translations");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the send — the INVERTED disabled wire flag
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePeerTranslations::ID,
+        );
+        let body = telegram_api::messages_togglePeerTranslations::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.disabled, "enabled sends disabled=false");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            &mut td,
+            user_dialog,
+            false,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePeerTranslations::ID,
+        );
+        let body = telegram_api::messages_togglePeerTranslations::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.disabled, "disabled sends disabled=true");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+
+        // 2. the false answer is the C++ 400 THROUGH on_error — the
+        //    local flag reverts
+        {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = user_dialog;
+            d.is_update_new_chat_sent = true;
+            td.messages_manager.dialogs.insert(user_dialog, d);
+        }
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePeerTranslations::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_dialog_net();
+        assert!(
+            !td.messages_manager
+                .get_dialog(user_dialog)
+                .is_some_and(|d| d.is_translatable),
+            "the false band reverts through the error tail"
+        );
+
+        // 3. the error band — the local flag reverts
+        {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = user_dialog;
+            d.is_update_new_chat_sent = true;
+            td.messages_manager.dialogs.insert(user_dialog, d);
+        }
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePeerTranslations::ID,
+        );
+        net_fail(sent, 500, "translations failed");
+        td.dispatch_completed_dialog_net();
+        assert!(
+            !td.messages_manager
+                .get_dialog(user_dialog)
+                .is_some_and(|d| d.is_translatable),
+            "the revert intake ran"
+        );
+
+        // 4. the peer-less band — the send-site 400 with no query
+        crate::dialog_manager::toggle_dialog_is_translatable_on_server(
+            &mut td,
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                700000099,
+            )),
+            true,
+            0,
+        );
+        assert!(rec.sent.lock().is_empty(), "no query without a peer");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn toggle_view_forum_as_messages_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(toggle_view_forum_as_messages_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn toggle_view_forum_as_messages_query_rides_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-toggle-view-forum");
+        seed_dialog_chats(&mut td);
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(704),
+        );
+
+        // 1. the send — channels.toggleViewForumAsMessages over the
+        //    input channel; the Updates answer re-enters on_get_updates
+        crate::dialog_manager::toggle_dialog_view_as_messages_on_server(
+            &mut td,
+            channel_dialog,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleViewForumAsMessages::ID,
+        );
+        let body = telegram_api::channels_toggleViewForumAsMessages::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.enabled);
+        match body.channel {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 704);
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_dialog_net();
+
+        // 2. the error band — the local flag reverts over the seeded
+        //    dialog record
+        {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = channel_dialog;
+            d.is_forum = true;
+            d.is_update_new_chat_sent = true;
+            td.messages_manager.dialogs.insert(channel_dialog, d);
+        }
+        crate::dialog_manager::toggle_dialog_view_as_messages_on_server(
+            &mut td,
+            channel_dialog,
+            true,
+            0,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleViewForumAsMessages::ID,
+        );
+        net_fail(sent, 500, "forum failed");
+        td.dispatch_completed_dialog_net();
+        assert!(
+            !td.messages_manager
+                .get_dialog(channel_dialog)
+                .is_some_and(|d| d.view_as_messages),
+            "the revert intake ran"
+        );
+
+        // 3. the non-channel band — the send-site 400 (the C++ CHECK band
+        //    kept honest)
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user(&mut td);
+        crate::dialog_manager::toggle_dialog_view_as_messages_on_server(
+            &mut td,
+            user_dialog,
+            true,
+            0,
+        );
+        assert!(rec.sent.lock().is_empty(), "no query for a user dialog");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn set_chat_theme_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(set_chat_theme_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn set_chat_theme_query_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-set-chat-theme");
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. the plain emoji theme — inputChatTheme with the emoticon
+        td.request(
+            1,
+            Function::setChatTheme(td_api::setChatTheme {
+                chat_id: user_dialog,
+                theme: Some(td_api::InputChatTheme::inputChatThemeEmoji(
+                    td_api::inputChatThemeEmoji {
+                        name: "🦄".to_owned(),
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatTheme::ID,
+        );
+        let body = telegram_api::messages_setChatTheme::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+            }
+            other => panic!("the write peer: {other:?}"),
+        }
+        match body.theme {
+            Some(telegram_api::InputChatTheme::inputChatTheme(theme)) => {
+                assert_eq!(theme.emoticon, "🦄");
+            }
+            other => panic!("the chat theme: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the gift form — inputChatThemeUniqueGift with the slug
+        td.request(
+            2,
+            Function::setChatTheme(td_api::setChatTheme {
+                chat_id: user_dialog,
+                theme: Some(td_api::InputChatTheme::inputChatThemeGift(
+                    td_api::inputChatThemeGift {
+                        name: "gift-slug".to_owned(),
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatTheme::ID,
+        );
+        let body = telegram_api::messages_setChatTheme::parse(sent.query()).expect("the sent body");
+        match body.theme {
+            Some(telegram_api::InputChatTheme::inputChatThemeUniqueGift(gift)) => {
+                assert_eq!(gift.slug, "gift-slug");
+            }
+            other => panic!("the gift theme: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the empty theme — inputChatThemeEmpty (the reset)
+        td.request(
+            3,
+            Function::setChatTheme(td_api::setChatTheme {
+                chat_id: user_dialog,
+                theme: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatTheme::ID,
+        );
+        let body = telegram_api::messages_setChatTheme::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.theme,
+            Some(telegram_api::InputChatTheme::inputChatThemeEmpty(_))
+        ));
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        // the CHAT_NOT_MODIFIED !bot value band — Ok, not an error
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the plain error forwards
+        td.request(
+            4,
+            Function::setChatTheme(td_api::setChatTheme {
+                chat_id: user_dialog,
+                theme: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatTheme::ID,
+        );
+        net_fail(sent, 420, "THEME_INVALID");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "THEME_INVALID");
+
+        // 5. the group band — "Can't change theme in the chat"
+        seed_dialog_chats(&mut td);
+        let group_dialog =
+            crate::messages_manager::DialogId::from_chat_id(crate::chat_manager::ChatId::new(701))
+                .get();
+        td.request(
+            5,
+            Function::setChatTheme(td_api::setChatTheme {
+                chat_id: group_dialog,
+                theme: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Can't change theme in the chat");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn update_color_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(update_color_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn update_color_query_rides_the_dispatcher_impl() {
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-update-color");
+
+        // 1. the own-account form — setAccentColor dispatches
+        //    account.updateColor with the COLOR flag and the peerColor
+        //    pair; the ok answer applies the local colors and resolves
+        td.request(
+            1,
+            Function::setAccentColor(td_api::setAccentColor {
+                accent_color_id: 5,
+                background_custom_emoji_id: 7,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateColor::ID,
+        );
+        let body = telegram_api::account_updateColor::parse(sent.query()).expect("the sent body");
+        assert!(!body.for_profile);
+        assert_eq!(body.flags, 4, "the COLOR flag");
+        match body.color {
+            Some(telegram_api::PeerColor::peerColor(color)) => {
+                assert_eq!(color.flags, 3, "COLOR + BACKGROUND_EMOJI_ID");
+                assert_eq!(color.color, 5);
+                assert_eq!(color.background_emoji_id, 7);
+            }
+            other => panic!("the peer color: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the profile variant — setProfileAccentColor with the
+        //    for_profile flag; the empty id sends the bare (reset) form
+        td.request(
+            2,
+            Function::setProfileAccentColor(td_api::setProfileAccentColor {
+                profile_accent_color_id: -1,
+                profile_background_custom_emoji_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateColor::ID,
+        );
+        let body = telegram_api::account_updateColor::parse(sent.query()).expect("the sent body");
+        assert!(body.for_profile);
+        assert_eq!(body.flags, 2, "no color — the for_profile bit only");
+        assert!(body.color.is_none());
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the invalid accent id band — the local 400 with no query
+        td.request(
+            3,
+            Function::setAccentColor(td_api::setAccentColor {
+                accent_color_id: -1,
+                background_custom_emoji_id: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Invalid accent color identifier specified");
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 4. the error band forwards
+        td.request(
+            4,
+            Function::setAccentColor(td_api::setAccentColor {
+                accent_color_id: 5,
+                background_custom_emoji_id: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateColor::ID,
+        );
+        net_fail(sent, 400, "ACCENT_COLOR_INVALID");
+        td.dispatch_completed_user_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "ACCENT_COLOR_INVALID");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+        assert!(td.user_net_completed.lock().is_empty(), "drained");
     }
 
     fn premium_queries_ride_the_dispatcher_impl() {

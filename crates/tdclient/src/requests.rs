@@ -3948,21 +3948,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             tdutils::log_info!("Toggle sponsored messages query — [blocked: net]");
         }
         Function::setAccentColor(request) => {
-            // Requests.cpp:7157-7167: the invalid-id 400 answers here; the
-            // UpdateAccentColorQuery is [blocked: net]
+            // Requests.cpp:7162-7167 — the promise settles from the
+            // `UpdateColorQuery` answer (the own-account form)
             if !check_is_user(td, id) {
                 return;
             }
-            let accent_color = crate::peer_color::AccentColorId::new(request.accent_color_id);
-            let custom_emoji =
-                crate::emoji_status::CustomEmojiId::new(request.background_custom_emoji_id);
-            let validated = td
-                .user_manager
-                .set_accent_color_local(accent_color, custom_emoji);
-            match validated {
-                Ok(_) => tdutils::log_info!("Update accent color query — [blocked: net]"),
-                Err(error) => send_error_status(td, id, error),
-            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.user_manager.set_accent_color(
+                crate::peer_color::AccentColorId::new(request.accent_color_id),
+                crate::emoji_status::CustomEmojiId::new(request.background_custom_emoji_id),
+                promise,
+            );
         }
 
         // --- the remaining photo-set handlers (the Files slice) and the
@@ -4224,15 +4220,20 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-        Function::setProfileAccentColor(_request) => {
+        Function::setProfileAccentColor(request) => {
             // Requests.cpp:7176-7180 → UserManager.cpp:6644-6648: no
-            // validation; the UpdateColorQuery carries the promise
-            // ([blocked: net]) and `on_update_accent_color_success` is
-            // its ack intake
+            // validation; the `UpdateColorQuery` (profile form) carries
+            // the promise; `on_update_accent_color_success` is its ack
+            // intake
             if !check_is_user(td, id) {
                 return;
             }
-            tdutils::log_info!("Send account.updateColor (profile) — [blocked: net]");
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.user_manager.set_profile_accent_color(
+                crate::peer_color::AccentColorId::new(request.profile_accent_color_id),
+                crate::emoji_status::CustomEmojiId::new(request.profile_background_custom_emoji_id),
+                promise,
+            );
         }
         Function::setUpgradedGiftColors(_request) => {
             // Requests.cpp:7169-7173 → UserManager.cpp:6640-6642: no
@@ -5069,7 +5070,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, slot) = object_request_promise();
+            // the promise settles from the GetBlockedDialogsQuery answer
+            // (the deferred outbox — the request id rides the promise)
+            let promise = td.deferred_promise::<crate::td_api::Object, _>(id, |object| object);
             crate::dialog_manager::get_blocked_dialogs(
                 td,
                 request.block_list.as_ref(),
@@ -5077,7 +5080,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.limit,
                 promise,
             );
-            finish_object_slot(td, id, slot);
         }
         Function::reportChat(request) => {
             if !check_is_user(td, id) {
@@ -5086,13 +5088,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
                 return;
             };
-            let option_id = String::from_utf8_lossy(&request.option_id).into_owned();
+            // the option id rides as raw bytes (the C++ BufferSlice —
+            // no utf8 gate on this field)
+            let option_id = request.option_id.clone();
             let message_ids: Vec<crate::chat_manager::MessageId> = request
                 .message_ids
                 .iter()
                 .map(|&message_id| crate::chat_manager::MessageId::new(message_id))
                 .collect();
-            let (promise, slot) = object_request_promise();
+            // the promise settles from the ReportPeerQuery answer (the
+            // deferred outbox — the request id rides the promise)
+            let promise = td.deferred_promise::<crate::td_api::Object, _>(id, |object| object);
             crate::dialog_manager::report_dialog(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
@@ -5101,7 +5107,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 &text,
                 promise,
             );
-            finish_object_slot(td, id, slot);
         }
 
         // setChatEmojiStatus and reportChatPhoto ride the dispatcher
@@ -14842,11 +14847,22 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
-        Function::setMessageSenderBlockList(_) => {
+        Function::setMessageSenderBlockList(request) => {
+            // Requests.cpp:5895-5899 — MessagesManager::
+            // set_message_sender_block_list (the toggleChatIsBlocked
+            // chain: the local flip, then the ToggleDialogIsBlockedQuery
+            // send; the request answers with the ladder's status)
             if !check_is_user(td, id) {
                 return;
             }
-            td.send_result(id, ok_object());
+            match crate::dialog_manager::set_message_sender_block_list(
+                td,
+                request.sender_id.as_ref(),
+                request.block_list.as_ref(),
+            ) {
+                tdutils::status::Result::Ok(()) => td.send_result(id, ok_object()),
+                tdutils::status::Result::Err(status) => send_error_status(td, id, status),
+            }
         }
         Function::setChatMessageSender(_) => {
             if !check_is_user(td, id) {
@@ -18902,7 +18918,7 @@ fn clean_or_utf8_error(td: &mut Td, id: u64, s: &str) -> Option<String> {
     }
 }
 
-/// The unit-shaped slot half of the collapse, aliased to match `ObjectSlot`.
+/// The unit-shaped slot half of the collapse.
 type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>;
 
 /// The synchronous collapse of `CREATE_REQUEST_PROMISE` for `Promise<Unit>`
@@ -18914,20 +18930,6 @@ fn unit_request_promise() -> (tdutils::promise::Promise<()>, UnitSlot) {
     let promise = tdutils::promise::PromiseCreator::lambda_result(move |result: Result<()>| {
         *capture.lock().unwrap() = Some(result);
     });
-    (promise, slot)
-}
-
-/// The same collapse for object-returning requests: the value is the result.
-type ObjectSlot = std::sync::Arc<std::sync::Mutex<Option<Result<crate::td_api::Object>>>>;
-
-fn object_request_promise() -> (tdutils::promise::Promise<crate::td_api::Object>, ObjectSlot) {
-    let slot: ObjectSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let capture = std::sync::Arc::clone(&slot);
-    let promise = tdutils::promise::PromiseCreator::lambda_result(
-        move |result: Result<crate::td_api::Object>| {
-            *capture.lock().unwrap() = Some(result);
-        },
-    );
     (promise, slot)
 }
 
@@ -18954,15 +18956,6 @@ fn finish_unit_slot(
 ) {
     match slot.lock().unwrap().take() {
         Some(Result::Ok(())) => td.send_result(id, ok_object()),
-        Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
-        None => {}
-    }
-}
-
-/// Send the object slot's result or error.
-fn finish_object_slot(td: &mut Td, id: u64, slot: ObjectSlot) {
-    match slot.lock().unwrap().take() {
-        Some(Result::Ok(object)) => td.send_result(id, object),
         Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
         None => {}
     }
