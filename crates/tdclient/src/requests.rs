@@ -5151,34 +5151,69 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::setChatLocation(request) => {
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:6113-6118` — CHECK_IS_USER; the promise
+            // settles from the EditLocationQuery answer. The C++ routes
+            // through `DialogManager::set_dialog_location` (the
+            // have_dialog_force gate is the M.6 stub): the channel leg
+            // decodes the dialog id, every other dialog type answers
+            // "The chat can't have location".
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = DialogId::new(request.chat_id);
+            // the invalid id fails the C++ have_dialog_force gate
+            // ("Chat not found", DialogManager.cpp:2783-2785 — the M.6
+            // stub collapse); every other dialog type answers "The
+            // chat can't have location"
+            if !dialog_id.is_valid() {
+                return td.send_error_impl(id, 400, "Chat not found");
+            }
+            if dialog_id.get_type() != crate::chat_manager::DialogType::Channel {
+                return td.send_error_impl(id, 400, "The chat can't have location");
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            // the null-location band builds the empty record like the
+            // C++ DialogLocation constructor — the manager's empty()
+            // gate answers the 400
             let location = crate::chat_manager::DialogLocation::from_td_api(
-                request.location.as_ref().unwrap(),
+                request
+                    .location
+                    .as_ref()
+                    .unwrap_or(&td_api::ChatLocation::default()),
             );
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_location(
                 user_manager,
                 &mut env,
-                ChannelId::new(request.chat_id),
+                dialog_id.get_channel_id(),
                 &location,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setChatSlowModeDelay(request) => {
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:6120-6125` — CHECK_IS_USER; the promise
+            // settles from the ToggleSlowModeQuery answer.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_slow_mode_delay(
                 user_manager,
                 &mut env,
-                DialogId::from_channel_id(ChannelId::new(request.chat_id)),
+                DialogId::new(request.chat_id),
                 request.slow_mode_delay,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupIsForum(request) => {
-            let (promise, recorded) = record_unit_promise();
+            // `Requests.cpp:7366-7372` — CHECK_IS_USER; the promise
+            // settles from the ToggleForumQuery answer (the equal-state
+            // early-OK resolves without a query).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, _user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_is_forum(
                 &mut env,
@@ -5187,16 +5222,16 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.has_forum_tabs,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
 
         Function::reportSupergroupAntiSpamFalsePositive(request) => {
-            // `Requests.cpp:2147-2152` — CHECK_IS_USER; the ok promise
-            // settles synchronously (the query tail is the net seam).
+            // `Requests.cpp:7386-7392` — CHECK_IS_USER; the promise
+            // settles from the ReportChannelAntiSpamFalsePositiveQuery
+            // answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.report_channel_anti_spam_false_positive(
                 user_manager,
@@ -5205,7 +5240,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 crate::chat_manager::MessageId::new(request.message_id),
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::reportSupergroupSpam(request) => {
             // `Requests.cpp:2154-2159`.
@@ -5229,11 +5263,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupIsBroadcastGroup(request) => {
-            // `Requests.cpp:2160-2166` — the gigagroup conversion gate.
+            // `Requests.cpp:7373-7379` — the gigagroup conversion gate;
+            // the promise settles from the ConvertToGigagroupQuery
+            // answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.convert_channel_to_gigagroup(
                 user_manager,
@@ -5241,14 +5277,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 ChannelId::new(request.supergroup_id),
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupHasAggressiveAntiSpamEnabled(request) => {
-            // `Requests.cpp:2174-2180`.
+            // `Requests.cpp:7359-7365` — the promise settles from the
+            // ToggleAntiSpamQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_has_aggressive_anti_spam_enabled(
                 user_manager,
@@ -5257,14 +5293,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.has_aggressive_anti_spam_enabled,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupHasHiddenMembers(request) => {
-            // `Requests.cpp:2181-2187`.
+            // `Requests.cpp:7352-7358` — the promise settles from the
+            // ToggleParticipantsHiddenQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_has_hidden_participants(
                 user_manager,
@@ -5273,14 +5309,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.has_hidden_members,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupHasAutomaticTranslation(request) => {
-            // `Requests.cpp:2188-2194`.
+            // `Requests.cpp:7345-7351` — the promise settles from the
+            // ToggleAutotranslationQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, _user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_has_automatic_translation(
                 &mut env,
@@ -5288,14 +5324,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.has_automatic_translation,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupCanHaveSponsoredMessages(request) => {
-            // `Requests.cpp:2195-2201`.
+            // `Requests.cpp:7338-7344` — the promise settles from the
+            // RestrictSponsoredMessagesQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, _user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_can_have_sponsored_messages(
                 &mut env,
@@ -5303,14 +5339,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.can_have_sponsored_messages,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupIsAllHistoryAvailable(request) => {
-            // `Requests.cpp:2202-2209`.
+            // `Requests.cpp:7331-7337` — the promise settles from the
+            // TogglePrehistoryHiddenQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, _user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_is_all_history_available(
                 &mut env,
@@ -5318,14 +5354,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.is_all_history_available,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupJoinByRequest(request) => {
-            // `Requests.cpp:2210-2216`.
+            // `Requests.cpp:7323-7330` — the promise settles from the
+            // ToggleChannelJoinRequestQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_join_request(
                 user_manager,
@@ -5336,14 +5372,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.apply_to_invite_links,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupJoinToSendMessages(request) => {
-            // `Requests.cpp:2217-2223`.
+            // `Requests.cpp:7316-7322` — the promise settles from the
+            // ToggleChannelJoinToSendQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, _user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_join_to_send(
                 &mut env,
@@ -5351,14 +5387,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.join_to_send_messages,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::toggleSupergroupSignMessages(request) => {
-            // `Requests.cpp:2224-2230`.
+            // `Requests.cpp:7309-7315` — the promise settles from the
+            // ToggleChannelSignaturesQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, _user_manager, chat_manager) = chat_env_split(td);
             chat_manager.toggle_channel_sign_messages(
                 &mut env,
@@ -5367,7 +5403,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.show_message_sender,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setSupergroupMainProfileTab(request) => {
             // `Requests.cpp:2231-2236` — the promise settles from the
@@ -5463,11 +5498,12 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::setChatDirectMessagesGroup(request) => {
-            // `Requests.cpp:3427-3432`.
+            // `Requests.cpp:6106-6112` — the promise settles from the
+            // UpdatePaidMessagesPriceQuery answer (the monoforum leg).
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_monoforum_group(
                 user_manager,
@@ -5477,14 +5513,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.paid_message_star_count,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setChatDiscussionGroup(request) => {
-            // `Requests.cpp:3434-3440`.
+            // `Requests.cpp:6099-6105` — the promise settles from the
+            // SetDiscussionGroupQuery answer.
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_discussion_group(
                 user_manager,
@@ -5493,14 +5529,15 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 DialogId::new(request.discussion_chat_id),
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
         Function::setChatPaidMessageStarCount(request) => {
-            // `Requests.cpp:3768-3774`.
+            // `Requests.cpp:5765-5771` — the promise settles from the
+            // UpdatePaidMessagesPriceQuery answer (the paid-message
+            // leg).
             if !check_is_user(td, id) {
                 return;
             }
-            let (promise, recorded) = record_unit_promise();
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut env, user_manager, chat_manager) = chat_env_split(td);
             chat_manager.set_channel_send_paid_message_star_count(
                 user_manager,
@@ -5509,7 +5546,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 request.paid_message_star_count,
                 promise,
             );
-            finish_unit_request(id, td, recorded);
         }
 
         // --- web browser settings (Requests.cpp:3154-3180, 3603-3608) ---

@@ -10912,6 +10912,379 @@ impl Td {
                     }
                 }
             }
+            // `ToggleChannelSignaturesQuery` (ChatManager.cpp:596-635) —
+            // the Updates answer re-enters `on_get_updates` with the
+            // promise; the error tail runs the CHAT_NOT_MODIFIED !bot
+            // value band and the channel-error head.
+            crate::chat_manager::ChatNetKind::ToggleChannelSignatures { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_toggle_channel_signatures_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "ToggleChannelSignaturesQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_toggleSignatures")),
+                    }
+                }
+            }
+            // `ToggleChannelJoinToSendQuery` (ChatManager.cpp:637-676) —
+            // the same Updates/error shape as the signatures family.
+            crate::chat_manager::ChatNetKind::ToggleChannelJoinToSend { channel_id } => {
+                let Some(mut promise) =
+                    self.chat_manager.take_toggle_channel_join_to_send_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "ToggleChannelJoinToSendQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_toggleJoinToSend")),
+                    }
+                }
+            }
+            // `ToggleChannelJoinRequestQuery` (ChatManager.cpp:677-716)
+            // — the ok head runs the guard-bot intake (the parked id,
+            // default when the query carried no input user) before the
+            // Updates re-entry; the error tail runs the
+            // CHAT_NOT_MODIFIED !bot value band and the channel-error
+            // head.
+            crate::chat_manager::ChatNetKind::ToggleChannelJoinRequest { channel_id } => {
+                let Some((guard_bot_user_id, mut promise)) =
+                    self.chat_manager.take_toggle_channel_join_request()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "ToggleChannelJoinRequestQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.with_chat_intake(|chat_manager, user_manager, env| {
+                                chat_manager.on_update_channel_guard_bot_user_id(
+                                    user_manager,
+                                    env,
+                                    channel_id,
+                                    guard_bot_user_id,
+                                );
+                            });
+                            self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            });
+                        }
+                        Err(_) => promise.set_error(parse_error("channels_toggleJoinRequest")),
+                    }
+                }
+            }
+            // `TogglePrehistoryHiddenQuery` (ChatManager.cpp:727-763) —
+            // the Updates answer rides the on_get_updates + intake
+            // lambda chain (`ChatToggleTail::IsAllHistoryAvailable`);
+            // the error tail runs the CHAT_NOT_MODIFIED !bot value band
+            // and the channel-error head.
+            crate::chat_manager::ChatNetKind::TogglePrehistoryHidden { channel_id } => {
+                let Some((is_all_history_available, mut promise)) =
+                    self.chat_manager.take_toggle_prehistory_hidden()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "TogglePrehistoryHiddenQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdatesChannelToggle {
+                            updates: Box::new(updates),
+                            tail: crate::chat_manager::ChatToggleTail::IsAllHistoryAvailable {
+                                channel_id,
+                                is_all_history_available,
+                            },
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_togglePreHistoryHidden")),
+                    }
+                }
+            }
+            // `RestrictSponsoredMessagesQuery` (ChatManager.cpp:778-816)
+            // — the Updates answer rides the on_get_updates + intake
+            // lambda chain (`ChatToggleTail::CanHaveSponsoredMessages`);
+            // the error tail runs the CHAT_NOT_MODIFIED !bot value band
+            // and the channel-error head.
+            crate::chat_manager::ChatNetKind::RestrictSponsoredMessages { channel_id } => {
+                let Some((can_have_sponsored_messages, mut promise)) =
+                    self.chat_manager.take_restrict_sponsored_messages()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "RestrictSponsoredMessagesQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdatesChannelToggle {
+                            updates: Box::new(updates),
+                            tail: crate::chat_manager::ChatToggleTail::CanHaveSponsoredMessages {
+                                channel_id,
+                                can_have_sponsored_messages,
+                            },
+                            promise,
+                        }),
+                        Err(_) => {
+                            promise.set_error(parse_error("channels_restrictSponsoredMessages"))
+                        }
+                    }
+                }
+            }
+            // `ToggleAutotranslationQuery` (ChatManager.cpp:829-868) —
+            // the Updates answer re-enters `on_get_updates` with the
+            // promise; the error tail runs the CHAT_NOT_MODIFIED !bot
+            // value band and the channel-error head.
+            crate::chat_manager::ChatNetKind::ToggleAutotranslation { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_toggle_autotranslation_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "ToggleAutotranslationQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_toggleAutotranslation")),
+                    }
+                }
+            }
+            // `ToggleParticipantsHiddenQuery` (ChatManager.cpp:874-913)
+            // — the Updates answer rides the on_get_updates + intake
+            // lambda chain (`ChatToggleTail::HasHiddenParticipants`);
+            // the error tail runs the CHAT_NOT_MODIFIED !bot value band
+            // and the channel-error head.
+            crate::chat_manager::ChatNetKind::ToggleParticipantsHidden { channel_id } => {
+                let Some((has_hidden_participants, mut promise)) =
+                    self.chat_manager.take_toggle_participants_hidden()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "ToggleParticipantsHiddenQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdatesChannelToggle {
+                            updates: Box::new(updates),
+                            tail: crate::chat_manager::ChatToggleTail::HasHiddenParticipants {
+                                channel_id,
+                                has_hidden_participants,
+                            },
+                            promise,
+                        }),
+                        Err(_) => {
+                            promise.set_error(parse_error("channels_toggleParticipantsHidden"))
+                        }
+                    }
+                }
+            }
+            // `ToggleAntiSpamQuery` (ChatManager.cpp:925-964) — the
+            // Updates answer rides the on_get_updates + intake lambda
+            // chain (`ChatToggleTail::HasAggressiveAntiSpamEnabled`);
+            // the error tail runs the CHAT_NOT_MODIFIED !bot value band
+            // and the channel-error head.
+            crate::chat_manager::ChatNetKind::ToggleAntiSpam { channel_id } => {
+                let Some((has_aggressive_anti_spam_enabled, mut promise)) =
+                    self.chat_manager.take_toggle_anti_spam()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "ToggleAntiSpamQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdatesChannelToggle {
+                            updates: Box::new(updates),
+                            tail:
+                                crate::chat_manager::ChatToggleTail::HasAggressiveAntiSpamEnabled {
+                                    channel_id,
+                                    has_aggressive_anti_spam_enabled,
+                                },
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_toggleAntiSpam")),
+                    }
+                }
+            }
+            // `ToggleForumQuery` (ChatManager.cpp:977-1014) — the Updates
+            // answer re-enters `on_get_updates` with the promise; the
+            // error tail runs the CHAT_NOT_MODIFIED !bot value band and
+            // the channel-error head.
+            crate::chat_manager::ChatNetKind::ToggleForum { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_toggle_forum_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(channel_id, &status, "ToggleForumQuery");
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_toggleForum")),
+                    }
+                }
+            }
+            // `ConvertToGigagroupQuery` (ChatManager.cpp:1019-1053) — the
+            // Updates answer re-enters `on_get_updates`; the
+            // CHAT_NOT_MODIFIED band answers the value for bots too
+            // (the C++ tail has no is_bot check).
+            crate::chat_manager::ChatNetKind::ConvertToGigagroup { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_convert_to_gigagroup_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "CHAT_NOT_MODIFIED" {
+                        promise.set_value(());
+                    } else {
+                        self.chat_channel_error_head(
+                            channel_id,
+                            &status,
+                            "ConvertToGigagroupQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_convertToGigagroup")),
+                    }
+                }
+            }
             // `DeleteChatQuery` (ChatManager.cpp:1375-1399) — the Bool
             // answer (either value; the C++ only logs it) refires
             // get_difference and chains the empty `updates` container
@@ -10965,6 +11338,196 @@ impl Td {
                             promise,
                         }),
                         Err(_) => promise.set_error(parse_error("channels_deleteChannel")),
+                    }
+                }
+            }
+            // `SetDiscussionGroupQuery` (ChatManager.cpp:1122-1157) — the
+            // Bool answer (either value) runs the linked-channel intake
+            // on both sides and answers the value; the error tail is the
+            // bare forward (the LINK_NOT_MODIFIED band answers the
+            // value; no channel-error head).
+            crate::chat_manager::ChatNetKind::SetDiscussionGroup {
+                broadcast_channel_id,
+                group_channel_id,
+            } => {
+                let Some(mut promise) = self.chat_manager.take_set_discussion_group_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "LINK_NOT_MODIFIED" {
+                        promise.set_value(());
+                    } else {
+                        promise.set_error(status);
+                    }
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(result) => {
+                            if !result {
+                                tdutils::log_info!("Set discussion group has failed");
+                            }
+                            self.with_chat_intake(|chat_manager, user_manager, env| {
+                                chat_manager.on_update_channel_linked_channel_id(
+                                    user_manager,
+                                    env,
+                                    broadcast_channel_id,
+                                    group_channel_id,
+                                );
+                            });
+                            promise.set_value(());
+                        }
+                        None => promise.set_error(parse_error("channels_setDiscussionGroup")),
+                    }
+                }
+            }
+            // `EditLocationQuery` (ChatManager.cpp:1162-1200) — the Bool
+            // answer (either value) runs the location intake and answers
+            // the value; the error tail runs the channel-error head.
+            crate::chat_manager::ChatNetKind::EditLocation { channel_id } => {
+                let Some((location, mut promise)) = self.chat_manager.take_edit_location() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.chat_channel_error_head(channel_id, &status, "EditLocationQuery");
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(result) => {
+                            if !result {
+                                tdutils::log_info!("Edit chat location has failed");
+                            }
+                            self.with_chat_intake(|chat_manager, user_manager, env| {
+                                chat_manager.on_update_channel_location(
+                                    user_manager,
+                                    env,
+                                    channel_id,
+                                    location,
+                                );
+                            });
+                            promise.set_value(());
+                        }
+                        None => promise.set_error(parse_error("channels_editLocation")),
+                    }
+                }
+            }
+            // `ToggleSlowModeQuery` (ChatManager.cpp:1203-1241) — the
+            // Updates answer rides the on_get_updates + intake lambda
+            // chain (`ChatToggleTail::SlowModeDelay`); the
+            // CHAT_NOT_MODIFIED band runs the intake with an empty
+            // promise first (both auth kinds), then the !bot value band
+            // or the error; other errors run the channel-error head.
+            crate::chat_manager::ChatNetKind::ToggleSlowMode { channel_id } => {
+                let Some((slow_mode_delay, mut promise)) =
+                    self.chat_manager.take_toggle_slow_mode()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified {
+                        self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_update_channel_slow_mode_delay(
+                                user_manager,
+                                env,
+                                channel_id,
+                                slow_mode_delay,
+                                Promise::default(),
+                            );
+                        });
+                        if !self.auth_manager.is_bot() {
+                            promise.set_value(());
+                            return;
+                        }
+                    } else {
+                        self.chat_channel_error_head(channel_id, &status, "ToggleSlowModeQuery");
+                    }
+                    promise.set_error(status);
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdatesChannelToggle {
+                            updates: Box::new(updates),
+                            tail: crate::chat_manager::ChatToggleTail::SlowModeDelay {
+                                channel_id,
+                                slow_mode_delay,
+                            },
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("channels_toggleSlowMode")),
+                    }
+                }
+            }
+            // `ReportChannelAntiSpamFalsePositiveQuery`
+            // (ChatManager.cpp:1298-1331) — the Bool answer (either
+            // value) answers the value; the error tail runs the
+            // channel-error head.
+            crate::chat_manager::ChatNetKind::ReportChannelAntiSpamFalsePositive { channel_id } => {
+                let Some(mut promise) = self
+                    .chat_manager
+                    .take_report_channel_anti_spam_false_positive_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.chat_channel_error_head(
+                        channel_id,
+                        &status,
+                        "ReportChannelAntiSpamFalsePositiveQuery",
+                    );
+                    promise.set_error(status);
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(result) => {
+                            if !result {
+                                tdutils::log_info!(
+                                    "Report anti-spam false positive has failed in {channel_id:?}"
+                                );
+                            }
+                            promise.set_value(());
+                        }
+                        None => {
+                            promise.set_error(parse_error("channels_reportAntiSpamFalsePositive"))
+                        }
+                    }
+                }
+            }
+            // `UpdatePaidMessagesPriceQuery` (ChatManager.cpp:1334-1370)
+            // — both send legs share the arm: the Updates answer
+            // re-enters `on_get_updates` with the promise; the error
+            // tail runs the CHAT_NOT_MODIFIED !bot value band and the
+            // channel-error head.
+            crate::chat_manager::ChatNetKind::UpdatePaidMessagesPrice { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_update_paid_messages_price_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let not_modified = status.message() == "CHAT_NOT_MODIFIED";
+                    if not_modified && !self.auth_manager.is_bot() {
+                        promise.set_value(());
+                    } else {
+                        if !not_modified {
+                            self.chat_channel_error_head(
+                                channel_id,
+                                &status,
+                                "UpdatePaidMessagesPriceQuery",
+                            );
+                        }
+                        promise.set_error(status);
+                    }
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => {
+                            promise.set_error(parse_error("channels_updatePaidMessagesPrice"))
+                        }
                     }
                 }
             }
@@ -18085,6 +18648,18 @@ pub(crate) enum UmMessage {
         chat_id: crate::chat_manager::ChatId,
         promise: Promise<crate::td_api::Object>,
     },
+    /// `on_get_updates` + the channel-toggle intake tail — the C++
+    /// `PromiseCreator::lambda` chains of the ChatManager toggle
+    /// families (ChatManager.cpp:756, :807, :903, :954, :1232): the
+    /// Updates run through the engine, then the intake completes the
+    /// promise (the LambdaPromise runs on both the ok and the error
+    /// paths — the `do_error(Auto())` shape — so the tail always
+    /// follows the updates engine).
+    OnGetUpdatesChannelToggle {
+        updates: Box<telegram_api::Updates>,
+        tail: crate::chat_manager::ChatToggleTail,
+        promise: Promise<()>,
+    },
     /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
     /// (cpp:522, :364).
     OnGetDifference {
@@ -18133,6 +18708,20 @@ impl UmMessage {
                 // between them here
                 td.drain_sink();
                 crate::dialog_manager::on_migrate_chat_to_megagroup(td, chat_id, promise);
+            }
+            UmMessage::OnGetUpdatesChannelToggle {
+                updates,
+                tail,
+                promise,
+            } => {
+                // the empty promise stands in for the C++ `Promise<Unit>`
+                // the handler passes to `on_get_updates` — the lambda
+                // chain's only continuation is the intake tail below
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                td.drain_sink();
+                td.with_chat_intake(|chat_manager, user_manager, env| {
+                    tail.run(chat_manager, user_manager, env, promise);
+                });
             }
             UmMessage::OnGetDifference { difference } => {
                 td.with_updates_env(|um, env| um.on_get_difference(env, difference));
@@ -39905,6 +40494,18 @@ mod tests {
     /// seed_dialog_chats ladder (702/703 → 777, 704 → 778, …) so the
     /// per-test channels stay distinct and the existing assertions hold.
     fn seed_dialog_channel(td: &mut Td, id: i64, creator: bool, megagroup: bool) {
+        seed_dialog_channel_with_flags(td, id, creator, megagroup, false)
+    }
+
+    /// The [`seed_dialog_channel`] form with the forum flags — the
+    /// equal-state early-OK band reads them off the record.
+    fn seed_dialog_channel_with_flags(
+        td: &mut Td,
+        id: i64,
+        creator: bool,
+        megagroup: bool,
+        forum: bool,
+    ) {
         let crate::td::Td {
             global,
             option_manager,
@@ -39927,6 +40528,8 @@ mod tests {
                 creator,
                 broadcast: !megagroup,
                 megagroup,
+                forum,
+                forum_tabs: forum,
                 id,
                 access_hash: 777 + (id - 703).max(0),
                 title: if megagroup { "megagroup" } else { "channel" }.to_owned(),
@@ -45720,5 +46323,1104 @@ mod tests {
         }
         assert!(td.bot_info_net_completed.lock().is_empty(), "drained");
         assert!(td.bot_info_manager_pending_is_empty());
+    }
+
+    #[test]
+    fn channel_toggle_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_toggle_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn channel_toggle_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-toggles");
+        seed_dialog_chats(&mut td);
+        // 702 — the creator broadcast channel; 703 — the member
+        // broadcast; 704 — the creator megagroup.
+
+        // 1. toggleSupergroupSignMessages — the live arm dispatches
+        //    channels.toggleSignatures with the two bool bits
+        td.request(
+            1,
+            Function::toggleSupergroupSignMessages(td_api::toggleSupergroupSignMessages {
+                supergroup_id: 702,
+                sign_messages: true,
+                show_message_sender: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleSignatures::ID,
+        );
+        let body =
+            telegram_api::channels_toggleSignatures::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (702, 777));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.signatures_enabled && body.profiles_enabled);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the signatures CHAT_NOT_MODIFIED band — the !bot value
+        td.request(
+            2,
+            Function::toggleSupergroupSignMessages(td_api::toggleSupergroupSignMessages {
+                supergroup_id: 702,
+                sign_messages: false,
+                show_message_sender: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleSignatures::ID,
+        );
+        let body =
+            telegram_api::channels_toggleSignatures::parse(sent.query()).expect("the sent body");
+        assert!(!body.signatures_enabled && body.profiles_enabled);
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the signatures hard error band — the head + the error
+        td.request(
+            3,
+            Function::toggleSupergroupSignMessages(td_api::toggleSupergroupSignMessages {
+                supergroup_id: 702,
+                sign_messages: true,
+                show_message_sender: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleSignatures::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 4. the signatures megagroup band — the C++ 400, no query
+        td.request(
+            4,
+            Function::toggleSupergroupSignMessages(td_api::toggleSupergroupSignMessages {
+                supergroup_id: 704,
+                sign_messages: true,
+                show_message_sender: false,
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message signatures can't be toggled in supergroups")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 5. toggleSupergroupJoinToSendMessages — the megagroup arm
+        td.request(
+            5,
+            Function::toggleSupergroupJoinToSendMessages(
+                td_api::toggleSupergroupJoinToSendMessages {
+                    supergroup_id: 704,
+                    join_to_send_messages: true,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleJoinToSend::ID,
+        );
+        let body =
+            telegram_api::channels_toggleJoinToSend::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.enabled);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. the join-to-send CHAT_NOT_MODIFIED bot twin — the error
+        td.request(
+            6,
+            Function::toggleSupergroupJoinToSendMessages(
+                td_api::toggleSupergroupJoinToSendMessages {
+                    supergroup_id: 704,
+                    join_to_send_messages: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleJoinToSend::ID,
+        );
+        td.auth_manager.restore_is_bot(true);
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        td.auth_manager.restore_is_bot(false);
+        let error = error_of(&callback, 6);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHAT_NOT_MODIFIED")
+        );
+
+        // 7. toggleSupergroupJoinByRequest without a guard bot — no
+        //    input user, the flag bit clear
+        td.request(
+            7,
+            Function::toggleSupergroupJoinByRequest(td_api::toggleSupergroupJoinByRequest {
+                supergroup_id: 704,
+                join_by_request: true,
+                guard_bot_user_id: 0,
+                apply_to_invite_links: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleJoinRequest::ID,
+        );
+        let body =
+            telegram_api::channels_toggleJoinRequest::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.flags & 1, 0, "no guard bot on the wire");
+        assert!(body.guard_bot.is_none());
+        assert!(body.enabled && body.apply_to_invites);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. the unknown guard-bot band — the get_input_user failure is
+        //    the C++ TRY_RESULT_PROMISE error, no query
+        td.request(
+            8,
+            Function::toggleSupergroupJoinByRequest(td_api::toggleSupergroupJoinByRequest {
+                supergroup_id: 704,
+                join_by_request: true,
+                guard_bot_user_id: 999,
+                apply_to_invite_links: false,
+            }),
+        );
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "User not found")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 9. the join-request hard error band — the head + the error
+        td.request(
+            9,
+            Function::toggleSupergroupJoinByRequest(td_api::toggleSupergroupJoinByRequest {
+                supergroup_id: 704,
+                join_by_request: false,
+                guard_bot_user_id: 0,
+                apply_to_invite_links: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleJoinRequest::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 9);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 10. toggleSupergroupIsAllHistoryAvailable — the wire flag is
+        //     the negation (hidden prehistory)
+        td.request(
+            10,
+            Function::toggleSupergroupIsAllHistoryAvailable(
+                td_api::toggleSupergroupIsAllHistoryAvailable {
+                    supergroup_id: 704,
+                    is_all_history_available: true,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_togglePreHistoryHidden::ID,
+        );
+        let body = telegram_api::channels_togglePreHistoryHidden::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(!body.enabled, "available=true wires hidden=false");
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 10).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 11. the prehistory CHAT_NOT_MODIFIED band — the !bot value
+        td.request(
+            11,
+            Function::toggleSupergroupIsAllHistoryAvailable(
+                td_api::toggleSupergroupIsAllHistoryAvailable {
+                    supergroup_id: 704,
+                    is_all_history_available: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_togglePreHistoryHidden::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 11).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 12. the load-bearing gate order — the member broadcast hits
+        //     the rights band before the type band
+        td.request(
+            12,
+            Function::toggleSupergroupIsAllHistoryAvailable(
+                td_api::toggleSupergroupIsAllHistoryAvailable {
+                    supergroup_id: 703,
+                    is_all_history_available: true,
+                },
+            ),
+        );
+        let error = error_of(&callback, 12);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                400,
+                "Not enough rights to toggle all supergroup history availability"
+            )
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 13. toggleSupergroupCanHaveSponsoredMessages — the wire flag
+        //     is the negation (restricted)
+        td.request(
+            13,
+            Function::toggleSupergroupCanHaveSponsoredMessages(
+                td_api::toggleSupergroupCanHaveSponsoredMessages {
+                    supergroup_id: 702,
+                    can_have_sponsored_messages: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_restrictSponsoredMessages::ID,
+        );
+        let body = telegram_api::channels_restrictSponsoredMessages::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (702, 777));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.restricted, "can_have=false wires restricted=true");
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 14. the sponsored hard error band
+        td.request(
+            14,
+            Function::toggleSupergroupCanHaveSponsoredMessages(
+                td_api::toggleSupergroupCanHaveSponsoredMessages {
+                    supergroup_id: 702,
+                    can_have_sponsored_messages: true,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_restrictSponsoredMessages::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 15. toggleSupergroupHasAutomaticTranslation
+        td.request(
+            15,
+            Function::toggleSupergroupHasAutomaticTranslation(
+                td_api::toggleSupergroupHasAutomaticTranslation {
+                    supergroup_id: 702,
+                    has_automatic_translation: true,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleAutotranslation::ID,
+        );
+        let body = telegram_api::channels_toggleAutotranslation::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (702, 777));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.enabled);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 15).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 16. the autotranslation CHAT_NOT_MODIFIED band
+        td.request(
+            16,
+            Function::toggleSupergroupHasAutomaticTranslation(
+                td_api::toggleSupergroupHasAutomaticTranslation {
+                    supergroup_id: 702,
+                    has_automatic_translation: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleAutotranslation::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 16).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 17. toggleSupergroupHasHiddenMembers
+        td.request(
+            17,
+            Function::toggleSupergroupHasHiddenMembers(td_api::toggleSupergroupHasHiddenMembers {
+                supergroup_id: 704,
+                has_hidden_members: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleParticipantsHidden::ID,
+        );
+        let body = telegram_api::channels_toggleParticipantsHidden::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.enabled);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 17).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 18. the hidden-members hard error band
+        td.request(
+            18,
+            Function::toggleSupergroupHasHiddenMembers(td_api::toggleSupergroupHasHiddenMembers {
+                supergroup_id: 704,
+                has_hidden_members: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleParticipantsHidden::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 18);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 19. toggleSupergroupHasAggressiveAntiSpamEnabled
+        td.request(
+            19,
+            Function::toggleSupergroupHasAggressiveAntiSpamEnabled(
+                td_api::toggleSupergroupHasAggressiveAntiSpamEnabled {
+                    supergroup_id: 704,
+                    has_aggressive_anti_spam_enabled: true,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleAntiSpam::ID,
+        );
+        let body =
+            telegram_api::channels_toggleAntiSpam::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.enabled);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 19).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 20. the anti-spam CHAT_NOT_MODIFIED band
+        td.request(
+            20,
+            Function::toggleSupergroupHasAggressiveAntiSpamEnabled(
+                td_api::toggleSupergroupHasAggressiveAntiSpamEnabled {
+                    supergroup_id: 704,
+                    has_aggressive_anti_spam_enabled: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleAntiSpam::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 20).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 21. toggleSupergroupIsForum — the tabs bit rides the AND
+        td.request(
+            21,
+            Function::toggleSupergroupIsForum(td_api::toggleSupergroupIsForum {
+                supergroup_id: 704,
+                is_forum: true,
+                has_forum_tabs: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleForum::ID,
+        );
+        let body = telegram_api::channels_toggleForum::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.enabled && body.tabs);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 21).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 22. the forum equal-state band — a channel seeded with the
+        //     same forum flags answers the early OK without a query
+        //     (there is no optimistic local flip at the send leg)
+        seed_dialog_channel_with_flags(&mut td, 705, true, true, true);
+        td.request(
+            22,
+            Function::toggleSupergroupIsForum(td_api::toggleSupergroupIsForum {
+                supergroup_id: 705,
+                is_forum: true,
+                has_forum_tabs: true,
+            }),
+        );
+        assert!(matches!(
+            responses_of(&callback, 22).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(rec.sent.lock().is_empty(), "no query on the equal state");
+
+        // 23. toggleSupergroupIsBroadcastGroup — the gigagroup
+        //     conversion (the seed megagroup keeps restrict_all
+        //     permissions)
+        td.request(
+            23,
+            Function::toggleSupergroupIsBroadcastGroup(td_api::toggleSupergroupIsBroadcastGroup {
+                supergroup_id: 704,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_convertToGigagroup::ID,
+        );
+        let body =
+            telegram_api::channels_convertToGigagroup::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 23).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 24. the gigagroup CHAT_NOT_MODIFIED band — the value for bots
+        //     too (the C++ tail has no is_bot check)
+        td.request(
+            24,
+            Function::toggleSupergroupIsBroadcastGroup(td_api::toggleSupergroupIsBroadcastGroup {
+                supergroup_id: 704,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_convertToGigagroup::ID,
+        );
+        td.auth_manager.restore_is_bot(true);
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        td.auth_manager.restore_is_bot(false);
+        assert!(
+            matches!(responses_of(&callback, 24).first(), Some(Object::ok(_))),
+            "the bot twin resolves ok"
+        );
+
+        // 25. the gigagroup rights band — the member channel
+        td.request(
+            25,
+            Function::toggleSupergroupIsBroadcastGroup(td_api::toggleSupergroupIsBroadcastGroup {
+                supergroup_id: 703,
+            }),
+        );
+        let error = error_of(&callback, 25);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't convert the chat to a broadcast group")
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn channel_link_and_paid_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_link_and_paid_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn channel_link_and_paid_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-link-paid");
+        seed_dialog_chats(&mut td);
+        // 702 — the creator broadcast channel; 704 — the creator
+        // megagroup. The td_api chat_id is the encoded DialogId.
+        let enc =
+            |id: i64| crate::chat_manager::DialogId::from_channel_id(ChannelId::new(id)).get();
+
+        // 1. setChatDiscussionGroup — both sides wire their input
+        //    channels
+        td.request(
+            1,
+            Function::setChatDiscussionGroup(td_api::setChatDiscussionGroup {
+                chat_id: enc(702),
+                discussion_chat_id: enc(704),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setDiscussionGroup::ID,
+        );
+        let body =
+            telegram_api::channels_setDiscussionGroup::parse(sent.query()).expect("the sent body");
+        match (body.broadcast.as_ref(), body.group.as_ref()) {
+            (
+                Some(telegram_api::InputChannel::inputChannel(broadcast)),
+                Some(telegram_api::InputChannel::inputChannel(group)),
+            ) => {
+                assert_eq!((broadcast.channel_id, broadcast.access_hash), (702, 777));
+                assert_eq!((group.channel_id, group.access_hash), (704, 778));
+            }
+            other => panic!("the input channels: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the discussion boolFalse band — the LOG_IF still resolves
+        //    the value (the C++ has no error on false)
+        td.request(
+            2,
+            Function::setChatDiscussionGroup(td_api::setChatDiscussionGroup {
+                chat_id: enc(702),
+                discussion_chat_id: enc(704),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setDiscussionGroup::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the LINK_NOT_MODIFIED band — the value without a head
+        td.request(
+            3,
+            Function::setChatDiscussionGroup(td_api::setChatDiscussionGroup {
+                chat_id: enc(702),
+                discussion_chat_id: enc(704),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setDiscussionGroup::ID,
+        );
+        net_fail(sent, 400, "LINK_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the discussion hard error band — the bare forward (no
+        //    channel-error head, no intake)
+        td.request(
+            4,
+            Function::setChatDiscussionGroup(td_api::setChatDiscussionGroup {
+                chat_id: enc(702),
+                discussion_chat_id: enc(704),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_setDiscussionGroup::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 5. the invalid-ids band — the C++ 400, no query
+        td.request(
+            5,
+            Function::setChatDiscussionGroup(td_api::setChatDiscussionGroup {
+                chat_id: 0,
+                discussion_chat_id: 0,
+            }),
+        );
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid chat identifiers specified")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 6. setChatLocation — the geo point + address wire
+        td.request(
+            6,
+            Function::setChatLocation(td_api::setChatLocation {
+                chat_id: enc(704),
+                location: Some(td_api::ChatLocation {
+                    location: Some(td_api::Location {
+                        latitude: 59.9,
+                        longitude: 30.3,
+                        horizontal_accuracy: 15.0,
+                    }),
+                    address: "Nevsky 1".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editLocation::ID,
+        );
+        let body = telegram_api::channels_editLocation::parse(sent.query()).expect("the sent body");
+        match (body.channel.as_ref(), body.geo_point.as_ref()) {
+            (
+                Some(telegram_api::InputChannel::inputChannel(channel)),
+                Some(telegram_api::InputGeoPoint::inputGeoPoint(geo)),
+            ) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+                assert!((geo.lat - 59.9).abs() < 1e-6 && (geo.long - 30.3).abs() < 1e-6);
+                assert_eq!(geo.accuracy_radius, 15);
+            }
+            other => panic!("the channel/geo point: {other:?}"),
+        }
+        assert_eq!(body.address, "Nevsky 1");
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. the location hard error band — the head + the error
+        td.request(
+            7,
+            Function::setChatLocation(td_api::setChatLocation {
+                chat_id: enc(704),
+                location: Some(td_api::ChatLocation {
+                    location: Some(td_api::Location {
+                        latitude: 1.0,
+                        longitude: 2.0,
+                        horizontal_accuracy: 0.0,
+                    }),
+                    address: "x".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editLocation::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 8. the empty-location band — the C++ 400, no query
+        td.request(
+            8,
+            Function::setChatLocation(td_api::setChatLocation {
+                chat_id: enc(704),
+                location: Some(td_api::ChatLocation {
+                    location: None,
+                    address: String::new(),
+                }),
+            }),
+        );
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid chat location specified")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 9. setChatSlowModeDelay — the seconds wire
+        td.request(
+            9,
+            Function::setChatSlowModeDelay(td_api::setChatSlowModeDelay {
+                chat_id: enc(704),
+                slow_mode_delay: 60,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleSlowMode::ID,
+        );
+        let body =
+            telegram_api::channels_toggleSlowMode::parse(sent.query()).expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.seconds, 60);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 10. the slow-mode CHAT_NOT_MODIFIED band — the intake runs
+        //     with an empty promise first, then the !bot value
+        td.request(
+            10,
+            Function::setChatSlowModeDelay(td_api::setChatSlowModeDelay {
+                chat_id: enc(704),
+                slow_mode_delay: 30,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_toggleSlowMode::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 10).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 11. the slow-mode invalid-delay band — the C++ 400, no query
+        td.request(
+            11,
+            Function::setChatSlowModeDelay(td_api::setChatSlowModeDelay {
+                chat_id: enc(704),
+                slow_mode_delay: 7,
+            }),
+        );
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid new value for slow mode delay")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 12. reportSupergroupAntiSpamFalsePositive — the server id wire
+        td.request(
+            12,
+            Function::reportSupergroupAntiSpamFalsePositive(
+                td_api::reportSupergroupAntiSpamFalsePositive {
+                    supergroup_id: 704,
+                    message_id: 12345 << 20,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_reportAntiSpamFalsePositive::ID,
+        );
+        let body = telegram_api::channels_reportAntiSpamFalsePositive::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert_eq!(body.msg_id, 12345); // the server id — the shift went out on the wire
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. the false-positive boolFalse band — the LOG_IF still
+        //     resolves the value
+        td.request(
+            13,
+            Function::reportSupergroupAntiSpamFalsePositive(
+                td_api::reportSupergroupAntiSpamFalsePositive {
+                    supergroup_id: 704,
+                    message_id: 12346 << 20,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_reportAntiSpamFalsePositive::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 14. the false-positive hard error band — the head + the error
+        td.request(
+            14,
+            Function::reportSupergroupAntiSpamFalsePositive(
+                td_api::reportSupergroupAntiSpamFalsePositive {
+                    supergroup_id: 704,
+                    message_id: 12347 << 20,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_reportAntiSpamFalsePositive::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 15. setChatDirectMessagesGroup — the monoforum leg wires
+        //     broadcast_messages_allowed = true
+        td.request(
+            15,
+            Function::setChatDirectMessagesGroup(td_api::setChatDirectMessagesGroup {
+                chat_id: enc(702),
+                is_enabled: true,
+                paid_message_star_count: 100,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updatePaidMessagesPrice::ID,
+        );
+        let body = telegram_api::channels_updatePaidMessagesPrice::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (702, 777));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(body.broadcast_messages_allowed);
+        assert_eq!(body.send_paid_messages_stars, 100);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 15).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 16. setChatPaidMessageStarCount — the paid-message leg wires
+        //     broadcast_messages_allowed = false
+        td.request(
+            16,
+            Function::setChatPaidMessageStarCount(td_api::setChatPaidMessageStarCount {
+                chat_id: enc(704),
+                paid_message_star_count: 250,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updatePaidMessagesPrice::ID,
+        );
+        let body = telegram_api::channels_updatePaidMessagesPrice::parse(sent.query())
+            .expect("the sent body");
+        match body.channel.as_ref() {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (704, 778));
+            }
+            other => panic!("the input channel: {other:?}"),
+        }
+        assert!(!body.broadcast_messages_allowed);
+        assert_eq!(body.send_paid_messages_stars, 250);
+        net_complete(sent, empty_updates_answer());
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 16).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 17. the paid-price CHAT_NOT_MODIFIED band — the !bot value
+        td.request(
+            17,
+            Function::setChatPaidMessageStarCount(td_api::setChatPaidMessageStarCount {
+                chat_id: enc(704),
+                paid_message_star_count: 300,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_updatePaidMessagesPrice::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 17).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 18. the paid-price range band — the C++ 400, no query
+        td.request(
+            18,
+            Function::setChatPaidMessageStarCount(td_api::setChatPaidMessageStarCount {
+                chat_id: enc(704),
+                paid_message_star_count: 2_000_000,
+            }),
+        );
+        let error = error_of(&callback, 18);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid number of Telegram Stars specified")
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no query on the bands");
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
     }
 }
