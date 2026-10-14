@@ -12,20 +12,12 @@ use crate::dialog_id::DialogId;
 use crate::td_api;
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
-use tdutils::status::Status;
 
 /// The `G()`/`td_` surface of the manager.
 pub trait StatisticsManagerEnv {
     fn close_flag(&self) -> bool;
 
     fn send_update(&mut self, update: td_api::Update);
-
-    /// `ChatManager::get_channel_statistics_dc_id` — the collapsed sync
-    /// form (the dc-id answer is 0/unknown until the net step).
-    fn get_channel_statistics_dc_id(
-        &mut self,
-        dialog_id: DialogId,
-    ) -> std::result::Result<(), Status>;
 
     // ---- the query seams ([blocked: net]; the promises park) ----
     fn send_get_channel_stats_query(&mut self, dialog_id: DialogId, is_dark: bool) {
@@ -183,7 +175,10 @@ impl StatisticsManager {
         StatisticsManager::default()
     }
 
-    /// `get_channel_statistics` (cpp:746-758).
+    /// `get_channel_statistics` (cpp:746-758) — the dc_id chain lives at
+    /// the Td level (`Td::get_channel_statistics_dc_chain`, the
+    /// collapsed manager flow); the manager surface keeps the
+    /// parked seam for the manager-level callers.
     pub fn get_channel_statistics(
         &mut self,
         env: &mut impl StatisticsManagerEnv,
@@ -367,13 +362,6 @@ mod tests {
 
         fn send_update(&mut self, update: td_api::Update) {
             self.updates.push(update);
-        }
-
-        fn get_channel_statistics_dc_id(
-            &mut self,
-            _dialog_id: DialogId,
-        ) -> std::result::Result<(), Status> {
-            Ok(())
         }
 
         fn send_get_channel_stats_query(&mut self, dialog_id: DialogId, is_dark: bool) {

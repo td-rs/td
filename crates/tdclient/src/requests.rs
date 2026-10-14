@@ -9890,13 +9890,12 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                     Object::chatStatisticsChannel(v)
                 }
             });
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_channel_statistics(
-                &mut env,
-                crate::dialog_id::DialogId::new(request.chat_id),
+            // StatisticsManager::get_channel_statistics (cpp:746-758) —
+            // the dc_id chain over the real ChatManager flow (the §2
+            // flip: the DC refire rides the GetFullChannel family; the
+            // stats query seam itself parks until net-drain 38)
+            td.get_channel_statistics_dc_chain(
+                crate::chat_manager::DialogId::new(request.chat_id),
                 request.is_dark,
                 promise,
             );
