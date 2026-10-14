@@ -1922,6 +1922,17 @@ pub(crate) enum UserNetKind {
     /// `on_set_emoji_status` (the local-user apply, cpp:6765), the
     /// error band refetches the recent list first (cpp:1399-1401).
     UpdateEmojiStatus,
+    /// `UpdateColorQuery` (UserManager.cpp:890) — the
+    /// `account.updateColor` query (the user leg; the channel twins
+    /// ride the ChatManager handle); the kind carries the answer's
+    /// `on_update_accent_color_success` members (`for_profile_`,
+    /// `accent_color_id_`, `background_custom_emoji_id_`), the promise
+    /// rides the family queue.
+    UpdateColor {
+        for_profile: bool,
+        accent_color_id: AccentColorId,
+        background_custom_emoji_id: CustomEmojiId,
+    },
     /// `GetDefaultEmojiStatusesQuery` (cpp:165).
     GetDefault,
     /// `GetChannelDefaultEmojiStatusesQuery` (cpp:209).
@@ -2519,6 +2530,9 @@ pub struct UserManager {
     /// the cloned status and the promise; the ok answer runs
     /// `on_set_emoji_status` (cpp:6765).
     pending_update_emoji_status_queries: Vec<(Option<EmojiStatus>, Promise<()>)>,
+    /// The `UpdateColorQuery` promises (UserManager.cpp:897-931) — the
+    /// `setAccentColor`/`setChatProfileAccentColor` user-leg promises.
+    pending_update_color_queries: Vec<Promise<()>>,
     /// The load-gated td_api requests (see
     /// [`PendingUserRequest`]) — the request-actor re-run analogue: parked
     /// with the request id while the contacts load, re-run to completion
@@ -8436,20 +8450,23 @@ impl UserManager {
         promise.set_value(());
     }
 
-    /// `UserManager::set_accent_color` (UserManager.cpp:6756-6765) —
-    /// returns the transformed arguments for the (net)
-    /// `UpdateColorQuery`; the id-derived default collapses to the
-    /// invalid marker.
-    pub fn set_accent_color_local(
+    /// `UserManager::set_accent_color` (UserManager.cpp:6756-6765) — the
+    /// local gate + the id-derived-default collapse, then the
+    /// `UpdateColorQuery` send over the user net handle (the promise
+    /// rides the family queue; the ok answer runs
+    /// [`Self::on_update_accent_color_success`]).
+    pub fn set_accent_color(
         &mut self,
         accent_color_id: AccentColorId,
         background_custom_emoji_id: CustomEmojiId,
-    ) -> Result<(AccentColorId, CustomEmojiId), Status> {
+        mut promise: Promise<()>,
+    ) {
         if !accent_color_id.is_valid() {
-            return Err(Status::error(
+            promise.set_error(Status::error(
                 400,
                 "Invalid accent color identifier specified",
             ));
+            return;
         }
         let accent_color_id =
             if accent_color_id == AccentColorId::from_peer_id(self.get_my_id().get()) {
@@ -8457,7 +8474,66 @@ impl UserManager {
             } else {
                 accent_color_id
             };
-        Ok((accent_color_id, background_custom_emoji_id))
+        self.send_update_color_query(false, accent_color_id, background_custom_emoji_id, promise);
+    }
+
+    /// `UserManager::set_profile_accent_color` (UserManager.cpp:6767-6770)
+    /// — no local gates (the C++ sends directly); the profile variant of
+    /// the `UpdateColorQuery`.
+    pub fn set_profile_accent_color(
+        &mut self,
+        profile_accent_color_id: AccentColorId,
+        profile_background_custom_emoji_id: CustomEmojiId,
+        promise: Promise<()>,
+    ) {
+        self.send_update_color_query(
+            true,
+            profile_accent_color_id,
+            profile_background_custom_emoji_id,
+            promise,
+        );
+    }
+
+    /// `UpdateColorQuery::send` (UserManager.cpp:901-919) — the COLOR
+    /// flag + the peerColor pair; the invalid accent id sends the bare
+    /// (reset) form.
+    fn send_update_color_query(
+        &mut self,
+        for_profile: bool,
+        accent_color_id: AccentColorId,
+        background_custom_emoji_id: CustomEmojiId,
+        promise: Promise<()>,
+    ) {
+        use tdmtproto::telegram_api;
+        let color = if accent_color_id.is_valid() {
+            let mut color_flags = 1; // telegram_api::peerColor::COLOR_MASK
+            if background_custom_emoji_id.is_valid() {
+                color_flags |= 2; // peerColor::BACKGROUND_EMOJI_ID_MASK
+            }
+            Some(telegram_api::PeerColor::peerColor(
+                telegram_api::peerColor {
+                    flags: color_flags,
+                    color: accent_color_id.get(),
+                    background_emoji_id: background_custom_emoji_id.get(),
+                },
+            ))
+        } else {
+            None
+        };
+        self.pending_update_color_queries.push(promise);
+        self.send_user_query(
+            UserNetKind::UpdateColor {
+                for_profile,
+                accent_color_id,
+                background_custom_emoji_id,
+            },
+            telegram_api::Function::account_updateColor(telegram_api::account_updateColor {
+                flags: if color.is_some() { 4 } else { 0 }, // COLOR_MASK
+                for_profile,
+                color,
+            }),
+            "account.updateColor",
+        );
     }
 
     /// `UserManager::on_update_accent_color_success`
@@ -8488,6 +8564,36 @@ impl UserManager {
             );
         }
         self.update_user(env, user_id, false, false);
+    }
+
+    /// `UserManager::on_update_user_is_blocked` +
+    /// `on_update_user_full_is_blocked` (UserManager.cpp:4143-4168) —
+    /// the full-record fan-in of the dialog block toggles.
+    pub fn on_update_user_is_blocked(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        is_blocked: bool,
+        is_blocked_for_stories: bool,
+    ) {
+        if !user_id.is_valid() {
+            tdutils::log_error!("Receive invalid {user_id:?}");
+            return;
+        }
+        if !self.get_user_full_force(env, user_id, "on_update_user_is_blocked") {
+            return;
+        }
+        {
+            let stored = self.users_full.get_mut(&user_id.get()).unwrap();
+            if stored.is_blocked != is_blocked
+                || stored.is_blocked_for_stories != is_blocked_for_stories
+            {
+                stored.is_blocked = is_blocked;
+                stored.is_blocked_for_stories = is_blocked_for_stories;
+                stored.is_changed = true;
+            }
+        }
+        self.update_user_full(env, user_id, "on_update_user_is_blocked", false);
     }
 
     /// `UserManager::set_emoji_status` (UserManager.cpp:6746-6762) — the
@@ -14283,6 +14389,17 @@ impl UserManager {
         }
     }
 
+    /// Pop the head `UpdateColorQuery` promise (UserManager.cpp:926-931)
+    /// — the Bool answer runs `on_update_accent_color_success` then
+    /// flushes it.
+    pub(crate) fn take_update_color_query(&mut self) -> Option<Promise<()>> {
+        if self.pending_update_color_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_update_color_queries.remove(0))
+        }
+    }
+
     /// The test read of `saved_contact_count_` (the reset band assert).
     #[cfg(test)]
     pub(crate) fn saved_contact_count_for_test(&self) -> i32 {
@@ -14632,6 +14749,28 @@ impl UserManager {
 mod tests {
     use super::*;
     use tdutils::promise::PromiseCreator;
+
+    /// The recording slot behind [`unit_promise_slot`].
+    type UnitPromiseSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    /// A `Promise<()>` recording slot (the promise-slot shape of the
+    /// td.rs netted tests).
+    fn unit_promise_slot() -> (tdutils::promise::Promise<()>, UnitPromiseSlot) {
+        struct Rec(UnitPromiseSlot);
+        impl tdutils::promise::PromiseInterface<()> for Rec {
+            fn set_value(&mut self, _value: ()) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(()));
+            }
+            fn set_error(&mut self, error: tdutils::status::Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (
+            tdutils::promise::Promise::from_interface(Rec(slot.clone())),
+            slot,
+        )
+    }
 
     fn test_env() -> (TempEnv, UserManager) {
         TempEnv::new("unit")
@@ -18040,20 +18179,29 @@ mod tests {
         let env = &mut temp.env(false);
 
         // The invalid id is the hard error; the id-derived default
-        // collapses to the invalid marker.
+        // collapses to the invalid marker (the net send halves park on
+        // the family queue — the net-inert test env holds no handle, so
+        // only the gate bands and the park shape run here).
+        let (promise, invalid_slot) = unit_promise_slot();
+        um.set_accent_color(AccentColorId::new(-1), CustomEmojiId::default(), promise);
         assert!(matches!(
-            um.set_accent_color_local(AccentColorId::new(-1), CustomEmojiId::default()),
-            Err(status) if status.message() == "Invalid accent color identifier specified"
+            invalid_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Err(ref status))
+                if status.message() == "Invalid accent color identifier specified"
         ));
-        let (collapsed, _) = um
-            .set_accent_color_local(AccentColorId::from_peer_id(5), CustomEmojiId::new(9))
-            .unwrap();
-        assert_eq!(collapsed, AccentColorId::default());
-        let (passed, emoji) = um
-            .set_accent_color_local(AccentColorId::new(3), CustomEmojiId::new(9))
-            .unwrap();
-        assert_eq!(passed.get(), 3);
-        assert_eq!(emoji.get(), 9);
+        let (promise, collapsed_slot) = unit_promise_slot();
+        um.set_accent_color(
+            AccentColorId::from_peer_id(5),
+            CustomEmojiId::new(9),
+            promise,
+        );
+        let (promise, passed_slot) = unit_promise_slot();
+        um.set_accent_color(AccentColorId::new(3), CustomEmojiId::new(9), promise);
+        // the two valid sends parked their promises on the family queue
+        // (the id-derived default collapse happens inside the first)
+        assert_eq!(um.pending_update_color_queries.len(), 2);
+        assert!(collapsed_slot.lock().unwrap().is_none());
+        assert!(passed_slot.lock().unwrap().is_none());
 
         // The success appliers mutate me and emit.
         um.on_update_accent_color_success(env, false, AccentColorId::new(3), CustomEmojiId::new(9));

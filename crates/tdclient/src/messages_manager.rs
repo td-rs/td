@@ -29542,6 +29542,16 @@ pub trait MmRequestContext:
         _view_as_messages: bool,
     ) {
     }
+    /// `user_manager_->on_update_user_is_blocked(user_id, is_blocked,
+    /// is_blocked_for_stories)` (UserManager.cpp:4143) — the
+    /// `set_dialog_is_blocked` user-leg fan-in.
+    fn on_update_user_is_blocked(
+        &mut self,
+        _user_id: crate::user_manager::UserId,
+        _is_blocked: bool,
+        _is_blocked_for_stories: bool,
+    ) {
+    }
 
     // -- the [blocked: net] wire tails; the promise lands unanswered
     //    offline (the translation-manager convention).
@@ -30143,6 +30153,129 @@ pub fn update_dialog_silent_send_message(
             },
         ));
     true
+}
+
+/// `MessagesManager::on_update_dialog_is_translatable`
+/// (MessagesManager.cpp:28775-28793) — the net-answer revert intake of
+/// the translations toggle error tail.
+pub fn on_update_dialog_is_translatable(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    is_translatable: bool,
+) {
+    if ctx.auth_is_bot() {
+        // just in case
+        return;
+    }
+    if !dialog_id.is_valid() {
+        tdutils::log_error!("Receive marking as unread of invalid {}", dialog_id.get());
+        return;
+    }
+    // get_dialog_force — the in-memory half; the db-load leg is the
+    // dialog-db receive seam
+    match manager.get_dialog(dialog_id) {
+        Some(d) if d.is_translatable != is_translatable => {
+            set_dialog_is_translatable(manager, ctx, dialog_id, is_translatable);
+        }
+        _ => {
+            // no dialog (nothing to do) or equal — nothing to do
+        }
+    }
+}
+
+/// `MessagesManager::on_update_dialog_view_as_messages`
+/// (MessagesManager.cpp:28672-28690) — the net-answer revert intake of
+/// the view-as-messages toggle error tail (the setter's equal-value
+/// branch covers the C++ `is_view_as_messages_inited` repair).
+pub fn on_update_dialog_view_as_messages(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    view_as_messages: bool,
+) {
+    if ctx.auth_is_bot() {
+        // just in case
+        return;
+    }
+    if !dialog_id.is_valid() {
+        tdutils::log_error!("Receive view_as_messages for invalid {}", dialog_id.get());
+        return;
+    }
+    if manager.get_dialog(dialog_id).is_none() {
+        // nothing to do
+        return;
+    }
+    set_dialog_view_as_messages(
+        manager,
+        ctx,
+        dialog_id,
+        view_as_messages,
+        "on_update_dialog_view_as_messages",
+    );
+}
+
+/// `MessagesManager::set_dialog_is_blocked` (MessagesManager.cpp:28862-28911)
+/// — the flag flip + the `updateChatBlockList` emission; the user leg
+/// fans into the user-full record (the action-bar repair and the
+/// secret-chat iteration ride their planes).
+pub fn set_dialog_is_blocked(
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    dialog_id: DialogId,
+    is_blocked: bool,
+    is_blocked_for_stories: bool,
+) {
+    if ctx.auth_is_bot() {
+        // just in case
+        return;
+    }
+    let old = manager
+        .get_dialog(dialog_id)
+        .map(|d| (d.is_blocked, d.is_blocked_for_stories))
+        .unwrap_or_else(|| panic!("set_dialog_is_blocked without {dialog_id:?}"));
+    assert!(old != (is_blocked, is_blocked_for_stories));
+    {
+        let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+        d.is_blocked = is_blocked;
+        d.is_blocked_for_stories = is_blocked_for_stories;
+        d.is_is_blocked_inited = true;
+        d.is_is_blocked_for_stories_inited = true;
+    }
+    on_dialog_updated(manager, dialog_id, "set_dialog_is_blocked");
+    let is_update_new_chat_sent = manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.is_update_new_chat_sent);
+    if !is_update_new_chat_sent {
+        log_error!(
+            "Wrong {} in set_dialog_is_blocked (updateNewChat not sent yet)",
+            dialog_id.get()
+        );
+    }
+    // `BlockListId(is_blocked, is_blocked_for_stories).get_block_list_object()`
+    // (BlockListId.h:57-69)
+    let block_list = if is_blocked {
+        Some(td_api::BlockList::blockListMain(td_api::blockListMain))
+    } else if is_blocked_for_stories {
+        Some(td_api::BlockList::blockListStories(
+            td_api::blockListStories,
+        ))
+    } else {
+        None
+    };
+    let chat_id = ctx.get_chat_id_object(dialog_id, "updateChatBlockList");
+    ctx.as_read_state()
+        .send_update(td_api::Object::updateChatBlockList(
+            td_api::updateChatBlockList {
+                chat_id,
+                block_list,
+            },
+        ));
+    if dialog_id.get_type() == DialogType::User {
+        ctx.on_update_user_is_blocked(dialog_id.get_user_id(), is_blocked, is_blocked_for_stories);
+        // the know_action_bar repair + for_each_secret_chat_with_user
+        // (cpp:28887-28909) — the action-bar/secret-chat planes
+    }
 }
 
 /// `MessagesManager::set_dialog_is_translatable` (MessagesManager.cpp:) —

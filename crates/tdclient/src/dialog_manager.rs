@@ -43,8 +43,8 @@
 //! | `chat_manager_->get_chat_has_protected_content` / `get_channel_has_protected_content` (cpp:2285/:2288/:2302/:2305) | `false` |
 //! | `messages_manager_->report_dialog_from_action_bar` (cpp:2835) | `{is_reported: false, know_action_bar: false}` (the empty option/text/message argument set is the only caller-visible shape until MessagesManager) |
 //! | `messages_manager_->can_report_message` (cpp:2849) | `Ok` (no messages exist until MessagesManager) |
-//! | the peer-settings/report/blocked/toggle query actors (`UpdatePeerSettingsQuery`, `ReportPeerQuery`, `ReportProfilePhotoQuery`, `ReportEncryptedSpamQuery`, `GetPeerSettingsQuery`, `GetBlockedDialogsQuery`, `GetDialogUnreadMarksQuery`, `ReorderPinnedDialogsQuery`, `ToggleDialogIsBlockedQuery`, `ToggleDialogUnreadMarkQuery`, `ToggleDialogPinQuery`, `ToggleDialogTranslationsQuery`, `ToggleViewForumAsMessagesQuery`, `EditDialogPhotoQuery`, `SaveDefaultSendAsQuery`, `EditPeerFoldersQuery`, `SetHistoryTtlQuery`, `SetChatThemeQuery`, `SetChatPhotoQuery` upload tail) | the send is `[blocked: net]` — the promise completes with 500 "Network is not implemented yet"; the `on_result`/`on_error` halves land with the net step (the rights-gated five — `MigrateChatQuery`, `EditDialogTitleQuery`, `EditChatDefaultBannedRightsQuery`, `ToggleNoForwardsQuery`, `CheckUsernameQuery`/`CheckChannelUsernameQuery` — dispatch over the dialog net handle) |
-//! | the erase-log-event promise (`get_erase_log_event_promise`) | not wired — the C++ erases the mirror on settlement, success or error (LogEventHelper.cpp:42-52); the Rust mirrors stay until the net step can complete them (net-step residue: on error paths the Rust re-saves where the C++ erases) |
+//! | the peer-settings/report/blocked/toggle query actors (`GetPeerSettingsQuery`, `EditDialogPhotoQuery`, `SaveDefaultSendAsQuery`, `EditPeerFoldersQuery`, `SetHistoryTtlQuery`, `SetChatPhotoQuery` upload tail) | the send is `[blocked: net]` — the promise completes with 500 "Network is not implemented yet"; the `on_result`/`on_error` halves land with the net step (the thirteen §3.4 families — `GetDialogUnreadMarksQuery`, `ReportPeerQuery`, `GetBlockedDialogsQuery`, `UpdatePeerSettingsQuery`, `ReportEncryptedSpamQuery`, `ReorderPinnedDialogsQuery`, `ToggleDialogIsBlockedQuery`, `ToggleDialogUnreadMarkQuery`, `ToggleDialogPinQuery`, `ToggleDialogTranslationsQuery`, `ToggleViewForumAsMessagesQuery`, `SetChatThemeQuery` + the `UpdateColorQuery` user leg — dispatch over the dialog/user net handles) |
+//! | the erase-log-event promise (`get_erase_log_event_promise`) | wired for the §3.4 toggle/report families (the query-carried promise erases the mirror on settlement, success or error, LogEventHelper.cpp:42-52); the remaining mirrors adopt it with their net slices |
 //! | `get_channel_first_username` (RecentDialogList.cpp:57) | channel dialogs persist by id — the C++ `@username` form arrives with the ChatManager username read |
 //! | `file_manager_` file views / `resume_upload` + `UploadDialogPhotoCallback` + `being_uploaded_dialog_photos_` (cpp:2398-2406/:2498-2593) | `[blocked: files]` — set_dialog_photo ports the gates and the empty/previous-photo validation, then reaches the net-blocked query |
 //! | `messages_manager_->create_dialog` / `sort_dialogs_by_order` / `can_add_dialog_to_filter` (cpp:3291/:3414/:3385) | local no-op completion / unsorted truncation / `Ok` |
@@ -1126,6 +1126,73 @@ pub(crate) enum DialogNetKind {
     CheckChannelUsername {
         channel_id: Option<crate::chat_manager::ChannelId>,
     },
+    /// `GetDialogUnreadMarksQuery` (DialogManager.cpp:450) — internal,
+    /// init-live (`load_dialog_marks_as_unread`); fire-and-forget (the
+    /// on_error ignores).
+    GetDialogUnreadMarks,
+    /// `ReportPeerQuery` (DialogManager.cpp:478) — the kind carries the
+    /// dialog for the error tail.
+    ReportPeer {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `GetBlockedDialogsQuery` (DialogManager.cpp:728) — the kind
+    /// carries the handler's `offset_`/`limit_` members for the
+    /// `on_get_blocked_dialogs` intake.
+    GetBlockedDialogs { offset: i32, limit: i32 },
+    /// `UpdatePeerSettingsQuery` (DialogManager.cpp:641) — the kind
+    /// carries the dialog for the `on_get_peer_settings` intake and the
+    /// error tail.
+    UpdatePeerSettings {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ReportEncryptedSpamQuery` (DialogManager.cpp:688) — the kind
+    /// carries the secret dialog for the error tail (the action-bar
+    /// reload resolves the user from it).
+    ReportEncryptedSpam {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ReorderPinnedDialogsQuery` (DialogManager.cpp:784) — the kind
+    /// carries the handler's `folder_id_` member for the
+    /// `on_update_pinned_dialogs` tail.
+    ReorderPinnedDialogs { folder_id: i32 },
+    /// `ToggleDialogIsBlockedQuery` (DialogManager.cpp:1043) — the kind
+    /// carries the dialog for the error tail.
+    ToggleDialogIsBlocked {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ToggleDialogUnreadMarkQuery` (DialogManager.cpp:1094) — the kind
+    /// carries the dialog and the handler's `saved_messages_topic_id_`/
+    /// `is_marked_as_unread_` members (the on_error revert tail reads
+    /// them).
+    ToggleDialogUnreadMark {
+        dialog_id: crate::dialog_id::DialogId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+        is_marked_as_unread: bool,
+    },
+    /// `ToggleDialogPinQuery` (DialogManager.cpp:1161) — the kind
+    /// carries the dialog for the error tail.
+    ToggleDialogPin {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ToggleDialogTranslationsQuery` (DialogManager.cpp:1207) — the
+    /// kind carries the dialog and the handler's `is_translatable_`
+    /// member (the on_error revert tail reads it).
+    ToggleDialogTranslations {
+        dialog_id: crate::dialog_id::DialogId,
+        is_translatable: bool,
+    },
+    /// `ToggleViewForumAsMessagesQuery` (DialogManager.cpp:1254) — the
+    /// kind carries the dialog and the handler's `view_as_messages_`
+    /// member (the on_error revert tail reads it).
+    ToggleViewForumAsMessages {
+        dialog_id: crate::dialog_id::DialogId,
+        view_as_messages: bool,
+    },
+    /// `SetChatThemeQuery` (DialogManager.cpp:995) — the kind carries
+    /// the dialog for the error tail.
+    SetChatTheme {
+        dialog_id: crate::dialog_id::DialogId,
+    },
 }
 
 /// `DialogManager` — the state of the C++ DialogManager actor that exists in
@@ -1171,6 +1238,37 @@ pub struct DialogManager {
     /// (DialogManager.cpp:62/:87) — the `checkChatUsername` object
     /// promises behind the C++ error→result mapping lambda (cpp:3074-3092).
     pub(crate) pending_check_username: Vec<Promise<crate::td_api::Object>>,
+    /// The `ReportPeerQuery` promises (DialogManager.cpp:480) — the
+    /// `reportChat` object promises.
+    pub(crate) pending_report_peer: Vec<Promise<crate::td_api::Object>>,
+    /// The `GetBlockedDialogsQuery` promises (DialogManager.cpp:730) —
+    /// the `getBlockedChats` object promises.
+    pub(crate) pending_get_blocked_dialogs: Vec<Promise<crate::td_api::Object>>,
+    /// The `UpdatePeerSettingsQuery` promises (DialogManager.cpp:643) —
+    /// the erase-log-event-wrapped caller promises.
+    pub(crate) pending_update_peer_settings: Vec<Promise<()>>,
+    /// The `ReportEncryptedSpamQuery` promises (DialogManager.cpp:690).
+    pub(crate) pending_report_encrypted_spam: Vec<Promise<()>>,
+    /// The `ReorderPinnedDialogsQuery` promises (DialogManager.cpp:786)
+    /// — the erase-log-event-wrapped mirrors.
+    pub(crate) pending_reorder_pinned_dialogs: Vec<Promise<()>>,
+    /// The `ToggleDialogIsBlockedQuery` promises
+    /// (DialogManager.cpp:1045) — the erase-log-event-wrapped mirrors.
+    pub(crate) pending_toggle_dialog_is_blocked: Vec<Promise<()>>,
+    /// The `ToggleDialogUnreadMarkQuery` promises
+    /// (DialogManager.cpp:1096) — the erase-log-event-wrapped mirrors.
+    pub(crate) pending_toggle_dialog_unread_mark: Vec<Promise<()>>,
+    /// The `ToggleDialogPinQuery` promises (DialogManager.cpp:1163) —
+    /// the erase-log-event-wrapped mirrors.
+    pub(crate) pending_toggle_dialog_pin: Vec<Promise<()>>,
+    /// The `ToggleDialogTranslationsQuery` promises
+    /// (DialogManager.cpp:1209) — the erase-log-event-wrapped mirrors.
+    pub(crate) pending_toggle_dialog_translations: Vec<Promise<()>>,
+    /// The `ToggleViewForumAsMessagesQuery` promises
+    /// (DialogManager.cpp:1256) — the erase-log-event-wrapped mirrors.
+    pub(crate) pending_toggle_view_forum_as_messages: Vec<Promise<()>>,
+    /// The `SetChatThemeQuery` promises (DialogManager.cpp:997).
+    pub(crate) pending_set_chat_theme: Vec<Promise<()>>,
 }
 
 impl Default for DialogManager {
@@ -1199,6 +1297,17 @@ impl DialogManager {
             pending_edit_chat_default_banned_rights: Vec::new(),
             pending_toggle_no_forwards: Vec::new(),
             pending_check_username: Vec::new(),
+            pending_report_peer: Vec::new(),
+            pending_get_blocked_dialogs: Vec::new(),
+            pending_update_peer_settings: Vec::new(),
+            pending_report_encrypted_spam: Vec::new(),
+            pending_reorder_pinned_dialogs: Vec::new(),
+            pending_toggle_dialog_is_blocked: Vec::new(),
+            pending_toggle_dialog_unread_mark: Vec::new(),
+            pending_toggle_dialog_pin: Vec::new(),
+            pending_toggle_dialog_translations: Vec::new(),
+            pending_toggle_view_forum_as_messages: Vec::new(),
+            pending_set_chat_theme: Vec::new(),
         }
     }
 
@@ -1768,9 +1877,10 @@ pub fn is_dialog_action_unneeded(td: &mut Td, dialog_id: DialogId) -> bool {
 }
 
 /// `DialogManager::load_dialog_marks_as_unread` (DialogManager.cpp:2800-2803)
-/// — the `GetDialogUnreadMarksQuery` send is [blocked: net] (stub
-/// inventory); until it can run, the pmc flag stays unset exactly like the
-/// C++ before a successful fetch.
+/// — the `GetDialogUnreadMarksQuery` send rides the dialog net handle;
+/// until a successful fetch the pmc flag stays unset, so the load
+/// re-runs until the answer lands (the C++ `fetched_marks_as_unread`
+/// set happens in the query's `on_result`).
 pub fn load_dialog_marks_as_unread(td: &mut Td) {
     if td
         .global
@@ -1778,7 +1888,17 @@ pub fn load_dialog_marks_as_unread(td: &mut Td) {
         .get("fetched_marks_as_unread")
         .is_empty()
     {
-        tracing::info!("Fetch dialog unread marks — [blocked: net]");
+        tracing::info!("Fetch dialog unread marks");
+        td.dialog_manager.send_dialog_net_query(
+            DialogNetKind::GetDialogUnreadMarks,
+            tdmtproto::telegram_api::Function::messages_getDialogUnreadMarks(
+                tdmtproto::telegram_api::messages_getDialogUnreadMarks {
+                    flags: 0,
+                    parent_peer: None,
+                },
+            ),
+            "messages.getDialogUnreadMarks",
+        );
     }
 }
 
@@ -1808,15 +1928,15 @@ pub fn can_report_dialog(td: &mut Td, dialog_id: DialogId) -> bool {
     }
 }
 
-/// `DialogManager::report_dialog` (DialogManager.cpp:2824-2851) — the
-/// action-bar intake and the `ReportPeerQuery` send are stub inventory;
-/// `can_report_message` is `Ok` (no messages exist).
+/// `DialogManager::report_dialog` (DialogManager.cpp:2824-2851) —
+/// `can_report_message` is `Ok` (no messages exist); the
+/// `ReportPeerQuery` send rides the dialog net handle.
 pub fn report_dialog(
     td: &mut Td,
     dialog_id: DialogId,
-    _option_id: &str,
-    _message_ids: &[crate::chat_manager::MessageId],
-    _text: &str,
+    option_id: &[u8],
+    message_ids: &[crate::chat_manager::MessageId],
+    text: &str,
     mut promise: Promise<crate::td_api::Object>,
 ) {
     let mut access = check_dialog_access(td, dialog_id, true, AccessRights::Read, "report_dialog");
@@ -1833,13 +1953,31 @@ pub fn report_dialog(
         return;
     }
 
-    for _message_id in _message_ids {
+    for _message_id in message_ids {
         // messages_manager_->can_report_message — Ok (stub inventory).
     }
 
-    // ReportPeerQuery send — [blocked: net] (stub inventory); the
-    // MESSAGE_ID_REQUIRED on_error mapping lands with the net step.
-    promise_unimplemented(&mut promise);
+    // `ReportPeerQuery::send` (DialogManager.cpp:488-494) — the Read
+    // input peer (CHECKed in the C++ — the access gate above guarantees
+    // it; can_report_dialog already rejected the secret-chat null peer).
+    let input_peer = get_input_peer(td, dialog_id, AccessRights::Read)
+        .expect("the access gate guaranteed the peer");
+    td.dialog_manager.pending_report_peer.push(promise);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::ReportPeer { dialog_id },
+        tdmtproto::telegram_api::Function::messages_report(
+            tdmtproto::telegram_api::messages_report {
+                peer: Some(Box::new(input_peer)),
+                id: message_ids
+                    .iter()
+                    .map(|&message_id| message_id.get_server_message_id().get())
+                    .collect(),
+                option: option_id.to_vec(),
+                message: text.to_owned(),
+            },
+        ),
+        "messages.report",
+    );
 }
 
 /// `DialogManager::report_dialog_photo` (DialogManager.cpp:2852-2875) —
@@ -1933,8 +2071,9 @@ impl BlockListId {
     }
 }
 
-/// `DialogManager::get_blocked_dialogs` (DialogManager.cpp:3583-3600) — the
-/// `GetBlockedDialogsQuery` send is [blocked: net] (stub inventory).
+/// `DialogManager::get_blocked_dialogs` (DialogManager.cpp:3583-3600)
+/// — the `GetBlockedDialogsQuery` send rides the dialog net handle (the
+/// `my_stories_from` flag carries the Stories block list).
 pub fn get_blocked_dialogs(
     td: &mut Td,
     block_list: Option<&crate::td_api::BlockList>,
@@ -1942,7 +2081,6 @@ pub fn get_blocked_dialogs(
     limit: i32,
     mut promise: Promise<crate::td_api::Object>,
 ) {
-    let _ = td;
     if offset < 0 {
         promise.set_error(Status::error(400, "Parameter offset must be non-negative"));
         return;
@@ -1953,12 +2091,28 @@ pub fn get_blocked_dialogs(
         return;
     }
 
-    if BlockListId::from_block_list(block_list).is_none() {
-        promise.set_error(Status::error(400, "Block list must be non-empty"));
-        return;
-    }
+    let block_list_id = match BlockListId::from_block_list(block_list) {
+        Some(block_list_id) => block_list_id,
+        None => {
+            promise.set_error(Status::error(400, "Block list must be non-empty"));
+            return;
+        }
+    };
 
-    promise_unimplemented(&mut promise);
+    // `GetBlockedDialogsQuery::send` (DialogManager.cpp:736-740).
+    td.dialog_manager.pending_get_blocked_dialogs.push(promise);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::GetBlockedDialogs { offset, limit },
+        tdmtproto::telegram_api::Function::contacts_getBlocked(
+            tdmtproto::telegram_api::contacts_getBlocked {
+                flags: 0,
+                my_stories_from: block_list_id == BlockListId::Stories,
+                offset,
+                limit,
+            },
+        ),
+        "contacts.getBlocked",
+    );
 }
 
 /// `UserManager::get_message_sender_object` shape
@@ -2263,6 +2417,29 @@ impl ToggleDialogPropertyOnServerLogEvent {
     }
 }
 
+/// `get_erase_log_event_promise` (LogEventHelper.cpp:42-52) — the
+/// query promise wrapper that erases the binlog mirror on settlement,
+/// success or error, unless the td is closing (the close-flag gate).
+/// `log_event_id == 0` passes the inner promise through untouched.
+fn get_erase_log_event_promise(
+    td: &mut Td,
+    log_event_id: u64,
+    promise: Promise<()>,
+) -> Promise<()> {
+    if log_event_id == 0 {
+        return promise;
+    }
+    let binlog = td.global.td_db().binlog();
+    let close_flag = td.global.shared_close_flag();
+    tdutils::promise::PromiseCreator::lambda_result(move |result| {
+        if !close_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            binlog.erase(log_event_id);
+        }
+        let mut promise = promise;
+        promise.set_result(result);
+    })
+}
+
 /// `DialogManager::save_reorder_pinned_dialogs_on_server_log_event`
 /// (DialogManager.cpp:3524-3530).
 pub(crate) fn save_reorder_pinned_dialogs_on_server_log_event(
@@ -2359,11 +2536,9 @@ pub(crate) fn save_toggle_dialog_property_on_server_log_event(
 
 /// `DialogManager::reorder_pinned_dialogs_on_server`
 /// (DialogManager.cpp:3517-3524) — the mirror save honors
-/// `use_message_database`; the `ReorderPinnedDialogsQuery` send is
-/// [blocked: net] (stub inventory). The C++ erase-on-completion promise
-/// (`get_erase_log_event_promise`) erases the mirror on settlement —
-/// success or error — while the Rust mirror stays until the net step can
-/// complete it (net-step residue).
+/// `use_message_database`; the `ReorderPinnedDialogsQuery` send rides
+/// the dialog net handle and the erase-log-event promise retires the
+/// mirror on settlement (LogEventHelper.cpp:42-52).
 pub fn reorder_pinned_dialogs_on_server(
     td: &mut Td,
     folder_id: i32,
@@ -2374,43 +2549,307 @@ pub fn reorder_pinned_dialogs_on_server(
     if log_event_id == 0 && td.global.td_db().parameters().use_message_database {
         log_event_id = save_reorder_pinned_dialogs_on_server_log_event(td, folder_id, dialog_ids);
     }
-    tracing::info!("Reorder pinned dialogs on server — [blocked: net]");
+    // `ReorderPinnedDialogsQuery::send` (DialogManager.cpp:788-794) —
+    // force=true + the Read input dialog peers.
+    let promise = get_erase_log_event_promise(td, log_event_id, Promise::default());
+    td.dialog_manager
+        .pending_reorder_pinned_dialogs
+        .push(promise);
+    let order = get_input_dialog_peers(td, dialog_ids, AccessRights::Read);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::ReorderPinnedDialogs { folder_id },
+        tdmtproto::telegram_api::Function::messages_reorderPinnedDialogs(
+            tdmtproto::telegram_api::messages_reorderPinnedDialogs {
+                flags: 0,
+                force: true,
+                folder_id,
+                order,
+            },
+        ),
+        "messages.reorderPinnedDialogs",
+    );
     log_event_id
 }
 
+/// `MessagesManager::set_message_sender_block_list`
+/// (MessagesManager.cpp:16422-16473) — the `toggleChatIsBlocked` chain
+/// the td_api `setMessageSenderBlockList` request drives (the missing
+/// arm of the ToggleDialogIsBlocked family): the sender resolution, the
+/// type ladder, the local flag flip, then the
+/// `toggle_dialog_is_blocked_on_server` net send.
+pub fn set_message_sender_block_list(
+    td: &mut Td,
+    sender: Option<&crate::td_api::MessageSender>,
+    block_list: Option<&crate::td_api::BlockList>,
+) -> Result<()> {
+    // get_message_sender_dialog_id(td_, sender, true, false)
+    // (MessageSender.cpp:173-215) — the inline resolution (the env trait
+    // lives behind the bot-info split; the branches match it)
+    let mut dialog_id = match sender {
+        None => {
+            return Result::from_status(Status::error(400, "Message sender must be non-empty"));
+        }
+        Some(crate::td_api::MessageSender::messageSenderUser(sender)) => {
+            let user_id = crate::user_manager::UserId::new(sender.user_id);
+            if !user_id.is_valid() {
+                return Result::from_status(Status::error(
+                    400,
+                    "Invalid user identifier specified",
+                ));
+            }
+            // have_user_force — the user-manager read
+            if !user_manager_user_known(td, user_id, "set_message_sender_block_list") {
+                return Result::from_status(Status::error(
+                    400,
+                    "Unknown user identifier specified",
+                ));
+            }
+            DialogId::from_user_id(user_id)
+        }
+        Some(crate::td_api::MessageSender::messageSenderChat(sender)) => {
+            let dialog_id = DialogId::new(sender.chat_id);
+            if !dialog_id.is_valid() {
+                return Result::from_status(Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            let known = if dialog_id.get_type() == crate::dialog_id::DialogType::User {
+                user_manager_user_known(
+                    td,
+                    dialog_id.get_user_id(),
+                    "set_message_sender_block_list 2",
+                )
+            } else {
+                // have_dialog_force — the dialog-manager form
+                have_dialog_info(td, dialog_id)
+            };
+            if !known {
+                return Result::from_status(Status::error(
+                    400,
+                    "Unknown chat identifier specified",
+                ));
+            }
+            dialog_id
+        }
+    };
+
+    // get_dialog_force — the in-memory half; the db-load leg is the
+    // dialog-db receive seam
+    // `d` is the ORIGINAL dialog record (the C++ `get_dialog_force` at
+    // MessagesManager.cpp:16425 ran before the type ladder); the
+    // secret-chat arm below re-resolves `dialog_id` onto the user for
+    // the SEND and the no-record fan-in, but `set_dialog_is_blocked`
+    // still operates on the original record (`d` itself)
+    let record_dialog_id = dialog_id;
+    let have_dialog =
+        crate::messages_manager::have_dialog_force(&td.messages_manager, record_dialog_id);
+    if !have_input_peer(td, dialog_id, false, AccessRights::Know) {
+        return Result::from_status(Status::error(400, "Message sender isn't accessible"));
+    }
+    let is_blocked = BlockListId::from_block_list(block_list) == Some(BlockListId::Main);
+    let is_blocked_for_stories =
+        BlockListId::from_block_list(block_list) == Some(BlockListId::Stories);
+    match dialog_id.get_type() {
+        crate::dialog_id::DialogType::User => {
+            if dialog_id == get_my_dialog_id(td) {
+                return Result::from_status(Status::error(
+                    400,
+                    if is_blocked || is_blocked_for_stories {
+                        "Can't block self"
+                    } else {
+                        "Can't unblock self"
+                    },
+                ));
+            }
+        }
+        crate::dialog_id::DialogType::Chat => {
+            return Result::from_status(Status::error(400, "Basic group chats can't be blocked"));
+        }
+        crate::dialog_id::DialogType::Channel => {
+            // ok
+        }
+        crate::dialog_id::DialogType::SecretChat => {
+            let user_id = td
+                .user_manager
+                .get_secret_chat_user_id(dialog_id.get_secret_chat_id());
+            if !user_id.is_valid()
+                || !user_manager_user_known(td, user_id, "set_message_sender_block_list")
+            {
+                return Result::from_status(Status::error(400, "The secret chat can't be blocked"));
+            }
+            dialog_id = DialogId::from_user_id(user_id);
+        }
+        crate::dialog_id::DialogType::None => {
+            unreachable!("the resolution gates rejected invalid ids")
+        }
+    }
+
+    // the record half runs over the ORIGINAL id (the C++ `d`), the
+    // fan-in/send halves over the resolved one (the C++ reassignment)
+    if have_dialog {
+        let equal = td
+            .messages_manager
+            .get_dialog(record_dialog_id)
+            .is_some_and(|d| {
+                d.is_blocked == is_blocked && d.is_blocked_for_stories == is_blocked_for_stories
+            });
+        if equal {
+            return Result::Ok(());
+        }
+        let mut manager = std::mem::take(&mut td.messages_manager);
+        // SAFETY: the ctx view aliases one Td and is used strictly
+        // sequentially inside the callee (the split_context_alias
+        // contract).
+        let td_ptr = std::ptr::from_mut(td);
+        let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+        crate::messages_manager::set_dialog_is_blocked(
+            &mut manager,
+            ctx,
+            record_dialog_id,
+            is_blocked,
+            is_blocked_for_stories,
+        );
+        td.messages_manager = manager;
+    } else {
+        // CHECK(dialog_id.get_type() == DialogType::User) — the ladder
+        // above guarantees it (a user dialog need not exist to block)
+        user_manager_on_update_is_blocked(
+            td,
+            dialog_id.get_user_id(),
+            is_blocked,
+            is_blocked_for_stories,
+        );
+    }
+
+    toggle_dialog_is_blocked_on_server(td, dialog_id, is_blocked, is_blocked_for_stories, 0);
+    Result::Ok(())
+}
+
+/// The `have_user_force` read over the user manager (the
+/// `get_message_sender_dialog_id` env seam).
+fn user_manager_user_known(
+    td: &mut Td,
+    user_id: crate::user_manager::UserId,
+    source: &str,
+) -> bool {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        ..
+    } = td;
+    let Some(options) = option_manager.as_mut() else {
+        return false;
+    };
+    let mut env = UserEnv {
+        global,
+        options,
+        auth_is_bot: auth_manager.is_bot(),
+    };
+    user_manager.get_user_force(&mut env, user_id, source)
+}
+
+/// The `on_update_user_is_blocked` fan-in over the user manager (the
+/// no-dialog branch of the block-list ladder).
+fn user_manager_on_update_is_blocked(
+    td: &mut Td,
+    user_id: crate::user_manager::UserId,
+    is_blocked: bool,
+    is_blocked_for_stories: bool,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        ..
+    } = td;
+    let Some(options) = option_manager.as_mut() else {
+        return;
+    };
+    let mut env = UserEnv {
+        global,
+        options,
+        auth_is_bot: auth_manager.is_bot(),
+    };
+    user_manager.on_update_user_is_blocked(&mut env, user_id, is_blocked, is_blocked_for_stories);
+}
+
 /// `DialogManager::toggle_dialog_report_spam_state_on_server`
-/// (DialogManager.cpp:3552-3582). The `input_peer == nullptr` shortcut of
-/// `UpdatePeerSettingsQuery::send` (cpp:652-654) is a net-free SUCCESS
-/// path: with the chat/channel input peers stubbed to `None` (stub
-/// inventory), every chat/channel dialog completes `Unit()` exactly like
-/// the C++ stub world.
+/// (DialogManager.cpp:3552-3582) — the `UpdatePeerSettingsQuery`/
+/// `ReportEncryptedSpamQuery` sends ride the dialog net handle; the
+/// caller promise rides the erase-log-event wrapper.
 pub fn toggle_dialog_report_spam_state_on_server(
     td: &mut Td,
     dialog_id: DialogId,
     is_spam_dialog: bool,
     log_event_id: u64,
-    mut promise: Promise<()>,
+    promise: Promise<()>,
 ) -> u64 {
     let mut log_event_id = log_event_id;
     if log_event_id == 0 && td.global.td_db().parameters().use_message_database {
         log_event_id =
             save_toggle_dialog_report_spam_state_on_server_log_event(td, dialog_id, is_spam_dialog);
     }
+    let mut promise = get_erase_log_event_promise(td, log_event_id, promise);
 
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User
         | crate::dialog_id::DialogType::Chat
         | crate::dialog_id::DialogType::Channel => {
-            if get_input_peer(td, dialog_id, AccessRights::Read).is_none() {
-                // UpdatePeerSettingsQuery::send, cpp:652-654
+            // `UpdatePeerSettingsQuery::send` (DialogManager.cpp:652-666)
+            // — the null input peer is the net-free SUCCESS path; the
+            // report-spam / hide-bar twins carry the spam flag.
+            let Some(input_peer) = get_input_peer(td, dialog_id, AccessRights::Read) else {
                 promise.set_value(());
                 return log_event_id;
-            }
-            // UpdatePeerSettingsQuery send — [blocked: net] (stub inventory).
+            };
+            td.dialog_manager.pending_update_peer_settings.push(promise);
+            let function = if is_spam_dialog {
+                tdmtproto::telegram_api::Function::messages_reportSpam(
+                    tdmtproto::telegram_api::messages_reportSpam {
+                        peer: Some(Box::new(input_peer)),
+                    },
+                )
+            } else {
+                tdmtproto::telegram_api::Function::messages_hidePeerSettingsBar(
+                    tdmtproto::telegram_api::messages_hidePeerSettingsBar {
+                        peer: Some(Box::new(input_peer)),
+                    },
+                )
+            };
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::UpdatePeerSettings { dialog_id },
+                function,
+                if is_spam_dialog {
+                    "messages.reportSpam"
+                } else {
+                    "messages.hidePeerSettingsBar"
+                },
+            );
         }
         crate::dialog_id::DialogType::SecretChat => {
             if is_spam_dialog {
-                // ReportEncryptedSpamQuery send — [blocked: net].
+                // `ReportEncryptedSpamQuery::send`
+                // (DialogManager.cpp:697-704) — the Read input encrypted
+                // chat (CHECKed in the C++; the replay arm's
+                // have_input_peer gate guarantees it).
+                let input_chat = get_input_encrypted_chat(td, dialog_id, AccessRights::Read)
+                    .expect("the replay gate guaranteed the encrypted peer");
+                td.dialog_manager
+                    .pending_report_encrypted_spam
+                    .push(promise);
+                td.dialog_manager.send_dialog_net_query(
+                    DialogNetKind::ReportEncryptedSpam { dialog_id },
+                    tdmtproto::telegram_api::Function::messages_reportEncryptedSpam(
+                        tdmtproto::telegram_api::messages_reportEncryptedSpam {
+                            peer: Some(input_chat),
+                        },
+                    ),
+                    "messages.reportEncryptedSpam",
+                );
             } else {
                 let user_id = td
                     .user_manager
@@ -2419,20 +2858,40 @@ pub fn toggle_dialog_report_spam_state_on_server(
                     promise.set_error(Status::error(400, "Peer user not found"));
                     return log_event_id;
                 }
-                // UpdatePeerSettingsQuery(DialogId(user_id), false) —
-                // [blocked: net].
+                // UpdatePeerSettingsQuery(DialogId(user_id), false) — the
+                // user-dialog send above over the resolved peer.
+                let user_dialog_id = DialogId::from_user_id(user_id);
+                let Some(input_peer) = get_input_peer(td, user_dialog_id, AccessRights::Read)
+                else {
+                    promise.set_value(());
+                    return log_event_id;
+                };
+                td.dialog_manager.pending_update_peer_settings.push(promise);
+                td.dialog_manager.send_dialog_net_query(
+                    DialogNetKind::UpdatePeerSettings {
+                        dialog_id: user_dialog_id,
+                    },
+                    tdmtproto::telegram_api::Function::messages_hidePeerSettingsBar(
+                        tdmtproto::telegram_api::messages_hidePeerSettingsBar {
+                            peer: Some(Box::new(input_peer)),
+                        },
+                    ),
+                    "messages.hidePeerSettingsBar",
+                );
             }
         }
         crate::dialog_id::DialogType::None => {
             unreachable!("toggle_dialog_report_spam_state_on_server on DialogType::None")
         }
     }
-    promise_unimplemented(&mut promise);
     log_event_id
 }
 
 /// `DialogManager::toggle_dialog_is_blocked_on_server`
-/// (DialogManager.cpp:3681-3690).
+/// (DialogManager.cpp:3681-3690) — the `ToggleDialogIsBlockedQuery`
+/// send rides the dialog net handle (the block/unblock twins carry the
+/// stories flag); the erase-log-event promise retires the mirror on
+/// settlement.
 pub fn toggle_dialog_is_blocked_on_server(
     td: &mut Td,
     dialog_id: DialogId,
@@ -2449,14 +2908,56 @@ pub fn toggle_dialog_is_blocked_on_server(
             is_blocked_for_stories,
         );
     }
-    // ToggleDialogIsBlockedQuery send — [blocked: net] (stub inventory).
-    tracing::info!("Toggle dialog blocked state on server — [blocked: net]");
+    // `ToggleDialogIsBlockedQuery::send` (DialogManager.cpp:1051-1066)
+    // — the Know input peer (CHECKed non-empty in the C++; the replay
+    // arm's have_input_peer gate guarantees it, the peer-less band keeps
+    // the promise honest instead of crashing).
+    let mut promise = get_erase_log_event_promise(td, log_event_id, Promise::default());
+    match get_input_peer(td, dialog_id, AccessRights::Know) {
+        Some(input_peer) => {
+            td.dialog_manager
+                .pending_toggle_dialog_is_blocked
+                .push(promise);
+            let function = if is_blocked || is_blocked_for_stories {
+                tdmtproto::telegram_api::Function::contacts_block(
+                    tdmtproto::telegram_api::contacts_block {
+                        flags: 0,
+                        my_stories_from: is_blocked_for_stories,
+                        id: Some(Box::new(input_peer)),
+                    },
+                )
+            } else {
+                tdmtproto::telegram_api::Function::contacts_unblock(
+                    tdmtproto::telegram_api::contacts_unblock {
+                        flags: 0,
+                        my_stories_from: is_blocked_for_stories,
+                        id: Some(Box::new(input_peer)),
+                    },
+                )
+            };
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ToggleDialogIsBlocked { dialog_id },
+                function,
+                if is_blocked || is_blocked_for_stories {
+                    "contacts.block"
+                } else {
+                    "contacts.unblock"
+                },
+            );
+        }
+        None => {
+            promise.set_error(Status::error(400, "Can't access the chat"));
+        }
+    }
     log_event_id
 }
 
 /// `DialogManager::toggle_dialog_is_marked_as_unread_on_server`
 /// (DialogManager.cpp:3733-3748) — secret chats never even create the
-/// binlog event.
+/// binlog event; the `ToggleDialogUnreadMarkQuery` send rides the dialog
+/// net handle (the saved-messages topic branch — the PARENT_PEER form —
+/// rides the SavedMessagesManager plane: no caller passes a valid topic
+/// id until it lands).
 pub fn toggle_dialog_is_marked_as_unread_on_server(
     td: &mut Td,
     dialog_id: DialogId,
@@ -2478,13 +2979,43 @@ pub fn toggle_dialog_is_marked_as_unread_on_server(
             is_marked_as_unread,
         );
     }
-    // ToggleDialogUnreadMarkQuery send — [blocked: net] (stub inventory).
-    tracing::info!("Toggle dialog unread mark on server — [blocked: net]");
+    // `ToggleDialogUnreadMarkQuery::send`
+    // (DialogManager.cpp:1104-1131) — the Read input dialog peer (the
+    // null peer is the send-site 400).
+    let mut promise = get_erase_log_event_promise(td, log_event_id, Promise::default());
+    match get_input_dialog_peer(td, dialog_id, AccessRights::Read) {
+        Some(input_peer) => {
+            td.dialog_manager
+                .pending_toggle_dialog_unread_mark
+                .push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ToggleDialogUnreadMark {
+                    dialog_id,
+                    saved_messages_topic_id,
+                    is_marked_as_unread,
+                },
+                tdmtproto::telegram_api::Function::messages_markDialogUnread(
+                    tdmtproto::telegram_api::messages_markDialogUnread {
+                        flags: 0,
+                        unread: is_marked_as_unread,
+                        parent_peer: None,
+                        peer: Some(input_peer),
+                    },
+                ),
+                "messages.markDialogUnread",
+            );
+        }
+        None => {
+            promise.set_error(Status::error(400, "Can't access the chat"));
+        }
+    }
     log_event_id
 }
 
 /// `DialogManager::toggle_dialog_is_pinned_on_server`
-/// (DialogManager.cpp:3780-3788).
+/// (DialogManager.cpp:3780-3788) — the `ToggleDialogPinQuery` send rides
+/// the dialog net handle; the erase-log-event promise retires the mirror
+/// on settlement.
 pub fn toggle_dialog_is_pinned_on_server(
     td: &mut Td,
     dialog_id: DialogId,
@@ -2509,13 +3040,35 @@ pub fn toggle_dialog_is_pinned_on_server(
             is_pinned,
         );
     }
-    // ToggleDialogPinQuery send — [blocked: net] (stub inventory).
-    tracing::info!("Toggle dialog pin on server — [blocked: net]");
+    // `ToggleDialogPinQuery::send` (DialogManager.cpp:1171-1181) — the
+    // Read input dialog peer (the null peer is the send-site 400).
+    let mut promise = get_erase_log_event_promise(td, log_event_id, Promise::default());
+    match get_input_dialog_peer(td, dialog_id, AccessRights::Read) {
+        Some(input_peer) => {
+            td.dialog_manager.pending_toggle_dialog_pin.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ToggleDialogPin { dialog_id },
+                tdmtproto::telegram_api::Function::messages_toggleDialogPin(
+                    tdmtproto::telegram_api::messages_toggleDialogPin {
+                        flags: 0,
+                        pinned: is_pinned,
+                        peer: Some(input_peer),
+                    },
+                ),
+                "messages.toggleDialogPin",
+            );
+        }
+        None => {
+            promise.set_error(Status::error(400, "Can't access the chat"));
+        }
+    }
     log_event_id
 }
 
 /// `DialogManager::toggle_dialog_is_translatable_on_server`
-/// (DialogManager.cpp:3800-3810).
+/// (DialogManager.cpp:3800-3810) — the `ToggleDialogTranslationsQuery`
+/// send rides the dialog net handle; the erase-log-event promise retires
+/// the mirror on settlement.
 pub fn toggle_dialog_is_translatable_on_server(
     td: &mut Td,
     dialog_id: DialogId,
@@ -2536,13 +3089,41 @@ pub fn toggle_dialog_is_translatable_on_server(
             is_translatable,
         );
     }
-    // ToggleDialogTranslationsQuery send — [blocked: net] (stub inventory).
-    tracing::info!("Toggle dialog translatable on server — [blocked: net]");
+    // `ToggleDialogTranslationsQuery::send`
+    // (DialogManager.cpp:1217-1227) — the Read input peer (the null peer
+    // is the send-site 400); the wire flag is the inverted `disabled`.
+    let mut promise = get_erase_log_event_promise(td, log_event_id, Promise::default());
+    match get_input_peer(td, dialog_id, AccessRights::Read) {
+        Some(input_peer) => {
+            td.dialog_manager
+                .pending_toggle_dialog_translations
+                .push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ToggleDialogTranslations {
+                    dialog_id,
+                    is_translatable,
+                },
+                tdmtproto::telegram_api::Function::messages_togglePeerTranslations(
+                    tdmtproto::telegram_api::messages_togglePeerTranslations {
+                        flags: 0,
+                        disabled: !is_translatable,
+                        peer: Some(Box::new(input_peer)),
+                    },
+                ),
+                "messages.togglePeerTranslations",
+            );
+        }
+        None => {
+            promise.set_error(Status::error(400, "Can't access the chat"));
+        }
+    }
     log_event_id
 }
 
 /// `DialogManager::toggle_dialog_view_as_messages_on_server`
-/// (DialogManager.cpp:3822-3831).
+/// (DialogManager.cpp:3822-3831) — the
+/// `ToggleViewForumAsMessagesQuery` send rides the dialog net handle
+/// over the input channel.
 pub fn toggle_dialog_view_as_messages_on_server(
     td: &mut Td,
     dialog_id: DialogId,
@@ -2558,8 +3139,39 @@ pub fn toggle_dialog_view_as_messages_on_server(
             view_as_messages,
         );
     }
-    // ToggleViewForumAsMessagesQuery send — [blocked: net] (stub inventory).
-    tracing::info!("Toggle dialog view-as-messages on server — [blocked: net]");
+    // `ToggleViewForumAsMessagesQuery::send`
+    // (DialogManager.cpp:1264-1273) — the CHECKed channel form (the
+    // C++ narrows to channels; the replay arm's dialog-type gate
+    // guarantees it, the non-channel band keeps the promise honest
+    // instead of crashing).
+    let mut promise = get_erase_log_event_promise(td, log_event_id, Promise::default());
+    if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
+        promise.set_error(Status::error(400, "Can't access the chat"));
+        return log_event_id;
+    }
+    match get_input_channel_td(td, dialog_id.get_channel_id()) {
+        Some(input_channel) => {
+            td.dialog_manager
+                .pending_toggle_view_forum_as_messages
+                .push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ToggleViewForumAsMessages {
+                    dialog_id,
+                    view_as_messages,
+                },
+                tdmtproto::telegram_api::Function::channels_toggleViewForumAsMessages(
+                    tdmtproto::telegram_api::channels_toggleViewForumAsMessages {
+                        channel: Some(input_channel),
+                        enabled: view_as_messages,
+                    },
+                ),
+                "channels.toggleViewForumAsMessages",
+            );
+        }
+        None => {
+            promise.set_error(Status::error(400, "Can't access the chat"));
+        }
+    }
     log_event_id
 }
 
@@ -2605,15 +3217,54 @@ pub fn set_dialog_message_ttl_on_server(
     promise_unimplemented(&mut promise);
 }
 
-/// `DialogManager::set_dialog_theme_on_server` (DialogManager.cpp:3642-3646).
+/// `DialogManager::set_dialog_theme_on_server` (DialogManager.cpp:3642-3646)
+/// — the `SetChatThemeQuery` send rides the dialog net handle (the Write
+/// input peer; the empty/gift/plain theme-name forms).
 pub fn set_dialog_theme_on_server(
-    _td: &mut Td,
-    _dialog_id: DialogId,
-    _theme_name: &str,
-    _is_gift: bool,
+    td: &mut Td,
+    dialog_id: DialogId,
+    theme_name: &str,
+    is_gift: bool,
     mut promise: Promise<()>,
 ) {
-    promise_unimplemented(&mut promise);
+    // `SetChatThemeQuery::send` (DialogManager.cpp:1003-1017) — the Write
+    // input peer (CHECKed in the C++ — the request arm's access gate
+    // guarantees it; the peer-less band keeps the promise honest).
+    let input_peer = match get_input_peer(td, dialog_id, AccessRights::Write) {
+        Some(input_peer) => input_peer,
+        None => {
+            promise.set_error(Status::error(400, "Can't access the chat"));
+            return;
+        }
+    };
+    let theme = if theme_name.is_empty() {
+        tdmtproto::telegram_api::InputChatTheme::inputChatThemeEmpty(
+            tdmtproto::telegram_api::inputChatThemeEmpty {},
+        )
+    } else if is_gift {
+        tdmtproto::telegram_api::InputChatTheme::inputChatThemeUniqueGift(
+            tdmtproto::telegram_api::inputChatThemeUniqueGift {
+                slug: theme_name.to_owned(),
+            },
+        )
+    } else {
+        tdmtproto::telegram_api::InputChatTheme::inputChatTheme(
+            tdmtproto::telegram_api::inputChatTheme {
+                emoticon: theme_name.to_owned(),
+            },
+        )
+    };
+    td.dialog_manager.pending_set_chat_theme.push(promise);
+    td.dialog_manager.send_dialog_net_query(
+        DialogNetKind::SetChatTheme { dialog_id },
+        tdmtproto::telegram_api::Function::messages_setChatTheme(
+            tdmtproto::telegram_api::messages_setChatTheme {
+                peer: Some(Box::new(input_peer)),
+                theme: Some(theme),
+            },
+        ),
+        "messages.setChatTheme",
+    );
 }
 
 /// `DialogManager::on_binlog_events` (DialogManager.cpp:3832-3989) — the
@@ -3026,15 +3677,11 @@ pub fn set_dialog_accent_color(
 
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User if dialog_id == get_my_dialog_id(td) => {
-            // user_manager_->set_accent_color — the local half; the
-            // account.updateColor send is [blocked: net].
-            match td
-                .user_manager
-                .set_accent_color_local(accent_color_id, background_custom_emoji_id)
-            {
-                Ok(_) => promise_unimplemented(&mut promise),
-                Err(status) => promise.set_error(status),
-            }
+            // user_manager_->set_accent_color — the local gate + the
+            // `UpdateColorQuery` send over the user net handle (the
+            // promise settles from the Bool answer).
+            td.user_manager
+                .set_accent_color(accent_color_id, background_custom_emoji_id, promise);
             return;
         }
         crate::dialog_id::DialogType::Channel => {
@@ -3089,11 +3736,14 @@ pub fn set_dialog_profile_accent_color(
 
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User if dialog_id == get_my_dialog_id(td) => {
-            // user_manager_->set_profile_accent_color — its local half
-            // arrives with the profile-colors step; the query tail is
-            // the net-blocked error (stub inventory).
-            let _ = (profile_accent_color_id, profile_background_custom_emoji_id);
-            promise_unimplemented(&mut promise);
+            // user_manager_->set_profile_accent_color — no local gates
+            // (the C++ sends directly); the profile variant of the
+            // `UpdateColorQuery`.
+            td.user_manager.set_profile_accent_color(
+                profile_accent_color_id,
+                profile_background_custom_emoji_id,
+                promise,
+            );
             return;
         }
         crate::dialog_id::DialogType::Channel => {
@@ -3944,73 +4594,123 @@ impl DialogManager {
         }
     }
 
+    /// The FIFO family-queue pop shared by the `take_*_promise` heads
+    /// (the §5 answer→promise pairing).
+    fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
+    }
+
     /// `ReportProfilePhotoQuery::on_result`'s promise pop
     /// (DialogManager.cpp:575-588).
     pub(crate) fn take_report_profile_photo_promise(&mut self) -> Option<Promise<()>> {
-        if self.pending_report_profile_photo.is_empty() {
-            None
-        } else {
-            Some(self.pending_report_profile_photo.remove(0))
-        }
+        Self::pop_head(&mut self.pending_report_profile_photo)
     }
 
     /// `SetChatAvailableReactionsQuery::on_result`'s promise pop
     /// (DialogManager.cpp:846-856).
     pub(crate) fn take_set_chat_available_reactions_promise(&mut self) -> Option<Promise<()>> {
-        if self.pending_set_chat_available_reactions.is_empty() {
-            None
-        } else {
-            Some(self.pending_set_chat_available_reactions.remove(0))
-        }
+        Self::pop_head(&mut self.pending_set_chat_available_reactions)
     }
 
     /// `MigrateChatQuery::on_result`'s promise pop (DialogManager.cpp:212-216).
     pub(crate) fn take_migrate_chat_promise(&mut self) -> Option<Promise<crate::td_api::Object>> {
-        if self.pending_migrate_chat.is_empty() {
-            None
-        } else {
-            Some(self.pending_migrate_chat.remove(0))
-        }
+        Self::pop_head(&mut self.pending_migrate_chat)
     }
 
     /// `EditDialogTitleQuery::on_result`'s promise pop
     /// (DialogManager.cpp:255-259).
     pub(crate) fn take_edit_dialog_title_promise(&mut self) -> Option<Promise<()>> {
-        if self.pending_edit_dialog_title.is_empty() {
-            None
-        } else {
-            Some(self.pending_edit_dialog_title.remove(0))
-        }
+        Self::pop_head(&mut self.pending_edit_dialog_title)
     }
 
     /// `EditChatDefaultBannedRightsQuery::on_result`'s promise pop
     /// (DialogManager.cpp:386-391).
     pub(crate) fn take_edit_chat_default_banned_rights_promise(&mut self) -> Option<Promise<()>> {
-        if self.pending_edit_chat_default_banned_rights.is_empty() {
-            None
-        } else {
-            Some(self.pending_edit_chat_default_banned_rights.remove(0))
-        }
+        Self::pop_head(&mut self.pending_edit_chat_default_banned_rights)
     }
 
     /// `ToggleNoForwardsQuery::on_result`'s promise pop
     /// (DialogManager.cpp:427-432).
     pub(crate) fn take_toggle_no_forwards_promise(&mut self) -> Option<Promise<()>> {
-        if self.pending_toggle_no_forwards.is_empty() {
-            None
-        } else {
-            Some(self.pending_toggle_no_forwards.remove(0))
-        }
+        Self::pop_head(&mut self.pending_toggle_no_forwards)
     }
 
     /// `CheckUsernameQuery`/`CheckChannelUsernameQuery::on_result`'s
     /// promise pop (DialogManager.cpp:73-77/:103-107).
     pub(crate) fn take_check_username_promise(&mut self) -> Option<Promise<crate::td_api::Object>> {
-        if self.pending_check_username.is_empty() {
-            None
-        } else {
-            Some(self.pending_check_username.remove(0))
-        }
+        Self::pop_head(&mut self.pending_check_username)
+    }
+
+    /// `ReportPeerQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:497-501).
+    pub(crate) fn take_report_peer_promise(&mut self) -> Option<Promise<crate::td_api::Object>> {
+        Self::pop_head(&mut self.pending_report_peer)
+    }
+
+    /// `GetBlockedDialogsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:745-770).
+    pub(crate) fn take_get_blocked_dialogs_promise(
+        &mut self,
+    ) -> Option<Promise<crate::td_api::Object>> {
+        Self::pop_head(&mut self.pending_get_blocked_dialogs)
+    }
+
+    /// `UpdatePeerSettingsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:676-680).
+    pub(crate) fn take_update_peer_settings_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_update_peer_settings)
+    }
+
+    /// `ReportEncryptedSpamQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:708-712).
+    pub(crate) fn take_report_encrypted_spam_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_report_encrypted_spam)
+    }
+
+    /// `ReorderPinnedDialogsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:801-805).
+    pub(crate) fn take_reorder_pinned_dialogs_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_reorder_pinned_dialogs)
+    }
+
+    /// `ToggleDialogIsBlockedQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:1069-1073).
+    pub(crate) fn take_toggle_dialog_is_blocked_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_toggle_dialog_is_blocked)
+    }
+
+    /// `ToggleDialogUnreadMarkQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:1128-1132).
+    pub(crate) fn take_toggle_dialog_unread_mark_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_toggle_dialog_unread_mark)
+    }
+
+    /// `ToggleDialogPinQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:1189-1193).
+    pub(crate) fn take_toggle_dialog_pin_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_toggle_dialog_pin)
+    }
+
+    /// `ToggleDialogTranslationsQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:1236-1240).
+    pub(crate) fn take_toggle_dialog_translations_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_toggle_dialog_translations)
+    }
+
+    /// `ToggleViewForumAsMessagesQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:1290-1294).
+    pub(crate) fn take_toggle_view_forum_as_messages_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_toggle_view_forum_as_messages)
+    }
+
+    /// `SetChatThemeQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:1015-1019).
+    pub(crate) fn take_set_chat_theme_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_set_chat_theme)
     }
 
     pub(crate) fn on_dialog_usernames_updated(
@@ -5346,7 +6046,7 @@ mod tests {
                 });
             (promise, slot)
         };
-        crate::dialog_manager::report_dialog(&mut td, DialogId::new(0), "", &[], "", promise);
+        crate::dialog_manager::report_dialog(&mut td, DialogId::new(0), b"", &[], "", promise);
         match slot.lock().unwrap().take() {
             Some(Result::Err(status)) => {
                 assert_eq!(status.message(), "Invalid chat identifier specified")
@@ -5396,7 +6096,9 @@ mod tests {
             _ => panic!("expected the limit error"),
         }
 
-        // a valid argument set reaches the net-blocked send
+        // a valid argument set now rides the net handle — the promise
+        // parks on the family queue (the net-inert test td holds no
+        // handle, so nothing settles it here)
         let (object_promise, object_slot) = {
             let s = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
             let c = Arc::clone(&s);
@@ -5406,12 +6108,8 @@ mod tests {
             (p, s)
         };
         get_blocked_dialogs(&mut td, Some(&block_list), 0, 10, object_promise);
-        match object_slot.lock().unwrap().take() {
-            Some(Result::Err(status)) => {
-                assert_eq!(status.message(), "Network is not implemented yet")
-            }
-            _ => panic!("expected the net-blocked error"),
-        }
+        assert!(object_slot.lock().unwrap().is_none(), "the promise parks");
+        assert_eq!(td.dialog_manager.pending_get_blocked_dialogs.len(), 1);
 
         assert_eq!(
             BlockListId::from_block_list(Some(&block_list)),
@@ -5797,12 +6495,25 @@ mod tests {
             toggle_dialog_is_marked_as_unread_on_server(&mut td, channel_dialog, 0, true, 0);
         assert_ne!(unread_log_event_id, 0);
 
-        // an explicit log event id is kept, not re-saved
+        // the parked erase promises settle through the C++ close-flag
+        // gate (the net-inert test td never dispatches — the
+        // init_td_db_for_test binlog wiring diverges from the live
+        // init's id space, so exercise the skip arm here; the
+        // netted reorder test covers the live erase)
+        td.global.set_close_flag();
+        if let Some(mut promise) = td.dialog_manager.take_toggle_dialog_pin_promise() {
+            promise.set_value(());
+        }
+        if let Some(mut promise) = td.dialog_manager.take_toggle_dialog_unread_mark_promise() {
+            promise.set_value(());
+        }
+
+        // an explicit log event id is kept, not re-saved (the binlog
+        // replay form — the mirror was already retired above)
         assert_eq!(
             toggle_dialog_is_pinned_on_server(&mut td, channel_dialog, false, pinned_log_event_id),
             pinned_log_event_id
         );
-
         let _ = unread_log_event_id;
         let _ = std::fs::remove_dir_all(&dir);
     }
