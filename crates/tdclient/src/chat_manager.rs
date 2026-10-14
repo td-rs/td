@@ -3589,18 +3589,21 @@ impl DialogLocation {
     }
 
     /// `as_dialog_location` (Td.cpp conversions) — the td_api chatLocation
-    /// into the internal record. The access hash is a Files-step stub (0).
+    /// into the internal record. The access hash is a Files-step stub (0);
+    /// a null location keeps the empty record like the C++ constructor.
     pub fn from_td_api(chat_location: &td_api::ChatLocation) -> DialogLocation {
         let mut result = DialogLocation::default();
-        let l = chat_location.location.as_ref().unwrap();
-        result.location_ =
-            Location::from_geo_point(telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
-                flags: 0,
-                lat: l.latitude,
-                long: l.longitude,
-                accuracy_radius: l.horizontal_accuracy as i32,
-                access_hash: 0,
-            }));
+        if let Some(l) = chat_location.location.as_ref() {
+            result.location_ = Location::from_geo_point(telegram_api::GeoPoint::geoPoint(
+                telegram_api::geoPoint {
+                    flags: 0,
+                    lat: l.latitude,
+                    long: l.longitude,
+                    accuracy_radius: l.horizontal_accuracy as i32,
+                    access_hash: 0,
+                },
+            ));
+        }
         result.address_ = chat_location.address.clone();
         result
     }
@@ -3608,6 +3611,12 @@ impl DialogLocation {
     /// `get_address`.
     pub fn get_address(&self) -> &str {
         &self.address_
+    }
+
+    /// `get_input_geo_point` (DialogLocation.cpp:66-68) — the wrapped
+    /// `Location::get_input_geo_point`.
+    pub fn get_input_geo_point(&self) -> telegram_api::InputGeoPoint {
+        self.location_.get_input_geo_point()
     }
 
     /// `store` (DialogLocation.h:51-55).
@@ -5428,12 +5437,175 @@ pub(crate) enum ChatNetKind {
     /// completion hook runs for the ok and the !bot CHAT_NOT_MODIFIED
     /// bands.
     SetChannelMainProfileTab { channel_id: ChannelId },
+    /// `ToggleChannelSignaturesQuery` (ChatManager.cpp:596) — the kind
+    /// carries the channel for the error tail; the promise parks in
+    /// the family queue.
+    ToggleChannelSignatures { channel_id: ChannelId },
+    /// `ToggleChannelJoinToSendQuery` (ChatManager.cpp:637).
+    ToggleChannelJoinToSend { channel_id: ChannelId },
+    /// `ToggleChannelJoinRequestQuery` (ChatManager.cpp:677) — the
+    /// guard-bot id parks with the promise (the handler's
+    /// `guard_bot_user_id_` member, default when the query carries no
+    /// input user); the ok head runs the guard-bot intake before
+    /// `on_get_updates`.
+    ToggleChannelJoinRequest { channel_id: ChannelId },
+    /// `TogglePrehistoryHiddenQuery` (ChatManager.cpp:727) — the
+    /// availability parks with the promise (the handler member); the
+    /// Updates answer rides the `on_get_updates` + intake lambda
+    /// chain.
+    TogglePrehistoryHidden { channel_id: ChannelId },
+    /// `RestrictSponsoredMessagesQuery` (ChatManager.cpp:778) — the
+    /// flag parks with the promise (the handler member); the same
+    /// lambda chain.
+    RestrictSponsoredMessages { channel_id: ChannelId },
+    /// `ToggleAutotranslationQuery` (ChatManager.cpp:829).
+    ToggleAutotranslation { channel_id: ChannelId },
+    /// `ToggleParticipantsHiddenQuery` (ChatManager.cpp:874) — the
+    /// flag parks with the promise (the handler member); the same
+    /// lambda chain.
+    ToggleParticipantsHidden { channel_id: ChannelId },
+    /// `ToggleAntiSpamQuery` (ChatManager.cpp:925) — the flag parks
+    /// with the promise (the handler member); the same lambda chain.
+    ToggleAntiSpam { channel_id: ChannelId },
+    /// `ToggleForumQuery` (ChatManager.cpp:977).
+    ToggleForum { channel_id: ChannelId },
+    /// `ConvertToGigagroupQuery` (ChatManager.cpp:1019) — the
+    /// CHAT_NOT_MODIFIED error band answers the value for bots too
+    /// (the C++ tail has no is_bot check).
+    ConvertToGigagroup { channel_id: ChannelId },
+    /// `SetDiscussionGroupQuery` (ChatManager.cpp:1122) — the kind
+    /// carries both sides for the linked-channel intake; the error
+    /// tail is the bare forward (no channel-error head).
+    SetDiscussionGroup {
+        broadcast_channel_id: ChannelId,
+        group_channel_id: ChannelId,
+    },
+    /// `EditLocationQuery` (ChatManager.cpp:1162) — the location parks
+    /// with the promise (the handler's `location_` member).
+    EditLocation { channel_id: ChannelId },
+    /// `ToggleSlowModeQuery` (ChatManager.cpp:1203) — the delay parks
+    /// with the promise (the handler member); the not-modified error
+    /// band runs the intake with an empty promise first.
+    ToggleSlowMode { channel_id: ChannelId },
+    /// `ReportChannelAntiSpamFalsePositiveQuery` (ChatManager.cpp:1298).
+    ReportChannelAntiSpamFalsePositive { channel_id: ChannelId },
+    /// `UpdatePaidMessagesPriceQuery` (ChatManager.cpp:1334) — one
+    /// query, two send legs (the monoforum
+    /// `set_channel_monoforum_group` and the paid-message
+    /// `set_channel_send_paid_message_star_count`).
+    UpdatePaidMessagesPrice { channel_id: ChannelId },
     /// `DeleteChatQuery` (ChatManager.cpp:1375) — the basic-group delete;
     /// the answer tail refires `get_difference` and chains the empty
     /// `updates` container into `on_get_updates`.
     DeleteChat,
     /// `DeleteChannelQuery` (ChatManager.cpp:1402).
     DeleteChannel { channel_id: ChannelId },
+}
+
+/// The `PromiseCreator::lambda` tails of the channel toggle families —
+/// the intakes that run after `on_get_updates` settles the Updates
+/// answer (the C++ lambda captures the value member + the promise; the
+/// `LambdaPromise` runs on both the ok and the error paths, so the
+/// tail unconditionally follows the updates engine). Rides
+/// [`crate::td::UmMessage::OnGetUpdatesChannelToggle`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChatToggleTail {
+    /// `TogglePrehistoryHiddenQuery` (ChatManager.cpp:727) — the
+    /// lambda capture `is_all_history_available_` (cpp:756-761).
+    IsAllHistoryAvailable {
+        channel_id: ChannelId,
+        is_all_history_available: bool,
+    },
+    /// `RestrictSponsoredMessagesQuery` (ChatManager.cpp:778) — the
+    /// lambda capture `can_have_sponsored_messages_` (cpp:807-812).
+    CanHaveSponsoredMessages {
+        channel_id: ChannelId,
+        can_have_sponsored_messages: bool,
+    },
+    /// `ToggleParticipantsHiddenQuery` (ChatManager.cpp:874) — the
+    /// lambda capture `has_hidden_participants_` (cpp:903-908).
+    HasHiddenParticipants {
+        channel_id: ChannelId,
+        has_hidden_participants: bool,
+    },
+    /// `ToggleAntiSpamQuery` (ChatManager.cpp:925) — the lambda capture
+    /// `has_aggressive_anti_spam_enabled_` (cpp:954-959).
+    HasAggressiveAntiSpamEnabled {
+        channel_id: ChannelId,
+        has_aggressive_anti_spam_enabled: bool,
+    },
+    /// `ToggleSlowModeQuery` (ChatManager.cpp:1203) — the lambda
+    /// capture `slow_mode_delay_` (cpp:1232-1237).
+    SlowModeDelay {
+        channel_id: ChannelId,
+        slow_mode_delay: i32,
+    },
+}
+
+impl ChatToggleTail {
+    /// Run the captured intake — the lambda body's `send_closure`
+    /// `&ChatManager::on_update_channel_*` hop collapsed onto the run
+    /// slice.
+    pub(crate) fn run(
+        self,
+        chat_manager: &mut ChatManager,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        promise: Promise<()>,
+    ) {
+        match self {
+            ChatToggleTail::IsAllHistoryAvailable {
+                channel_id,
+                is_all_history_available,
+            } => chat_manager.on_update_channel_is_all_history_available(
+                user_manager,
+                env,
+                channel_id,
+                is_all_history_available,
+                promise,
+            ),
+            ChatToggleTail::CanHaveSponsoredMessages {
+                channel_id,
+                can_have_sponsored_messages,
+            } => chat_manager.on_update_channel_can_have_sponsored_messages(
+                user_manager,
+                env,
+                channel_id,
+                can_have_sponsored_messages,
+                promise,
+            ),
+            ChatToggleTail::HasHiddenParticipants {
+                channel_id,
+                has_hidden_participants,
+            } => chat_manager.on_update_channel_has_hidden_participants(
+                user_manager,
+                env,
+                channel_id,
+                has_hidden_participants,
+                promise,
+            ),
+            ChatToggleTail::HasAggressiveAntiSpamEnabled {
+                channel_id,
+                has_aggressive_anti_spam_enabled,
+            } => chat_manager.on_update_channel_has_aggressive_anti_spam_enabled(
+                user_manager,
+                env,
+                channel_id,
+                has_aggressive_anti_spam_enabled,
+                promise,
+            ),
+            ChatToggleTail::SlowModeDelay {
+                channel_id,
+                slow_mode_delay,
+            } => chat_manager.on_update_channel_slow_mode_delay(
+                user_manager,
+                env,
+                channel_id,
+                slow_mode_delay,
+                promise,
+            ),
+        }
+    }
 }
 
 pub struct ChatManager {
@@ -5544,6 +5716,47 @@ pub struct ChatManager {
     /// query_promise lambda's `profile_tab` capture + the caller promise,
     /// cpp:559-561).
     pending_set_channel_main_profile_tab: Vec<(ProfileTab, Promise<()>)>,
+    /// The `ToggleChannelSignaturesQuery` promises (cpp:598-600).
+    pending_toggle_channel_signatures: Vec<Promise<()>>,
+    /// The `ToggleChannelJoinToSendQuery` promises (cpp:639-641).
+    pending_toggle_channel_join_to_send: Vec<Promise<()>>,
+    /// The `ToggleChannelJoinRequestQuery` in-flight states (the
+    /// handler's `guard_bot_user_id_`/`promise_` members, cpp:679-682).
+    pending_toggle_channel_join_request: Vec<(UserId, Promise<()>)>,
+    /// The `TogglePrehistoryHiddenQuery` in-flight states (the handler's
+    /// `is_all_history_available_`/`promise_` members, cpp:729-732).
+    pending_toggle_prehistory_hidden: Vec<(bool, Promise<()>)>,
+    /// The `RestrictSponsoredMessagesQuery` in-flight states (the
+    /// handler's `can_have_sponsored_messages_`/`promise_` members,
+    /// cpp:780-783).
+    pending_restrict_sponsored_messages: Vec<(bool, Promise<()>)>,
+    /// The `ToggleAutotranslationQuery` promises (cpp:831-833).
+    pending_toggle_autotranslation: Vec<Promise<()>>,
+    /// The `ToggleParticipantsHiddenQuery` in-flight states (the
+    /// handler's `has_hidden_participants_`/`promise_` members,
+    /// cpp:876-879).
+    pending_toggle_participants_hidden: Vec<(bool, Promise<()>)>,
+    /// The `ToggleAntiSpamQuery` in-flight states (the handler's
+    /// `has_aggressive_anti_spam_enabled_`/`promise_` members,
+    /// cpp:927-930).
+    pending_toggle_anti_spam: Vec<(bool, Promise<()>)>,
+    /// The `ToggleForumQuery` promises (cpp:979-981).
+    pending_toggle_forum: Vec<Promise<()>>,
+    /// The `ConvertToGigagroupQuery` promises (cpp:1021-1023).
+    pending_convert_to_gigagroup: Vec<Promise<()>>,
+    /// The `SetDiscussionGroupQuery` promises (cpp:1124-1126).
+    pending_set_discussion_group: Vec<Promise<()>>,
+    /// The `EditLocationQuery` in-flight states (the handler's
+    /// `location_`/`promise_` members, cpp:1164-1167).
+    pending_edit_location: Vec<(DialogLocation, Promise<()>)>,
+    /// The `ToggleSlowModeQuery` in-flight states (the handler's
+    /// `slow_mode_delay_`/`promise_` members, cpp:1205-1208).
+    pending_toggle_slow_mode: Vec<(i32, Promise<()>)>,
+    /// The `ReportChannelAntiSpamFalsePositiveQuery` promises
+    /// (cpp:1300-1302).
+    pending_report_channel_anti_spam_false_positive: Vec<Promise<()>>,
+    /// The `UpdatePaidMessagesPriceQuery` promises (cpp:1336-1338).
+    pending_update_paid_messages_price: Vec<Promise<()>>,
     /// The `DeleteChatQuery` promises (ChatManager.cpp:1377).
     pending_delete_chat: Vec<Promise<()>>,
     /// The `DeleteChannelQuery` promises (ChatManager.cpp:1404).
@@ -5594,6 +5807,21 @@ impl ChatManager {
             pending_set_channel_emoji_sticker_set: Vec::new(),
             pending_set_channel_boosts_to_unblock_restrictions: Vec::new(),
             pending_set_channel_main_profile_tab: Vec::new(),
+            pending_toggle_channel_signatures: Vec::new(),
+            pending_toggle_channel_join_to_send: Vec::new(),
+            pending_toggle_channel_join_request: Vec::new(),
+            pending_toggle_prehistory_hidden: Vec::new(),
+            pending_restrict_sponsored_messages: Vec::new(),
+            pending_toggle_autotranslation: Vec::new(),
+            pending_toggle_participants_hidden: Vec::new(),
+            pending_toggle_anti_spam: Vec::new(),
+            pending_toggle_forum: Vec::new(),
+            pending_convert_to_gigagroup: Vec::new(),
+            pending_set_discussion_group: Vec::new(),
+            pending_edit_location: Vec::new(),
+            pending_toggle_slow_mode: Vec::new(),
+            pending_report_channel_anti_spam_false_positive: Vec::new(),
+            pending_update_paid_messages_price: Vec::new(),
             pending_delete_chat: Vec::new(),
             pending_delete_channel: Vec::new(),
         }
@@ -8738,6 +8966,169 @@ impl ChatManager {
         }
     }
 
+    /// `ToggleChannelSignaturesQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:611-622).
+    pub(crate) fn take_toggle_channel_signatures_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_toggle_channel_signatures.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_channel_signatures.remove(0))
+        }
+    }
+
+    /// `ToggleChannelJoinToSendQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:652-663).
+    pub(crate) fn take_toggle_channel_join_to_send_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_toggle_channel_join_to_send.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_channel_join_to_send.remove(0))
+        }
+    }
+
+    /// `ToggleChannelJoinRequestQuery::on_result`'s in-flight pop (the
+    /// handler's `guard_bot_user_id_`/`promise_` members,
+    /// ChatManager.cpp:692-703).
+    pub(crate) fn take_toggle_channel_join_request(&mut self) -> Option<(UserId, Promise<()>)> {
+        if self.pending_toggle_channel_join_request.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_channel_join_request.remove(0))
+        }
+    }
+
+    /// `TogglePrehistoryHiddenQuery::on_result`'s in-flight pop (the
+    /// handler's `is_all_history_available_`/`promise_` members,
+    /// ChatManager.cpp:742-753).
+    pub(crate) fn take_toggle_prehistory_hidden(&mut self) -> Option<(bool, Promise<()>)> {
+        if self.pending_toggle_prehistory_hidden.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_prehistory_hidden.remove(0))
+        }
+    }
+
+    /// `RestrictSponsoredMessagesQuery::on_result`'s in-flight pop (the
+    /// handler's `can_have_sponsored_messages_`/`promise_` members,
+    /// ChatManager.cpp:793-804).
+    pub(crate) fn take_restrict_sponsored_messages(&mut self) -> Option<(bool, Promise<()>)> {
+        if self.pending_restrict_sponsored_messages.is_empty() {
+            None
+        } else {
+            Some(self.pending_restrict_sponsored_messages.remove(0))
+        }
+    }
+
+    /// `ToggleAutotranslationQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:844-855).
+    pub(crate) fn take_toggle_autotranslation_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_toggle_autotranslation.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_autotranslation.remove(0))
+        }
+    }
+
+    /// `ToggleParticipantsHiddenQuery::on_result`'s in-flight pop (the
+    /// handler's `has_hidden_participants_`/`promise_` members,
+    /// ChatManager.cpp:889-900).
+    pub(crate) fn take_toggle_participants_hidden(&mut self) -> Option<(bool, Promise<()>)> {
+        if self.pending_toggle_participants_hidden.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_participants_hidden.remove(0))
+        }
+    }
+
+    /// `ToggleAntiSpamQuery::on_result`'s in-flight pop (the handler's
+    /// `has_aggressive_anti_spam_enabled_`/`promise_` members,
+    /// ChatManager.cpp:940-951).
+    pub(crate) fn take_toggle_anti_spam(&mut self) -> Option<(bool, Promise<()>)> {
+        if self.pending_toggle_anti_spam.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_anti_spam.remove(0))
+        }
+    }
+
+    /// `ToggleForumQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:992-1003).
+    pub(crate) fn take_toggle_forum_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_toggle_forum.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_forum.remove(0))
+        }
+    }
+
+    /// `ConvertToGigagroupQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:1034-1045).
+    pub(crate) fn take_convert_to_gigagroup_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_convert_to_gigagroup.is_empty() {
+            None
+        } else {
+            Some(self.pending_convert_to_gigagroup.remove(0))
+        }
+    }
+
+    /// `SetDiscussionGroupQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:1143-1152).
+    pub(crate) fn take_set_discussion_group_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_set_discussion_group.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_discussion_group.remove(0))
+        }
+    }
+
+    /// `EditLocationQuery::on_result`'s in-flight pop (the handler's
+    /// `location_`/`promise_` members, ChatManager.cpp:1184-1195).
+    pub(crate) fn take_edit_location(&mut self) -> Option<(DialogLocation, Promise<()>)> {
+        if self.pending_edit_location.is_empty() {
+            None
+        } else {
+            Some(self.pending_edit_location.remove(0))
+        }
+    }
+
+    /// `ToggleSlowModeQuery::on_result`'s in-flight pop (the handler's
+    /// `slow_mode_delay_`/`promise_` members, ChatManager.cpp:1225-1236).
+    pub(crate) fn take_toggle_slow_mode(&mut self) -> Option<(i32, Promise<()>)> {
+        if self.pending_toggle_slow_mode.is_empty() {
+            None
+        } else {
+            Some(self.pending_toggle_slow_mode.remove(0))
+        }
+    }
+
+    /// `ReportChannelAntiSpamFalsePositiveQuery::on_result`'s promise
+    /// pop (ChatManager.cpp:1310-1320).
+    pub(crate) fn take_report_channel_anti_spam_false_positive_promise(
+        &mut self,
+    ) -> Option<Promise<()>> {
+        if self
+            .pending_report_channel_anti_spam_false_positive
+            .is_empty()
+        {
+            None
+        } else {
+            Some(
+                self.pending_report_channel_anti_spam_false_positive
+                    .remove(0),
+            )
+        }
+    }
+
+    /// `UpdatePaidMessagesPriceQuery::on_result`'s promise pop
+    /// (ChatManager.cpp:1346-1357).
+    pub(crate) fn take_update_paid_messages_price_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_update_paid_messages_price.is_empty() {
+            None
+        } else {
+            Some(self.pending_update_paid_messages_price.remove(0))
+        }
+    }
+
     /// `DeleteChatQuery::on_result`'s promise pop (ChatManager.cpp:1387-1397).
     pub(crate) fn take_delete_chat_promise(&mut self) -> Option<Promise<()>> {
         if self.pending_delete_chat.is_empty() {
@@ -10885,6 +11276,319 @@ impl ChatManager {
         }
     }
 
+    /// `on_update_channel_is_all_history_available`
+    /// (ChatManager.cpp:8225-8236) — the `TogglePrehistoryHiddenQuery`
+    /// intake (the PromiseCreator::lambda chain routes both the ok and
+    /// the error paths of the updates engine here).
+    pub fn on_update_channel_is_all_history_available(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        is_all_history_available: bool,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        let changed = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_is_all_history_available",
+                false,
+            )
+            .is_some_and(|f| f.is_all_history_available != is_all_history_available);
+        if changed {
+            let f = self.get_channel_full_mut(channel_id).unwrap();
+            f.is_all_history_available = is_all_history_available;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_is_all_history_available",
+                false,
+            );
+        }
+        promise.set_value(());
+    }
+
+    /// `on_update_channel_can_have_sponsored_messages`
+    /// (ChatManager.cpp:8238-8249) — the
+    /// `RestrictSponsoredMessagesQuery` intake (the same lambda chain).
+    pub fn on_update_channel_can_have_sponsored_messages(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        can_have_sponsored_messages: bool,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        let changed = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_can_have_sponsored_messages",
+                false,
+            )
+            .is_some_and(|f| f.can_have_sponsored_messages != can_have_sponsored_messages);
+        if changed {
+            let f = self.get_channel_full_mut(channel_id).unwrap();
+            f.can_have_sponsored_messages = can_have_sponsored_messages;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_can_have_sponsored_messages",
+                false,
+            );
+        }
+        promise.set_value(());
+    }
+
+    /// `on_update_channel_has_hidden_participants`
+    /// (ChatManager.cpp:8251-8262) — the `ToggleParticipantsHiddenQuery`
+    /// intake (the same lambda chain).
+    pub fn on_update_channel_has_hidden_participants(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        has_hidden_participants: bool,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        let changed = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_has_hidden_participants",
+                false,
+            )
+            .is_some_and(|f| f.has_hidden_participants != has_hidden_participants);
+        if changed {
+            let f = self.get_channel_full_mut(channel_id).unwrap();
+            f.has_hidden_participants = has_hidden_participants;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_has_hidden_participants",
+                false,
+            );
+        }
+        promise.set_value(());
+    }
+
+    /// `on_update_channel_has_aggressive_anti_spam_enabled`
+    /// (ChatManager.cpp:8264-8276) — the `ToggleAntiSpamQuery` intake
+    /// (the same lambda chain).
+    pub fn on_update_channel_has_aggressive_anti_spam_enabled(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        has_aggressive_anti_spam_enabled: bool,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        assert!(channel_id.is_valid(), "Receive invalid {channel_id:?}");
+        let changed = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_has_aggressive_anti_spam_enabled",
+                false,
+            )
+            .is_some_and(|f| {
+                f.has_aggressive_anti_spam_enabled != has_aggressive_anti_spam_enabled
+            });
+        if changed {
+            let f = self.get_channel_full_mut(channel_id).unwrap();
+            f.has_aggressive_anti_spam_enabled = has_aggressive_anti_spam_enabled;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_has_aggressive_anti_spam_enabled",
+                false,
+            );
+        }
+        promise.set_value(());
+    }
+
+    /// `on_update_channel_linked_channel_id` (ChatManager.cpp:8137-8151)
+    /// — the `SetDiscussionGroupQuery` intake: both sides' fulls take
+    /// the mutual link rewrite (an invalid side skips its half).
+    pub fn on_update_channel_linked_channel_id(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        group_channel_id: ChannelId,
+    ) {
+        if channel_id.is_valid() {
+            let have_full = self
+                .get_channel_full_force(
+                    user_manager,
+                    env,
+                    channel_id,
+                    true,
+                    "on_update_channel_linked_channel_id 1",
+                    false,
+                )
+                .is_some();
+            self.on_update_channel_full_linked_channel_id(
+                user_manager,
+                env,
+                channel_id,
+                group_channel_id,
+            );
+            if have_full {
+                self.update_channel_full(
+                    user_manager,
+                    env,
+                    channel_id,
+                    "on_update_channel_linked_channel_id 3",
+                    false,
+                );
+            }
+        }
+        if group_channel_id.is_valid() {
+            let have_full = self
+                .get_channel_full_force(
+                    user_manager,
+                    env,
+                    group_channel_id,
+                    true,
+                    "on_update_channel_linked_channel_id 2",
+                    false,
+                )
+                .is_some();
+            self.on_update_channel_full_linked_channel_id(
+                user_manager,
+                env,
+                group_channel_id,
+                channel_id,
+            );
+            if have_full {
+                self.update_channel_full(
+                    user_manager,
+                    env,
+                    group_channel_id,
+                    "on_update_channel_linked_channel_id 4",
+                    false,
+                );
+            }
+        }
+    }
+
+    /// `on_update_channel_location` (ChatManager.cpp:8169-8175) — the
+    /// `EditLocationQuery` intake.
+    pub fn on_update_channel_location(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        location: DialogLocation,
+    ) {
+        let have_full = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_location",
+                false,
+            )
+            .is_some();
+        if have_full {
+            self.on_update_channel_full_location(user_manager, env, channel_id, location);
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_location",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_channel_slow_mode_delay` (ChatManager.cpp:8177-8186) —
+    /// the `ToggleSlowModeQuery` intake (the Updates lambda chain and
+    /// the CHAT_NOT_MODIFIED error band with its empty promise).
+    pub fn on_update_channel_slow_mode_delay(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        slow_mode_delay: i32,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status()) — the collapsed
+        // close gate drops the promise (the "Lost promise" convention).
+        if env.global.close_flag() {
+            return;
+        }
+        let have_full = self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_slow_mode_delay",
+                false,
+            )
+            .is_some();
+        if have_full {
+            self.on_update_channel_full_slow_mode_delay(
+                user_manager,
+                env,
+                channel_id,
+                slow_mode_delay,
+                0,
+            );
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_slow_mode_delay",
+                false,
+            );
+        }
+        promise.set_value(());
+    }
+
     /// `on_update_channel_permanent_invite_link`
     /// (ChatManager.cpp:9144-9152).
     pub fn on_update_channel_permanent_invite_link(
@@ -12075,13 +12779,14 @@ impl ChatManager {
 
     // ---- M.5.41: the toggle family (ChatManager.cpp:3444-3675) ----
 
-    /// `toggle_channel_sign_messages` (ChatManager.cpp:3444-3458).
+    /// `toggle_channel_sign_messages` (ChatManager.cpp:3444-3458) — the
+    /// `ToggleChannelSignaturesQuery` send rides the `net` handle.
     pub fn toggle_channel_sign_messages(
         &mut self,
         env: &mut UserEnv,
         channel_id: ChannelId,
-        _sign_messages: bool,
-        _show_message_sender: bool,
+        sign_messages: bool,
+        show_message_sender: bool,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -12102,16 +12807,33 @@ impl ChatManager {
                 "Not enough rights to toggle channel sign messages",
             ));
         }
-        tdutils::log_info!("ToggleChannelSignaturesQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ToggleChannelSignaturesQuery::send` (cpp:603-610) — the
+        // caller passes flags 0; the bools carry the wire bits.
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_toggle_channel_signatures.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::ToggleChannelSignatures { channel_id },
+            telegram_api::Function::channels_toggleSignatures(
+                telegram_api::channels_toggleSignatures {
+                    flags: 0,
+                    signatures_enabled: sign_messages,
+                    profiles_enabled: show_message_sender,
+                    channel: Some(input_channel),
+                },
+            ),
+            "channels.toggleSignatures",
+        );
     }
 
-    /// `toggle_channel_join_to_send` (ChatManager.cpp:3461-3473).
+    /// `toggle_channel_join_to_send` (ChatManager.cpp:3461-3473) — the
+    /// `ToggleChannelJoinToSendQuery` send rides the `net` handle.
     pub fn toggle_channel_join_to_send(
         &mut self,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
-        _join_to_send: bool,
+        join_to_send: bool,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -12126,16 +12848,32 @@ impl ChatManager {
         if !self.get_channel_status(channel_id).can_restrict_members() {
             return promise.set_error(Status::error(400, "Not enough rights"));
         }
-        tdutils::log_info!("ToggleChannelJoinToSendQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ToggleChannelJoinToSendQuery::send` (cpp:644-651).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_toggle_channel_join_to_send.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::ToggleChannelJoinToSend { channel_id },
+            telegram_api::Function::channels_toggleJoinToSend(
+                telegram_api::channels_toggleJoinToSend {
+                    channel: Some(input_channel),
+                    enabled: join_to_send,
+                },
+            ),
+            "channels.toggleJoinToSend",
+        );
     }
 
-    /// `toggle_channel_join_request` (ChatManager.cpp:3476-3494).
+    /// `toggle_channel_join_request` (ChatManager.cpp:3476-3494) — the
+    /// guard-bot `input_user` resolves at the send leg (the C++
+    /// `get_input_user` TRY); the `ToggleChannelJoinRequestQuery` send
+    /// rides the `net` handle.
     #[allow(clippy::too_many_arguments)]
     pub fn toggle_channel_join_request(
         &mut self,
-        _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         join_request: bool,
         guard_bot_user_id: UserId,
@@ -12154,14 +12892,46 @@ impl ChatManager {
         if !self.get_channel_status(channel_id).can_restrict_members() {
             return promise.set_error(Status::error(400, "Not enough rights"));
         }
-        let _ = (join_request, guard_bot_user_id, apply_to_invite_links);
-        // the guard-bot input_user resolution is the net step's job (M.5.45)
-        tdutils::log_info!("ToggleChannelJoinRequestQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        let mut input_user = None;
+        if join_request && guard_bot_user_id != UserId::default() {
+            match user_manager.get_input_user(env, guard_bot_user_id) {
+                Ok(user) => input_user = Some(user),
+                Err(status) => return promise.set_error(status),
+            }
+        }
+        // `ToggleChannelJoinRequestQuery::send` (cpp:684-696) — the
+        // GUARD_BOT flag bit rides the query with the input user; the
+        // handler's `guard_bot_user_id_` member stays default without
+        // one.
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        let guard_bot_parked = if input_user.is_some() {
+            guard_bot_user_id
+        } else {
+            UserId::default()
+        };
+        self.pending_toggle_channel_join_request
+            .push((guard_bot_parked, promise));
+        self.send_chat_net_query(
+            ChatNetKind::ToggleChannelJoinRequest { channel_id },
+            telegram_api::Function::channels_toggleJoinRequest(
+                telegram_api::channels_toggleJoinRequest {
+                    flags: if input_user.is_some() { 1 } else { 0 },
+                    apply_to_invites: apply_to_invite_links,
+                    channel: Some(input_channel),
+                    enabled: join_request,
+                    guard_bot: input_user,
+                },
+            ),
+            "channels.toggleJoinRequest",
+        );
     }
 
     /// `toggle_channel_is_all_history_available`
-    /// (ChatManager.cpp:3497-3517) — the gate order is load-bearing.
+    /// (ChatManager.cpp:3497-3517) — the gate order is load-bearing
+    /// (the rights check precedes the type check); the
+    /// `TogglePrehistoryHiddenQuery` send rides the `net` handle.
     pub fn toggle_channel_is_all_history_available(
         &mut self,
         env: &mut UserEnv,
@@ -12199,17 +12969,35 @@ impl ChatManager {
                 "Message history can't be hidden in discussion supergroups",
             ));
         }
-        tdutils::log_info!("TogglePrehistoryHiddenQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // it can be toggled in public chats, but will not affect them
+        //
+        // `TogglePrehistoryHiddenQuery::send` (cpp:734-741) — the wire
+        // flag is the negation (hidden_prehistory).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_toggle_prehistory_hidden
+            .push((is_all_history_available, promise));
+        self.send_chat_net_query(
+            ChatNetKind::TogglePrehistoryHidden { channel_id },
+            telegram_api::Function::channels_togglePreHistoryHidden(
+                telegram_api::channels_togglePreHistoryHidden {
+                    channel: Some(input_channel),
+                    enabled: !is_all_history_available,
+                },
+            ),
+            "channels.togglePreHistoryHidden",
+        );
     }
 
     /// `toggle_channel_can_have_sponsored_messages`
-    /// (ChatManager.cpp:3520-3534).
+    /// (ChatManager.cpp:3520-3534) — the
+    /// `RestrictSponsoredMessagesQuery` send rides the `net` handle.
     pub fn toggle_channel_can_have_sponsored_messages(
         &mut self,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
-        _can_have_sponsored_messages: bool,
+        can_have_sponsored_messages: bool,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -12227,17 +13015,33 @@ impl ChatManager {
                 "Sponsored messages can be disabled only in channels",
             ));
         }
-        tdutils::log_info!("RestrictSponsoredMessagesQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `RestrictSponsoredMessagesQuery::send` (cpp:785-792) — the
+        // wire flag is the negation (restricted).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_restrict_sponsored_messages
+            .push((can_have_sponsored_messages, promise));
+        self.send_chat_net_query(
+            ChatNetKind::RestrictSponsoredMessages { channel_id },
+            telegram_api::Function::channels_restrictSponsoredMessages(
+                telegram_api::channels_restrictSponsoredMessages {
+                    channel: Some(input_channel),
+                    restricted: !can_have_sponsored_messages,
+                },
+            ),
+            "channels.restrictSponsoredMessages",
+        );
     }
 
     /// `toggle_channel_has_automatic_translation`
-    /// (ChatManager.cpp:3537-3550).
+    /// (ChatManager.cpp:3537-3550) — the `ToggleAutotranslationQuery`
+    /// send rides the `net` handle.
     pub fn toggle_channel_has_automatic_translation(
         &mut self,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
-        _has_automatic_translation: bool,
+        has_automatic_translation: bool,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
@@ -12255,18 +13059,32 @@ impl ChatManager {
                 "Automatic translation can be enabled only in channels",
             ));
         }
-        tdutils::log_info!("ToggleAutotranslationQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ToggleAutotranslationQuery::send` (cpp:836-843).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_toggle_autotranslation.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::ToggleAutotranslation { channel_id },
+            telegram_api::Function::channels_toggleAutotranslation(
+                telegram_api::channels_toggleAutotranslation {
+                    channel: Some(input_channel),
+                    enabled: has_automatic_translation,
+                },
+            ),
+            "channels.toggleAutotranslation",
+        );
     }
 
     /// `toggle_channel_has_hidden_participants`
-    /// (ChatManager.cpp:3588-3593).
+    /// (ChatManager.cpp:3588-3593) — the
+    /// `ToggleParticipantsHiddenQuery` send rides the `net` handle.
     pub fn toggle_channel_has_hidden_participants(
         &mut self,
         _user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
-        _has_hidden_participants: bool,
+        has_hidden_participants: bool,
         // user_manager is consumed by get_channel_full_force above
         mut promise: Promise<()>,
     ) {
@@ -12274,41 +13092,69 @@ impl ChatManager {
         let check = self.can_hide_channel_participants(env, channel_id, full.as_ref());
         match check {
             tdutils::status::Result::Ok(()) => {
-                tdutils::log_info!(
-                    "ToggleParticipantsHiddenQuery for {channel_id:?} — [blocked: net]"
+                // `ToggleParticipantsHiddenQuery::send` (cpp:881-888).
+                let input_channel = self
+                    .get_input_channel(env, channel_id)
+                    .expect("the flow read the channel record");
+                self.pending_toggle_participants_hidden
+                    .push((has_hidden_participants, promise));
+                self.send_chat_net_query(
+                    ChatNetKind::ToggleParticipantsHidden { channel_id },
+                    telegram_api::Function::channels_toggleParticipantsHidden(
+                        telegram_api::channels_toggleParticipantsHidden {
+                            channel: Some(input_channel),
+                            enabled: has_hidden_participants,
+                        },
+                    ),
+                    "channels.toggleParticipantsHidden",
                 );
-                promise.set_error(Status::error(500, "Network is not implemented yet"));
             }
             tdutils::status::Result::Err(status) => promise.set_error(status),
         }
     }
 
     /// `toggle_channel_has_aggressive_anti_spam_enabled`
-    /// (ChatManager.cpp:3639-3645).
+    /// (ChatManager.cpp:3639-3645) — the `ToggleAntiSpamQuery` send
+    /// rides the `net` handle.
     pub fn toggle_channel_has_aggressive_anti_spam_enabled(
         &mut self,
         _user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
-        _has_aggressive_anti_spam_enabled: bool,
+        has_aggressive_anti_spam_enabled: bool,
         mut promise: Promise<()>,
     ) {
         let full = self.get_channel_full_const(channel_id).cloned();
         let check = self.can_toggle_channel_aggressive_anti_spam(env, channel_id, full.as_ref());
         match check {
             tdutils::status::Result::Ok(()) => {
-                tdutils::log_info!("ToggleAntiSpamQuery for {channel_id:?} — [blocked: net]");
-                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                // `ToggleAntiSpamQuery::send` (cpp:932-939).
+                let input_channel = self
+                    .get_input_channel(env, channel_id)
+                    .expect("the flow read the channel record");
+                self.pending_toggle_anti_spam
+                    .push((has_aggressive_anti_spam_enabled, promise));
+                self.send_chat_net_query(
+                    ChatNetKind::ToggleAntiSpam { channel_id },
+                    telegram_api::Function::channels_toggleAntiSpam(
+                        telegram_api::channels_toggleAntiSpam {
+                            channel: Some(input_channel),
+                            enabled: has_aggressive_anti_spam_enabled,
+                        },
+                    ),
+                    "channels.toggleAntiSpam",
+                );
             }
             tdutils::status::Result::Err(status) => promise.set_error(status),
         }
     }
 
     /// `toggle_channel_is_forum` (ChatManager.cpp:3648-3664) — the no-op
-    /// equal-state early-OK resolves without a query.
+    /// equal-state early-OK resolves without a query; the
+    /// `ToggleForumQuery` send rides the `net` handle.
     pub fn toggle_channel_is_forum(
         &mut self,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         is_forum: bool,
         is_forum_tabs: bool,
@@ -12332,8 +13178,21 @@ impl ChatManager {
                 "Forums can be enabled in supergroups only",
             ));
         }
-        tdutils::log_info!("ToggleForumQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ToggleForumQuery::send` (cpp:984-991) — the tabs bit rides
+        // `is_forum && is_forum_tabs`.
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_toggle_forum.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::ToggleForum { channel_id },
+            telegram_api::Function::channels_toggleForum(telegram_api::channels_toggleForum {
+                channel: Some(input_channel),
+                enabled: is_forum,
+                tabs: is_forum && is_forum_tabs,
+            }),
+            "channels.toggleForum",
+        );
     }
 
     /// `can_convert_channel_to_gigagroup` (ChatManager.cpp:3925-3928).
@@ -12355,7 +13214,8 @@ impl ChatManager {
         true
     }
 
-    /// `convert_channel_to_gigagroup` (ChatManager.cpp:3667-3675).
+    /// `convert_channel_to_gigagroup` (ChatManager.cpp:3667-3675) — the
+    /// `ConvertToGigagroupQuery` send rides the `net` handle.
     pub fn convert_channel_to_gigagroup(
         &mut self,
         _user_manager: &mut UserManager,
@@ -12371,20 +13231,33 @@ impl ChatManager {
         }
         // td_->suggested_action_manager_->remove_dialog_suggested_action —
         // the M.13 stub.
-        tdutils::log_info!("ConvertToGigagroupQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ConvertToGigagroupQuery::send` (cpp:1026-1033).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_convert_to_gigagroup.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::ConvertToGigagroup { channel_id },
+            telegram_api::Function::channels_convertToGigagroup(
+                telegram_api::channels_convertToGigagroup {
+                    channel: Some(input_channel),
+                },
+            ),
+            "channels.convertToGigagroup",
+        );
     }
 
     // ---- M.5.42: discussion / monoforum / location / slow mode /
     // statistics / report / paid messages (ChatManager.cpp:3691-4018) ----
 
     /// `set_channel_discussion_group` (ChatManager.cpp:3691-3758). The
-    /// have_dialog_force gates are the DialogManager stubs (M.6/M.10); the
-    /// SetDiscussionGroupQuery send is [blocked: net].
+    /// have_dialog_force gates are the DialogManager stubs (M.6/M.10);
+    /// the `SetDiscussionGroupQuery` send rides the `net` handle — an
+    /// invalid side takes the `inputChannelEmpty` wire form.
     pub fn set_channel_discussion_group(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         dialog_id: DialogId,
         discussion_dialog_id: DialogId,
         mut promise: Promise<()>,
@@ -12393,9 +13266,13 @@ impl ChatManager {
             return promise.set_error(Status::error(400, "Invalid chat identifiers specified"));
         }
         // the broadcast side
+        let mut broadcast_channel_id = ChannelId::default();
+        let mut broadcast_input_channel =
+            telegram_api::InputChannel::inputChannelEmpty(telegram_api::inputChannelEmpty);
         if dialog_id.is_valid() {
-            // have_dialog_force — the DialogManager stub (M.6)
-            if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Broadcast {
+            // have_dialog_force — the DialogManager stub (M.6): the
+            // type gate + the record gates carry the C++ bands
+            if dialog_id.get_type() != DialogType::Channel {
                 return promise.set_error(Status::error(400, "Chat is not a channel"));
             }
             let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
@@ -12407,12 +13284,19 @@ impl ChatManager {
             if !c.status.can_change_info_and_settings_as_administrator() {
                 return promise.set_error(Status::error(400, "Not enough rights in the channel"));
             }
-            // get_input_channel — CHECKed non-null in C++
+            broadcast_channel_id = dialog_id.get_channel_id();
+            broadcast_input_channel = self
+                .get_input_channel(env, broadcast_channel_id)
+                .expect("get_input_channel — CHECKed non-null in C++");
         }
         // the discussion (megagroup) side
+        let mut group_channel_id = ChannelId::default();
+        let mut group_input_channel =
+            telegram_api::InputChannel::inputChannelEmpty(telegram_api::inputChannelEmpty);
         if discussion_dialog_id.is_valid() {
-            if self.get_channel_type_by_id(discussion_dialog_id.get_channel_id())
-                != ChannelType::Megagroup
+            if discussion_dialog_id.get_type() != DialogType::Channel
+                || self.get_channel_type_by_id(discussion_dialog_id.get_channel_id())
+                    != ChannelType::Megagroup
             {
                 return promise
                     .set_error(Status::error(400, "Discussion chat is not a supergroup"));
@@ -12428,18 +13312,35 @@ impl ChatManager {
                 return promise
                     .set_error(Status::error(400, "Not enough rights in the supergroup"));
             }
+            group_channel_id = discussion_dialog_id.get_channel_id();
+            group_input_channel = self
+                .get_input_channel(env, group_channel_id)
+                .expect("get_input_channel — CHECKed non-null in C++");
         }
-        tdutils::log_info!(
-            "SetDiscussionGroupQuery for {dialog_id:?}/{discussion_dialog_id:?} — [blocked: net]"
+        // `SetDiscussionGroupQuery::send` (cpp:1133-1141).
+        self.pending_set_discussion_group.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::SetDiscussionGroup {
+                broadcast_channel_id,
+                group_channel_id,
+            },
+            telegram_api::Function::channels_setDiscussionGroup(
+                telegram_api::channels_setDiscussionGroup {
+                    broadcast: Some(broadcast_input_channel),
+                    group: Some(group_input_channel),
+                },
+            ),
+            "channels.setDiscussionGroup",
         );
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
     }
 
-    /// `set_channel_monoforum_group` (ChatManager.cpp:3761-3792).
+    /// `set_channel_monoforum_group` (ChatManager.cpp:3761-3792) — the
+    /// monoforum leg of the `UpdatePaidMessagesPriceQuery` (the
+    /// broadcast_messages_allowed flag carries `is_enabled`).
     pub fn set_channel_monoforum_group(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         dialog_id: DialogId,
         is_enabled: bool,
         mut paid_message_star_count: i64,
@@ -12448,10 +13349,11 @@ impl ChatManager {
         if !dialog_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
         }
-        // have_dialog_force — the DialogManager stub (M.6)
-        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Broadcast {
+        if dialog_id.get_type() != DialogType::Channel {
             return promise.set_error(Status::error(400, "Chat is not a supergroup"));
         }
+        // have_dialog_force — the DialogManager stub (M.6): the record
+        // gates below carry the C++ bands
         let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
@@ -12463,22 +13365,39 @@ impl ChatManager {
         }
         if !is_enabled {
             paid_message_star_count = 0;
-            let _ = paid_message_star_count;
         } else if !(0..=1_000_000).contains(&paid_message_star_count) {
             return promise.set_error(Status::error(
                 400,
                 "Invalid number of Telegram Stars specified",
             ));
         }
-        tdutils::log_info!("UpdatePaidMessagesPriceQuery for {dialog_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `UpdatePaidMessagesPriceQuery::send` (cpp:1339-1346).
+        let input_channel = self
+            .get_input_channel(env, dialog_id.get_channel_id())
+            .expect("the flow read the channel record");
+        self.pending_update_paid_messages_price.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::UpdatePaidMessagesPrice {
+                channel_id: dialog_id.get_channel_id(),
+            },
+            telegram_api::Function::channels_updatePaidMessagesPrice(
+                telegram_api::channels_updatePaidMessagesPrice {
+                    flags: 0,
+                    broadcast_messages_allowed: is_enabled,
+                    channel: Some(input_channel),
+                    send_paid_messages_stars: paid_message_star_count,
+                },
+            ),
+            "channels.updatePaidMessagesPrice",
+        );
     }
 
-    /// `set_channel_location` (ChatManager.cpp:3795-3811).
+    /// `set_channel_location` (ChatManager.cpp:3795-3811) — the
+    /// `EditLocationQuery` send rides the `net` handle.
     pub fn set_channel_location(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         location: &DialogLocation,
         mut promise: Promise<()>,
@@ -12495,16 +13414,30 @@ impl ChatManager {
         if !c.status.is_creator() {
             return promise.set_error(Status::error(400, "Not enough rights in the supergroup"));
         }
-        tdutils::log_info!("EditLocationQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `EditLocationQuery::send` (cpp:1171-1179) — the location parks
+        // with the promise (the handler's `location_` member).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_edit_location.push((location.clone(), promise));
+        self.send_chat_net_query(
+            ChatNetKind::EditLocation { channel_id },
+            telegram_api::Function::channels_editLocation(telegram_api::channels_editLocation {
+                channel: Some(input_channel),
+                geo_point: Some(location.get_input_geo_point()),
+                address: location.get_address().to_owned(),
+            }),
+            "channels.editLocation",
+        );
     }
 
     /// `set_channel_slow_mode_delay` (ChatManager.cpp:3814-3843) — the
-    /// allowed-value check precedes the id validity check, like the C++.
+    /// allowed-value check precedes the id validity check, like the C++;
+    /// the `ToggleSlowModeQuery` send rides the `net` handle.
     pub fn set_channel_slow_mode_delay(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         dialog_id: DialogId,
         slow_mode_delay: i32,
         mut promise: Promise<()>,
@@ -12515,9 +13448,11 @@ impl ChatManager {
         if !dialog_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
         }
-        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Megagroup {
+        if dialog_id.get_type() != DialogType::Channel {
             return promise.set_error(Status::error(400, "Chat is not a supergroup"));
         }
+        // have_dialog_force — the DialogManager stub (M.6): the record
+        // gates below carry the C++ bands
         let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
@@ -12530,8 +13465,25 @@ impl ChatManager {
         {
             return promise.set_error(Status::error(400, "Not enough rights in the supergroup"));
         }
-        tdutils::log_info!("ToggleSlowModeQuery for {dialog_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `ToggleSlowModeQuery::send` (cpp:1212-1220) — the delay parks
+        // with the promise (the handler's `slow_mode_delay_` member).
+        let input_channel = self
+            .get_input_channel(env, dialog_id.get_channel_id())
+            .expect("the flow read the channel record");
+        self.pending_toggle_slow_mode
+            .push((slow_mode_delay, promise));
+        self.send_chat_net_query(
+            ChatNetKind::ToggleSlowMode {
+                channel_id: dialog_id.get_channel_id(),
+            },
+            telegram_api::Function::channels_toggleSlowMode(
+                telegram_api::channels_toggleSlowMode {
+                    channel: Some(input_channel),
+                    seconds: slow_mode_delay,
+                },
+            ),
+            "channels.toggleSlowMode",
+        );
     }
 
     /// `get_channel_statistics_dc_id` (ChatManager.cpp:3846-3876) — the
@@ -12643,11 +13595,13 @@ impl ChatManager {
     }
 
     /// `report_channel_anti_spam_false_positive`
-    /// (ChatManager.cpp:3969-3985).
+    /// (ChatManager.cpp:3969-3985) — the
+    /// `ReportChannelAntiSpamFalsePositiveQuery` send rides the `net`
+    /// handle.
     pub fn report_channel_anti_spam_false_positive(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         channel_id: ChannelId,
         message_id: MessageId,
         mut promise: Promise<()>,
@@ -12667,18 +13621,33 @@ impl ChatManager {
         if !message_id.is_server() {
             return promise.set_error(Status::error(400, "Invalid message identifier specified"));
         }
-        tdutils::log_info!(
-            "ReportChannelAntiSpamFalsePositiveQuery for {channel_id:?} — [blocked: net]"
+        // `ReportChannelAntiSpamFalsePositiveQuery::send`
+        // (cpp:1305-1312).
+        let input_channel = self
+            .get_input_channel(env, channel_id)
+            .expect("the flow read the channel record");
+        self.pending_report_channel_anti_spam_false_positive
+            .push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::ReportChannelAntiSpamFalsePositive { channel_id },
+            telegram_api::Function::channels_reportAntiSpamFalsePositive(
+                telegram_api::channels_reportAntiSpamFalsePositive {
+                    channel: Some(input_channel),
+                    msg_id: message_id.get_server_message_id().get(),
+                },
+            ),
+            "channels.reportAntiSpamFalsePositive",
         );
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
     }
 
     /// `set_channel_send_paid_message_star_count`
-    /// (ChatManager.cpp:3989-4018).
+    /// (ChatManager.cpp:3989-4018) — the paid-message leg of the
+    /// `UpdatePaidMessagesPriceQuery` (broadcast_messages_allowed is
+    /// always false on this leg).
     pub fn set_channel_send_paid_message_star_count(
         &mut self,
         _user_manager: &mut UserManager,
-        _env: &mut UserEnv,
+        env: &mut UserEnv,
         dialog_id: DialogId,
         count: i64,
         mut promise: Promise<()>,
@@ -12686,9 +13655,11 @@ impl ChatManager {
         if !dialog_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
         }
-        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Megagroup {
+        if dialog_id.get_type() != DialogType::Channel {
             return promise.set_error(Status::error(400, "Chat is not a supergroup"));
         }
+        // have_dialog_force — the DialogManager stub (M.6): the record
+        // gates below carry the C++ bands
         let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
@@ -12707,8 +13678,26 @@ impl ChatManager {
                 "Invalid number of Telegram Stars specified",
             ));
         }
-        tdutils::log_info!("UpdatePaidMessagesPriceQuery for {dialog_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        // `UpdatePaidMessagesPriceQuery::send` (cpp:1339-1346) — the
+        // paid-message leg passes broadcast_messages_allowed = false.
+        let input_channel = self
+            .get_input_channel(env, dialog_id.get_channel_id())
+            .expect("the flow read the channel record");
+        self.pending_update_paid_messages_price.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::UpdatePaidMessagesPrice {
+                channel_id: dialog_id.get_channel_id(),
+            },
+            telegram_api::Function::channels_updatePaidMessagesPrice(
+                telegram_api::channels_updatePaidMessagesPrice {
+                    flags: 0,
+                    broadcast_messages_allowed: false,
+                    channel: Some(input_channel),
+                    send_paid_messages_stars: count,
+                },
+            ),
+            "channels.updatePaidMessagesPrice",
+        );
     }
 
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
@@ -21203,5 +22192,217 @@ mod tests {
         let parsed = MessageId::parse_from(&mut parser).expect("parses");
         parser.fetch_end().expect("fully consumed");
         assert_eq!(parsed, message_id);
+    }
+
+    #[test]
+    fn channel_toggle_intakes_mutate_the_fulls() {
+        let (mut global, mut options) = open_db(&db_dir("netdrain15-toggle-fulls"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let channel_id = ChannelId::new(704);
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                megagroup: true,
+                id: channel_id.get(),
+                access_hash: 778,
+                title: "megagroup".to_owned(),
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+        cm.channels_full
+            .insert(channel_id.get(), ChannelFull::new());
+
+        // on_update_channel_is_all_history_available — the flip + the
+        // value; the same-value band is the no-op
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_is_all_history_available(
+            &mut um, &mut env, channel_id, false, promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            !cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .is_all_history_available
+        );
+        cm.on_update_channel_is_all_history_available(
+            &mut um,
+            &mut env,
+            channel_id,
+            false,
+            Promise::default(),
+        );
+
+        // on_update_channel_can_have_sponsored_messages — the twin shape
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_can_have_sponsored_messages(
+            &mut um, &mut env, channel_id, false, promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            !cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .can_have_sponsored_messages
+        );
+
+        // on_update_channel_has_hidden_participants — the twin shape
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_has_hidden_participants(&mut um, &mut env, channel_id, true, promise);
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .has_hidden_participants
+        );
+
+        // on_update_channel_has_aggressive_anti_spam_enabled — the twin
+        // shape
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_has_aggressive_anti_spam_enabled(
+            &mut um, &mut env, channel_id, true, promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .has_aggressive_anti_spam_enabled
+        );
+
+        // the missing-full band — the intakes answer without the write
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_is_all_history_available(
+            &mut um,
+            &mut env,
+            ChannelId::new(799),
+            false,
+            promise,
+        );
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // on_update_channel_location — the full write + the channel
+        // has_location flip
+        let location = DialogLocation::from_td_api(&td_api::ChatLocation {
+            location: Some(td_api::Location {
+                latitude: 59.9,
+                longitude: 30.3,
+                horizontal_accuracy: 15.0,
+            }),
+            address: "Nevsky 1".to_owned(),
+        });
+        cm.on_update_channel_location(&mut um, &mut env, channel_id, location);
+        assert_eq!(
+            cm.get_channel_full_const(channel_id).unwrap().location,
+            DialogLocation::from_td_api(&td_api::ChatLocation {
+                location: Some(td_api::Location {
+                    latitude: 59.9,
+                    longitude: 30.3,
+                    horizontal_accuracy: 15.0,
+                }),
+                address: "Nevsky 1".to_owned(),
+            })
+        );
+        assert!(cm.get_channel(channel_id).unwrap().has_location);
+
+        // on_update_channel_slow_mode_delay — the full delay + the
+        // channel slow-mode flip + the value
+        let (promise, recorded) = recorded_unit_promise();
+        cm.on_update_channel_slow_mode_delay(&mut um, &mut env, channel_id, 60, promise);
+        assert!(matches!(
+            &*recorded.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert_eq!(
+            cm.get_channel_full_const(channel_id)
+                .unwrap()
+                .slow_mode_delay,
+            60
+        );
+        assert!(cm.get_channel(channel_id).unwrap().is_slow_mode_enabled);
+
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("netdrain15-toggle-fulls"));
+    }
+
+    #[test]
+    fn channel_linked_channel_intake_pairs_the_sides() {
+        let (mut global, mut options) = open_db(&db_dir("netdrain15-linked"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let broadcast_id = ChannelId::new(702);
+        let group_id = ChannelId::new(704);
+        for (id, megagroup) in [(broadcast_id, false), (group_id, true)] {
+            cm.on_get_chat(
+                &mut um,
+                &mut env,
+                telegram_api::Chat::channel(telegram_api::channel {
+                    creator: true,
+                    megagroup,
+                    broadcast: !megagroup,
+                    id: id.get(),
+                    access_hash: 777 + (id.get() - 703).max(0),
+                    title: "side".to_owned(),
+                    ..telegram_api::channel::default()
+                }),
+                "test",
+            );
+            cm.channels_full.insert(id.get(), ChannelFull::new());
+        }
+
+        // the mutual pair — both fulls take the link and both channel
+        // records flip has_linked_channel
+        cm.on_update_channel_linked_channel_id(&mut um, &mut env, broadcast_id, group_id);
+        assert_eq!(
+            cm.get_channel_full_const(broadcast_id)
+                .unwrap()
+                .linked_channel_id,
+            group_id
+        );
+        assert_eq!(
+            cm.get_channel_full_const(group_id)
+                .unwrap()
+                .linked_channel_id,
+            broadcast_id
+        );
+        assert!(cm.get_channel(broadcast_id).unwrap().has_linked_channel);
+        assert!(cm.get_channel(group_id).unwrap().has_linked_channel);
+
+        // the unlink pass — an invalid group id clears both sides
+        cm.on_update_channel_linked_channel_id(
+            &mut um,
+            &mut env,
+            broadcast_id,
+            ChannelId::default(),
+        );
+        assert_eq!(
+            cm.get_channel_full_const(broadcast_id)
+                .unwrap()
+                .linked_channel_id,
+            ChannelId::default()
+        );
+        assert!(!cm.get_channel(broadcast_id).unwrap().has_linked_channel);
+        assert!(!cm.get_channel(group_id).unwrap().has_linked_channel);
+
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("netdrain15-linked"));
     }
 }
