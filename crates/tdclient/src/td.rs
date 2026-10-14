@@ -9320,6 +9320,71 @@ impl Td {
                     }
                 }
             }
+            BotInfoNetKind::GetPreviewMedias => {
+                // `GetPreviewMediasQuery::on_result`/`on_error`
+                // (cpp:290-319) — the answer converts over the story
+                // plane (the `convert_bot_media_preview` halves),
+                // registers the BotMediaPreview file sources, then the
+                // bot's `has_preview_medias` cache flips before the
+                // promise answer (the user-manager intake).
+                if let Some(mut reply) = bot_info_manager.take_get_preview_medias_reply() {
+                    if query.is_error() {
+                        reply.promise.set_error(query.error().clone());
+                    } else {
+                        match parse_vector_bot_preview_media(query.ok()) {
+                            Ok(medias) => {
+                                tdutils::log_info!(
+                                    "Receive result for GetPreviewMediasQuery: {medias:?}"
+                                );
+                                let previews = self.answer_bot_media_preview_query(
+                                    &mut bot_info_manager,
+                                    medias,
+                                    reply.bot_user_id,
+                                    None,
+                                );
+                                reply
+                                    .promise
+                                    .set_value(td_api::BotMediaPreviews { previews });
+                            }
+                            Err(_) => reply
+                                .promise
+                                .set_error(parse_error("bots_getPreviewMedias")),
+                        }
+                    }
+                }
+            }
+            BotInfoNetKind::GetPreviewInfo => {
+                // `GetPreviewInfoQuery::on_result`/`on_error`
+                // (cpp:340-367) — the language-keyed twin: the same
+                // story-plane conversion with the BotMediaPreviewInfo
+                // file source keyed by the handler's language_code_;
+                // no `on_update_bot_has_preview_medias` write (the C++
+                // info handler has none).
+                if let Some(mut reply) = bot_info_manager.take_get_preview_info_reply() {
+                    if query.is_error() {
+                        reply.promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::bots_PreviewInfo::parse(query.ok()) {
+                            Ok(preview_info) => {
+                                tdutils::log_info!(
+                                    "Receive result for GetPreviewInfoQuery: {preview_info:?}"
+                                );
+                                let previews = self.answer_bot_media_preview_query(
+                                    &mut bot_info_manager,
+                                    preview_info.media,
+                                    reply.bot_user_id,
+                                    Some(&reply.language_code),
+                                );
+                                reply.promise.set_value(td_api::BotMediaPreviewInfo {
+                                    previews,
+                                    language_codes: preview_info.lang_codes,
+                                });
+                            }
+                            Err(_) => reply.promise.set_error(parse_error("bots_getPreviewInfo")),
+                        }
+                    }
+                }
+            }
             _ => {
                 // The env arms — the `td_` surface the C++ handlers read
                 // (the user intakes, the object builders, the reload
@@ -9336,6 +9401,7 @@ impl Td {
                     auth_is_bot: is_bot,
                     user_manager: &mut self.user_manager,
                     net: None,
+                    file_reference_manager: &mut self.file_reference_manager,
                 };
                 match kind {
                     BotInfoNetKind::SetBotCommands => {
@@ -9782,7 +9848,9 @@ impl Td {
                     }
                     BotInfoNetKind::AllowSendMessage
                     | BotInfoNetKind::SetCustomVerification
-                    | BotInfoNetKind::SetBotUpdatesStatus => {
+                    | BotInfoNetKind::SetBotUpdatesStatus
+                    | BotInfoNetKind::GetPreviewMedias
+                    | BotInfoNetKind::GetPreviewInfo => {
                         unreachable!("the env-free kinds answered before the env construction")
                     }
                 }
@@ -9798,6 +9866,168 @@ impl Td {
                 promise,
             });
         }
+    }
+
+    /// `convert_bot_media_preview` over the whole answer
+    /// (BotInfoManager.cpp:262-274, the on_result loops at :300-305 and
+    /// :349-354) — the story-content halves per entry
+    /// (`get_story_content`/`get_story_content_file_ids`/
+    /// `get_story_content_object` with `for_bot_preview`); the invalid
+    /// media answers the C++ `nullptr` (the dropped preview, the
+    /// "Receive invalid media preview" error log).
+    fn convert_bot_media_previews(
+        &mut self,
+        medias: Vec<telegram_api::BotPreviewMedia>,
+        bot_user_id: crate::user_manager::UserId,
+    ) -> (Vec<td_api::BotMediaPreview>, Vec<crate::files::FileId>) {
+        let mut story_updates = Vec::new();
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            file_manager,
+            file_load_manager,
+            documents_manager,
+            videos_manager,
+            audios_manager,
+            voice_notes_manager,
+            video_notes_manager,
+            ..
+        } = self;
+        let mut env = StoryEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: file_manager.clone(),
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
+            documents: documents_manager,
+            videos: videos_manager,
+            audios: audios_manager,
+            voice_notes: voice_notes_manager,
+            video_notes: video_notes_manager,
+            updates: &mut story_updates,
+        };
+        let owner_dialog_id = DialogId::from_user_id(bot_user_id);
+        let mut previews = Vec::new();
+        let mut file_ids = Vec::new();
+        for media in medias {
+            let content = media.media.and_then(|media| {
+                crate::story_content::get_story_content(&mut env, *media, owner_dialog_id, true)
+            });
+            let Some(content) = content else {
+                tdutils::log_error!("Receive invalid media preview for {bot_user_id:?}");
+                continue;
+            };
+            // `append(file_ids, get_story_content_file_ids(...))` — the
+            // C++ file ids are always valid (its `get_photo` registers
+            // the sizes); the Rust story-photo reduction keeps
+            // placeholder ids until that registration lands, so the
+            // invalid ones drop here instead of reaching
+            // `add_file_source` (whose node table keys on valid ids).
+            file_ids.extend(
+                crate::story_content::get_story_content_file_ids(&mut env, &content)
+                    .into_iter()
+                    .filter(|file_id| file_id.is_valid()),
+            );
+            previews.push(td_api::BotMediaPreview {
+                date: media.date.max(0),
+                content: Some(crate::story_content::get_story_content_object(
+                    &mut env,
+                    &content,
+                    owner_dialog_id,
+                )),
+            });
+        }
+        // The story plane may have parked file-manager updates (the
+        // documents intake) — route them through the notification
+        // outbox like the other story-plane drains.
+        self.notification_updates.extend(story_updates);
+        (previews, file_ids)
+    }
+
+    /// The shared ok-tail of the two preview answer handlers — the
+    /// file-source registration (`add_file_source` over the interned
+    /// preview source, GetPreviewMediasQuery cpp:306-311 /
+    /// GetPreviewInfoQuery cpp:355-361; `language_code` picks the
+    /// info-keyed source, mirroring the C++ handler members) plus the
+    /// medias family's `td_->user_manager_->on_update_bot_has_preview_
+    /// medias(bot_user_id_, !previews.empty())` cache write
+    /// (cpp:312 — the info handler has none). Returns the converted
+    /// previews; the tails skip only in the unreachable pre-init window
+    /// (the queries dispatch post-init — the same graceful posture as
+    /// the env arms' option-manager bail).
+    fn answer_bot_media_preview_query(
+        &mut self,
+        bot_info_manager: &mut crate::bot_info_manager::BotInfoManager,
+        medias: Vec<telegram_api::BotPreviewMedia>,
+        bot_user_id: crate::user_manager::UserId,
+        language_code: Option<&str>,
+    ) -> Vec<td_api::BotMediaPreview> {
+        use crate::bot_info_manager::BotInfoManagerEnv as _;
+        let (previews, file_ids) = self.convert_bot_media_previews(medias, bot_user_id);
+        // the file-source registration — the interned source id comes
+        // through the manager's dedup maps (the scoped BotInfoEnv; the
+        // add loop needs the FileReferenceManager back, so the env
+        // closes first, the per-call env convention)
+        if !file_ids.is_empty() {
+            let source_id = {
+                let is_bot = self.auth_manager.is_bot();
+                let auth_is_authorized = self.auth_manager.is_authorized();
+                let Some(options) = self.option_manager.as_mut() else {
+                    return previews;
+                };
+                let mut env = BotInfoEnv {
+                    global: &mut self.global,
+                    options: Some(options),
+                    auth_is_authorized,
+                    auth_is_bot: is_bot,
+                    user_manager: &mut self.user_manager,
+                    net: None,
+                    file_reference_manager: &mut self.file_reference_manager,
+                };
+                match language_code {
+                    Some(language_code) => bot_info_manager
+                        .get_bot_media_preview_info_file_source_id(
+                            &mut env,
+                            bot_user_id,
+                            language_code,
+                        ),
+                    None => {
+                        bot_info_manager.get_bot_media_preview_file_source_id(&mut env, bot_user_id)
+                    }
+                }
+            };
+            // `td_->file_manager_->add_file_source(file_id, file_source_id,
+            // "…")` — the hop routes into the FileReferenceManager
+            for file_id in file_ids {
+                self.file_reference_manager
+                    .add_file_source(file_id, source_id);
+            }
+        }
+        // `td_->user_manager_->on_update_bot_has_preview_medias(...)` —
+        // the medias family only (cpp:312), over the env seam
+        if language_code.is_none() {
+            let is_bot = self.auth_manager.is_bot();
+            let auth_is_authorized = self.auth_manager.is_authorized();
+            if let Some(options) = self.option_manager.as_mut() {
+                let mut env = BotInfoEnv {
+                    global: &mut self.global,
+                    options: Some(options),
+                    auth_is_authorized,
+                    auth_is_bot: is_bot,
+                    user_manager: &mut self.user_manager,
+                    net: None,
+                    file_reference_manager: &mut self.file_reference_manager,
+                };
+                env.on_update_bot_has_preview_medias(bot_user_id, !previews.is_empty());
+            }
+        }
+        previews
     }
 
     /// Drain the callback-parked chat answers — the C++ ResultHandler
@@ -17612,6 +17842,22 @@ fn parse_vector_bot_command(data: &[u8]) -> Result<Vec<telegram_api::BotCommand>
     Ok(commands)
 }
 
+/// `Vector<botPreviewMedia>` — the `bots_getPreviewMedias` result.
+fn parse_vector_bot_preview_media(
+    data: &[u8],
+) -> Result<Vec<telegram_api::BotPreviewMedia>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut medias = Vec::with_capacity(count);
+    for _ in 0..count {
+        medias.push(telegram_api::BotPreviewMedia::read(&mut reader)?);
+    }
+    Ok(medias)
+}
+
 /// `Vector<user>` — the `users_getUsers` result (the merged GetUserMerger
 /// batches; the elements ride boxed, like the generated vector readers).
 fn parse_get_users_answer(data: &[u8]) -> Result<Vec<telegram_api::User>, &'static str> {
@@ -24690,6 +24936,9 @@ pub(crate) struct BotInfoEnv<'a> {
     /// bot-administration families); the `None` arm logs the send
     /// instead of dispatching.
     pub(crate) net: Option<BotInfoNetHandle>,
+    /// `td_->file_reference_manager_` — the bot-media-preview file
+    /// sources intern through it (the attach-menu convention).
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
 }
 
 impl BotInfoEnv<'_> {
@@ -24899,10 +25148,38 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
         user_id: crate::user_manager::UserId,
         has_preview_medias: bool,
     ) {
-        let _ = (user_id, has_preview_medias);
-        tdutils::log_info!(
-            "UserManager::on_update_bot_has_preview_medias — [blocked: the user bot-info step]"
-        );
+        // `UserManager::on_update_bot_has_preview_medias`
+        // (UserManager.cpp:4589-4604) — the GetPreviewMediasQuery ok
+        // tail over the live user manager.
+        self.with_user_env(|user_manager, env| {
+            user_manager.on_update_bot_has_preview_medias(env, user_id, has_preview_medias)
+        });
+    }
+
+    fn create_bot_media_preview_file_source(
+        &mut self,
+        bot_user_id: crate::user_manager::UserId,
+    ) -> FileSourceId {
+        // `FileReferenceManager::create_bot_media_preview_file_source`
+        // (FileReferenceManager.cpp:308-311) — the interning dedup
+        // folds into the single value index (the attach-menu
+        // convention)
+        self.file_reference_manager
+            .intern(crate::files::FileSource::BotMediaPreview(bot_user_id))
+    }
+
+    fn create_bot_media_preview_info_file_source(
+        &mut self,
+        bot_user_id: crate::user_manager::UserId,
+        language_code: &str,
+    ) -> FileSourceId {
+        // `FileReferenceManager::create_bot_media_preview_info_file_source`
+        // (FileReferenceManager.cpp:313-317)
+        self.file_reference_manager
+            .intern(crate::files::FileSource::BotMediaPreviewInfo {
+                bot_user_id,
+                language_code: language_code.to_owned(),
+            })
     }
 
     // The dialog seams: the env-local mirror of the M.6.15a free
@@ -25263,6 +25540,46 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
                 ),
             ),
             None => tdutils::log_info!("Send bots.allowSendMessage — [net-inert]"),
+        }
+    }
+
+    fn send_get_preview_medias_query(
+        &mut self,
+        bot_user_id: crate::user_manager::UserId,
+        input_user: telegram_api::InputUser,
+    ) {
+        // the C++ `{{bot_user_id}}` auth-user-ids creator argument rides
+        // the walking-skeleton dispatch defaults (NetKindHandle)
+        let _ = bot_user_id;
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                BotInfoNetKind::GetPreviewMedias,
+                telegram_api::Function::bots_getPreviewMedias(
+                    telegram_api::bots_getPreviewMedias {
+                        bot: Some(input_user),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send bots.getPreviewMedias — [net-inert]"),
+        }
+    }
+
+    fn send_get_preview_info_query(
+        &mut self,
+        bot_user_id: crate::user_manager::UserId,
+        input_user: telegram_api::InputUser,
+        language_code: &str,
+    ) {
+        let _ = bot_user_id;
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                BotInfoNetKind::GetPreviewInfo,
+                telegram_api::Function::bots_getPreviewInfo(telegram_api::bots_getPreviewInfo {
+                    bot: Some(input_user),
+                    lang_code: language_code.to_owned(),
+                }),
+            ),
+            None => tdutils::log_info!("Send bots.getPreviewInfo — [net-inert]"),
         }
     }
 
@@ -35770,6 +36087,7 @@ mod tests {
             auth_is_bot,
             user_manager: &mut td.user_manager,
             net,
+            file_reference_manager: &mut td.file_reference_manager,
         };
         let f_result = f(&mut bot_info_manager, &mut env);
         td.bot_info_manager = bot_info_manager;
@@ -44257,7 +44575,6 @@ mod tests {
             "test",
         );
     }
-
     #[test]
     fn channel_username_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -44267,7 +44584,6 @@ mod tests {
             .join()
             .unwrap();
     }
-
     fn channel_username_queries_ride_the_dispatcher_impl() {
         let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-usernames");
         seed_dialog_chats(&mut td);
@@ -44304,7 +44620,6 @@ mod tests {
                 .usernames
                 .get_usernames_object()
         };
-
         // 1. setSupergroupUsername — the live arm dispatches
         //    channels.updateUsername; the boolTrue answer runs the
         //    editable-username intake
@@ -44338,7 +44653,6 @@ mod tests {
         let object = usernames_object(&td, 705);
         assert_eq!(object.active_usernames, ["renamed", "beta"]);
         assert_eq!(object.editable_username, "renamed");
-
         // 2. the USERNAME_NOT_MODIFIED band — the intake runs, the !bot
         //    value answers
         td.request(
@@ -44360,7 +44674,6 @@ mod tests {
             Some(Object::ok(_))
         ));
         assert_eq!(usernames_object(&td, 705).editable_username, "renamed2");
-
         // 3. the hard error band — the channel-error head + the error
         td.request(
             3,
@@ -44381,7 +44694,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHANNEL_PRIVATE")
         );
-
         // 4. the invalid-username band — the C++ 400, no query
         td.request(
             4,
@@ -44396,7 +44708,6 @@ mod tests {
             (400, "Username is invalid")
         );
         assert!(rec.sent.lock().is_empty(), "no query on the band");
-
         // 5. toggleSupergroupUsernameIsActive — the optimistic local
         //    toggle lands before the answer (cpp:3204-3205)
         td.request(
@@ -44434,7 +44745,6 @@ mod tests {
         let object = usernames_object(&td, 706);
         assert_eq!(object.active_usernames, ["alpha"]);
         assert_eq!(object.disabled_usernames, ["beta"]);
-
         // 6. the toggle hard error band — the head + the error
         td.request(
             6,
@@ -44456,7 +44766,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHANNEL_PRIVATE")
         );
-
         // 7. reorderSupergroupActiveUsernames — the optimistic reorder +
         //    the round-trip
         td.request(
@@ -44491,7 +44800,6 @@ mod tests {
             responses_of(&callback, 7).first(),
             Some(Object::ok(_))
         ));
-
         // 8. the stale reorder — a toggle answer changes the active set
         //    between the send and the answer; the reorder intake rides
         //    the promise into the reload
@@ -44540,7 +44848,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (500, "Network is not implemented yet")
         );
-
         // 9. the reorder hard error band — the head + the error
         td.request(
             10,
@@ -44561,7 +44868,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHANNEL_PRIVATE")
         );
-
         // 10. the invalid-order band — the C++ 400, no query
         td.request(
             11,
@@ -44575,7 +44881,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Invalid username order specified")
         );
-
         // 11. the len<=1 band — the value answers inline, no query
         td.request(
             12,
@@ -44589,7 +44894,6 @@ mod tests {
             Some(Object::ok(_))
         ));
         assert!(rec.sent.lock().is_empty(), "no query on the len band");
-
         // 12. disableAllSupergroupUsernames — the optimistic deactivate
         //     keeps the editable username active (the Usernames rule)
         td.request(
@@ -44620,7 +44924,6 @@ mod tests {
             responses_of(&callback, 13).first(),
             Some(Object::ok(_))
         ));
-
         // 13. the rights band — the member channel answers the C++ 400
         td.request(
             14,
@@ -44634,11 +44937,9 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Not enough rights to change supergroup username")
         );
-
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
     }
-
     #[test]
     fn channel_settings_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -44648,13 +44949,11 @@ mod tests {
             .join()
             .unwrap();
     }
-
     fn channel_settings_queries_ride_the_dispatcher_impl() {
         let (mut td, rec, callback) = netted_td_with_callback("netfix-channel-settings");
         seed_dialog_chats(&mut td);
         // 702 — the creator broadcast channel; 703 — the member channel;
         // 704 — the creator megagroup.
-
         // 1. setSupergroupStickerSet — the invalid id dispatches the
         //    inputStickerSetEmpty form; the boolTrue answer resolves ok
         td.request(
@@ -44686,7 +44985,6 @@ mod tests {
             responses_of(&callback, 1).first(),
             Some(Object::ok(_))
         ));
-
         // 2. the boolFalse band — the C++ 500
         td.request(
             2,
@@ -44707,7 +45005,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (500, "Supergroup sticker set not updated")
         );
-
         // 3. the CHAT_NOT_MODIFIED band — the !bot value answer
         td.request(
             3,
@@ -44727,7 +45024,6 @@ mod tests {
             responses_of(&callback, 3).first(),
             Some(Object::ok(_))
         ));
-
         // 4. the valid-id band — the StickersManager seam (§3.9) keeps
         //    the C++ miss answer
         td.request(
@@ -44742,7 +45038,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Sticker set not found")
         );
-
         // 5. the broadcast band
         td.request(
             5,
@@ -44756,7 +45051,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Chat sticker set can be set only for supergroups")
         );
-
         // 6. setSupergroupCustomEmojiStickerSet — the emoji twin
         td.request(
             6,
@@ -44790,7 +45084,6 @@ mod tests {
             responses_of(&callback, 6).first(),
             Some(Object::ok(_))
         ));
-
         // 7. the emoji boolFalse band — the C++ 500
         td.request(
             7,
@@ -44813,7 +45106,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (500, "Supergroup custom emoji sticker set not updated")
         );
-
         // 8. setSupergroupUnrestrictBoostCount — the Updates answer
         //    re-enters on_get_updates with the promise
         td.request(
@@ -44845,7 +45137,6 @@ mod tests {
             responses_of(&callback, 8).first(),
             Some(Object::ok(_))
         ));
-
         // 9. the boosts CHAT_NOT_MODIFIED band — the intake + the !bot
         //    value
         td.request(
@@ -44868,7 +45159,6 @@ mod tests {
             responses_of(&callback, 9).first(),
             Some(Object::ok(_))
         ));
-
         // 9b. the bot twin of the band — cpp:541-544 runs the intake for
         //     a bot too, but the promise settles the error
         td.request(
@@ -44894,7 +45184,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHAT_NOT_MODIFIED")
         );
-
         // 10. the range band — the C++ 400, no query
         td.request(
             10,
@@ -44913,7 +45202,6 @@ mod tests {
                 "Invalid new value for the unrestrict boost count specified"
             )
         );
-
         // 11. the broadcast band
         td.request(
             11,
@@ -44932,7 +45220,6 @@ mod tests {
                 "Unrestrict boost count can be set only for supergroups"
             )
         );
-
         // 12. setSupergroupMainProfileTab — the tab wire form + the
         //     completion hook
         td.request(
@@ -44967,7 +45254,6 @@ mod tests {
             responses_of(&callback, 12).first(),
             Some(Object::ok(_))
         ));
-
         // 13. the main-tab CHAT_NOT_MODIFIED band — the !bot value
         //     routes the same completion hook
         td.request(
@@ -44990,7 +45276,6 @@ mod tests {
             responses_of(&callback, 13).first(),
             Some(Object::ok(_))
         ));
-
         // 14. the null-tab band — the ladder's "must be non-empty" 400
         td.request(
             14,
@@ -45004,7 +45289,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Profile tab must be non-empty")
         );
-
         // 15. the megagroup band
         td.request(
             15,
@@ -45020,7 +45304,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Main profile tab can't be changed in supergroups")
         );
-
         // 16. the main-tab hard error band — the head + the error
         td.request(
             16,
@@ -45043,7 +45326,6 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHANNEL_PRIVATE")
         );
-
         // 17. the main-tab rights band — the member channel
         td.request(
             17,
@@ -45059,8 +45341,384 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "Not enough rights to change main profile tab")
         );
-
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+    // ---- the bot preview pair (§3.2, net-drain 13): getBotMediaPreviews
+    // and getBotMediaPreviewInfo ride the dispatcher — the answers
+    // convert through the story plane (the StoryContent halves), the
+    // file sources intern, and the has-preview-medias cache write
+    // broadcasts. ----
+    /// One wire photo record for the preview media (the 'a'/'c' pair).
+    fn preview_wire_photo() -> telegram_api::Photo {
+        let size = |r#type: &str, dim: i32| {
+            telegram_api::PhotoSize::photoSize(telegram_api::photoSize {
+                r#type: r#type.to_owned(),
+                w: dim,
+                h: dim,
+                size: dim * dim,
+            })
+        };
+        telegram_api::Photo::photo(telegram_api::photo {
+            flags: 0,
+            has_stickers: false,
+            id: 90,
+            access_hash: 5,
+            file_reference: b"fr".to_vec(),
+            date: 1234,
+            sizes: vec![size("a", 5), size("c", 9)],
+            video_sizes: Vec::new(),
+            dc_id: 2,
+        })
+    }
+    /// A `botPreviewMedia` over a `messageMediaPhoto` (the story photo
+    /// arm — the file ids stay the reduced placeholders).
+    fn preview_photo_media(date: i32) -> telegram_api::BotPreviewMedia {
+        telegram_api::BotPreviewMedia {
+            date,
+            media: Some(Box::new(telegram_api::MessageMedia::messageMediaPhoto(
+                telegram_api::messageMediaPhoto {
+                    flags: 1,
+                    photo: Some(preview_wire_photo()),
+                    ..telegram_api::messageMediaPhoto::default()
+                },
+            ))),
+        }
+    }
+    /// A `botPreviewMedia` over a `messageMediaDocument` video (the real
+    /// story-document registration — valid file-manager file ids).
+    fn preview_video_media(date: i32) -> telegram_api::BotPreviewMedia {
+        telegram_api::BotPreviewMedia {
+            date,
+            media: Some(Box::new(telegram_api::MessageMedia::messageMediaDocument(
+                telegram_api::messageMediaDocument {
+                    flags: 1,
+                    document: Some(telegram_api::Document::document(telegram_api::document {
+                        id: 501,
+                        access_hash: 6,
+                        file_reference: b"fr".to_vec(),
+                        date: 12,
+                        mime_type: "video/mp4".to_owned(),
+                        size: 4096,
+                        dc_id: 1,
+                        attributes: vec![
+                            telegram_api::DocumentAttribute::documentAttributeVideo(
+                                telegram_api::documentAttributeVideo {
+                                    duration: 5.0,
+                                    w: 320,
+                                    h: 640,
+                                    ..telegram_api::documentAttributeVideo::default()
+                                },
+                            ),
+                            telegram_api::DocumentAttribute::documentAttributeFilename(
+                                telegram_api::documentAttributeFilename {
+                                    file_name: "preview.mp4".to_owned(),
+                                },
+                            ),
+                        ],
+                        ..telegram_api::document::default()
+                    })),
+                    ..telegram_api::messageMediaDocument::default()
+                },
+            ))),
+        }
+    }
+    /// A `botPreviewMedia` the story plane must reject —
+    /// `messageMediaVideoStream` never converts under `is_bot_preview`.
+    fn preview_invalid_media(date: i32) -> telegram_api::BotPreviewMedia {
+        telegram_api::BotPreviewMedia {
+            date,
+            media: Some(Box::new(
+                telegram_api::MessageMedia::messageMediaVideoStream(
+                    telegram_api::messageMediaVideoStream::default(),
+                ),
+            )),
+        }
+    }
+    /// A boxed `Vector<botPreviewMedia>` answer (the bots.getPreviewMedias
+    /// result shape).
+    fn preview_medias_vector_answer(medias: Vec<telegram_api::BotPreviewMedia>) -> Vec<u8> {
+        let mut answer = Vec::new();
+        answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        answer.extend_from_slice(&(medias.len() as i32).to_le_bytes());
+        for media in medias {
+            media.store_boxed(&mut answer);
+        }
+        answer
+    }
+    #[test]
+    fn bot_media_previews_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(bot_media_previews_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    fn bot_media_previews_ride_the_dispatcher_impl() {
+        // the files database on: the video preview's story-document
+        // registration flushes its file records (the FileDb events need
+        // the files key-value)
+        let (mut td, rec, callback) = netted_td_with_files("netfix-bot-previews");
+        // me, an owned bot with the main-app bit (both preview gates),
+        // and the bot's full record (the has-preview-medias cache write
+        // reads it through get_user_full_force)
+        with_user_manager(&mut td, |manager, env| {
+            manager.set_my_id(env, crate::user_manager::UserId::new(700000001));
+            manager.on_get_user(
+                env,
+                telegram_api::User::user(telegram_api::user {
+                    flags: 1 | (1 << 1),
+                    access_hash: 42,
+                    id: 700000001,
+                    first_name: "Me".to_owned(),
+                    ..telegram_api::user::default()
+                }),
+                "t",
+            );
+            manager.on_get_user(
+                env,
+                telegram_api::User::user(telegram_api::user {
+                    flags: 1 | (1 << 1) | (1 << 14),
+                    flags2: (1 << 1) | (1 << 13),
+                    bot: true,
+                    bot_can_edit: true,
+                    bot_has_main_app: true,
+                    access_hash: 43,
+                    id: 8,
+                    first_name: "Bot".to_owned(),
+                    ..telegram_api::user::default()
+                }),
+                "t",
+            );
+            manager.add_user_full(crate::user_manager::UserId::new(8));
+        });
+        // drain the seeding broadcasts so the later update stream is
+        // exactly the answer's
+        td.flush_user_updates();
+        // 1. getBotMediaPreviews (the live td_api arm) — the bot's input
+        //    user rides the query; the Vector<botPreviewMedia> answer
+        //    converts through the story plane: the video preview keeps
+        //    its story-document registration (valid file ids → the
+        //    BotMediaPreview file source), the photo preview converts
+        //    over the reduced placeholder ids, the invalid stream media
+        //    drops, and the negative date clamps.
+        td.request(
+            1,
+            Function::getBotMediaPreviews(td_api::getBotMediaPreviews { bot_user_id: 8 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPreviewMedias::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::bots_getPreviewMedias(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.bot.expect("the bot rides the query")
+                else {
+                    panic!("the preview peer must be a concrete input user");
+                };
+                assert_eq!((input_user.user_id, input_user.access_hash), (8, 43));
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            preview_medias_vector_answer(vec![
+                preview_video_media(-5),
+                preview_photo_media(123),
+                preview_invalid_media(999),
+            ]),
+        );
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::botMediaPreviews(previews)) => {
+                assert_eq!(previews.previews.len(), 2, "the invalid media dropped");
+                assert_eq!(previews.previews[0].date, 0, "the max(date, 0) clamp");
+                assert_eq!(previews.previews[1].date, 123);
+                assert!(matches!(
+                    previews.previews[0].content,
+                    Some(td_api::StoryContent::storyContentVideo(_))
+                ));
+                assert!(matches!(
+                    previews.previews[1].content,
+                    Some(td_api::StoryContent::storyContentPhoto(_))
+                ));
+            }
+            other => panic!("the previews answer: {other:?}"),
+        }
+        // the file-source registration: the video's real file ids intern
+        // the BotMediaPreview source (the photo placeholders never
+        // register — the reduced story-photo form)
+        assert_eq!(td.file_reference_manager.file_sources_len(), 1);
+        // `on_update_bot_has_preview_medias(8, !previews.empty())` — the
+        // flush streams the updateUserFullInfo broadcast
+        td.flush_user_updates();
+        assert!(
+            callback
+                .responses
+                .lock()
+                .iter()
+                .any(|(id, object)| matches!(
+                    object,
+                    Object::updateUserFullInfo(update) if *id == 0 && update.user_id == 8
+                )),
+            "the has-preview-medias cache write never broadcast"
+        );
+        assert!(td.bot_info_manager_pending_is_empty());
+        // 2. getBotMediaPreviewInfo (the live td_api arm) — the language
+        //    code rides the query; the bots.previewInfo answer answers
+        //    its object with the server's lang codes, the info-keyed
+        //    file source interns, and NO has-preview-medias write runs
+        //    (the C++ info handler has none).
+        td.request(
+            2,
+            Function::getBotMediaPreviewInfo(td_api::getBotMediaPreviewInfo {
+                bot_user_id: 8,
+                language_code: "en".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPreviewInfo::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::bots_getPreviewInfo(payload) => {
+                let telegram_api::InputUser::inputUser(input_user) =
+                    payload.bot.expect("the bot rides the query")
+                else {
+                    panic!("the preview-info peer must be a concrete input user");
+                };
+                assert_eq!(input_user.user_id, 8);
+                assert_eq!(payload.lang_code, "en");
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::bots_PreviewInfo {
+            media: vec![preview_video_media(200)],
+            lang_codes: vec!["de".to_owned(), "en".to_owned()],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::botMediaPreviewInfo(info)) => {
+                assert_eq!(info.previews.len(), 1);
+                assert_eq!(info.previews[0].date, 200);
+                assert_eq!(info.language_codes, vec!["de".to_owned(), "en".to_owned()]);
+            }
+            other => panic!("the preview info answer: {other:?}"),
+        }
+        // the info-keyed source interns beside the plain one; the record
+        // already broadcast, so no further updateUserFullInfo lands
+        assert_eq!(td.file_reference_manager.file_sources_len(), 2);
+        td.flush_user_updates();
+        assert_eq!(
+            callback
+                .responses
+                .lock()
+                .iter()
+                .filter(|(id, object)| matches!(
+                    object,
+                    Object::updateUserFullInfo(update) if *id == 0 && update.user_id == 8
+                ))
+                .count(),
+            1,
+            "the info family never writes has_preview_medias"
+        );
+        // 3-5. the error bands (the §7 gate) — the query errors forward
+        //     to the requests; the medias family also carries the parse
+        //     500 band.
+        td.request(
+            3,
+            Function::getBotMediaPreviews(td_api::getBotMediaPreviews { bot_user_id: 8 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPreviewMedias::ID,
+        );
+        net_fail(sent, 400, "BOT_PREVIEWS_INVALID");
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 3) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, "BOT_PREVIEWS_INVALID");
+            }
+            None => panic!("the getPreviewMedias error band never fired"),
+        }
+        td.request(
+            4,
+            Function::getBotMediaPreviewInfo(td_api::getBotMediaPreviewInfo {
+                bot_user_id: 8,
+                language_code: "en".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPreviewInfo::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 4) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 420);
+                assert_eq!(error.message, "FLOOD_WAIT_9");
+            }
+            None => panic!("the getPreviewInfo error band never fired"),
+        }
+        td.request(
+            5,
+            Function::getBotMediaPreviews(td_api::getBotMediaPreviews { bot_user_id: 8 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPreviewMedias::ID,
+        );
+        net_complete(sent, vec![0xff, 0xff, 0xff, 0xff]);
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 5) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 500);
+                assert_eq!(
+                    error.message,
+                    "Failed to parse the bots_getPreviewMedias answer"
+                );
+            }
+            None => panic!("the getPreviewMedias parse band never fired"),
+        }
+        // the info family's parse band — the same 500 over the
+        // bots.previewInfo constructor
+        td.request(
+            6,
+            Function::getBotMediaPreviewInfo(td_api::getBotMediaPreviewInfo {
+                bot_user_id: 8,
+                language_code: "en".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPreviewInfo::ID,
+        );
+        net_complete(sent, vec![0xff, 0xff, 0xff, 0xff]);
+        td.dispatch_completed_bot_info_net();
+        td.flush_deferred_results();
+        match callback.errors.lock().iter().find(|(id, _)| *id == 6) {
+            Some((_, error)) => {
+                assert_eq!(error.code, 500);
+                assert_eq!(
+                    error.message,
+                    "Failed to parse the bots_getPreviewInfo answer"
+                );
+            }
+            None => panic!("the getPreviewInfo parse band never fired"),
+        }
+        assert!(td.bot_info_net_completed.lock().is_empty(), "drained");
+        assert!(td.bot_info_manager_pending_is_empty());
     }
 }

@@ -135,6 +135,14 @@ pub(crate) enum BotInfoNetKind {
     /// `bots.allowSendMessage`; the Updates answer re-enters
     /// `on_get_updates` with the promise.
     AllowSendMessage,
+    /// `GetPreviewMediasQuery` (BotInfoManager.cpp:275-319) —
+    /// `bots.getPreviewMedias`; the answer converts over the story
+    /// plane (the `convert_bot_media_preview` halves) and the ok tail
+    /// runs the `on_update_bot_has_preview_medias` cache write.
+    GetPreviewMedias,
+    /// `GetPreviewInfoQuery` (BotInfoManager.cpp:321-369) —
+    /// `bots.getPreviewInfo`; the language-keyed preview listing.
+    GetPreviewInfo,
     /// `SetBotInfoQuery` (BotInfoManager.cpp:590-661) — `bots.setBotInfo`;
     /// the kind carries the handler members the reload tails key on (the
     /// reload queries themselves park at the `BotInfoManagerEnv` reload
@@ -487,7 +495,7 @@ pub trait BotInfoManagerEnv {
         input_user: telegram_api::InputUser,
     ) {
         let _ = (bot_user_id, input_user);
-        tdutils::log_info!("Send bots.getPreviewMedias — [blocked: net]");
+        tdutils::log_info!("Send bots.getPreviewMedias — [net-inert]");
     }
 
     /// `GetPreviewInfoQuery::send` (BotInfoManager.cpp:331-337) —
@@ -499,7 +507,7 @@ pub trait BotInfoManagerEnv {
         language_code: &str,
     ) {
         let _ = (bot_user_id, input_user, language_code);
-        tdutils::log_info!("Send bots.getPreviewInfo — [blocked: net]");
+        tdutils::log_info!("Send bots.getPreviewInfo — [net-inert]");
     }
 
     /// `SetBotInfoQuery::send` (BotInfoManager.cpp:606-634) —
@@ -1981,6 +1989,26 @@ impl BotInfoManager {
         }
     }
 
+    /// Pop the first parked `GetPreviewMediasQuery` reply (the
+    /// handler's `bot_user_id_` member rides it).
+    pub(crate) fn take_get_preview_medias_reply(&mut self) -> Option<PendingGetPreviewMediasReply> {
+        if self.pending_get_preview_medias_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_preview_medias_replies.remove(0))
+        }
+    }
+
+    /// Pop the first parked `GetPreviewInfoQuery` reply (the handler's
+    /// `bot_user_id_`/`language_code_` members ride it).
+    pub(crate) fn take_get_preview_info_reply(&mut self) -> Option<PendingGetPreviewInfoReply> {
+        if self.pending_get_preview_info_replies.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_preview_info_replies.remove(0))
+        }
+    }
+
     /// Pop the first parked `SetCustomVerificationQuery` reply.
     pub(crate) fn take_set_custom_verification_reply(
         &mut self,
@@ -2441,7 +2469,7 @@ pub(crate) mod test_env {
             _input_user: telegram_api::InputUser,
         ) {
             self.queries
-                .push("Send bots.getPreviewMedias — [blocked: net]".to_owned());
+                .push("Send bots.getPreviewMedias — [net-inert]".to_owned());
         }
 
         fn send_get_preview_info_query(
@@ -2451,7 +2479,7 @@ pub(crate) mod test_env {
             _language_code: &str,
         ) {
             self.queries
-                .push("Send bots.getPreviewInfo — [blocked: net]".to_owned());
+                .push("Send bots.getPreviewInfo — [net-inert]".to_owned());
         }
 
         fn send_set_bot_info_query(

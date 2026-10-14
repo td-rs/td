@@ -10085,6 +10085,7 @@ fn bot_env_split(
         option_manager,
         auth_manager,
         user_manager,
+        file_reference_manager,
         ..
     } = td;
     let env = crate::td::BotInfoEnv {
@@ -10094,6 +10095,7 @@ fn bot_env_split(
         auth_is_bot: auth_manager.is_bot(),
         user_manager,
         net,
+        file_reference_manager,
     };
     (bot_info_manager, env)
 }
