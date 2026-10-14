@@ -3645,6 +3645,17 @@ pub struct Td {
     /// The statistics plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) statistics_updates: Vec<td_api::Update>,
+    /// The parked `getChatStatistics` requests riding the DC chain —
+    /// the collapsed `dc_id_promise` lambda tail
+    /// (StatisticsManager.cpp:746-758): a sync-resolved dc parks here
+    /// at the query seam; the refire path parks while the full query
+    /// is in flight and [`Td::finish_pending_channel_statistics_dc_id`]
+    /// settles it (the stats query seam lands with net-drain 38).
+    pub(crate) statistics_dc_parked: Vec<(
+        crate::chat_manager::DialogId,
+        bool,
+        Promise<td_api::ChatStatistics>,
+    )>,
     /// `Td::community_manager_` (the C++ init_managers block).
     pub(crate) community_manager: CommunityManager,
     /// The community plane's `send_update` outbox; drained by
@@ -3784,6 +3795,19 @@ pub struct Td {
     /// UserManager.h:1314 — "GetUserFullCombiner", 2.0).
     #[allow(dead_code)]
     get_user_full_combiner: Option<ActorOwn<QueryCombiner>>,
+    /// The GetChatMerger actor (`get_chat_queries_`, ChatManager.h:982 —
+    /// "GetChatMerger", 3, 50); same ownership shape as the user twin.
+    #[allow(dead_code)]
+    get_chat_merger: Option<ActorOwn<QueryMerger>>,
+    /// The GetChannelMerger actor (`get_channel_queries_`,
+    /// ChatManager.h:983 — "GetChannelMerger", 100, 1).
+    #[allow(dead_code)]
+    get_channel_merger: Option<ActorOwn<QueryMerger>>,
+    /// The GetChatFullCombiner actor (`get_chat_full_queries_`,
+    /// ChatManager.h:985 — "GetChatFullCombiner", 2.0) — both full
+    /// families park on it, keyed by the DialogId form.
+    #[allow(dead_code)]
+    get_chat_full_combiner: Option<ActorOwn<QueryCombiner>>,
     /// `Td::chat_manager_` — the basic-group/supergroup cache (created with
     /// Td; its binlog replay rides the same `process_binlog_events` pass as
     /// the users, in the C++ users→chats→channels order).
@@ -4300,6 +4324,7 @@ impl Td {
             premium_manager: PremiumManager::new(),
             statistics_manager: StatisticsManager::new(),
             statistics_updates: Vec::new(),
+            statistics_dc_parked: Vec::new(),
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             ton_wallet_manager: crate::ton_wallet::TonWalletManager::new(),
@@ -4351,6 +4376,9 @@ impl Td {
             premium_required_contact_merger: None,
             get_user_merger: None,
             get_user_full_combiner: None,
+            get_chat_merger: None,
+            get_channel_merger: None,
+            get_chat_full_combiner: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
             updates_manager: UpdatesManager::new(TdSink::default()),
@@ -5165,6 +5193,74 @@ impl Td {
             );
             self.user_manager.get_user_full_queries = Some(get_user_full_combiner.get());
             self.get_user_full_combiner = Some(get_user_full_combiner);
+
+            // The ChatManager member actors (ChatManager.cpp:1723-1735 +
+            // the `get_chat_full_queries_` value member,
+            // ChatManager.h:982-985):
+            // `get_chat_queries_{"GetChatMerger", 3, 50}` and
+            // `get_channel_queries_{"GetChannelMerger", 100, 1}` — the
+            // merge functions hop back into the Td actor
+            // (`MergeGetChatQueries`/`MergeGetChannelQueries`);
+            // `get_chat_full_queries_{"GetChatFullCombiner", 2.0}` —
+            // both the basic-group and the channel full queries park on
+            // it, keyed by the DialogId form (cpp:8523/:9046); the send
+            // closures are built at the park sites over the Td actor
+            // back-pointer.
+            self.chat_manager.td_actor_id = Some(self.actor_id_of::<Td>());
+            let td_id = self.actor_id_of::<Td>();
+            let get_chat_merger = tdactor::create_actor(
+                "GetChatMerger",
+                QueryMerger::new(
+                    3,
+                    50,
+                    Box::new(move |query_ids, promise| {
+                        tdactor::send_closure(
+                            td_id.clone(),
+                            MergeGetChatQueries {
+                                chat_ids: query_ids,
+                                promise,
+                            },
+                        );
+                    }),
+                ),
+            );
+            self.chat_manager.get_chat_queries = Some(get_chat_merger.get());
+            self.get_chat_merger = Some(get_chat_merger);
+
+            let td_id = self.actor_id_of::<Td>();
+            let get_channel_merger = tdactor::create_actor(
+                "GetChannelMerger",
+                QueryMerger::new(
+                    100,
+                    1,
+                    Box::new(move |query_ids, promise| {
+                        tdactor::send_closure(
+                            td_id.clone(),
+                            MergeGetChannelQueries {
+                                channel_id: query_ids[0],
+                                promise,
+                            },
+                        );
+                    }),
+                ),
+            );
+            self.chat_manager.get_channel_queries = Some(get_channel_merger.get());
+            self.get_channel_merger = Some(get_channel_merger);
+
+            // `get_chat_full_queries_{"GetChatFullCombiner", 2.0}``
+            // (ChatManager.h:985) — the QueryCombiner's `G()->
+            // close_flag()` gate reads the shared close probe
+            // (Global::set_close_flag keeps it in step).
+            let close_probe = self.global.shared_close_flag();
+            let get_chat_full_combiner = tdactor::create_actor(
+                "GetChatFullCombiner",
+                QueryCombiner::new(
+                    2.0,
+                    Box::new(move || close_probe.load(std::sync::atomic::Ordering::Relaxed)),
+                ),
+            );
+            self.chat_manager.get_chat_full_queries = Some(get_chat_full_combiner.get());
+            self.get_chat_full_combiner = Some(get_chat_full_combiner);
         }
 
         self.parameters = Some(parameters);
@@ -10494,6 +10590,7 @@ impl Td {
                     // the fire-and-forget refetch
                     self.with_chat_intake(|chat_manager, _user_manager, env| {
                         chat_manager.reload_channel(
+                            _user_manager,
                             env,
                             channel_id,
                             Promise::default(),
@@ -10542,6 +10639,7 @@ impl Td {
                     );
                     self.with_chat_intake(|chat_manager, _user_manager, env| {
                         chat_manager.reload_channel(
+                            _user_manager,
                             env,
                             channel_id,
                             Promise::default(),
@@ -10610,6 +10708,7 @@ impl Td {
                         );
                         self.with_chat_intake(|chat_manager, _user_manager, env| {
                             chat_manager.reload_channel(
+                                _user_manager,
                                 env,
                                 channel_id,
                                 Promise::default(),
@@ -11531,6 +11630,222 @@ impl Td {
                     }
                 }
             }
+            // `GetChatsQuery::on_result`/`on_error` (cpp:1561-1589) — the
+            // chats intake (the chatsSlice LOG(ERROR) band carries the
+            // slice source), then the merger's result promise flush.
+            crate::chat_manager::ChatNetKind::GetChats => {
+                let Some(mut promise) = self.chat_manager.take_get_chats_query_promise() else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::messages_Chats::parse(query.ok())
+                        .map_err(|_| parse_error("messages_getChats"))
+                };
+                match result {
+                    Ok(chats) => {
+                        let (chats, source) = match chats {
+                            telegram_api::messages_Chats::messages_chats(chats) => {
+                                (chats.chats, "GetChatsQuery")
+                            }
+                            telegram_api::messages_Chats::messages_chatsSlice(chats) => {
+                                tdutils::log_error!(
+                                    "Receive chatsSlice in result of GetChatsQuery"
+                                );
+                                (chats.chats, "GetChatsQuery slice")
+                            }
+                        };
+                        self.intake_chats(chats, source);
+                        promise.set_value(());
+                    }
+                    Err(status) => promise.set_error(status),
+                }
+            }
+            // `GetChannelsQuery::on_result`/`on_error` (cpp:1650-1680) —
+            // the chats intake then the promise; the error tail runs
+            // the channel-error head.
+            crate::chat_manager::ChatNetKind::GetChannels { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_get_channels_query_promise() else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::messages_Chats::parse(query.ok())
+                        .map_err(|_| parse_error("channels_getChannels"))
+                };
+                match result {
+                    Ok(chats) => {
+                        let (chats, source) = match chats {
+                            telegram_api::messages_Chats::messages_chats(chats) => {
+                                (chats.chats, "GetChannelsQuery")
+                            }
+                            telegram_api::messages_Chats::messages_chatsSlice(chats) => {
+                                tdutils::log_error!(
+                                    "Receive chatsSlice in result of GetChannelsQuery"
+                                );
+                                (chats.chats, "GetChannelsQuery slice")
+                            }
+                        };
+                        self.intake_chats(chats, source);
+                        promise.set_value(());
+                    }
+                    Err(status) => {
+                        self.chat_channel_error_head(channel_id, &status, "GetChannelsQuery");
+                        promise.set_error(status);
+                    }
+                }
+            }
+            // `GetFullChatQuery::on_result`/`on_error` (cpp:1602-1619) —
+            // the users/chats pre-application, then the full record
+            // through `on_get_chat_full` (the combiner's result promise
+            // rides the intake); the error tail runs
+            // `on_get_chat_full_failed`.
+            crate::chat_manager::ChatNetKind::GetFullChat { chat_id } => {
+                let Some(mut promise) = self.chat_manager.take_get_full_chat_query_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.with_chat_intake(|chat_manager, _user_manager, env| {
+                        chat_manager.on_get_chat_full_failed(env, chat_id);
+                    });
+                    return promise.set_error(status);
+                }
+                match telegram_api::messages_ChatFull::parse(query.ok()) {
+                    Ok(full) => {
+                        self.intake_users(full.users, "GetFullChatQuery");
+                        self.intake_chats(full.chats, "GetFullChatQuery");
+                        match full.full_chat {
+                            Some(full_chat) => {
+                                self.with_chat_intake(|chat_manager, user_manager, env| {
+                                    chat_manager.on_get_chat_full(
+                                        user_manager,
+                                        env,
+                                        full_chat,
+                                        promise,
+                                    );
+                                })
+                            }
+                            None => {
+                                tdutils::log_error!(
+                                    "Receive no full chat in result of GetFullChatQuery"
+                                );
+                                promise.set_error(parse_error("messages_getFullChat"));
+                            }
+                        }
+                    }
+                    Err(_) => promise.set_error(parse_error("messages_getFullChat")),
+                }
+            }
+            // `GetFullChannelQuery::on_result`/`on_error`
+            // (cpp:1691-1714) — the users/chats pre-application, then
+            // the channelFull record through the shared
+            // `on_get_chat_full`; the error tail runs the
+            // channel-error head + `on_get_channel_full_failed`. The
+            // `get_channel_statistics_dc_id` continuation (the
+            // collapsed query_promise lambda, cpp:3866-3876) drains
+            // after the intake — the impl re-reads the fresh full and
+            // answers the dc, the parked stats request following it.
+            crate::chat_manager::ChatNetKind::GetFullChannel { channel_id } => {
+                let Some(mut promise) = self.chat_manager.take_get_full_channel_query_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.chat_channel_error_head(channel_id, &status, "GetFullChannelQuery");
+                    self.with_chat_intake(|chat_manager, user_manager, env| {
+                        chat_manager.on_get_channel_full_failed(user_manager, env, channel_id);
+                    });
+                    promise.set_error(status);
+                } else {
+                    match telegram_api::messages_ChatFull::parse(query.ok()) {
+                        Ok(full) => {
+                            self.intake_users(full.users, "GetFullChannelQuery");
+                            self.intake_chats(full.chats, "GetFullChannelQuery");
+                            match full.full_chat {
+                                Some(full_chat) => {
+                                    self.with_chat_intake(|chat_manager, user_manager, env| {
+                                        chat_manager.on_get_chat_full(
+                                            user_manager,
+                                            env,
+                                            full_chat,
+                                            promise,
+                                        );
+                                    })
+                                }
+                                None => {
+                                    tdutils::log_error!(
+                                        "Receive no full chat in result of GetFullChannelQuery"
+                                    );
+                                    promise.set_error(parse_error("channels_getFullChannel"));
+                                }
+                            }
+                        }
+                        Err(_) => promise.set_error(parse_error("channels_getFullChannel")),
+                    }
+                }
+                self.finish_pending_channel_statistics_dc_id(channel_id);
+            }
+            // `GetCreatedPublicChannelsQuery::on_result`/`on_error`
+            // (cpp:1447-1480) — the chats intake, the promise settle,
+            // then the collapsed finish hop when the reload leg parked
+            // one (the PromiseCreator::lambda into
+            // `finish_get_created_public_dialogs`, cpp:4171-4181).
+            crate::chat_manager::ChatNetKind::GetCreatedPublicChannels => {
+                let Some((public_dialog_type, finish, mut promise)) =
+                    self.chat_manager.take_get_created_public_channels_query()
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::messages_Chats::parse(query.ok())
+                        .map_err(|_| parse_error("channels_getAdminedPublicChannels"))
+                };
+                match result {
+                    Ok(chats) => {
+                        let chats = match chats {
+                            telegram_api::messages_Chats::messages_chats(chats) => chats.chats,
+                            telegram_api::messages_Chats::messages_chatsSlice(chats) => {
+                                tdutils::log_error!(
+                                    "Receive chatsSlice in result of GetCreatedPublicChannelsQuery"
+                                );
+                                chats.chats
+                            }
+                        };
+                        self.with_chat_intake(|chat_manager, user_manager, env| {
+                            chat_manager.on_get_created_public_channels(
+                                user_manager,
+                                env,
+                                public_dialog_type,
+                                chats,
+                            );
+                            if finish {
+                                chat_manager.finish_get_created_public_dialogs(
+                                    public_dialog_type,
+                                    tdutils::status::Result::Ok(()),
+                                );
+                            }
+                        });
+                        promise.set_value(());
+                    }
+                    Err(status) => {
+                        promise.set_error(status.clone());
+                        if finish {
+                            self.with_chat_intake(|chat_manager, _user_manager, _env| {
+                                chat_manager.finish_get_created_public_dialogs(
+                                    public_dialog_type,
+                                    tdutils::status::Result::Err(status),
+                                );
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -11546,6 +11861,84 @@ impl Td {
         self.with_chat_intake(|chat_manager, user_manager, env| {
             chat_manager.on_get_channel_error(user_manager, env, channel_id, status, source);
         });
+    }
+
+    /// The `get_channel_statistics_dc_id` continuation drain (the
+    /// collapsed query_promise lambda of cpp:3866-3876):
+    /// `get_channel_statistics_dc_id_impl` re-reads the fresh full and
+    /// answers the parked dc promise; the parked `getChatStatistics`
+    /// request (the dc_id_promise lambda tail,
+    /// StatisticsManager.cpp:746-758) follows it — the error fails the
+    /// request, the dc parks it at the stats query seam (net-drain 38).
+    fn finish_pending_channel_statistics_dc_id(
+        &mut self,
+        answered_channel_id: crate::chat_manager::ChannelId,
+    ) {
+        let continuations = self
+            .chat_manager
+            .take_channel_statistics_dc_ids(answered_channel_id);
+        if continuations.is_empty() {
+            // an answered full with no parked continuation for the
+            // channel (a repair or owner-change refire) touches nothing
+            return;
+        }
+        // the fresh full answers every continuation of the channel at
+        // once (the C++ runs one impl per combiner query; the joined
+        // waiters share it — the only caller always passes
+        // for_full_statistics = true)
+        let for_full_statistics = continuations[0].1;
+        let (recorded, slot) = recorded_dc_id_promise();
+        self.with_chat_intake(|chat_manager, _user_manager, env| {
+            chat_manager.get_channel_statistics_dc_id_impl(
+                env,
+                answered_channel_id,
+                for_full_statistics,
+                recorded,
+            );
+        });
+        let result =
+            slot.lock().unwrap().take().unwrap_or_else(|| {
+                tdutils::status::Result::Err(Status::error(500, "Request aborted"))
+            });
+        for (_, _, mut dc_promise) in continuations {
+            dc_promise.set_result(result.clone());
+        }
+        // the parked stats requests pair by the dialog (the dc_id_promise
+        // lambda tail, StatisticsManager.cpp:746-758) and drain per
+        // continuation — the combiner's same-channel join included
+        let dialog_id = crate::chat_manager::DialogId::from_channel_id(answered_channel_id);
+        let parked = (0..self.statistics_dc_parked.len())
+            .filter(|&index| self.statistics_dc_parked[index].0 == dialog_id)
+            .collect::<Vec<_>>();
+        match result {
+            tdutils::status::Result::Ok(dc_id) => {
+                // `send_get_channel_stats_query` (cpp:753-764) — the query
+                // seam parks the promises (net-drain 38 consumes them
+                // when the stats queries land); the seam log rides the
+                // env once
+                if let Some((dialog_id, is_dark)) = parked.first().and_then(|&index| {
+                    self.statistics_dc_parked
+                        .get(index)
+                        .map(|(d, i, _)| (*d, *i))
+                }) {
+                    let mut env = StatisticsEnv {
+                        global: &mut self.global,
+                        updates: &mut self.statistics_updates,
+                    };
+                    let _ = dc_id;
+                    env.send_get_channel_stats_query(
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        is_dark,
+                    );
+                }
+            }
+            tdutils::status::Result::Err(status) => {
+                for index in parked.iter().rev() {
+                    let (_, _, mut promise) = self.statistics_dc_parked.remove(*index);
+                    promise.set_error(status.clone());
+                }
+            }
+        }
     }
 
     /// Run one ChatManager intake under the taken-out managers (the
@@ -20706,6 +21099,72 @@ impl tdactor::ActorMessage for MergeGetUserQueries {
     }
 }
 
+/// The GetChatMerger merge function (cpp:1723-1726): send the merged
+/// `messages.getChats` query (`GetChatsQuery::send` cpp:1556-1560).
+/// The answer feeds `ChatManager::on_get_chats` and flushes the
+/// merger's result promise.
+struct MergeGetChatQueries {
+    chat_ids: Vec<i64>,
+    promise: Promise<()>,
+}
+
+impl tdactor::ActorMessage for MergeGetChatQueries {
+    type Actor = Td;
+
+    fn dispatch(mut self, td: &mut Td) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status())
+        if td.global.close_flag() {
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        }
+        td.chat_manager
+            .send_get_chats_query(self.chat_ids, self.promise);
+    }
+}
+
+/// The GetChannelMerger merge function (cpp:1727-1735): build the
+/// input channel and send the single-id `channels.getChannels` query
+/// (`GetChannelsQuery::send` cpp:1633-1648).
+struct MergeGetChannelQueries {
+    channel_id: i64,
+    promise: Promise<()>,
+}
+
+impl tdactor::ActorMessage for MergeGetChannelQueries {
+    type Actor = Td;
+
+    fn dispatch(mut self, td: &mut Td) {
+        if td.global.close_flag() {
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        }
+        // CHECK(query_ids.size() == 1) — the {100, 1} merger form
+        let channel_id = crate::chat_manager::ChannelId::new(self.channel_id);
+        let Some(options) = td.option_manager.as_mut() else {
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        };
+        let env = crate::user_manager::UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        match td.chat_manager.get_input_channel(&env, channel_id) {
+            Some(input_channel) => {
+                td.chat_manager
+                    .send_get_channels_query(channel_id, input_channel, self.promise);
+            }
+            // the merge function's missing-input band (cpp:1730-1733)
+            None => self
+                .promise
+                .set_error(Status::error(400, "Channel not found")),
+        }
+    }
+}
+
 /// The `complete_pending_preauthentication_requests` id sets, collapsed
 /// into named kinds (the C++ switches over constructor ids).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22351,17 +22810,81 @@ impl StatisticsManagerEnv for StatisticsEnv<'_> {
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
     }
+}
 
-    fn get_channel_statistics_dc_id(
+/// The recorded-dc slot type — catches a synchronously-resolved
+/// [`crate::chat_manager::DcId`] answer (the refire leaves it empty and
+/// parks the continuation instead).
+type DcIdSlot =
+    std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<crate::chat_manager::DcId>>>>;
+
+/// The recorded dc promise paired with its [`DcIdSlot`].
+fn recorded_dc_id_promise() -> (Promise<crate::chat_manager::DcId>, DcIdSlot) {
+    struct Rec(DcIdSlot);
+    impl tdutils::promise::PromiseInterface<crate::chat_manager::DcId> for Rec {
+        fn set_value(&mut self, value: crate::chat_manager::DcId) {
+            *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+        }
+    }
+    let slot: DcIdSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    (
+        Promise::from_interface(Rec(std::sync::Arc::clone(&slot))),
+        slot,
+    )
+}
+
+impl Td {
+    /// `StatisticsManager::get_channel_statistics` (StatisticsManager.cpp:746-758)
+    /// — the collapsed manager flow at the Td level: the dc_id chain
+    /// over the real [`ChatManager::get_channel_statistics_dc_id`]. A
+    /// synchronously-resolved dc parks the request at the stats query
+    /// seam; a missing/unexact dc refires the full query with the
+    /// continuation parked ([`Td::finish_pending_channel_statistics_dc_id`]
+    /// drains it); the error tail fails the request.
+    pub(crate) fn get_channel_statistics_dc_chain(
         &mut self,
-        dialog_id: crate::dialog_id::DialogId,
-    ) -> std::result::Result<(), tdutils::status::Status> {
-        // `ChatManager::get_channel_statistics_dc_id` — the dc-id answer
-        // joins with the net step; the seam accepts valid dialogs.
-        if dialog_id.is_valid() {
-            Ok(())
-        } else {
-            Err(tdutils::status::Status::error(400, "Chat not found"))
+        dialog_id: crate::chat_manager::DialogId,
+        is_dark: bool,
+        mut promise: Promise<td_api::ChatStatistics>,
+    ) {
+        let (dc_promise, slot) = recorded_dc_id_promise();
+        self.with_chat_intake(|chat_manager, user_manager, env| {
+            chat_manager.get_channel_statistics_dc_id(
+                user_manager,
+                env,
+                dialog_id,
+                true,
+                dc_promise,
+            );
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(dc_id)) => {
+                // send_get_channel_stats_query (cpp:753-764) — the query
+                // seam parks the promise (net-drain 38); the seam log
+                // rides the env
+                let _ = dc_id;
+                let mut env = StatisticsEnv {
+                    global: &mut self.global,
+                    updates: &mut self.statistics_updates,
+                };
+                env.send_get_channel_stats_query(
+                    crate::dialog_id::DialogId::new(dialog_id.get()),
+                    is_dark,
+                );
+                self.statistics_dc_parked
+                    .push((dialog_id, is_dark, promise));
+            }
+            Some(tdutils::status::Result::Err(status)) => promise.set_error(status),
+            None => {
+                // the refire — the full query is out with the
+                // continuation parked; the answer leg settles the chain
+                self.statistics_dc_parked
+                    .push((dialog_id, is_dark, promise));
+            }
         }
     }
 }
@@ -45178,6 +45701,19 @@ mod tests {
             "test",
         );
     }
+
+    /// One wire `Username` record (the wire form needs no extra flags).
+    fn wire_username(username: &str, editable: bool, active: bool) -> telegram_api::Username {
+        telegram_api::Username {
+            flags: 0,
+            editable,
+            active,
+            deletable: false,
+            expired: false,
+            username: username.to_string(),
+        }
+    }
+
     #[test]
     fn channel_username_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -45369,6 +45905,26 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHANNEL_PRIVATE")
         );
+
+        // the error tail's fire-and-forget reload (reload_channel for
+        // 706) drains here over an empty answer, keeping the
+        // GetChannels family queue FIFO-clean for the later bands
+        let reload_index = rec
+            .sent
+            .lock()
+            .iter()
+            .position(|query| query.tl_constructor() == telegram_api::channels_getChannels::ID);
+        if let Some(index) = reload_index {
+            let reload_sent = rec.sent.lock().remove(index);
+            let mut empty_answer = Vec::new();
+            telegram_api::messages_Chats::messages_chats(telegram_api::messages_chats {
+                chats: Vec::new(),
+            })
+            .store(&mut empty_answer);
+            net_complete(reload_sent, empty_answer);
+            td.dispatch_completed_chat_net();
+        }
+
         // 7. reorderSupergroupActiveUsernames — the optimistic reorder +
         //    the round-trip
         td.request(
@@ -45441,16 +45997,61 @@ mod tests {
             usernames_object(&td, 707).active_usernames,
             ["alpha", "beta"]
         );
-        // the reorder answer can no longer apply — the reload parks the
-        // promise (the reload seam rides net-drain 16)
+        // the reorder answer can no longer apply — the promise rides
+        // the reload refire (net-drain 16: the GetChannelsQuery goes
+        // out; the messages.chats answer completes the request; the
+        // request-6 error tail's own reload already drained above)
         net_complete(reorder_sent, bool_answer(true));
         td.dispatch_completed_chat_net();
         td.flush_deferred_results();
-        let error = error_of(&callback, 8);
-        assert_eq!(
-            (error.code, error.message.as_str()),
-            (500, "Network is not implemented yet")
+        let reload_sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannels::ID,
         );
+        match sent_function(&reload_sent) {
+            telegram_api::Function::channels_getChannels(payload) => match &payload.id[..] {
+                [telegram_api::InputChannel::inputChannel(input_channel)] => {
+                    assert_eq!(input_channel.channel_id, 707, "the stale-reload target");
+                }
+                other => panic!("the single-id merger form: {other:?}"),
+            },
+            other => panic!("the reload refire: {other:?}"),
+        }
+        let mut reload_answer = Vec::new();
+        telegram_api::messages_Chats::messages_chats(telegram_api::messages_chats {
+            chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                flags: (1 << 13) | (1 << 17), // access_hash + participants_count
+                flags2: 1,                    // usernames present
+                creator: true,
+                broadcast: false,
+                megagroup: true,
+                id: 707,
+                access_hash: 781,
+                title: "named".to_owned(),
+                usernames: vec![
+                    wire_username("alpha", true, true),
+                    wire_username("beta", false, true),
+                    wire_username("gamma", false, false),
+                ],
+                ..telegram_api::channel::default()
+            })],
+        })
+        .store(&mut reload_answer);
+        net_complete(reload_sent, reload_answer);
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+        // the reload intake re-applied the server's set (the toggle's
+        // deactivated gamma stays disabled)
+        assert_eq!(
+            usernames_object(&td, 707).active_usernames,
+            ["alpha", "beta"]
+        );
+        assert_eq!(usernames_object(&td, 707).disabled_usernames, ["gamma"]);
+
         // 9. the reorder hard error band — the head + the error
         td.request(
             10,
@@ -45471,6 +46072,25 @@ mod tests {
             (error.code, error.message.as_str()),
             (400, "CHANNEL_PRIVATE")
         );
+
+        // the error tail's fire-and-forget reload drains over an empty
+        // answer (keeping the family queue FIFO-clean below)
+        let reload_index = rec
+            .sent
+            .lock()
+            .iter()
+            .position(|query| query.tl_constructor() == telegram_api::channels_getChannels::ID);
+        if let Some(index) = reload_index {
+            let reload_sent = rec.sent.lock().remove(index);
+            let mut empty_answer = Vec::new();
+            telegram_api::messages_Chats::messages_chats(telegram_api::messages_chats {
+                chats: Vec::new(),
+            })
+            .store(&mut empty_answer);
+            net_complete(reload_sent, empty_answer);
+            td.dispatch_completed_chat_net();
+        }
+
         // 10. the invalid-order band — the C++ 400, no query
         td.request(
             11,
@@ -45543,6 +46163,973 @@ mod tests {
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
     }
+
+    /// The chat/user managers out together (the netted chat-flow runner).
+    fn with_chat_managers<R>(
+        td: &mut Td,
+        f: impl FnOnce(
+            &mut crate::chat_manager::ChatManager,
+            &mut crate::user_manager::UserManager,
+            &mut crate::user_manager::UserEnv<'_>,
+        ) -> R,
+    ) -> R {
+        let mut chat_manager = std::mem::take(&mut td.chat_manager);
+        let mut user_manager = std::mem::take(&mut td.user_manager);
+        let auth_is_bot = td.auth_manager.is_bot();
+        let Some(options) = td.option_manager.as_mut() else {
+            panic!("the option manager is set for the netted td");
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot,
+        };
+        let result = f(&mut chat_manager, &mut user_manager, &mut env);
+        td.user_manager = user_manager;
+        td.chat_manager = chat_manager;
+        result
+    }
+
+    /// One wire basic-group `chat` record (the bools ride their own
+    /// flag bits).
+    fn wire_basic_group_chat(id: i64, title: &str) -> telegram_api::Chat {
+        telegram_api::Chat::chat(telegram_api::chat {
+            creator: true,
+            id,
+            title: title.to_owned(),
+            participants_count: 2,
+            date: 10,
+            version: 1,
+            ..telegram_api::chat::default()
+        })
+    }
+
+    /// A boxed `messages.chats` answer.
+    fn messages_chats_answer(chats: Vec<telegram_api::Chat>) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::messages_Chats::messages_chats(telegram_api::messages_chats { chats })
+            .store(&mut out);
+        out
+    }
+
+    /// A boxed `messages.chatFull` answer.
+    fn messages_chat_full_answer(
+        full_chat: telegram_api::ChatFull,
+        chats: Vec<telegram_api::Chat>,
+        users: Vec<telegram_api::User>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::messages_ChatFull {
+            full_chat: Some(full_chat),
+            chats,
+            users,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    #[test]
+    fn chat_get_chats_merger_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_get_chats_merger_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_get_chats_merger_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-chat-get-chats");
+
+        // 1. the merge-function half (cpp:1723-1726): the merged batch
+        //    dispatches messages.getChats with the caller's ids
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergeGetChatQueries {
+                chat_ids: vec![91],
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getChats::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::messages_getChats(payload) => {
+                assert_eq!(payload.id, vec![91]);
+            }
+            other => panic!("the merged payload: {other:?}"),
+        }
+
+        // 2. the happy-path answer (cpp:1562-1583): on_get_chats caches
+        //    the record, the merger's result promise flushes
+        net_complete(
+            sent,
+            messages_chats_answer(vec![wire_basic_group_chat(91, "group")]),
+        );
+        td.dispatch_completed_chat_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.chat_manager
+                .have_chat(crate::chat_manager::ChatId::new(91))
+        );
+
+        // 3. the error band forwards to the promise (cpp:1585-1588)
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergeGetChatQueries {
+                chat_ids: vec![91],
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getChats::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_chat_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (420, "FLOOD_WAIT_5"));
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        // 4. reload_chat through the real flow (cpp:8421-8429): the
+        //    single-id merger ride over the actor-less collapse
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, _user_manager, env| {
+            chat_manager.reload_chat(env, crate::chat_manager::ChatId::new(91), promise, "test");
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getChats::ID,
+        );
+        net_complete(
+            sent,
+            messages_chats_answer(vec![wire_basic_group_chat(91, "group")]),
+        );
+        td.dispatch_completed_chat_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 5. the validation band — the validity gate answers before any
+        //    query (cpp:8421-8426)
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, _user_manager, env| {
+            chat_manager.reload_chat(env, crate::chat_manager::ChatId::new(0), promise, "test");
+        });
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(
+                    (status.code(), status.message()),
+                    (400, "Invalid basic group identifier")
+                );
+            }
+            other => panic!("the validity band: {other:?}"),
+        }
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn chat_get_channels_and_migrated_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_get_channels_and_migrated_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_get_channels_and_migrated_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-chat-get-channels");
+        seed_dialog_channel(&mut td, 802, true, false);
+
+        // 1. the merge-function half (cpp:1727-1735): the input channel
+        //    rides the seeded access hash
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergeGetChannelQueries {
+                channel_id: 802,
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannels::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::channels_getChannels(payload) => match &payload.id[..] {
+                [telegram_api::InputChannel::inputChannel(input_channel)] => {
+                    assert_eq!(
+                        (input_channel.channel_id, input_channel.access_hash),
+                        (802, 876)
+                    );
+                }
+                other => panic!("the single-id payload: {other:?}"),
+            },
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the happy-path answer (cpp:1650-1675): the intake applies
+        //    the fresh record, the promise flushes
+        net_complete(
+            sent,
+            messages_chats_answer(vec![telegram_api::Chat::channel(telegram_api::channel {
+                flags: (1 << 13) | (1 << 17), // access_hash + participants_count
+                flags2: 1,                    // usernames present
+                creator: true,
+                broadcast: true,
+                megagroup: false,
+                id: 802,
+                access_hash: 876,
+                title: "renamed".to_owned(),
+                participants_count: 7,
+                usernames: vec![wire_username("fresh", true, true)],
+                ..telegram_api::channel::default()
+            })]),
+        );
+        td.dispatch_completed_chat_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.chat_manager
+                .get_channel(crate::chat_manager::ChannelId::new(802))
+                .is_some_and(|c| c.title == "renamed")
+        );
+
+        // 3. the error band (cpp:1677-1680): the channel-error head +
+        //    the error
+        let (promise, slot) = record_ton_unit();
+        tdactor::ActorMessage::dispatch(
+            MergeGetChannelQueries {
+                channel_id: 802,
+                promise,
+            },
+            &mut td,
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannels::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "CHANNEL_PRIVATE"));
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+        // the CHANNEL_PRIVATE head ran (cpp:6405-6410: the member-leave
+        // emulation is the invalidation tail — the record stays; the
+        // forbidden emulation lands with on_get_channel_forbidden)
+        assert!(
+            td.chat_manager
+                .have_channel(crate::chat_manager::ChannelId::new(802))
+        );
+
+        // 4. reload_channel's hash-0 arm (cpp:8949-8953): an unknown
+        //    channel sends unmerged with access_hash 0
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.reload_channel(
+                user_manager,
+                env,
+                crate::chat_manager::ChannelId::new(803),
+                promise,
+                "test",
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannels::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::channels_getChannels(payload) => match &payload.id[..] {
+                [telegram_api::InputChannel::inputChannel(input_channel)] => {
+                    assert_eq!(
+                        (input_channel.channel_id, input_channel.access_hash),
+                        (803, 0)
+                    );
+                }
+                other => panic!("the hash-0 payload: {other:?}"),
+            },
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_complete(
+            sent,
+            messages_chats_answer(vec![telegram_api::Chat::channel(telegram_api::channel {
+                flags: 1 << 13,
+                creator: true,
+                broadcast: true,
+                megagroup: false,
+                id: 803,
+                access_hash: 42,
+                title: "fresh".to_owned(),
+                ..telegram_api::channel::default()
+            })]),
+        );
+        td.dispatch_completed_chat_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 5. the migrated-to leg (cpp:9196-9210): a basic group with an
+        //    unknown migrated-to channel refires the query through the
+        //    merger (the promise-less park)
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.on_get_chats(
+                user_manager,
+                env,
+                vec![telegram_api::Chat::chat(telegram_api::chat {
+                    creator: true,
+                    id: 91,
+                    title: "migrating".to_owned(),
+                    migrated_to: Some(telegram_api::InputChannel::inputChannel(
+                        telegram_api::inputChannel {
+                            channel_id: 804,
+                            access_hash: 55,
+                        },
+                    )),
+                    participants_count: 2,
+                    date: 10,
+                    version: 1,
+                    ..telegram_api::chat::default()
+                })],
+                "test",
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannels::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::channels_getChannels(payload) => match &payload.id[..] {
+                [telegram_api::InputChannel::inputChannel(input_channel)] => {
+                    assert_eq!(
+                        (input_channel.channel_id, input_channel.access_hash),
+                        (804, 55)
+                    );
+                }
+                other => panic!("the migrated-to payload: {other:?}"),
+            },
+            other => panic!("the sent function: {other:?}"),
+        }
+        // the temporarily-created channel record is visible to the client
+        assert!(
+            td.chat_manager
+                .have_channel(crate::chat_manager::ChannelId::new(804))
+        );
+        net_complete(
+            sent,
+            messages_chats_answer(vec![telegram_api::Chat::channel(telegram_api::channel {
+                flags: 1 << 13,
+                creator: true,
+                broadcast: false,
+                megagroup: true,
+                id: 804,
+                access_hash: 55,
+                title: "migrating".to_owned(),
+                ..telegram_api::channel::default()
+            })]),
+        );
+        td.dispatch_completed_chat_net();
+
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn chat_full_queries_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(chat_full_queries_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn chat_full_queries_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-chat-fulls");
+        // a basic group with a record; a broadcast channel
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.on_get_chats(
+                user_manager,
+                env,
+                vec![wire_basic_group_chat(91, "group")],
+                "test",
+            );
+        });
+        seed_dialog_channel(&mut td, 803, true, false);
+
+        // 1. GetFullChat through the real flow (load_chat_full over a
+        //    known chat with no full, cpp:8479-8496 → 8513-8525): the
+        //    combiner-collapse send goes out with the chat id
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.load_chat_full(
+                user_manager,
+                env,
+                crate::chat_manager::ChatId::new(91),
+                false,
+                promise,
+                "test",
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getFullChat::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::messages_getFullChat(payload) => {
+                assert_eq!(payload.chat_id, 91);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the answer (cpp:1602-1613): the users/chats pre-apply, the
+        //    full record caches through on_get_chat_full, the promise
+        //    flushes
+        let chat_full = telegram_api::ChatFull::chatFull(telegram_api::chatFull {
+            id: 91,
+            about: "about".to_owned(),
+            ..telegram_api::chatFull::default()
+        });
+        net_complete(
+            sent,
+            messages_chat_full_answer(
+                chat_full,
+                vec![wire_basic_group_chat(91, "group")],
+                Vec::new(),
+            ),
+        );
+        td.dispatch_completed_chat_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(())) => {}
+            other => panic!("the full-chat band: {other:?}"),
+        }
+        let has_full = with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager
+                .get_chat_full(crate::chat_manager::ChatId::new(91))
+                .is_some()
+        });
+        assert!(has_full, "the first full applies");
+
+        // 3. GetFullChannel through the real flow (load_channel_full over
+        //    a channel with no full): the first full applies — the
+        //    missing-full repair check skips (cpp:5879-5894)
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.load_channel_full(
+                user_manager,
+                env,
+                crate::chat_manager::ChannelId::new(803),
+                false,
+                promise,
+                "test",
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getFullChannel::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::channels_getFullChannel(payload) => {
+                let telegram_api::InputChannel::inputChannel(input_channel) =
+                    payload.channel.expect("the input channel rides the query")
+                else {
+                    panic!("the full query rides a concrete input channel");
+                };
+                assert_eq!(input_channel.channel_id, 803);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        let channel_full = telegram_api::ChatFull::channelFull(telegram_api::channelFull {
+            flags: 1 << 12, // stats_dc present
+            can_view_stats: true,
+            id: 803,
+            about: "about".to_owned(),
+            stats_dc: 2,
+            ..telegram_api::channelFull::default()
+        });
+        net_complete(
+            sent,
+            messages_chat_full_answer(channel_full, Vec::new(), Vec::new()),
+        );
+        td.dispatch_completed_chat_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        let stats_dc = with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager
+                .get_channel_full_const(crate::chat_manager::ChannelId::new(803))
+                .map(|full| full.stats_dc_id)
+        });
+        assert_eq!(
+            stats_dc.map(|dc| dc.get_value()),
+            Some(2),
+            "the first full applies"
+        );
+
+        // 4. the error band (cpp:1706-1712): the channel-error head, the
+        //    on_get_channel_full_failed repair reset, the promise error
+        //    (a fresh channel — 803's full is fresh and answers locally)
+        seed_dialog_channel(&mut td, 807, true, false);
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.load_channel_full(
+                user_manager,
+                env,
+                crate::chat_manager::ChannelId::new(807),
+                true,
+                promise,
+                "test",
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getFullChannel::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!((status.code(), status.message()), (400, "CHANNEL_PRIVATE"));
+            }
+            other => panic!("the error band: {other:?}"),
+        }
+
+        // 5. the validation bands — the missing-input/access gates answer
+        //    before any query (cpp:9019-9025)
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.load_channel_full(
+                user_manager,
+                env,
+                crate::chat_manager::ChannelId::new(0),
+                false,
+                promise,
+                "test",
+            );
+        });
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(
+                    (status.code(), status.message()),
+                    (400, "Supergroup not found")
+                );
+            }
+            other => panic!("the validity band: {other:?}"),
+        }
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn get_chat_statistics_dc_refire_rides_the_live_arm() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_chat_statistics_dc_refire_rides_the_live_arm_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_chat_statistics_dc_refire_rides_the_live_arm_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-stats-dc");
+        seed_dialog_channel(&mut td, 804, true, false);
+        let chat_id = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(804),
+        )
+        .get();
+
+        // 1. the §2 flip — the live arm runs the real
+        //    get_channel_statistics_dc_id (cpp:746-758 + 3846-3876): a
+        //    channel with no full refires GetFullChannelQuery; the
+        //    request parks at the stats seam (net-drain 38)
+        td.request(
+            1,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id,
+                is_dark: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getFullChannel::ID,
+        );
+        assert!(responses_of(&callback, 1).is_empty(), "the request parks");
+        assert_eq!(td.statistics_dc_parked.len(), 1);
+
+        // 2. the refire answer — the full applies with the exact dc, the
+        //    impl resolves it, the request stays parked at the seam
+        //    (cpp:3866-3876 + 753-764)
+        let channel_full = telegram_api::ChatFull::channelFull(telegram_api::channelFull {
+            flags: 1 << 12, // stats_dc present
+            can_view_stats: true,
+            id: 804,
+            about: "about".to_owned(),
+            stats_dc: 2,
+            ..telegram_api::channelFull::default()
+        });
+        net_complete(
+            sent,
+            messages_chat_full_answer(channel_full, Vec::new(), Vec::new()),
+        );
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        assert_eq!(td.statistics_dc_parked.len(), 1, "still parked at the seam");
+        assert!(responses_of(&callback, 1).is_empty(), "no response yet");
+        let stats_dc = with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager
+                .get_channel_full_const(crate::chat_manager::ChannelId::new(804))
+                .map(|full| full.stats_dc_id)
+        });
+        assert_eq!(stats_dc.map(|dc| dc.get_value()), Some(2));
+
+        // 3. the sync band — an exact cached dc parks directly at the
+        //    seam with no query out
+        td.request(
+            2,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id,
+                is_dark: true,
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "the cached dc needs no query");
+        assert_eq!(td.statistics_dc_parked.len(), 2);
+
+        // 4. the error band — the refire fails, the impl answers the
+        //    "Chat full info not found" 400 to the request
+        //    (cpp:3879-3886)
+        seed_dialog_channel(&mut td, 805, true, false);
+        td.request(
+            3,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: crate::chat_manager::DialogId::from_channel_id(
+                    crate::chat_manager::ChannelId::new(805),
+                )
+                .get(),
+                is_dark: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getFullChannel::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat full info not found")
+        );
+
+        // 5. the gates — an unknown channel answers the C++ 400 before
+        //    any query (cpp:3852-3858 over the have_dialog collapse)
+        td.request(
+            4,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: crate::chat_manager::DialogId::from_channel_id(
+                    crate::chat_manager::ChannelId::new(807),
+                )
+                .get(),
+                is_dark: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 6. the interleaving band — the channel-matched continuation
+        //    drain: an answered full settles only its own channel's
+        //    parked stats requests (never an unrelated channel's), and
+        //    the same-channel join drains together. 805 still has no
+        //    full (its case-4 refire failed), so both new requests
+        //    refire
+        let chat_id_805 = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(805),
+        )
+        .get();
+        td.request(
+            5,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: chat_id_805,
+                is_dark: false,
+            }),
+        );
+        td.request(
+            6,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: chat_id_805,
+                is_dark: false,
+            }),
+        );
+        // both refires went out; the parked requests wait on them
+        let mut stats_refires = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .filter(|query| query.tl_constructor() == telegram_api::channels_getFullChannel::ID)
+            .collect::<Vec<_>>();
+        assert_eq!(stats_refires.len(), 2, "both 805 refires went out");
+        let parked_before = td.statistics_dc_parked.len();
+        net_fail(stats_refires.remove(0), 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        // the failed refire fails BOTH 805 requests (the same-channel
+        // drain); the parked 804 seam entries stay untouched
+        assert!(td.statistics_dc_parked.len() < parked_before);
+        assert_eq!(error_of(&callback, 5).code, 400);
+        assert_eq!(error_of(&callback, 6).code, 400);
+
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// The `td_api::Chats`-typed recorded promise (the created-public
+    /// family's td_api surface).
+    type ChatsSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::Chats>>>>;
+
+    fn record_ton_chats() -> (Promise<td_api::Chats>, ChatsSlot) {
+        struct Rec(ChatsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::Chats> for Rec {
+            fn set_value(&mut self, value: td_api::Chats) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: ChatsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn created_public_channels_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(created_public_channels_round_trips_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn created_public_channels_round_trips_impl() {
+        let (mut td, rec) = netted_td("netfix-created-public");
+        use crate::chat_manager::PublicDialogType;
+
+        // 1. two concurrent callers merge onto one query (cpp:4168-4177:
+        //    the first waiter sends; the queue joins) — the
+        //    HasUsername flags ride the wire (cpp:1440-1446)
+        let (promise1, slot1) = record_ton_chats();
+        let (promise2, slot2) = record_ton_chats();
+        with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager.get_created_public_dialogs(
+                _user_manager,
+                _env,
+                PublicDialogType::HasUsername,
+                promise1,
+                false,
+            );
+        });
+        assert!(slot1.lock().unwrap().is_none(), "in flight");
+        with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager.reload_created_public_dialogs(PublicDialogType::HasUsername, promise2);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getAdminedPublicChannels::ID,
+        );
+        assert_eq!(rec.sent.lock().len(), 0, "one query for both callers");
+        match sent_function(&sent) {
+            telegram_api::Function::channels_getAdminedPublicChannels(payload) => {
+                assert!(!payload.by_location);
+                assert!(!payload.check_limit);
+                assert!(!payload.for_personal);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+
+        // 2. the answer (cpp:1447-1470): the intake filters the suitable
+        //    channel (a public broadcast with a username), inits the list,
+        //    the finish answers BOTH callers with the chats object
+        let suitable = telegram_api::channel {
+            flags: (1 << 13) | (1 << 17), // access_hash + participants_count
+            flags2: 1,                    // usernames present
+            creator: true,
+            broadcast: true,
+            megagroup: false,
+            id: 810,
+            access_hash: 30,
+            title: "public".to_owned(),
+            usernames: vec![wire_username("public", true, true)],
+            ..telegram_api::channel::default()
+        };
+        let unsuitable = telegram_api::channel {
+            flags: 1 << 13,
+            creator: true,
+            broadcast: true,
+            megagroup: false,
+            id: 811,
+            access_hash: 31,
+            title: "private".to_owned(),
+            ..telegram_api::channel::default()
+        };
+        net_complete(
+            sent,
+            messages_chats_answer(vec![
+                telegram_api::Chat::channel(suitable),
+                telegram_api::Chat::channel(unsuitable),
+            ]),
+        );
+        td.dispatch_completed_chat_net();
+        for slot in [&slot1, &slot2] {
+            match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Ok(chats)) => {
+                    assert_eq!(chats.total_count, 1);
+                    assert_eq!(chats.chat_ids, vec![810]);
+                }
+                other => panic!("the finish answers both callers: {other:?}"),
+            }
+        }
+        // inited: the next caller answers from the cache with no query
+        let (promise3, slot3) = record_ton_chats();
+        with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager.get_created_public_dialogs(
+                _user_manager,
+                _env,
+                PublicDialogType::HasUsername,
+                promise3,
+                false,
+            );
+        });
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the inited cache answers inline"
+        );
+        match &*slot3.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(chats)) => {
+                assert_eq!(chats.chat_ids, vec![810]);
+            }
+            other => panic!("the cached band: {other:?}"),
+        }
+
+        // 3. the internal refire (cpp:4195-4216): a new suitable channel
+        //    through the intake re-queues the reload (the add leg)
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.on_get_chats(
+                user_manager,
+                env,
+                vec![telegram_api::Chat::channel(telegram_api::channel {
+                    flags: (1 << 13) | (1 << 17),
+                    flags2: 1,
+                    creator: true,
+                    broadcast: true,
+                    megagroup: false,
+                    id: 812,
+                    access_hash: 32,
+                    title: "newcomer".to_owned(),
+                    usernames: vec![wire_username("newcomer", true, true)],
+                    ..telegram_api::channel::default()
+                })],
+                "test",
+            );
+        });
+        assert!(
+            rec.sent.lock().iter().any(|query| query.tl_constructor()
+                == telegram_api::channels_getAdminedPublicChannels::ID),
+            "the suitability change refires the query"
+        );
+        // drain the refire (its answer keeps the list — the intake runs
+        // over an empty set)
+        let index = rec
+            .sent
+            .lock()
+            .iter()
+            .position(|query| {
+                query.tl_constructor() == telegram_api::channels_getAdminedPublicChannels::ID
+            })
+            .expect("the refire query");
+        let sent = rec.sent.lock().remove(index);
+        net_complete(sent, messages_chats_answer(Vec::new()));
+        td.dispatch_completed_chat_net();
+
+        // 4. the limit check (cpp:4249-4251): the check_limit flag rides
+        //    the wire; the caller's promise settles with the answer
+        let (promise, slot) = record_ton_unit();
+        with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager
+                .check_created_public_dialogs_limit(PublicDialogType::IsLocationBased, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getAdminedPublicChannels::ID,
+        );
+        match sent_function(&sent) {
+            telegram_api::Function::channels_getAdminedPublicChannels(payload) => {
+                assert!(payload.by_location);
+                assert!(payload.check_limit);
+                assert!(!payload.for_personal);
+            }
+            other => panic!("the sent function: {other:?}"),
+        }
+        net_fail(sent, 400, "CHANNELS_TOO_MUCH");
+        td.dispatch_completed_chat_net();
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(
+                    (status.code(), status.message()),
+                    (400, "CHANNELS_TOO_MUCH")
+                );
+            }
+            other => panic!("the limit band: {other:?}"),
+        }
+
+        // 5. the error band for the reload family — the queued callers
+        //    all fail (cpp:4183-4193)
+        let (promise1, slot1) = record_ton_chats();
+        let (promise2, slot2) = record_ton_chats();
+        with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
+            chat_manager
+                .reload_created_public_dialogs(PublicDialogType::ForPersonalDialog, promise1);
+            chat_manager
+                .reload_created_public_dialogs(PublicDialogType::ForPersonalDialog, promise2);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getAdminedPublicChannels::ID,
+        );
+        net_fail(sent, 500, "TOT_NOT_A_TEST");
+        td.dispatch_completed_chat_net();
+        for slot in [&slot1, &slot2] {
+            match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Err(_)) => {}
+                other => panic!("the fail band drains both: {other:?}"),
+            }
+        }
+
+        assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
     #[test]
     fn channel_settings_queries_ride_the_dispatcher() {
         std::thread::Builder::new()

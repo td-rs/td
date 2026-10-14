@@ -44,7 +44,7 @@ use crate::user_manager::{
 };
 use crate::usernames::Usernames;
 use tdmtproto::telegram_api;
-use tdutils::promise::Promise;
+use tdutils::promise::{Promise, PromiseCreator};
 use tdutils::status::Status;
 
 /// `td::ChatId` (ChatId.h): `0 < id ≤ MAX_CHAT_ID`.
@@ -5500,6 +5500,29 @@ pub(crate) enum ChatNetKind {
     DeleteChat,
     /// `DeleteChannelQuery` (ChatManager.cpp:1402).
     DeleteChannel { channel_id: ChannelId },
+    /// `GetChatsQuery` (ChatManager.cpp:1554) — the merged-batch form: the
+    /// chat ids ride the query (the GetChatMerger merge function's ids,
+    /// cpp:1723-1726), the merger's result promise parks FIFO per batch.
+    GetChats,
+    /// `GetChannelsQuery` (ChatManager.cpp:1626) — the kind carries the
+    /// channel for the error tail (the handler's `channel_id_` member,
+    /// cpp:1633-1641); the promise parks FIFO.
+    GetChannels { channel_id: ChannelId },
+    /// `GetFullChatQuery` (ChatManager.cpp:1596) — the kind carries the
+    /// chat for the error tail (the handler's `chat_id_`); the
+    /// GetChatFullCombiner result promise parks FIFO.
+    GetFullChat { chat_id: ChatId },
+    /// `GetFullChannelQuery` (ChatManager.cpp:1681) — the kind carries
+    /// the channel for the error tails; the GetChatFullCombiner result
+    /// promise parks FIFO (both full families share the combiner,
+    /// keyed by the DialogId form).
+    GetFullChannel { channel_id: ChannelId },
+    /// `GetCreatedPublicChannelsQuery` (ChatManager.cpp:1435) — the
+    /// handler's `type_` member and the finish distinction (the
+    /// `reload_created_public_dialogs` query_promise lambda vs the
+    /// `check_created_public_dialogs_limit` caller promise) park with
+    /// the promise.
+    GetCreatedPublicChannels,
 }
 
 /// The `PromiseCreator::lambda` tails of the channel toggle families —
@@ -5680,6 +5703,26 @@ pub struct ChatManager {
     /// uses for its query sends, narrowed to the net plane (`None` in
     /// the net-inert tests; set at the dispatcher install).
     pub(crate) net: Option<crate::td::ChatNetHandle>,
+    /// `get_chat_queries_` (ChatManager.h:982) — the GetChatMerger actor
+    /// ("GetChatMerger", 3, 50), created by the Td init; both `reload_chat`
+    /// and the `get_chat` left-tries ladder park on it.
+    pub(crate) get_chat_queries: Option<tdactor::ActorId<crate::query_merger::QueryMerger>>,
+    /// `get_channel_queries_` (ChatManager.h:983) — the GetChannelMerger
+    /// actor ("GetChannelMerger", 100, 1 — ids can't merge without the
+    /// access hash); `reload_channel`, the `get_channel` ladder and the
+    /// migrated-to refire park on it.
+    pub(crate) get_channel_queries: Option<tdactor::ActorId<crate::query_merger::QueryMerger>>,
+    /// `get_chat_full_queries_` (ChatManager.h:985) — the
+    /// GetChatFullCombiner actor ("GetChatFullCombiner", 2.0); both the
+    /// basic-group and the channel full queries park on it, keyed by
+    /// the DialogId form (cpp:8523/:9046).
+    pub(crate) get_chat_full_queries:
+        Option<tdactor::ActorId<crate::query_combiner::QueryCombiner>>,
+    /// The owning Td actor (the C++ `td_` back-pointer) — the combiner
+    /// send closures hop through it (`None` outside the actor
+    /// contexts; the netted round-trips then drive the collapsed
+    /// single-flight sends).
+    pub(crate) td_actor_id: Option<tdactor::ActorId<crate::td::Td>>,
     /// The `EditChatAboutQuery` in-flight states (the C++ handler's own
     /// `about_`/`promise_` members, ChatManager.cpp:1061-1063) — the
     /// answer pops the head and runs the `on_success` intake.
@@ -5761,6 +5804,33 @@ pub struct ChatManager {
     pending_delete_chat: Vec<Promise<()>>,
     /// The `DeleteChannelQuery` promises (ChatManager.cpp:1404).
     pending_delete_channel: Vec<Promise<()>>,
+    /// `get_created_public_channels_queries_` (ChatManager.h) — the
+    /// parked td_api chats promises per `PublicDialogType` (the
+    /// `reload_created_public_dialogs` queue; the first waiter sends
+    /// the query, `finish_get_created_public_dialogs` drains).
+    get_created_public_channels_queries: [Vec<Promise<crate::td_api::Chats>>; 3],
+    /// The `GetChatsQuery` in-flight promises (cpp:1556) — the merger's
+    /// result promise per merged batch; popped FIFO by the answers.
+    pending_get_chats_queries: Vec<Promise<()>>,
+    /// The `GetChannelsQuery` in-flight promises (cpp:1648) — popped
+    /// FIFO; the channel for the error tail rides the kind.
+    pending_get_channels_queries: Vec<Promise<()>>,
+    /// The `GetFullChatQuery` in-flight promises (cpp:1598) — the
+    /// combiner's result promise per combined query; popped FIFO.
+    pending_get_full_chat_queries: Vec<Promise<()>>,
+    /// The `GetFullChannelQuery` in-flight promises (cpp:1689).
+    pending_get_full_channel_queries: Vec<Promise<()>>,
+    /// The `GetCreatedPublicChannelsQuery` in-flight states (the
+    /// handler's `type_` member + the finish distinction — the
+    /// `reload` leg's PromiseCreator::lambda vs the limit-check
+    /// caller's promise, cpp:1440-1446) — popped FIFO.
+    pending_get_created_public_channels: Vec<(PublicDialogType, bool, Promise<()>)>,
+    /// The `get_channel_statistics_dc_id` continuations (the C++
+    /// query_promise lambda, cpp:3866-3871): the `for_full_statistics`
+    /// flag and the dc promise park while the full re-fetch rides the
+    /// GetFullChannel family; the answer leg pops the head and runs
+    /// `get_channel_statistics_dc_id_impl`.
+    pending_channel_statistics_dc_ids: Vec<(ChannelId, bool, Promise<DcId>)>,
 }
 
 impl ChatManager {
@@ -5824,6 +5894,17 @@ impl ChatManager {
             pending_update_paid_messages_price: Vec::new(),
             pending_delete_chat: Vec::new(),
             pending_delete_channel: Vec::new(),
+            get_chat_queries: None,
+            get_channel_queries: None,
+            get_chat_full_queries: None,
+            td_actor_id: None,
+            get_created_public_channels_queries: [Vec::new(), Vec::new(), Vec::new()],
+            pending_get_chats_queries: Vec::new(),
+            pending_get_channels_queries: Vec::new(),
+            pending_get_full_chat_queries: Vec::new(),
+            pending_get_full_channel_queries: Vec::new(),
+            pending_get_created_public_channels: Vec::new(),
+            pending_channel_statistics_dc_ids: Vec::new(),
         }
     }
 
@@ -6223,6 +6304,7 @@ impl ChatManager {
                     }
                     self.update_channel(user_manager, env, old, false, false);
                     self.reload_channel(
+                        user_manager,
                         env,
                         old,
                         Promise::default(),
@@ -6272,6 +6354,7 @@ impl ChatManager {
                     }
                     self.update_channel(user_manager, env, linked_channel_id, false, false);
                     self.reload_channel(
+                        user_manager,
                         env,
                         linked_channel_id,
                         Promise::default(),
@@ -6805,6 +6888,7 @@ impl ChatManager {
             {
                 // the C++ SleepActor defers only the net query
                 self.reload_channel(
+                    user_manager,
                     env,
                     channel_id,
                     Promise::default(),
@@ -7017,7 +7101,13 @@ impl ChatManager {
                 c.is_repaired = true;
             }
             tdutils::log_info!("Repairing cache of {channel_id:?}");
-            self.reload_channel(env, channel_id, Promise::default(), "update_channel");
+            self.reload_channel(
+                user_manager,
+                env,
+                channel_id,
+                Promise::default(),
+                "update_channel",
+            );
         }
     }
 
@@ -7081,13 +7171,192 @@ impl ChatManager {
             }
             if was_changed {
                 self.save_created_public_channels(public_dialog_type, env);
-                // reload_created_public_dialogs — the GetCreatedPublicChannels
-                // query is [blocked: net] (M.5.46).
-                tdutils::log_info!(
-                    "GetCreatedPublicChannelsQuery for {public_dialog_type:?} — [blocked: net]"
-                );
+                // reload_created_public_dialogs — the refire joins the
+                // per-type queue (the first waiter owns the query)
+                self.reload_created_public_dialogs(public_dialog_type, Promise::default());
             }
         }
+    }
+
+    /// `get_created_public_dialogs` (ChatManager.cpp:4113-4177) — the
+    /// binlog-pmc early answer over the saved id list, then the reload
+    /// queue. The C++ `Dependencies::resolve_force` collapses onto the
+    /// per-channel force-loads (the M.6 stub convention); the
+    /// `force_create_dialog` fan-out of the answer leg is the M.6 stub.
+    pub fn get_created_public_dialogs(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        public_dialog_type: PublicDialogType,
+        mut promise: Promise<crate::td_api::Chats>,
+        from_binlog: bool,
+    ) {
+        let index = public_dialog_type as usize;
+        if self.created_public_channels_inited[index] {
+            let channel_ids = self.created_public_channels[index].clone();
+            return self.return_created_public_dialogs(promise, &channel_ids);
+        }
+        if self.get_created_public_channels_queries[index].is_empty()
+            && env.global.use_message_database()
+        {
+            let pmc_key = format!("public_channels{index}");
+            let value = env.global.td_db().binlog_pmc().get(&pmc_key);
+            if !value.is_empty() {
+                let parsed: Option<Vec<i64>> = value
+                    .split(',')
+                    .map(|part| {
+                        part.parse::<i64>()
+                            .ok()
+                            .filter(|id| ChannelId::new(*id).is_valid())
+                    })
+                    .collect();
+                let Some(channel_ids) = parsed else {
+                    tdutils::log_error!("Can't parse {value}");
+                    env.global.td_db().binlog_pmc().erase(&pmc_key);
+                    return self.reload_created_public_dialogs(public_dialog_type, promise);
+                };
+                let resolved = channel_ids.iter().all(|id| {
+                    self.have_channel_force(
+                        user_manager,
+                        env,
+                        ChannelId::new(*id),
+                        "get_created_public_dialogs",
+                    )
+                });
+                if !resolved {
+                    env.global.td_db().binlog_pmc().erase(&pmc_key);
+                } else {
+                    self.created_public_channels[index].clear();
+                    for id in channel_ids {
+                        let suitable = self.get_channel(ChannelId::new(id)).is_some_and(|c| {
+                            Self::is_suitable_created_public_channel(public_dialog_type, Some(c))
+                        });
+                        if suitable {
+                            self.created_public_channels[index].push(id);
+                        }
+                    }
+                    self.created_public_channels_inited[index] = true;
+
+                    if from_binlog {
+                        let channel_ids = self.created_public_channels[index].clone();
+                        self.return_created_public_dialogs(promise, &channel_ids);
+                        promise = Promise::default();
+                    }
+                }
+            }
+        }
+        self.reload_created_public_dialogs(public_dialog_type, promise);
+    }
+
+    /// `reload_created_public_dialogs` (ChatManager.cpp:4168-4177) — the
+    /// per-type promise queue; the first waiter sends the query with
+    /// the finish continuation parked alongside the promise (the C++
+    /// PromiseCreator::lambda into `finish_get_created_public_dialogs`).
+    pub fn reload_created_public_dialogs(
+        &mut self,
+        public_dialog_type: PublicDialogType,
+        promise: Promise<crate::td_api::Chats>,
+    ) {
+        let index = public_dialog_type as usize;
+        self.get_created_public_channels_queries[index].push(promise);
+        if self.get_created_public_channels_queries[index].len() == 1 {
+            self.send_get_created_public_channels_query(
+                public_dialog_type,
+                false,
+                true,
+                Promise::default(),
+            );
+        }
+    }
+
+    /// `finish_get_created_public_dialogs` (ChatManager.cpp:4181-4193) —
+    /// the collapsed query_promise lambda: the answer leg runs it after
+    /// the intake; every parked td_api promise drains.
+    pub(crate) fn finish_get_created_public_dialogs(
+        &mut self,
+        public_dialog_type: PublicDialogType,
+        result: tdutils::status::Result<()>,
+    ) {
+        let index = public_dialog_type as usize;
+        let promises = std::mem::take(&mut self.get_created_public_channels_queries[index]);
+        match result {
+            tdutils::status::Result::Ok(()) => {
+                debug_assert!(self.created_public_channels_inited[index]);
+                let channel_ids = self.created_public_channels[index].clone();
+                for promise in promises {
+                    self.return_created_public_dialogs(promise, &channel_ids);
+                }
+            }
+            tdutils::status::Result::Err(status) => {
+                for mut promise in promises {
+                    promise.set_error(status.clone());
+                }
+            }
+        }
+    }
+
+    /// `return_created_public_dialogs` (ChatManager.cpp:4078-4086) —
+    /// `get_chats_object(-1, dialog_ids, …)` (DialogManager.cpp:1698)
+    /// collapses onto the channel-id mapping (the channel-only list).
+    fn return_created_public_dialogs(
+        &mut self,
+        mut promise: Promise<crate::td_api::Chats>,
+        channel_ids: &[i64],
+    ) {
+        if promise.is_empty() {
+            return;
+        }
+        promise.set_value(crate::td_api::Chats {
+            total_count: channel_ids.len() as i32,
+            chat_ids: channel_ids.to_vec(),
+        });
+    }
+
+    /// `on_get_created_public_channels` (ChatManager.cpp:4219-4230) —
+    /// the ids through the chat intake, then the suitability filter;
+    /// the `force_create_dialog` fan-out is the M.6 stub.
+    pub(crate) fn on_get_created_public_channels(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        public_dialog_type: PublicDialogType,
+        chats: Vec<telegram_api::Chat>,
+    ) {
+        let index = public_dialog_type as usize;
+        let channel_ids =
+            self.get_channel_ids(user_manager, env, chats, "on_get_created_public_channels");
+        if self.created_public_channels_inited[index]
+            && self.created_public_channels[index]
+                .iter()
+                .copied()
+                .eq(channel_ids.iter().map(|c| c.get()))
+        {
+            return;
+        }
+        self.created_public_channels[index].clear();
+        for channel_id in channel_ids {
+            // td_->dialog_manager_->force_create_dialog(DialogId(channel_id))
+            // — the M.6 stub
+            let suitable = self.get_channel(channel_id).is_some_and(|c| {
+                Self::is_suitable_created_public_channel(public_dialog_type, Some(c))
+            });
+            if suitable {
+                self.created_public_channels[index].push(channel_id.get());
+            }
+        }
+        self.created_public_channels_inited[index] = true;
+
+        self.save_created_public_channels(public_dialog_type, env);
+    }
+
+    /// `check_created_public_dialogs_limit` (ChatManager.cpp:4249-4251)
+    /// — the check_limit send; the promise settles with the query.
+    pub fn check_created_public_dialogs_limit(
+        &mut self,
+        public_dialog_type: PublicDialogType,
+        promise: Promise<()>,
+    ) {
+        self.send_get_created_public_channels_query(public_dialog_type, true, false, promise);
     }
 
     /// `save_created_public_channels` (ChatManager.cpp:4232-4245).
@@ -7245,9 +7514,14 @@ impl ChatManager {
             if let Some(c) = self.get_channel_mut(channel_id) {
                 c.is_creator_changed = true;
             }
-            // send_get_channel_full_query(nullptr, ...) — the query the
-            // owner change refires is [blocked: net] (M.5.45).
-            tdutils::log_info!("GetFullChannelQuery after the owner change — [blocked: net]");
+            // send_get_channel_full_query(nullptr, ...) — the owner-change
+            // refire rides the combiner (cpp:7766)
+            self.send_get_channel_full_query(
+                env,
+                channel_id,
+                Promise::default(),
+                "update channel owner",
+            );
             // the DialogParticipantManager/SuggestedActionManager refires —
             // the wave-2 stubs.
         }
@@ -7785,25 +8059,25 @@ impl ChatManager {
                     return promise.set_value(());
                 }
                 self.invalidated_channels_full.remove(&channel_id.get());
-                if !env.global.close_flag() {
-                    let resend = {
-                        let Some(f) = self.get_channel_full_mut(channel_id) else {
-                            return promise.set_value(());
-                        };
-                        if f.repair_request_version != 0
-                            && f.repair_request_version < f.speculative_version
-                        {
-                            tdutils::log_info!(
-                                "Receive ChannelFull with request version {}, but current speculative version is {}",
-                                f.repair_request_version,
-                                f.speculative_version
-                            );
-                            f.repair_request_version = f.speculative_version;
-                            true
-                        } else {
-                            f.repair_request_version = 0;
-                            false
-                        }
+                if !env.global.close_flag()
+                    && let Some(f) = self.get_channel_full_mut(channel_id)
+                {
+                    // `get_channel_full(channel_id, true, ...)` — the
+                    // repair bookkeeping only runs over an existing full
+                    // (cpp:5879-5894); a missing one is created below
+                    let resend = if f.repair_request_version != 0
+                        && f.repair_request_version < f.speculative_version
+                    {
+                        tdutils::log_info!(
+                            "Receive ChannelFull with request version {}, but current speculative version is {}",
+                            f.repair_request_version,
+                            f.speculative_version
+                        );
+                        f.repair_request_version = f.speculative_version;
+                        true
+                    } else {
+                        f.repair_request_version = 0;
+                        false
                     };
                     if resend {
                         debug_assert!(self.get_input_channel(env, channel_id).is_some());
@@ -8843,6 +9117,50 @@ impl ChatManager {
         }
     }
 
+    /// The `get_chat_queries_.add_query` park (cpp:8410/:8429) — the
+    /// GetChatMerger ride; the actor-less contexts collapse the merger
+    /// onto the direct single-id send (the merged form needs the
+    /// scheduler context).
+    fn add_reload_chat_query(&mut self, chat_id: ChatId, promise: Promise<()>) {
+        match self.get_chat_queries.clone() {
+            Some(merger) => tdactor::send_closure(
+                merger,
+                crate::query_merger::QueryMergerMessage::AddQuery {
+                    query_id: chat_id.get(),
+                    promise,
+                },
+            ),
+            None => self.send_get_chats_query(vec![chat_id.get()], promise),
+        }
+    }
+
+    /// The `get_channel_queries_.add_query` park (cpp:8932/:8955) — the
+    /// GetChannelMerger ride; the actor-less collapse sends the
+    /// single-id query directly, the merge function's missing-input
+    /// band answering the C++ 400 (cpp:1730-1733).
+    fn add_reload_channel_query(
+        &mut self,
+        env: &UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+    ) {
+        match self.get_channel_queries.clone() {
+            Some(merger) => tdactor::send_closure(
+                merger,
+                crate::query_merger::QueryMergerMessage::AddQuery {
+                    query_id: channel_id.get(),
+                    promise,
+                },
+            ),
+            None => match self.get_input_channel(env, channel_id) {
+                Some(input_channel) => {
+                    self.send_get_channels_query(channel_id, input_channel, promise)
+                }
+                None => promise.set_error(Status::error(400, "Channel not found")),
+            },
+        }
+    }
+
     /// `EditChatAboutQuery::on_result`'s in-flight pop (the handler's
     /// `about_`/`promise_` members, ChatManager.cpp:1061-1063).
     pub(crate) fn take_edit_chat_about(&mut self) -> Option<(String, Promise<()>)> {
@@ -9146,6 +9464,173 @@ impl ChatManager {
         } else {
             Some(self.pending_delete_channel.remove(0))
         }
+    }
+
+    /// `GetChatsQuery::on_result`'s promise pop (cpp:1556) — the head
+    /// merger result promise.
+    pub(crate) fn take_get_chats_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_chats_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_chats_queries.remove(0))
+        }
+    }
+
+    /// `GetChannelsQuery::on_result`'s promise pop (cpp:1648).
+    pub(crate) fn take_get_channels_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_channels_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_channels_queries.remove(0))
+        }
+    }
+
+    /// `GetFullChatQuery::on_result`'s promise pop (cpp:1598) — the
+    /// head combiner result promise.
+    pub(crate) fn take_get_full_chat_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_full_chat_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_full_chat_queries.remove(0))
+        }
+    }
+
+    /// `GetFullChannelQuery::on_result`'s promise pop (cpp:1689).
+    pub(crate) fn take_get_full_channel_query_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending_get_full_channel_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_full_channel_queries.remove(0))
+        }
+    }
+
+    /// `GetCreatedPublicChannelsQuery::on_result`'s in-flight pop (the
+    /// handler's `type_` member + the finish distinction, cpp:1440-1446).
+    pub(crate) fn take_get_created_public_channels_query(
+        &mut self,
+    ) -> Option<(PublicDialogType, bool, Promise<()>)> {
+        if self.pending_get_created_public_channels.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_created_public_channels.remove(0))
+        }
+    }
+
+    /// The `get_channel_statistics_dc_id` continuation pop (the
+    /// query_promise lambda of cpp:3866-3871) — every entry for the
+    /// answered channel (the C++ carries each promise on the combiner's
+    /// query; the channel-matched drain restores the pairing under
+    /// interleaving — an answered full with no parked continuation
+    /// touches nothing — and drains the combiner's same-channel join
+    /// in one pass).
+    pub(crate) fn take_channel_statistics_dc_ids(
+        &mut self,
+        channel_id: ChannelId,
+    ) -> Vec<(ChannelId, bool, Promise<DcId>)> {
+        let mut result = Vec::new();
+        let mut index = 0;
+        while index < self.pending_channel_statistics_dc_ids.len() {
+            if self.pending_channel_statistics_dc_ids[index].0 == channel_id {
+                result.push(self.pending_channel_statistics_dc_ids.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        result
+    }
+
+    /// `GetChatsQuery::send` (ChatManager.cpp:1556-1560, reached through
+    /// the GetChatMerger merge function cpp:1723-1726): park the
+    /// merger's result promise and dispatch the merged
+    /// `messages.getChats` query.
+    pub(crate) fn send_get_chats_query(&mut self, chat_ids: Vec<i64>, promise: Promise<()>) {
+        self.pending_get_chats_queries.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::GetChats,
+            telegram_api::Function::messages_getChats(telegram_api::messages_getChats {
+                id: chat_ids,
+            }),
+            "GetChatsQuery",
+        );
+    }
+
+    /// `GetChannelsQuery::send` (ChatManager.cpp:1633-1648) — the kind
+    /// carries the channel (the handler's `channel_id_` member); the
+    /// single input channel rides the vector form.
+    pub(crate) fn send_get_channels_query(
+        &mut self,
+        channel_id: ChannelId,
+        input_channel: telegram_api::InputChannel,
+        promise: Promise<()>,
+    ) {
+        self.pending_get_channels_queries.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::GetChannels { channel_id },
+            telegram_api::Function::channels_getChannels(telegram_api::channels_getChannels {
+                id: vec![input_channel],
+            }),
+            "GetChannelsQuery",
+        );
+    }
+
+    /// `GetFullChatQuery::send` (ChatManager.cpp:1598-1600, reached
+    /// through the GetChatFullCombiner send closure cpp:8513-8525).
+    pub(crate) fn send_get_full_chat_query(&mut self, chat_id: ChatId, promise: Promise<()>) {
+        self.pending_get_full_chat_queries.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::GetFullChat { chat_id },
+            telegram_api::Function::messages_getFullChat(telegram_api::messages_getFullChat {
+                chat_id: chat_id.get(),
+            }),
+            "GetFullChatQuery",
+        );
+    }
+
+    /// `GetFullChannelQuery::send` (ChatManager.cpp:1686-1689, reached
+    /// through the GetChatFullCombiner send closure cpp:9040-9047).
+    pub(crate) fn send_get_full_channel_query(
+        &mut self,
+        channel_id: ChannelId,
+        input_channel: telegram_api::InputChannel,
+        promise: Promise<()>,
+    ) {
+        self.pending_get_full_channel_queries.push(promise);
+        self.send_chat_net_query(
+            ChatNetKind::GetFullChannel { channel_id },
+            telegram_api::Function::channels_getFullChannel(
+                telegram_api::channels_getFullChannel {
+                    channel: Some(input_channel),
+                },
+            ),
+            "GetFullChannelQuery",
+        );
+    }
+
+    /// `GetCreatedPublicChannelsQuery::send` (ChatManager.cpp:1440-1446)
+    /// — the `check_limit` flag and the finish distinction park with
+    /// the promise (the reload leg's query_promise lambda vs the
+    /// limit-check caller's promise).
+    pub(crate) fn send_get_created_public_channels_query(
+        &mut self,
+        public_dialog_type: PublicDialogType,
+        check_limit: bool,
+        finish: bool,
+        promise: Promise<()>,
+    ) {
+        self.pending_get_created_public_channels
+            .push((public_dialog_type, finish, promise));
+        self.send_chat_net_query(
+            ChatNetKind::GetCreatedPublicChannels,
+            telegram_api::Function::channels_getAdminedPublicChannels(
+                telegram_api::channels_getAdminedPublicChannels {
+                    by_location: public_dialog_type == PublicDialogType::IsLocationBased,
+                    check_limit,
+                    for_personal: public_dialog_type == PublicDialogType::ForPersonalDialog,
+                    ..telegram_api::channels_getAdminedPublicChannels::default()
+                },
+            ),
+            "GetCreatedPublicChannelsQuery",
+        );
     }
 
     /// `on_update_channel_description` (ChatManager.cpp:8065-8078) — the
@@ -9472,8 +9957,13 @@ impl ChatManager {
                             false,
                             false,
                         );
-                        // get_channel_queries_.add_query — [blocked: net]
-                        // (M.5.44).
+                        // get info about the channel — the GetChannelMerger
+                        // park (cpp:9209)
+                        self.add_reload_channel_query(
+                            env,
+                            migrated_to_channel_id,
+                            Promise::default(),
+                        );
                     }
                 }
             }
@@ -11654,9 +12144,9 @@ impl ChatManager {
                 return false;
             }
             if left_tries > 1 {
-                // get_chat_queries_.add_query — the deduped net query is
-                // [blocked: net] (M.5.44)
-                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                // get_chat_queries_.add_query — the GetChatMerger park
+                // (cpp:8410-8413)
+                self.add_reload_chat_query(chat_id, promise);
                 return false;
             }
             promise.set_error(Status::error(400, "Group not found"));
@@ -11682,12 +12172,14 @@ impl ChatManager {
             return false;
         }
         if !self.have_channel(channel_id) {
-            if left_tries > 2 && env.auth_is_bot {
+            if left_tries > 3 && env.global.use_chat_info_database() {
                 self.load_channel_from_database(user_manager, env, channel_id, false, false);
                 return false;
             }
-            if left_tries > 1 {
-                promise.set_error(Status::error(500, "Network is not implemented yet"));
+            if left_tries > 2 && env.auth_is_bot {
+                // get_channel_queries_.add_query — the GetChannelMerger
+                // park (cpp:8931-8935)
+                self.add_reload_channel_query(env, channel_id, promise);
                 return false;
             }
             promise.set_error(Status::error(400, "Supergroup not found"));
@@ -11698,7 +12190,7 @@ impl ChatManager {
             .map(|c| c.monoforum_channel_id)
             .unwrap_or_default();
         if monoforum_channel_id.is_valid() && !self.have_channel(monoforum_channel_id) {
-            if left_tries > 3 && env.global.use_chat_info_database() {
+            if left_tries > 2 && env.global.use_chat_info_database() {
                 self.load_channel_from_database(
                     user_manager,
                     env,
@@ -11706,12 +12198,17 @@ impl ChatManager {
                     false,
                     false,
                 );
-            } else if left_tries > 2 && env.auth_is_bot {
-                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                // the C++ promise lambda set_values on the load completion
+                // (cpp:8943-8947) — the synchronous-kv collapse falls
+                // through to the value below
+            } else if left_tries > 1
+                && env.auth_is_bot
+                && self
+                    .get_channel(channel_id)
+                    .is_some_and(|c| c.is_monoforum || c.status.can_manage_direct_messages())
+            {
+                self.add_reload_channel_query(env, monoforum_channel_id, promise);
                 return false;
-            } else {
-                promise.set_value(());
-                return true;
             }
         }
         promise.set_value(());
@@ -12664,6 +13161,7 @@ impl ChatManager {
             .expect("the answer flow read the channel record");
         if !c.usernames.can_toggle(false, &username) {
             return self.reload_channel(
+                user_manager,
                 env,
                 channel_id,
                 promise,
@@ -12711,6 +13209,7 @@ impl ChatManager {
             .expect("the answer flow read the channel record");
         if !c.usernames.can_reorder_to(&usernames) {
             return self.reload_channel(
+                user_manager,
                 env,
                 channel_id,
                 promise,
@@ -13487,10 +13986,13 @@ impl ChatManager {
     }
 
     /// `get_channel_statistics_dc_id` (ChatManager.cpp:3846-3876) — the
-    /// full re-fetch on a missing/unexact DC rides the blocked-net query.
+    /// exact gates; the missing/unexact DC refires the full query with
+    /// the continuation parked in the family queue (the C++
+    /// query_promise lambda, cpp:3866-3871 — the GetFullChannel answer
+    /// leg runs the impl).
     pub fn get_channel_statistics_dc_id(
         &mut self,
-        _user_manager: &mut UserManager,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         dialog_id: DialogId,
         for_full_statistics: bool,
@@ -13499,29 +14001,74 @@ impl ChatManager {
         if !dialog_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
         }
-        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Broadcast {
+        // `have_dialog_force` — the DialogManager stub (M.6) collapses
+        // onto the per-type record checks (the set_channel_discussion_
+        // group convention)
+        let have_dialog = match dialog_id.get_type() {
+            DialogType::User => user_manager.have_accessible_user(dialog_id.get_user_id()),
+            DialogType::Chat => self.have_chat(dialog_id.get_chat_id()),
+            DialogType::Channel => self.have_channel(dialog_id.get_channel_id()),
+            DialogType::SecretChat => user_manager.have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
+        };
+        if !have_dialog {
+            return promise.set_error(Status::error(400, "Chat not found"));
+        }
+        if dialog_id.get_type() != DialogType::Channel {
             return promise.set_error(Status::error(400, "Chat is not a channel"));
         }
-        let Some(_) = self.get_channel(dialog_id.get_channel_id()) else {
+        let channel_id = dialog_id.get_channel_id();
+        let Some(_) = self.get_channel(channel_id) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
-        let dc = self
-            .get_channel_full_const(dialog_id.get_channel_id())
-            .map(|f| f.stats_dc_id);
-        let can_view = self
-            .get_channel_full_const(dialog_id.get_channel_id())
-            .map(|f| f.can_view_statistics)
-            .unwrap_or(false);
-        if dc.is_none_or(|dc| !dc.is_exact()) || (for_full_statistics && !can_view) {
+        let channel_full = self.get_channel_full_force(
+            user_manager,
+            env,
+            channel_id,
+            false,
+            "get_channel_statistics_dc_id",
+            false,
+        );
+        let snapshot = channel_full.map(|f| (f.stats_dc_id, f.can_view_statistics));
+        if snapshot.is_none_or(|(stats_dc_id, _)| !stats_dc_id.is_exact())
+            || (for_full_statistics && snapshot.is_some_and(|(_, can_view)| !can_view))
+        {
+            self.pending_channel_statistics_dc_ids
+                .push((channel_id, for_full_statistics, promise));
             self.send_get_channel_full_query(
                 env,
-                dialog_id.get_channel_id(),
+                channel_id,
                 Promise::default(),
                 "get_channel_statistics_dc_id",
             );
-            return promise.set_error(Status::error(500, "Network is not implemented yet"));
+            return;
         }
-        promise.set_value(dc.unwrap_or_default());
+        promise.set_value(snapshot.expect("the exact branch").0);
+    }
+
+    /// `get_channel_statistics_dc_id_impl` (ChatManager.cpp:3879-3893) —
+    /// the re-read after the full re-fetch: the fresh full answers the
+    /// dc or one of the two 400 bands.
+    pub fn get_channel_statistics_dc_id_impl(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        for_full_statistics: bool,
+        mut promise: Promise<DcId>,
+    ) {
+        if env.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        let snapshot = self
+            .get_channel_full(env, channel_id, false, "get_channel_statistics_dc_id_impl")
+            .map(|f| (f.stats_dc_id, f.can_view_statistics));
+        let Some((stats_dc_id, can_view_statistics)) = snapshot else {
+            return promise.set_error(Status::error(400, "Chat full info not found"));
+        };
+        if !stats_dc_id.is_exact() || (for_full_statistics && !can_view_statistics) {
+            return promise.set_error(Status::error(400, "Chat statistics are not available"));
+        }
+        promise.set_value(stats_dc_id);
     }
 
     /// `can_get_channel_message_statistics` (ChatManager.cpp:3895-3906).
@@ -14648,7 +15195,7 @@ impl ChatManager {
     }
 
     /// `get_chat_full` (ChatManager.cpp:8432-8438).
-    fn get_chat_full(&self, chat_id: ChatId) -> Option<&ChatFull> {
+    pub(crate) fn get_chat_full(&self, chat_id: ChatId) -> Option<&ChatFull> {
         self.chats_full.get(&chat_id.get())
     }
 
@@ -14690,7 +15237,7 @@ impl ChatManager {
         }
     }
 
-    fn get_channel_full_const(&self, channel_id: ChannelId) -> Option<&ChannelFull> {
+    pub(crate) fn get_channel_full_const(&self, channel_id: ChannelId) -> Option<&ChannelFull> {
         self.channels_full.get(&channel_id.get())
     }
 
@@ -15010,11 +15557,15 @@ impl ChatManager {
     }
 
     /// `send_get_chat_full_query` (ChatManager.cpp:8513-8525) — the
-    /// QueryCombiner + GetFullChatQuery send is `[blocked: net]`; the
-    /// validation surfaces stay exact.
+    /// GetChatFullCombiner park: the first waiter supplies the send
+    /// closure, the duplicates join; the combiner resolves the closure
+    /// with its result promise when the query goes out (the Td-actor
+    /// hop runs [`ChatManager::send_get_full_chat_query`], the handler
+    /// send). The actor-less contexts collapse the combiner onto the
+    /// direct single-flight send.
     fn send_get_chat_full_query(
         &mut self,
-        env: &mut UserEnv,
+        _env: &mut UserEnv,
         chat_id: ChatId,
         mut promise: Promise<()>,
         source: &str,
@@ -15023,9 +15574,35 @@ impl ChatManager {
         if !chat_id.is_valid() {
             return promise.set_error(Status::error(500, "Invalid chat_id"));
         }
-        let _ = env;
-        tdutils::log_info!("GetFullChatQuery for {chat_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        match (self.td_actor_id.clone(), self.get_chat_full_queries.clone()) {
+            (Some(td_actor_id), Some(combiner)) => {
+                let send_query = PromiseCreator::lambda_result(tdactor::promise_send_closure(
+                    td_actor_id,
+                    move |td: &mut crate::td::Td, result: tdutils::status::Result<Promise<()>>| {
+                        if let tdutils::status::Result::Ok(promise) = result
+                            && !td.global.close_flag()
+                        {
+                            // `td->create_handler<GetFullChatQuery>(
+                            // promise.move_as_ok())->send(chat_id)`
+                            td.chat_manager.send_get_full_chat_query(chat_id, promise);
+                        }
+                    },
+                ));
+                tdactor::send_closure(
+                    combiner,
+                    crate::query_combiner::QueryCombinerMessage::AddQuery {
+                        query_id: DialogId::from_chat_id(chat_id).get(),
+                        send_query,
+                        promise,
+                    },
+                );
+            }
+            _ => {
+                // the combiner needs the scheduler context; the collapsed
+                // form sends single-flight (the netted round-trips)
+                self.send_get_full_chat_query(chat_id, promise);
+            }
+        }
     }
 
     /// `reload_chat_full` (ChatManager.cpp:8512).
@@ -15039,9 +15616,9 @@ impl ChatManager {
         self.send_get_chat_full_query(env, chat_id, promise, source);
     }
 
-    /// `reload_chat` (ChatManager.cpp:8421-8429) — the GetChatsQuery send
-    /// is [blocked: net] (M.5.44); the validation surfaces stay exact.
-    fn reload_chat(
+    /// `reload_chat` (ChatManager.cpp:8421-8429) — the GetChatMerger
+    /// park; the validation surfaces stay exact.
+    pub(crate) fn reload_chat(
         &mut self,
         env: &mut UserEnv,
         chat_id: ChatId,
@@ -15056,15 +15633,16 @@ impl ChatManager {
             return promise.set_error(Status::error(400, "Invalid basic group identifier"));
         }
         let _ = source;
-        tdutils::log_info!("GetChatsQuery for {chat_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        self.add_reload_chat_query(chat_id, promise);
     }
 
-    /// `reload_channel` (ChatManager.cpp:8938-8946) — the GetChannels
-    /// query send is [blocked: net] (M.5.44); the validation surfaces
-    /// stay exact.
+    /// `reload_channel` (ChatManager.cpp:8938-8956) — the force-load,
+    /// then the merger park; the no-input arm sends the hash-0 query
+    /// directly (requests with 0 access_hash must not be merged,
+    /// cpp:8949-8953).
     pub(crate) fn reload_channel(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         mut promise: Promise<()>,
@@ -15078,8 +15656,19 @@ impl ChatManager {
             return promise.set_error(Status::error(400, "Invalid supergroup identifier"));
         }
         let _ = source;
-        tdutils::log_info!("GetChannelsQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        self.have_channel_force(user_manager, env, channel_id, source);
+        if self.get_input_channel(env, channel_id).is_none() {
+            // requests with 0 access_hash must not be merged
+            return self.send_get_channels_query(
+                channel_id,
+                telegram_api::InputChannel::inputChannel(telegram_api::inputChannel {
+                    channel_id: channel_id.get(),
+                    access_hash: 0,
+                }),
+                promise,
+            );
+        }
+        self.add_reload_channel_query(env, channel_id, promise);
     }
 
     /// `on_load_channel_full_from_database` (ChatManager.cpp:5098-5220).
@@ -15372,8 +15961,12 @@ impl ChatManager {
     }
 
     /// `send_get_channel_full_query` (ChatManager.cpp:9015-9048) — the
-    /// GetFullChannelQuery send is `[blocked: net]`; the validation and
-    /// the `repair_request_version` bookkeeping stay exact.
+    /// validation and the `repair_request_version` bookkeeping stay
+    /// exact; the send parks on the GetChatFullCombiner (the send
+    /// closure captures the input channel and hops to the Td actor,
+    /// running [`ChatManager::send_get_full_channel_query`]). The
+    /// actor-less contexts collapse the combiner onto the direct
+    /// single-flight send.
     fn send_get_channel_full_query(
         &mut self,
         env: &mut UserEnv,
@@ -15406,9 +15999,41 @@ impl ChatManager {
             }
         }
         tdutils::log_info!("Get full {channel_id:?} from {source}");
-        let _ = input_channel;
-        tdutils::log_info!("GetFullChannelQuery for {channel_id:?} — [blocked: net]");
-        promise.set_error(Status::error(500, "Network is not implemented yet"));
+        let input_channel = input_channel.expect("the validation gates above");
+        match (self.td_actor_id.clone(), self.get_chat_full_queries.clone()) {
+            (Some(td_actor_id), Some(combiner)) => {
+                let send_query = PromiseCreator::lambda_result(tdactor::promise_send_closure(
+                    td_actor_id,
+                    move |td: &mut crate::td::Td, result: tdutils::status::Result<Promise<()>>| {
+                        if let tdutils::status::Result::Ok(promise) = result
+                            && !td.global.close_flag()
+                        {
+                            // `td->create_handler<GetFullChannelQuery>(
+                            // promise.move_as_ok())->send(channel_id,
+                            // std::move(input_channel))`
+                            td.chat_manager.send_get_full_channel_query(
+                                channel_id,
+                                input_channel,
+                                promise,
+                            );
+                        }
+                    },
+                ));
+                tdactor::send_closure(
+                    combiner,
+                    crate::query_combiner::QueryCombinerMessage::AddQuery {
+                        query_id: DialogId::from_channel_id(channel_id).get(),
+                        send_query,
+                        promise,
+                    },
+                );
+            }
+            _ => {
+                // the combiner needs the scheduler context; the collapsed
+                // form sends single-flight (the netted round-trips)
+                self.send_get_full_channel_query(channel_id, input_channel, promise);
+            }
+        }
     }
 
     /// `reload_channel_full` (ChatManager.cpp:9028-9031).
@@ -20346,7 +20971,8 @@ mod tests {
         );
 
         // the stale branch — an unknown username rides the promise into
-        // the reload (the seam parks with the net-drain-16 500)
+        // the reload (the GetChannelsQuery parks at the net seam; the
+        // promise rides its family queue)
         let (promise, recorded) = recorded_unit_promise();
         cm.on_update_channel_username_is_active(
             &mut um,
@@ -20356,7 +20982,8 @@ mod tests {
             true,
             promise,
         );
-        assert_unit_error(&recorded, "Network is not implemented yet");
+        assert!(recorded.lock().unwrap().is_none(), "the parked reload");
+        assert_eq!(cm.pending_get_channels_queries.len(), 1);
 
         // on_deactivate_channel_usernames — the editable username stays
         // active (the Usernames rule); the value resolves
@@ -20533,7 +21160,8 @@ mod tests {
         assert_eq!(object.editable_username, "alpha");
 
         // the stale branch — the local set no longer matches the order;
-        // the promise rides the reload (the net-drain-16 park)
+        // the promise rides the reload (the GetChannelsQuery parks at
+        // the net seam; the promise rides its family queue)
         let (promise, recorded) = recorded_unit_promise();
         cm.on_update_channel_active_usernames_order(
             &mut um,
@@ -20547,7 +21175,8 @@ mod tests {
             ],
             promise,
         );
-        assert_unit_error(&recorded, "Network is not implemented yet");
+        assert!(recorded.lock().unwrap().is_none(), "the parked reload");
+        assert_eq!(cm.pending_get_channels_queries.len(), 1);
         // the order is unchanged by the failed apply
         assert_eq!(
             cm.get_channel(channel_id)
@@ -21713,19 +22342,22 @@ mod tests {
         cm.load_chat_full(&mut um, &mut env, ChatId::new(91), false, p2, "test");
         assert_unit_error(&r2, "Group not found");
 
-        // with the chat known but no full anywhere, the get query answers
-        // the net-step surface
+        // with the chat known but no full anywhere, the get query parks
+        // at the net seam (the GetChatFullCombiner send; the promise
+        // rides the family queue)
         cm.add_chat(ChatId::new(91)).clone_from(&sample_chat());
         let (p2b, r2b) = recorded_unit_promise();
         cm.load_chat_full(&mut um, &mut env, ChatId::new(91), false, p2b, "test");
-        assert_unit_error(&r2b, "Network is not implemented yet");
+        assert!(r2b.lock().unwrap().is_none(), "the parked full query");
+        assert_eq!(cm.pending_get_full_chat_queries.len(), 1);
 
         // reload_chat_full forwards blindly in the C++ (cpp:8509-8511);
         // the "Can't access the chat" surface is the GetFullChatQuery
         // on_error mapping (cpp:1086), which lands with the net step
         let (p3, r3) = recorded_unit_promise();
         cm.reload_chat_full(&mut env, ChatId::new(92), p3, "test");
-        assert_unit_error(&r3, "Network is not implemented yet");
+        assert!(r3.lock().unwrap().is_none(), "the parked full query");
+        assert_eq!(cm.pending_get_full_chat_queries.len(), 2);
 
         let (p4, r4) = recorded_unit_promise();
         cm.load_channel_full(&mut um, &mut env, ChannelId::new(0), false, p4, "test");
