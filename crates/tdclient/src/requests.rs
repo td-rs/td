@@ -4751,7 +4751,10 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             // SearchPublicChatRequest: set_tries(4); get_tries() < 3 →
             // false on the first try. The result object is the
             // MessagesManager chat (the builder lands with M.10; on this
-            // base every reachable path errors first — stub inventory).
+            // base every reachable path errors first — the parked-resolve
+            // collapse keeps the inline stand-in: the resolve query goes
+            // out and the M.10 gap answers here, the parked family promise
+            // settles a dropped slot).
             let (promise, slot) = unit_request_promise();
             let _dialog_id =
                 crate::dialog_manager::search_public_dialog(td, &username, false, promise);
@@ -4767,19 +4770,16 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
                 return;
             };
-            let (promise, slot) = unit_request_promise();
-            let dialog_ids = crate::dialog_manager::search_public_dialogs(
+            // the promise settles from the SearchPublicDialogsQuery answer
+            // (the deferred outbox — the parked request re-runs against the
+            // fresh cache)
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            crate::dialog_manager::search_public_dialogs_for_request(
                 td,
                 &query,
                 request.type_filter.as_ref(),
                 promise,
             );
-            if fail_from_slot(td, id, &slot) {
-                return;
-            }
-            let chats =
-                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchPublicChats");
-            td.send_result(id, Object::chats(chats));
         }
         Function::searchChats(request) => {
             if !check_is_user(td, id) {
@@ -4810,20 +4810,16 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
                 return;
             };
-            let (promise, slot) = unit_request_promise();
-            let dialog_ids = crate::dialog_manager::search_dialogs_on_server(
+            // the promise settles from the SearchPublicDialogsQuery answer
+            // (the deferred outbox)
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            crate::dialog_manager::search_dialogs_on_server_for_request(
                 td,
                 &query,
                 request.type_filter.as_ref(),
                 request.limit,
                 promise,
             );
-            if fail_from_slot(td, id, &slot) {
-                return;
-            }
-            let chats =
-                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchChatsOnServer");
-            td.send_result(id, Object::chats(chats));
         }
         Function::searchRecentlyFoundChats(request) => {
             if !check_is_user(td, id) {
@@ -4973,14 +4969,15 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::setChatPhoto(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:5784-5787)
-            let (promise, slot) = unit_request_promise();
+            // — the promise settles from the EditDialogPhotoQuery answer
+            // (the deferred outbox; the upload tail rides the Files plane)
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             crate::dialog_manager::set_dialog_photo(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.photo.as_ref(),
                 promise,
             );
-            finish_unit_slot(td, id, slot);
         }
         Function::setChatAccentColor(request) => {
             if !check_is_user(td, id) {
@@ -18979,22 +18976,6 @@ fn fail_from_slot(td: &mut Td, id: u64, slot: &std::sync::Mutex<Option<Result<()
             true
         }
         _ => false,
-    }
-}
-
-/// The synchronous collapse of `CREATE_OK_REQUEST_PROMISE`
-/// (Requests.cpp:1923-1930): the error is sent as-is, and a success sends
-/// `ok` — the C++ `create_ok_request_promise` answers `send_result(id, ok)`
-/// on `set_value`.
-fn finish_unit_slot(
-    td: &mut Td,
-    id: u64,
-    slot: std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>,
-) {
-    match slot.lock().unwrap().take() {
-        Some(Result::Ok(())) => td.send_result(id, ok_object()),
-        Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
-        None => {}
     }
 }
 

@@ -25,7 +25,7 @@
 //! | `user_manager_->reload_user` / `chat_manager_->reload_chat` / `reload_channel` (cpp:1623-1627) | the promise completes with 500 "Network is not implemented yet" |
 //! | `chat_manager_->load_chat_full` / `load_channel_full` (cpp:1636-1641) | the promise completes with 500 "Network is not implemented yet" |
 //! | `user_manager_->reload_user_full` / `chat_manager_->reload_chat_full` / `reload_channel_full` (cpp:1664-1669) | a logged no-op |
-//! | `dialog_manager_->search_public_dialog` / `get_resolved_dialog_by_username` (RecentDialogList.cpp:117/:142) | unresolved: `@username` entries drop on load |
+//! | `dialog_manager_->get_resolved_dialog_by_username` (RecentDialogList.cpp:142) | wired — the `@username` recent-dialog entries rehydrate their dialogs on load (the still-unresolved usernames drop)
 //! | `messages_manager_->load_dialogs` / `get_dialogs_from_list` + `user_manager_->search_contacts` (RecentDialogList.cpp:121-136) | skipped — the load completes from memory alone |
 //! | `chat_manager_->get_input_peer_chat` / `get_input_peer_channel` (cpp:1372-1375) | `None` (the C++ `nullptr`) — ChatManager peers arrive with its read surface |
 //! | `chat_manager_->have_input_peer_chat` / `have_input_peer_channel` (cpp:1473-1476) | `false` |
@@ -43,19 +43,19 @@
 //! | `chat_manager_->get_chat_has_protected_content` / `get_channel_has_protected_content` (cpp:2285/:2288/:2302/:2305) | `false` |
 //! | `messages_manager_->report_dialog_from_action_bar` (cpp:2835) | `{is_reported: false, know_action_bar: false}` (the empty option/text/message argument set is the only caller-visible shape until MessagesManager) |
 //! | `messages_manager_->can_report_message` (cpp:2849) | `Ok` (no messages exist until MessagesManager) |
-//! | the peer-settings/report/blocked/toggle query actors (`GetPeerSettingsQuery`, `EditDialogPhotoQuery`, `SaveDefaultSendAsQuery`, `EditPeerFoldersQuery`, `SetHistoryTtlQuery`, `SetChatPhotoQuery` upload tail) | the send is `[blocked: net]` — the promise completes with 500 "Network is not implemented yet"; the `on_result`/`on_error` halves land with the net step (the thirteen §3.4 families — `GetDialogUnreadMarksQuery`, `ReportPeerQuery`, `GetBlockedDialogsQuery`, `UpdatePeerSettingsQuery`, `ReportEncryptedSpamQuery`, `ReorderPinnedDialogsQuery`, `ToggleDialogIsBlockedQuery`, `ToggleDialogUnreadMarkQuery`, `ToggleDialogPinQuery`, `ToggleDialogTranslationsQuery`, `ToggleViewForumAsMessagesQuery`, `SetChatThemeQuery` + the `UpdateColorQuery` user leg — dispatch over the dialog/user net handles) |
+//! | the peer-settings/report/blocked/toggle query actors (`GetPeerSettingsQuery`, `SaveDefaultSendAsQuery`, `EditPeerFoldersQuery`, `SetHistoryTtlQuery`) | the send is `[blocked: net]` — the promise completes with 500 "Network is not implemented yet"; the `on_result`/`on_error` halves land with their net steps (the landed families dispatch over the dialog/user net handles)
 //! | the erase-log-event promise (`get_erase_log_event_promise`) | wired for the §3.4 toggle/report families (the query-carried promise erases the mirror on settlement, success or error, LogEventHelper.cpp:42-52); the remaining mirrors adopt it with their net slices |
 //! | `get_channel_first_username` (RecentDialogList.cpp:57) | channel dialogs persist by id — the C++ `@username` form arrives with the ChatManager username read |
-//! | `file_manager_` file views / `resume_upload` + `UploadDialogPhotoCallback` + `being_uploaded_dialog_photos_` (cpp:2398-2406/:2498-2593) | `[blocked: files]` — set_dialog_photo ports the gates and the empty/previous-photo validation, then reaches the net-blocked query |
+//! | `file_manager_` file views / `resume_upload` + `UploadDialogPhotoCallback` + `being_uploaded_dialog_photos_` (cpp:2398-2406/:2498-2593) | `[blocked: files]` — the static/animation upload tail and the previous-photo file view ride the Files plane (M.20); the `EditDialogPhotoQuery` wire itself is landed (`send_edit_dialog_photo_query`)
 //! | `messages_manager_->create_dialog` / `sort_dialogs_by_order` / `can_add_dialog_to_filter` (cpp:3291/:3414/:3385) | local no-op completion / unsorted truncation / `Ok` |
-//! | `chat_manager_->reload_channel_full` (cpp:3295) | the promise completes with 500 "Network is not implemented yet" |
+//! | `chat_manager_->reload_channel_full` (cpp:3280) | wired — the search_public_dialog video-chat reload rides the `GetChannelFullQuery` answer
 //! | `user_manager_->on_update_user_commands` / `chat_manager_->on_update_chat_bot_commands` / `on_update_channel_bot_commands` (cpp:2991/:2995/:2997) | commented no-ops (BotCommands arrives with the M.5/M.8 integration) |
 //! | `CheckUsernameQuery` / `CheckChannelUsernameQuery` (cpp:3096-3098) | dispatch over the dialog net handle (see [`check_dialog_username`]) |
-//! | `ResolveUsernameQuery` + the `resolve_dialog_username_queries_` queue (cpp:3134-3145) | `[blocked: net]` — the promise completes inline instead of parking in the queue; `resolve_dialog` itself (cpp:3185-3207) lands with the net step |
-//! | `SearchPublicDialogsQuery` / `send_search_public_dialogs_query` (cpp:3436-3446) | the send is `[blocked: net]` (see [`search_public_dialogs`] / [`search_dialogs_on_server`]) |
+//! | `ResolveUsernameQuery` + the `resolve_dialog_username_queries_` queue (cpp:3134-3145) | dispatch over the dialog net handle — the promise parks on the per-username queue (see `send_resolve_dialog_username_query` / `on_resolved_username`); `resolve_dialog` itself (cpp:3185-3207) lands with the MessagesManager/link step |
+//! | `SearchPublicDialogsQuery` / `send_search_public_dialogs_query` (cpp:3436-3446) | dispatch over the dialog net handle — the per-query promise queue with the negative cache (see [`search_public_dialogs`] / [`search_dialogs_on_server`]); the request arms ride the parked-request re-run collapse |
 //! | `get_input_dialog_id` (cpp:1340-1348) | lands with the `InputDialogId` type |
 //! | `set_dialog_location` (cpp:2782-2799) | lands with the M.5.5+ ChatManager integration (the `DialogLocation` record) |
-//! | `hangup` / `tear_down` (cpp:1324-1334) | not ported — the Rust search promises complete inline, so nothing is parked to fail at close, and there is no actor to tear down |
+//! | `hangup` / `tear_down` (cpp:1324-1334) | not ported — the parked family-queue promises fail with the lost-promise error on drop, so nothing dangles at close, and there is no actor to tear down |
 
 use std::collections::HashMap;
 
@@ -83,9 +83,9 @@ pub enum NotificationSettingsScope {
 }
 
 /// `DialogManager::DialogTypeFilter` (DialogManager.h) — the chat-type facet
-/// of the search queries.
+/// of the search queries (the `SearchPublicDialogs` kind carries it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DialogTypeFilter {
+pub(crate) enum DialogTypeFilter {
     None,
     Bot,
     Broadcast,
@@ -377,6 +377,21 @@ pub fn have_dialog_force(td: &mut Td, dialog_id: DialogId, _source: &str) -> boo
 /// `expect_no_access` / `force_update_dialog_pos` args ride the stub.
 pub fn force_create_dialog(_td: &mut Td, _dialog_id: DialogId, _source: &str) {
     // M.6 stub: messages_manager_->force_create_dialog
+}
+
+/// The parked family-promise completion slot (the requests.rs
+/// `UnitSlot` shape, shared with the search re-run collapse).
+type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>;
+
+/// The unit promise + slot pair the search entries park on the family
+/// queues (the completion signals the request drain).
+fn unit_slot_promise() -> (Promise<()>, UnitSlot) {
+    let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capture = std::sync::Arc::clone(&slot);
+    let promise = tdutils::promise::PromiseCreator::lambda_result(move |result: Result<()>| {
+        *capture.lock().unwrap() = Some(result);
+    });
+    (promise, slot)
 }
 
 /// `DialogManager::get_peers_dialog_ids` (DialogManager.cpp:1545-1557) —
@@ -916,9 +931,10 @@ impl RecentDialogList {
 
         for found_dialog in found_dialogs.iter().rev() {
             let dialog_id = if let Some(username) = found_dialog.strip_prefix('@') {
-                // M.6 stub: get_resolved_dialog_by_username ([blocked: net])
-                let _ = username;
-                DialogId::new(0)
+                // `get_resolved_dialog_by_username` (RecentDialogList.cpp:141)
+                // — the keep: a still-resolved username rehydrates its
+                // dialog, an unresolved one drops the entry.
+                td.dialog_manager.get_resolved_dialog_by_username(username)
             } else {
                 DialogId::new(found_dialog.parse::<i64>().unwrap_or(0))
             };
@@ -1193,6 +1209,25 @@ pub(crate) enum DialogNetKind {
     SetChatTheme {
         dialog_id: crate::dialog_id::DialogId,
     },
+    /// `ResolveUsernameQuery` (DialogManager.cpp:131) — the kind carries
+    /// the interned username index (the answer tail re-keys the
+    /// `resolve_dialog_username_queries` queue from it; the kinds stay
+    /// `Copy`).
+    ResolveUsername { username_index: u32 },
+    /// `SearchPublicDialogsQuery` (DialogManager.cpp:161) — the kind
+    /// carries the handler's `type_filter_` member and the interned
+    /// query index (the answer tail re-keys the
+    /// `search_public_dialogs_queries` queue from it).
+    SearchPublicDialogs {
+        type_filter: DialogTypeFilter,
+        query_index: u32,
+    },
+    /// `EditDialogPhotoQuery` (DialogManager.cpp:280) — the kind carries
+    /// the dialog for the error tail; the `file_upload_id_`/`was_uploaded_`
+    /// handler members ride the Files plane (the upload tail).
+    EditDialogPhoto {
+        dialog_id: crate::dialog_id::DialogId,
+    },
 }
 
 /// `DialogManager` — the state of the C++ DialogManager actor that exists in
@@ -1269,6 +1304,46 @@ pub struct DialogManager {
     pub(crate) pending_toggle_view_forum_as_messages: Vec<Promise<()>>,
     /// The `SetChatThemeQuery` promises (DialogManager.cpp:997).
     pub(crate) pending_set_chat_theme: Vec<Promise<()>>,
+    /// `resolve_dialog_username_queries_` (DialogManager.h) — the
+    /// per-username promise queue of the resolve family (cpp:3134-3145:
+    /// the head entry owns the in-flight query, the tail entries ride
+    /// its answer).
+    pub(crate) resolve_dialog_username_queries: HashMap<String, Vec<Promise<()>>>,
+    /// `search_public_dialogs_queries_` (DialogManager.h) — the
+    /// per-query promise queues of the two search entries, indexed by
+    /// the `DialogTypeFilter` number (cpp:3436-3446).
+    pub(crate) search_public_dialogs_queries: [HashMap<String, Vec<Promise<()>>>; 3],
+    /// The parked `searchPublicChats`/`searchChatsOnServer` requests —
+    /// the RequestActor do_run/do_send_result re-run collapse (the
+    /// parked family promise signals through the slot; the answer
+    /// tails re-run the entry against the fresh cache).
+    pub(crate) pending_search_dialogs_requests: Vec<PendingSearchDialogsRequest>,
+    /// The `EditDialogPhotoQuery` promises (DialogManager.cpp:282).
+    pub(crate) pending_edit_dialog_photo: Vec<Promise<()>>,
+}
+
+/// One parked search request — the `SearchPublicChatsRequest`/
+/// `SearchChatsOnServerRequest` actor state (Requests.cpp:426-487): the
+/// query/type/limit members, the RequestActor tries, and the completion
+/// slot of the promise parked on the family queue (`None` while parked,
+/// `Some` once an answer settled it — the drain re-runs exactly the
+/// signaled entries).
+pub(crate) struct PendingSearchDialogsRequest {
+    pub(crate) query: String,
+    pub(crate) type_filter: DialogTypeFilter,
+    /// `SearchChatsOnServerRequest::limit_` (the public form ignores
+    /// it — the C++ member stays default there).
+    pub(crate) limit: i32,
+    /// the on-server form reads `found_on_server_dialogs` (the
+    /// `sort_dialogs_by_order` truncation is the observable half).
+    pub(crate) on_server: bool,
+    /// `RequestActor::tries_left_` — 2 (the initial run + one re-run);
+    /// a park past the last try answers the C++ tries-exhausted error.
+    pub(crate) tries_left: i32,
+    /// The parked family promise's completion slot.
+    pub(crate) slot: UnitSlot,
+    /// The request's chats-object promise (the `do_send_result` half).
+    pub(crate) promise: Promise<crate::td_api::Chats>,
 }
 
 impl Default for DialogManager {
@@ -1308,6 +1383,10 @@ impl DialogManager {
             pending_toggle_dialog_translations: Vec::new(),
             pending_toggle_view_forum_as_messages: Vec::new(),
             pending_set_chat_theme: Vec::new(),
+            resolve_dialog_username_queries: HashMap::new(),
+            search_public_dialogs_queries: Default::default(),
+            pending_search_dialogs_requests: Vec::new(),
+            pending_edit_dialog_photo: Vec::new(),
         }
     }
 
@@ -3537,16 +3616,11 @@ pub fn set_dialog_title(td: &mut Td, dialog_id: DialogId, title: &str, mut promi
     }
 }
 
-/// `DialogManager::set_dialog_photo` (DialogManager.cpp:2385-2412, the
-/// fb05f53c2 shape) — the dialog-type gates, then the
-/// `do_set_dialog_photo` ladder. The FileManager upload halves are
-/// [blocked: files] and the `EditDialogPhotoQuery` send is [blocked: net]
-/// (stub inventory); for a non-regular channel (a community) the arm
-/// answers "Can't change chat photo" after the rights gate. The
-/// Chat/Channel rights gates answer the unloaded defaults, so the
-/// is_regular_channel dispatch is unreachable until the ChatManager read
-/// surface lands.
-#[allow(unreachable_code, unused_variables)]
+/// `DialogManager::set_dialog_photo` (DialogManager.cpp:2385-2412) — the
+/// dialog-type and rights gates, then the `do_set_dialog_photo` ladder
+/// (the fb05f53c2 split the port keeps for the community photo flow;
+/// the current C++ folded them — ab73e74d9). The FileManager upload
+/// halves are [blocked: files].
 pub fn set_dialog_photo(
     td: &mut Td,
     dialog_id: DialogId,
@@ -3564,18 +3638,24 @@ pub fn set_dialog_photo(
             return;
         }
         crate::dialog_id::DialogType::Chat => {
-            // get_chat_permissions — the unloaded default (stub
-            // inventory).
-            promise.set_error(Status::error(400, "Not enough rights to change chat photo"));
-            return;
+            let chat_id = dialog_id.get_chat_id();
+            let status = td.chat_manager.get_chat_permissions_id(chat_id);
+            if !status.can_change_info_and_settings()
+                || (td.auth_manager.is_bot()
+                    && !td.chat_manager.is_appointed_chat_administrator(chat_id))
+            {
+                promise.set_error(Status::error(400, "Not enough rights to change chat photo"));
+                return;
+            }
         }
         crate::dialog_id::DialogType::Channel => {
-            // get_channel_permissions — the unloaded default (stub
-            // inventory).
-            promise.set_error(Status::error(400, "Not enough rights to change chat photo"));
-            return;
-            // `if (!channel_id.is_regular_channel())` — "Can't change chat
-            // photo" (fb05f53c2); unreachable over the unloaded rights.
+            let status = td
+                .chat_manager
+                .get_channel_permissions_id(&td.global, dialog_id.get_channel_id());
+            if !status.can_change_info_and_settings() {
+                promise.set_error(Status::error(400, "Not enough rights to change chat photo"));
+                return;
+            }
         }
         crate::dialog_id::DialogType::SecretChat => {
             promise.set_error(Status::error(400, "Can't change secret chat photo"));
@@ -3593,9 +3673,10 @@ pub fn set_dialog_photo(
 /// DialogManager.cpp:2414-2497) — the input-photo shape ladder shared by
 /// the request plane and the community photo flow; `owner_dialog_id` is
 /// the file-upload owner (the community's fake dialog id carries the
-/// DialogId() owner). The upload/query tails park at the [blocked:
-/// files]/[blocked: net] seams (stub inventory).
-#[allow(unreachable_code, unused_variables)]
+/// DialogId() owner). The sticker and empty forms reach the landed
+/// `EditDialogPhotoQuery` wire; the static/animation upload tail is
+/// [blocked: files] (the `upload_dialog_photo`/`on_upload_dialog_photo`
+/// halves, M.20).
 pub fn do_set_dialog_photo(
     td: &mut Td,
     dialog_id: DialogId,
@@ -3604,9 +3685,9 @@ pub fn do_set_dialog_photo(
     mut promise: Promise<()>,
 ) {
     use crate::td_api;
-    let _ = (td, owner_dialog_id);
+    let _ = owner_dialog_id;
 
-    let mut input_file_present = false;
+    let mut input_file: Option<&td_api::InputFile> = None;
     let mut main_frame_timestamp = 0.0;
     let mut is_animation = false;
     if let Some(input_photo) = input_photo {
@@ -3623,30 +3704,71 @@ pub fn do_set_dialog_photo(
                 ));
                 return;
             }
-            td_api::InputChatPhoto::inputChatPhotoStatic(_) => {
+            td_api::InputChatPhoto::inputChatPhotoStatic(photo) => {
                 // photo:InputFile — the union field is always present; the
                 // C++ keeps the address for get_input_file_id.
-                input_file_present = true;
+                input_file = photo.photo.as_ref();
             }
             td_api::InputChatPhoto::inputChatPhotoAnimation(photo) => {
-                input_file_present = true;
+                input_file = photo.animation.as_ref();
                 main_frame_timestamp = photo.main_frame_timestamp;
                 is_animation = true;
             }
-            td_api::InputChatPhoto::inputChatPhotoSticker(_) => {
-                // StickerPhotoSize::get_sticker_photo_size needs the
-                // sticker read surface (M.8/M.9 residue); the C++ built an
-                // inputChatUploadedPhoto with VIDEO_EMOJI_MARKUP and sent
-                // the edit query — [blocked: net] (stub inventory).
-                promise_unimplemented(&mut promise);
+            td_api::InputChatPhoto::inputChatPhotoSticker(photo) => {
+                // `StickerPhotoSize::get_sticker_photo_size(td_, sticker_)`
+                // (StickerPhotoSize.cpp:14-69) — the null/type/fill bands
+                // and the have_sticker/have_custom_emoji reads over the
+                // stickers surface, then the VIDEO_EMOJI_MARKUP query
+                // (cpp:2452-2461).
+                let sticker_photo_size =
+                    match crate::photo::StickerPhotoSize::get_sticker_photo_size_td_api(
+                        photo.sticker.as_ref(),
+                        |sticker_set_id, sticker_id| {
+                            td.stickers_manager.have_sticker(
+                                crate::stickers_manager::StickerSetId::new(sticker_set_id),
+                                sticker_id,
+                            )
+                        },
+                        |custom_emoji_id| {
+                            td.stickers_manager.have_custom_emoji(
+                                crate::stickers_manager::CustomEmojiId::new(custom_emoji_id),
+                            )
+                        },
+                    ) {
+                        Ok(sticker_photo_size) => sticker_photo_size,
+                        Err(error) => return promise.set_error(error),
+                    };
+                // the sticker form's flag bit (the
+                // `inputChatUploadedPhoto::VIDEO_EMOJI_MARKUP_MASK` pair —
+                // bit 3 of this constructor's flags)
+                const VIDEO_EMOJI_MARKUP_MASK: i32 = 1 << 3;
+                let input_chat_photo =
+                    tdmtproto::telegram_api::InputChatPhoto::inputChatUploadedPhoto(
+                        tdmtproto::telegram_api::inputChatUploadedPhoto {
+                            flags: VIDEO_EMOJI_MARKUP_MASK,
+                            file: None,
+                            video: None,
+                            video_start_ts: 0.0,
+                            video_emoji_markup: Some(
+                                sticker_photo_size.get_input_video_size_object(|sticker_set_id| {
+                                    td.stickers_manager.get_input_sticker_set(
+                                        crate::stickers_manager::StickerSetId::new(sticker_set_id),
+                                    )
+                                }),
+                            ),
+                        },
+                    );
+                send_edit_dialog_photo_query(td, dialog_id, input_chat_photo, promise);
                 return;
             }
         }
     }
-
-    if !input_file_present {
-        // send_edit_dialog_photo_query(inputChatPhotoEmpty) — [blocked: net].
-        promise_unimplemented(&mut promise);
+    if input_file.is_none() {
+        // send_edit_dialog_photo_query(inputChatPhotoEmpty) (cpp:2463-2466)
+        let input_chat_photo = tdmtproto::telegram_api::InputChatPhoto::inputChatPhotoEmpty(
+            tdmtproto::telegram_api::inputChatPhotoEmpty,
+        );
+        send_edit_dialog_photo_query(td, dialog_id, input_chat_photo, promise);
         return;
     }
 
@@ -3657,9 +3779,67 @@ pub fn do_set_dialog_photo(
     }
 
     // get_input_file_id + upload_dialog_photo — [blocked: files] (stub
-    // inventory).
+    // inventory; the upload tail rides the Files plane, M.20 — the
+    // `!file_id.is_valid()` band's inputChatPhotoEmpty query lands with
+    // it).
     let _ = is_animation;
     promise_unimplemented(&mut promise);
+}
+
+/// `DialogManager::send_edit_dialog_photo_query`
+/// (DialogManager.cpp:2490-2497) — the `EditDialogPhotoQuery` send over
+/// the dialog net handle (the basic-group `messages.editChatPhoto` /
+/// channel `channels.editPhoto` pair); the promise parks on the family
+/// queue. The handler's `file_upload_id_`/`was_uploaded_` members ride
+/// the Files plane (the upload tail).
+pub fn send_edit_dialog_photo_query(
+    td: &mut Td,
+    dialog_id: DialogId,
+    input_chat_photo: tdmtproto::telegram_api::InputChatPhoto,
+    mut promise: Promise<()>,
+) {
+    // TRY_STATUS_PROMISE(promise, G()->close_status())
+    if td.global.close_flag() {
+        promise.set_error(Status::error(500, "Request aborted"));
+        return;
+    }
+
+    match dialog_id.get_type() {
+        crate::dialog_id::DialogType::Chat => {
+            td.dialog_manager.pending_edit_dialog_photo.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::EditDialogPhoto { dialog_id },
+                tdmtproto::telegram_api::Function::messages_editChatPhoto(
+                    tdmtproto::telegram_api::messages_editChatPhoto {
+                        chat_id: dialog_id.get_chat_id().get(),
+                        photo: Some(input_chat_photo),
+                    },
+                ),
+                "messages.editChatPhoto",
+            );
+        }
+        crate::dialog_id::DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let Some(input_channel) = get_input_channel_td(td, channel_id) else {
+                // the C++ CHECK(input_channel != nullptr) — the peer-less
+                // band keeps the promise honest instead of crashing
+                promise.set_error(Status::error(400, "Can't access the chat"));
+                return;
+            };
+            td.dialog_manager.pending_edit_dialog_photo.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::EditDialogPhoto { dialog_id },
+                tdmtproto::telegram_api::Function::channels_editPhoto(
+                    tdmtproto::telegram_api::channels_editPhoto {
+                        channel: Some(input_channel),
+                        photo: Some(input_chat_photo),
+                    },
+                ),
+                "channels.editPhoto",
+            );
+        }
+        _ => unreachable!("EditDialogPhotoQuery over a non-chat/channel dialog"),
+    }
 }
 
 /// `DialogManager::set_dialog_accent_color` (DialogManager.cpp:2594-2619).
@@ -4713,6 +4893,12 @@ impl DialogManager {
         Self::pop_head(&mut self.pending_set_chat_theme)
     }
 
+    /// `EditDialogPhotoQuery::on_result`'s promise pop
+    /// (DialogManager.cpp:322-331).
+    pub(crate) fn take_edit_dialog_photo_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_edit_dialog_photo)
+    }
+
     pub(crate) fn on_dialog_usernames_updated(
         &mut self,
         dialog_id: DialogId,
@@ -4943,10 +5129,9 @@ pub fn get_check_chat_username_result_object(
 }
 
 /// `DialogManager::get_resolved_dialog_by_username`
-/// (DialogManager.cpp:3232-3240) — a [`DialogManager`] method; the callers
-/// (resolve_dialog, the RecentDialogList `@username` load) arrive with the
-/// net step.
-#[allow(dead_code)]
+/// (DialogManager.cpp:3232-3240) — a [`DialogManager`] method (the
+/// callers: the RecentDialogList `@username` load; `resolve_dialog`
+/// itself, cpp:3185-3207, lands with the MessagesManager/link step).
 impl DialogManager {
     pub(crate) fn get_resolved_dialog_by_username(&self, username: &str) -> DialogId {
         let cleaned_username = clean_username(username);
@@ -4962,41 +5147,167 @@ impl DialogManager {
             .copied()
             .unwrap_or_else(|| DialogId::new(0))
     }
+}
 
-    /// `DialogManager::resolve_dialog_username`
-    /// (DialogManager.cpp:3242-3256) — the query path is net-blocked, so the
-    /// passed promise completes with the net-blocked error instead of
-    /// parking in the C++ `resolve_dialog_username_queries_` queue (stub
-    /// inventory). `resolve_dialog` itself (DialogManager.cpp:3185-3207,
-    /// the username/channel-id resolution entry) lands with the net step.
-    pub(crate) fn resolve_dialog_username(
-        &mut self,
-        _td: &mut Td,
-        username: &str,
-        promise: &mut Promise<()>,
-    ) -> DialogId {
-        match self.resolved_usernames.get(username) {
-            Some(resolved_username) if resolved_username.dialog_id.is_valid() => {
-                let dialog_id = resolved_username.dialog_id;
-                if resolved_username.expires_at < time::now() {
-                    // the refresh query with an empty promise — [blocked:
-                    // net]
-                    tracing::info!("Refresh resolved username — [blocked: net]");
-                }
-                return dialog_id;
-            }
-            _ => {}
+/// `DialogManager::resolve_dialog_username` (DialogManager.cpp:3242-3256)
+/// — the cached hits answer from the maps (an expired entry refreshes
+/// with an empty promise); the miss parks the passed promise on the
+/// resolve family queue via [`send_resolve_dialog_username_query`].
+pub(crate) fn resolve_dialog_username(
+    td: &mut Td,
+    username: &str,
+    promise: &mut Promise<()>,
+) -> DialogId {
+    if let Some(resolved_username) = td.dialog_manager.resolved_usernames.get(username)
+        && resolved_username.dialog_id.is_valid()
+    {
+        let dialog_id = resolved_username.dialog_id;
+        if resolved_username.expires_at < time::now() {
+            // the refresh query with an empty promise (cpp:3250-3252)
+            send_resolve_dialog_username_query(td, username.to_owned(), Promise::default());
         }
-        let dialog_id = self
-            .inaccessible_resolved_usernames
-            .get(username)
-            .copied()
-            .unwrap_or_else(|| DialogId::new(0));
-        if !dialog_id.is_valid() {
-            promise_unimplemented(promise);
-        }
-        dialog_id
+        return dialog_id;
     }
+
+    let dialog_id = td
+        .dialog_manager
+        .inaccessible_resolved_usernames
+        .get(username)
+        .copied()
+        .unwrap_or_else(|| DialogId::new(0));
+    if !dialog_id.is_valid() {
+        send_resolve_dialog_username_query(td, username.to_owned(), std::mem::take(promise));
+    }
+    dialog_id
+}
+
+/// `DialogManager::send_resolve_dialog_username_query`
+/// (DialogManager.cpp:3134-3145) — the promise parks on the per-username
+/// queue; the head entry (the first parker) owns the
+/// `contacts.resolveUsername` send, the tail entries ride its answer
+/// (the `on_resolved_username` fan-out). The username rides the kind as
+/// an interned index (`Td::dialog_net_strings`).
+pub(crate) fn send_resolve_dialog_username_query(
+    td: &mut Td,
+    username: String,
+    promise: Promise<()>,
+) {
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    let is_query_owner = {
+        let queries = manager
+            .resolve_dialog_username_queries
+            .entry(username.clone())
+            .or_default();
+        queries.push(promise);
+        queries.len() == 1
+    };
+    if is_query_owner {
+        let username_index = td.dialog_net_strings.len() as u32;
+        td.dialog_net_strings
+            .push(std::sync::Arc::from(username.as_str()));
+        manager.send_dialog_net_query(
+            DialogNetKind::ResolveUsername { username_index },
+            tdmtproto::telegram_api::Function::contacts_resolveUsername(
+                tdmtproto::telegram_api::contacts_resolveUsername {
+                    flags: 0,
+                    username,
+                    referer: String::new(),
+                },
+            ),
+            "contacts.resolveUsername",
+        );
+    }
+    td.dialog_manager = manager;
+}
+
+/// `DialogManager::on_resolved_username` (DialogManager.cpp:3147-3183) —
+/// the resolve answer fan-out: the queue entry drains, the
+/// USERNAME_NOT_OCCUPIED/USERNAME_INVALID errors drop the username, and
+/// the ok path fills `inaccessible_resolved_usernames_` (the
+/// `resolved_usernames_` hit wins, with the mismatch log).
+pub(crate) fn on_resolved_username(td: &mut Td, username: &str, result: Result<DialogId>) {
+    // G()->ignore_result_if_closing — a closing Td drops the answer
+    if td.global.close_flag() {
+        return;
+    }
+
+    let mut promises = {
+        let mut manager = std::mem::take(&mut td.dialog_manager);
+        let promises = manager.resolve_dialog_username_queries.remove(username);
+        td.dialog_manager = manager;
+        match promises {
+            // the C++ CHECK(it != …end()) — every in-flight query has its
+            // queue entry; the band keeps a stray answer honest
+            Some(promises) if !promises.is_empty() => promises,
+            _ => {
+                tdutils::log_error!("Missing resolve queue entry for username \"{username}\"");
+                return;
+            }
+        }
+    };
+
+    let dialog_id = match result {
+        Result::Err(status) => {
+            if status.message() == "USERNAME_NOT_OCCUPIED" || status.message() == "USERNAME_INVALID"
+            {
+                drop_username(td, username);
+            }
+            for promise in promises.iter_mut() {
+                promise.set_error(status.clone());
+            }
+            // the failed parked search requests answer with the error
+            // (the RequestActor do_send_error half)
+            drain_search_dialogs_requests(td);
+            return;
+        }
+        Result::Ok(dialog_id) => dialog_id,
+    };
+
+    if !dialog_id.is_valid() {
+        tdutils::log_error!("Resolve username \"{username}\" to invalid {dialog_id:?}");
+        for promise in promises.iter_mut() {
+            promise.set_error(Status::error(500, "Chat not found"));
+        }
+        drain_search_dialogs_requests(td);
+        return;
+    }
+
+    let cleaned_username = clean_username(username);
+    if cleaned_username.is_empty() {
+        for promise in promises.iter_mut() {
+            promise.set_error(Status::error(500, "Invalid username"));
+        }
+        drain_search_dialogs_requests(td);
+        return;
+    }
+
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    let already_resolved = manager
+        .resolved_usernames
+        .get(&cleaned_username)
+        .filter(|resolved| resolved.dialog_id.is_valid());
+    match already_resolved {
+        Some(resolved) => {
+            if resolved.dialog_id != dialog_id {
+                tdutils::log_error!(
+                    "Resolve username \"{username}\" to {dialog_id:?}, but have it in {:?}",
+                    resolved.dialog_id
+                );
+            }
+        }
+        None => {
+            manager
+                .inaccessible_resolved_usernames
+                .insert(cleaned_username, dialog_id);
+        }
+    }
+    td.dialog_manager = manager;
+    for promise in promises.iter_mut() {
+        promise.set_value(());
+    }
+    // the settled promises re-run the parked search requests (the
+    // RequestActor raw_event → loop re-entry)
+    drain_search_dialogs_requests(td);
 }
 
 /// `DialogManager::drop_username` (DialogManager.cpp:3307-3324) — free fn
@@ -5058,12 +5369,7 @@ pub fn search_public_dialog(
         return DialogId::new(0);
     }
 
-    let dialog_id = {
-        let mut manager = std::mem::take(&mut td.dialog_manager);
-        let dialog_id = manager.resolve_dialog_username(td, &username, &mut promise);
-        td.dialog_manager = manager;
-        dialog_id
-    };
+    let dialog_id = resolve_dialog_username(td, &username, &mut promise);
     if !dialog_id.is_valid() {
         return DialogId::new(0);
     }
@@ -5076,10 +5382,27 @@ pub fn search_public_dialog(
                 .remove(&username)
             && dialog_id.get_type() == crate::dialog_id::DialogType::Channel
         {
-            // chat_manager_->reload_channel_full — the promise completes
-            // with the net-blocked error (stub inventory).
             td.dialog_manager = manager;
-            promise.set_error(Status::error(500, "Network is not implemented yet"));
+            // chat_manager_->reload_channel_full (cpp:3280) — the
+            // promise rides the GetChannelFullQuery answer.
+            let channel_id = dialog_id.get_channel_id();
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                chat_manager,
+                ..
+            } = td;
+            let Some(options) = option_manager.as_mut() else {
+                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                return DialogId::new(0);
+            };
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            chat_manager.reload_channel_full(&mut env, channel_id, promise, "search_public_dialog");
             return DialogId::new(0);
         }
         td.dialog_manager = manager;
@@ -5098,8 +5421,9 @@ pub fn search_public_dialog(
         return dialog_id;
     }
 
-    // send_resolve_dialog_username_query — [blocked: net] (stub inventory).
-    promise.set_error(Status::error(500, "Network is not implemented yet"));
+    // send_resolve_dialog_username_query (cpp:3293) — the user dialog
+    // without an access hash re-resolves; the promise rides the queue.
+    send_resolve_dialog_username_query(td, username, promise);
     DialogId::new(0)
 }
 
@@ -5125,12 +5449,7 @@ pub fn search_public_dialogs(
         for &short_username in get_valid_short_usernames() {
             if 2 * username.len() > short_username.len() && short_username.starts_with(&username) {
                 let username = short_username;
-                let dialog_id = {
-                    let mut manager = std::mem::take(&mut td.dialog_manager);
-                    let dialog_id = manager.resolve_dialog_username(td, username, &mut promise);
-                    td.dialog_manager = manager;
-                    dialog_id
-                };
+                let dialog_id = resolve_dialog_username(td, username, &mut promise);
                 if !dialog_id.is_valid() {
                     return Vec::new();
                 }
@@ -5162,18 +5481,13 @@ pub fn search_public_dialogs(
     }
 
     let type_num = type_filter as usize;
-    let manager = std::mem::take(&mut td.dialog_manager);
-    if let Some(found) = manager.found_public_dialogs[type_num].get(query) {
+    if let Some(found) = td.dialog_manager.found_public_dialogs[type_num].get(query) {
         let found = found.clone();
-        td.dialog_manager = manager;
         promise.set_value(());
         return found;
     }
-    td.dialog_manager = manager;
 
-    // send_search_public_dialogs_query — [blocked: net] (stub inventory);
-    // the C++ promise queue exists only while the query is in flight.
-    promise.set_error(Status::error(500, "Network is not implemented yet"));
+    send_search_public_dialogs_query(td, query, type_filter, promise);
     Vec::new()
 }
 
@@ -5201,20 +5515,333 @@ pub fn search_dialogs_on_server(
     }
 
     let type_num = type_filter as usize;
-    let manager = std::mem::take(&mut td.dialog_manager);
-    if let Some(found) = manager.found_on_server_dialogs[type_num].get(query) {
+    if let Some(found) = td.dialog_manager.found_on_server_dialogs[type_num].get(query) {
         // messages_manager_->sort_dialogs_by_order — no order source in the
         // port, the truncation is the observable part (stub inventory).
         let found = found[..found.len().min(limit.max(0) as usize)].to_vec();
-        td.dialog_manager = manager;
         promise.set_value(());
         return found;
     }
-    td.dialog_manager = manager;
 
-    // send_search_public_dialogs_query — [blocked: net] (stub inventory).
-    promise.set_error(Status::error(500, "Network is not implemented yet"));
+    send_search_public_dialogs_query(td, query, type_filter, promise);
     Vec::new()
+}
+
+/// The request-facing `search_public_dialogs`
+/// (SearchPublicChatsRequest, Requests.cpp:426-440) — the local arms
+/// answer through `get_chats_object(-1, …)` (the `do_send_result` form);
+/// the query leg parks the request on the family queue (the RequestActor
+/// do_run/do_send_result re-run collapse: the answer fills the caches,
+/// the drain answers from the fresh cache).
+pub(crate) fn search_public_dialogs_for_request(
+    td: &mut Td,
+    query: &str,
+    chat_type_filter: Option<&crate::td_api::SearchChatTypeFilter>,
+    promise: Promise<crate::td_api::Chats>,
+) {
+    let type_filter = get_dialog_type_filter(chat_type_filter);
+    match run_search_dialogs_request(td, query, type_filter, 0, false, promise) {
+        SearchRequestRun::Answered => {}
+        SearchRequestRun::Parked { slot, promise } => {
+            park_search_dialogs_request(td, query, type_filter, 0, false, slot, promise);
+        }
+    }
+}
+
+/// The request-facing `search_dialogs_on_server`
+/// (SearchChatsOnServerRequest, Requests.cpp:460-474) — the same
+/// collapse over the on-server cache (the limit truncation is the
+/// `do_send_result` half).
+pub(crate) fn search_dialogs_on_server_for_request(
+    td: &mut Td,
+    query: &str,
+    chat_type_filter: Option<&crate::td_api::SearchChatTypeFilter>,
+    limit: i32,
+    promise: Promise<crate::td_api::Chats>,
+) {
+    let type_filter = get_dialog_type_filter(chat_type_filter);
+    match run_search_dialogs_request(td, query, type_filter, limit, true, promise) {
+        SearchRequestRun::Answered => {}
+        SearchRequestRun::Parked { slot, promise } => {
+            park_search_dialogs_request(td, query, type_filter, limit, true, slot, promise);
+        }
+    }
+}
+
+/// Park one search request — the RequestActor park. `tries_left` is
+/// the C++ `tries_left_` AFTER the initial park (2 − 1: one re-run;
+/// a park that exhausts it answers the tries-exhausted error instead
+/// of parking again).
+fn park_search_dialogs_request(
+    td: &mut Td,
+    query: &str,
+    type_filter: DialogTypeFilter,
+    limit: i32,
+    on_server: bool,
+    slot: UnitSlot,
+    promise: Promise<crate::td_api::Chats>,
+) {
+    const TRIES: i32 = 2;
+    td.dialog_manager
+        .pending_search_dialogs_requests
+        .push(PendingSearchDialogsRequest {
+            query: query.to_owned(),
+            type_filter,
+            limit,
+            on_server,
+            tries_left: TRIES - 1,
+            slot,
+            promise,
+        });
+}
+
+/// The outcome of one search run over a fresh slot promise — the
+/// promise answered inline, or parked on a family queue (the slot
+/// returns so the caller can park/re-park the request entry).
+enum SearchRequestRun {
+    Answered,
+    Parked {
+        slot: UnitSlot,
+        promise: Promise<crate::td_api::Chats>,
+    },
+}
+
+/// The shared `do_run` leg of the two request wrappers and the re-run
+/// (Requests.cpp:431-433/:465-467): one search pass with the object
+/// promise — the synchronous completions build the `do_send_result`
+/// chats object, the errors forward, and a park hands the slot + the
+/// promise back for the request entry.
+fn run_search_dialogs_request(
+    td: &mut Td,
+    query: &str,
+    type_filter: DialogTypeFilter,
+    limit: i32,
+    on_server: bool,
+    mut promise: Promise<crate::td_api::Chats>,
+) -> SearchRequestRun {
+    let source = if on_server {
+        "SearchChatsOnServerRequest"
+    } else {
+        "SearchPublicChatsRequest"
+    };
+    let (unit_promise, slot) = unit_slot_promise();
+    let chat_type_filter = type_filter.as_search_chat_type_filter();
+    let found = if on_server {
+        search_dialogs_on_server(td, query, chat_type_filter.as_ref(), limit, unit_promise)
+    } else {
+        search_public_dialogs(td, query, chat_type_filter.as_ref(), unit_promise)
+    };
+    let outcome = slot.lock().unwrap().take();
+    match outcome {
+        Some(Result::Ok(())) => {
+            promise.set_value(get_chats_object(-1, &found, source));
+            SearchRequestRun::Answered
+        }
+        Some(Result::Err(status)) => {
+            promise.set_error(status);
+            SearchRequestRun::Answered
+        }
+        None => SearchRequestRun::Parked { slot, promise },
+    }
+}
+
+/// Re-run the signaled parked search requests — the RequestActor
+/// `raw_event` → `loop()` re-entry (RequestActor.h:60-75): an answer that
+/// settled a request's family promise re-runs the search against the
+/// fresh cache (the returned ids build the `do_send_result` object); an
+/// error fails the request; an unanswered park stays parked. The
+/// `RequestActor::loop` tries exhaustion (`--tries_left_ == 0`) answers
+/// "Requested data is inaccessible" at the park that spends the last
+/// try, without parking again.
+fn drain_search_dialogs_requests(td: &mut Td) {
+    let mut requests = std::mem::take(&mut td.dialog_manager.pending_search_dialogs_requests);
+    let mut index = 0;
+    while index < requests.len() {
+        let signal = requests[index].slot.lock().unwrap().take();
+        match signal {
+            None => {
+                index += 1;
+            }
+            Some(Result::Err(status)) => {
+                let PendingSearchDialogsRequest { mut promise, .. } = requests.remove(index);
+                promise.set_error(status);
+            }
+            Some(Result::Ok(())) => {
+                let PendingSearchDialogsRequest {
+                    query,
+                    type_filter,
+                    limit,
+                    on_server,
+                    tries_left,
+                    slot: _,
+                    promise,
+                } = requests.remove(index);
+                // the re-run (loop() → do_run)
+                match run_search_dialogs_request(td, &query, type_filter, limit, on_server, promise)
+                {
+                    SearchRequestRun::Answered => {}
+                    SearchRequestRun::Parked { slot, mut promise } => {
+                        // the re-run parked on the next query — the C++
+                        // spends a try at every park (`--tries_left_`);
+                        // the exhausted park answers instead of parking
+                        let tries_left = tries_left - 1;
+                        if tries_left == 0 {
+                            promise.set_error(Status::error(500, "Requested data is inaccessible"));
+                        } else {
+                            requests.push(PendingSearchDialogsRequest {
+                                query,
+                                type_filter,
+                                limit,
+                                on_server,
+                                tries_left,
+                                slot,
+                                promise,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    td.dialog_manager.pending_search_dialogs_requests = requests;
+}
+
+impl DialogTypeFilter {
+    /// The `DialogTypeFilter` → `td_api::SearchChatTypeFilter` mapping of
+    /// the re-run — the inverse of [`get_dialog_type_filter`] (the
+    /// `None` filter maps back to the null pointer).
+    fn as_search_chat_type_filter(&self) -> Option<crate::td_api::SearchChatTypeFilter> {
+        match self {
+            DialogTypeFilter::None => None,
+            DialogTypeFilter::Bot => Some(
+                crate::td_api::SearchChatTypeFilter::searchChatTypeFilterBot(
+                    crate::td_api::searchChatTypeFilterBot {},
+                ),
+            ),
+            DialogTypeFilter::Broadcast => Some(
+                crate::td_api::SearchChatTypeFilter::searchChatTypeFilterChannel(
+                    crate::td_api::searchChatTypeFilterChannel {},
+                ),
+            ),
+        }
+    }
+}
+
+/// `DialogManager::send_search_public_dialogs_query`
+/// (DialogManager.cpp:3436-3446) — the promise parks on the per-query
+/// queue; the head entry owns the `contacts.search` send. The query
+/// rides the kind as an interned index (`Td::dialog_net_strings`).
+pub(crate) fn send_search_public_dialogs_query(
+    td: &mut Td,
+    query: &str,
+    type_filter: DialogTypeFilter,
+    promise: Promise<()>,
+) {
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    let type_num = type_filter as usize;
+    let is_query_owner = {
+        let promises = manager.search_public_dialogs_queries[type_num]
+            .entry(query.to_owned())
+            .or_default();
+        promises.push(promise);
+        promises.len() == 1
+    };
+    if is_query_owner {
+        let query_index = td.dialog_net_strings.len() as u32;
+        td.dialog_net_strings.push(std::sync::Arc::from(query));
+        manager.send_dialog_net_query(
+            DialogNetKind::SearchPublicDialogs {
+                type_filter,
+                query_index,
+            },
+            tdmtproto::telegram_api::Function::contacts_search(
+                tdmtproto::telegram_api::contacts_search {
+                    flags: 0,
+                    broadcasts: type_filter == DialogTypeFilter::Broadcast,
+                    bots: type_filter == DialogTypeFilter::Bot,
+                    q: query.to_owned(),
+                    // mostly ignored server-side (the C++ literal)
+                    limit: 20,
+                },
+            ),
+            "contacts.search",
+        );
+    }
+    td.dialog_manager = manager;
+}
+
+/// `DialogManager::on_get_public_dialogs_search_result`
+/// (DialogManager.cpp:3449-3470) — the queue entry drains, both caches
+/// fill over the peers, and the parked search requests re-run (the
+/// `QUERY_TOO_SHORT` empty-result band enters here too).
+pub(crate) fn on_get_public_dialogs_search_result(
+    td: &mut Td,
+    query: &str,
+    type_filter: DialogTypeFilter,
+    my_peers: Vec<tdmtproto::telegram_api::Peer>,
+    peers: Vec<tdmtproto::telegram_api::Peer>,
+) {
+    let type_num = type_filter as usize;
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    let promises = manager.search_public_dialogs_queries[type_num].remove(query);
+    td.dialog_manager = manager;
+    match promises {
+        Some(promises) if !promises.is_empty() => {
+            for mut promise in promises {
+                promise.set_value(());
+            }
+        }
+        _ => {
+            // the C++ CHECK — every in-flight query has its queue entry
+            tdutils::log_error!("Missing search queue entry for query \"{query}\"");
+            return;
+        }
+    }
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    manager.found_public_dialogs[type_num]
+        .insert(query.to_owned(), get_peers_dialog_ids(td, &peers, false));
+    manager.found_on_server_dialogs[type_num]
+        .insert(query.to_owned(), get_peers_dialog_ids(td, &my_peers, false));
+    td.dialog_manager = manager;
+    drain_search_dialogs_requests(td);
+}
+
+/// `DialogManager::on_failed_public_dialogs_search`
+/// (DialogManager.cpp:3472-3479) — the queue entry drains into the
+/// error, the negative-cache entries appear (the empty `operator[]`
+/// inserts), and the parked requests fail.
+pub(crate) fn on_failed_public_dialogs_search(
+    td: &mut Td,
+    query: &str,
+    type_filter: DialogTypeFilter,
+    status: Status,
+) {
+    let type_num = type_filter as usize;
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    let promises = manager.search_public_dialogs_queries[type_num].remove(query);
+    td.dialog_manager = manager;
+    match promises {
+        Some(promises) if !promises.is_empty() => {
+            for mut promise in promises {
+                promise.set_error(status.clone());
+            }
+        }
+        _ => {
+            tdutils::log_error!("Missing search queue entry for query \"{query}\"");
+            return;
+        }
+    }
+    let mut manager = std::mem::take(&mut td.dialog_manager);
+    // the negative cache — the empty entries make the next search a
+    // local no-hit success
+    manager.found_public_dialogs[type_num]
+        .entry(query.to_owned())
+        .or_default();
+    manager.found_on_server_dialogs[type_num]
+        .entry(query.to_owned())
+        .or_default();
+    td.dialog_manager = manager;
+    drain_search_dialogs_requests(td);
 }
 
 /// `DialogManager::on_get_public_dialogs_search_result` /
@@ -6361,7 +6988,8 @@ mod tests {
     fn search_public_dialogs_short_prefix_branch_resolves_through_the_cache() {
         let mut td = test_td();
         // "gi" is a short-username prefix of "gif" — the cache is empty, so
-        // the resolve is net-blocked and the search returns nothing.
+        // the promise parks on the resolve family queue (one entry, the
+        // head query went out net-inert) and the search returns nothing.
         let (promise, slot) = capture_unit_promise();
         let found = search_public_dialogs(
             &mut td,
@@ -6372,23 +7000,41 @@ mod tests {
             promise,
         );
         assert!(found.is_empty());
+        assert!(slot.lock().unwrap().is_none(), "the promise parks");
         assert_eq!(
-            captured_status(&slot).message(),
-            "Network is not implemented yet"
+            td.dialog_manager
+                .resolve_dialog_username_queries
+                .get("gif")
+                .map(Vec::len),
+            Some(1)
         );
+
+        // the parked promise settles from the resolve fan-out
+        let mut parked = td
+            .dialog_manager
+            .resolve_dialog_username_queries
+            .remove("gif")
+            .unwrap()
+            .remove(0);
+        parked.set_value(());
+        assert!(matches!(slot.lock().unwrap().take(), Some(Result::Ok(()))));
 
         // a cached short username resolves and passes the filter checks
         td.dialog_manager
             .inaccessible_resolved_usernames
             .insert("gif".to_string(), DialogId::new(0));
-        // the inaccessible form is not valid — search falls through to the
-        // net-blocked resolve as well
+        // the inaccessible form is not valid — the search falls through to
+        // a fresh resolve park as well (the second queue entry)
         let (promise, slot) = capture_unit_promise();
         let found = search_public_dialogs(&mut td, "gi", None, promise);
         assert!(found.is_empty());
+        assert!(slot.lock().unwrap().is_none(), "the promise parks again");
         assert_eq!(
-            captured_status(&slot).message(),
-            "Network is not implemented yet"
+            td.dialog_manager
+                .resolve_dialog_username_queries
+                .get("gif")
+                .map(Vec::len),
+            Some(1)
         );
     }
 
@@ -6424,6 +7070,289 @@ mod tests {
         let found = search_dialogs_on_server(&mut td, "", None, 10, promise);
         assert!(found.is_empty());
         assert!(slot.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn resolve_dialog_username_parks_and_refreshes() {
+        let mut td = test_td();
+
+        // the miss parks the caller promise on the resolve family queue
+        // (the head entry owns the in-flight query)
+        let (mut promise, slot) = capture_unit_promise();
+        let dialog_id = resolve_dialog_username(&mut td, "somebody", &mut promise);
+        assert!(!dialog_id.is_valid());
+        assert!(slot.lock().unwrap().is_none(), "the promise parks");
+        assert_eq!(
+            td.dialog_manager
+                .resolve_dialog_username_queries
+                .get("somebody")
+                .map(Vec::len),
+            Some(1)
+        );
+
+        // a second parker rides the same in-flight query
+        let (mut promise, slot2) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "somebody", &mut promise);
+        assert!(slot2.lock().unwrap().is_none(), "the promise parks");
+        assert_eq!(
+            td.dialog_manager
+                .resolve_dialog_username_queries
+                .get("somebody")
+                .map(Vec::len),
+            Some(2)
+        );
+
+        // the inaccessible hit answers without a park — the C++ returns
+        // the dialog and leaves the promise to the caller
+        // (search_public_dialog completes it over the input-peer ladder)
+        let dialog = DialogId::from_user_id(crate::user_manager::UserId::new(9));
+        td.dialog_manager
+            .inaccessible_resolved_usernames
+            .insert("known".to_string(), dialog);
+        let (mut promise, slot) = capture_unit_promise();
+        assert_eq!(
+            resolve_dialog_username(&mut td, "known", &mut promise),
+            dialog
+        );
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the caller owns the promise"
+        );
+
+        // an expired resolved entry answers AND refreshes with an empty
+        // promise (a fresh queue entry, the caller's promise stays its
+        // own — the C++ passes it by reference untouched)
+        td.dialog_manager.resolved_usernames.insert(
+            "stale".to_string(),
+            ResolvedUsername {
+                dialog_id: dialog,
+                expires_at: 0.0,
+            },
+        );
+        let (mut promise, slot) = capture_unit_promise();
+        assert_eq!(
+            resolve_dialog_username(&mut td, "stale", &mut promise),
+            dialog
+        );
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the caller owns the promise"
+        );
+        assert_eq!(
+            td.dialog_manager
+                .resolve_dialog_username_queries
+                .get("stale")
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn on_resolved_username_fans_out_the_queue_bands() {
+        let mut td = test_td();
+
+        // USERNAME_NOT_OCCUPIED fails the parked promises and drops the
+        // username (cpp:3161-3165)
+        let dialog = DialogId::from_user_id(crate::user_manager::UserId::new(5));
+        let (mut promise, gone_slot) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "gone", &mut promise);
+        td.dialog_manager
+            .inaccessible_resolved_usernames
+            .insert("gone".to_string(), dialog);
+        on_resolved_username(
+            &mut td,
+            "gone",
+            Result::Err(Status::error(400, "USERNAME_NOT_OCCUPIED")),
+        );
+        assert_eq!(
+            captured_status(&gone_slot).message(),
+            "USERNAME_NOT_OCCUPIED"
+        );
+        assert!(
+            !td.dialog_manager
+                .inaccessible_resolved_usernames
+                .contains_key("gone")
+        );
+        assert!(
+            !td.dialog_manager
+                .resolve_dialog_username_queries
+                .contains_key("gone")
+        );
+
+        // an invalid resolved dialog answers "Chat not found"
+        let (mut promise, slot) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "broken", &mut promise);
+        on_resolved_username(&mut td, "broken", Result::Ok(DialogId::new(0)));
+        assert_eq!(captured_status(&slot).message(), "Chat not found");
+
+        // a username that cleans to nothing (all dots) answers
+        // "Invalid username"
+        let (mut promise, slot) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "...", &mut promise);
+        on_resolved_username(&mut td, "...", Result::Ok(dialog));
+        assert_eq!(captured_status(&slot).message(), "Invalid username");
+
+        // the ok path caches the dialog and completes the promises
+        let user_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(7));
+        let (mut promise, first_slot) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "fresh", &mut promise);
+        let (mut promise, second_slot) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "fresh", &mut promise);
+        on_resolved_username(&mut td, "fresh", Result::Ok(user_dialog));
+        assert!(matches!(
+            first_slot.lock().unwrap().take(),
+            Some(Result::Ok(()))
+        ));
+        assert!(matches!(
+            second_slot.lock().unwrap().take(),
+            Some(Result::Ok(()))
+        ));
+        assert_eq!(
+            td.dialog_manager
+                .inaccessible_resolved_usernames
+                .get("fresh"),
+            Some(&user_dialog)
+        );
+
+        // a resolved_usernames hit wins — the inaccessible map is not
+        // written (cpp:3174-3177)
+        let resolved_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(8));
+        let (mut promise, slot) = capture_unit_promise();
+        resolve_dialog_username(&mut td, "primed", &mut promise);
+        td.dialog_manager.resolved_usernames.insert(
+            "primed".to_string(),
+            ResolvedUsername {
+                dialog_id: resolved_dialog,
+                expires_at: f64::MAX,
+            },
+        );
+        on_resolved_username(&mut td, "primed", Result::Ok(user_dialog));
+        assert!(matches!(slot.lock().unwrap().take(), Some(Result::Ok(()))));
+        assert!(
+            !td.dialog_manager
+                .inaccessible_resolved_usernames
+                .contains_key("primed")
+        );
+
+        // a stray answer (no queue entry) is dropped without a panic
+        on_resolved_username(&mut td, "unknown", Result::Ok(user_dialog));
+    }
+
+    #[test]
+    fn search_public_dialogs_query_dedups_and_caches() {
+        let mut td = test_td();
+
+        // two searchers of one query ride a single in-flight query
+        let (promise, first_slot) = capture_unit_promise();
+        let found = search_public_dialogs(&mut td, "query", None, promise);
+        assert!(found.is_empty());
+        let (promise, second_slot) = capture_unit_promise();
+        search_public_dialogs(&mut td, "query", None, promise);
+        assert_eq!(
+            td.dialog_manager.search_public_dialogs_queries[0]
+                .get("query")
+                .map(Vec::len),
+            Some(2)
+        );
+
+        // the answer fills both caches and completes both promises
+        let my_peer = tdmtproto::telegram_api::Peer::peerUser(tdmtproto::telegram_api::peerUser {
+            user_id: 42,
+        });
+        let peer = tdmtproto::telegram_api::Peer::peerUser(tdmtproto::telegram_api::peerUser {
+            user_id: 43,
+        });
+        on_get_public_dialogs_search_result(
+            &mut td,
+            "query",
+            DialogTypeFilter::None,
+            vec![my_peer],
+            vec![peer],
+        );
+        assert!(matches!(
+            first_slot.lock().unwrap().take(),
+            Some(Result::Ok(()))
+        ));
+        assert!(matches!(
+            second_slot.lock().unwrap().take(),
+            Some(Result::Ok(()))
+        ));
+        let public_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(43));
+        let server_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(42));
+        assert_eq!(
+            td.dialog_manager.found_public_dialogs[0].get("query"),
+            Some(&vec![public_dialog])
+        );
+        assert_eq!(
+            td.dialog_manager.found_on_server_dialogs[0].get("query"),
+            Some(&vec![server_dialog])
+        );
+
+        // the next search of the same query is a local cache hit
+        let (promise, slot) = capture_unit_promise();
+        let found = search_public_dialogs(&mut td, "query", None, promise);
+        assert_eq!(found, vec![public_dialog]);
+        assert!(matches!(slot.lock().unwrap().take(), Some(Result::Ok(()))));
+
+        // the failed search parks, fails its promise, and leaves the
+        // negative cache (the next search answers locally, empty)
+        let (promise, slot) = capture_unit_promise();
+        search_public_dialogs(&mut td, "missing", None, promise);
+        on_failed_public_dialogs_search(
+            &mut td,
+            "missing",
+            DialogTypeFilter::None,
+            Status::error(500, "Search query timed out"),
+        );
+        assert_eq!(captured_status(&slot).message(), "Search query timed out");
+        let (promise, slot) = capture_unit_promise();
+        let found = search_public_dialogs(&mut td, "missing", None, promise);
+        assert!(found.is_empty());
+        assert!(matches!(slot.lock().unwrap().take(), Some(Result::Ok(()))));
+    }
+
+    #[test]
+    fn recent_dialog_list_rehydrates_at_username_entries() {
+        let mut td = test_td();
+        let dir = init_td_db_for_test(&mut td, "nd18_at_usernames");
+
+        // a seeded accessible user dialog the @-form will resolve to
+        let user_id = crate::user_manager::UserId::new(2200000052);
+        let options = td.option_manager.as_mut().expect("user environment");
+        let mut env = UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        td.user_manager.on_get_user(
+            &mut env,
+            tdmtproto::telegram_api::User::user(tdmtproto::telegram_api::user {
+                id: user_id.get(),
+                flags: 1, // USER_ACCESS_HASH_MASK
+                access_hash: 321,
+                first_name: "At".to_string(),
+                ..Default::default()
+            }),
+            "test",
+        );
+        let dialog_id = DialogId::from_user_id(user_id);
+        td.dialog_manager
+            .inaccessible_resolved_usernames
+            .insert("atuser".to_string(), dialog_id);
+
+        // the saved form "@atuser,<unknown-user-id>" — the @ entry
+        // rehydrates through get_resolved_dialog_by_username, the
+        // unresolved @ entry drops
+        td.global.binlog_pmc().set(
+            "recently_found_dialog_usernames_and_ids",
+            "@atuser,@missing",
+        );
+
+        let mut reloaded = RecentDialogList::new("recently_found", MAX_RECENT_DIALOGS);
+        let (total, ids) = reloaded.get_dialogs(&mut td, 10);
+        assert_eq!(total, 1);
+        assert_eq!(ids, vec![dialog_id]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
