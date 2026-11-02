@@ -3982,6 +3982,9 @@ pub struct Td {
     /// The callback-parked dialog answers — the
     /// `Td::on_dialog_net_answer` drain.
     dialog_net_completed: Arc<Mutex<Vec<(crate::dialog_manager::DialogNetKind, NetQuery)>>>,
+    /// The callback-parked story answers (the C++ ResultHandler halves
+    /// of the story-core families — the [`Td::on_story_net_answer`]
+    /// drain).
     /// The callback-parked BotInfoManager answers (the C++ ResultHandler
     /// halves of the bot-administration families — the
     /// [`Td::on_bot_info_net_answer`] drain).
@@ -4943,6 +4946,7 @@ impl Td {
         self.user_manager.net = self.user_net();
         self.chat_manager.net = self.chat_net();
         self.dialog_manager.net = self.dialog_net();
+        self.story_manager.net = self.story_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -6732,6 +6736,7 @@ impl Td {
         self.dispatch_completed_user_net();
         self.dispatch_completed_chat_net();
         self.dispatch_completed_dialog_net();
+        self.dispatch_completed_story_net();
         self.dispatch_completed_bot_info_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_send_message_net();
@@ -6929,6 +6934,16 @@ impl Td {
         })
     }
 
+    /// The cloned story dispatch surface (the story-core families' send
+    /// legs — the C++ ResultHandler send halves of §3.5).
+    pub(crate) fn story_net(&self) -> Option<StoryNetHandle> {
+        Some(StoryNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.story_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned bot-info dispatch surface (the `BotInfoEnv` senders —
     /// the C++ ResultHandler send legs of the bot-administration
     /// families).
@@ -6936,16 +6951,6 @@ impl Td {
         Some(BotInfoNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.bot_info_net_completed),
-            shared: self.net_shared.clone(),
-        })
-    }
-
-    /// The cloned story dispatch surface (the `StoryEnv` senders — the
-    /// §3.5 net-drain 20 families).
-    pub(crate) fn story_net(&self) -> Option<StoryNetHandle> {
-        Some(StoryNetHandle {
-            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
-            completed: Arc::clone(&self.story_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -9479,6 +9484,10 @@ impl Td {
         fn parse_error(what: &str) -> Status {
             Status::error(500, &format!("Failed to parse the {what} answer"))
         }
+        use tdutils::status::Result as TdResult;
+        fn story_error(query: &NetQuery) -> Option<Status> {
+            query.is_error().then(|| query.error().clone())
+        }
         use crate::story_manager::StoryNetKind;
         // the closures call the env read-surface trait methods
         use crate::story_manager::StoryManagerEnv as _;
@@ -10027,6 +10036,534 @@ impl Td {
                         )
                     }),
                 }
+            }
+            // `GetAllStoriesQuery` (StoryManager.cpp:69-100) — the raw
+            // `stories_AllStories` answer re-enters
+            // `on_load_active_stories_from_server` with the parked lambda
+            // captures; the error tail forwards through the same intake
+            // (the parked promises fail there).
+            StoryNetKind::GetAllStories { story_list_id } => {
+                let Some((is_next, old_state)) =
+                    self.story_manager.take_in_flight_load_list(story_list_id)
+                else {
+                    return;
+                };
+                let r_all_stories = match story_error(&query) {
+                    Some(status) => TdResult::Err(status),
+                    None => match telegram_api::stories_AllStories::parse(query.ok()) {
+                        Ok(all_stories) => TdResult::Ok(Box::new(all_stories)),
+                        Err(_) => TdResult::Err(parse_error("stories.getAllStories")),
+                    },
+                };
+                self.with_story_manager(|env, manager| {
+                    manager.on_load_active_stories_from_server(
+                        env,
+                        story_list_id,
+                        is_next,
+                        old_state,
+                        r_all_stories,
+                    );
+                });
+            }
+            // `ToggleStoriesHiddenQuery` (StoryManager.cpp:102-138) — the
+            // true Bool lands the hidden flip through the intake; the
+            // false value still settles (no false-400 band in the C++).
+            StoryNetKind::ToggleStoriesHidden {
+                dialog_id,
+                are_hidden,
+            } => {
+                let Some(mut promise) = self.story_manager.take_toggle_stories_hidden_promise()
+                else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "ToggleStoriesHiddenQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    None => match parse_wire_bool_value(query.ok()) {
+                        Some(true) => self.with_story_manager(|env, manager| {
+                            manager.on_toggle_dialog_stories_hidden(
+                                env, dialog_id, are_hidden, promise,
+                            )
+                        }),
+                        Some(false) => promise.set_value(()),
+                        None => promise.set_error(parse_error("stories.togglePeerStoriesHidden")),
+                    },
+                }
+            }
+            // `GetAllReadPeerStoriesQuery` (StoryManager.cpp:140-160) —
+            // promise-less; the Updates ride the engine, the error tail
+            // only logs.
+            StoryNetKind::GetAllReadPeerStories => match story_error(&query) {
+                Some(status) => {
+                    tdutils::log_info!("Receive error for GetAllReadPeerStoriesQuery: {status}");
+                }
+                None => match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise: Promise::default(),
+                    }),
+                    Err(_) => tdutils::log_info!(
+                        "Receive error for GetAllReadPeerStoriesQuery: {}",
+                        parse_error("stories.getAllReadPeerStories")
+                    ),
+                },
+            },
+            // `ToggleAllStoriesHiddenQuery` (StoryManager.cpp:162-188 +
+            // the lambda at :2945-2953) — the C++ discards the Updates
+            // body and fires the lambda on BOTH bands (the option clears
+            // either way).
+            StoryNetKind::ToggleAllStoriesHidden {
+                set_archive_all_stories,
+            } => {
+                let result = match story_error(&query) {
+                    Some(status) => TdResult::Err(status),
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(_) => TdResult::Ok(()),
+                        Err(_) => TdResult::Err(parse_error("stories.toggleAllStoriesHidden")),
+                    },
+                };
+                self.with_story_manager(|env, manager| {
+                    manager.on_synchronized_archive_all_stories(
+                        env,
+                        set_archive_all_stories,
+                        result,
+                    );
+                });
+            }
+            // `IncrementStoryViewsQuery` (StoryManager.cpp:190-222 + the
+            // lambda at :3575-3588) — the re-arm runs on both bands; the
+            // error band runs the head first.
+            StoryNetKind::IncrementStoryViews { dialog_id } => {
+                if let Some(status) = story_error(&query) {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "IncrementStoryViewsQuery",
+                    );
+                }
+                self.with_story_manager(|env, manager| {
+                    manager.on_increment_story_views(env, dialog_id);
+                });
+            }
+            // `ReadStoriesQuery` (StoryManager.cpp:224-255) — the promise
+            // is the binlog-blocked erase event (a no-op); the error band
+            // runs the head only.
+            StoryNetKind::ReadStories { dialog_id } => {
+                if let Some(status) = story_error(&query) {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ReadStoriesQuery",
+                    );
+                }
+            }
+            // `SendStoryReactionQuery` (StoryManager.cpp:257-301) — the
+            // Updates ride the engine, the lambda settles through
+            // `on_set_story_reaction`; STORY_NOT_MODIFIED is the value
+            // band; the error tail runs the head + the error lambda.
+            StoryNetKind::SendStoryReaction { story_full_id } => {
+                let dialog_id = story_full_id.get_dialog_id();
+                let result = match story_error(&query) {
+                    Some(status) => {
+                        if status.message() == "STORY_NOT_MODIFIED" {
+                            TdResult::Ok(())
+                        } else {
+                            crate::dialog_manager::on_get_dialog_error(
+                                &self.global,
+                                dialog_id,
+                                &status,
+                                "SendStoryReactionQuery",
+                            );
+                            TdResult::Err(status)
+                        }
+                    }
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.um_send(UmMessage::OnGetUpdatesStoryTail {
+                                updates: Box::new(updates),
+                                tail: crate::story_manager::StoryNetTail::SetStoryReaction {
+                                    story_full_id,
+                                },
+                            });
+                            return;
+                        }
+                        Err(_) => TdResult::Err(parse_error("stories.sendReaction")),
+                    },
+                };
+                self.with_story_manager(|env, manager| {
+                    manager.on_set_story_reaction(env, story_full_id, result);
+                });
+            }
+            // `GetPeerStoriesQuery` (StoryManager.cpp:504-538) — the raw
+            // `stories_peerStories` lands through
+            // `on_get_dialog_expiring_stories` (the parked promises settle
+            // there); the error tail runs the head and fails them.
+            StoryNetKind::GetPeerStories { dialog_id } => match story_error(&query) {
+                Some(status) => {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetPeerStoriesQuery",
+                    );
+                    self.story_manager.fail_expiring_stories(dialog_id, status);
+                }
+                None => match telegram_api::stories_PeerStories::parse(query.ok()) {
+                    Ok(stories) => self.with_story_manager(|env, manager| {
+                        manager.on_get_dialog_expiring_stories(env, dialog_id, stories);
+                    }),
+                    Err(_) => self
+                        .story_manager
+                        .fail_expiring_stories(dialog_id, parse_error("stories.getPeerStories")),
+                },
+            },
+            // `EditStoryPrivacyQuery` (StoryManager.cpp:609-651) — the
+            // Updates ride the engine with the caller promise directly;
+            // STORY_NOT_MODIFIED is the !bot value band.
+            StoryNetKind::EditStoryPrivacy { dialog_id } => {
+                let Some(mut promise) = self.story_manager.take_edit_story_privacy_promise() else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        if status.message() == "STORY_NOT_MODIFIED" && !self.auth_manager.is_bot() {
+                            promise.set_value(());
+                        } else {
+                            crate::dialog_manager::on_get_dialog_error(
+                                &self.global,
+                                dialog_id,
+                                &status,
+                                "EditStoryPrivacyQuery",
+                            );
+                            promise.set_error(status);
+                        }
+                    }
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("stories.editStory")),
+                    },
+                }
+            }
+            // `ToggleStoryPinnedQuery` (StoryManager.cpp:653-687) — the C++
+            // does NOT read the Updates body: the lambda runs the local
+            // flip, then the promise settles.
+            StoryNetKind::ToggleStoryPinned {
+                story_full_id,
+                is_pinned,
+            } => {
+                let dialog_id = story_full_id.get_dialog_id();
+                let Some(mut promise) = self.story_manager.take_toggle_story_pinned_promise()
+                else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "ToggleStoryPinnedQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    None => {
+                        self.with_story_manager(|env, manager| {
+                            manager.on_toggle_story_is_pinned(env, story_full_id, is_pinned);
+                        });
+                        promise.set_value(());
+                    }
+                }
+            }
+            // `DeleteStoriesQuery` (StoryManager.cpp:689-722) — the C++
+            // ignores the Updates body; the query-carried promise settles.
+            StoryNetKind::DeleteStories { dialog_id } => {
+                let Some(mut promise) = self.story_manager.take_delete_stories_promise() else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "DeleteStoriesQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    None => promise.set_value(()),
+                }
+            }
+            // `TogglePinnedStoriesToTopQuery` (StoryManager.cpp:824-855)
+            // — the Updates body ignored (the C++ on_error head carries
+            // the GetStoriesViewsQuery label upstream kept).
+            StoryNetKind::TogglePinnedStoriesToTop { dialog_id } => {
+                let Some(mut promise) = self.story_manager.take_set_pinned_stories_promise() else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "GetStoriesViewsQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    None => promise.set_value(()),
+                }
+            }
+            // `ReportStoryQuery` (StoryManager.cpp:890-948) — the
+            // ReportResult variant mapping (the reported / choose-option
+            // / add-comment bands).
+            StoryNetKind::ReportStory { dialog_id } => {
+                let Some(mut promise) = self.story_manager.take_report_story_promise() else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "ReportStoryQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    None => {
+                        let report_result = match telegram_api::ReportResult::parse(query.ok()) {
+                            Ok(telegram_api::ReportResult::reportResultReported(_)) => {
+                                td_api::ReportStoryResult::reportStoryResultOk(
+                                    td_api::reportStoryResultOk,
+                                )
+                            }
+                            Ok(telegram_api::ReportResult::reportResultChooseOption(options)) => {
+                                if options.options.is_empty() {
+                                    td_api::ReportStoryResult::reportStoryResultOk(
+                                        td_api::reportStoryResultOk,
+                                    )
+                                } else {
+                                    td_api::ReportStoryResult::reportStoryResultOptionRequired(
+                                        td_api::reportStoryResultOptionRequired {
+                                            title: options.title,
+                                            options: options
+                                                .options
+                                                .into_iter()
+                                                .map(|option| td_api::ReportOption {
+                                                    id: option.option,
+                                                    text: option.text,
+                                                })
+                                                .collect(),
+                                        },
+                                    )
+                                }
+                            }
+                            Ok(telegram_api::ReportResult::reportResultAddComment(option)) => {
+                                td_api::ReportStoryResult::reportStoryResultTextRequired(
+                                    td_api::reportStoryResultTextRequired {
+                                        option_id: option.option,
+                                        is_optional: option.optional,
+                                    },
+                                )
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("stories.report"));
+                                return;
+                            }
+                        };
+                        promise.set_value(report_result);
+                    }
+                }
+            }
+            // `ActivateStealthModeQuery` (StoryManager.cpp:1225-1251) —
+            // the Updates ride the engine with the caller promise (the
+            // engine settles it; the stealth-mode state lands through
+            // updateStoryStealthMode).
+            StoryNetKind::ActivateStealthMode => {
+                let Some(mut promise) = self.story_manager.take_stealth_mode_promise() else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => promise.set_error(status),
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        }),
+                        Err(_) => promise.set_error(parse_error("stories.activateStealthMode")),
+                    },
+                }
+            }
+            // `StoryManager::SendStoryQuery` (StoryManager.cpp:1334-1437)
+            // — the Updates ride the engine, then the lambda's
+            // `delete_pending_story` tail; the error bands run the head
+            // and the tail's error arm (the close-flag gate and the
+            // missing-file-parts re-upload are the Files/binlog planes —
+            // noted).
+            StoryNetKind::SendStory { dialog_id } => {
+                let status = match story_error(&query) {
+                    Some(status) => status,
+                    None => {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => self.um_send(UmMessage::OnGetUpdatesStoryTail {
+                                updates: Box::new(updates),
+                                tail: crate::story_manager::StoryNetTail::SendStory,
+                            }),
+                            Err(_) => {
+                                let Some(pending_story) = self.story_manager.take_send_story_tail()
+                                else {
+                                    return;
+                                };
+                                let status = parse_error("stories.sendStory");
+                                crate::dialog_manager::on_get_dialog_error(
+                                    &self.global,
+                                    dialog_id,
+                                    &status,
+                                    "SendStoryQuery",
+                                );
+                                self.with_story_manager(|env, manager| {
+                                    manager.delete_pending_story(env, pending_story, status);
+                                });
+                            }
+                        }
+                        return;
+                    }
+                };
+                crate::dialog_manager::on_get_dialog_error(
+                    &self.global,
+                    dialog_id,
+                    &status,
+                    "SendStoryQuery",
+                );
+                let Some(pending_story) = self.story_manager.take_send_story_tail() else {
+                    return;
+                };
+                self.with_story_manager(|env, manager| {
+                    manager.delete_pending_story(env, pending_story, status);
+                });
+            }
+            // `StoryManager::RepostBusinessStoryQuery`
+            // (StoryManager.cpp:1439-1504) — the users/chats intake and
+            // `extract_story` run WITHOUT the updates engine (cpp:1472-1488),
+            // then `on_get_story`, the object promise and `on_delete_story`.
+            StoryNetKind::RepostBusinessStory { dialog_id } => {
+                let Some(mut promise) = self.story_manager.take_repost_business_story_promise()
+                else {
+                    return;
+                };
+                match story_error(&query) {
+                    Some(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "RepostBusinessStoryQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    None => {
+                        let mut updates = match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => updates,
+                            Err(_) => {
+                                promise.set_error(parse_error("stories.sendStory"));
+                                return;
+                            }
+                        };
+                        // `process_updates_users_and_chats`
+                        // (UpdatesManager.cpp:1583-1601) — over the td
+                        // sink, then the drain.
+                        let mut sink = TdSink::default();
+                        crate::updates_manager::process_updates_users_and_chats(
+                            &mut sink,
+                            &mut updates,
+                        );
+                        self.updates_manager.sink().users.append(&mut sink.users);
+                        self.updates_manager.sink().chats.append(&mut sink.chats);
+                        self.drain_sink();
+                        match crate::updates_manager::extract_story(
+                            &mut updates,
+                            crate::chat_manager::DialogId::new(dialog_id.get()),
+                            true,
+                        ) {
+                            Some(story) => {
+                                self.with_story_manager(|env, manager| {
+                                    let story_id =
+                                        manager.on_get_story(env, dialog_id, Some(story));
+                                    let story_full_id =
+                                        crate::story_ids::StoryFullId::new(dialog_id, story_id);
+                                    let object = manager.get_story_object(env, story_full_id);
+                                    promise.set_value(object);
+                                    manager.on_delete_story(env, story_full_id);
+                                });
+                            }
+                            None => {
+                                tdutils::log_error!("Receive unexpected repost story result");
+                                promise.set_error(Status::error(400, "Failed to repost story"));
+                            }
+                        }
+                    }
+                }
+            }
+            // `StoryManager::EditStoryQuery` (StoryManager.cpp:1571-1654)
+            // — the Updates ride the engine, then the lambda's
+            // `delete_pending_story` edit arm (the ported `on_edit_story`);
+            // STORY_NOT_MODIFIED is the !bot value band (the OK tail).
+            StoryNetKind::EditStory {
+                story_full_id,
+                generation,
+            } => {
+                // `delete_pending_story`'s stale-edit guard
+                // (StoryManager.cpp:1615-1621)
+                if self
+                    .story_manager
+                    .is_outdated_edit(story_full_id, generation)
+                {
+                    tdutils::log_info!("Ignore outdated edit of {story_full_id:?}");
+                    return;
+                }
+                let dialog_id = story_full_id.get_dialog_id();
+                let result = match story_error(&query) {
+                    Some(status) => {
+                        if status.message() == "STORY_NOT_MODIFIED" && !self.auth_manager.is_bot() {
+                            TdResult::Ok(())
+                        } else {
+                            crate::dialog_manager::on_get_dialog_error(
+                                &self.global,
+                                dialog_id,
+                                &status,
+                                "EditStoryQuery",
+                            );
+                            TdResult::Err(status)
+                        }
+                    }
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.um_send(UmMessage::OnGetUpdatesStoryTail {
+                                updates: Box::new(updates),
+                                tail: crate::story_manager::StoryNetTail::EditStory {
+                                    story_full_id,
+                                },
+                            });
+                            return;
+                        }
+                        Err(_) => TdResult::Err(parse_error("stories.editStory")),
+                    },
+                };
+                self.with_story_manager(|env, manager| {
+                    manager.on_edit_story(env, story_full_id, result);
+                });
             }
         }
     }
@@ -20371,6 +20908,15 @@ pub(crate) enum UmMessage {
         tail: crate::chat_manager::ChatToggleTail,
         promise: Promise<()>,
     },
+    /// `on_get_updates` + the story-core intake tail — the C++
+    /// `PromiseCreator::lambda` chains of the StoryManager answer
+    /// halves (StoryManager.cpp:3485, :2945, :1400, :1604): the Updates
+    /// run through the engine, then the tail runs the manager intake
+    /// (the parked promises settle there).
+    OnGetUpdatesStoryTail {
+        updates: Box<telegram_api::Updates>,
+        tail: crate::story_manager::StoryNetTail,
+    },
     /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
     /// (cpp:522, :364).
     OnGetDifference {
@@ -20433,6 +20979,42 @@ impl UmMessage {
                 td.with_chat_intake(|chat_manager, user_manager, env| {
                     tail.run(chat_manager, user_manager, env, promise);
                 });
+            }
+            UmMessage::OnGetUpdatesStoryTail { updates, tail } => {
+                // the empty promise stands in for the C++ `Promise<Unit>`
+                // the handler passes to `on_get_updates` — the lambda
+                // chain's only continuation is the intake tail below
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                td.drain_sink();
+                use crate::story_manager::StoryNetTail;
+                match tail {
+                    StoryNetTail::SetStoryReaction { story_full_id } => {
+                        td.with_story_manager(|env, manager| {
+                            manager.on_set_story_reaction(
+                                env,
+                                story_full_id,
+                                tdutils::status::Result::Ok(()),
+                            );
+                        });
+                    }
+                    StoryNetTail::SendStory => {
+                        // cpp:1400-1408 — the pending story's Ok tail
+                        if let Some(pending_story) = td.story_manager.take_send_story_tail() {
+                            td.with_story_manager(|env, manager| {
+                                manager.delete_pending_story(env, pending_story, Status::ok());
+                            });
+                        }
+                    }
+                    StoryNetTail::EditStory { story_full_id } => {
+                        td.with_story_manager(|env, manager| {
+                            manager.on_edit_story(
+                                env,
+                                story_full_id,
+                                tdutils::status::Result::Ok(()),
+                            );
+                        });
+                    }
+                }
             }
             UmMessage::OnGetDifference { difference } => {
                 td.with_updates_env(|um, env| um.on_get_difference(env, difference));
@@ -29112,43 +29694,102 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
         None
     }
 
-    // ---- the §3.5 net-drain 20 send legs — `td_->create_handler<X>()
-    // ->send(...)` over the StoryNetHandle; the peers resolve at the
-    // send leg and the null band files the C++ "Can't access the chat"
-    // on_error through the completed queue ----
-
     fn get_input_peer(
         &mut self,
-        dialog_id: DialogId,
-        need_write: bool,
-    ) -> Option<telegram_api::InputPeer> {
-        self.story_input_peer(dialog_id, need_write)
-    }
-
-    fn on_get_dialog_error(&mut self, dialog_id: DialogId, status: &Status, source: &str) {
-        crate::dialog_manager::on_get_dialog_error(self.global, dialog_id, status, source);
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        // `DialogManager::get_input_peer` (DialogManager.cpp:1377-1395)
+        // — the same split the free function runs over `Td`.
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                let StoryEnv {
+                    global,
+                    options,
+                    auth_is_bot,
+                    user_manager,
+                    ..
+                } = self;
+                let env = UserEnv {
+                    global,
+                    options: options
+                        .as_deref_mut()
+                        .expect("story requests run with the initialized option manager"),
+                    auth_is_bot: *auth_is_bot,
+                };
+                user_manager.get_input_peer_user(&env, user_id, access_rights)
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let channel_id = dialog_id.get_channel_id();
+                let StoryEnv {
+                    global,
+                    options,
+                    auth_is_bot,
+                    chat_manager,
+                    ..
+                } = self;
+                let env = UserEnv {
+                    global,
+                    options: options
+                        .as_deref_mut()
+                        .expect("story requests run with the initialized option manager"),
+                    auth_is_bot: *auth_is_bot,
+                };
+                chat_manager.get_input_peer_channel(&env, channel_id, access_rights)
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
     }
 
     fn get_input_users_force(
         &mut self,
         user_ids: &[crate::user_manager::UserId],
-    ) -> Vec<telegram_api::InputUser> {
-        let StoryEnv {
-            global,
-            options,
-            auth_is_bot,
-            user_manager,
-            ..
-        } = self;
-        let user_env = UserEnv {
-            global,
-            options: options
-                .as_deref_mut()
-                .expect("story requests run with the initialized option manager"),
-            auth_is_bot: *auth_is_bot,
-        };
-        user_manager.get_input_users_force(&user_env, user_ids)
+    ) -> Vec<tdmtproto::telegram_api::InputUser> {
+        // `UserManager::get_input_users_force` (UserManager.cpp:5254-5265)
+        let mut input_users = Vec::with_capacity(user_ids.len());
+        for &user_id in user_ids {
+            let StoryEnv {
+                global,
+                options,
+                auth_is_bot,
+                user_manager,
+                ..
+            } = self;
+            let env = UserEnv {
+                global,
+                options: options
+                    .as_deref_mut()
+                    .expect("story requests run with the initialized option manager"),
+                auth_is_bot: *auth_is_bot,
+            };
+            if let Ok(input_user) = user_manager.get_input_user(&env, user_id) {
+                input_users.push(input_user);
+            }
+        }
+        input_users
     }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        _source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error_core(self.global, dialog_id, status);
+    }
+    // ---- the §3.5 net-drain 20 send legs — `td_->create_handler<X>()
+    // ->send(...)` over the StoryNetHandle; the peers resolve at the
+    // send leg and the null band files the C++ "Can't access the chat"
+    // on_error through the completed queue ----
 
     fn get_channel_ids(&mut self, chats: Vec<telegram_api::Chat>, source: &str) -> Vec<i64> {
         let StoryEnv {
@@ -36975,6 +37616,7 @@ mod tests {
         td.user_manager.net = td.user_net();
         td.chat_manager.net = td.chat_net();
         td.dialog_manager.net = td.dialog_net();
+        td.story_manager.net = td.story_net();
         (td, rec, callback)
     }
 
@@ -53424,6 +54066,1260 @@ mod tests {
 
         assert!(rec.sent.lock().is_empty(), "no query on the bands");
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+    // --- net-drain 19: the story-core families (§3.5) ---
+
+    /// Seed the my-user (id 42) — the `set_my_id` + min-user halves the
+    /// my-story families read (`is_my_story`, `inputPeerSelf`).
+    fn seed_my_user(td: &mut Td) {
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager
+                    .as_mut()
+                    .expect("option manager exists after init"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.set_my_id(&mut env, crate::user_manager::UserId::new(42));
+        }
+        seed_dialog_user_id(td, 42, 9);
+    }
+
+    /// Seed one accessible user (the `seed_dialog_user` shape, any id).
+    fn seed_dialog_user_id(td: &mut Td, id: i64, access_hash: i64) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        user_manager.on_get_user(
+            &mut env,
+            telegram_api::User::user(telegram_api::user {
+                id,
+                flags: 1, // USER_ACCESS_HASH_MASK
+                access_hash,
+                first_name: "User".to_owned(),
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+    }
+
+    /// One `storyItem` photo story — the wire form the peerStories answer
+    /// carries.
+    fn wire_photo_story(id: i32, pinned: bool, expire_date: i32) -> telegram_api::StoryItem {
+        telegram_api::StoryItem::storyItem(telegram_api::storyItem {
+            pinned,
+            id,
+            date: 1_700_000_000,
+            expire_date,
+            media: Some(Box::new(telegram_api::MessageMedia::messageMediaPhoto(
+                telegram_api::messageMediaPhoto {
+                    flags: 1, // the photo bit
+                    photo: Some(telegram_api::Photo::photo(telegram_api::photo {
+                        id: 1_000 + id as i64,
+                        access_hash: 7,
+                        date: 1_700_000_000,
+                        sizes: vec![telegram_api::PhotoSize::photoSize(
+                            telegram_api::photoSize {
+                                r#type: "m".to_owned(),
+                                w: 128,
+                                h: 128,
+                                size: 1024,
+                            },
+                        )],
+                        ..telegram_api::photo::default()
+                    })),
+                    ..telegram_api::messageMediaPhoto::default()
+                },
+            ))),
+            ..telegram_api::storyItem::default()
+        })
+    }
+
+    /// The `stories.peerStories` answer body for one dialog's stories.
+    fn wire_peer_stories(user_id: i64, stories: Vec<telegram_api::StoryItem>) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::stories_PeerStories {
+            stories: Some(telegram_api::PeerStories {
+                flags: 0,
+                peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id,
+                })),
+                max_read_id: 0,
+                stories: stories.into_iter().map(Box::new).collect(),
+            }),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    /// The empty `updates` body the engine-routed answers carry.
+    fn wire_empty_updates() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut out);
+        out
+    }
+
+    #[test]
+    fn story_core_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_core_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_core_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain19-story-core");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+        seed_my_user(&mut td); // my id 42
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        let my_dialog =
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(42))
+                .get();
+
+        // 1. getChatActiveStories — the GetPeerStoriesQuery constructor
+        //    (the Read peer) + the stories_peerStories intake
+        td.request(
+            1,
+            Function::getChatActiveStories(td_api::getChatActiveStories {
+                chat_id: user_dialog,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_getPeerStories::ID,
+        );
+        let body =
+            telegram_api::stories_getPeerStories::parse(sent.query()).expect("the sent body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+                assert_eq!(peer.access_hash, 5);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        // story 10 — active; story 11 — pinned + expired (the view
+        // increment band)
+        net_complete(
+            sent,
+            wire_peer_stories(
+                700000001,
+                vec![
+                    wire_photo_story(10, false, 2_000_000_000),
+                    wire_photo_story(11, true, 1),
+                ],
+            ),
+        );
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::chatActiveStories(stories)) => {
+                // chat_id is the [blocked: M.6] `get_chats_object` zero;
+                // the seeded stories ride the list (11 expired → dropped
+                // by the C++ active filter, 10 alive)
+                assert_eq!(stories.stories.len(), 1, "the expired story drops");
+                assert_eq!(stories.stories[0].story_id, 10);
+            }
+            other => panic!("the active stories: {other:?}"),
+        }
+
+        // 2. the same query for my dialog seeds my stories (20/21, both
+        //    pinned — the setChatPinnedStories band)
+        td.request(
+            2,
+            Function::getChatActiveStories(td_api::getChatActiveStories { chat_id: my_dialog }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_getPeerStories::ID,
+        );
+        net_complete(
+            sent,
+            wire_peer_stories(
+                42,
+                vec![
+                    wire_photo_story(20, true, 2_000_000_000),
+                    wire_photo_story(21, true, 2_000_000_000),
+                    wire_photo_story(22, false, 2_000_000_000),
+                ],
+            ),
+        );
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::chatActiveStories(_))
+        ));
+
+        // 3. loadActiveStories — the never-loaded 404 gate is the C++
+        //    band (the list loads through reload_active_stories / the
+        //    difference engine, not the request arm)
+        td.request(
+            3,
+            Function::loadActiveStories(td_api::loadActiveStories {
+                story_list: Some(td_api::StoryList::storyListMain(td_api::storyListMain)),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (404, "Not found"));
+
+        // 4. reload_active_stories — the GetAllStoriesQuery constructor
+        //    (the state-less first page) + the notModified intake
+        type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+        struct RecUnit(UnitSlot);
+        impl tdutils::promise::PromiseInterface<()> for RecUnit {
+            fn set_value(&mut self, _value: ()) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(()));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(RecUnit(slot.clone()));
+        td.with_story_manager(|env, manager| {
+            manager.reload_active_stories(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_getAllStories::ID,
+        );
+        let body = telegram_api::stories_getAllStories::parse(sent.query()).expect("the sent body");
+        assert!(!body.hidden, "the main list first");
+        assert!(!body.next);
+        let mut answer = Vec::new();
+        telegram_api::stories_AllStories::stories_allStoriesNotModified(
+            telegram_api::stories_allStoriesNotModified {
+                flags: 0,
+                state: "abc".to_owned(),
+                stealth_mode: None,
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 5. the second load carries the state (STATE_MASK + next)
+        let (promise, slot2) = {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            (Promise::from_interface(RecUnit(slot.clone())), slot)
+        };
+        td.with_story_manager(|env, manager| {
+            manager.reload_active_stories(env, promise);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_getAllStories::ID,
+        );
+        let body = telegram_api::stories_getAllStories::parse(sent.query()).expect("the sent body");
+        assert!(body.next, "the notModified state armed the next page");
+        assert_eq!(body.state, "abc");
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        match &*slot2.lock().unwrap() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 420);
+            }
+            other => panic!("the reload error: {other:?}"),
+        }
+
+        // 5. setChatActiveStoriesList — the ToggleStoriesHiddenQuery
+        //    constructor + the true-Bool intake
+        td.request(
+            5,
+            Function::setChatActiveStoriesList(td_api::setChatActiveStoriesList {
+                chat_id: user_dialog,
+                story_list: Some(td_api::StoryList::storyListArchive(
+                    td_api::storyListArchive,
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_togglePeerStoriesHidden::ID,
+        );
+        let body =
+            telegram_api::stories_togglePeerStoriesHidden::parse(sent.query()).expect("the body");
+        assert!(body.hidden);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. the false Bool still settles (no false-400 band in the C++)
+        td.request(
+            6,
+            Function::setChatActiveStoriesList(td_api::setChatActiveStoriesList {
+                chat_id: user_dialog,
+                story_list: Some(td_api::StoryList::storyListMain(td_api::storyListMain)),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_togglePeerStoriesHidden::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. the error band — the dialog-error head + the promise error
+        td.request(
+            7,
+            Function::setChatActiveStoriesList(td_api::setChatActiveStoriesList {
+                chat_id: user_dialog,
+                story_list: Some(td_api::StoryList::storyListArchive(
+                    td_api::storyListArchive,
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_togglePeerStoriesHidden::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 420);
+
+        // 8. openStory on the active story — the ReadStoriesQuery
+        //    constructor; the second open sends nothing (the max-read
+        //    state advanced)
+        td.request(
+            8,
+            Function::openStory(td_api::openStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_readStories::ID,
+        );
+        let body = telegram_api::stories_readStories::parse(sent.query()).expect("the body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        assert_eq!(body.max_id, 10);
+        net_complete(sent, Vec::new());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+        td.request(
+            9,
+            Function::openStory(td_api::openStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        assert_not_sent(
+            &rec,
+            telegram_api::stories_readStories::ID,
+            "the read state armed",
+        );
+
+        // 10. openStory on the pinned expired story — the
+        //     IncrementStoryViewsQuery constructor + the re-arm band
+        td.request(
+            10,
+            Function::openStory(td_api::openStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 11,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_incrementStoryViews::ID,
+        );
+        let body =
+            telegram_api::stories_incrementStoryViews::parse(sent.query()).expect("the body");
+        assert_eq!(body.id, vec![11]);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 10).first(),
+            Some(Object::ok(_))
+        ));
+        // the re-arm: the drained ids requeue on the next open
+        td.request(
+            11,
+            Function::openStory(td_api::openStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 11,
+            }),
+        );
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_incrementStoryViews::ID,
+        );
+
+        // 12. setStoryReaction — the SendStoryReactionQuery constructor
+        //     + the engine tail (the updates ride on_get_updates, the
+        //     lambda settles through on_set_story_reaction)
+        td.request(
+            12,
+            Function::setStoryReaction(td_api::setStoryReaction {
+                story_poster_chat_id: user_dialog,
+                story_id: 10,
+                reaction_type: Some(td_api::ReactionType::reactionTypeEmoji(
+                    td_api::reactionTypeEmoji {
+                        emoji: "\u{1f44d}".to_owned(),
+                    },
+                )),
+                update_recent_reactions: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_sendReaction::ID,
+        );
+        let body = telegram_api::stories_sendReaction::parse(sent.query()).expect("the body");
+        assert_eq!(body.story_id, 10);
+        assert!(!body.add_to_recent);
+        match body.reaction.as_ref() {
+            Some(telegram_api::Reaction::reactionEmoji(emoji)) => {
+                assert_eq!(emoji.emoticon, "\u{1f44d}");
+            }
+            other => panic!("the reaction: {other:?}"),
+        }
+        net_complete(sent, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. the STORY_NOT_MODIFIED value band — Ok, no query effect
+        td.request(
+            13,
+            Function::setStoryReaction(td_api::setStoryReaction {
+                story_poster_chat_id: my_dialog,
+                story_id: 20,
+                reaction_type: Some(td_api::ReactionType::reactionTypeEmoji(
+                    td_api::reactionTypeEmoji {
+                        emoji: "\u{1f525}".to_owned(),
+                    },
+                )),
+                update_recent_reactions: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_sendReaction::ID,
+        );
+        net_fail(sent, 400, "STORY_NOT_MODIFIED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 14. reportStory — the ReportStoryQuery constructor + the
+        //     choose-option variant mapping
+        td.request(
+            14,
+            Function::reportStory(td_api::reportStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 10,
+                option_id: Vec::new(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_report::ID,
+        );
+        let body = telegram_api::stories_report::parse(sent.query()).expect("the body");
+        assert_eq!(body.id, vec![10]);
+        assert_eq!(body.option, Vec::<u8>::new());
+        let mut answer = Vec::new();
+        telegram_api::ReportResult::reportResultChooseOption(
+            telegram_api::reportResultChooseOption {
+                title: "Report story".to_owned(),
+                options: vec![telegram_api::MessageReportOption {
+                    text: "Spam".to_owned(),
+                    option: b"2".to_vec(),
+                }],
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 14).first() {
+            Some(Object::reportStoryResultOptionRequired(result)) => {
+                assert_eq!(result.title, "Report story");
+                assert_eq!(result.options.len(), 1);
+                assert_eq!(result.options[0].id, b"2".to_vec());
+                assert_eq!(result.options[0].text, "Spam");
+            }
+            other => panic!("the report result: {other:?}"),
+        }
+
+        // 15. the reported variant + the error band
+        td.request(
+            15,
+            Function::reportStory(td_api::reportStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 10,
+                option_id: b"2".to_vec(),
+                text: "it is spam".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_report::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::ReportResult::reportResultReported(telegram_api::reportResultReported)
+            .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 15).first(),
+            Some(Object::reportStoryResultOk(_))
+        ));
+        td.request(
+            16,
+            Function::reportStory(td_api::reportStory {
+                story_poster_chat_id: user_dialog,
+                story_id: 10,
+                option_id: b"2".to_vec(),
+                text: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_report::ID,
+        );
+        net_fail(sent, 400, "STORY_ID_INVALID");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 16);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "STORY_ID_INVALID")
+        );
+
+        // 16. toggleStoryIsPostedToChatPage — the ToggleStoryPinnedQuery
+        //     constructor (the Write peer of my dialog — inputPeerSelf)
+        //     + the C++ answer that never reads the Updates body
+        td.request(
+            17,
+            Function::toggleStoryIsPostedToChatPage(td_api::toggleStoryIsPostedToChatPage {
+                story_poster_chat_id: my_dialog,
+                story_id: 20,
+                is_posted_to_chat_page: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_togglePinned::ID,
+        );
+        let body = telegram_api::stories_togglePinned::parse(sent.query()).expect("the body");
+        assert_eq!(body.id, vec![20]);
+        assert!(!body.pinned);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerSelf(_)) => {}
+            other => panic!("the self peer: {other:?}"),
+        }
+        net_complete(sent, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 17).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 17. setChatPinnedStories — the TogglePinnedStoriesToTopQuery
+        //     constructor; story 21 (still pinned after 16 unpinned 20)
+        //     re-pins to the top
+        td.request(
+            18,
+            Function::setChatPinnedStories(td_api::setChatPinnedStories {
+                chat_id: my_dialog,
+                story_ids: vec![21],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_togglePinnedToTop::ID,
+        );
+        let body = telegram_api::stories_togglePinnedToTop::parse(sent.query()).expect("the body");
+        assert_eq!(body.id, vec![21]);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 18).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 18. deleteStory — the DeleteStoriesQuery constructor + the
+        //     query-carried promise (§5); the error band fails it
+        td.request(
+            19,
+            Function::deleteStory(td_api::deleteStory {
+                story_poster_chat_id: my_dialog,
+                story_id: 21,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_deleteStories::ID,
+        );
+        let body = telegram_api::stories_deleteStories::parse(sent.query()).expect("the body");
+        assert_eq!(body.id, vec![21]);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 19).first(),
+            Some(Object::ok(_))
+        ));
+        td.request(
+            20,
+            Function::deleteStory(td_api::deleteStory {
+                story_poster_chat_id: my_dialog,
+                story_id: 20,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_deleteStories::ID,
+        );
+        net_fail(sent, 400, "STORY_ID_INVALID");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 20);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "STORY_ID_INVALID")
+        );
+
+        // 19. setStoryPrivacySettings — the EditStoryPrivacyQuery
+        //     constructor (PRIVACY_RULES_MASK + the everyone rules) +
+        //     the engine promise (story 22 — 20/21 are deleted above)
+        td.request(
+            21,
+            Function::setStoryPrivacySettings(td_api::setStoryPrivacySettings {
+                story_id: 22,
+                privacy_settings: Some(td_api::StoryPrivacySettings::storyPrivacySettingsContacts(
+                    td_api::storyPrivacySettingsContacts {
+                        except_user_ids: Vec::new(),
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 2); // PRIVACY_RULES_MASK only
+        assert_eq!(body.id, 22);
+        assert!(matches!(
+            body.privacy_rules.as_slice(),
+            [telegram_api::InputPrivacyRule::inputPrivacyValueAllowContacts(_)]
+        ));
+        net_complete(sent, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 21).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 20. editStory caption-only — the EditStoryQuery constructor
+        //     (the CAPTION bit); the STORY_NOT_MODIFIED value band
+        td.request(
+            22,
+            Function::editStory(td_api::editStory {
+                story_poster_chat_id: my_dialog,
+                story_id: 22,
+                content: None,
+                areas: None,
+                caption: Some(td_api::FormattedText {
+                    text: "new caption".to_owned(),
+                    entities: Vec::new(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 1); // CAPTION_MASK (== ENTITIES_MASK)
+        assert_eq!(body.caption, "new caption");
+        net_fail(sent, 400, "STORY_NOT_MODIFIED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 22).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 21b. the stale-edit guard (delete_pending_story cpp:1615-1621)
+        //     — two overlapping edits: the older generation's answer
+        //     drops, the newer settles
+        td.request(
+            25,
+            Function::editStory(td_api::editStory {
+                story_poster_chat_id: my_dialog,
+                story_id: 22,
+                content: None,
+                areas: None,
+                caption: Some(td_api::FormattedText {
+                    text: "older edit".to_owned(),
+                    entities: Vec::new(),
+                }),
+            }),
+        );
+        let older = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        td.request(
+            26,
+            Function::editStory(td_api::editStory {
+                story_poster_chat_id: my_dialog,
+                story_id: 22,
+                content: None,
+                areas: None,
+                caption: Some(td_api::FormattedText {
+                    text: "newer edit".to_owned(),
+                    entities: Vec::new(),
+                }),
+            }),
+        );
+        let newer = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        net_complete(older, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 25).is_empty(),
+            "the stale edit's answer drops"
+        );
+        net_complete(newer, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        // the merged edit entry settles every parked caller
+        // (the C++ `being_edited_stories_` promises)
+        assert!(matches!(
+            responses_of(&callback, 25).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(matches!(
+            responses_of(&callback, 26).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 21. activateStoryStealthMode — the ActivateStealthModeQuery
+        //     constructor (both windows) + the engine promise; the error
+        //     band fails it
+        td.request(
+            23,
+            Function::activateStoryStealthMode(td_api::activateStoryStealthMode),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_activateStealthMode::ID,
+        );
+        let body =
+            telegram_api::stories_activateStealthMode::parse(sent.query()).expect("the body");
+        assert!(body.past);
+        assert!(body.future);
+        net_complete(sent, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 23).first(),
+            Some(Object::ok(_))
+        ));
+        td.request(
+            24,
+            Function::activateStoryStealthMode(td_api::activateStoryStealthMode),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_activateStealthMode::ID,
+        );
+        net_fail(sent, 400, "PREMIUM_ACCOUNT_REQUIRED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 24);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "PREMIUM_ACCOUNT_REQUIRED")
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no stray story queries");
+        assert!(td.story_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn story_repost_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_repost_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_repost_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain19-story-repost");
+        td.auth_manager.restore_is_bot(true);
+        seed_dialog_user(&mut td);
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+
+        // 1. postStory(from_story_full_id) — the bot repost arm of the
+        //    SendStoryQuery (site two): the FWD_FROM_ID|FWD_FROM_STORY +
+        //    PERIOD flags, the empty media, the everyone rules, the
+        //    forward pair and the premium period band
+        td.request(
+            1,
+            Function::postStory(td_api::postStory {
+                chat_id: user_dialog,
+                content: None,
+                areas: None,
+                caption: None,
+                privacy_settings: None,
+                album_ids: Vec::new(),
+                active_period: 6 * 3600,
+                from_story_full_id: Some(td_api::StoryFullId {
+                    poster_chat_id: user_dialog,
+                    story_id: 10,
+                }),
+                is_posted_to_chat_page: true,
+                protect_content: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_sendStory::ID,
+        );
+        let body = telegram_api::stories_sendStory::parse(sent.query()).expect("the sent body");
+        assert_eq!(
+            body.flags & (1 << 6 | 1 << 3),
+            1 << 6 | 1 << 3,
+            "the fwd pair + period bits"
+        );
+        assert!(body.pinned);
+        assert!(body.noforwards);
+        assert_eq!(body.period, 6 * 3600);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+                assert_eq!(peer.access_hash, 5);
+            }
+            other => panic!("the write peer: {other:?}"),
+        }
+        assert!(matches!(
+            body.media.as_deref(),
+            Some(telegram_api::InputMedia::inputMediaEmpty(_))
+        ));
+        assert!(matches!(
+            body.privacy_rules.as_slice(),
+            [telegram_api::InputPrivacyRule::inputPrivacyValueAllowAll(_)]
+        ));
+        match body.fwd_from_id.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+            }
+            other => panic!("the forward peer: {other:?}"),
+        }
+        assert_eq!(body.fwd_from_story, 10);
+        // the answer runs the users/chats intake + extract_story inline
+        // (the engine is not involved), then on_get_story -> the object
+        // promise -> on_delete_story
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![telegram_api::Update::updateStory(
+                telegram_api::updateStory {
+                    peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 700000001,
+                    })),
+                    story: Some(Box::new(wire_photo_story(15, false, 2_000_000_000))),
+                },
+            )],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::story(story)) => {
+                assert_eq!(story.id, 15, "the extracted story answers");
+            }
+            other => panic!("the repost answer: {other:?}"),
+        }
+
+        // 2. the error band — the head + the parked promise error
+        td.request(
+            2,
+            Function::postStory(td_api::postStory {
+                chat_id: user_dialog,
+                content: None,
+                areas: None,
+                caption: None,
+                privacy_settings: None,
+                album_ids: Vec::new(),
+                active_period: 86400,
+                from_story_full_id: Some(td_api::StoryFullId {
+                    poster_chat_id: user_dialog,
+                    story_id: 10,
+                }),
+                is_posted_to_chat_page: false,
+                protect_content: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_sendStory::ID,
+        );
+        net_fail(sent, 400, "STORY_ID_EMPTY");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "STORY_ID_EMPTY")
+        );
+
+        assert!(rec.sent.lock().is_empty(), "no stray repost queries");
+        assert!(td.story_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn story_send_story_tail_settles_on_injected_answer() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_send_story_tail_settles_on_injected_answer_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_send_story_tail_settles_on_injected_answer_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain19-story-send");
+        seed_my_user(&mut td);
+        let my_dialog =
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(42))
+                .get();
+
+        // the local photo the story content reads
+        let dir = temp_db_dir("netdrain19-story-send-src");
+        let path = std::path::Path::new(&dir).join("photo.jpg");
+        std::fs::write(&path, vec![7u8; 512]).unwrap();
+
+        // 1. postStory — the local story + the parked tail; the send leg
+        //    is StoryContent-gated (noted, not silently skipped — no
+        //    query goes out)
+        td.request(
+            1,
+            Function::postStory(td_api::postStory {
+                chat_id: my_dialog,
+                content: Some(td_api::InputStoryContent::inputStoryContentPhoto(
+                    td_api::inputStoryContentPhoto {
+                        photo: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                            path: path.to_string_lossy().into_owned(),
+                        })),
+                        added_sticker_file_ids: Vec::new(),
+                    },
+                )),
+                areas: None,
+                caption: Some(td_api::FormattedText {
+                    text: "caption".to_owned(),
+                    entities: Vec::new(),
+                }),
+                privacy_settings: Some(td_api::StoryPrivacySettings::storyPrivacySettingsEveryone(
+                    td_api::storyPrivacySettingsEveryone {
+                        except_user_ids: Vec::new(),
+                    },
+                )),
+                album_ids: Vec::new(),
+                active_period: 86400,
+                from_story_full_id: None,
+                is_posted_to_chat_page: false,
+                protect_content: false,
+            }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::story(story)) => {
+                // the not-sent local story answers like the C++ upload
+                // window (the yet-unsent id band above MAX_SERVER_STORY_ID)
+                assert!(story.id > crate::story_ids::StoryId::MAX_SERVER_STORY_ID);
+            }
+            other => panic!("the posted story: {other:?}"),
+        }
+        assert_not_sent(
+            &rec,
+            telegram_api::stories_sendStory::ID,
+            "the StoryContent-gated send leg",
+        );
+
+        // 2. the injected error answer — the delete_pending_story error
+        //    arm settles the parked tail
+        let mut query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            telegram_api::stories_sendStory::ID,
+            Vec::new(),
+            u32::MAX,
+            42,
+        );
+        query.set_error(Status::error(400, "PHOTO_INVALID_DIMENSIONS"));
+        td.story_net_completed.lock().push((
+            crate::story_manager::StoryNetKind::SendStory {
+                dialog_id: crate::messages_manager::DialogId::new(my_dialog),
+            },
+            query,
+        ));
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(
+            td.story_manager.take_send_story_tail().is_none(),
+            "the error tail settled the parked story"
+        );
+
+        // 3. the injected ok answer — the updates engine runs, then the
+        //    Ok tail (the story exists locally, so the C++ 500
+        //    "Failed to receive a sent story" band collapses it)
+        td.request(
+            2,
+            Function::postStory(td_api::postStory {
+                chat_id: my_dialog,
+                content: Some(td_api::InputStoryContent::inputStoryContentPhoto(
+                    td_api::inputStoryContentPhoto {
+                        photo: Some(td_api::InputFile::inputFileLocal(td_api::inputFileLocal {
+                            path: path.to_string_lossy().into_owned(),
+                        })),
+                        added_sticker_file_ids: Vec::new(),
+                    },
+                )),
+                areas: None,
+                caption: None,
+                privacy_settings: Some(td_api::StoryPrivacySettings::storyPrivacySettingsEveryone(
+                    td_api::storyPrivacySettingsEveryone {
+                        except_user_ids: Vec::new(),
+                    },
+                )),
+                album_ids: Vec::new(),
+                active_period: 86400,
+                from_story_full_id: None,
+                is_posted_to_chat_page: false,
+                protect_content: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::story(_))
+        ));
+        let mut query = NetQuery::new(
+            0,
+            DcId::main(),
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            telegram_api::stories_sendStory::ID,
+            Vec::new(),
+            u32::MAX,
+            42,
+        );
+        query.set_ok(wire_empty_updates());
+        td.story_net_completed.lock().push((
+            crate::story_manager::StoryNetKind::SendStory {
+                dialog_id: crate::messages_manager::DialogId::new(my_dialog),
+            },
+            query,
+        ));
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(
+            td.story_manager.take_send_story_tail().is_none(),
+            "the ok tail settled the parked story"
+        );
+
+        assert!(td.story_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn story_read_all_and_archive_sync_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_read_all_and_archive_sync_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_read_all_and_archive_sync_impl() {
+        let (mut td, rec) = netted_td("netdrain19-story-read-all");
+
+        // 1. reloadAllReadPeerStories — the promise-less
+        //    GetAllReadPeerStoriesQuery; the Updates answer rides the
+        //    engine with an empty promise
+        td.with_story_manager(|env, manager| {
+            manager.reload_all_read_stories(env);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_getAllReadPeerStories::ID,
+        );
+        net_complete(sent, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+
+        // 2. the error tail only logs (the C++ LOG(INFO) band)
+        td.with_story_manager(|env, manager| {
+            manager.reload_all_read_stories(env);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_getAllReadPeerStories::ID,
+        );
+        net_fail(sent, 500, "TIMEOUT");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(td.story_net_completed.lock().is_empty(), "drained");
+
+        // 3. trySynchronizeArchiveAllStories — the
+        //    ToggleAllStoriesHiddenQuery rides the option; the lambda
+        //    clears it through the engine tail
+        td.option_manager
+            .as_mut()
+            .expect("option manager set")
+            .set_option_boolean("need_synchronize_archive_all_stories", true);
+        td.with_story_manager(|env, manager| {
+            manager.try_synchronize_archive_all_stories(env);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_toggleAllStoriesHidden::ID,
+        );
+        let body =
+            telegram_api::stories_toggleAllStoriesHidden::parse(sent.query()).expect("the body");
+        assert!(!body.hidden, "the archive_all_stories default");
+        net_complete(sent, wire_empty_updates());
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        // the option cleared — a re-drive sends nothing
+        td.with_story_manager(|env, manager| {
+            manager.try_synchronize_archive_all_stories(env);
+        });
+        assert_not_sent(
+            &rec,
+            telegram_api::stories_toggleAllStoriesHidden::ID,
+            "the synchronized option cleared",
+        );
+
+        // 4. the error band — the lambda still fires (cpp:2955-2971:
+        //    the option clears on BOTH bands; only the app-config
+        //    reload rides its blocked seam)
+        td.option_manager
+            .as_mut()
+            .expect("option manager set")
+            .set_option_boolean("need_synchronize_archive_all_stories", true);
+        td.with_story_manager(|env, manager| {
+            manager.try_synchronize_archive_all_stories(env);
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_toggleAllStoriesHidden::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_30");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        td.with_story_manager(|env, manager| {
+            manager.try_synchronize_archive_all_stories(env);
+        });
+        assert_not_sent(
+            &rec,
+            telegram_api::stories_toggleAllStoriesHidden::ID,
+            "the error band cleared the option too",
+        );
+        assert!(td.story_net_completed.lock().is_empty(), "drained");
     }
 
     // ---- the §3.5 net-drain 20 slice: the story albums, the interaction
