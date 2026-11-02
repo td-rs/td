@@ -654,7 +654,9 @@ fn as_input_document(
 
 /// `FullRemoteFileLocation::as_input_photo` (FileLocation.h) — the
 /// video-cover probe; the caller validated `is_photo`.
-fn as_input_photo(location: &crate::files::FullRemoteFileLocation) -> telegram_api::InputPhoto {
+pub(crate) fn as_input_photo(
+    location: &crate::files::FullRemoteFileLocation,
+) -> telegram_api::InputPhoto {
     debug_assert!(location.is_photo());
     telegram_api::InputPhoto::inputPhoto(telegram_api::inputPhoto {
         id: location.get_id(),

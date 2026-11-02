@@ -753,7 +753,7 @@ pub fn can_dialog_have_threads(td: &mut Td, dialog_id: DialogId) -> bool {
 /// `BOT_METHOD_INVALID` is intercepted at the dialog level first, exactly
 /// like the C++.
 pub fn on_get_dialog_error(
-    td: &mut Td,
+    global: &crate::global::Global,
     dialog_id: DialogId,
     status: &Status,
     _source: &str,
@@ -762,7 +762,7 @@ pub fn on_get_dialog_error(
     if message == "BOT_METHOD_INVALID" {
         return true;
     }
-    if td.global.is_expected_error(status) {
+    if global.is_expected_error(status) {
         return true;
     }
     if message == "SEND_AS_PEER_INVALID" {
@@ -5547,29 +5547,29 @@ mod tests {
 
     #[test]
     fn on_get_dialog_error_classifies_messages() {
-        let mut td = test_td();
+        let td = test_td();
         let dialog_id = DialogId::from_user_id(crate::user_manager::UserId::new(1));
 
         assert!(on_get_dialog_error(
-            &mut td,
+            &td.global,
             dialog_id,
             &Status::error(400, "BOT_METHOD_INVALID"),
             "test"
         ));
         assert!(on_get_dialog_error(
-            &mut td,
+            &td.global,
             dialog_id,
             &Status::error(401, "UNAUTHORIZED"),
             "test"
         ));
         assert!(on_get_dialog_error(
-            &mut td,
+            &td.global,
             dialog_id,
             &Status::error(400, "ALLOW_PAYMENT_REQUIRED_X"),
             "test"
         ));
         assert!(!on_get_dialog_error(
-            &mut td,
+            &td.global,
             dialog_id,
             &Status::error(400, "SOMETHING_ELSE"),
             "test"
@@ -5581,19 +5581,19 @@ mod tests {
         // (ChatManager.cpp:6398-6400), everything else is the unloaded false
         let channel_dialog = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1001));
         assert!(on_get_dialog_error(
-            &mut td,
+            &td.global,
             channel_dialog,
             &Status::error(400, "CHANNEL_MONOFORUM_UNSUPPORTED"),
             "test"
         ));
         assert!(!on_get_dialog_error(
-            &mut td,
+            &td.global,
             channel_dialog,
             &Status::error(400, "SOMETHING_ELSE"),
             "test"
         ));
         assert!(on_get_dialog_error(
-            &mut td,
+            &td.global,
             channel_dialog,
             &Status::error(400, "BOT_METHOD_INVALID"),
             "test"

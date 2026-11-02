@@ -7507,40 +7507,7 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
         td: &mut Td,
         run: impl FnOnce(&mut crate::td::StoryEnv<'_>, &mut crate::story_manager::StoryManager),
     ) {
-        let crate::td::Td {
-            story_manager,
-            global,
-            option_manager,
-            auth_manager,
-            user_manager,
-            chat_manager,
-            file_manager,
-            file_load_manager,
-            documents_manager,
-            videos_manager,
-            audios_manager,
-            voice_notes_manager,
-            video_notes_manager,
-            notification_updates,
-            ..
-        } = td;
-        let mut env = crate::td::StoryEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-            file_manager: file_manager.clone(),
-            file_load_manager: std::sync::Arc::clone(file_load_manager),
-            documents: documents_manager,
-            videos: videos_manager,
-            audios: audios_manager,
-            voice_notes: voice_notes_manager,
-            video_notes: video_notes_manager,
-            updates: notification_updates,
-        };
-        run(&mut env, story_manager);
+        td.with_story_manager(run);
     }
 
     macro_rules! ok_promise {
