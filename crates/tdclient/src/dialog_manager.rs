@@ -758,11 +758,22 @@ pub fn on_get_dialog_error(
     status: &Status,
     _source: &str,
 ) -> bool {
+    on_get_dialog_error_core(&mut td.global, dialog_id, status)
+}
+
+/// The `DialogManager::on_get_dialog_error` core (DialogManager.cpp
+/// `on_get_dialog_error`) — the env planes share it (the story env has
+/// no `Td` back-pointer).
+pub fn on_get_dialog_error_core(
+    global: &mut crate::global::Global,
+    dialog_id: DialogId,
+    status: &Status,
+) -> bool {
     let message = status.message();
     if message == "BOT_METHOD_INVALID" {
         return true;
     }
-    if td.global.is_expected_error(status) {
+    if global.is_expected_error(status) {
         return true;
     }
     if message == "SEND_AS_PEER_INVALID" {
