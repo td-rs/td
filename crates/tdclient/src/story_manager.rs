@@ -5,9 +5,11 @@
 //!
 //! Seams (the ThemeManagerEnv conventions):
 //! - every server-bound query (`stories.getStoriesByID`,
-//!   `stories.getAllStories`, ...) is a [`StoryManagerEnv`] `[blocked: net]`
-//!   seam: the query name is logged and the parked promise settles through
-//!   the ported `on_*` answer half;
+//!   `stories.getAllStories`, ...) is a [`StoryManagerEnv`] seam: the
+//!   net-drain 20 families (the §3.5 albums/metrics/search/live slice)
+//!   dispatch through the `StoryEnv` net handle; the rest park at the
+//!   `[blocked: net]` default seams — the query name is logged and the
+//!   parked promise settles through the ported `on_*` answer half;
 //! - the binlog log events (`DeleteStoryOnServer`, `ReadStoriesOnServer`,
 //!   `LoadDialogExpiringStories`, `SendStory`, `EditStory`) are
 //!   `[blocked: binlog]` — the base carries only the binlog pmc, so the
@@ -936,8 +938,11 @@ struct BeingEditedStory {
 }
 
 /// The StoryManager in-flight query kinds — the C++ ResultHandler
-/// classes of the story-core families (StoryManager.cpp:69-1748, the
-/// §3.5 core sends and reads). The kinds carry the Copy handler members
+/// classes of the story plane: the story-core sends and reads
+/// (StoryManager.cpp:69-1748, the §3.5 core families) and the
+/// §3.5 net-drain 20 slice (the albums, the interaction metrics, the
+/// pinned/archive reads, the hashtag search, the live/business sends
+/// and the send-right checks). The kinds carry the Copy handler members
 /// the answer halves read (the dialog ids for the `on_get_dialog_error`
 /// heads, the toggle flags); the non-Copy handler state (the promises,
 /// the pending stories, the load snapshots) parks on the manager next to
@@ -1002,6 +1007,92 @@ pub(crate) enum StoryNetKind {
         story_full_id: StoryFullId,
         generation: i64,
     },
+    /// `GetStoryViewsListQuery` (StoryManager.cpp:303-341) — the
+    /// `getStoryInteractions` wire leg; the kind carries the story for
+    /// the `on_get_story_interactions` intake flags (the C++
+    /// query_promise lambda captures), the dialog for the error tail
+    /// (the handler's `dialog_id_` member).
+    GetStoryViewsList {
+        story_full_id: StoryFullId,
+        is_full: bool,
+        is_first: bool,
+    },
+    /// `GetStoryReactionsListQuery` (StoryManager.cpp:346-391) — the
+    /// `getChatStoryInteractions` wire leg; the story rides the kind
+    /// (the `on_get_dialog_story_interactions` capture), the dialog for
+    /// the error tail.
+    GetStoryReactionsList { story_full_id: StoryFullId },
+    /// `GetStoriesByIDQuery` (StoryManager.cpp:394-430) — the reload
+    /// chain's single-story fetch; the promise parks in
+    /// `reload_story_queries` (an exact keying), the handler's
+    /// `story_ids_`/`dialog_id_` collapse onto the one story full id.
+    GetStoriesByID { story_full_id: StoryFullId },
+    /// `GetPinnedStoriesQuery` (StoryManager.cpp:432-466) — the
+    /// `getChatPostedToChatPageStories` leg; the promises park in
+    /// `pending_pinned_stories` keyed by the dialog.
+    GetPinnedStories { dialog_id: DialogId },
+    /// `GetStoriesArchiveQuery` (StoryManager.cpp:468-502) — the
+    /// `getChatArchivedStories` leg; the promises park in
+    /// `pending_archive_stories` keyed by the dialog.
+    GetStoriesArchive { dialog_id: DialogId },
+    /// `GetStoriesViewsQuery` (StoryManager.cpp:857-885) — the
+    /// interaction-count poll (no promise); the handler's
+    /// `dialog_id_`/`story_ids_` members park in the
+    /// `pending_get_stories_views` context queue.
+    GetStoriesViews,
+    /// `SearchStoriesQuery` (StoryManager.cpp:724-815) — the three
+    /// `searchPublicStories*` arms share the query; the kind carries
+    /// the arm's dialog for the error tail (the handler's `dialog_id_`,
+    /// default for the area arms), the promises park in
+    /// `pending_search_stories`.
+    SearchStories { dialog_id: DialogId },
+    /// `GetStoryAlbumsQuery` (StoryManager.cpp:950-997) — the
+    /// `getChatStoryAlbums` leg; the promises park in
+    /// `pending_story_albums` keyed by the owner.
+    GetStoryAlbums { owner_dialog_id: DialogId },
+    /// `GetAlbumStoriesQuery` (StoryManager.cpp:999-1031) — the
+    /// `getStoryAlbumStories` leg; the promises park in
+    /// `pending_album_stories` keyed by the (dialog, album) pair.
+    GetAlbumStories {
+        dialog_id: DialogId,
+        story_album_id: StoryAlbumId,
+    },
+    /// `CreateStoryAlbumQuery` (StoryManager.cpp:1033-1072) — the
+    /// promise parks in the `pending_create_story_albums` FIFO with the
+    /// handler's `story_ids_` member (the
+    /// `update_story_albums` refire reads it at the answer).
+    CreateStoryAlbum { owner_dialog_id: DialogId },
+    /// `ReorderStoryAlbumsQuery` (StoryManager.cpp:1074-1092) — the
+    /// promise parks in `pending_unit_queries`.
+    ReorderStoryAlbums { owner_dialog_id: DialogId },
+    /// `DeleteStoryAlbumQuery` (StoryManager.cpp:1107-1131) — the
+    /// promise parks in `pending_unit_queries`.
+    DeleteStoryAlbum { owner_dialog_id: DialogId },
+    /// `UpdateStoryAlbumQuery` (StoryManager.cpp:1138-1240) — the four
+    /// `setStoryAlbumName`/`add`/`remove`/`reorder` album-stories arms
+    /// share the query; the promise parks in
+    /// `pending_update_story_albums` with the handler's rollback
+    /// members (`story_album_id_`, `deleted_story_ids_`,
+    /// `added_story_ids_`).
+    UpdateStoryAlbum,
+    /// `StartLiveStoryQuery` (StoryManager.cpp:1506-1569) — the
+    /// `startLiveStory` leg; the promise parks in
+    /// `pending_start_live_story`.
+    StartLiveStory { dialog_id: DialogId },
+    /// `CanSendStoryQuery` (StoryManager.cpp:1296-1334) — the
+    /// `canPostStory` leg (the paid-reaction count remains answer); the
+    /// promise parks in `pending_can_post_story`.
+    CanSendStory { dialog_id: DialogId },
+    /// `GetChatsToSendStoriesQuery` (StoryManager.cpp:1253-1294) — the
+    /// `getChatsToPostStories` leg; the promise parks in
+    /// `pending_dialogs_to_send_stories`.
+    GetChatsToSendStories,
+    /// `StoryManager::EditBusinessStoryQuery` (StoryManager.cpp:1656-1717)
+    /// — the bot business edit; the `BeingEditedBusinessStory` (the
+    /// content/areas/caption/privacy rules + the promise — the C++
+    /// `being_edited_business_stories_` row) parks keyed by the kind's
+    /// `send_story_num`.
+    EditBusinessStory { send_story_num: u32 },
 }
 
 /// The post-`on_get_updates` continuations of the story-core answer
@@ -1023,6 +1114,23 @@ pub(crate) enum StoryNetTail {
     /// `EditStoryQuery`'s lambda → `delete_pending_story`'s edit arm
     /// (StoryManager.cpp:1598-1607) — the ported `on_edit_story`.
     EditStory { story_full_id: StoryFullId },
+}
+
+/// `StoryManager::BeingEditedBusinessStory` (StoryManager.h:117-124) —
+/// the bot business edit's parked row; keyed by the send story num like
+/// the C++ `being_edited_business_stories_`. The content/areas/caption/
+/// privacy fields are the C++ members the FILE_PART re-fire
+/// (`on_send_story_file_parts_missing` → `do_send_story`) re-sends —
+/// they read when the FileUploader plane lands.
+#[allow(dead_code)] // the re-upload re-fire rides the FileUploader plane
+struct BeingEditedBusinessStory {
+    dialog_id: DialogId,
+    story_id: StoryId,
+    content: StoryContent,
+    areas: Vec<MediaArea>,
+    caption: FormattedText,
+    privacy_rules: UserPrivacySettingRules,
+    promise: Promise<Option<td_api::Story>>,
 }
 
 /// The `G()`/`td_` surface of the manager. The net queries are the
@@ -1467,7 +1575,7 @@ pub trait StoryManagerEnv {
             prefer_forwards,
             prefer_with_reaction,
         );
-        tdutils::log_info!("Send stories.getStoryViewsList — [blocked: net]");
+        tdutils::log_info!("Send stories.getStoryViewsList — [net-inert]");
         let _ = (query, offset, limit);
     }
 
@@ -1476,7 +1584,7 @@ pub trait StoryManagerEnv {
     fn send_get_stories_views_query(&mut self, dialog_id: DialogId, story_ids: &[StoryId]) {
         let _ = dialog_id;
         tdutils::log_info!(
-            "Send stories.getStoriesViews({} ids) — [blocked: net]",
+            "Send stories.getStoriesViews({} ids) — [net-inert]",
             story_ids.len()
         );
     }
@@ -1491,7 +1599,7 @@ pub trait StoryManagerEnv {
         limit: i32,
     ) {
         let _ = (story_full_id, prefer_forwards);
-        tdutils::log_info!("Send stories.getStoryReactionsList — [blocked: net]");
+        tdutils::log_info!("Send stories.getStoryReactionsList — [net-inert]");
         let _ = (reaction_type, offset, limit);
     }
 
@@ -1499,7 +1607,7 @@ pub trait StoryManagerEnv {
     fn send_get_stories_by_id_query(&mut self, dialog_id: DialogId, story_ids: &[StoryId]) {
         let _ = dialog_id;
         tdutils::log_info!(
-            "Send stories.getStoriesByID({} ids) — [blocked: net]",
+            "Send stories.getStoriesByID({} ids) — [net-inert]",
             story_ids.len()
         );
     }
@@ -1512,7 +1620,7 @@ pub trait StoryManagerEnv {
         limit: i32,
     ) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.getPinnedStories — [blocked: net]");
+        tdutils::log_info!("Send stories.getPinnedStories — [net-inert]");
         let _ = (offset_story_id, limit);
     }
 
@@ -1524,21 +1632,30 @@ pub trait StoryManagerEnv {
         limit: i32,
     ) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.getStoriesArchive — [blocked: net]");
+        tdutils::log_info!("Send stories.getStoriesArchive — [net-inert]");
         let _ = (offset_story_id, limit);
     }
 
     /// `SearchStoriesQuery::send` for the three search arms
-    /// (StoryManager.cpp:3212-3237).
-    fn send_search_stories_query(&mut self, query: &str, offset: &str, limit: i32) {
-        tdutils::log_info!("Send stories.searchPostsByHashtag/Location/Venue — [blocked: net]");
-        let _ = (query, offset, limit);
+    /// (StoryManager.cpp:3212-3237) — the arm carries the wire's
+    /// hashtag/area payload (the C++ `send` overloads); `dialog_id` is
+    /// the hashtag arm's peer filter (default for the area arms).
+    fn send_search_stories_query(
+        &mut self,
+        dialog_id: DialogId,
+        arm: SearchStoriesArm<'_>,
+        offset: &str,
+        limit: i32,
+    ) {
+        let _ = (dialog_id, offset, limit);
+        tdutils::log_info!("Send stories.searchPosts — [net-inert]");
+        let _ = arm;
     }
 
     /// `GetStoryAlbumsQuery::send` (StoryManager.cpp:3855).
     fn send_get_story_albums_query(&mut self, dialog_id: DialogId) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.getAlbums — [blocked: net]");
+        tdutils::log_info!("Send stories.getAlbums — [net-inert]");
     }
 
     /// `GetAlbumStoriesQuery::send` (StoryManager.cpp:3882).
@@ -1550,7 +1667,7 @@ pub trait StoryManagerEnv {
         limit: i32,
     ) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.getAlbumStories — [blocked: net]");
+        tdutils::log_info!("Send stories.getAlbumStories — [net-inert]");
         let _ = (story_album_id, offset, limit);
     }
 
@@ -1562,7 +1679,7 @@ pub trait StoryManagerEnv {
         story_ids: &[StoryId],
     ) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.createAlbum — [blocked: net]");
+        tdutils::log_info!("Send stories.createAlbum — [net-inert]");
         let _ = (title, story_ids);
     }
 
@@ -1574,7 +1691,7 @@ pub trait StoryManagerEnv {
     ) {
         let _ = dialog_id;
         tdutils::log_info!(
-            "Send stories.reorderAlbums({} ids) — [blocked: net]",
+            "Send stories.reorderAlbums({} ids) — [net-inert]",
             story_album_ids.len()
         );
     }
@@ -1582,7 +1699,7 @@ pub trait StoryManagerEnv {
     /// `DeleteStoryAlbumQuery::send` (StoryManager.cpp:3938).
     fn send_delete_story_album_query(&mut self, dialog_id: DialogId, story_album_id: StoryAlbumId) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.deleteAlbum — [blocked: net]");
+        tdutils::log_info!("Send stories.deleteAlbum — [net-inert]");
         let _ = story_album_id;
     }
 
@@ -1599,7 +1716,7 @@ pub trait StoryManagerEnv {
         reorder_story_ids: &[StoryId],
     ) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.updateAlbum — [blocked: net]");
+        tdutils::log_info!("Send stories.updateAlbum — [net-inert]");
         let _ = (
             story_album_id,
             title,
@@ -1612,7 +1729,7 @@ pub trait StoryManagerEnv {
     /// `CanSendStoryQuery::send` (StoryManager.cpp:5897).
     fn send_can_send_story_query(&mut self, dialog_id: DialogId) {
         let _ = dialog_id;
-        tdutils::log_info!("Send channels.getSendStoriesPaidReactionInfo — [blocked: net]");
+        tdutils::log_info!("Send channels.getSendStoriesPaidReactionInfo — [net-inert]");
     }
 
     /// `StartLiveStoryQuery::send` (StoryManager.cpp:6226).
@@ -1628,7 +1745,7 @@ pub trait StoryManagerEnv {
         paid_message_star_count: i64,
     ) {
         let _ = dialog_id;
-        tdutils::log_info!("Send stories.startLiveStory — [blocked: net]");
+        tdutils::log_info!("Send stories.startLiveStory — [net-inert]");
         let _ = (
             privacy_rules,
             is_pinned,
@@ -1641,16 +1758,56 @@ pub trait StoryManagerEnv {
 
     /// `GetChatsToSendStoriesQuery::send` (StoryManager.cpp:5820).
     fn send_get_chats_to_send_stories_query(&mut self) {
-        tdutils::log_info!("Send channels.getChannelsToSendStories — [blocked: net]");
+        tdutils::log_info!("Send channels.getChannelsToSendStories — [net-inert]");
     }
 
     /// `StoryManager::EditBusinessStoryQuery::send`
-    /// (StoryManager.cpp:1656-1718) — [blocked: StoryContent → input
-    /// media + net] (the bot business edit always re-uploads; rides with
-    /// the StoryContent plane / net-drain 20).
-    fn send_edit_business_story_query(&mut self, pending_story: PendingStory) {
-        tdutils::log_info!("Send stories.editStory(business) — [blocked: net]");
-        let _ = pending_story;
+    /// (StoryManager.cpp:1676-1695) — `stories.editStory` with the
+    /// full media/areas/caption/privacy flags; the send story num keys
+    /// the parked `BeingEditedBusinessStory` (the kind rides it back at
+    /// the answer).
+    #[allow(clippy::too_many_arguments)]
+    fn send_edit_business_story_query(
+        &mut self,
+        dialog_id: DialogId,
+        story_id: StoryId,
+        input_media: telegram_api::InputMedia,
+        areas: &[MediaArea],
+        caption: &FormattedText,
+        privacy_rules: &UserPrivacySettingRules,
+        edit_story_num: u32,
+    ) {
+        let _ = (
+            dialog_id,
+            story_id,
+            input_media,
+            areas,
+            caption,
+            privacy_rules,
+            edit_story_num,
+        );
+        tdutils::log_info!("Send stories.editStory (business) — [net-inert]");
+    }
+
+    /// `td_->chat_manager_->get_channel_ids(chats, source)` — the
+    /// `on_get_dialogs_to_send_stories` channel extraction (the chats
+    /// land through the real intake).
+    fn get_channel_ids(&mut self, chats: Vec<telegram_api::Chat>, source: &str) -> Vec<i64> {
+        let _ = (chats, source);
+        Vec::new()
+    }
+
+    /// `get_story_content_input_media(td, content, input_file)`
+    /// (StoryContent.cpp:351-372) narrowed to the uploaded-input-file-less
+    /// form the collapsed edit send uses — the photo/video remote arms;
+    /// `None` is the fresh-upload band (the FileUploader plane).
+    fn get_story_content_input_media(
+        &mut self,
+        content: &StoryContent,
+    ) -> Option<telegram_api::InputMedia> {
+        let _ = content;
+        tdutils::log_info!("get_story_content_input_media — [net-inert]");
+        None
     }
 
     /// `EditStoryCoverQuery::send` (StoryManager.cpp:540-608) — [blocked:
@@ -1689,6 +1846,46 @@ pub struct PendingStory {
     pub random_id: i64,
     pub was_reuploaded: bool,
     pub story: Story,
+}
+
+/// The `process_updates_users_and_chats` legs the §3.5 Updates answers
+/// run (`UpdatesManager::process_updates_users_and_chats`,
+/// UpdatesManager.cpp:6617-6636) — the users/chats of the umbrella land
+/// through the env intakes (the full sink surface is the updates plane).
+fn on_updates_users_and_chats(env: &mut impl StoryManagerEnv, updates: &mut telegram_api::Updates) {
+    let (users, chats) = match updates {
+        telegram_api::Updates::updatesCombined(updates) => (
+            std::mem::take(&mut updates.users),
+            std::mem::take(&mut updates.chats),
+        ),
+        telegram_api::Updates::updates(updates) => (
+            std::mem::take(&mut updates.users),
+            std::mem::take(&mut updates.chats),
+        ),
+        _ => return,
+    };
+    env.on_get_users(users, "process_updates_users_and_chats");
+    env.on_get_chats(chats, "process_updates_users_and_chats");
+}
+
+/// The three `SearchStoriesQuery::send` arms (StoryManager.cpp:724-785)
+/// — one wire query (`stories.searchPosts`), three payload legs: the
+/// `searchPublicStoriesByTag` hashtag, the
+/// `searchPublicStoriesByLocation` geo-point address and the
+/// `searchPublicStoriesByVenue` provider/id pair.
+pub enum SearchStoriesArm<'a> {
+    /// The hashtag leg — the `#`/`$`-prefixed query string.
+    Hashtag { query: &'a str },
+    /// The location leg — the address the wire `mediaAreaGeoPoint`
+    /// carries.
+    Location {
+        address: &'a td_api::LocationAddress,
+    },
+    /// The venue leg.
+    Venue {
+        venue_provider: &'a str,
+        venue_id: &'a str,
+    },
 }
 
 /// The [`StoryManager::increment_story_views`] free-standing body — the
@@ -1898,6 +2095,30 @@ pub struct StoryManager {
     /// the query-carried promise restored per §5 (the interim answered
     /// `None` at the send).
     pending_repost_stories: Vec<Promise<Option<td_api::Story>>>,
+    /// The parked Reorder/DeleteStoryAlbumQuery promises — the Bool
+    /// answers of the §3.5 slice (kept off [`Self::pending_unit_queries`]
+    /// whose still-inert families must not settle on these answers).
+    pending_story_album_unit_queries: Vec<Promise<()>>,
+    /// The GetStoriesViewsQuery context queue — the handler's
+    /// `dialog_id_`/`story_ids_` members (the answer runs
+    /// `on_get_story_views` with them).
+    pending_get_stories_views: Vec<(DialogId, Vec<StoryId>)>,
+    /// The parked CreateStoryAlbumQuery promises (the handler member).
+    pending_create_story_albums: Vec<Promise<td_api::StoryAlbum>>,
+    /// The CreateStoryAlbumQuery context queue — the handler's
+    /// `owner_dialog_id_`/`story_ids_` members (the answer's
+    /// `update_story_albums` refire reads them).
+    pending_create_story_album_contexts: Vec<(DialogId, Vec<StoryId>)>,
+    /// The parked UpdateStoryAlbumQuery promises (the handler member).
+    pending_update_story_albums: Vec<Promise<td_api::StoryAlbum>>,
+    /// The UpdateStoryAlbumQuery context queue — the handler's
+    /// `owner_dialog_id_`/`story_album_id_`/`deleted_story_ids_`/
+    /// `added_story_ids_` members (the answer's id check and the error
+    /// tail's `update_story_albums` rollback read them).
+    pending_update_story_album_contexts: Vec<(DialogId, StoryAlbumId, Vec<StoryId>, Vec<StoryId>)>,
+    /// `being_edited_business_stories_` — the business edit's parked
+    /// rows keyed by the send story num.
+    being_edited_business_stories: HashMap<u32, BeingEditedBusinessStory>,
     /// `load_expired_database_stories_next_limit_`.
     load_expired_database_stories_next_limit: i32,
 }
@@ -5105,6 +5326,10 @@ impl StoryManager {
                 .or_default();
             *open_count += 1;
             if *open_count == 1 {
+                // the handler's `dialog_id_`/`story_ids_` members park for
+                // the answer's `on_get_story_views` intake
+                self.pending_get_stories_views
+                    .push((owner_dialog_id, vec![story_id]));
                 env.send_get_stories_views_query(owner_dialog_id, &[story_id]);
             }
         }
@@ -5250,6 +5475,10 @@ impl StoryManager {
                 story_full_id.get_dialog_id(),
                 &[story_full_id.get_story_id()],
             );
+            self.pending_get_stories_views.push((
+                story_full_id.get_dialog_id(),
+                vec![story_full_id.get_story_id()],
+            ));
         }
     }
 
@@ -6472,7 +6701,12 @@ impl StoryManager {
 
         let query = format!("{query_prefix}{hashtag}");
         self.pending_search_stories.push(promise);
-        env.send_search_stories_query(&query, &offset, limit);
+        env.send_search_stories_query(
+            dialog_id,
+            SearchStoriesArm::Hashtag { query: &query },
+            &offset,
+            limit,
+        );
     }
 
     /// `StoryManager::search_location_posts` (StoryManager.cpp:3216-3226).
@@ -6495,10 +6729,15 @@ impl StoryManager {
             promise.set_error(Status::error(400, "Address must be non-empty"));
             return;
         }
+        let address = address.expect("checked above");
 
         self.pending_search_stories.push(promise);
-        env.send_search_stories_query("location", &offset, limit);
-        let _ = address;
+        env.send_search_stories_query(
+            DialogId::default(),
+            SearchStoriesArm::Location { address: &address },
+            &offset,
+            limit,
+        );
     }
 
     /// `StoryManager::search_venue_posts` (StoryManager.cpp:3228-3238).
@@ -6520,7 +6759,15 @@ impl StoryManager {
         }
 
         self.pending_search_stories.push(promise);
-        env.send_search_stories_query(&format!("{venue_provider}:{venue_id}"), &offset, limit);
+        env.send_search_stories_query(
+            DialogId::default(),
+            SearchStoriesArm::Venue {
+                venue_provider: &venue_provider,
+                venue_id: &venue_id,
+            },
+            &offset,
+            limit,
+        );
     }
 
     /// `StoryManager::set_pinned_stories` (StoryManager.cpp:3264-3284).
@@ -6884,6 +7131,581 @@ impl StoryManager {
         }
     }
 
+    /// The GetStoryAlbumsQuery `albumsNotModified` answer
+    /// (StoryManager.cpp:982-984) — the empty album list value.
+    pub(crate) fn on_get_story_albums_not_modified(&mut self, owner_dialog_id: DialogId) {
+        let result = td_api::StoryAlbums::default();
+        if let Some(promises) = self.pending_story_albums.remove(&owner_dialog_id) {
+            for mut promise in promises {
+                promise.set_value(result.clone());
+            }
+        }
+    }
+
+    // ---- the net-drain 20 answer halves' manager legs (the C++
+    // ResultHandler on_result/on_error bodies of the §3.5 slice; the
+    // parse + the wire-error heads live in `Td::on_story_net_answer`) ----
+
+    /// The GetPinnedStoriesQuery error tail (StoryManager.cpp:461-465) —
+    /// the parked promises fail with the status.
+    pub(crate) fn fail_pinned_stories(&mut self, dialog_id: DialogId, status: Status) {
+        if let Some(promises) = self.pending_pinned_stories.remove(&dialog_id) {
+            for mut promise in promises {
+                promise.set_error(status.clone());
+            }
+        }
+    }
+
+    /// The GetStoriesArchiveQuery error tail (StoryManager.cpp:497-501).
+    pub(crate) fn fail_archive_stories(&mut self, dialog_id: DialogId, status: Status) {
+        if let Some(promises) = self.pending_archive_stories.remove(&dialog_id) {
+            for mut promise in promises {
+                promise.set_error(status.clone());
+            }
+        }
+    }
+
+    /// The GetStoryAlbumsQuery error tail (StoryManager.cpp:993-997).
+    pub(crate) fn fail_story_albums(&mut self, owner_dialog_id: DialogId, status: Status) {
+        if let Some(promises) = self.pending_story_albums.remove(&owner_dialog_id) {
+            for mut promise in promises {
+                promise.set_error(status.clone());
+            }
+        }
+    }
+
+    /// The GetAlbumStoriesQuery error tail (StoryManager.cpp:1027-1031).
+    pub(crate) fn fail_album_stories(
+        &mut self,
+        dialog_id: DialogId,
+        story_album_id: StoryAlbumId,
+        status: Status,
+    ) {
+        if let Some(promises) = self
+            .pending_album_stories
+            .remove(&(dialog_id, story_album_id))
+        {
+            for mut promise in promises {
+                promise.set_error(status.clone());
+            }
+        }
+    }
+
+    /// The GetStoriesViewsQuery context pop — the handler's
+    /// `dialog_id_`/`story_ids_` members for the answer intake.
+    pub(crate) fn take_get_stories_views_context(&mut self) -> Option<(DialogId, Vec<StoryId>)> {
+        if self.pending_get_stories_views.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_stories_views.remove(0))
+        }
+    }
+
+    /// The SearchStoriesQuery error tail (StoryManager.cpp:805-815) —
+    /// the `SEARCH_QUERY_EMPTY` band answers the empty value, the rest
+    /// fail the parked promises.
+    pub(crate) fn on_search_stories_error(&mut self, status: Status) {
+        let promises = std::mem::take(&mut self.pending_search_stories);
+        if status.message() == "SEARCH_QUERY_EMPTY" {
+            for mut promise in promises {
+                promise.set_value(td_api::FoundStories::default());
+            }
+            return;
+        }
+        for mut promise in promises {
+            promise.set_error(status.clone());
+        }
+    }
+
+    /// The SearchStoriesQuery answer (StoryManager.cpp:786-804) — the
+    /// users/chats land through the real intakes, every found story
+    /// through `on_get_story`, and the assembled `foundStories` value
+    /// settles the parked promises.
+    #[allow(clippy::boxed_local)] // the codegen boxes the found umbrella
+    pub(crate) fn on_search_stories(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        mut found_stories: Box<telegram_api::stories_FoundStories>,
+    ) {
+        env.on_get_users(
+            std::mem::take(&mut found_stories.users),
+            "SearchStoriesQuery",
+        );
+        env.on_get_chats(
+            std::mem::take(&mut found_stories.chats),
+            "SearchStoriesQuery",
+        );
+
+        let mut total_count = found_stories.count;
+        if total_count < found_stories.stories.len() as i32 {
+            tdutils::log_error!(
+                "Receive total count = {total_count} and {} stories",
+                found_stories.stories.len()
+            );
+            total_count = found_stories.stories.len() as i32;
+        }
+        let mut stories = Vec::new();
+        for found_story in found_stories.stories.iter() {
+            let owner_dialog_id = DialogId::from_peer(
+                found_story
+                    .peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            );
+            let story = found_story.story.clone().map(|boxed| *boxed);
+            let story_id = self.on_get_story(env, owner_dialog_id, story);
+            if story_id.is_valid() {
+                let story_object =
+                    self.get_story_object(env, StoryFullId::new(owner_dialog_id, story_id));
+                match story_object {
+                    Some(story_object) => stories.push(story_object),
+                    None => {
+                        tdutils::log_error!("Receive deleted {story_id} from {owner_dialog_id:?}")
+                    }
+                }
+            }
+        }
+        let result = td_api::FoundStories {
+            total_count,
+            stories,
+            next_offset: std::mem::take(&mut found_stories.next_offset),
+        };
+        let promises = std::mem::take(&mut self.pending_search_stories);
+        for mut promise in promises {
+            promise.set_value(result.clone());
+        }
+    }
+
+    /// The CreateStoryAlbumQuery error tail (StoryManager.cpp:1067-1071)
+    /// — the parked promise + context fail with the status.
+    pub(crate) fn on_create_story_album_error(&mut self, status: Status) {
+        if self.pending_create_story_album_contexts.is_empty() {
+            return;
+        }
+        self.pending_create_story_album_contexts.remove(0);
+        let mut promise = self.pending_create_story_albums.remove(0);
+        promise.set_error(status);
+    }
+
+    /// The CreateStoryAlbumQuery answer (StoryManager.cpp:1047-1066) —
+    /// the invalid-album 500 band runs the dialog-error head like the
+    /// C++ `on_error` re-entry; the ok band registers the album, adds
+    /// the stories and settles the promise with the album object.
+    pub(crate) fn on_create_story_album(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        story_album: telegram_api::StoryAlbum,
+    ) {
+        let Some((owner_dialog_id, story_ids)) =
+            self.pending_create_story_album_contexts.first().cloned()
+        else {
+            return;
+        };
+        let album =
+            crate::story_album::StoryAlbum::from_telegram(env, owner_dialog_id, story_album);
+        if !album.is_valid() {
+            let status = Status::error(500, "Receive invalid album");
+            env.on_get_dialog_error(owner_dialog_id, &status, "CreateStoryAlbumQuery");
+            self.on_create_story_album_error(status);
+            return;
+        }
+        self.update_story_albums(
+            env,
+            owner_dialog_id,
+            &story_ids,
+            album.get_story_album_id(),
+            true,
+        );
+        let album_object = album.get_story_album_object(env);
+        self.pending_create_story_album_contexts.remove(0);
+        let mut promise = self.pending_create_story_albums.remove(0);
+        promise.set_value(album_object);
+    }
+
+    /// The ReorderStoryAlbumsQuery/DeleteStoryAlbumQuery Bool answer —
+    /// the parked unit promises settle (the shared queue, FIFO per kind
+    /// — the §5 shape).
+    pub(crate) fn on_story_album_unit_ok(&mut self) {
+        let promises = std::mem::take(&mut self.pending_story_album_unit_queries);
+        for mut promise in promises {
+            promise.set_value(());
+        }
+    }
+
+    /// The ReorderStoryAlbumsQuery error tail (StoryManager.cpp:1088-1092)
+    /// / the DeleteStoryAlbumQuery one (StoryManager.cpp:1127-1131).
+    pub(crate) fn on_story_album_unit_error(&mut self, status: Status) {
+        let promises = std::mem::take(&mut self.pending_story_album_unit_queries);
+        for mut promise in promises {
+            promise.set_error(status.clone());
+        }
+    }
+
+    /// The UpdateStoryAlbumQuery error tail (StoryManager.cpp:1230-1240)
+    /// — the optimistic local album-story moves roll back
+    /// (`update_story_albums` with the handler members) before the
+    /// promise fails.
+    pub(crate) fn on_update_story_album_error(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        status: Status,
+    ) {
+        if self.pending_update_story_album_contexts.is_empty() {
+            return;
+        }
+        let (owner_dialog_id, story_album_id, deleted_story_ids, added_story_ids) =
+            self.pending_update_story_album_contexts.remove(0);
+        self.update_story_albums(
+            env,
+            owner_dialog_id,
+            &deleted_story_ids,
+            story_album_id,
+            true,
+        );
+        self.update_story_albums(
+            env,
+            owner_dialog_id,
+            &added_story_ids,
+            story_album_id,
+            false,
+        );
+        let mut promise = self.pending_update_story_albums.remove(0);
+        promise.set_error(status);
+    }
+
+    /// The front UpdateStoryAlbum context — the wire-error head reads
+    /// the owner dialog before the tail pops it.
+    pub(crate) fn peek_update_story_album_context(
+        &mut self,
+    ) -> Option<(DialogId, StoryAlbumId, Vec<StoryId>, Vec<StoryId>)> {
+        self.pending_update_story_album_contexts.first().cloned()
+    }
+
+    /// The UpdateStoryAlbumQuery answer (StoryManager.cpp:1213-1229) —
+    /// the id-mismatch band replays the error tail (the C++ `on_error`
+    /// re-entry with the 500), the ok band settles with the server
+    /// album object.
+    pub(crate) fn on_update_story_album(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        story_album: telegram_api::StoryAlbum,
+    ) {
+        let Some(&(owner_dialog_id, story_album_id, _, _)) =
+            self.pending_update_story_album_contexts.first()
+        else {
+            return;
+        };
+        let album =
+            crate::story_album::StoryAlbum::from_telegram(env, owner_dialog_id, story_album);
+        if album.get_story_album_id() != story_album_id {
+            let status = Status::error(500, "Receive invalid album");
+            env.on_get_dialog_error(owner_dialog_id, &status, "UpdateStoryAlbumQuery");
+            self.on_update_story_album_error(env, status);
+            return;
+        }
+        let album_object = album.get_story_album_object(env);
+        self.pending_update_story_album_contexts.remove(0);
+        let mut promise = self.pending_update_story_albums.remove(0);
+        promise.set_value(album_object);
+    }
+
+    /// `StoryManager::get_can_post_story_result_object` — the nullable
+    /// `force = false` overload the CanSendStory/StartLiveStory error
+    /// tails read (StoryManager.cpp:1325/:1562): the mapped bands answer
+    /// the value, anything else returns `None` and the tail forwards the
+    /// error.
+    pub(crate) fn try_get_can_post_story_result_object(
+        env: &mut impl StoryManagerEnv,
+        status: &Status,
+    ) -> Option<td_api::CanPostStoryResult> {
+        let message = status.message();
+        if message == "PREMIUM_ACCOUNT_REQUIRED" {
+            return Some(td_api::CanPostStoryResult::canPostStoryResultPremiumNeeded(
+                td_api::canPostStoryResultPremiumNeeded,
+            ));
+        }
+        if message == "BOOSTS_REQUIRED" {
+            return Some(td_api::CanPostStoryResult::canPostStoryResultBoostNeeded(
+                td_api::canPostStoryResultBoostNeeded,
+            ));
+        }
+        if message == "STORIES_TOO_MUCH" {
+            return Some(
+                td_api::CanPostStoryResult::canPostStoryResultActiveStoryLimitExceeded(
+                    td_api::canPostStoryResultActiveStoryLimitExceeded,
+                ),
+            );
+        }
+        for (prefix, monthly) in [
+            ("STORY_SEND_FLOOD_WEEKLY_", false),
+            ("STORY_SEND_FLOOD_MONTHLY_", true),
+        ] {
+            if let Some(tail) = message.strip_prefix(prefix)
+                && let Ok(next_date) = tail.parse::<i32>()
+                && next_date > 0
+            {
+                let retry_after = (next_date - env.unix_time()).max(0);
+                if retry_after > 0 {
+                    return Some(if monthly {
+                        td_api::CanPostStoryResult::canPostStoryResultMonthlyLimitExceeded(
+                            td_api::canPostStoryResultMonthlyLimitExceeded { retry_after },
+                        )
+                    } else {
+                        td_api::CanPostStoryResult::canPostStoryResultWeeklyLimitExceeded(
+                            td_api::canPostStoryResultWeeklyLimitExceeded { retry_after },
+                        )
+                    });
+                }
+                // the window elapsed (StoryManager.cpp:4298-4300) — the
+                // `canPostStoryResultOk(1)` value, not an error
+                return Some(td_api::CanPostStoryResult::canPostStoryResultOk(
+                    td_api::canPostStoryResultOk { story_count: 1 },
+                ));
+            }
+        }
+        if let Some(tail) = message.strip_prefix("STORY_LIVE_ALREADY_")
+            && let Ok(story_id) = tail.parse::<i32>()
+            && StoryId::new(story_id).is_server()
+        {
+            return Some(
+                td_api::CanPostStoryResult::canPostStoryResultLiveStoryIsActive(
+                    td_api::canPostStoryResultLiveStoryIsActive { story_id },
+                ),
+            );
+        }
+        None
+    }
+
+    /// The CanSendStoryQuery answer (StoryManager.cpp:1317-1321) — the
+    /// remaining-count value.
+    pub(crate) fn on_can_send_story(&mut self, count_remains: i32) {
+        let promises = std::mem::take(&mut self.pending_can_post_story);
+        for mut promise in promises {
+            promise.set_value(td_api::CanPostStoryResult::canPostStoryResultOk(
+                td_api::canPostStoryResultOk {
+                    story_count: count_remains,
+                },
+            ));
+        }
+    }
+
+    /// The CanSendStoryQuery error tail (StoryManager.cpp:1323-1334) —
+    /// the mapped bands answer the value, the rest run the head and
+    /// forward the error.
+    pub(crate) fn on_can_send_story_error(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        dialog_id: DialogId,
+        status: Status,
+    ) {
+        if let Some(result) = Self::try_get_can_post_story_result_object(env, &status) {
+            let promises = std::mem::take(&mut self.pending_can_post_story);
+            for mut promise in promises {
+                promise.set_value(result.clone());
+            }
+            return;
+        }
+        env.on_get_dialog_error(dialog_id, &status, "CanSendStoryQuery");
+        let promises = std::mem::take(&mut self.pending_can_post_story);
+        for mut promise in promises {
+            promise.set_error(status.clone());
+        }
+    }
+
+    /// The StartLiveStoryQuery answer (StoryManager.cpp:1532-1558) — the
+    /// users/chats land through the intakes, the extracted story through
+    /// `on_get_story`, and the ok value carries the story object; the
+    /// unexpected-answer bands fail with the C++ 400.
+    pub(crate) fn on_start_live_story(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        dialog_id: DialogId,
+        mut updates: Box<telegram_api::Updates>,
+    ) {
+        let promise = self.take_start_live_story_promise();
+        let Some(mut promise) = promise else {
+            return;
+        };
+        on_updates_users_and_chats(env, &mut updates);
+        let story = crate::updates_manager::extract_story(
+            &mut updates,
+            crate::chat_manager::DialogId::new(dialog_id.get()),
+            false,
+        );
+        let Some(story) = story else {
+            tdutils::log_error!("Receive unexpected live story: {updates:?}");
+            promise.set_error(Status::error(400, "Failed to create live story"));
+            return;
+        };
+        let story_id = self.on_get_story(env, dialog_id, Some(story));
+        if !story_id.is_valid() {
+            promise.set_error(Status::error(400, "Failed to create live story"));
+            return;
+        }
+        let story_object = self
+            .get_story_object(env, StoryFullId::new(dialog_id, story_id))
+            .expect("the story was just registered");
+        promise.set_value(td_api::StartLiveStoryResult::startLiveStoryResultOk(
+            td_api::startLiveStoryResultOk {
+                story: Some(story_object),
+            },
+        ));
+    }
+
+    /// The StartLiveStoryQuery error tail (StoryManager.cpp:1560-1569) —
+    /// the mapped bands answer `startLiveStoryResultFail` with the
+    /// value, the rest run the head and forward the error.
+    pub(crate) fn on_start_live_story_error(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        dialog_id: DialogId,
+        status: Status,
+    ) {
+        let promise = self.take_start_live_story_promise();
+        let Some(mut promise) = promise else {
+            return;
+        };
+        if let Some(result) = Self::try_get_can_post_story_result_object(env, &status) {
+            promise.set_value(td_api::StartLiveStoryResult::startLiveStoryResultFail(
+                td_api::startLiveStoryResultFail {
+                    error_type: Some(result),
+                },
+            ));
+            return;
+        }
+        env.on_get_dialog_error(dialog_id, &status, "StartLiveStoryQuery");
+        promise.set_error(status);
+    }
+
+    /// The parked `startLiveStory` promise pop (FIFO per kind).
+    fn take_start_live_story_promise(&mut self) -> Option<Promise<td_api::StartLiveStoryResult>> {
+        if self.pending_start_live_story.is_empty() {
+            None
+        } else {
+            Some(self.pending_start_live_story.remove(0))
+        }
+    }
+
+    /// `StoryManager::on_get_dialogs_to_send_stories`
+    /// (StoryManager.cpp:5862-5877).
+    pub fn on_get_dialogs_to_send_stories(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        chats: Vec<telegram_api::Chat>,
+    ) {
+        let channel_ids = env.get_channel_ids(chats, "on_get_dialogs_to_send_stories");
+        if self.channels_to_send_stories_inited && self.channels_to_send_stories == channel_ids {
+            return;
+        }
+        self.channels_to_send_stories.clear();
+        for channel_id in channel_ids {
+            env.force_create_dialog(
+                DialogId::from_channel_id(crate::chat_manager::ChannelId::new(channel_id)),
+                "on_get_dialogs_to_send_stories",
+                false,
+            );
+            if env.get_channel_status(channel_id).can_post_stories() {
+                self.channels_to_send_stories.push(channel_id);
+            }
+        }
+        self.channels_to_send_stories_inited = true;
+
+        self.save_channels_to_send_stories(env);
+    }
+
+    /// The GetChatsToSendStoriesQuery answer promise tail
+    /// (StoryManager.cpp:1288-1292) — after the intake refreshes the
+    /// channel list, every parked promise answers with the chat list.
+    pub(crate) fn on_get_dialogs_to_send_stories_result(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        chats: Vec<telegram_api::Chat>,
+    ) {
+        self.on_get_dialogs_to_send_stories(env, chats);
+        let channels = self.channels_to_send_stories.clone();
+        let promises = std::mem::take(&mut self.pending_dialogs_to_send_stories);
+        for promise in promises {
+            self.return_dialogs_to_send_stories(env, promise, &channels);
+        }
+    }
+
+    /// The EditBusinessStoryQuery answer
+    /// (`StoryManager::on_edit_business_story`, StoryManager.cpp:6441-6473)
+    /// — the extracted story must match the edited id; the ok value
+    /// carries the story object and the local row deletes after (the
+    /// C++ `on_delete_story` tail).
+    pub(crate) fn on_edit_business_story(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        send_story_num: u32,
+        mut updates: Box<telegram_api::Updates>,
+    ) {
+        let Some(edited) = self.being_edited_business_stories.remove(&send_story_num) else {
+            return;
+        };
+        let BeingEditedBusinessStory {
+            dialog_id,
+            story_id,
+            mut promise,
+            ..
+        } = edited;
+        on_updates_users_and_chats(env, &mut updates);
+        let story = crate::updates_manager::extract_story(
+            &mut updates,
+            crate::chat_manager::DialogId::new(dialog_id.get()),
+            true,
+        );
+        let Some(story) = story else {
+            tdutils::log_error!("Receive unexpected edit story result: {updates:?}");
+            promise.set_error(Status::error(400, "Failed to edit story"));
+            return;
+        };
+        let new_story_id = self.on_get_story(env, dialog_id, Some(story));
+        // the C++ tail runs `on_delete_story` after both branches
+        // (StoryManager.cpp:6466-6472)
+        let result = if new_story_id != story_id {
+            tdutils::log_error!("Receive unexpected {new_story_id} instead of {story_id}");
+            tdutils::status::Result::Err(Status::error(400, "Failed to edit story"))
+        } else {
+            let story_object = self
+                .get_story_object(env, StoryFullId::new(dialog_id, new_story_id))
+                .expect("the story was just registered");
+            tdutils::status::Result::Ok(Some(story_object))
+        };
+        promise.set_result(result);
+        self.on_delete_story(env, StoryFullId::new(dialog_id, story_id));
+    }
+
+    /// The EditBusinessStoryQuery error tail
+    /// (StoryManager.cpp:1703-1717) — the FILE_PART re-upload band rides
+    /// the FileUploader plane (the `on_send_story_file_parts_missing`
+    /// re-fire); the rest run the head, drop the pending story row and
+    /// fail the promise (`delete_pending_story`'s bot arm,
+    /// StoryManager.cpp:6534-6541 — the `updateStoryPostFailed` outbox
+    /// is the non-bot edit arm's, so the row drops without it).
+    pub(crate) fn on_edit_business_story_error(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        send_story_num: u32,
+        status: Status,
+    ) {
+        let Some(edited) = self.being_edited_business_stories.remove(&send_story_num) else {
+            return;
+        };
+        let BeingEditedBusinessStory {
+            dialog_id, promise, ..
+        } = edited;
+        let mut promise = promise;
+        assert!(env.is_bot());
+        tdutils::log_info!("Receive error for EditBusinessStoryQuery: {status}");
+        if !crate::files::get_missing_file_parts(&status).is_empty() {
+            tdutils::log_info!("on_send_story_file_parts_missing — [blocked: FileUploader]");
+            return;
+        }
+        env.on_get_dialog_error(dialog_id, &status, "EditBusinessStoryQuery");
+        promise.set_error(status);
+    }
+
     /// `StoryManager::get_story_album_stories`
     /// (StoryManager.cpp:3858-3884).
     pub fn get_story_album_stories(
@@ -7011,19 +7833,12 @@ impl StoryManager {
             promise.set_error(Status::error(400, "Story album name must be non-empty"));
             return;
         }
-        // the story album object promise parks like the C++
-        // CreateStoryAlbumQuery answer
-        let _ = self
-            .pending_story_albums
-            .entry(owner_dialog_id)
-            .or_default();
+        // the promise parks like the C++ handler member (the answer
+        // settles it with the server album)
+        self.pending_create_story_albums.push(promise);
+        self.pending_create_story_album_contexts
+            .push((owner_dialog_id, story_ids.to_vec()));
         env.send_create_story_album_query(owner_dialog_id, title, story_ids);
-        promise.set_value(td_api::StoryAlbum {
-            id: 0,
-            name: title.to_owned(),
-            photo_icon: None,
-            video_icon: None,
-        });
     }
 
     /// `StoryManager::reorder_story_albums` (StoryManager.cpp:3926-3933).
@@ -7047,7 +7862,7 @@ impl StoryManager {
             }
         }
         env.send_reorder_story_albums_query(owner_dialog_id, story_album_ids);
-        self.pending_unit_queries.push(promise);
+        self.pending_story_album_unit_queries.push(promise);
     }
 
     /// `StoryManager::delete_story_album` (StoryManager.cpp:3935-3939).
@@ -7069,7 +7884,7 @@ impl StoryManager {
             return;
         }
         env.send_delete_story_album_query(owner_dialog_id, story_album_id);
-        self.pending_unit_queries.push(promise);
+        self.pending_story_album_unit_queries.push(promise);
     }
 
     /// `StoryManager::set_story_album_title` (StoryManager.cpp:3941-3950).
@@ -7095,13 +7910,16 @@ impl StoryManager {
             promise.set_error(Status::error(400, "Story album name must be non-empty"));
             return;
         }
+        // the promise parks like the C++ handler member (the answer
+        // settles it with the server album)
+        self.pending_update_story_albums.push(promise);
+        self.pending_update_story_album_contexts.push((
+            owner_dialog_id,
+            story_album_id,
+            Vec::new(),
+            Vec::new(),
+        ));
         env.send_update_story_album_query(owner_dialog_id, story_album_id, title, &[], &[], &[]);
-        promise.set_value(td_api::StoryAlbum {
-            id: story_album_id.get(),
-            name: title.to_owned(),
-            photo_icon: None,
-            video_icon: None,
-        });
     }
 
     /// `StoryManager::add_story_album_stories` (StoryManager.cpp:3952-3961).
@@ -7129,13 +7947,17 @@ impl StoryManager {
             return;
         }
         self.update_story_albums(env, owner_dialog_id, story_ids, story_album_id, true);
+        // the promise parks like the C++ handler member; the optimistic
+        // local `update_story_albums(true)` above rolls back at the
+        // error tail (the handler's `deleted_story_ids_` member)
+        self.pending_update_story_albums.push(promise);
+        self.pending_update_story_album_contexts.push((
+            owner_dialog_id,
+            story_album_id,
+            Vec::new(),
+            story_ids.to_vec(),
+        ));
         env.send_update_story_album_query(owner_dialog_id, story_album_id, "", &[], story_ids, &[]);
-        promise.set_value(td_api::StoryAlbum {
-            id: story_album_id.get(),
-            name: String::new(),
-            photo_icon: None,
-            video_icon: None,
-        });
     }
 
     /// `StoryManager::remove_story_album_stories`
@@ -7165,13 +7987,17 @@ impl StoryManager {
             return;
         }
         self.update_story_albums(env, owner_dialog_id, story_ids, story_album_id, false);
+        // the promise parks like the C++ handler member; the optimistic
+        // local `update_story_albums(false)` above rolls back at the
+        // error tail (the handler's `added_story_ids_` member)
+        self.pending_update_story_albums.push(promise);
+        self.pending_update_story_album_contexts.push((
+            owner_dialog_id,
+            story_album_id,
+            story_ids.to_vec(),
+            Vec::new(),
+        ));
         env.send_update_story_album_query(owner_dialog_id, story_album_id, "", story_ids, &[], &[]);
-        promise.set_value(td_api::StoryAlbum {
-            id: story_album_id.get(),
-            name: String::new(),
-            photo_icon: None,
-            video_icon: None,
-        });
     }
 
     /// `StoryManager::reorder_story_album_stories`
@@ -7200,13 +8026,16 @@ impl StoryManager {
             promise.set_error(status);
             return;
         }
+        // the promise parks like the C++ handler member (the reorder arm
+        // carries no rollback members)
+        self.pending_update_story_albums.push(promise);
+        self.pending_update_story_album_contexts.push((
+            owner_dialog_id,
+            story_album_id,
+            Vec::new(),
+            Vec::new(),
+        ));
         env.send_update_story_album_query(owner_dialog_id, story_album_id, "", &[], &[], story_ids);
-        promise.set_value(td_api::StoryAlbum {
-            id: story_album_id.get(),
-            name: String::new(),
-            photo_icon: None,
-            video_icon: None,
-        });
     }
 
     /// `StoryManager::activate_stealth_mode` (StoryManager.cpp:3984-3986).
@@ -7418,21 +8247,6 @@ impl StoryManager {
         for mut promise in promises {
             promise.set_error(status.clone());
         }
-    }
-
-    /// `StoryManager::on_get_dialogs_to_send_stories`
-    /// (StoryManager.cpp:5862-5877) — the channel extraction rides the
-    /// [blocked: M.5 channel intake]; the interim hook only logs.
-    pub fn on_get_dialogs_to_send_stories(
-        &mut self,
-        env: &mut impl StoryManagerEnv,
-        chats: Vec<telegram_api::Chat>,
-    ) {
-        tdutils::log_info!(
-            "on_get_dialogs_to_send_stories({} chats) — [blocked: channel intake]",
-            chats.len()
-        );
-        let _ = env;
     }
 
     /// `StoryManager::save_channels_to_send_stories`
@@ -8038,6 +8852,16 @@ impl StoryManager {
         }
     }
 
+    /// `++send_story_count_` with the u32-wrap skip
+    /// (StoryManager.cpp:6417-6419).
+    fn next_send_story_num(&mut self) -> u32 {
+        self.send_story_count += 1;
+        if self.send_story_count == 0 {
+            self.send_story_count += 1;
+        }
+        self.send_story_count
+    }
+
     /// `StoryManager::edit_business_story` (StoryManager.cpp:6398-6439).
     /// The C++-faithful argument list (the convention's
     /// too_many_arguments note).
@@ -8087,25 +8911,38 @@ impl StoryManager {
             }
         };
 
-        // the EditBusinessStoryQuery send is [blocked: StoryContent →
-        // input media + net] (the bot business edit always re-uploads);
-        // the business edit applies locally like the C++ update path does
-        env.send_edit_business_story_query(PendingStory {
-            dialog_id: owner_dialog_id,
-            story_id,
-            forward_from_story_full_id: StoryFullId::default(),
-            send_story_num: 0,
-            random_id: 0,
-            was_reuploaded: false,
-            story: Story {
-                content: Some(content),
-                areas,
-                caption,
-                privacy_rules,
-                ..Story::default()
+        // the C++ parks `BeingEditedBusinessStory` keyed by the send
+        // story num, then rides the upload machine
+        // (`do_send_story`/`do_edit_story` — [blocked: FileUploader]);
+        // the upload leg collapses here onto the direct send when the
+        // content's file is already remote, and parks otherwise
+        let edit_story_num = self.next_send_story_num();
+        self.being_edited_business_stories.insert(
+            edit_story_num,
+            BeingEditedBusinessStory {
+                dialog_id: owner_dialog_id,
+                story_id,
+                content: content.clone(),
+                areas: areas.clone(),
+                caption: caption.clone(),
+                privacy_rules: privacy_rules.clone(),
+                promise,
             },
-        });
-        promise.set_value(None);
+        );
+        match env.get_story_content_input_media(&content) {
+            Some(input_media) => env.send_edit_business_story_query(
+                owner_dialog_id,
+                story_id,
+                input_media,
+                &areas,
+                &caption,
+                &privacy_rules,
+                edit_story_num,
+            ),
+            None => tdutils::log_info!(
+                "EditBusinessStoryQuery — the content file has no remote location; the upload rides the FileUploader plane"
+            ),
+        }
     }
 
     /// `StoryManager::edit_story_cover` (StoryManager.cpp:6491-6519).
