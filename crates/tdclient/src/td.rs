@@ -3963,6 +3963,11 @@ pub struct Td {
     /// `CountriesList { language_code_index }` kind payload — the kinds
     /// stay `Copy`; send-time registration, completion-time lookup).
     country_language_codes: Vec<std::sync::Arc<str>>,
+    /// The interned dialog-plane query strings (the
+    /// `ResolveUsername`/`SearchPublicDialogs` kind payloads — the
+    /// username/query of the family-queue key; send-time registration,
+    /// completion-time lookup).
+    pub(crate) dialog_net_strings: Vec<std::sync::Arc<str>>,
     /// The callback-parked `SendMessageQuery` answers, parked by the send
     /// identity (random_id, dialog).
     send_message_net_completed: Arc<Mutex<Vec<(i64, crate::messages_manager::DialogId, NetQuery)>>>,
@@ -4425,6 +4430,7 @@ impl Td {
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
+            dialog_net_strings: Vec::new(),
             send_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             net_dispatch_token: 1,
             my_id: 0,
@@ -10833,6 +10839,120 @@ impl Td {
                     promise,
                     "messages_setChatTheme",
                     "SetChatThemeQuery",
+                );
+            }
+            // `ResolveUsernameQuery` (DialogManager.cpp:131-159) — the
+            // resolvedPeer answer runs the users/chats intakes, then the
+            // `on_resolved_username` fan-out over the interned username's
+            // queue entry (the error path enters the same fan-out).
+            crate::dialog_manager::DialogNetKind::ResolveUsername { username_index } => {
+                let Some(username) = self
+                    .dialog_net_strings
+                    .get(username_index as usize)
+                    .cloned()
+                else {
+                    return;
+                };
+                let result: tdutils::status::Result<crate::messages_manager::DialogId> = if query
+                    .is_error()
+                {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::contacts_ResolvedPeer::parse(query.ok()) {
+                        Ok(mut resolved) => {
+                            let dialog_id = match resolved.peer.take() {
+                                Some(peer) => crate::messages_manager::DialogId::from_peer(&peer),
+                                None => crate::messages_manager::DialogId::default(),
+                            };
+                            self.intake_users(
+                                std::mem::take(&mut resolved.users),
+                                "ResolveUsernameQuery",
+                            );
+                            self.intake_chats(
+                                std::mem::take(&mut resolved.chats),
+                                "ResolveUsernameQuery",
+                            );
+                            tdutils::status::Result::Ok(dialog_id)
+                        }
+                        Err(_) => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the contacts.resolveUsername answer",
+                        )),
+                    }
+                };
+                crate::dialog_manager::on_resolved_username(self, &username, result);
+            }
+            // `SearchPublicDialogsQuery` (DialogManager.cpp:161-198) — the
+            // contacts_Found answer runs the users/chats intakes, then
+            // fills the two caches through `on_get_public_dialogs_search_result`;
+            // the error tail maps QUERY_TOO_SHORT to the empty success and
+            // everything else fails through `on_failed_public_dialogs_search`.
+            crate::dialog_manager::DialogNetKind::SearchPublicDialogs {
+                type_filter,
+                query_index,
+            } => {
+                let Some(query_string) = self.dialog_net_strings.get(query_index as usize).cloned()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !self.global.is_expected_error(&status) {
+                        if status.message() == "QUERY_TOO_SHORT" {
+                            return crate::dialog_manager::on_get_public_dialogs_search_result(
+                                self,
+                                &query_string,
+                                type_filter,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                        }
+                        tdutils::log_error!("Receive error for SearchPublicDialogsQuery: {status}");
+                    }
+                    return crate::dialog_manager::on_failed_public_dialogs_search(
+                        self,
+                        &query_string,
+                        type_filter,
+                        status,
+                    );
+                }
+                match telegram_api::contacts_Found::parse(query.ok()) {
+                    Ok(found) => {
+                        self.intake_users(found.users, "SearchPublicDialogsQuery");
+                        self.intake_chats(found.chats, "SearchPublicDialogsQuery");
+                        crate::dialog_manager::on_get_public_dialogs_search_result(
+                            self,
+                            &query_string,
+                            type_filter,
+                            found.my_results,
+                            found.results,
+                        );
+                    }
+                    Err(_) => crate::dialog_manager::on_failed_public_dialogs_search(
+                        self,
+                        &query_string,
+                        type_filter,
+                        Status::error(500, "Failed to parse the contacts.search answer"),
+                    ),
+                }
+            }
+            // `EditDialogPhotoQuery` (DialogManager.cpp:280-358) — the
+            // Updates answer re-enters `on_get_updates` with the promise;
+            // the error tail runs the CHAT_NOT_MODIFIED !bot value band
+            // and the dialog-error head (the `EditDialogTitleQuery`
+            // shape). The `delete_partial_remote_location`/
+            // file-reference re-upload halves of the handler tail ride
+            // the Files plane (the upload tail, M.20).
+            crate::dialog_manager::DialogNetKind::EditDialogPhoto { dialog_id } => {
+                let Some(promise) = self.dialog_manager.take_edit_dialog_photo_promise() else {
+                    return;
+                };
+                self.edit_updates_answer_tail(
+                    query,
+                    crate::dialog_id::DialogId::new(dialog_id.get()),
+                    promise,
+                    "messages_editChatPhoto",
+                    "EditDialogPhotoQuery",
                 );
             }
         }
@@ -43674,6 +43794,606 @@ mod tests {
         let error = error_of(&callback, 12);
         assert_eq!(error.code, 400);
         assert_eq!(error.message, "The chat can't have a username");
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn resolve_username_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(resolve_username_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn resolve_username_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-resolve-username");
+        let resolved_answer = |user_id: i64| {
+            let mut answer = Vec::new();
+            telegram_api::contacts_ResolvedPeer {
+                peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id,
+                })),
+                chats: Vec::new(),
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    id: user_id,
+                    flags: 1, // USER_ACCESS_HASH_MASK
+                    access_hash: 55,
+                    first_name: "Gif".to_owned(),
+                    ..telegram_api::user::default()
+                })],
+            }
+            .store_boxed(&mut answer);
+            answer
+        };
+
+        // 1. the short-prefix search parks on the resolve family queue —
+        //    "gi" is a prefix of the valid short username "gif"; one
+        //    contacts.resolveUsername owns the in-flight query
+        td.request(
+            1,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "gi".to_owned(),
+                type_filter: None,
+            }),
+        );
+        td.request(
+            2,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "gi".to_owned(),
+                type_filter: None,
+            }),
+        );
+        assert!(responses_of(&callback, 1).is_empty(), "the request parks");
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolveUsername::ID,
+        );
+        let body =
+            telegram_api::contacts_resolveUsername::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.username, "gif");
+
+        // 2. the answer resolves the user (the users intake lands the
+        //    access hash) and BOTH parked requests answer the chats object
+        net_complete(sent, resolved_answer(43));
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let gif_dialog =
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(43))
+                .get();
+        for n in [1, 2] {
+            match responses_of(&callback, n).first() {
+                Some(Object::chats(chats)) => {
+                    assert_eq!(chats.total_count, 1);
+                    assert_eq!(chats.chat_ids, vec![gif_dialog]);
+                }
+                other => panic!("request {n}: wrong answer {other:?}"),
+            }
+        }
+        assert_eq!(
+            td.dialog_manager.inaccessible_resolved_usernames.get("gif"),
+            Some(&crate::messages_manager::DialogId::from_user_id(
+                crate::user_manager::UserId::new(43),
+            ))
+        );
+
+        // 3. the cached resolve answers without a new query
+        td.request(
+            3,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "gi".to_owned(),
+                type_filter: None,
+            }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 3).first() {
+            Some(Object::chats(chats)) => assert_eq!(chats.chat_ids, vec![gif_dialog]),
+            other => panic!("request 3: wrong answer {other:?}"),
+        }
+        assert_not_sent(
+            &rec,
+            telegram_api::contacts_resolveUsername::ID,
+            "the cached resolve",
+        );
+
+        // 4. the resolve error band — USERNAME_NOT_OCCUPIED fails the
+        //    parked request and drops the cached username
+        td.request(
+            4,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "nf".to_owned(), // the prefix of "nft"
+                type_filter: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resolveUsername::ID,
+        );
+        net_fail(sent, 400, "USERNAME_NOT_OCCUPIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "USERNAME_NOT_OCCUPIED");
+        assert!(
+            !td.dialog_manager
+                .inaccessible_resolved_usernames
+                .contains_key("nft")
+        );
+
+        // 5. the video-chat reload arm (cpp:3276-3281) — a resolved
+        //    channel tagged by reload_video_chat_on_search rides
+        //    reload_channel_full's GetFullChannelQuery instead of
+        //    creating the dialog (the promise parks on that query)
+        seed_dialog_channel(&mut td, 710, true, true);
+        let reload_channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(710),
+        );
+        td.dialog_manager
+            .inaccessible_resolved_usernames
+            .insert("vid".to_string(), reload_channel_dialog);
+        crate::dialog_manager::reload_video_chat_on_search(&mut td, "vid");
+        let reload_slot = Arc::new(std::sync::Mutex::new(None));
+        let reload_capture = Arc::clone(&reload_slot);
+        let reload_promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<()>| {
+                *reload_capture.lock().unwrap() = Some(result);
+            },
+        );
+        let found_dialog =
+            crate::dialog_manager::search_public_dialog(&mut td, "@vid", false, reload_promise);
+        assert_eq!(found_dialog, crate::messages_manager::DialogId::default());
+        assert!(
+            reload_slot.lock().unwrap().is_none(),
+            "the promise rides the full reload"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getFullChannel::ID,
+        );
+        let body =
+            telegram_api::channels_getFullChannel::parse(sent.query()).expect("the sent body");
+        assert!(
+            matches!(&body.channel, Some(telegram_api::InputChannel::inputChannel(c)) if c.channel_id == 710)
+        );
+        assert!(
+            !td.dialog_manager
+                .reload_video_chat_on_search_usernames
+                .contains("vid")
+        );
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.dialog_manager.resolve_dialog_username_queries.is_empty(),
+            "the resolve queue drained"
+        );
+    }
+
+    #[test]
+    fn search_public_dialogs_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(search_public_dialogs_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn search_public_dialogs_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-search-public-dialogs");
+        let found_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::contacts_Found {
+                my_results: vec![telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 42,
+                })],
+                results: vec![telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 43,
+                })],
+                chats: Vec::new(),
+                users: vec![
+                    telegram_api::User::user(telegram_api::user {
+                        id: 42,
+                        flags: 1,
+                        access_hash: 61,
+                        first_name: "Mine".to_owned(),
+                        ..telegram_api::user::default()
+                    }),
+                    telegram_api::User::user(telegram_api::user {
+                        id: 43,
+                        flags: 1,
+                        access_hash: 62,
+                        first_name: "Public".to_owned(),
+                        ..telegram_api::user::default()
+                    }),
+                ],
+            }
+            .store_boxed(&mut answer);
+            answer
+        };
+        let dialog_of = |user_id: i64| {
+            crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                user_id,
+            ))
+            .get()
+        };
+
+        // 1. the long query parks on the search family queue and sends
+        //    contacts.search (limit 20, the unfiltered form)
+        td.request(
+            1,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "query".to_owned(),
+                type_filter: None,
+            }),
+        );
+        assert!(responses_of(&callback, 1).is_empty(), "the request parks");
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_search::ID,
+        );
+        let body = telegram_api::contacts_search::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.q, "query");
+        assert_eq!(body.limit, 20);
+        assert!(!body.broadcasts && !body.bots);
+
+        // 2. the answer fills the caches; the parked request answers the
+        //    public half (the results peers)
+        net_complete(sent, found_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::chats(chats)) => {
+                assert_eq!(chats.total_count, 1);
+                assert_eq!(chats.chat_ids, vec![dialog_of(43)]);
+            }
+            other => panic!("request 1: wrong answer {other:?}"),
+        }
+
+        // 3. the cached public search answers locally (no new query)
+        td.request(
+            2,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "query".to_owned(),
+                type_filter: None,
+            }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::chats(chats)) => assert_eq!(chats.chat_ids, vec![dialog_of(43)]),
+            other => panic!("request 2: wrong answer {other:?}"),
+        }
+        assert_not_sent(&rec, telegram_api::contacts_search::ID, "the cache hit");
+
+        // 4. the on-server search reads the my_results half with the
+        //    limit truncation (still no new query)
+        td.request(
+            3,
+            Function::searchChatsOnServer(td_api::searchChatsOnServer {
+                query: "query".to_owned(),
+                type_filter: None,
+                limit: 1,
+            }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 3).first() {
+            Some(Object::chats(chats)) => {
+                assert_eq!(chats.total_count, 1);
+                assert_eq!(chats.chat_ids, vec![dialog_of(42)]);
+            }
+            other => panic!("request 3: wrong answer {other:?}"),
+        }
+
+        // 5. the QUERY_TOO_SHORT band answers the empty success
+        td.request(
+            4,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "toolongforshort".to_owned(),
+                type_filter: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_search::ID,
+        );
+        net_fail(sent, 400, "QUERY_TOO_SHORT");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 4).first() {
+            Some(Object::chats(chats)) => assert!(chats.chat_ids.is_empty()),
+            other => panic!("request 4: wrong answer {other:?}"),
+        }
+
+        // 6. the plain error band fails the parked request and leaves the
+        //    negative cache (the next search answers locally, empty)
+        td.request(
+            6,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "failing".to_owned(),
+                type_filter: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_search::ID,
+        );
+        net_fail(sent, 500, "Timeout");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Timeout");
+        td.request(
+            7,
+            Function::searchPublicChats(td_api::searchPublicChats {
+                query: "failing".to_owned(),
+                type_filter: None,
+            }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 7).first() {
+            Some(Object::chats(chats)) => assert!(chats.chat_ids.is_empty()),
+            other => panic!("request 7: wrong answer {other:?}"),
+        }
+        assert_not_sent(
+            &rec,
+            telegram_api::contacts_search::ID,
+            "the negative cache",
+        );
+
+        assert!(td.dialog_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.dialog_manager
+                .search_public_dialogs_queries
+                .iter()
+                .all(|queue| queue.is_empty()),
+            "the search queues drained"
+        );
+        assert!(
+            td.dialog_manager.pending_search_dialogs_requests.is_empty(),
+            "the parked requests drained"
+        );
+    }
+
+    #[test]
+    fn edit_dialog_photo_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(edit_dialog_photo_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn edit_dialog_photo_query_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-edit-dialog-photo");
+        seed_dialog_chats(&mut td);
+        seed_dialog_user(&mut td);
+        // a creator megagroup — the rights gate passes
+        seed_dialog_channel(&mut td, 706, true, true);
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(706),
+        )
+        .get();
+        let member_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+        let user_dialog = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        };
+
+        // 1. the null photo (the delete form) — channels.editPhoto with
+        //    the inputChannel and inputChatPhotoEmpty
+        td.request(
+            1,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: channel_dialog,
+                photo: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editPhoto::ID,
+        );
+        let body = telegram_api::channels_editPhoto::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.photo,
+            Some(telegram_api::InputChatPhoto::inputChatPhotoEmpty(_))
+        ));
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the CHAT_NOT_MODIFIED !bot value band
+        td.request(
+            2,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: channel_dialog,
+                photo: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editPhoto::ID,
+        );
+        net_fail(sent, 400, "CHAT_NOT_MODIFIED");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the plain error band surfaces the error
+        td.request(
+            3,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: channel_dialog,
+                photo: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editPhoto::ID,
+        );
+        net_fail(sent, 400, "CHAT_ID_INVALID");
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "CHAT_ID_INVALID");
+
+        // 4. the rights band — a member channel answers the 400 before the
+        //    query
+        td.request(
+            4,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: member_dialog,
+                photo: None,
+            }),
+        );
+        let error = error_of(&callback, 4);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Not enough rights to change chat photo");
+
+        // 5. the user band
+        td.request(
+            5,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: user_dialog,
+                photo: None,
+            }),
+        );
+        let error = error_of(&callback, 5);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Can't change private chat photo");
+
+        // 6. the sticker form over a seeded custom emoji — the
+        //    VIDEO_EMOJI_MARKUP wire (the videoSizeEmojiMarkup payload)
+        td.stickers_manager.custom_emoji_to_sticker_id.insert(
+            crate::stickers_manager::CustomEmojiId::new(7),
+            Default::default(),
+        );
+        td.request(
+            6,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: channel_dialog,
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoSticker(
+                    td_api::inputChatPhotoSticker {
+                        sticker: Some(td_api::ChatPhotoSticker {
+                            r#type: Some(
+                                td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                                    td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 7 },
+                                ),
+                            ),
+                            background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
+                                td_api::backgroundFillSolid { color: 0xFF0000 },
+                            )),
+                        }),
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_editPhoto::ID,
+        );
+        let body = telegram_api::channels_editPhoto::parse(sent.query()).expect("the sent body");
+        match body.photo {
+            Some(telegram_api::InputChatPhoto::inputChatUploadedPhoto(uploaded)) => {
+                assert_eq!(
+                    uploaded.flags & (1 << 3),
+                    1 << 3,
+                    "the VIDEO_EMOJI_MARKUP bit"
+                );
+                match uploaded.video_emoji_markup {
+                    Some(telegram_api::VideoSize::videoSizeEmojiMarkup(markup)) => {
+                        assert_eq!(markup.emoji_id, 7);
+                        assert_eq!(markup.background_colors, vec![0xFF0000]);
+                    }
+                    other => panic!("the emoji markup: {other:?}"),
+                }
+            }
+            other => panic!("the uploaded photo form: {other:?}"),
+        }
+        net_complete(sent, updates_answer());
+        td.dispatch_completed_dialog_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. the unloaded stickers surface answers the local 400 (the
+        //    custom emoji band)
+        td.request(
+            7,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: channel_dialog,
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoSticker(
+                    td_api::inputChatPhotoSticker {
+                        sticker: Some(td_api::ChatPhotoSticker {
+                            r#type: Some(
+                                td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                                    td_api::chatPhotoStickerTypeCustomEmoji {
+                                        custom_emoji_id: 999,
+                                    },
+                                ),
+                            ),
+                            background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
+                                td_api::backgroundFillSolid { color: 0xFF0000 },
+                            )),
+                        }),
+                    },
+                )),
+            }),
+        );
+        let error = error_of(&callback, 7);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Custom emoji not found");
+
+        // 8. the static form parks at the Files upload tail (no query)
+        td.request(
+            8,
+            Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: channel_dialog,
+                photo: Some(td_api::InputChatPhoto::inputChatPhotoStatic(
+                    td_api::inputChatPhotoStatic {
+                        photo: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                            id: 5,
+                        })),
+                    },
+                )),
+            }),
+        );
+        let error = error_of(&callback, 8);
+        assert_eq!(error.code, 500);
+        assert_eq!(error.message, "Network is not implemented yet");
+        assert_not_sent(
+            &rec,
+            telegram_api::channels_editPhoto::ID,
+            "the upload tail",
+        );
 
         assert!(td.dialog_net_completed.lock().is_empty(), "drained");
     }
