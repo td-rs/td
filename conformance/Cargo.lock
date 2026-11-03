@@ -1660,10 +1660,10 @@ dependencies = [
  "serde",
  "tdactor",
  "tddb",
+ "tde2e",
  "tdmtproto",
  "tdnet",
  "tdutils",
- "tl-codegen",
  "tokio",
  "tracing",
 ]
@@ -1677,6 +1677,13 @@ dependencies = [
  "rusqlite",
  "tdutils",
  "tracing",
+]
+
+[[package]]
+name = "tde2e"
+version = "0.1.0"
+dependencies = [
+ "tdutils",
 ]
 
 [[package]]
@@ -1694,7 +1701,6 @@ dependencies = [
  "base64",
  "tdnet",
  "tdutils",
- "tl-codegen",
  "tokio",
 ]
 
