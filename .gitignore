@@ -12,3 +12,6 @@ fuzz/fuzz-week.log
 
 # codegraph tool cache
 /.codegraph/
+
+# local cargo timing scratch dir
+/target-timings/
