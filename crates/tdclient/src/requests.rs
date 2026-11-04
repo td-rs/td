@@ -6037,6 +6037,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 &mut manager,
                 dialog_list_id,
                 request.limit,
+                None, // the promise rides the td-level wrapper
             );
             td.messages_manager = manager;
             match result {
