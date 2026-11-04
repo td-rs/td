@@ -718,6 +718,14 @@ impl AuthManager {
         self.update_state(State::Ok);
     }
 
+    /// Test-only: the bot-token flag (the bot-only request arms — e.g.
+    /// `setPassportElementErrors` — need it without the sign-in flow; the
+    /// real transition rides the bot-token answer's is_bot pass-through).
+    #[cfg(test)]
+    pub(crate) fn force_bot_for_test(&mut self) {
+        self.is_bot = true;
+    }
+
     /// The api_id/api_hash half of `setTdlibParameters` (Td passes them
     /// through after its own validation).
     pub fn set_api_credentials(&mut self, api_id: i32, api_hash: String) {
