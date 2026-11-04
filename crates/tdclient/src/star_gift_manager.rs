@@ -51,6 +51,13 @@
 //!   `updates_manager_->on_get_updates` and the StarManager pending
 //!   balance, so their on_result halves stay parked with the net step
 //!   (see the module divergences).
+//!   The §3.6 collections/offers/promo slice (the private
+//!   StarGiftNetKind plane) rides the manager net handle instead: those
+//!   sends construct the wire queries at the manager send sites and
+//!   their answers drain through `Td::on_star_gift_net_answer` (the
+//!   Updates-typed answers — the offers, the resale-price update — ride
+//!   the um bridge; the promo-animation object rides the animations
+//!   plane, answering the zeroed object like the C++ null value).
 //!
 //! Recorded divergences:
 //! - The three `get_*_promise` statics (StarGiftManager.cpp:777-822,
@@ -3063,12 +3070,31 @@ pub trait StarGiftEnv {
         UserId::default()
     }
 
-    // -- the [blocked: net] query seams; the promise parks in the manager --
-
-    /// `CheckCanSendGiftQuery::send` (StarGiftManager.cpp:146-148).
-    fn send_check_can_send_gift_query(&mut self, gift_id: i64) {
-        tdutils::log_info!("Send payments.checkCanSendGift(gift_id = {gift_id}) — [blocked: net]");
+    /// `td_->documents_manager_->on_get_document(document, DialogId(),
+    /// false, false, nullptr, Document::Type::Animation)`
+    /// (StarGiftManager.cpp:2371-2373) — the promo-animation video
+    /// intake; the files plane default registers nothing (the parsed
+    /// document stays type-Unknown, so the section video takes the
+    /// not-an-Animation band exactly like the C++ on an unparsable
+    /// document).
+    fn on_get_document(&mut self, _document: telegram_api::document) -> crate::document::Document {
+        tdutils::log_info!("DocumentsManager::on_get_document — [blocked: files plane]");
+        crate::document::Document::default()
     }
+
+    /// `td_->animations_manager_->get_animation_object(file_id)`
+    /// (StarGiftManager.cpp:2381) — the animations record parks at the
+    /// M.20 integration (`create_animation` is the collapsed seam), so
+    /// the object stays absent until that plane lands.
+    fn get_animation_object(
+        &mut self,
+        _file_id: crate::files::FileId,
+    ) -> Option<td_api::Animation> {
+        tdutils::log_info!("get_animation_object — [blocked: animations integration]");
+        None
+    }
+
+    // -- the [blocked: net] query seams; the promise parks in the manager --
 
     /// `GetGiftPaymentFormQuery::send` (StarGiftManager.cpp:234-241) —
     /// the send-gift payment chain head; the invoice bits ride the log
@@ -3084,27 +3110,6 @@ pub trait StarGiftEnv {
         tdutils::log_info!(
             "Send payments.getPaymentForm for the star gift {gift_id} (star_count = {star_count}, \
              is_private = {is_private}, pay_for_upgrade = {pay_for_upgrade}, has_message = {has_message}) — [blocked: net]"
-        );
-    }
-
-    /// `ToggleStarGiftsPinnedToTopQuery::send` (StarGiftManager.cpp:573-581).
-    fn send_toggle_star_gifts_pinned_to_top_query(&mut self, star_gift_ids: &[StarGiftId]) {
-        tdutils::log_info!(
-            "Send payments.toggleStarGiftsPinnedToTop({} gifts) — [blocked: net]",
-            star_gift_ids.len()
-        );
-    }
-
-    /// `ToggleChatStarGiftNotificationsQuery::send`
-    /// (StarGiftManager.cpp:606-612).
-    fn send_toggle_chat_star_gift_notifications_query(
-        &mut self,
-        dialog_id: DialogId,
-        are_enabled: bool,
-    ) {
-        tdutils::log_info!(
-            "Send payments.toggleChatStarGiftNotifications(dialog {}, enabled = {are_enabled}) — [blocked: net]",
-            dialog_id.get()
         );
     }
 
@@ -3145,76 +3150,6 @@ pub trait StarGiftEnv {
         tdutils::log_info!("Send the gift resale payment chain for {gift_name} — [blocked: net]");
     }
 
-    /// `SendStarGiftOfferQuery::send` (StarGiftManager.cpp:1584-1598).
-    fn send_send_star_gift_offer_query(&mut self, gift_name: &str) {
-        tdutils::log_info!("Send payments.sendStarGiftOffer for {gift_name} — [blocked: net]");
-    }
-
-    /// `ResolveStarGiftOfferQuery::send` (StarGiftManager.cpp:1629-1632).
-    fn send_resolve_star_gift_offer_query(&mut self, server_message_id: i32, decline: bool) {
-        tdutils::log_info!(
-            "Send payments.resolveStarGiftOffer(message {}, decline = {decline}) — [blocked: net]",
-            server_message_id
-        );
-    }
-
-    /// `UpdateStarGiftPriceQuery::send` (StarGiftManager.cpp:1962-1969).
-    fn send_update_star_gift_price_query(&mut self, star_gift_id: &StarGiftId) {
-        let _ = star_gift_id;
-        tdutils::log_info!("Send payments.updateStarGiftPrice — [blocked: net]");
-    }
-
-    /// `GetStarGiftCollectionsQuery::send` (StarGiftManager.cpp:2139-2144).
-    fn send_get_star_gift_collections_query(&mut self, dialog_id: DialogId) {
-        tdutils::log_info!(
-            "Send payments.getStarGiftCollections(dialog {}) — [blocked: net]",
-            dialog_id.get()
-        );
-    }
-
-    /// `CreateStarGiftCollectionQuery::send` (StarGiftManager.cpp:2188-2195).
-    fn send_create_star_gift_collection_query(&mut self, dialog_id: DialogId, title: &str) {
-        tdutils::log_info!(
-            "Send payments.createStarGiftCollection(dialog {}, title = {title}) — [blocked: net]",
-            dialog_id.get()
-        );
-    }
-
-    /// `ReorderStarGiftCollectionsQuery::send`
-    /// (StarGiftManager.cpp:2224-2232).
-    fn send_reorder_star_gift_collections_query(&mut self, dialog_id: DialogId) {
-        tdutils::log_info!(
-            "Send payments.reorderStarGiftCollections(dialog {}) — [blocked: net]",
-            dialog_id.get()
-        );
-    }
-
-    /// `DeleteStarGiftCollectionQuery::send` (StarGiftManager.cpp:2258-2263).
-    fn send_delete_star_gift_collection_query(&mut self, dialog_id: DialogId) {
-        tdutils::log_info!(
-            "Send payments.deleteStarGiftCollection(dialog {}) — [blocked: net]",
-            dialog_id.get()
-        );
-    }
-
-    /// `UpdateStarGiftCollectionQuery::send` (StarGiftManager.cpp:2290-2314).
-    fn send_update_star_gift_collection_query(
-        &mut self,
-        dialog_id: DialogId,
-        collection_id: StarGiftCollectionId,
-    ) {
-        tdutils::log_info!(
-            "Send payments.updateStarGiftCollection(dialog {}, collection {}) — [blocked: net]",
-            dialog_id.get(),
-            collection_id.get()
-        );
-    }
-
-    /// `GetStarGiftPromoAnimationQuery::send` (StarGiftManager.cpp:2343-2345).
-    fn send_get_star_gift_promo_animation_query(&mut self) {
-        tdutils::log_info!("Send help.getPremiumPromo — [blocked: net]");
-    }
-
     /// `MessagesManager::get_message_from_server(message_full_id, ...)`
     /// — the gift-message poll ([blocked: M.6]).
     fn get_message_from_server(&mut self, message_full_id: crate::message_id::MessageFullId) {
@@ -3226,12 +3161,14 @@ pub trait StarGiftEnv {
 }
 
 /// The StarGiftManager in-flight query kinds — the C++ ResultHandler
-/// classes of the §3.6 catalog/transformation families
-/// (StarGiftManager.cpp:51-2055): the kinds carry the Copy handler
-/// members the answer halves read (the dialog ids for the
-/// `on_get_dialog_error` heads, the full-list flag); the non-Copy
-/// handler state (the promises) parks in the manager's per-family
-/// queues beside them — the §5 FIFO-per-kind convention.
+/// classes of the §3.6 families (StarGiftManager.cpp:51-2383 — the
+/// catalog/transformation sixteen of net-drain 21 plus the
+/// collections/offers/promo twelve of net-drain 22): the kinds carry
+/// the Copy handler members the answer halves read (the dialog ids for
+/// the `on_get_dialog_error` heads, the full-list flag); the non-Copy
+/// handler state (the promises, the resale price) parks in the
+/// manager's per-family queues beside them — the §5 FIFO-per-kind
+/// convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StarGiftNetKind {
     /// `GetStarGiftsQuery` (StarGiftManager.cpp:51).
@@ -3279,6 +3216,44 @@ pub(crate) enum StarGiftNetKind {
     GetStarGiftWithdrawalUrl,
     /// `GetResaleStarGiftsQuery` (StarGiftManager.cpp:1988).
     GetResaleStarGifts,
+    /// `CheckCanSendGiftQuery` (StarGiftManager.cpp:140).
+    CheckCanSendGift,
+    /// `ToggleStarGiftsPinnedToTopQuery` (StarGiftManager.cpp:565) — the
+    /// handler's `dialog_id_` member (the error head).
+    ToggleStarGiftsPinnedToTop { dialog_id: DialogId },
+    /// `ToggleChatStarGiftNotificationsQuery` (StarGiftManager.cpp:589)
+    /// — the handler's `dialog_id_` member (the error head).
+    ToggleChatStarGiftNotifications { dialog_id: DialogId },
+    /// `SendStarGiftOfferQuery` (StarGiftManager.cpp:1575) — the
+    /// handler's `dialog_id_` member; the `price_`/
+    /// `paid_message_star_count_` members park beside the promise (the
+    /// star-balance pendings re-add them on the answer).
+    SendStarGiftOffer { dialog_id: DialogId },
+    /// `ResolveStarGiftOfferQuery` (StarGiftManager.cpp:1617).
+    ResolveStarGiftOffer,
+    /// `UpdateStarGiftPriceQuery` (StarGiftManager.cpp:1955).
+    UpdateStarGiftPrice,
+    /// `GetStarGiftCollectionsQuery` (StarGiftManager.cpp:2128) — the
+    /// handler's `dialog_id_` member (the error head).
+    GetStarGiftCollections { dialog_id: DialogId },
+    /// `CreateStarGiftCollectionQuery` (StarGiftManager.cpp:2178) — the
+    /// handler's `dialog_id_` member (the error head).
+    CreateStarGiftCollection { dialog_id: DialogId },
+    /// `ReorderStarGiftCollectionsQuery` (StarGiftManager.cpp:2216) —
+    /// the handler's `dialog_id_` member (the error head).
+    ReorderStarGiftCollections { dialog_id: DialogId },
+    /// `DeleteStarGiftCollectionQuery` (StarGiftManager.cpp:2249) — the
+    /// handler's `dialog_id_` member (the error head).
+    DeleteStarGiftCollection { dialog_id: DialogId },
+    /// `UpdateStarGiftCollectionQuery` (StarGiftManager.cpp:2280) — the
+    /// one wire query behind the title/add/remove/reorder-gifts arms;
+    /// the handler's `dialog_id_` member (the error head).
+    UpdateStarGiftCollection { dialog_id: DialogId },
+    /// `GetStarGiftPromoAnimationQuery` (StarGiftManager.cpp:2341) —
+    /// sends `help.getPremiumPromo`; its own kind per the ownership
+    /// decision (PremiumNetKind's GetPremiumPromo serves the C++
+    /// Premium.cpp:312 handler, this one the gifts-animation handler).
+    GetStarGiftPromoAnimation,
 }
 
 /// The `get_gift_craft_promise` fail-arm chain (StarGiftManager.cpp:1090-1095)
@@ -3305,6 +3280,17 @@ impl tdutils::promise::PromiseInterface<()> for CraftFailChain {
 }
 
 // --- the manager ---
+
+/// `payments.updateStarGiftCollection` flag bits — the C++
+/// `TITLE_MASK`/`DELETE_STARGIFT_MASK`/`ADD_STARGIFT_MASK`/
+/// `ORDER_MASK` (StarGiftManager.cpp:2299-2308).
+const TITLE_MASK: i32 = 1;
+const DELETE_STARGIFT_MASK: i32 = 1 << 1;
+const ADD_STARGIFT_MASK: i32 = 1 << 2;
+const ORDER_MASK: i32 = 1 << 3;
+/// `payments.sendStarGiftOffer::ALLOW_PAID_STARS_MASK`
+/// (StarGiftManager.cpp:1592-1594) — flags.0 carries allow_paid_stars.
+const ALLOW_PAID_STARS_MASK: i32 = 1;
 
 /// A parked `get_gift_auction_state` continuation: the C++
 /// `PromiseCreator::lambda([actor_id, ...])(r_state)` chains collapsed
@@ -3383,6 +3369,22 @@ struct PendingQueries {
     /// `finish_gift_craft` half (the M.6 plane; the SendStory-tail park
     /// convention).
     pending_finish_gift_craft: Vec<Promise<td_api::CraftGiftResult>>,
+    /// The parked `ToggleStarGiftsPinnedToTopQuery` promises (the §3.6
+    /// net slice — kept off [`Self::unit_answers`] whose still-inert
+    /// families must not settle on these answers).
+    toggle_star_gifts_pinned_to_top: Vec<Promise<()>>,
+    /// The parked `ToggleChatStarGiftNotificationsQuery` promises.
+    toggle_chat_star_gift_notifications: Vec<Promise<()>>,
+    /// The parked `SendStarGiftOfferQuery` promises with the handler's
+    /// non-Copy members — `(price_, paid_message_star_count_, promise)`;
+    /// the answer halves re-add the star-balance pendings through them.
+    send_star_gift_offer: Vec<(StarGiftResalePrice, i64, Promise<()>)>,
+    /// The parked `UpdateStarGiftPriceQuery` promises.
+    update_star_gift_price: Vec<Promise<()>>,
+    /// The parked `ReorderStarGiftCollectionsQuery` promises.
+    reorder_star_gift_collections: Vec<Promise<()>>,
+    /// The parked `DeleteStarGiftCollectionQuery` promises.
+    delete_star_gift_collection: Vec<Promise<()>>,
 }
 
 /// The port of `td::StarGiftManager` (StarGiftManager.h:41-261).
@@ -3573,11 +3575,18 @@ impl StarGiftManager {
     /// `StarGiftManager::can_send_gift` (StarGiftManager.cpp:2442-2444).
     pub fn can_send_gift(
         &mut self,
-        env: &mut impl StarGiftEnv,
+        _env: &mut impl StarGiftEnv,
         gift_id: i64,
         promise: Promise<td_api::CanSendGiftResult>,
     ) {
-        env.send_check_can_send_gift_query(gift_id);
+        // `CheckCanSendGiftQuery::send` (StarGiftManager.cpp:146-148)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::CheckCanSendGift,
+            telegram_api::Function::payments_checkCanSendGift(
+                telegram_api::payments_checkCanSendGift { gift_id },
+            ),
+            "payments.checkCanSendGift",
+        );
         self.pending.can_send_gift.push(promise);
     }
 
@@ -3619,6 +3628,49 @@ impl StarGiftManager {
         for mut query in pending {
             query.set_value(answer.clone());
         }
+    }
+
+    /// Settle one Bool-answer unit family — the C++ `on_result` ignores
+    /// the Bool payload entirely (the fetch fails only on the wire
+    /// error), so any parsed Bool settles the promise and the error
+    /// fails it (StarGiftManager.cpp:584-612, 2234-2280).
+    fn settle_unit_family(pending: &mut Vec<Promise<()>>, result: &Result<(), Status>) {
+        for mut promise in std::mem::take(pending) {
+            match result {
+                Ok(()) => promise.set_value(()),
+                Err(status) => promise.set_error(status.clone()),
+            }
+        }
+    }
+
+    /// `ToggleStarGiftsPinnedToTopQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:584-599).
+    pub(crate) fn on_get_toggle_star_gifts_pinned_to_top(&mut self, result: Result<(), Status>) {
+        Self::settle_unit_family(&mut self.pending.toggle_star_gifts_pinned_to_top, &result);
+    }
+
+    /// `ToggleChatStarGiftNotificationsQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:614-625).
+    pub(crate) fn on_get_toggle_chat_star_gift_notifications(
+        &mut self,
+        result: Result<(), Status>,
+    ) {
+        Self::settle_unit_family(
+            &mut self.pending.toggle_chat_star_gift_notifications,
+            &result,
+        );
+    }
+
+    /// `ReorderStarGiftCollectionsQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:2234-2243).
+    pub(crate) fn on_get_reorder_gift_collections(&mut self, result: Result<(), Status>) {
+        Self::settle_unit_family(&mut self.pending.reorder_star_gift_collections, &result);
+    }
+
+    /// `DeleteStarGiftCollectionQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:2271-2280).
+    pub(crate) fn on_get_delete_gift_collection(&mut self, result: Result<(), Status>) {
+        Self::settle_unit_family(&mut self.pending.delete_star_gift_collection, &result);
     }
 
     /// `StarGiftManager::send_gift` (StarGiftManager.cpp:2446-2485) — the
@@ -4530,8 +4582,27 @@ impl StarGiftManager {
         if let Err(status) = self.check_star_gift_ids(env, &star_gift_ids, dialog_id) {
             return promise.set_error(status);
         }
-        env.send_toggle_star_gifts_pinned_to_top_query(&star_gift_ids);
-        self.pending.unit_answers.push(promise);
+        // `ToggleStarGiftsPinnedToTopQuery::send`
+        // (StarGiftManager.cpp:573-581) — the post-access-check peer
+        // resolution is the C++ CHECK; the unreachable band keeps the
+        // access error.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::ToggleStarGiftsPinnedToTop { dialog_id },
+            telegram_api::Function::payments_toggleStarGiftsPinnedToTop(
+                telegram_api::payments_toggleStarGiftsPinnedToTop {
+                    peer: Some(Box::new(input_peer)),
+                    stargift: StarGiftId::get_input_saved_star_gifts(env, &star_gift_ids)
+                        .into_iter()
+                        .map(|gift| gift.expect("the saved star gift resolves"))
+                        .collect(),
+                },
+            ),
+            "payments.toggleStarGiftsPinnedToTop",
+        );
+        self.pending.toggle_star_gifts_pinned_to_top.push(promise);
     }
 
     /// `StarGiftManager::toggle_chat_star_gift_notifications`
@@ -4553,8 +4624,27 @@ impl StarGiftManager {
         {
             return promise.set_error(Status::error(400, "Wrong chat specified"));
         }
-        env.send_toggle_chat_star_gift_notifications_query(dialog_id, are_enabled);
-        self.pending.unit_answers.push(promise);
+        // `ToggleChatStarGiftNotificationsQuery::send`
+        // (StarGiftManager.cpp:606-612) — the post-access-check peer
+        // resolution is the C++ CHECK; the unreachable band keeps the
+        // access error.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::ToggleChatStarGiftNotifications { dialog_id },
+            telegram_api::Function::payments_toggleChatStarGiftNotifications(
+                telegram_api::payments_toggleChatStarGiftNotifications {
+                    flags: 0,
+                    enabled: are_enabled,
+                    peer: Some(Box::new(input_peer)),
+                },
+            ),
+            "payments.toggleChatStarGiftNotifications",
+        );
+        self.pending
+            .toggle_chat_star_gift_notifications
+            .push(promise);
     }
 
     // -- the upgrade plane --
@@ -5112,6 +5202,13 @@ impl StarGiftManager {
         if !env.have_dialog_force(owner_dialog_id, "send_gift_offer") {
             return promise.set_error(Status::error(400, "Can't access the chat"));
         }
+        // `td_->dialog_manager_->have_input_peer(owner_dialog_id, false,
+        // AccessRights::Read)` (StarGiftManager.cpp:3118-3120) — the C++
+        // gates the peer BEFORE any star-balance pending moves; the
+        // port's `get_input_peer` carries the same resolution
+        let Some(input_peer) = env.get_input_peer(owner_dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
         if paid_message_star_count < 0 {
             return promise.set_error(Status::error(
                 400,
@@ -5127,14 +5224,40 @@ impl StarGiftManager {
             return promise.set_error(Status::error(400, "Have not enough funds"));
         }
         env.add_pending_owned_amount(&price, -1, false);
-        env.send_send_star_gift_offer_query(gift_name);
-        self.pending.unit_answers.push(promise);
+        // `SendStarGiftOfferQuery::send` (StarGiftManager.cpp:1584-1598)
+        // — the ALLOW_PAID_STARS flag rides the paid star count; the
+        // random id is `Random::secure_int64()`.
+        let flags = if paid_message_star_count > 0 {
+            ALLOW_PAID_STARS_MASK
+        } else {
+            0
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::SendStarGiftOffer {
+                dialog_id: owner_dialog_id,
+            },
+            telegram_api::Function::payments_sendStarGiftOffer(
+                telegram_api::payments_sendStarGiftOffer {
+                    flags,
+                    peer: Some(Box::new(input_peer)),
+                    slug: gift_name.to_owned(),
+                    price: Some(price.get_input_stars_amount()),
+                    duration,
+                    random_id: tdutils::random::secure_int64(),
+                    allow_paid_stars: paid_message_star_count,
+                },
+            ),
+            "payments.sendStarGiftOffer",
+        );
+        self.pending
+            .send_star_gift_offer
+            .push((price, paid_message_star_count, promise));
     }
 
     /// `StarGiftManager::process_gift_offer` (StarGiftManager.cpp:3137-3142).
     pub fn process_gift_offer(
         &mut self,
-        env: &mut impl StarGiftEnv,
+        _env: &mut impl StarGiftEnv,
         message_id: i64,
         decline: bool,
         mut promise: Promise<()>,
@@ -5150,8 +5273,72 @@ impl StarGiftManager {
                 "Invalid offer message identifier specified",
             ));
         }
-        env.send_resolve_star_gift_offer_query((message_id >> SERVER_ID_SHIFT) as i32, decline);
+        // `ResolveStarGiftOfferQuery::send`
+        // (StarGiftManager.cpp:1629-1632).
+        self.send_star_gift_net_query(
+            StarGiftNetKind::ResolveStarGiftOffer,
+            telegram_api::Function::payments_resolveStarGiftOffer(
+                telegram_api::payments_resolveStarGiftOffer {
+                    flags: 0,
+                    decline,
+                    offer_msg_id: (message_id >> SERVER_ID_SHIFT) as i32,
+                },
+            ),
+            "payments.resolveStarGiftOffer",
+        );
         self.pending.resolve_star_gift_offer.push(promise);
+    }
+
+    /// `SendStarGiftOfferQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:1601-1615) — the ok half re-adds the
+    /// star-balance pendings and hands the Updates answer + promise to
+    /// the um bridge; the error half (the wire error and the parse
+    /// failure alike, the §5 landed-flip convention) re-adds the
+    /// pendings and fails the promise (the `on_get_dialog_error` head
+    /// runs at the dispatcher arm for the wire errors).
+    pub(crate) fn on_get_send_star_gift_offer(
+        &mut self,
+        env: &mut impl StarGiftEnv,
+        result: Result<telegram_api::Updates, Status>,
+    ) -> Option<(telegram_api::Updates, Promise<()>)> {
+        if self.pending.send_star_gift_offer.is_empty() {
+            return None;
+        }
+        let (price, paid_message_star_count, mut promise) =
+            self.pending.send_star_gift_offer.remove(0);
+        match result {
+            Ok(updates) => {
+                env.add_pending_owned_star_count(paid_message_star_count, true);
+                env.add_pending_owned_amount(&price, 1, true);
+                Some((updates, promise))
+            }
+            Err(status) => {
+                env.add_pending_owned_star_count(paid_message_star_count, false);
+                env.add_pending_owned_amount(&price, 1, false);
+                promise.set_error(status);
+                None
+            }
+        }
+    }
+
+    /// `ResolveStarGiftOfferQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:1639-1648) — the Updates answer rides the um
+    /// bridge with the promise.
+    pub(crate) fn on_get_resolve_star_gift_offer(
+        &mut self,
+        result: Result<telegram_api::Updates, Status>,
+    ) -> Option<(telegram_api::Updates, Promise<()>)> {
+        if self.pending.resolve_star_gift_offer.is_empty() {
+            return None;
+        }
+        let mut promise = self.pending.resolve_star_gift_offer.remove(0);
+        match result {
+            Ok(updates) => Some((updates, promise)),
+            Err(status) => {
+                promise.set_error(status);
+                None
+            }
+        }
     }
 
     // -- the saved-gifts plane --
@@ -5662,9 +5849,43 @@ impl StarGiftManager {
         if !star_gift_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
         }
-        let _ = price;
-        env.send_update_star_gift_price_query(&star_gift_id);
-        self.pending.unit_answers.push(promise);
+        // `UpdateStarGiftPriceQuery::send`
+        // (StarGiftManager.cpp:1962-1969) — the unresolvable gift is
+        // the send-leg `on_error` band.
+        let Some(input_gift) = star_gift_id.get_input_saved_star_gift(env) else {
+            return promise.set_error(Status::error(400, "Gift not found"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::UpdateStarGiftPrice,
+            telegram_api::Function::payments_updateStarGiftPrice(
+                telegram_api::payments_updateStarGiftPrice {
+                    stargift: Some(input_gift),
+                    resell_amount: Some(price.get_input_stars_amount()),
+                },
+            ),
+            "payments.updateStarGiftPrice",
+        );
+        self.pending.update_star_gift_price.push(promise);
+    }
+
+    /// `UpdateStarGiftPriceQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:1971-1981) — the Updates answer rides the um
+    /// bridge with the promise.
+    pub(crate) fn on_get_update_star_gift_price(
+        &mut self,
+        result: Result<telegram_api::Updates, Status>,
+    ) -> Option<(telegram_api::Updates, Promise<()>)> {
+        if self.pending.update_star_gift_price.is_empty() {
+            return None;
+        }
+        let mut promise = self.pending.update_star_gift_price.remove(0);
+        match result {
+            Ok(updates) => Some((updates, promise)),
+            Err(status) => {
+                promise.set_error(status);
+                None
+            }
+        }
     }
 
     /// `StarGiftManager::get_resale_star_gifts` (StarGiftManager.cpp:3224-3238).
@@ -5870,7 +6091,23 @@ impl StarGiftManager {
         if let Err(status) = env.check_dialog_access(dialog_id, "get_gift_collections") {
             return promise.set_error(status);
         }
-        env.send_get_star_gift_collections_query(dialog_id);
+        // `GetStarGiftCollectionsQuery::send`
+        // (StarGiftManager.cpp:2139-2144) — the post-access-check peer
+        // resolution is the C++ CHECK; the unreachable band keeps the
+        // access error.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGiftCollections { dialog_id },
+            telegram_api::Function::payments_getStarGiftCollections(
+                telegram_api::payments_getStarGiftCollections {
+                    peer: Some(Box::new(input_peer)),
+                    hash: 0,
+                },
+            ),
+            "payments.getStarGiftCollections",
+        );
         self.pending.gift_collections.push(promise);
     }
 
@@ -5933,7 +6170,27 @@ impl StarGiftManager {
         if let Err(status) = self.check_star_gift_ids(env, &star_gift_ids, dialog_id) {
             return promise.set_error(status);
         }
-        env.send_create_star_gift_collection_query(dialog_id, title);
+        // `CreateStarGiftCollectionQuery::send`
+        // (StarGiftManager.cpp:2188-2195) — the post-access-check peer
+        // resolution is the C++ CHECK; the unreachable band keeps the
+        // access error.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::CreateStarGiftCollection { dialog_id },
+            telegram_api::Function::payments_createStarGiftCollection(
+                telegram_api::payments_createStarGiftCollection {
+                    peer: Some(Box::new(input_peer)),
+                    title: title.to_owned(),
+                    stargift: StarGiftId::get_input_saved_star_gifts(env, &star_gift_ids)
+                        .into_iter()
+                        .map(|gift| gift.expect("the checked saved star gift resolves"))
+                        .collect(),
+                },
+            ),
+            "payments.createStarGiftCollection",
+        );
         self.pending.gift_collection.push(promise);
     }
 
@@ -5979,8 +6236,22 @@ impl StarGiftManager {
                 ));
             }
         }
-        env.send_reorder_star_gift_collections_query(dialog_id);
-        self.pending.unit_answers.push(promise);
+        // `ReorderStarGiftCollectionsQuery::send`
+        // (StarGiftManager.cpp:2224-2232).
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::ReorderStarGiftCollections { dialog_id },
+            telegram_api::Function::payments_reorderStarGiftCollections(
+                telegram_api::payments_reorderStarGiftCollections {
+                    peer: Some(Box::new(input_peer)),
+                    order: collection_ids.iter().map(|id| id.get()).collect(),
+                },
+            ),
+            "payments.reorderStarGiftCollections",
+        );
+        self.pending.reorder_star_gift_collections.push(promise);
     }
 
     /// `StarGiftManager::delete_gift_collection` (StarGiftManager.cpp:3268-3276).
@@ -6000,8 +6271,22 @@ impl StarGiftManager {
                 "Invalid collection identifier specified",
             ));
         }
-        env.send_delete_star_gift_collection_query(dialog_id);
-        self.pending.unit_answers.push(promise);
+        // `DeleteStarGiftCollectionQuery::send`
+        // (StarGiftManager.cpp:2258-2263).
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::DeleteStarGiftCollection { dialog_id },
+            telegram_api::Function::payments_deleteStarGiftCollection(
+                telegram_api::payments_deleteStarGiftCollection {
+                    peer: Some(Box::new(input_peer)),
+                    collection_id: collection_id.get(),
+                },
+            ),
+            "payments.deleteStarGiftCollection",
+        );
+        self.pending.delete_star_gift_collection.push(promise);
     }
 
     /// `StarGiftManager::set_gift_collection_title` (StarGiftManager.cpp:3278-3291).
@@ -6025,7 +6310,27 @@ impl StarGiftManager {
         if title.is_empty() {
             return promise.set_error(Status::error(400, "Gift collection name must be non-empty"));
         }
-        env.send_update_star_gift_collection_query(dialog_id, collection_id);
+        // `UpdateStarGiftCollectionQuery::send`
+        // (StarGiftManager.cpp:2290-2314) — the title arm sets only
+        // TITLE_MASK.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::UpdateStarGiftCollection { dialog_id },
+            telegram_api::Function::payments_updateStarGiftCollection(
+                telegram_api::payments_updateStarGiftCollection {
+                    flags: TITLE_MASK,
+                    peer: Some(Box::new(input_peer)),
+                    collection_id: collection_id.get(),
+                    title: title.to_owned(),
+                    delete_stargift: Vec::new(),
+                    add_stargift: Vec::new(),
+                    order: Vec::new(),
+                },
+            ),
+            "payments.updateStarGiftCollection",
+        );
         self.pending.gift_collection.push(promise);
     }
 
@@ -6053,7 +6358,30 @@ impl StarGiftManager {
         if let Err(status) = self.check_star_gift_ids(env, &star_gift_ids, dialog_id) {
             return promise.set_error(status);
         }
-        env.send_update_star_gift_collection_query(dialog_id, collection_id);
+        // `UpdateStarGiftCollectionQuery::send`
+        // (StarGiftManager.cpp:2290-2314) — the add arm sets only
+        // ADD_STARGIFT_MASK.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::UpdateStarGiftCollection { dialog_id },
+            telegram_api::Function::payments_updateStarGiftCollection(
+                telegram_api::payments_updateStarGiftCollection {
+                    flags: ADD_STARGIFT_MASK,
+                    peer: Some(Box::new(input_peer)),
+                    collection_id: collection_id.get(),
+                    title: String::new(),
+                    delete_stargift: Vec::new(),
+                    add_stargift: StarGiftId::get_input_saved_star_gifts(env, &star_gift_ids)
+                        .into_iter()
+                        .map(|gift| gift.expect("the checked saved star gift resolves"))
+                        .collect(),
+                    order: Vec::new(),
+                },
+            ),
+            "payments.updateStarGiftCollection",
+        );
         self.pending.gift_collection.push(promise);
     }
 
@@ -6078,7 +6406,30 @@ impl StarGiftManager {
         if star_gift_ids.is_empty() {
             return promise.set_error(Status::error(400, "Gift list must be non-empty"));
         }
-        env.send_update_star_gift_collection_query(dialog_id, collection_id);
+        // `UpdateStarGiftCollectionQuery::send`
+        // (StarGiftManager.cpp:2290-2314) — the remove arm sets only
+        // DELETE_STARGIFT_MASK.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::UpdateStarGiftCollection { dialog_id },
+            telegram_api::Function::payments_updateStarGiftCollection(
+                telegram_api::payments_updateStarGiftCollection {
+                    flags: DELETE_STARGIFT_MASK,
+                    peer: Some(Box::new(input_peer)),
+                    collection_id: collection_id.get(),
+                    title: String::new(),
+                    delete_stargift: StarGiftId::get_input_saved_star_gifts(env, &star_gift_ids)
+                        .into_iter()
+                        .map(|gift| gift.expect("the saved star gift resolves"))
+                        .collect(),
+                    add_stargift: Vec::new(),
+                    order: Vec::new(),
+                },
+            ),
+            "payments.updateStarGiftCollection",
+        );
         self.pending.gift_collection.push(promise);
     }
 
@@ -6103,7 +6454,30 @@ impl StarGiftManager {
         if star_gift_ids.is_empty() {
             return promise.set_error(Status::error(400, "Gift list must be non-empty"));
         }
-        env.send_update_star_gift_collection_query(dialog_id, collection_id);
+        // `UpdateStarGiftCollectionQuery::send`
+        // (StarGiftManager.cpp:2290-2314) — the reorder arm sets only
+        // ORDER_MASK.
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        };
+        self.send_star_gift_net_query(
+            StarGiftNetKind::UpdateStarGiftCollection { dialog_id },
+            telegram_api::Function::payments_updateStarGiftCollection(
+                telegram_api::payments_updateStarGiftCollection {
+                    flags: ORDER_MASK,
+                    peer: Some(Box::new(input_peer)),
+                    collection_id: collection_id.get(),
+                    title: String::new(),
+                    delete_stargift: Vec::new(),
+                    add_stargift: Vec::new(),
+                    order: StarGiftId::get_input_saved_star_gifts(env, &star_gift_ids)
+                        .into_iter()
+                        .map(|gift| gift.expect("the saved star gift resolves"))
+                        .collect(),
+                },
+            ),
+            "payments.updateStarGiftCollection",
+        );
         self.pending.gift_collection.push(promise);
     }
 
@@ -6123,11 +6497,72 @@ impl StarGiftManager {
     /// (StarGiftManager.cpp:3338-3340).
     pub fn get_star_gift_promo_animation(
         &mut self,
-        env: &mut impl StarGiftEnv,
+        _env: &mut impl StarGiftEnv,
         promise: Promise<td_api::Animation>,
     ) {
-        env.send_get_star_gift_promo_animation_query();
+        // `GetStarGiftPromoAnimationQuery::send`
+        // (StarGiftManager.cpp:2343-2345) — the refire rides its own
+        // kind (the ownership decision at the enum).
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGiftPromoAnimation,
+            telegram_api::Function::help_getPremiumPromo(telegram_api::help_getPremiumPromo),
+            "help.getPremiumPromo",
+        );
         self.pending.star_gift_promo_animation.push(promise);
+    }
+
+    /// `GetStarGiftPromoAnimationQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:2347-2381) — the users intake, then the
+    /// first `"gifts"`-section video parsed as an Animation. The
+    /// document/animation halves ride the animations plane (the §4
+    /// cross-plane row), so until it lands every section video takes
+    /// the not-an-Animation band and the promise settles the Rust
+    /// default animation — the `set_value(nullptr)` shape (a divergence
+    /// note: the C++ null answer maps to the zeroed object).
+    pub fn on_get_star_gift_promo_animation(
+        &mut self,
+        env: &mut impl StarGiftEnv,
+        result: Result<telegram_api::help_PremiumPromo, Status>,
+    ) {
+        let pending = std::mem::take(&mut self.pending.star_gift_promo_animation);
+        let Ok(promo) = result else {
+            let status = result.unwrap_err();
+            for mut query in pending {
+                query.set_error(status.clone());
+            }
+            return;
+        };
+        env.on_get_users(promo.users, "GetStarGiftPromoAnimationQuery");
+        let mut answer = td_api::Animation::default();
+        for (i, section) in promo.video_sections.iter().enumerate() {
+            if i >= promo.videos.len() {
+                break;
+            }
+            if section != "gifts" {
+                continue;
+            }
+            let video = &promo.videos[i];
+            match video {
+                telegram_api::Document::document(document) => {
+                    let parsed_document = env.on_get_document(document.clone());
+                    if parsed_document.type_ != crate::document::DocumentType::Animation {
+                        tdutils::log_error!("Receive {:?} for {section}", parsed_document.type_);
+                        break;
+                    }
+                    if let Some(animation) = env.get_animation_object(parsed_document.file_id) {
+                        answer = animation;
+                    }
+                    break;
+                }
+                other => {
+                    tdutils::log_error!("Receive {other:?} for {section}");
+                    break;
+                }
+            }
+        }
+        for mut query in pending {
+            query.set_value(answer.clone());
+        }
     }
 
     // -- the gift-message polling registry --
@@ -6273,6 +6708,12 @@ mod tests {
         next_document_id: i64,
         owned_star_count: i64,
         gift_counts: Vec<String>,
+        // the star-balance pending call log (the send-offer ordering
+        // band: the peer gate must run before any pending move)
+        star_pending_calls: Vec<String>,
+        // the dialogs whose peer resolution fails while
+        // `have_dialog_force` still passes (the M.6.15a stub split)
+        no_peer_dialogs: Vec<i64>,
     }
 
     impl Default for TestEnv {
@@ -6291,6 +6732,8 @@ mod tests {
                 next_document_id: 100,
                 owned_star_count: i64::MAX,
                 gift_counts: Vec::new(),
+                star_pending_calls: Vec::new(),
+                no_peer_dialogs: Vec::new(),
             }
         }
     }
@@ -6374,7 +6817,7 @@ mod tests {
         }
 
         fn get_input_peer(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
-            if dialog_id.is_valid() {
+            if dialog_id.is_valid() && !self.no_peer_dialogs.contains(&dialog_id.get()) {
                 Some(telegram_api::InputPeer::inputPeerEmpty(
                     telegram_api::inputPeerEmpty {},
                 ))
@@ -6471,8 +6914,20 @@ mod tests {
             self.owned_star_count >= star_count
         }
 
-        fn send_check_can_send_gift_query(&mut self, gift_id: i64) {
-            self.queries.push(format!("checkCanSendGift:{gift_id}"));
+        fn add_pending_owned_star_count(&mut self, star_count: i64, is_successful: bool) {
+            self.star_pending_calls
+                .push(format!("stars {star_count}:{is_successful}"));
+        }
+
+        fn add_pending_owned_amount(
+            &mut self,
+            price: &StarGiftResalePrice,
+            count: i64,
+            is_successful: bool,
+        ) {
+            self.star_pending_calls
+                .push(format!("amount {}:{}", price.amount, count));
+            let _ = is_successful;
         }
     }
 
@@ -7176,8 +7631,9 @@ mod tests {
         let mut manager = StarGiftManager::new();
         let (promise, recorded) = recording_promise();
         manager.can_send_gift(&mut env, 5, promise);
-        assert_eq!(env.queries, vec!["checkCanSendGift:5"]);
-
+        // the wire send rides the net handle (net-inert here — the
+        // constructor assert lives in the td.rs netted test); the
+        // answer half drives the family round-trip
         manager.on_get_can_send_gift_result(
             &mut env,
             Result::Ok(
@@ -7815,7 +8271,9 @@ mod tests {
             promise,
         );
         assert!(recorded.value().is_none());
-        assert_eq!(manager.pending.unit_answers.len(), 1);
+        assert_eq!(manager.pending.send_star_gift_offer.len(), 1);
+        let (_, paid_message_star_count, _) = &manager.pending.send_star_gift_offer[0];
+        assert_eq!(*paid_message_star_count, 5);
     }
 
     #[test]
@@ -8217,7 +8675,7 @@ mod tests {
         assert!(recorded.value().is_none());
         assert_eq!(manager.pending.star_gift_withdrawal_url.len(), 1);
 
-        // the price update parks
+        // the price update parks (the slug gift resolves its input form)
         let (promise, recorded) = recording_promise();
         manager.set_star_gift_price(
             &mut env,
@@ -8226,7 +8684,23 @@ mod tests {
             promise,
         );
         assert!(recorded.value().is_none());
-        assert_eq!(manager.pending.unit_answers.len(), 1);
+        assert_eq!(manager.pending.update_star_gift_price.len(), 1);
+
+        // the unresolvable gift keeps the send-leg band (the
+        // `UpdateStarGiftPriceQuery::send` on_error); the peer-resolution
+        // miss needs a dialog-typed id — covered by the td.rs netted test
+        // over the Td env's unseeded user
+        let (promise, recorded) = recording_promise();
+        manager.set_star_gift_price(
+            &mut env,
+            StarGiftId::from_dialog(DialogId::default(), 3),
+            StarGiftResalePrice::legacy(5),
+            promise,
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Invalid gift identifier specified"
+        );
     }
 
     #[test]
@@ -8481,6 +8955,201 @@ mod tests {
         manager.get_star_gift_promo_animation(&mut env, promise);
         assert!(recorded.value().is_none());
         assert_eq!(manager.pending.star_gift_promo_animation.len(), 1);
+
+        // the answer runs the users intake and the gifts-section scan;
+        // the animations plane keeps the object default (the C++ null
+        // value band)
+        manager.on_get_star_gift_promo_animation(
+            &mut env,
+            Result::Ok(telegram_api::help_PremiumPromo {
+                status_text: String::new(),
+                status_entities: Vec::new(),
+                video_sections: vec!["other".to_owned(), "gifts".to_owned()],
+                videos: vec![
+                    telegram_api::Document::documentEmpty(telegram_api::documentEmpty { id: 0 }),
+                    telegram_api::Document::document(telegram_api::document::default()),
+                ],
+                period_options: Vec::new(),
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    id: 42,
+                    ..telegram_api::user::default()
+                })],
+            }),
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|query| query == "GetStarGiftPromoAnimationQuery:1 users")
+        );
+        assert!(matches!(
+            recorded.value().expect("answered").expect("ok"),
+            td_api::Animation { .. }
+        ));
+
+        // the error band fails the promise
+        let (promise, recorded) = recording_promise();
+        manager.get_star_gift_promo_animation(&mut env, promise);
+        manager.on_get_star_gift_promo_animation(
+            &mut env,
+            Result::Err(Status::error(420, "FLOOD_WAIT_5")),
+        );
+        assert_eq!(recorded.value().expect("answered").unwrap_err().code(), 420);
+    }
+
+    #[test]
+    fn send_gift_offer_peer_gate_precedes_the_star_pendings() {
+        // the C++ have_input_peer gate (StarGiftManager.cpp:3118-3120)
+        // runs BEFORE any star-balance pending move — the M.6.15a stub
+        // split (force passes, the peer doesn't) must error without
+        // touching the balance
+        let dialog_id = DialogId::from_user_id(UserId::new(42));
+        let mut env = TestEnv {
+            no_peer_dialogs: vec![dialog_id.get()],
+            ..TestEnv::default()
+        };
+        let mut manager = StarGiftManager::new();
+        let (promise, recorded) = recording_promise();
+        manager.send_gift_offer(
+            &mut env,
+            dialog_id,
+            "slug",
+            StarGiftResalePrice::legacy(200),
+            60,
+            5,
+            promise,
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Can't access the chat"
+        );
+        assert!(
+            env.star_pending_calls.is_empty(),
+            "the peer gate precedes the pendings"
+        );
+    }
+
+    #[test]
+    fn offer_and_unit_answers_settle() {
+        let mut env = TestEnv::default();
+        let mut manager = StarGiftManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(42));
+        let empty_updates = || {
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+        };
+
+        // the send-offer ok half hands the Updates answer + promise to
+        // the um bridge
+        let (promise, _) = recording_promise();
+        manager.send_gift_offer(
+            &mut env,
+            dialog_id,
+            "slug",
+            StarGiftResalePrice::legacy(200),
+            60,
+            5,
+            promise,
+        );
+        let pending = manager.on_get_send_star_gift_offer(&mut env, Result::Ok(empty_updates()));
+        assert!(pending.is_some());
+
+        // the error half fails the promise (the balance pendings re-add
+        // through the env)
+        let (promise, recorded) = recording_promise();
+        manager.send_gift_offer(
+            &mut env,
+            dialog_id,
+            "slug",
+            StarGiftResalePrice::legacy(200),
+            60,
+            5,
+            promise,
+        );
+        let pending = manager
+            .on_get_send_star_gift_offer(&mut env, Result::Err(Status::error(420, "FLOOD_WAIT_2")));
+        assert!(pending.is_none());
+        assert_eq!(recorded.value().expect("answered").unwrap_err().code(), 420);
+
+        // the resolve/update-price halves settle through the Updates pair
+        let (promise, _) = recording_promise();
+        manager.process_gift_offer(&mut env, 1 << 20, true, promise);
+        assert!(
+            manager
+                .on_get_resolve_star_gift_offer(Result::Ok(empty_updates()))
+                .is_some()
+        );
+        let (promise, recorded) = recording_promise();
+        manager.process_gift_offer(&mut env, 1 << 20, true, promise);
+        assert!(
+            manager
+                .on_get_resolve_star_gift_offer(Result::Err(Status::error(400, "OFFER_INVALID")))
+                .is_none()
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "OFFER_INVALID"
+        );
+
+        let (promise, _) = recording_promise();
+        manager.set_star_gift_price(
+            &mut env,
+            StarGiftId::from_slug("name"),
+            StarGiftResalePrice::legacy(200),
+            promise,
+        );
+        assert!(
+            manager
+                .on_get_update_star_gift_price(Result::Ok(empty_updates()))
+                .is_some()
+        );
+
+        // the Bool-answer unit families settle both bands
+        let (promise, recorded) = recording_promise();
+        manager.set_dialog_pinned_gifts(&mut env, dialog_id, Vec::new(), promise);
+        manager.on_get_toggle_star_gifts_pinned_to_top(Result::Ok(()));
+        assert!(matches!(
+            recorded.value().expect("answered").expect("ok"),
+            ()
+        ));
+
+        let (promise, recorded) = recording_promise();
+        manager.delete_gift_collection(&mut env, dialog_id, StarGiftCollectionId::new(5), promise);
+        manager.on_get_delete_gift_collection(Result::Err(Status::error(420, "FLOOD_WAIT_1")));
+        assert_eq!(recorded.value().expect("answered").unwrap_err().code(), 420);
+
+        let (promise, recorded) = recording_promise();
+        manager.reorder_gift_collections(
+            &mut env,
+            dialog_id,
+            StarGiftCollectionId::get_star_gift_collection_ids(&[5]),
+            promise,
+        );
+        manager.on_get_reorder_gift_collections(Result::Ok(()));
+        assert!(matches!(
+            recorded.value().expect("answered").expect("ok"),
+            ()
+        ));
+
+        let (promise, recorded) = recording_promise();
+        manager.toggle_chat_star_gift_notifications(
+            &mut env,
+            DialogId::from_channel_id(ChannelId::new(1)),
+            true,
+            promise,
+        );
+        manager.on_get_toggle_chat_star_gift_notifications(Result::Err(Status::error(
+            400,
+            "CHAT_WRITE_FORBIDDEN",
+        )));
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "CHAT_WRITE_FORBIDDEN"
+        );
     }
 
     #[test]
