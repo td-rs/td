@@ -3813,6 +3813,30 @@ impl MessageReaction {
     /// `MessageReaction::MAX_CHOOSE_COUNT` (MessageReaction.h:25).
     pub const MAX_CHOOSE_COUNT: i32 = 2147483640;
 
+    /// The paid-reaction row the pending insertions build
+    /// (MessageReaction.cpp:973/1059 — `MessageReaction(paid, count, true,
+    /// DialogId(), Auto(), Auto())`).
+    pub fn new_paid(star_count: i32) -> MessageReaction {
+        MessageReaction {
+            reaction_type: ReactionType::paid(),
+            choose_count: star_count,
+            is_chosen: true,
+            my_recent_chooser_dialog_id: DialogId::new(0),
+            recent_chooser_dialog_ids: Vec::new(),
+            recent_chooser_min_channels: Vec::new(),
+        }
+    }
+
+    /// `add_paid_reaction` (MessageReaction.cpp:423-427).
+    pub fn add_paid_reaction(&mut self, star_count: i32) {
+        self.is_chosen = true;
+        debug_assert!(
+            star_count <= i32::MAX - self.choose_count,
+            "the C++ CHECKs the count headroom"
+        );
+        self.choose_count += star_count;
+    }
+
     /// `MessageReaction::add_my_recent_chooser_dialog_id`
     /// (MessageReaction.cpp:358-363).
     pub fn add_my_recent_chooser_dialog_id(&mut self, dialog_id: DialogId) {
@@ -4018,6 +4042,20 @@ impl MessageReactor {
     /// `MessageReactor::is_me` (MessageReactor.h:56-58).
     pub fn is_me(&self) -> bool {
         self.is_me
+    }
+
+    /// `MessageReactor::add_count` (MessageReactor.h:83-91) — the paid
+    /// pendings' reactor fold (the `apply_reactor_pending_paid_reactions`
+    /// walk).
+    pub fn add_count(&mut self, count: i32, reactor_dialog_id: DialogId, my_dialog_id: DialogId) {
+        self.count += count;
+        if reactor_dialog_id == DialogId::new(0) {
+            self.dialog_id = my_dialog_id;
+            self.is_anonymous = true;
+        } else {
+            self.dialog_id = reactor_dialog_id;
+            self.is_anonymous = false;
+        }
     }
 
     /// `MessageReactor::store_min_channel` (MessageReactor.cpp:24-34).
@@ -4505,6 +4543,52 @@ impl MessageReactions {
             can_get_added_reactions,
             are_tags,
         })
+    }
+
+    /// `apply_reactor_pending_paid_reactions`
+    /// (MessageReaction.cpp:943-961) — the pending→committed reactor fold
+    /// of `send_paid_message_reaction`: my top-reactor rows absorb the
+    /// pending count, a fresh me-row joins when none exists, and the
+    /// table re-fixes.
+    pub fn apply_reactor_pending_paid_reactions(
+        &self,
+        my_dialog_id: DialogId,
+    ) -> Vec<MessageReactor> {
+        let mut top_reactors = Vec::new();
+        let mut was_me = false;
+        let reactor_dialog_id = self.pending_paid_reaction_type.get_dialog_id(my_dialog_id);
+        for reactor in &self.top_reactors {
+            let mut copy = MessageReactor {
+                dialog_id: reactor.dialog_id,
+                min_channel: reactor.min_channel.clone(),
+                count: reactor.count,
+                is_top: reactor.is_top,
+                is_me: reactor.is_me,
+                is_anonymous: reactor.is_anonymous,
+            };
+            if reactor.is_me() {
+                was_me = true;
+                copy.add_count(self.pending_paid_reactions, reactor_dialog_id, my_dialog_id);
+            }
+            top_reactors.push(copy);
+        }
+        if !was_me {
+            let is_anonymous = reactor_dialog_id == DialogId::new(0);
+            top_reactors.push(MessageReactor {
+                dialog_id: if is_anonymous {
+                    my_dialog_id
+                } else {
+                    reactor_dialog_id
+                },
+                min_channel: None,
+                count: self.pending_paid_reactions,
+                is_top: true,
+                is_me: true,
+                is_anonymous,
+            });
+        }
+        fix_message_reactors(&mut top_reactors, false);
+        top_reactors
     }
 }
 
@@ -8646,7 +8730,8 @@ pub const MAX_GET_DIALOGS: i32 = 100;
 /// per-dialog container set the database family and the receive path walk.
 /// The C++ class carries ~200 private fields; the ones the ported slices
 /// touch land here per slice, the rest grow with their owning tasks.
-#[derive(Debug, Default)]
+/// (No `Debug` — the §3.8 promise queues have no Debug payload.)
+#[derive(Default)]
 pub struct MessagesManager {
     /// The C++ `td_->auth_manager_->is_bot()` — process-constant per
     /// session; bots never maintain the ordered-message tree (the C++
@@ -8743,6 +8828,17 @@ pub struct MessagesManager {
     /// `pending_reactions_` (MessagesManager.h) — the in-flight reaction
     /// query counts, collapsed to the counter the C++ record carries.
     pub(crate) pending_reactions: HashMap<MessageFullId, i32>,
+    /// The parked `SendPaidReactionQuery` promises — the C++ handler's
+    /// own `Promise<Unit>` (the `on_set_message_reactions` lambda chain
+    /// over the request promise, MessageReaction.cpp:93-95) with the
+    /// handler's `message_full_id` beside it; FIFO popped by the answers
+    /// (the §5 family-queue convention; the §3.8 net-drain 25 shape).
+    pub(crate) pending_paid_reaction_sends:
+        std::collections::VecDeque<(MessageFullId, tdutils::promise::Promise<()>)>,
+    /// The parked `TogglePaidReactionPrivacyQuery` promises (the C++
+    /// handler's own `Promise<Unit>`); FIFO popped by the answers.
+    pub(crate) pending_paid_reaction_privacy:
+        std::collections::VecDeque<tdutils::promise::Promise<()>>,
     /// `channel_get_difference_retry_timeouts_` (MessagesManager.h:3427)
     /// — the per-dialog backoff delay (seconds; 0 = none).
     pub(crate) channel_get_difference_retry_timeouts: HashMap<DialogId, i32>,
@@ -13891,6 +13987,74 @@ pub fn get_message_max_media_timestamp(m: &Message) -> i32 {
         m.max_own_media_timestamp
     } else {
         m.max_reply_media_timestamp
+    }
+}
+
+/// The `translate_message_text` gates' outcome — the messages-side
+/// halves of `MessagesManager::translate_message_text`
+/// (MessagesManager.cpp:15146-15168); the caller completes the promise or
+/// hands the input text to the translation manager.
+pub enum TranslateMessageTextAction {
+    /// `get_message_force == nullptr` — the 400 "Message not found" band.
+    NotFound,
+    /// a contentless/empty-text message — the empty `formattedText`.
+    Empty,
+    /// the translate send: the input text plus the autotranslation flag
+    /// (a true flag keeps the message full id — the PEER wire form).
+    Translate {
+        input_text: crate::translation_manager::InputText,
+        has_autotranslation: bool,
+    },
+}
+
+/// `MessagesManager::translate_message_text`'s gate half
+/// (MessagesManager.cpp:15146-15168) — the message read, the content-text
+/// probe, the `InputText` build (skip-bot-commands + the media timestamp)
+/// and the channel-autotranslation flag that picks the wire form.
+pub fn translate_message_text_gates(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut impl MmRequestContext,
+    message_full_id: MessageFullId,
+) -> TranslateMessageTextAction {
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    ensure_message_force(global, manager, ctx, dialog_id, message_id);
+    let Some(m) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message(d, message_id))
+        .cloned()
+    else {
+        return TranslateMessageTextAction::NotFound;
+    };
+    let content = get_message_actual_content(&m);
+    let Some(text) = crate::message_content::get_message_content_text(content) else {
+        return TranslateMessageTextAction::Empty;
+    };
+    if text.text.is_empty() {
+        return TranslateMessageTextAction::Empty;
+    }
+    let input_text = crate::translation_manager::InputText {
+        text: text.clone(),
+        skip_bot_commands: need_skip_bot_commands(
+            manager,
+            ctx.as_message_object(),
+            dialog_id,
+            Some(&m),
+        ),
+        max_media_timestamp: get_message_max_media_timestamp(&m),
+    };
+    let has_autotranslation = dialog_id.get_type() == DialogType::Channel
+        // `td_->dialog_manager_->have_input_peer(dialog_id, false, Read)`
+        // — the Td impl folds to the dialog-existence probe over the
+        // same map (the manager the caller holds)
+        && have_dialog_force(manager, dialog_id)
+        && m.message_id.is_server()
+        && m.ephemeral_message.is_none()
+        && ctx.get_channel_autotranslation(dialog_id.get_channel_id());
+    TranslateMessageTextAction::Translate {
+        input_text,
+        has_autotranslation,
     }
 }
 
@@ -20592,6 +20756,13 @@ pub trait SendMessageContext: MessageObjectContext {
         &self,
         _channel_id: ChannelId,
     ) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_channel_autotranslation(channel_id)`
+    /// (ChatManager.cpp:3100-3106) — the message-translate PEER gate
+    /// (the §3.8 net-drain 25 `translateText` shape).
+    fn get_channel_autotranslation(&self, _channel_id: ChannelId) -> bool {
         false
     }
 
@@ -29503,25 +29674,30 @@ pub trait MmRequestContext:
         crate::paid_reaction_type::PaidReactionType::default()
     }
 
-    // -- the [blocked: net] paid-reaction tails
-    /// `MessageReactions::send_paid_message_reaction` — the
-    /// SendPaidReactionQuery tail; [blocked: net], the promise parks.
+    // -- the paid-reaction wire tails (the §3.8 net-drain 25 families;
+    // the `Td` impls are the pure dispatch legs — the manager the
+    // caller holds parks the promises, so these never touch it)
+    /// `SendPaidReactionQuery::send` (MessageReaction.cpp:100-118): the
+    /// read peer resolves here, the PRIVATE flag/privacy build rides the
+    /// params, the query dispatches. `Err` is the inline `on_error`
+    /// band (the null peer's 400 "Can't access the chat").
     fn send_paid_message_reaction_on_server(
         &mut self,
-        message_full_id: MessageFullId,
-        star_count: i32,
-        promise: tdutils::promise::Promise<()>,
-    ) {
-        let _ = (message_full_id, star_count, promise);
+        _message_full_id: MessageFullId,
+        _star_count: i32,
+        _params: &crate::messages_manager::SendPaidReactionParams,
+    ) -> Result<(), Status> {
+        Result::Ok(())
     }
-    /// `create_handler<TogglePaidReactionPrivacyQuery>` — [blocked: net],
-    /// the promise parks.
+    /// `TogglePaidReactionPrivacyQuery::send` (MessageReaction.cpp:161-169)
+    /// — the read peer carries the toggle; `Err` is the inline
+    /// `on_error` band.
     fn toggle_paid_reaction_privacy_on_server(
         &mut self,
-        message_full_id: MessageFullId,
-        promise: tdutils::promise::Promise<()>,
-    ) {
-        let _ = (message_full_id, promise);
+        _message_full_id: MessageFullId,
+        _paid_reaction_type: &crate::paid_reaction_type::PaidReactionType,
+    ) -> Result<(), Status> {
+        Result::Ok(())
     }
 
     /// Upcast to the message-object view (the `get_message_object` plane).
@@ -32150,8 +32326,8 @@ pub fn remove_paid_message_reactions(
 }
 
 /// `MessagesManager::commit_paid_message_reactions`
-/// (MessagesManager.cpp:) — the wire tail parks at the [blocked: net]
-/// seam.
+/// (MessagesManager.cpp:) — the `SendPaidReactionQuery` wire tail sends
+/// through the context (the promise rides the family queue).
 pub fn commit_paid_message_reactions(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
@@ -32209,20 +32385,177 @@ pub fn commit_paid_message_reactions(
         .pending_reactions
         .entry(message_full_id)
         .or_insert(0) += 1;
-    // `send_paid_message_reaction` — the wire tail ([blocked: net]); the
-    // promise lands unanswered offline.
+    // the C++ chain (MessagesManager.cpp:20432-20437): the random id,
+    // the `on_set_message_reactions` query-promise wrap, then
+    // `m->reactions->send_paid_message_reaction(...)` — the swap runs
+    // here (the manager the caller holds), the promise parks in the
+    // family queue, and the context tail is the pure dispatch leg.
     let star_count = manager
         .get_dialog(dialog_id)
         .and_then(|d| get_message(d, message_id))
         .and_then(|m| m.reactions.as_ref())
         .map(|reactions| reactions.pending_paid_reactions)
         .unwrap_or(0);
-    ctx.send_paid_message_reaction_on_server(message_full_id, star_count, promise);
+    let random_id = ((global.unix_time() as i64) << 32) | (tdutils::random::secure_uint32() as i64);
+    let my_dialog_id = ctx.my_dialog_id();
+    let params = message_reactions_send_paid_message_reaction(
+        manager,
+        my_dialog_id,
+        message_full_id,
+        star_count,
+        random_id,
+    );
+    let dispatch = params.as_ref().map_or(Result::Ok(()), |params| {
+        ctx.send_paid_message_reaction_on_server(message_full_id, star_count, params)
+    });
+    match dispatch {
+        // the dispatch went out — the promise rides the family queue
+        Result::Ok(()) => {
+            manager
+                .pending_paid_reaction_sends
+                .push_back((message_full_id, promise));
+        }
+        // the inline `on_error` band (the null peer,
+        // MessageReaction.cpp:105-107): the ledger re-add parks at the
+        // StarManager seam (the `add_my_paid_reaction` convention), the
+        // dialog-error head runs, and the chain completes the promise
+        Result::Err(status) => {
+            ctx.add_pending_owned_star_count(star_count, false);
+            crate::dialog_manager::on_get_dialog_error(
+                global,
+                dialog_id,
+                &status,
+                "SendPaidReactionQuery",
+            );
+            on_set_message_reactions(
+                manager,
+                ctx,
+                message_full_id,
+                tdutils::status::Result::Err(status),
+                promise,
+            );
+        }
+    }
+}
+
+/// The `SendPaidReactionQuery::send` payload the swap captures — the
+/// pending trio read before the pending→committed swap consumes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendPaidReactionParams {
+    /// `use_default_paid_reaction_type` — the PRIVATE flag gate.
+    pub use_default_paid_reaction_type: bool,
+    /// `paid_reaction_type` — the wire privacy form.
+    pub paid_reaction_type: crate::paid_reaction_type::PaidReactionType,
+    /// `random_id` — the `(unix_time << 32) | secure_uint32` pair the
+    /// commit builds (MessagesManager.cpp:20432).
+    pub random_id: i64,
+}
+
+/// `MessageReactions::send_paid_message_reaction`'s local half
+/// (MessageReaction.cpp:1050-1068) — the pending→committed swap over the
+/// stored reactions: capture the pending trio, apply the reactor
+/// pendings, insert/extend the paid reaction row, reset the pendings.
+/// Returns the query payload (the captured trio) for the send leg.
+pub(crate) fn message_reactions_send_paid_message_reaction(
+    manager: &mut MessagesManager,
+    my_dialog_id: DialogId,
+    message_full_id: MessageFullId,
+    star_count: i32,
+    random_id: i64,
+) -> Option<SendPaidReactionParams> {
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    let d = manager.get_dialog_mut(dialog_id)?;
+    let m = d.messages.get_mut(&message_id)?;
+    let reactions = m.reactions.as_mut()?;
+    // the C++ `CHECK(has_pending_paid_reactions())` (cpp:1051)
+    assert!(
+        reactions.pending_paid_reactions != 0,
+        "send_paid_message_reaction without pending paid reactions"
+    );
+    let params = SendPaidReactionParams {
+        use_default_paid_reaction_type: reactions.pending_use_default_paid_reaction_type,
+        paid_reaction_type: reactions.pending_paid_reaction_type.clone(),
+        random_id,
+    };
+    reactions.top_reactors = reactions.apply_reactor_pending_paid_reactions(my_dialog_id);
+    if reactions.reactions.is_empty() || !reactions.reactions[0].reaction_type.is_paid_reaction() {
+        reactions
+            .reactions
+            .insert(0, MessageReaction::new_paid(star_count));
+    } else {
+        reactions.reactions[0].add_paid_reaction(star_count);
+    }
+    reactions.pending_paid_reactions = 0;
+    reactions.pending_use_default_paid_reaction_type = false;
+    reactions.pending_paid_reaction_type = crate::paid_reaction_type::PaidReactionType::default();
+    Some(params)
+}
+
+/// `MessagesManager::on_set_message_reactions`
+/// (MessagesManager.cpp:20495-20519) — the `SendPaidReactionQuery`
+/// promise's completion chain (the C++ query-promise lambda): the
+/// pending-reactions counter unwinds, the message re-reads, the error
+/// band queues the reactions reload, and the request promise settles
+/// with the query result.
+pub fn on_set_message_reactions(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn MmRequestContext,
+    message_full_id: MessageFullId,
+    result: tdutils::status::Result<()>,
+    mut promise: tdutils::promise::Promise<()>,
+) {
+    if ctx.as_read_state().close_flag() {
+        // `TRY_STATUS_PROMISE(promise, G()->close_status())` — the
+        // close window aborts the chain
+        promise.set_error(crate::config_result::request_aborted_error());
+        return;
+    }
+    let need_reload = result.is_error();
+    let entry = manager
+        .pending_reactions
+        .get_mut(&message_full_id)
+        .expect("on_set_message_reactions without a pending query");
+    *entry -= 1;
+    if *entry == 0 {
+        manager.pending_reactions.remove(&message_full_id);
+    }
+
+    if !have_message_force_full(manager, message_full_id, "on_set_message_reactions") {
+        promise.set_value(());
+        return;
+    }
+
+    if need_reload {
+        // `message_query_manager_->queue_message_reactions_reload` —
+        // the §3.9 message-query plane seam
+        tdutils::log_info!("queue_message_reactions_reload seam: {message_full_id:?}");
+    }
+    match result {
+        tdutils::status::Result::Ok(()) => promise.set_value(()),
+        tdutils::status::Result::Err(status) => promise.set_error(status),
+    }
+}
+
+/// Pop the oldest parked `SendPaidReactionQuery` promise pair — the §5
+/// FIFO-per-kind convention (the answer pairs with the request that
+/// parked first, like the C++ promise riding its own ResultHandler).
+pub(crate) fn pop_paid_reaction_promise(
+    manager: &mut MessagesManager,
+) -> Option<(MessageFullId, tdutils::promise::Promise<()>)> {
+    manager.pending_paid_reaction_sends.pop_front()
+}
+
+/// Pop the oldest parked `TogglePaidReactionPrivacyQuery` promise.
+pub(crate) fn pop_paid_reaction_privacy_promise(
+    manager: &mut MessagesManager,
+) -> Option<tdutils::promise::Promise<()>> {
+    manager.pending_paid_reaction_privacy.pop_front()
 }
 
 /// `MessagesManager::set_paid_message_reaction_type`
 /// (MessagesManager.cpp:) — the C++ body runs on MessageReactions; the
-/// wire tail parks at the [blocked: net] seam.
+/// `TogglePaidReactionPrivacyQuery` wire tail sends through the context.
 pub fn set_paid_message_reaction_type(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
@@ -32253,10 +32586,38 @@ pub fn set_paid_message_reaction_type(
         return;
     }
 
-    // `PaidReactionType(td, type)` — the td_api intake; the dialog probes
-    // answer the M.6 stand-in bands on this path.
-    let paid_reaction_type = crate::paid_reaction_type::PaidReactionType::default();
-    let _ = type_;
+    // `PaidReactionType(td, type)` (PaidReactionType.cpp:46-71) — the
+    // td_api intake over the context probes: the Anonymous arm flips the
+    // flag, the Chat arm gates on the dialog access + the broadcast
+    // check (the failing gates degrade to the Regular default).
+    let paid_reaction_type = {
+        let mut result = crate::paid_reaction_type::PaidReactionType::default();
+        if let Some(type_) = type_ {
+            match type_ {
+                td_api::PaidReactionType::paidReactionTypeRegular(_) => {}
+                td_api::PaidReactionType::paidReactionTypeAnonymous(_) => {
+                    result = crate::paid_reaction_type::PaidReactionType::legacy(true);
+                }
+                td_api::PaidReactionType::paidReactionTypeChat(chat) => {
+                    let dialog_id_of_type = DialogId::new(chat.chat_id);
+                    let is_accessible = check_dialog_access(
+                        manager,
+                        ctx,
+                        dialog_id_of_type,
+                        false,
+                        crate::user_manager::AccessRights::Write,
+                        "PaidReactionType",
+                    )
+                    .is_ok();
+                    if is_accessible && ctx.is_broadcast_channel_dialog(dialog_id_of_type) {
+                        result =
+                            crate::paid_reaction_type::PaidReactionType::dialog(dialog_id_of_type);
+                    }
+                }
+            }
+        }
+        result
+    };
     let mut found_me = false;
     {
         let d = manager.get_dialog_mut(dialog_id).expect("checked above");
@@ -32264,7 +32625,7 @@ pub fn set_paid_message_reaction_type(
         let reactions = m.reactions.as_mut().expect("checked above");
         if reactions.pending_paid_reactions != 0 {
             reactions.pending_use_default_paid_reaction_type = false;
-            reactions.pending_paid_reaction_type = paid_reaction_type;
+            reactions.pending_paid_reaction_type = paid_reaction_type.clone();
         }
         let my_dialog_id = ctx.my_dialog_id();
         for top_reactor in &mut reactions.top_reactors {
@@ -32285,8 +32646,24 @@ pub fn set_paid_message_reaction_type(
             return;
         }
     }
-    // `create_handler<TogglePaidReactionPrivacyQuery>` — [blocked: net]
-    ctx.toggle_paid_reaction_privacy_on_server(message_full_id, promise);
+    // `create_handler<TogglePaidReactionPrivacyQuery>` (the §3.8 wire
+    // tail): the pure dispatch leg sends, the promise parks in the
+    // family queue, and the inline `on_error` band runs the dialog-error
+    // head + the promise error
+    match ctx.toggle_paid_reaction_privacy_on_server(message_full_id, &paid_reaction_type) {
+        Result::Ok(()) => {
+            manager.pending_paid_reaction_privacy.push_back(promise);
+        }
+        Result::Err(status) => {
+            crate::dialog_manager::on_get_dialog_error(
+                global,
+                dialog_id,
+                &status,
+                "TogglePaidReactionPrivacyQuery",
+            );
+            promise.set_error(status);
+        }
+    }
     let m = manager
         .get_dialog(dialog_id)
         .and_then(|d| get_message(d, message_id))
@@ -32430,6 +32807,18 @@ pub(crate) enum MessagesNetKind {
         pts: i32,
         limit: i32,
     },
+    /// `SendPaidReactionQuery` (MessageReaction.cpp:93-146) — the
+    /// handler's `dialog_id_`/`star_count_` members (the ok half's
+    /// star-balance ledger re-add, the error head's dialog error); the
+    /// promise parks in `pending_paid_reaction_sends`.
+    SendPaidReaction {
+        dialog_id: DialogId,
+        star_count: i64,
+    },
+    /// `TogglePaidReactionPrivacyQuery` (MessageReaction.cpp:149-187)
+    /// — the handler's `dialog_id_` member (the error head); the
+    /// promise parks in `pending_paid_reaction_privacy`.
+    TogglePaidReactionPrivacy { dialog_id: DialogId },
 }
 
 /// The M.10.19 context plane — the cross-manager reads and sends the

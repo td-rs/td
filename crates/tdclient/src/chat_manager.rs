@@ -12338,6 +12338,14 @@ impl ChatManager {
         }
     }
 
+    /// `get_channel_autotranslation` (ChatManager.cpp:3100-3106) — the
+    /// message-translate PEER gate reads it (the §3.8 net-drain 25
+    /// `translateText` shape).
+    pub fn get_channel_autotranslation(&self, channel_id: ChannelId) -> bool {
+        self.get_channel(channel_id)
+            .is_some_and(|c| c.autotranslation)
+    }
+
     /// `get_current_state` (ChatManager.cpp:9966-9992) — the state-dump
     /// terminal piece. Order contract: unknown placeholders first; channels
     /// before chats ("chat objects can contain channel_id, so they must be

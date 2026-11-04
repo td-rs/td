@@ -612,8 +612,12 @@ impl crate::message_content::MessageContentContext for Td {
     fn get_channel_effective_restricted_rights(&self, _channel_id: ChannelId) -> RestrictedRights {
         RestrictedRights::default()
     }
-    fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
-        false
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+        // `ChatManager::is_broadcast_channel` (ChatManager.cpp:8624-8626)
+        // — flipped at the §3.8 net-drain 25 slice (the paid-reaction
+        // ladder's `DialogManager::is_broadcast_channel` gate reads the
+        // channel record; the false stub was the offline band)
+        self.chat_manager.is_broadcast_channel(channel_id)
     }
     fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
         false
@@ -2468,6 +2472,13 @@ impl crate::messages_manager::SendMessageContext for Td {
                 self,
                 dialog_id.get_channel_id(),
             )
+    }
+
+    /// `ChatManager::get_channel_autotranslation(channel_id)`
+    /// (ChatManager.cpp:3100-3106) — the message-translate PEER gate (the
+    /// §3.8 net-drain 25 `translateText` shape).
+    fn get_channel_autotranslation(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_autotranslation(channel_id)
     }
 
     /// The `SendMessageQuery::send` wire leg (MessagesManager.cpp:1207-1249):
@@ -16833,6 +16844,106 @@ impl Td {
         self.drain_sink();
     }
 
+    /// `td_->star_manager_->add_pending_owned_star_count(star_count,
+    /// is_final)` (StarManager.cpp:1481-1496) — the paid-reaction ledger
+    /// legs of the `SendPaidReactionQuery` answer halves
+    /// (MessageReaction.cpp:126/:137).
+    fn star_add_pending_owned(&mut self, star_count: i64, move_to_owned: bool) {
+        let (mut manager, mut env) = crate::td::star_env_split(self);
+        manager.add_pending_owned_star_count(&mut env, star_count, move_to_owned);
+        self.star_manager = manager;
+    }
+
+    /// The `on_set_message_reactions` completion chain over the collapsed
+    /// actor shape (the C++ query-promise lambda of
+    /// `commit_paid_message_reactions`, MessagesManager.cpp:20433-20439).
+    fn on_set_message_reactions_chain(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        result: tdutils::status::Result<()>,
+        promise: Promise<()>,
+    ) {
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        // SAFETY: the ctx view aliases one Td and is used strictly
+        // sequentially inside the callee (the split_context_alias
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+        crate::messages_manager::on_set_message_reactions(
+            &mut manager,
+            ctx,
+            message_full_id,
+            result,
+            promise,
+        );
+        self.messages_manager = manager;
+        self.drain_sink();
+    }
+
+    /// `MessagesManager::translate_message_text`
+    /// (MessagesManager.cpp:15146-15168) — the request glue: the
+    /// messages-side gates run over the split contexts, then the
+    /// translation manager's send body carries the input text with the
+    /// autotranslation-picked wire form (the §3.8 net-drain 25
+    /// `translateText` PEER shape).
+    pub(crate) fn translate_message_text(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        to_language_code: String,
+        tone: String,
+        mut promise: Promise<td_api::FormattedText>,
+    ) {
+        use crate::messages_manager::TranslateMessageTextAction;
+        let action = {
+            let mut global = std::mem::take(&mut self.global);
+            let mut manager = std::mem::take(&mut self.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(self);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let action = crate::messages_manager::translate_message_text_gates(
+                &mut global,
+                &mut manager,
+                ctx,
+                message_full_id,
+            );
+            self.global = global;
+            self.messages_manager = manager;
+            action
+        };
+        match action {
+            TranslateMessageTextAction::NotFound => {
+                promise.set_error(Status::error(400, "Message not found"));
+            }
+            TranslateMessageTextAction::Empty => {
+                promise.set_value(td_api::FormattedText {
+                    text: String::new(),
+                    entities: Vec::new(),
+                });
+            }
+            TranslateMessageTextAction::Translate {
+                input_text,
+                has_autotranslation,
+            } => {
+                let (translation, mut env) = crate::td::translation_env_split(self);
+                translation.translate_input_text(
+                    &mut env,
+                    input_text,
+                    if has_autotranslation {
+                        message_full_id
+                    } else {
+                        crate::messages_manager::MessageFullId::default()
+                    },
+                    to_language_code,
+                    tone,
+                    promise,
+                );
+                self.translation_manager = translation;
+            }
+        }
+    }
+
     /// Drain the callback-parked star-gift answers (the §3.6 families) +
     /// the ConvertStarGiftQuery continuation queue (the reload completes
     /// into `on_dialog_gift_transferred`).
@@ -17578,6 +17689,105 @@ impl Td {
                     limit,
                     result,
                 );
+            }
+            // `SendPaidReactionQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:121-146) — the star-balance ledger
+            // re-add, then the updates re-enter the engine with the
+            // `on_set_message_reactions` chain; the error bands settle
+            // through the same chain (the MESSAGE_NOT_MODIFIED ok band
+            // included).
+            crate::messages_manager::MessagesNetKind::SendPaidReaction {
+                dialog_id,
+                star_count,
+            } => {
+                let Some((message_full_id, promise)) =
+                    crate::messages_manager::pop_paid_reaction_promise(&mut self.messages_manager)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    // the `on_error` head (MessageReaction.cpp:132-145)
+                    if status.message() == "MESSAGE_NOT_MODIFIED" {
+                        self.star_add_pending_owned(star_count, true);
+                        self.on_set_message_reactions_chain(
+                            message_full_id,
+                            tdutils::status::Result::Ok(()),
+                            promise,
+                        );
+                        return;
+                    }
+                    self.star_add_pending_owned(star_count, false);
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "SendPaidReactionQuery",
+                    );
+                    self.on_set_message_reactions_chain(
+                        message_full_id,
+                        tdutils::status::Result::Err(status),
+                        promise,
+                    );
+                    return;
+                }
+                let updates = match telegram_api::Updates::parse(query.ok()) {
+                    Result::Ok(updates) => updates,
+                    Result::Err(_) => {
+                        // the fetch_result parse failure runs on_error with
+                        // the 500 (the C++ `fetch_result` error path)
+                        let status = Status::error(
+                            500,
+                            "Failed to parse the messages_sendPaidReaction answer",
+                        );
+                        self.star_add_pending_owned(star_count, false);
+                        self.on_set_message_reactions_chain(
+                            message_full_id,
+                            tdutils::status::Result::Err(status),
+                            promise,
+                        );
+                        return;
+                    }
+                };
+                // the ok half (MessageReaction.cpp:125-130): the ledger
+                // re-add (is_final), then the updates run through the
+                // engine with the promise chain
+                self.star_add_pending_owned(star_count, true);
+                self.um_send_later(UmMessage::OnGetUpdatesPaidReaction {
+                    updates: Box::new(updates),
+                    message_full_id,
+                    promise,
+                });
+                self.drain_sink();
+            }
+            // `TogglePaidReactionPrivacyQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:172-187) — the promise settles
+            // directly; the error head runs the dialog error intake.
+            crate::messages_manager::MessagesNetKind::TogglePaidReactionPrivacy { dialog_id } => {
+                let Some(mut promise) = crate::messages_manager::pop_paid_reaction_privacy_promise(
+                    &mut self.messages_manager,
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "TogglePaidReactionPrivacyQuery",
+                    );
+                    promise.set_error(status);
+                    return;
+                }
+                match parse_wire_bool(query.ok()) {
+                    Some(()) => promise.set_value(()),
+                    // the fetch failure runs on_error with the 500
+                    None => promise.set_error(Status::error(
+                        500,
+                        "Failed to parse the messages_togglePaidReactionPrivacy answer",
+                    )),
+                }
             }
         }
     }
@@ -22425,6 +22635,18 @@ pub(crate) enum UmMessage {
         updates: Box<telegram_api::Updates>,
         tail: crate::story_manager::StoryNetTail,
     },
+    /// `on_get_updates` + the paid-reaction chain tail — the C++
+    /// `PromiseCreator::lambda` chain of
+    /// `MessagesManager::commit_paid_message_reactions`
+    /// (MessagesManager.cpp:20433-20439): the Updates run through the
+    /// engine, then the chain result completes
+    /// `on_set_message_reactions` with the request promise (the lambda
+    /// runs on both the ok and the error paths — the exact C++ order).
+    OnGetUpdatesPaidReaction {
+        updates: Box<telegram_api::Updates>,
+        message_full_id: crate::messages_manager::MessageFullId,
+        promise: Promise<()>,
+    },
     /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
     /// (cpp:522, :364).
     OnGetDifference {
@@ -22457,6 +22679,30 @@ impl UmMessage {
         match self {
             UmMessage::OnGetUpdates { updates, promise } => {
                 td.with_updates_env(|um, env| um.on_get_updates(env, *updates, promise));
+            }
+            UmMessage::OnGetUpdatesPaidReaction {
+                updates,
+                message_full_id,
+                promise,
+            } => {
+                // the chain's promise captures the engine result — the
+                // `unit_slot_promise` shape (the updates engine completes
+                // it synchronously; the slot carries the result into
+                // `on_set_message_reactions`'s need_reload band)
+                let slot: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                let capture = std::sync::Arc::clone(&slot);
+                let updates_promise =
+                    tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                        *capture.lock().unwrap() = Some(result);
+                    });
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, updates_promise));
+                let result = slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(tdutils::status::Result::Ok(()));
+                td.on_set_message_reactions_chain(message_full_id, result, promise);
             }
             UmMessage::OnGetUpdatesMigrateChat {
                 updates,
@@ -23706,10 +23952,14 @@ impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> 
     }
 
     /// `TranslateTextQuery::send` (TranslationManager.cpp:44-66) — the
-    /// text form (the PEER form stays with the message-translate flow).
+    /// two wire forms: a valid message full id flips to the PEER form
+    /// (the resolved read peer + the message ids, the §3.8 net-drain 25
+    /// `translateText` shape), otherwise the TEXT form packs the
+    /// input texts.
     fn send_translate_text_query(
         &mut self,
         texts: Vec<FormattedText>,
+        message_full_id: crate::messages_manager::MessageFullId,
         to_language_code: String,
         tone: String,
         skip_bot_commands: bool,
@@ -23721,20 +23971,47 @@ impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> 
             tdutils::log_info!("Translate text — [net-inert]");
             return;
         };
-        let mut flags = 2; // TEXT_MASK
+        let mut flags = 0;
         if !tone.is_empty() {
             flags |= 4; // TONE_MASK
         }
-        let input_texts = texts
-            .iter()
-            .map(|text| {
-                crate::message_entity::get_input_text_with_entities(
-                    Some(&mut *self),
-                    text,
-                    "TranslateTextQuery",
-                )
-            })
-            .collect();
+        // `CHECK(texts.size() == 1u)` on the PEER arm (TranslationManager.cpp:49)
+        let (peer, message_ids, input_texts) = if message_full_id.get_message_id().is_valid() {
+            flags |= 1; // PEER_MASK
+            let dialog_id = message_full_id.get_dialog_id();
+            // the C++ `CHECK(input_peer != nullptr)` — the manager gate
+            // proved the read access; the None band falls back to the
+            // empty peer the wire rejects (the offline shape)
+            let peer = crate::dialog_manager::get_input_peer(
+                self.td,
+                dialog_id,
+                crate::user_manager::AccessRights::Read,
+            )
+            .map(Box::new);
+            (
+                peer,
+                vec![
+                    message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                ],
+                Vec::new(),
+            )
+        } else {
+            flags |= 2; // TEXT_MASK
+            let input_texts = texts
+                .iter()
+                .map(|text| {
+                    crate::message_entity::get_input_text_with_entities(
+                        Some(&mut *self),
+                        text,
+                        "TranslateTextQuery",
+                    )
+                })
+                .collect();
+            (None, Vec::new(), input_texts)
+        };
         self.td
             .translation_promises
             .push(PendingTranslationQuery::TranslateText {
@@ -23746,8 +24023,8 @@ impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> 
             TranslationNetKind::TranslateText,
             telegram_api::Function::messages_translateText(telegram_api::messages_translateText {
                 flags,
-                peer: None,
-                id: Vec::new(),
+                peer,
+                id: message_ids,
                 text: input_texts,
                 to_lang: to_language_code,
                 tone,
@@ -35929,6 +36206,128 @@ impl crate::messages_manager::MmRequestContext for Td {
 
     fn my_dialog_id(&self) -> crate::messages_manager::DialogId {
         crate::messages_manager::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    // -- the paid-reaction wire tails (the §3.8 net-drain 25 families;
+    // MessageReaction.cpp:93-187) — the pure dispatch legs; the manager
+    // the caller holds runs the swap and parks the promises
+
+    /// `SendPaidReactionQuery::send` (MessageReaction.cpp:100-118): the
+    /// resolved read peer, the PRIVATE flag/privacy form over the params,
+    /// the dispatch. The null-peer band is the `Err` the caller completes
+    /// through the inline `on_error` shape.
+    fn send_paid_message_reaction_on_server(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        star_count: i32,
+        params: &crate::messages_manager::SendPaidReactionParams,
+    ) -> Result<(), Status> {
+        use crate::messages_manager::MessagesNetKind;
+        let dialog_id = message_full_id.get_dialog_id();
+        // `get_input_peer(dialog_id, AccessRights::Read) == nullptr →
+        // on_error(400 "Can't access the chat")` (MessageReaction.cpp:105)
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return Err(Status::error(400, "Can't access the chat"));
+        };
+        let Some(net) = self.messages_net() else {
+            tdutils::log_info!("Send messages.sendPaidReaction — [net-inert]");
+            return Ok(());
+        };
+        let mut flags = 0;
+        let privacy = if params.use_default_paid_reaction_type {
+            None
+        } else {
+            // the PRIVATE flag + `get_input_paid_reaction_privacy` over the
+            // write peer (the Dialog arm's read)
+            flags |= 1; // PRIVATE_MASK
+            let write_peer =
+                params
+                    .paid_reaction_type
+                    .privacy_dialog_id()
+                    .and_then(|privacy_dialog_id| {
+                        crate::dialog_manager::get_input_peer(
+                            self,
+                            privacy_dialog_id,
+                            crate::user_manager::AccessRights::Write,
+                        )
+                    });
+            Some(
+                params
+                    .paid_reaction_type
+                    .input_paid_reaction_privacy(write_peer),
+            )
+        };
+        net.dispatch(
+            MessagesNetKind::SendPaidReaction {
+                dialog_id,
+                star_count: i64::from(star_count),
+            },
+            telegram_api::Function::messages_sendPaidReaction(
+                telegram_api::messages_sendPaidReaction {
+                    flags,
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    count: star_count,
+                    random_id: params.random_id,
+                    private: privacy,
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// `TogglePaidReactionPrivacyQuery::send` (MessageReaction.cpp:161-169)
+    /// — the resolved read peer carries the toggle; the promise parks in
+    /// the family queue at the manager the caller holds.
+    fn toggle_paid_reaction_privacy_on_server(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        paid_reaction_type: &crate::paid_reaction_type::PaidReactionType,
+    ) -> Result<(), Status> {
+        use crate::messages_manager::MessagesNetKind;
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return Err(Status::error(400, "Can't access the chat"));
+        };
+        let Some(net) = self.messages_net() else {
+            tdutils::log_info!("Send messages.togglePaidReactionPrivacy — [net-inert]");
+            return Ok(());
+        };
+        let write_peer = paid_reaction_type
+            .privacy_dialog_id()
+            .and_then(|privacy_dialog_id| {
+                crate::dialog_manager::get_input_peer(
+                    self,
+                    privacy_dialog_id,
+                    crate::user_manager::AccessRights::Write,
+                )
+            });
+        let privacy = paid_reaction_type.input_paid_reaction_privacy(write_peer);
+        net.dispatch(
+            MessagesNetKind::TogglePaidReactionPrivacy { dialog_id },
+            telegram_api::Function::messages_togglePaidReactionPrivacy(
+                telegram_api::messages_togglePaidReactionPrivacy {
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    private: Some(privacy),
+                },
+            ),
+        );
+        Ok(())
     }
 
     fn get_chat_id_object(
@@ -61310,5 +61709,464 @@ mod tests {
         }
 
         assert!(td.payments_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- net-drain 25 (§3.8): the messages-plane send families ----
+
+    /// Seed a broadcast channel with the autotranslation flag on — the
+    /// `translateMessageText` PEER gate reads it off the channel record.
+    fn seed_autotranslation_channel(td: &mut Td, channel_id: i64) {
+        seed_my_user(td);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                broadcast: true,
+                megagroup: false,
+                id: channel_id,
+                access_hash: 999,
+                title: "channel".to_owned(),
+                autotranslation: true,
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+    }
+
+    #[test]
+    fn messages_translate_message_text_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_translate_message_text_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 `translateText` PEER round-trip
+    /// (TranslationManager.cpp:44-56/681-699,
+    /// MessagesManager.cpp:15146-15168): the autotranslation channel keeps
+    /// the message full id — the wire flips to the PEER form (the read
+    /// peer + the server message id, no input texts); the plain band
+    /// keeps the TEXT form; the empty-text and not-found bands settle
+    /// before the wire.
+    fn messages_translate_message_text_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain25-translate-peertext");
+        let channel_id = 2147483642;
+        seed_autotranslation_channel(&mut td, channel_id);
+        assert!(
+            td.chat_manager
+                .get_channel_autotranslation(crate::chat_manager::ChannelId::new(channel_id)),
+            "the seeded channel carries the autotranslation flag"
+        );
+        let dialog_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(channel_id),
+        );
+        let chat_id = dialog_id.get();
+        let message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(700),
+        );
+        let text_message = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(701),
+        );
+        {
+            let mut dialog = Box::new(crate::messages_manager::Dialog::default());
+            dialog.dialog_id = dialog_id;
+            dialog.is_update_new_chat_sent = true;
+            let mut message = crate::messages_manager::Message {
+                message_id,
+                content: Some(crate::message_content::MessageContent::Text(
+                    crate::message_content::MessageText {
+                        text: crate::message_entity::FormattedText {
+                            text: "hello world".to_owned(),
+                            entities: Vec::new(),
+                        },
+                        ..crate::message_content::MessageText::default()
+                    },
+                )),
+                ..crate::messages_manager::Message::default()
+            };
+            message.random_id = 1;
+            dialog.messages.insert(message_id, Box::new(message));
+            let empty = crate::messages_manager::Message {
+                message_id: text_message,
+                content: Some(crate::message_content::MessageContent::Text(
+                    crate::message_content::MessageText::default(),
+                )),
+                ..crate::messages_manager::Message::default()
+            };
+            dialog.messages.insert(text_message, Box::new(empty));
+            td.messages_manager.dialogs.insert(dialog_id, dialog);
+        }
+
+        // 1. the PEER form — the autotranslation channel keeps the full
+        //    id: the read peer + the server message id ride the wire,
+        //    the input texts stay empty, and the translated answer
+        //    resolves the request promise.
+        td.request(
+            1,
+            Function::translateMessageText(td_api::translateMessageText {
+                chat_id,
+                message_id: message_id.get(),
+                to_language_code: "de".to_owned(),
+                tone: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_translateText::ID,
+        );
+        let body = telegram_api::messages_translateText::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags & 1, 1, "the PEER flag");
+        assert_eq!(body.flags & 2, 0, "no TEXT flag");
+        assert_eq!(body.id, vec![700]);
+        assert!(body.text.is_empty(), "no input texts on the PEER form");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, channel_id);
+            }
+            other => panic!("the translate peer: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::messages_TranslatedText {
+            result: vec![telegram_api::TextWithEntities {
+                text: "hallo welt".to_owned(),
+                entities: vec![],
+            }],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_translation_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::formattedText(text)) => assert_eq!(text.text, "hallo welt"),
+            other => panic!("the translated text: {other:?}"),
+        }
+
+        // 2. the empty-text band — the empty formattedText settles before
+        //    the wire.
+        td.request(
+            2,
+            Function::translateMessageText(td_api::translateMessageText {
+                chat_id,
+                message_id: text_message.get(),
+                to_language_code: "de".to_owned(),
+                tone: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            !rec.sent
+                .lock()
+                .iter()
+                .any(|query| query.tl_constructor() == telegram_api::messages_translateText::ID),
+            "the empty band sends nothing"
+        );
+        match responses_of(&callback, 2).first() {
+            Some(Object::formattedText(text)) => assert_eq!(text.text, ""),
+            other => panic!("the empty text band: {other:?}"),
+        }
+
+        // 3. the not-found band — the 400 settles before the wire.
+        td.request(
+            3,
+            Function::translateMessageText(td_api::translateMessageText {
+                chat_id,
+                message_id: 999999,
+                to_language_code: "de".to_owned(),
+                tone: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+    }
+
+    /// Seed a broadcast-channel dialog carrying one server message with
+    /// an empty reactions block and the paid-reactions-available table —
+    /// the `addPendingPaidMessageReaction` gates open on this state.
+    fn seed_paid_reaction_channel(
+        td: &mut Td,
+    ) -> (
+        crate::messages_manager::DialogId,
+        crate::messages_manager::MessageId,
+    ) {
+        seed_my_user(td);
+        let channel_id = 2147483641;
+        seed_dialog_channel(td, channel_id, true, false);
+        let dialog_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(channel_id),
+        );
+        let mut dialog = Box::new(crate::messages_manager::Dialog::default());
+        dialog.dialog_id = dialog_id;
+        dialog.is_update_new_chat_sent = true;
+        dialog.available_reactions = crate::messages_manager::ChatReactions {
+            paid_reactions_available: true,
+            ..crate::messages_manager::ChatReactions::default()
+        };
+        let message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(500),
+        );
+        let message = crate::messages_manager::Message {
+            message_id,
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            reactions: Some(crate::messages_manager::MessageReactions::default()),
+            ..crate::messages_manager::Message::default()
+        };
+        dialog.messages.insert(message_id, Box::new(message));
+        td.messages_manager.dialogs.insert(dialog_id, dialog);
+        (dialog_id, message_id)
+    }
+
+    #[test]
+    fn messages_paid_reaction_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_paid_reaction_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 round-trips: `SendPaidReactionQuery` +
+    /// `TogglePaidReactionPrivacyQuery` (MessageReaction.cpp:93-187) —
+    /// the wire constructions at the send arms (the PRIVATE flag gate,
+    /// the privacy form), the answer halves behind
+    /// `on_messages_net_answer` (the star ledger re-adds, the
+    /// on_get_updates → `on_set_message_reactions` chain, the
+    /// MESSAGE_NOT_MODIFIED band, the dialog-error head), and the
+    /// send-leg 400 band.
+    fn messages_paid_reaction_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain25-paid-reactions");
+        let (dialog_id, message_id) = seed_paid_reaction_channel(&mut td);
+        let chat_id = dialog_id.get();
+
+        // 1. addPendingPaidMessageReaction — the pending ladder seeds the
+        //    local pending trio (5 stars, the default type).
+        td.request(
+            1,
+            Function::addPendingPaidMessageReaction(td_api::addPendingPaidMessageReaction {
+                chat_id,
+                message_id: message_id.get(),
+                star_count: 5,
+                r#type: None,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            !responses_of(&callback, 1).is_empty(),
+            "the pending add ok"
+        );
+
+        // 2. commitPendingPaidMessageReactions — SendPaidReactionQuery
+        //    rides the dispatcher: the default type keeps the PRIVATE
+        //    flag off, the count is the pending 5.
+        td.request(
+            2,
+            Function::commitPendingPaidMessageReactions(
+                td_api::commitPendingPaidMessageReactions {
+                    chat_id,
+                    message_id: message_id.get(),
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendPaidReaction::ID,
+        );
+        let body = telegram_api::messages_sendPaidReaction::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags & 1, 0, "no PRIVATE flag for the default type");
+        assert!(body.private.is_none());
+        assert_eq!(body.msg_id, 500);
+        assert_eq!(body.count, 5);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 2147483641);
+            }
+            other => panic!("the send peer: {other:?}"),
+        }
+        // the ok answer: the ledger re-add runs, the updates re-enter the
+        // engine, the chain completes the request promise
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        assert!(!responses_of(&callback, 2).is_empty(), "the commit ok");
+        // the swap consumed the pendings: the paid row landed
+        {
+            let d = td
+                .messages_manager
+                .get_dialog(dialog_id)
+                .expect("the dialog");
+            let m = crate::messages_manager::get_message(d, message_id).expect("the message");
+            let reactions = m.reactions.as_ref().expect("the reactions");
+            assert_eq!(reactions.pending_paid_reactions, 0, "pendings consumed");
+            assert_eq!(
+                reactions
+                    .top_reactors
+                    .iter()
+                    .find(|reactor| reactor.is_me())
+                    .map(|reactor| reactor.count),
+                Some(5),
+                "the me-row absorbed the pending stars"
+            );
+        }
+
+        // 3. the MESSAGE_NOT_MODIFIED band — the promise completes ok
+        //    through the chain (the ledger re-add with is_final).
+        td.request(
+            3,
+            Function::addPendingPaidMessageReaction(td_api::addPendingPaidMessageReaction {
+                chat_id,
+                message_id: message_id.get(),
+                star_count: 3,
+                r#type: Some(td_api::PaidReactionType::paidReactionTypeAnonymous(
+                    td_api::paidReactionTypeAnonymous {},
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        td.request(
+            4,
+            Function::commitPendingPaidMessageReactions(
+                td_api::commitPendingPaidMessageReactions {
+                    chat_id,
+                    message_id: message_id.get(),
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendPaidReaction::ID,
+        );
+        net_fail(sent, 400, "MESSAGE_NOT_MODIFIED");
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        assert!(
+            !responses_of(&callback, 4).is_empty(),
+            "the not-modified band completes ok"
+        );
+
+        // 4. the error band — the dialog-error head runs and the promise
+        //    errors through the chain.
+        td.request(
+            5,
+            Function::addPendingPaidMessageReaction(td_api::addPendingPaidMessageReaction {
+                chat_id,
+                message_id: message_id.get(),
+                star_count: 2,
+                r#type: None,
+            }),
+        );
+        td.flush_deferred_results();
+        td.request(
+            6,
+            Function::commitPendingPaidMessageReactions(
+                td_api::commitPendingPaidMessageReactions {
+                    chat_id,
+                    message_id: message_id.get(),
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendPaidReaction::ID,
+        );
+        net_fail(sent, 420, "REACTION_INVALID");
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "REACTION_INVALID")
+        );
+
+        // 5. setPaidMessageReactionType — the me-row exists (case 2's
+        //    swap), so TogglePaidReactionPrivacyQuery rides the
+        //    dispatcher with the anonymous privacy form.
+        td.request(
+            7,
+            Function::setPaidMessageReactionType(td_api::setPaidMessageReactionType {
+                chat_id,
+                message_id: message_id.get(),
+                r#type: Some(td_api::PaidReactionType::paidReactionTypeAnonymous(
+                    td_api::paidReactionTypeAnonymous {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePaidReactionPrivacy::ID,
+        );
+        let body = telegram_api::messages_togglePaidReactionPrivacy::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.msg_id, 500);
+        assert!(matches!(
+            body.private,
+            Some(telegram_api::PaidReactionPrivacy::paidReactionPrivacyAnonymous(_))
+        ));
+        let mut answer = Vec::new();
+        // boolTrue#997275b5
+        answer.extend_from_slice(&0x9972_75b5u32.to_le_bytes());
+        net_complete(sent, answer);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        assert!(!responses_of(&callback, 7).is_empty(), "the toggle ok");
+
+        // 6. the toggle error band — the dialog-error head + the promise
+        //    error.
+        td.request(
+            8,
+            Function::setPaidMessageReactionType(td_api::setPaidMessageReactionType {
+                chat_id,
+                message_id: message_id.get(),
+                r#type: Some(td_api::PaidReactionType::paidReactionTypeAnonymous(
+                    td_api::paidReactionTypeAnonymous {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePaidReactionPrivacy::ID,
+        );
+        net_fail(sent, 420, "CHAT_WRITE_FORBIDDEN");
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "CHAT_WRITE_FORBIDDEN")
+        );
+
+        assert!(td.messages_net_completed.lock().is_empty(), "drained");
     }
 }

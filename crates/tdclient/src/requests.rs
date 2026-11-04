@@ -14905,17 +14905,30 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
         Function::translateMessageText(request) => {
+            // `Requests.cpp:2867-2873` — CHECK_IS_USER, clean the two
+            // strings, then the messages-manager glue (the §3.8 net-drain
+            // 25 `translateText` PEER shape).
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(_lang) = clean_or_utf8_error(td, id, &request.to_language_code) else {
+            let Some(to_language_code) = clean_or_utf8_error(td, id, &request.to_language_code)
+            else {
                 return;
             };
-            let Some(_tone) = clean_or_utf8_error(td, id, &request.tone) else {
+            let Some(tone) = clean_or_utf8_error(td, id, &request.tone) else {
                 return;
             };
-            let _promise =
+            let promise =
                 td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+            td.translate_message_text(
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                to_language_code,
+                tone,
+                promise,
+            );
         }
         Function::translateMessageRichMessage(request) => {
             if !check_is_user(td, id) {
