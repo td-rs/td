@@ -3085,6 +3085,12 @@ pub(crate) type StoryNetHandle = NetKindHandle<crate::story_manager::StoryNetKin
 /// through [`Td::dispatch_completed_star_gift_net`].
 pub(crate) type StarGiftNetHandle = NetKindHandle<crate::star_gift_manager::StarGiftNetKind>;
 
+/// The cloned payments dispatch surface the [`PaymentsTdEnv`] senders
+/// use — the per-kind handle over the Payments.cpp ResultHandler kinds
+/// (the net-drain 23 twelve); the answers drain through
+/// [`Td::dispatch_completed_payments_net`].
+pub(crate) type PaymentsNetHandle = NetKindHandle<crate::payments::PaymentsNetKind>;
+
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
 /// completes into `on_dialog_gift_transferred` with the empty to-dialog
@@ -4033,6 +4039,14 @@ pub struct Td {
     /// halves of the §3.6 families — the
     /// [`Td::on_star_gift_net_answer`] drain).
     star_gift_net_completed: Arc<Mutex<Vec<(crate::star_gift_manager::StarGiftNetKind, NetQuery)>>>,
+    /// The callback-parked payments answers (the C++ ResultHandler
+    /// halves of the net-drain 23 families — the
+    /// [`Td::on_payments_net_answer`] drain).
+    payments_net_completed: Arc<Mutex<Vec<(crate::payments::PaymentsNetKind, NetQuery)>>>,
+    /// The parked payments query promises (the per-family queues the
+    /// send arms fill and `on_payments_net_answer` pops — Payments.cpp
+    /// is free functions over `Td`, so the lot lives here).
+    payments_net_pending: crate::payments::PendingNetQueries,
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
@@ -4511,6 +4525,8 @@ impl Td {
             bot_info_net_completed: Arc::new(Mutex::new(Vec::new())),
             story_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_gift_net_completed: Arc::new(Mutex::new(Vec::new())),
+            payments_net_completed: Arc::new(Mutex::new(Vec::new())),
+            payments_net_pending: crate::payments::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
@@ -6784,6 +6800,7 @@ impl Td {
         self.dispatch_completed_dialog_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_bot_info_net();
+        self.dispatch_completed_payments_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_send_message_net();
@@ -6948,6 +6965,16 @@ impl Td {
         Some(PremiumNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.premium_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned payments dispatch surface (the `PaymentsTdEnv`
+    /// senders — the net-drain 23 families).
+    pub(crate) fn payments_net(&self) -> Option<PaymentsNetHandle> {
+        Some(PaymentsNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.payments_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -14146,6 +14173,323 @@ impl Td {
                             Err(_) => {
                                 promise.set_error(parse_error("payments_sendStarsForm"));
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain the callback-parked payments answers — the C++
+    /// ResultHandler halves of the net-drain 23 families (Payments.cpp).
+    fn dispatch_completed_payments_net(&mut self) {
+        let completed = std::mem::take(&mut *self.payments_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_payments_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one payments net answer by kind — the ResultHandler halves
+    /// of the net-drain 23 families (Payments.cpp:217-1010). The five
+    /// dialog-carrying kinds run the `on_get_dialog_error` head before
+    /// the promise error (the C++ `on_error` first line); the stars form
+    /// re-adds the pending stars on both halves (Payments.cpp:730-763).
+    fn on_payments_net_answer(&mut self, kind: crate::payments::PaymentsNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        use crate::payments::PaymentsEnv as _;
+        use crate::payments::PaymentsNetKind;
+        /// Pop the oldest parked promise — the §5 FIFO-per-kind
+        /// convention (the `pop_head` shape of the sibling planes; the
+        /// answer pairs with the request that parked first, like the
+        /// C++ promise riding its own ResultHandler).
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+        /// The Bool-answer unit band of the three `()` families — both
+        /// bool constructors settle ok; the shipping/pre-checkout false
+        /// bands log the C++ INFO (Payments.cpp:237-246, 275-284) while
+        /// `ClearSavedInfoQuery::on_result` ignores the payload
+        /// (Payments.cpp:905-913).
+        fn bool_unit_result(
+            query: &NetQuery,
+            what: &str,
+            fail_log: Option<&str>,
+        ) -> Result<(), Status> {
+            if query.is_error() {
+                return Err(query.error().clone());
+            }
+            match parse_wire_bool_value(query.ok()) {
+                Some(true) => Ok(()),
+                Some(false) => {
+                    if let Some(fail_log) = fail_log {
+                        tdutils::log_info!("{fail_log}");
+                    }
+                    Ok(())
+                }
+                None => Err(parse_error(what)),
+            }
+        }
+        /// The dialog-error head of the five dialog-carrying kinds (the
+        /// C++ `on_error` first line).
+        fn dialog_error_head(
+            td: &Td,
+            dialog_id: crate::dialog_id::DialogId,
+            status: &Status,
+            source: &str,
+        ) {
+            crate::dialog_manager::on_get_dialog_error(&td.global, dialog_id, status, source);
+        }
+        match kind {
+            // `SetBotShippingAnswerQuery::on_result`/`on_error`
+            // (Payments.cpp:237-246) — the Bool answer band.
+            PaymentsNetKind::SetBotShippingAnswer => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.payments_net_pending.set_bot_shipping_answer)
+                {
+                    match bool_unit_result(
+                        &query,
+                        "messages.setBotShippingResults",
+                        Some("Sending answer to a shipping query has failed"),
+                    ) {
+                        Result::Ok(()) => promise.set_value(()),
+                        Result::Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `SetBotPreCheckoutAnswerQuery::on_result`/`on_error`
+            // (Payments.cpp:275-284).
+            PaymentsNetKind::SetBotPreCheckoutAnswer => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.payments_net_pending.set_bot_pre_checkout_answer)
+                {
+                    match bool_unit_result(
+                        &query,
+                        "messages.setBotPrecheckoutResults",
+                        Some("Sending answer to a pre-checkout query has failed"),
+                    ) {
+                        Result::Ok(()) => promise.set_value(()),
+                        Result::Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `GetPaymentFormQuery::on_result`/`on_error`
+            // (Payments.cpp:511-603) — the two form constructors route
+            // through their conversion halves.
+            PaymentsNetKind::GetPaymentForm { dialog_id } => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.payment_form) {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        dialog_error_head(self, dialog_id, &status, "GetPaymentFormQuery");
+                        promise.set_error(status);
+                    } else {
+                        let mut env = PaymentsTdEnv { td: self };
+                        match telegram_api::payments_PaymentForm::parse(query.ok()) {
+                            Ok(telegram_api::payments_PaymentForm::payments_paymentForm(form)) => {
+                                crate::payments::on_get_payment_form_result(
+                                    &mut env, dialog_id, form, promise,
+                                )
+                            }
+                            Ok(telegram_api::payments_PaymentForm::payments_paymentFormStars(
+                                form,
+                            )) => crate::payments::on_get_payment_form_stars_result(
+                                &mut env, dialog_id, form, promise,
+                            ),
+                            // the star-gift form is the C++ 500
+                            // "Unsupported" band (Payments.cpp:588-590)
+                            Ok(
+                                telegram_api::payments_PaymentForm::payments_paymentFormStarGift(
+                                    form,
+                                ),
+                            ) => {
+                                tdutils::log_error!("Receive {}", form.to_debug_string());
+                                promise.set_error(Status::error(500, "Unsupported"));
+                            }
+                            Err(_) => promise.set_error(parse_error("payments.getPaymentForm")),
+                        }
+                    }
+                }
+            }
+            // `ValidateRequestedInfoQuery::on_result`/`on_error`
+            // (Payments.cpp:626-644).
+            PaymentsNetKind::ValidateRequestedInfo { dialog_id } => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.payments_net_pending.validated_order_info)
+                {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        dialog_error_head(self, dialog_id, &status, "ValidateRequestedInfoQuery");
+                        promise.set_error(status);
+                    } else {
+                        match telegram_api::payments_ValidatedRequestedInfo::parse(query.ok()) {
+                            Ok(info) => {
+                                crate::payments::on_get_validated_order_info_result(info, promise)
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("payments.validateRequestedInfo"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `SendPaymentFormQuery::on_result`/`on_error`
+            // (Payments.cpp:677-703) — the updates tail re-enters the
+            // engine, the verification URL settles directly.
+            PaymentsNetKind::SendPaymentForm { dialog_id } => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.payment_result) {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        dialog_error_head(self, dialog_id, &status, "SendPaymentFormQuery");
+                        promise.set_error(status);
+                    } else {
+                        match telegram_api::payments_PaymentResult::parse(query.ok()) {
+                            Ok(result) => {
+                                let mut env = PaymentsTdEnv { td: self };
+                                crate::payments::on_get_send_payment_form_result(
+                                    &mut env, result, promise, false,
+                                )
+                            }
+                            Err(_) => promise.set_error(parse_error("payments.sendPaymentForm")),
+                        }
+                    }
+                }
+            }
+            // `SendStarPaymentFormQuery::on_result`/`on_error`
+            // (Payments.cpp:730-763) — both halves re-add the pending
+            // stars (only_first on the ok half).
+            PaymentsNetKind::SendStarPaymentForm {
+                dialog_id,
+                star_count,
+            } => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.payment_result) {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        dialog_error_head(self, dialog_id, &status, "SendStarPaymentFormQuery");
+                        let mut env = PaymentsTdEnv { td: self };
+                        env.add_pending_owned_star_count(star_count, false);
+                        promise.set_error(status);
+                    } else {
+                        let mut env = PaymentsTdEnv { td: self };
+                        env.add_pending_owned_star_count(star_count, true);
+                        match telegram_api::payments_PaymentResult::parse(query.ok()) {
+                            Ok(result) => crate::payments::on_get_send_payment_form_result(
+                                &mut env, result, promise, true,
+                            ),
+                            Err(_) => promise.set_error(parse_error("payments.sendStarsForm")),
+                        }
+                    }
+                }
+            }
+            // `GetPaymentReceiptQuery::on_result`/`on_error`
+            // (Payments.cpp:786-857) — the two receipt constructors
+            // route through their conversion halves.
+            PaymentsNetKind::GetPaymentReceipt { dialog_id } => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.payment_receipt)
+                {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        dialog_error_head(self, dialog_id, &status, "GetPaymentReceiptQuery");
+                        promise.set_error(status);
+                    } else {
+                        let mut env = PaymentsTdEnv { td: self };
+                        match telegram_api::payments_PaymentReceipt::parse(query.ok()) {
+                            Ok(telegram_api::payments_PaymentReceipt::payments_paymentReceipt(
+                                receipt,
+                            )) => crate::payments::on_get_payment_receipt_result(
+                                &mut env, dialog_id, receipt, promise,
+                            ),
+                            Ok(
+                                telegram_api::payments_PaymentReceipt::payments_paymentReceiptStars(
+                                    receipt,
+                                ),
+                            ) => crate::payments::on_get_payment_receipt_stars_result(
+                                &mut env, dialog_id, receipt, promise,
+                            ),
+                            Err(_) => promise.set_error(parse_error("payments.getPaymentReceipt")),
+                        }
+                    }
+                }
+            }
+            // `GetSavedInfoQuery::on_result`/`on_error`
+            // (Payments.cpp:871-885).
+            PaymentsNetKind::GetSavedInfo => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.saved_order_info)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_SavedInfo::parse(query.ok()) {
+                            Ok(saved_info) => {
+                                crate::payments::on_get_saved_order_info_result(saved_info, promise)
+                            }
+                            Err(_) => promise.set_error(parse_error("payments.getSavedInfo")),
+                        }
+                    }
+                }
+            }
+            // `ClearSavedInfoQuery::on_result`/`on_error`
+            // (Payments.cpp:905-913) — the Bool answer band.
+            PaymentsNetKind::ClearSavedInfo => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.clear_saved_info)
+                {
+                    match bool_unit_result(&query, "payments.clearSavedInfo", None) {
+                        Result::Ok(()) => promise.set_value(()),
+                        Result::Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `ExportInvoiceQuery::on_result`/`on_error`
+            // (Payments.cpp:929-937).
+            PaymentsNetKind::ExportInvoice => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.exported_invoice)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_ExportedInvoice::parse(query.ok()) {
+                            Ok(link) => {
+                                crate::payments::on_get_exported_invoice_result(link, promise)
+                            }
+                            Err(_) => promise.set_error(parse_error("payments.exportInvoice")),
+                        }
+                    }
+                }
+            }
+            // `GetBankCardInfoQuery::on_result`/`on_error`
+            // (Payments.cpp:957-968).
+            PaymentsNetKind::GetBankCardInfo => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.bank_card_info) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_BankCardData::parse(query.ok()) {
+                            Ok(response) => {
+                                crate::payments::on_get_bank_card_info_result(response, promise)
+                            }
+                            Err(_) => promise.set_error(parse_error("payments.getBankCardData")),
+                        }
+                    }
+                }
+            }
+            // `GetCollectibleInfoQuery::on_result`/`on_error`
+            // (Payments.cpp:988-1006).
+            PaymentsNetKind::GetCollectibleInfo => {
+                if let Some(mut promise) = pop_head(&mut self.payments_net_pending.collectible_info)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::fragment_CollectibleInfo::parse(query.ok()) {
+                            Ok(result) => {
+                                crate::payments::on_get_collectible_info_result(result, promise)
+                            }
+                            Err(_) => promise.set_error(parse_error("fragment.getCollectibleInfo")),
                         }
                     }
                 }
@@ -25926,27 +26270,7 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             Some(peer) => peer,
             None => panic!("launchPrepaidGiveaway has no input peer"),
         };
-        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
-        let crate::td::Td {
-            global,
-            option_manager,
-            auth_manager,
-            user_manager,
-            chat_manager,
-            ..
-        } = self.td;
-        let mut payments_env = crate::td::PaymentsEnv {
-            global,
-            options: Some(
-                option_manager
-                    .as_mut()
-                    .expect("premium calls run with the initialized option manager"),
-            ),
-            auth_is_bot: auth_manager.is_bot(),
-            my_dialog_id,
-            user_manager,
-            chat_manager,
-        };
+        let mut payments_env = crate::td::PaymentsTdEnv { td: self.td };
         let purpose = if star_count == 0 {
             parameters.get_input_store_payment_premium_giveaway(&mut payments_env, "", 0)
         } else {
@@ -26025,28 +26349,8 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         &mut self,
         text: Option<td_api::FormattedText>,
     ) -> tdutils::status::Result<Option<telegram_api::TextWithEntities>> {
-        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
-        let crate::td::Td {
-            global,
-            option_manager,
-            auth_manager,
-            user_manager,
-            chat_manager,
-            ..
-        } = self.td;
-        let mut payments_env = crate::td::PaymentsEnv {
-            global,
-            options: Some(
-                option_manager
-                    .as_mut()
-                    .expect("premium calls run with the initialized option manager"),
-            ),
-            auth_is_bot: auth_manager.is_bot(),
-            my_dialog_id,
-            user_manager,
-            chat_manager,
-        };
-        <crate::td::PaymentsEnv<'_> as crate::payments::PaymentsEnv>::premium_gift_text(
+        let mut payments_env = crate::td::PaymentsTdEnv { td: self.td };
+        <crate::td::PaymentsTdEnv<'_> as crate::payments::PaymentsEnv>::premium_gift_text(
             &mut payments_env,
             text,
         )
@@ -26138,27 +26442,7 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         &mut self,
         purpose: Option<td_api::StorePaymentPurpose>,
     ) -> tdutils::status::Result<telegram_api::InputStorePaymentPurpose> {
-        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
-        let crate::td::Td {
-            global,
-            option_manager,
-            auth_manager,
-            user_manager,
-            chat_manager,
-            ..
-        } = self.td;
-        let mut payments_env = crate::td::PaymentsEnv {
-            global,
-            options: Some(
-                option_manager
-                    .as_mut()
-                    .expect("premium calls run with the initialized option manager"),
-            ),
-            auth_is_bot: auth_manager.is_bot(),
-            my_dialog_id,
-            user_manager,
-            chat_manager,
-        };
+        let mut payments_env = crate::td::PaymentsTdEnv { td: self.td };
         crate::premium::get_input_store_payment_purpose(&mut payments_env, purpose)
     }
 
@@ -26168,27 +26452,7 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         &mut self,
         parameters: Option<&td_api::GiveawayParameters>,
     ) -> tdutils::status::Result<crate::payments::GiveawayParameters> {
-        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self.td);
-        let crate::td::Td {
-            global,
-            option_manager,
-            auth_manager,
-            user_manager,
-            chat_manager,
-            ..
-        } = self.td;
-        let mut payments_env = crate::td::PaymentsEnv {
-            global,
-            options: Some(
-                option_manager
-                    .as_mut()
-                    .expect("premium calls run with the initialized option manager"),
-            ),
-            auth_is_bot: auth_manager.is_bot(),
-            my_dialog_id,
-            user_manager,
-            chat_manager,
-        };
+        let mut payments_env = crate::td::PaymentsTdEnv { td: self.td };
         crate::payments::GiveawayParameters::get_giveaway_parameters(&mut payments_env, parameters)
     }
 }
@@ -28354,45 +28618,48 @@ impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
     }
 }
 
-/// The [`crate::payments::PaymentsEnv`] over the `Td` fields — built per
-/// request with the field-split borrows (the `NotificationEnv`
-/// convention), never held across calls. The UserManager reads are real;
-/// the DialogManager halves mirror the M.6 stub inventory (the chat/
+/// The [`crate::payments::PaymentsEnv`] over the whole `Td` (the
+/// `PremiumTdEnv` convention — the net-drain 23 send arms dispatch
+/// through [`Td::payments_net`] and park the promises in
+/// `payments_net_pending`). The UserManager reads are real; the
+/// DialogManager halves mirror the M.6 stub inventory (the chat/
 /// channel-backed reads stay the unloaded results until M.10), and the
-/// net/MessagesManager/StarManager/Files seams keep their trait defaults.
-pub(crate) struct PaymentsEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) auth_is_bot: bool,
-    /// `dialog_manager::get_my_dialog_id(td)`, computed before the field
-    /// split (the free function needs the whole `Td`).
-    pub(crate) my_dialog_id: crate::dialog_id::DialogId,
-    pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+/// MessagesManager/StarManager/Files seams keep their trait defaults.
+pub(crate) struct PaymentsTdEnv<'a> {
+    pub(crate) td: &'a mut Td,
 }
 
-impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
+impl crate::payments::PaymentsEnv for PaymentsTdEnv<'_> {
     fn get_unix_time(&self) -> i32 {
-        self.global.unix_time()
+        self.td.global.unix_time()
     }
 
     fn get_option_integer(&mut self, name: &str) -> i64 {
-        self.options
+        self.td
+            .option_manager
             .as_mut()
             .map(|options| options.get_option_integer(name, 0))
             .unwrap_or(0)
     }
 
     fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.binlog_pmc().get_raw(key)
+        self.td.global.binlog_pmc().get_raw(key)
     }
 
     fn get_input_user(
         &mut self,
         user_id: UserId,
     ) -> tdutils::status::Result<telegram_api::InputUser> {
-        let (env, user_manager) = self.split_user_env();
-        match user_manager.get_input_user(&env, user_id) {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("payment calls run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        match self.td.user_manager.get_input_user(&env, user_id) {
             Ok(input_user) => tdutils::status::Result::Ok(input_user),
             Err(status) => tdutils::status::Result::Err(status),
         }
@@ -28402,21 +28669,47 @@ impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
         &mut self,
         user_ids: &[UserId],
     ) -> tdutils::status::Result<Vec<telegram_api::InputUser>> {
-        let (env, user_manager) = self.split_user_env();
-        match user_manager.get_input_users(&env, user_ids) {
+        let env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("payment calls run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        match self.td.user_manager.get_input_users(&env, user_ids) {
             Ok(input_users) => tdutils::status::Result::Ok(input_users),
             Err(status) => tdutils::status::Result::Err(status),
         }
     }
 
     fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
-        let (mut env, user_manager) = self.split_user_env();
-        user_manager.on_get_users(&mut env, users, source);
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("payment answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td.user_manager.on_get_users(&mut env, users, source);
     }
 
     fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
-        let (mut env, user_manager) = self.split_user_env();
-        user_manager.get_user_id_object(&mut env, user_id, source)
+        let mut env = UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("payment answers run with the initialized option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_user_id_object(&mut env, user_id, source)
     }
 
     fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> bool {
@@ -28426,9 +28719,11 @@ impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
         use crate::dialog_id::DialogType;
         match dialog_id.get_type() {
             DialogType::User => self
+                .td
                 .user_manager
                 .have_accessible_user(dialog_id.get_user_id()),
             DialogType::SecretChat => self
+                .td
                 .user_manager
                 .have_secret_chat(dialog_id.get_secret_chat_id()),
             DialogType::Chat | DialogType::Channel | DialogType::None => false,
@@ -28439,11 +28734,11 @@ impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
         &mut self,
         channel_id: crate::chat_manager::ChannelId,
     ) -> crate::chat_manager::DialogParticipantStatus {
-        self.chat_manager.get_channel_status(channel_id)
+        self.td.chat_manager.get_channel_status(channel_id)
     }
 
     fn is_broadcast_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
-        self.chat_manager.is_broadcast_channel(channel_id)
+        self.td.chat_manager.is_broadcast_channel(channel_id)
     }
 
     fn get_input_peer(
@@ -28457,8 +28752,20 @@ impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
         use crate::dialog_id::DialogType;
         match dialog_id.get_type() {
             DialogType::User => {
-                let (env, user_manager) = self.split_user_env();
-                user_manager.get_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+                let env = UserEnv {
+                    global: &mut self.td.global,
+                    options: self
+                        .td
+                        .option_manager
+                        .as_mut()
+                        .expect("payment calls run with the initialized option manager"),
+                    auth_is_bot: self.td.auth_manager.is_bot(),
+                };
+                self.td.user_manager.get_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
             }
             DialogType::Chat | DialogType::Channel | DialogType::SecretChat => None,
             DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
@@ -28491,33 +28798,392 @@ impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
     }
 
     fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
-        self.my_dialog_id
+        crate::dialog_manager::get_my_dialog_id(self.td)
     }
-}
 
-impl PaymentsEnv<'_> {
-    /// Field-split the env into the `UserEnv` plus the manager reference
-    /// (the `user_env!` shape; a `&mut self` helper cannot return both,
-    /// hence the manual destructuring at every call).
-    fn split_user_env(&mut self) -> (UserEnv<'_>, &mut UserManager) {
-        let Self {
-            global,
-            options,
-            auth_is_bot,
-            my_dialog_id: _,
-            user_manager,
-            chat_manager: _,
-        } = self;
-        (
-            UserEnv {
-                global,
-                options: options
-                    .as_mut()
-                    .expect("payment requests run with the initialized option manager"),
-                auth_is_bot: *auth_is_bot,
-            },
-            user_manager,
-        )
+    // `DialogManager::on_get_dialog_error` (the ResultHandler `on_error`
+    // intake) — the net-drain 23 hookup.
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error(&self.td.global, dialog_id, status, source);
+    }
+
+    // `UpdatesManager::on_get_updates` (the public entry's self-bounce —
+    // UpdatesManager.cpp:1176-1178, the `PremiumTdEnv` shape).
+    fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
+        self.td.um_send_later(UmMessage::OnGetUpdates {
+            updates: Box::new(updates),
+            promise,
+        });
+    }
+
+    // The twelve query sends (Payments.cpp:217-1010) — the wire
+    // construction lives at the send arms; the answers drain through
+    // `Td::on_payments_net_answer`.
+
+    // `SetBotShippingAnswerQuery::send` (Payments.cpp:224-235) — the
+    // ERROR/SHIPPING_OPTIONS flag positions (messages.setBotShippingResults).
+    fn send_set_bot_shipping_answer_query(
+        &mut self,
+        shipping_query_id: i64,
+        error_message: &str,
+        shipping_options: Vec<telegram_api::ShippingOption>,
+        promise: Promise<()>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                let mut flags = 0;
+                if !error_message.is_empty() {
+                    flags |= 1; // ERROR_MASK
+                }
+                if !shipping_options.is_empty() {
+                    flags |= 1 << 1; // SHIPPING_OPTIONS_MASK
+                }
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::SetBotShippingAnswer,
+                    telegram_api::Function::messages_setBotShippingResults(
+                        telegram_api::messages_setBotShippingResults {
+                            flags,
+                            query_id: shipping_query_id,
+                            error: error_message.to_owned(),
+                            shipping_options,
+                        },
+                    ),
+                );
+                self.td
+                    .payments_net_pending
+                    .set_bot_shipping_answer
+                    .push(promise);
+            }
+            None => tdutils::log_info!("Send messages.setBotShippingResults — [net-inert]"),
+        }
+    }
+
+    // `SetBotPreCheckoutAnswerQuery::send` (Payments.cpp:262-273) — the
+    // ERROR flag position; success is the empty-error form.
+    fn send_set_bot_pre_checkout_answer_query(
+        &mut self,
+        pre_checkout_query_id: i64,
+        error_message: &str,
+        promise: Promise<()>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                let is_success = error_message.is_empty();
+                let flags = if is_success { 0 } else { 1 }; // ERROR_MASK
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::SetBotPreCheckoutAnswer,
+                    telegram_api::Function::messages_setBotPrecheckoutResults(
+                        telegram_api::messages_setBotPrecheckoutResults {
+                            flags,
+                            success: is_success,
+                            query_id: pre_checkout_query_id,
+                            error: error_message.to_owned(),
+                        },
+                    ),
+                );
+                self.td
+                    .payments_net_pending
+                    .set_bot_pre_checkout_answer
+                    .push(promise);
+            }
+            None => tdutils::log_info!("Send messages.setBotPrecheckoutResults — [net-inert]"),
+        }
+    }
+
+    // `GetPaymentFormQuery::send` (Payments.cpp:500-509) — the
+    // THEME_PARAMS flag position; the kind carries the dialog id.
+    fn send_get_payment_form_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_invoice: telegram_api::InputInvoice,
+        theme_parameters: Option<telegram_api::DataJSON>,
+        promise: Promise<td_api::PaymentForm>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                let flags = if theme_parameters.is_some() { 1 } else { 0 }; // THEME_PARAMS_MASK
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::GetPaymentForm { dialog_id },
+                    telegram_api::Function::payments_getPaymentForm(
+                        telegram_api::payments_getPaymentForm {
+                            flags,
+                            invoice: Some(input_invoice),
+                            theme_params: theme_parameters,
+                        },
+                    ),
+                );
+                self.td.payments_net_pending.payment_form.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.getPaymentForm — [net-inert]"),
+        }
+    }
+
+    // `ValidateRequestedInfoQuery::send` (Payments.cpp:615-624) — the
+    // null-info normalization ran at the flow; save rides flags.0.
+    fn send_validate_requested_info_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_invoice: telegram_api::InputInvoice,
+        requested_info: Option<telegram_api::PaymentRequestedInfo>,
+        allow_save: bool,
+        promise: Promise<td_api::ValidatedOrderInfo>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::ValidateRequestedInfo { dialog_id },
+                    telegram_api::Function::payments_validateRequestedInfo(
+                        telegram_api::payments_validateRequestedInfo {
+                            flags: 0,
+                            save: allow_save,
+                            invoice: Some(input_invoice),
+                            info: requested_info,
+                        },
+                    ),
+                );
+                self.td
+                    .payments_net_pending
+                    .validated_order_info
+                    .push(promise);
+            }
+            None => tdutils::log_info!("Send payments.validateRequestedInfo — [net-inert]"),
+        }
+    }
+
+    // `SendPaymentFormQuery::send` (Payments.cpp:655-675) — the
+    // REQUESTED_INFO_ID/SHIPPING_OPTION_ID/TIP_AMOUNT flag positions.
+    fn send_send_payment_form_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_invoice: telegram_api::InputInvoice,
+        payment_form_id: i64,
+        order_info_id: &str,
+        shipping_option_id: &str,
+        input_credentials: telegram_api::InputPaymentCredentials,
+        tip_amount: i64,
+        promise: Promise<td_api::PaymentResult>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                let mut flags = 0;
+                if !order_info_id.is_empty() {
+                    flags |= 1; // REQUESTED_INFO_ID_MASK
+                }
+                if !shipping_option_id.is_empty() {
+                    flags |= 1 << 1; // SHIPPING_OPTION_ID_MASK
+                }
+                if tip_amount != 0 {
+                    flags |= 1 << 2; // TIP_AMOUNT_MASK
+                }
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::SendPaymentForm { dialog_id },
+                    telegram_api::Function::payments_sendPaymentForm(
+                        telegram_api::payments_sendPaymentForm {
+                            flags,
+                            form_id: payment_form_id,
+                            invoice: Some(input_invoice),
+                            requested_info_id: order_info_id.to_owned(),
+                            shipping_option_id: shipping_option_id.to_owned(),
+                            credentials: Some(input_credentials),
+                            tip_amount,
+                        },
+                    ),
+                );
+                self.td.payments_net_pending.payment_result.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.sendPaymentForm — [net-inert]"),
+        }
+    }
+
+    // `SendStarPaymentFormQuery::send` (Payments.cpp:721-728) — the kind
+    // carries the dialog id and the star count (the answer re-adds).
+    fn send_send_stars_form_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        star_count: i64,
+        payment_form_id: i64,
+        input_invoice: telegram_api::InputInvoice,
+        promise: Promise<td_api::PaymentResult>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::SendStarPaymentForm {
+                        dialog_id,
+                        star_count,
+                    },
+                    telegram_api::Function::payments_sendStarsForm(
+                        telegram_api::payments_sendStarsForm {
+                            form_id: payment_form_id,
+                            invoice: Some(input_invoice),
+                        },
+                    ),
+                );
+                self.td.payments_net_pending.payment_result.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.sendStarsForm — [net-inert]"),
+        }
+    }
+
+    // `GetPaymentReceiptQuery::send` (Payments.cpp:775-784) — the Read
+    // peer resolves at the send leg; the unresolved band is the C++
+    // inline `on_error(Status)` (the complete_error convention).
+    fn send_get_payment_receipt_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        server_message_id: crate::dialog_id::ServerMessageId,
+        promise: Promise<td_api::PaymentReceipt>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                let kind = crate::payments::PaymentsNetKind::GetPaymentReceipt { dialog_id };
+                match self.get_input_peer(dialog_id, crate::user_manager::AccessRights::Read) {
+                    Some(peer) => net.dispatch(
+                        kind,
+                        telegram_api::Function::payments_getPaymentReceipt(
+                            telegram_api::payments_getPaymentReceipt {
+                                peer: Some(Box::new(peer)),
+                                msg_id: server_message_id.get(),
+                            },
+                        ),
+                    ),
+                    None => net.complete_error(kind, 400, "Can't access the chat"),
+                }
+                self.td.payments_net_pending.payment_receipt.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.getPaymentReceipt — [net-inert]"),
+        }
+    }
+
+    // `GetSavedInfoQuery::send` (Payments.cpp:867-869).
+    fn send_get_saved_info_query(&mut self, promise: Promise<td_api::OrderInfo>) {
+        match self.td.payments_net() {
+            Some(net) => {
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::GetSavedInfo,
+                    telegram_api::Function::payments_getSavedInfo(
+                        telegram_api::payments_getSavedInfo,
+                    ),
+                );
+                self.td.payments_net_pending.saved_order_info.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.getSavedInfo — [net-inert]"),
+        }
+    }
+
+    // `ClearSavedInfoQuery::send` (Payments.cpp:894-898) — the
+    // credentials/info flag positions.
+    fn send_clear_saved_info_query(
+        &mut self,
+        clear_credentials: bool,
+        clear_order_info: bool,
+        promise: Promise<()>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::ClearSavedInfo,
+                    telegram_api::Function::payments_clearSavedInfo(
+                        telegram_api::payments_clearSavedInfo {
+                            flags: 0,
+                            credentials: clear_credentials,
+                            info: clear_order_info,
+                        },
+                    ),
+                );
+                self.td.payments_net_pending.clear_saved_info.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.clearSavedInfo — [net-inert]"),
+        }
+    }
+
+    // `ExportInvoiceQuery::send` (Payments.cpp:921-927) — the
+    // `create_with_prefix` invoke prefix and the business DC ride the
+    // BusinessConnectionManager plane (the star-gift business-form
+    // convention); the empty id dispatches plain on the main DC.
+    fn send_export_invoice_query(
+        &mut self,
+        business_connection_id: &crate::payments::BusinessConnectionId,
+        input_media_invoice: telegram_api::inputMediaInvoice,
+        promise: Promise<String>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                if business_connection_id.is_valid() {
+                    // the invoke-prefix dispatch never answers until the
+                    // BusinessConnectionManager plane lands, so the
+                    // promise parks by consuming it (the net-inert
+                    // posture) — off the answered FIFO
+                    tdutils::log_info!("Send payments.exportInvoice (business) — [blocked: net]");
+                    drop(promise);
+                    return;
+                }
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::ExportInvoice,
+                    telegram_api::Function::payments_exportInvoice(
+                        telegram_api::payments_exportInvoice {
+                            invoice_media: Some(Box::new(
+                                telegram_api::InputMedia::inputMediaInvoice(input_media_invoice),
+                            )),
+                        },
+                    ),
+                );
+                self.td.payments_net_pending.exported_invoice.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.exportInvoice — [net-inert]"),
+        }
+    }
+
+    // `GetBankCardInfoQuery::send` (Payments.cpp:952-955) — the webfile
+    // DC (the toncenter-perform precedent).
+    fn send_get_bank_card_info_query(
+        &mut self,
+        bank_card_number: &str,
+        promise: Promise<td_api::BankCardInfo>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                let webfile_dc = self.td.webfile_dc_id();
+                net.dispatch_dc(
+                    crate::payments::PaymentsNetKind::GetBankCardInfo,
+                    telegram_api::Function::payments_getBankCardData(
+                        telegram_api::payments_getBankCardData {
+                            number: bank_card_number.to_owned(),
+                        },
+                    ),
+                    webfile_dc,
+                );
+                self.td.payments_net_pending.bank_card_info.push(promise);
+            }
+            None => tdutils::log_info!("Send payments.getBankCardData — [net-inert]"),
+        }
+    }
+
+    // `GetCollectibleInfoQuery::send` (Payments.cpp:983-986).
+    fn send_get_collectible_info_query(
+        &mut self,
+        input_collectible: telegram_api::InputCollectible,
+        promise: Promise<td_api::CollectibleItemInfo>,
+    ) {
+        match self.td.payments_net() {
+            Some(net) => {
+                net.dispatch(
+                    crate::payments::PaymentsNetKind::GetCollectibleInfo,
+                    telegram_api::Function::fragment_getCollectibleInfo(
+                        telegram_api::fragment_getCollectibleInfo {
+                            collectible: Some(input_collectible),
+                        },
+                    ),
+                );
+                self.td.payments_net_pending.collectible_info.push(promise);
+            }
+            None => tdutils::log_info!("Send fragment.getCollectibleInfo — [net-inert]"),
+        }
     }
 }
 
@@ -58901,5 +59567,813 @@ mod tests {
 
         assert!(rec.sent.lock().is_empty(), "no stray queries");
         assert!(td.star_gift_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn payments_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(payments_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 23 round-trips (net-drain 23 / #32): the twelve
+    /// Payments.cpp families dispatch over the `PaymentsNetKind` plane —
+    /// the wire constructions at the send arms, the answer halves behind
+    /// `on_payments_net_answer`, the receipt send-leg 400 band, and the
+    /// `on_get_updates` re-entry of the payment-result tail.
+    fn payments_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain23-payments");
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+        seed_my_user(&mut td); // my id 42
+
+        // 1. getPaymentForm (the slug invoice) — the plain form: the
+        //    THEME_PARAMS flag stays off, the answer converts through
+        //    `on_get_payment_form_result`.
+        td.request(
+            1,
+            Function::getPaymentForm(td_api::getPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                theme: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let body = telegram_api::payments_getPaymentForm::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 0);
+        match body.invoice {
+            Some(telegram_api::InputInvoice::inputInvoiceSlug(invoice)) => {
+                assert_eq!(invoice.slug, "slug-1");
+            }
+            other => panic!("the wire invoice: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentForm(
+            telegram_api::payments_paymentForm {
+                form_id: 9,
+                bot_id: 700000001,
+                title: "T".to_owned(),
+                description: "D".to_owned(),
+                provider_id: 700000002,
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "base".to_owned(),
+                        amount: 100,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentForm::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::paymentForm(form)) => {
+                assert_eq!(form.id, 9);
+                assert!(matches!(
+                    form.r#type,
+                    Some(td_api::PaymentFormType::paymentFormTypeRegular(_))
+                ));
+                assert_eq!(form.seller_bot_user_id, 700000001);
+            }
+            other => panic!("the payment form: {other:?}"),
+        }
+
+        // 2. getPaymentForm with the theme — the THEME_PARAMS flag rides
+        //    flags.0; the stars form converts through the stars half.
+        td.request(
+            2,
+            Function::getPaymentForm(td_api::getPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                theme: Some(td_api::ThemeParameters::default()),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let body = telegram_api::payments_getPaymentForm::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1);
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                form_id: 11,
+                bot_id: 700000001,
+                title: "T".to_owned(),
+                description: "D".to_owned(),
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "base".to_owned(),
+                        amount: 250,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentFormStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::paymentForm(form)) => {
+                assert_eq!(form.id, 11);
+                match &form.r#type {
+                    Some(td_api::PaymentFormType::paymentFormTypeStars(t)) => {
+                        assert_eq!(t.star_count, 250);
+                    }
+                    other => panic!("the stars form type: {other:?}"),
+                }
+            }
+            other => panic!("the stars form: {other:?}"),
+        }
+
+        // 3. getPaymentForm — the star-gift form is the C++ 500
+        //    "Unsupported" band (Payments.cpp:588-590).
+        td.request(
+            3,
+            Function::getPaymentForm(td_api::getPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                theme: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStarGift(
+            telegram_api::payments_paymentFormStarGift {
+                form_id: 1,
+                invoice: Some(telegram_api::Invoice::default()),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (500, "Unsupported"));
+
+        // 4. getPaymentForm — the wire-error band runs the dialog-error
+        //    head then errors the promise.
+        td.request(
+            4,
+            Function::getPaymentForm(td_api::getPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                theme: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        net_fail(sent, 400, "PAYMENT_FORM_EXPIRED");
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "PAYMENT_FORM_EXPIRED")
+        );
+
+        // 5. validateOrderInfo — the info + the save flag ride the wire
+        //    (flags.0), the answer converts the options.
+        td.request(
+            5,
+            Function::validateOrderInfo(td_api::validateOrderInfo {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                order_info: Some(td_api::OrderInfo {
+                    name: "Alice".to_owned(),
+                    ..td_api::OrderInfo::default()
+                }),
+                allow_save: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_validateRequestedInfo::ID,
+        );
+        let body =
+            telegram_api::payments_validateRequestedInfo::parse(sent.query()).expect("the body");
+        // flags.0 carries save (the store ORs the boolean member in)
+        assert_eq!(body.flags, 1);
+        assert!(body.save);
+        match &body.info {
+            Some(info) => assert_eq!(info.name, "Alice"),
+            None => panic!("the requested info must ride the query"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_ValidatedRequestedInfo {
+            flags: 1, // the ID flag position — id: flags.0?string
+            id: "oi-1".to_owned(),
+            shipping_options: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 5).first() {
+            Some(Object::validatedOrderInfo(info)) => {
+                assert_eq!(info.order_info_id, "oi-1");
+                assert!(info.shipping_options.is_empty());
+            }
+            other => panic!("the validated order info: {other:?}"),
+        }
+
+        // 6. sendPaymentForm — the verification-needed answer settles
+        //    the paymentResult(false, url) directly.
+        td.request(
+            6,
+            Function::sendPaymentForm(td_api::sendPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                payment_form_id: 9,
+                order_info_id: String::new(),
+                shipping_option_id: String::new(),
+                credentials: Some(td_api::InputCredentials::inputCredentialsNew(
+                    td_api::inputCredentialsNew {
+                        data: "{}".to_owned(),
+                        allow_save: false,
+                    },
+                )),
+                tip_amount: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_sendPaymentForm::ID,
+        );
+        let body = telegram_api::payments_sendPaymentForm::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 0);
+        assert_eq!(body.form_id, 9);
+        assert!(matches!(
+            body.credentials,
+            Some(telegram_api::InputPaymentCredentials::inputPaymentCredentials(_))
+        ));
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
+            telegram_api::payments_paymentVerificationNeeded {
+                url: "https://verify.example".to_owned(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 6).first() {
+            Some(Object::paymentResult(result)) => {
+                assert!(!result.success);
+                assert_eq!(result.verification_url, "https://verify.example");
+            }
+            other => panic!("the payment result: {other:?}"),
+        }
+
+        // 7. sendPaymentForm — the paymentResult answer re-enters
+        //    `on_get_updates` with the continuation; the updates tail
+        //    completes paymentResult(true, "").
+        td.request(
+            7,
+            Function::sendPaymentForm(td_api::sendPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                payment_form_id: 9,
+                order_info_id: String::new(),
+                shipping_option_id: String::new(),
+                credentials: Some(td_api::InputCredentials::inputCredentialsNew(
+                    td_api::inputCredentialsNew {
+                        data: "{}".to_owned(),
+                        allow_save: false,
+                    },
+                )),
+                tip_amount: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_sendPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentResult(
+            telegram_api::payments_paymentResult {
+                updates: Some(telegram_api::Updates::updates(telegram_api::updates {
+                    updates: Vec::new(),
+                    users: Vec::new(),
+                    chats: Vec::new(),
+                    date: 0,
+                    seq: 0,
+                })),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 7).first() {
+            Some(Object::paymentResult(result)) => {
+                assert!(result.success);
+                assert_eq!(result.verification_url, "");
+            }
+            other => panic!("the updates-tail payment result: {other:?}"),
+        }
+
+        // 8. sendPaymentForm — the stars branch (no credentials): the
+        //    send rides `payments.sendStarsForm`.
+        td.request(
+            8,
+            Function::sendPaymentForm(td_api::sendPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                payment_form_id: 11,
+                order_info_id: String::new(),
+                shipping_option_id: String::new(),
+                credentials: None,
+                tip_amount: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_sendStarsForm::ID,
+        );
+        let body = telegram_api::payments_sendStarsForm::parse(sent.query()).expect("the body");
+        assert_eq!(body.form_id, 11);
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
+            telegram_api::payments_paymentVerificationNeeded {
+                url: "https://stars.example".to_owned(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 8).first() {
+            Some(Object::paymentResult(result)) => {
+                assert!(!result.success);
+                assert_eq!(result.verification_url, "https://stars.example");
+            }
+            other => panic!("the stars payment result: {other:?}"),
+        }
+
+        // 9. sendStarsForm — the error band re-adds the pending stars
+        //    and errors the promise.
+        td.request(
+            9,
+            Function::sendPaymentForm(td_api::sendPaymentForm {
+                input_invoice: Some(td_api::InputInvoice::inputInvoiceName(
+                    td_api::inputInvoiceName {
+                        name: "slug-1".to_owned(),
+                    },
+                )),
+                payment_form_id: 11,
+                order_info_id: String::new(),
+                shipping_option_id: String::new(),
+                credentials: None,
+                tip_amount: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_sendStarsForm::ID,
+        );
+        net_fail(sent, 420, "STARS_NOT_ENOUGH");
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 9);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "STARS_NOT_ENOUGH")
+        );
+
+        // 10. getPaymentReceipt — the request arm is the M.10 seam: the
+        //     message read 400s before the send leg.
+        td.request(
+            10,
+            Function::getPaymentReceipt(td_api::getPaymentReceipt {
+                chat_id: 700000001,
+                message_id: 100,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 10);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 11. getPaymentReceipt — the send seam over the seeded user:
+        //     the Read peer resolves at the send leg, the stars receipt
+        //     converts.
+        {
+            // the seam drive registers the request ids the C++ `Td::request`
+            // would (`send_result` delivers only in-flight ids)
+            td.request_set.insert(11);
+            let mut env = crate::td::PaymentsTdEnv { td: &mut td };
+            let promise = env
+                .td
+                .deferred_promise(11, |b: td_api::PaymentReceipt| Object::paymentReceipt(b));
+            crate::payments::PaymentsEnv::send_get_payment_receipt_query(
+                &mut env,
+                crate::dialog_id::DialogId::new(700000001),
+                crate::dialog_id::ServerMessageId::new(7),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentReceipt::ID,
+        );
+        let body = telegram_api::payments_getPaymentReceipt::parse(sent.query()).expect("the body");
+        assert_eq!(body.msg_id, 7);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+                assert_eq!(peer.access_hash, 5);
+            }
+            other => panic!("the receipt peer: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentReceipt::payments_paymentReceiptStars(
+            telegram_api::payments_paymentReceiptStars {
+                date: 1000,
+                bot_id: 700000001,
+                title: "T".to_owned(),
+                description: "D".to_owned(),
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "base".to_owned(),
+                        amount: 100,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                transaction_id: "tx-1".to_owned(),
+                ..telegram_api::payments_paymentReceiptStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 11).first() {
+            Some(Object::paymentReceipt(receipt)) => {
+                assert_eq!(receipt.date, 1000);
+                match &receipt.r#type {
+                    Some(td_api::PaymentReceiptType::paymentReceiptTypeStars(t)) => {
+                        assert_eq!(t.star_count, 100);
+                        assert_eq!(t.transaction_id, "tx-1");
+                    }
+                    other => panic!("the receipt type: {other:?}"),
+                }
+            }
+            other => panic!("the payment receipt: {other:?}"),
+        }
+
+        // 12. getPaymentReceipt — the unreachable dialog is the send-leg
+        //     400 "Can't access the chat" band (the C++ inline
+        //     `on_error(Status)` through the completed queue).
+        {
+            td.request_set.insert(12);
+            let mut env = crate::td::PaymentsTdEnv { td: &mut td };
+            let promise = env
+                .td
+                .deferred_promise(12, |b: td_api::PaymentReceipt| Object::paymentReceipt(b));
+            crate::payments::PaymentsEnv::send_get_payment_receipt_query(
+                &mut env,
+                crate::dialog_id::DialogId::new(799999999),
+                crate::dialog_id::ServerMessageId::new(8),
+                promise,
+            );
+        }
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't access the chat")
+        );
+
+        // 13. getSavedOrderInfo — the saved-info answer converts.
+        td.request(13, Function::getSavedOrderInfo(td_api::getSavedOrderInfo));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getSavedInfo::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_SavedInfo {
+            // the SAVED_INFO flag position — saved_info: flags.0?
+            flags: 1,
+            has_saved_credentials: false,
+            saved_info: Some(telegram_api::PaymentRequestedInfo {
+                // the NAME flag position — name: flags.0?string
+                flags: 1,
+                name: "Alice".to_owned(),
+                ..telegram_api::PaymentRequestedInfo::default()
+            }),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 13).first() {
+            Some(Object::orderInfo(info)) => {
+                assert_eq!(info.name, "Alice");
+            }
+            other => panic!("the saved order info: {other:?}"),
+        }
+
+        // 14. deleteSavedOrderInfo — the info flag rides flags.1.
+        td.request(
+            14,
+            Function::deleteSavedOrderInfo(td_api::deleteSavedOrderInfo),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_clearSavedInfo::ID,
+        );
+        let body = telegram_api::payments_clearSavedInfo::parse(sent.query()).expect("the body");
+        assert!(!body.credentials && body.info);
+        let answer = bool_answer(true);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 14).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 15. deleteSavedCredentials — the credentials flag rides
+        //     flags.0; the boolFalse band still settles ok.
+        td.request(
+            15,
+            Function::deleteSavedCredentials(td_api::deleteSavedCredentials),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_clearSavedInfo::ID,
+        );
+        let body = telegram_api::payments_clearSavedInfo::parse(sent.query()).expect("the body");
+        assert!(body.credentials && !body.info);
+        let answer = bool_answer(false);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 15).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 16. getBankCardInfo — the webfile-DC dispatch: the config seam
+        //     answers the invalid id until the option lands, so the
+        //     offline dispatcher's DC gate completes the query with the
+        //     C++ "No such dc" error through the routing (the toncenter
+        //     webfile-DC precedent); the answer conversion half is
+        //     unit-tested in payments.rs.
+        td.request(
+            16,
+            Function::getBankCardInfo(td_api::getBankCardInfo {
+                bank_card_number: "4242424242424242".to_owned(),
+            }),
+        );
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the DC gate refuses the query before the session offline"
+        );
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 16);
+        assert_eq!(error.code, 0);
+        assert!(error.message.starts_with("No such dc"), "{}", error.message);
+
+        // 17. getCollectibleItemInfo — the username collectible; the
+        //     invalid price clamps to zero (the C++ value band).
+        td.request(
+            17,
+            Function::getCollectibleItemInfo(td_api::getCollectibleItemInfo {
+                r#type: Some(td_api::CollectibleItemType::collectibleItemTypeUsername(
+                    td_api::collectibleItemTypeUsername {
+                        username: "collectible".to_owned(),
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::fragment_getCollectibleInfo::ID,
+        );
+        let body =
+            telegram_api::fragment_getCollectibleInfo::parse(sent.query()).expect("the body");
+        match body.collectible {
+            Some(telegram_api::InputCollectible::inputCollectibleUsername(collectible)) => {
+                assert_eq!(collectible.username, "collectible");
+            }
+            other => panic!("the collectible: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::fragment_CollectibleInfo {
+            purchase_date: 1700000000,
+            currency: "USD".to_owned(),
+            amount: -5, // the invalid-price clamp band
+            crypto_currency: "TON".to_owned(),
+            crypto_amount: 7,
+            url: "https://fragment.example".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 17).first() {
+            Some(Object::collectibleItemInfo(info)) => {
+                assert_eq!(info.amount, 0, "the invalid price clamps");
+                assert_eq!(info.cryptocurrency_amount, 7);
+                assert_eq!(info.url, "https://fragment.example");
+            }
+            other => panic!("the collectible info: {other:?}"),
+        }
+
+        // The bot-gated arms from here (Requests.cpp:8372-8386, 8757-8762).
+        td.auth_manager.restore_is_bot(true);
+
+        // 18. answerShippingQuery — the SHIPPING_OPTIONS flag rides
+        //     flags.1 (no error); the boolFalse band still settles ok.
+        td.request(
+            18,
+            Function::answerShippingQuery(td_api::answerShippingQuery {
+                shipping_query_id: 55,
+                shipping_options: vec![td_api::ShippingOption {
+                    id: "opt".to_owned(),
+                    title: "Option".to_owned(),
+                    price_parts: vec![td_api::LabeledPricePart {
+                        label: "base".to_owned(),
+                        amount: 100,
+                    }],
+                }],
+                error_message: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotShippingResults::ID,
+        );
+        let body =
+            telegram_api::messages_setBotShippingResults::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 1);
+        assert_eq!(body.query_id, 55);
+        assert_eq!(body.shipping_options.len(), 1);
+        let answer = bool_answer(false);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 18).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 19. answerPreCheckoutQuery — the ERROR flag rides flags.0 with
+        //     success false.
+        td.request(
+            19,
+            Function::answerPreCheckoutQuery(td_api::answerPreCheckoutQuery {
+                pre_checkout_query_id: 66,
+                error_message: "Out of stock".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotPrecheckoutResults::ID,
+        );
+        let body =
+            telegram_api::messages_setBotPrecheckoutResults::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1);
+        assert!(!body.success);
+        assert_eq!(body.query_id, 66);
+        assert_eq!(body.error, "Out of stock");
+        let answer = bool_answer(true);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 19).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 20. createInvoiceLink (the exportInvoice flow) — the plain
+        //     (empty business id) form dispatches main-DC; the answer
+        //     URL lands as httpUrl.
+        td.request(
+            20,
+            Function::createInvoiceLink(td_api::createInvoiceLink {
+                business_connection_id: String::new(),
+                invoice: Some(Box::new(td_api::InputMessageContent::inputMessageInvoice(
+                    td_api::inputMessageInvoice {
+                        invoice: Some(td_api::Invoice {
+                            currency: "USD".to_owned(),
+                            price_parts: vec![td_api::LabeledPricePart {
+                                label: "base".to_owned(),
+                                amount: 100,
+                            }],
+                            ..td_api::Invoice::default()
+                        }),
+                        title: "T".to_owned(),
+                        description: "D".to_owned(),
+                        ..td_api::inputMessageInvoice::default()
+                    },
+                ))),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_exportInvoice::ID,
+        );
+        let body = telegram_api::payments_exportInvoice::parse(sent.query()).expect("the body");
+        match body.invoice_media.as_deref() {
+            Some(telegram_api::InputMedia::inputMediaInvoice(media)) => {
+                assert_eq!(media.title, "T");
+            }
+            other => panic!("the invoice media: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_ExportedInvoice {
+            url: "https://t.me/invoice".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 20).first() {
+            Some(Object::httpUrl(url)) => assert_eq!(url.url, "https://t.me/invoice"),
+            other => panic!("the exported invoice: {other:?}"),
+        }
+
+        // 21. The FIFO-per-kind pairing — two concurrent
+        //     getSavedOrderInfo requests (back to the user posture):
+        //     the first answer settles the first parker (the C++
+        //     promise rides its own ResultHandler; the queue port
+        //     pairs in park order).
+        td.auth_manager.restore_is_bot(false);
+        td.request(21, Function::getSavedOrderInfo(td_api::getSavedOrderInfo));
+        td.request(22, Function::getSavedOrderInfo(td_api::getSavedOrderInfo));
+        let sent_queries = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent_queries.len(), 2, "both requests dispatch");
+        let saved_info_answer = |name: &str| {
+            let mut answer = Vec::new();
+            telegram_api::payments_SavedInfo {
+                flags: 1,
+                has_saved_credentials: false,
+                saved_info: Some(telegram_api::PaymentRequestedInfo {
+                    flags: 1,
+                    name: name.to_owned(),
+                    ..telegram_api::PaymentRequestedInfo::default()
+                }),
+            }
+            .store_boxed(&mut answer);
+            answer
+        };
+        net_complete(
+            sent_queries.into_iter().next().unwrap(),
+            saved_info_answer("First"),
+        );
+        td.dispatch_completed_payments_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 21).first() {
+            Some(Object::orderInfo(info)) => assert_eq!(info.name, "First"),
+            other => panic!("the first FIFO answer: {other:?}"),
+        }
+
+        assert!(td.payments_net_completed.lock().is_empty(), "drained");
     }
 }

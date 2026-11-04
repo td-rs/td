@@ -34,12 +34,16 @@
 //!   its base; this base is pre-M.41).
 //!
 //! Seams ([`PaymentsEnv`], the ThemeManagerEnv convention):
-//! - The eleven `Td::ResultHandler` queries are `[blocked: net]` env
-//!   seams: each `send_*` seam `log_info!`s the query name and parks (by
-//!   consuming) the request promise — the deferred outbox keeps the
-//!   request pending exactly like a sent-but-unanswered net query. The
-//!   matching `on_get_*` answer halves are real and unit-tested; they are
-//!   what the net integration will drive (the M.31/M.41 convention).
+//! - The twelve `Td::ResultHandler` queries ride the client-side net
+//!   dispatcher (net-drain 23 / #32) under `PaymentsNetKind`: the Td
+//!   env's `send_*` arms construct the wire query, dispatch through the
+//!   per-kind handle, and park the request promise in the per-family
+//!   queues (`PendingNetQueries`) until `Td::on_payments_net_answer`
+//!   settles it through the answer halves. The trait defaults keep the
+//!   net-inert posture — the promise parks by consuming it, the
+//!   `[net-inert]` log — so the deferred outbox stays pending exactly
+//!   like a sent-but-unanswered net query (the M.31/M.41 convention).
+//!   The matching `on_get_*` answer halves are real and unit-tested.
 //! - The MessagesManager reads (`get_invoice_message_info`,
 //!   `get_payment_successful_message_id`, MessagesManager.cpp:36587-36675)
 //!   are `[blocked: M.10]` env seams.
@@ -56,8 +60,8 @@
 //!   `[blocked: M.12]` seams; the payment forms/receipts build photo-less
 //!   product info until it lands.
 //! - `DialogManager::on_get_dialog_error` (the ResultHandler `on_error`
-//!   intake) rides an env seam — the real free function needs the whole
-//!   `Td`, so the hookup lands with the net step.
+//!   intake) rides an env seam whose default is inert; the Td env runs
+//!   the real free function (landed with net-drain 23).
 //!
 //! Recorded divergences:
 //! - `convert_labeled_price`/`convert_invoice` mutate the received wire
@@ -798,12 +802,95 @@ impl InputInvoice {
 }
 
 // ---------------------------------------------------------------------------
+// the net kinds + the parked promises (net-drain 23 / #32)
+// ---------------------------------------------------------------------------
+
+/// The payments in-flight query kinds — the C++ `Td::ResultHandler`
+/// classes of Payments.cpp (net-drain 23): the kinds carry the Copy
+/// handler members the answer halves read (the `dialog_id_` behind the
+/// five `on_get_dialog_error` heads, the `star_count_` behind the
+/// stars-form pending re-adds); the promises park in
+/// `PendingNetQueries` beside them (the §5 FIFO-per-kind convention).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaymentsNetKind {
+    /// `SetBotShippingAnswerQuery` (Payments.cpp:217).
+    SetBotShippingAnswer,
+    /// `SetBotPreCheckoutAnswerQuery` (Payments.cpp:255).
+    SetBotPreCheckoutAnswer,
+    /// `GetPaymentFormQuery` (Payments.cpp:492) — the handler's
+    /// `dialog_id_` member (the photo build + the error head).
+    GetPaymentForm { dialog_id: DialogId },
+    /// `ValidateRequestedInfoQuery` (Payments.cpp:606) — the handler's
+    /// `dialog_id_` member (the error head).
+    ValidateRequestedInfo { dialog_id: DialogId },
+    /// `SendPaymentFormQuery` (Payments.cpp:646) — the handler's
+    /// `dialog_id_` member (the error head).
+    SendPaymentForm { dialog_id: DialogId },
+    /// `SendStarPaymentFormQuery` (Payments.cpp:711) — the handler's
+    /// `dialog_id_`/`star_count_` members (the error head + the
+    /// pending-star re-adds on both answer halves).
+    SendStarPaymentForm {
+        dialog_id: DialogId,
+        star_count: i64,
+    },
+    /// `GetPaymentReceiptQuery` (Payments.cpp:766) — the handler's
+    /// `dialog_id_` member (the photo build + the error head); the Read
+    /// peer resolves at the send leg (the 400 "Can't access the chat"
+    /// band settles through the completed queue).
+    GetPaymentReceipt { dialog_id: DialogId },
+    /// `GetSavedInfoQuery` (Payments.cpp:860).
+    GetSavedInfo,
+    /// `ClearSavedInfoQuery` (Payments.cpp:887).
+    ClearSavedInfo,
+    /// `ExportInvoiceQuery` (Payments.cpp:914); the business-connection
+    /// invoke prefix and DC ride the BusinessConnectionManager plane —
+    /// the valid-id form parks until it lands.
+    ExportInvoice,
+    /// `GetBankCardInfoQuery` (Payments.cpp:944) — the webfile-DC
+    /// dispatch.
+    GetBankCardInfo,
+    /// `GetCollectibleInfoQuery` (Payments.cpp:975).
+    GetCollectibleInfo,
+}
+
+/// The parked query promises of the twelve net families, one list per
+/// answer kind (the C++ promises ride the ResultHandlers; the collapsed
+/// port parks them on the `Td` — Payments.cpp is free functions over
+/// `Td`, so there is no manager to hold them).
+#[derive(Default)]
+pub(crate) struct PendingNetQueries {
+    /// `GetPaymentFormQuery::promise_`.
+    pub(crate) payment_form: Vec<Promise<td_api::PaymentForm>>,
+    /// `ValidateRequestedInfoQuery::promise_`.
+    pub(crate) validated_order_info: Vec<Promise<td_api::ValidatedOrderInfo>>,
+    /// `SendPaymentFormQuery`/`SendStarPaymentFormQuery::promise_` (the
+    /// shared `payments_PaymentResult` answer collapse).
+    pub(crate) payment_result: Vec<Promise<td_api::PaymentResult>>,
+    /// `GetPaymentReceiptQuery::promise_`.
+    pub(crate) payment_receipt: Vec<Promise<td_api::PaymentReceipt>>,
+    /// `GetSavedInfoQuery::promise_`.
+    pub(crate) saved_order_info: Vec<Promise<td_api::OrderInfo>>,
+    /// `SetBotShippingAnswerQuery::promise_`.
+    pub(crate) set_bot_shipping_answer: Vec<Promise<()>>,
+    /// `SetBotPreCheckoutAnswerQuery::promise_`.
+    pub(crate) set_bot_pre_checkout_answer: Vec<Promise<()>>,
+    /// `ClearSavedInfoQuery::promise_`.
+    pub(crate) clear_saved_info: Vec<Promise<()>>,
+    /// `ExportInvoiceQuery::promise_`.
+    pub(crate) exported_invoice: Vec<Promise<String>>,
+    /// `GetBankCardInfoQuery::promise_`.
+    pub(crate) bank_card_info: Vec<Promise<td_api::BankCardInfo>>,
+    /// `GetCollectibleInfoQuery::promise_`.
+    pub(crate) collectible_info: Vec<Promise<td_api::CollectibleItemInfo>>,
+}
+
+// ---------------------------------------------------------------------------
 // the env trait
 // ---------------------------------------------------------------------------
 
-/// The `Td`/`G()` surface of the payment flows. The net queries are the
-/// `[blocked: net]` seams; the dialog/message reads are the
-/// `[blocked: M.10]` stub-inventory seams.
+/// The `Td`/`G()` surface of the payment flows. The net queries ride
+/// the dispatcher through the Td env's send arms; the dialog/message
+/// reads are the `[blocked: M.10]` stub-inventory seams.
 pub trait PaymentsEnv {
     // --- the G()/OptionManager plane ---
     /// `G()->unix_time()`.
@@ -1013,13 +1100,13 @@ pub trait PaymentsEnv {
         Result::Ok(crate::message_entity::FormattedText::default())
     }
 
-    // --- the UpdatesManager tail seam ([blocked: net]) ---
+    // --- the UpdatesManager tail seam (the netted re-entry) ---
     /// `td_->updates_manager_->on_get_updates(updates, promise)` with the
-    /// payment-result continuation; the promise parks with the seam until
-    /// the net step.
+    /// payment-result continuation; the Td env re-enters the updates
+    /// engine through the um bridge.
     fn on_get_updates(&mut self, updates: telegram_api::Updates, on_complete: Promise<()>) {
         let _ = (updates, on_complete);
-        tdutils::log_info!("UpdatesManager::on_get_updates — [blocked: net]");
+        tdutils::log_info!("UpdatesManager::on_get_updates — [net-inert]");
     }
 
     // --- the LinkManager seam ---
@@ -1034,9 +1121,10 @@ pub trait PaymentsEnv {
         String::new()
     }
 
-    // --- the net query seams ([blocked: net]) ---
+    // --- the net query sends — the dispatcher arms live at the Td env ---
     /// `SetBotShippingAnswerQuery::send` (Payments.cpp:224-235); the
-    /// promise rides the seam (the ResultHandler slot) until the net step.
+    /// promise rides the seam (the ResultHandler slot) in the inert
+    /// posture.
     fn send_set_bot_shipping_answer_query(
         &mut self,
         shipping_query_id: i64,
@@ -1047,7 +1135,7 @@ pub trait PaymentsEnv {
         let _ = (shipping_options, promise);
         tdutils::log_info!(
             "Send messages.setBotShippingResults(query_id = {shipping_query_id}, \
-             error = {error_message:?}) — [blocked: net]"
+             error = {error_message:?}) — [net-inert]"
         );
     }
 
@@ -1061,37 +1149,50 @@ pub trait PaymentsEnv {
         let _ = promise;
         tdutils::log_info!(
             "Send messages.setBotPrecheckoutResults(query_id = {pre_checkout_query_id}, \
-             error = {error_message:?}) — [blocked: net]"
+             error = {error_message:?}) — [net-inert]"
         );
     }
 
-    /// `GetPaymentFormQuery::send` (Payments.cpp:500-509).
+    /// `GetPaymentFormQuery::send` (Payments.cpp:500-509) — the
+    /// handler's `dialog_id_` member rides the send for the answer's
+    /// photo build and the error head.
     fn send_get_payment_form_query(
         &mut self,
+        dialog_id: DialogId,
         input_invoice: telegram_api::InputInvoice,
         theme_parameters: Option<telegram_api::DataJSON>,
         promise: Promise<td_api::PaymentForm>,
     ) {
-        let _ = (input_invoice, theme_parameters, promise);
-        tdutils::log_info!("Send payments.getPaymentForm — [blocked: net]");
+        let _ = (dialog_id, input_invoice, theme_parameters, promise);
+        tdutils::log_info!("Send payments.getPaymentForm — [net-inert]");
     }
 
-    /// `ValidateRequestedInfoQuery::send` (Payments.cpp:615-624).
+    /// `ValidateRequestedInfoQuery::send` (Payments.cpp:615-624) — the
+    /// handler's `dialog_id_` member rides the send for the error head.
     fn send_validate_requested_info_query(
         &mut self,
+        dialog_id: DialogId,
         input_invoice: telegram_api::InputInvoice,
         requested_info: Option<telegram_api::PaymentRequestedInfo>,
         allow_save: bool,
         promise: Promise<td_api::ValidatedOrderInfo>,
     ) {
-        let _ = (input_invoice, requested_info, allow_save, promise);
-        tdutils::log_info!("Send payments.validateRequestedInfo — [blocked: net]");
+        let _ = (
+            dialog_id,
+            input_invoice,
+            requested_info,
+            allow_save,
+            promise,
+        );
+        tdutils::log_info!("Send payments.validateRequestedInfo — [net-inert]");
     }
 
-    /// `SendPaymentFormQuery::send` (Payments.cpp:655-675).
+    /// `SendPaymentFormQuery::send` (Payments.cpp:655-675) — the
+    /// handler's `dialog_id_` member rides the send for the error head.
     #[allow(clippy::too_many_arguments)] // the C++ Query::send signature
     fn send_send_payment_form_query(
         &mut self,
+        dialog_id: DialogId,
         input_invoice: telegram_api::InputInvoice,
         payment_form_id: i64,
         order_info_id: &str,
@@ -1101,6 +1202,7 @@ pub trait PaymentsEnv {
         promise: Promise<td_api::PaymentResult>,
     ) {
         let _ = (
+            dialog_id,
             input_invoice,
             payment_form_id,
             order_info_id,
@@ -1109,21 +1211,33 @@ pub trait PaymentsEnv {
             tip_amount,
             promise,
         );
-        tdutils::log_info!("Send payments.sendPaymentForm — [blocked: net]");
+        tdutils::log_info!("Send payments.sendPaymentForm — [net-inert]");
     }
 
-    /// `SendStarPaymentFormQuery::send` (Payments.cpp:721-728).
+    /// `SendStarPaymentFormQuery::send` (Payments.cpp:721-728) — the
+    /// handler's `dialog_id_`/`star_count_` members ride the send for
+    /// the error head and the pending-star re-adds.
     fn send_send_stars_form_query(
         &mut self,
+        dialog_id: DialogId,
+        star_count: i64,
         payment_form_id: i64,
         input_invoice: telegram_api::InputInvoice,
         promise: Promise<td_api::PaymentResult>,
     ) {
-        let _ = (payment_form_id, input_invoice, promise);
-        tdutils::log_info!("Send payments.sendStarsForm — [blocked: net]");
+        let _ = (
+            dialog_id,
+            star_count,
+            payment_form_id,
+            input_invoice,
+            promise,
+        );
+        tdutils::log_info!("Send payments.sendStarsForm — [net-inert]");
     }
 
-    /// `GetPaymentReceiptQuery::send` (Payments.cpp:775-784).
+    /// `GetPaymentReceiptQuery::send` (Payments.cpp:775-784) — the Read
+    /// peer resolves at the send leg; the C++ `on_error(Status)` inline
+    /// band settles through the completed queue at the Td env.
     fn send_get_payment_receipt_query(
         &mut self,
         dialog_id: DialogId,
@@ -1131,13 +1245,13 @@ pub trait PaymentsEnv {
         promise: Promise<td_api::PaymentReceipt>,
     ) {
         let _ = (dialog_id, server_message_id, promise);
-        tdutils::log_info!("Send payments.getPaymentReceipt — [blocked: net]");
+        tdutils::log_info!("Send payments.getPaymentReceipt — [net-inert]");
     }
 
     /// `GetSavedInfoQuery::send` (Payments.cpp:867-869).
     fn send_get_saved_info_query(&mut self, promise: Promise<td_api::OrderInfo>) {
         let _ = promise;
-        tdutils::log_info!("Send payments.getSavedInfo — [blocked: net]");
+        tdutils::log_info!("Send payments.getSavedInfo — [net-inert]");
     }
 
     /// `ClearSavedInfoQuery::send` (Payments.cpp:894-898).
@@ -1148,12 +1262,12 @@ pub trait PaymentsEnv {
         promise: Promise<()>,
     ) {
         let _ = (clear_credentials, clear_order_info, promise);
-        tdutils::log_info!("Send payments.clearSavedInfo — [blocked: net]");
+        tdutils::log_info!("Send payments.clearSavedInfo — [net-inert]");
     }
 
     /// `ExportInvoiceQuery::send` (Payments.cpp:921-927); the
-    /// business-connection invoke prefix and the DC-id hop are the net
-    /// step's.
+    /// business-connection invoke prefix and the DC-id hop ride the
+    /// BusinessConnectionManager plane at the Td env.
     fn send_export_invoice_query(
         &mut self,
         business_connection_id: &BusinessConnectionId,
@@ -1161,18 +1275,18 @@ pub trait PaymentsEnv {
         promise: Promise<String>,
     ) {
         let _ = (business_connection_id, input_media_invoice, promise);
-        tdutils::log_info!("Send payments.exportInvoice — [blocked: net]");
+        tdutils::log_info!("Send payments.exportInvoice — [net-inert]");
     }
 
     /// `GetBankCardInfoQuery::send` (Payments.cpp:952-955) — the
-    /// webfile-DC routing is the net step's.
+    /// webfile-DC routing lives at the Td env.
     fn send_get_bank_card_info_query(
         &mut self,
         bank_card_number: &str,
         promise: Promise<td_api::BankCardInfo>,
     ) {
         let _ = (bank_card_number, promise);
-        tdutils::log_info!("Send payments.getBankCardData — [blocked: net]");
+        tdutils::log_info!("Send payments.getBankCardData — [net-inert]");
     }
 
     /// `GetCollectibleInfoQuery::send` (Payments.cpp:983-986).
@@ -1182,7 +1296,7 @@ pub trait PaymentsEnv {
         promise: Promise<td_api::CollectibleItemInfo>,
     ) {
         let _ = (input_collectible, promise);
-        tdutils::log_info!("Send fragment.getCollectibleInfo — [blocked: net]");
+        tdutils::log_info!("Send fragment.getCollectibleInfo — [net-inert]");
     }
 }
 
@@ -2100,6 +2214,7 @@ pub fn get_payment_form(
         data: get_theme_parameters_json_string(theme),
     });
     env.send_get_payment_form_query(
+        input_invoice_info.dialog_id,
         input_invoice_info
             .input_invoice
             .expect("get_input_invoice_info always builds the wire invoice"),
@@ -2189,6 +2304,7 @@ pub fn validate_order_info(
         None => Some(telegram_api::PaymentRequestedInfo::default()),
     };
     env.send_validate_requested_info_query(
+        input_invoice_info.dialog_id,
         input_invoice_info
             .input_invoice
             .expect("get_input_invoice_info always builds the wire invoice"),
@@ -2232,7 +2348,13 @@ pub fn send_payment_form(
         let input_invoice = input_invoice_info
             .input_invoice
             .expect("get_input_invoice_info always builds the wire invoice");
-        env.send_send_stars_form_query(payment_form_id, input_invoice, promise);
+        env.send_send_stars_form_query(
+            input_invoice_info.dialog_id,
+            input_invoice_info.star_count,
+            payment_form_id,
+            input_invoice,
+            promise,
+        );
         return;
     };
 
@@ -2297,6 +2419,7 @@ pub fn send_payment_form(
         .input_invoice
         .expect("get_input_invoice_info always builds the wire invoice");
     env.send_send_payment_form_query(
+        input_invoice_info.dialog_id,
         input_invoice,
         payment_form_id,
         order_info_id,
@@ -3070,6 +3193,7 @@ mod tests {
 
         fn send_get_payment_form_query(
             &mut self,
+            _dialog_id: DialogId,
             _input_invoice: telegram_api::InputInvoice,
             theme_parameters: Option<telegram_api::DataJSON>,
             _promise: Promise<td_api::PaymentForm>,
@@ -3080,6 +3204,7 @@ mod tests {
 
         fn send_validate_requested_info_query(
             &mut self,
+            _dialog_id: DialogId,
             _input_invoice: telegram_api::InputInvoice,
             requested_info: Option<telegram_api::PaymentRequestedInfo>,
             allow_save: bool,
@@ -3094,6 +3219,7 @@ mod tests {
 
         fn send_send_payment_form_query(
             &mut self,
+            _dialog_id: DialogId,
             _input_invoice: telegram_api::InputInvoice,
             payment_form_id: i64,
             order_info_id: &str,
@@ -3109,6 +3235,8 @@ mod tests {
 
         fn send_send_stars_form_query(
             &mut self,
+            _dialog_id: DialogId,
+            _star_count: i64,
             payment_form_id: i64,
             _input_invoice: telegram_api::InputInvoice,
             _promise: Promise<td_api::PaymentResult>,

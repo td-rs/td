@@ -10048,31 +10048,11 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
     }
 }
 
-/// Build the [`crate::td::PaymentsEnv`] over the disjoint `Td` fields and
-/// run the payment flow. The env is per-call (the `ThemeEnv` convention);
-/// `my_dialog_id` is read before the split.
-fn payments_arm(td: &mut Td, run: impl FnOnce(&mut crate::td::PaymentsEnv<'_>), _id: u64) {
-    let my_dialog_id = crate::dialog_manager::get_my_dialog_id(td);
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        ..
-    } = td;
-    let mut env = crate::td::PaymentsEnv {
-        global,
-        options: Some(
-            option_manager
-                .as_mut()
-                .expect("payment requests run with the initialized option manager"),
-        ),
-        auth_is_bot: auth_manager.is_bot(),
-        my_dialog_id,
-        user_manager,
-        chat_manager,
-    };
+/// Run the payment flow over the whole-`Td` payments env (the
+/// `PremiumTdEnv` convention — the net-drain 23 send arms dispatch
+/// through it).
+fn payments_arm(td: &mut Td, run: impl FnOnce(&mut crate::td::PaymentsTdEnv<'_>), _id: u64) {
+    let mut env = crate::td::PaymentsTdEnv { td };
     run(&mut env);
 }
 
