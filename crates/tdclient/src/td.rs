@@ -2232,8 +2232,7 @@ impl crate::messages_manager::ReadStateContext for Td {
         let leg = crate::messages_manager::new_dialog_list_leg(is_folder_load);
         match self.messages_net() {
             Some(net) => {
-                self.messages_manager
-                    .pending_get_dialog_list_legs
+                self.pending_get_dialog_list_legs
                     .entry(folder_id)
                     .or_default()
                     .push_back(leg);
@@ -2267,8 +2266,7 @@ impl crate::messages_manager::ReadStateContext for Td {
         let leg = crate::messages_manager::new_dialog_list_leg(is_folder_load);
         match self.messages_net() {
             Some(net) => {
-                self.messages_manager
-                    .pending_get_pinned_dialogs_legs
+                self.pending_get_pinned_dialogs_legs
                     .entry(folder_id)
                     .or_default()
                     .push_back(leg);
@@ -4332,6 +4330,26 @@ pub struct Td {
     /// FIFO popped by the answers (the validation ladder + the error
     /// fan-out); the §3.8 net-drain 25 family queue.
     pending_multi_media_random_ids: std::collections::VecDeque<Vec<i64>>,
+    /// The parked `GetDialogListQuery` legs — the C++ handler's own
+    /// `Promise<Unit>` (MessagesManager.cpp:458-460) captured over the
+    /// unit slot, keyed per folder and FIFO popped by the answers (the
+    /// per-folder program order — concurrent folder loads are gated by
+    /// the in-flight latch; the count-repair probe rides the same queue
+    /// with `is_folder_load` false). Td-held, not manager-held: the send
+    /// legs can run inside a taken-manager scope (the getChats arm's
+    /// `std::mem::take`), where a manager-side park would be lost with
+    /// the temporary.
+    pub(crate) pending_get_dialog_list_legs: std::collections::HashMap<
+        crate::messages_manager::FolderId,
+        std::collections::VecDeque<crate::messages_manager::PendingDialogListLeg>,
+    >,
+    /// The parked `GetPinnedDialogsQuery` legs
+    /// (MessagesManager.cpp:178-180) — the same shape over the pinned
+    /// family.
+    pub(crate) pending_get_pinned_dialogs_legs: std::collections::HashMap<
+        crate::messages_manager::FolderId,
+        std::collections::VecDeque<crate::messages_manager::PendingDialogListLeg>,
+    >,
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
@@ -4814,6 +4832,8 @@ impl Td {
             payments_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_pending: crate::payments::PendingNetQueries::default(),
             pending_multi_media_random_ids: std::collections::VecDeque::new(),
+            pending_get_dialog_list_legs: std::collections::HashMap::new(),
+            pending_get_pinned_dialogs_legs: std::collections::HashMap::new(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
@@ -17999,10 +18019,11 @@ impl Td {
             // promise; the dialogsNotModified 500 and the folder-load
             // fan-in tail.
             crate::messages_manager::MessagesNetKind::GetDialogList { folder_id } => {
-                let Some(leg) = crate::messages_manager::pop_get_dialog_list_leg(
-                    &mut self.messages_manager,
-                    folder_id,
-                ) else {
+                let Some(leg) = self
+                    .pending_get_dialog_list_legs
+                    .get_mut(&folder_id)
+                    .and_then(|legs| legs.pop_front())
+                else {
                     return;
                 };
                 let fetched: tdutils::status::Result<telegram_api::messages_Dialogs> =
@@ -18090,10 +18111,11 @@ impl Td {
             // base fields without a variant switch, so the slice form
             // runs its vectors and the notModified form runs empty ones.
             crate::messages_manager::MessagesNetKind::GetPinnedDialogs { folder_id } => {
-                let Some(leg) = crate::messages_manager::pop_get_pinned_dialogs_leg(
-                    &mut self.messages_manager,
-                    folder_id,
-                ) else {
+                let Some(leg) = self
+                    .pending_get_pinned_dialogs_legs
+                    .get_mut(&folder_id)
+                    .and_then(|legs| legs.pop_front())
+                else {
                     return;
                 };
                 let fetched: tdutils::status::Result<telegram_api::messages_Dialogs> =
@@ -63086,14 +63108,8 @@ mod tests {
             let folder = td.messages_manager.dialog_folders.get(&folder_id).unwrap();
             assert_eq!(folder.load_folder_dialog_list_outstanding_promises, 2);
             assert_eq!(folder.load_folder_dialog_list_promise_count, 1);
-            assert_eq!(
-                td.messages_manager.pending_get_pinned_dialogs_legs[&folder_id].len(),
-                1
-            );
-            assert_eq!(
-                td.messages_manager.pending_get_dialog_list_legs[&folder_id].len(),
-                1
-            );
+            assert_eq!(td.pending_get_pinned_dialogs_legs[&folder_id].len(), 1);
+            assert_eq!(td.pending_get_dialog_list_legs[&folder_id].len(), 1);
         }
 
         // 2. the pinned answer (the empty page) — the -2 walk settles
@@ -63111,7 +63127,7 @@ mod tests {
         {
             let folder = td.messages_manager.dialog_folders.get(&folder_id).unwrap();
             assert_eq!(folder.load_folder_dialog_list_outstanding_promises, 1);
-            assert!(td.messages_manager.pending_get_pinned_dialogs_legs[&folder_id].is_empty());
+            assert!(td.pending_get_pinned_dialogs_legs[&folder_id].is_empty());
             // the -2 walk initialized the pinned window
             let list = td.messages_manager.dialog_lists.get(&main).unwrap();
             assert!(list.are_pinned_dialogs_inited);
@@ -63170,7 +63186,7 @@ mod tests {
                 "the cursor advance"
             );
             assert!(mm.get_dialog(dialog_id).is_some(), "the dialog added");
-            assert!(mm.pending_get_dialog_list_legs[&folder_id].is_empty());
+            assert!(td.pending_get_dialog_list_legs[&folder_id].is_empty());
             assert!(mm.folder_load_first_errors.is_empty());
         }
 
@@ -63237,6 +63253,248 @@ mod tests {
             assert_eq!(
                 folder.last_server_dialog_date, folder.folder_last_dialog_date,
                 "the failed page does not advance the cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn messages_get_chats_rides_the_load_promise() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_get_chats_rides_the_load_promise_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 `getChats` promise round-trip (Requests.cpp:3260,
+    /// MessagesManager.cpp:14385-14405): the request promise rides the
+    /// get-dialogs task, the task parks on the folder-load legs, and the
+    /// page answer's `update_last_dialog_date` set_promises chain re-runs
+    /// it into the chats object (cpp:34234-34239). The error band walks
+    /// the same chain: the validation-ladder 500 fails the load, the
+    /// parked task re-runs with the error, and the client receives it.
+    fn messages_get_chats_rides_the_load_promise_impl() {
+        use crate::messages_manager::{
+            DialogDate, DialogId, DialogListId, FolderId, MessageId, ServerMessageId,
+            add_dialog_list,
+        };
+        use crate::user_manager::UserId;
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain25-get-chats");
+        let folder_id = FolderId::main();
+        let main = DialogListId::from_folder(folder_id);
+
+        // the loaded window ends mid-list (the m10_12 retry-table shape):
+        // the exact-limit walk can't complete, the folder load sends
+        {
+            let mm = &mut td.messages_manager;
+            add_dialog_list(mm, main);
+            mm.dialog_folders.insert(
+                folder_id,
+                crate::messages_manager::DialogFolder {
+                    folder_id,
+                    ..crate::messages_manager::DialogFolder::default()
+                },
+            );
+            let window_end = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(20)),
+                    1700000001,
+                ),
+                DialogId::from_user_id(UserId::new(2)),
+            );
+            {
+                let list = mm.dialog_lists.get_mut(&main).unwrap();
+                list.list_last_dialog_date = window_end;
+            }
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.folder_last_dialog_date = window_end;
+            folder.last_server_dialog_date = window_end;
+        }
+
+        // 1. the request parks — no answer yet, both load legs dispatch
+        td.request(
+            7,
+            Function::getChats(td_api::getChats {
+                chat_list: None,
+                limit: 2,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            callback.responses.lock().iter().all(|(id, _)| *id == 0),
+            "the task parks behind the folder load (only the option broadcasts)"
+        );
+        assert!(callback.errors.lock().is_empty());
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+
+        // 2. the pinned leg answers empty, the page leg returns one
+        //    older dialog — the walk registers it, the list advances,
+        //    the set_promises chain re-runs the task into the answer
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        let mut page_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogsSlice(
+            telegram_api::messages_dialogsSlice {
+                count: 1,
+                dialogs: vec![telegram_api::Dialog::dialog(telegram_api::dialog {
+                    peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 42,
+                    })),
+                    top_message: 500,
+                    read_inbox_max_id: 500,
+                    unread_count: 0,
+                    folder_id: 0,
+                    ..telegram_api::dialog::default()
+                })],
+                messages: vec![list_answer_message(500, 1700000000, 42)],
+                chats: Vec::new(),
+                users: vec![wire_user(42, "Chats")],
+            },
+        )
+        .store(&mut page_answer);
+        net_complete(page, page_answer);
+        td.dispatch_completed_messages_net();
+
+        // the "+1" tail of get_dialog_total_count (the unknown-server-
+        // total heuristic, MessagesManager.cpp:9696-9699) re-arms the
+        // load once — the second page answers empty, the folder
+        // exhausts, and the re-run completes through the max branch
+        assert!(
+            !rec.sent.lock().is_empty(),
+            "the heuristic re-arm dispatched the second round"
+        );
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        let mut empty_page = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut empty_page);
+        net_complete(page, empty_page);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        {
+            let responses = callback.responses.lock();
+            let chats = responses
+                .iter()
+                .find(|(id, _)| *id == 7)
+                .map(|(_, object)| match object {
+                    Object::chats(chats) => chats.clone(),
+                    other => panic!("expected chats, got {other:?}"),
+                })
+                .expect("the parked task answered through the load");
+            assert_eq!(chats.chat_ids, vec![42], "the loaded dialog");
+            assert!(chats.total_count >= 1);
+            assert!(callback.errors.lock().is_empty());
+        }
+
+        // 3. the error band — a fresh park, the page answer carries a
+        //    user dialog WITH pts (the validation-ladder 500,
+        //    MessagesManager.cpp:12810-12816): the load fails, the
+        //    crossing fails the list promises, the re-run errors the
+        //    parked task, the client receives the 500
+        {
+            let fresh_window = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(600)),
+                    1700000010,
+                ),
+                DialogId::from_user_id(UserId::new(3)),
+            );
+            let mm = &mut td.messages_manager;
+            let list = mm.dialog_lists.get_mut(&main).unwrap();
+            list.list_last_dialog_date = fresh_window;
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.folder_last_dialog_date = fresh_window;
+            folder.last_server_dialog_date = fresh_window;
+        }
+        td.request(
+            8,
+            Function::getChats(td_api::getChats {
+                chat_list: None,
+                limit: 2,
+            }),
+        );
+        td.flush_deferred_results();
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        let mut bad_page = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogsSlice(
+            telegram_api::messages_dialogsSlice {
+                count: 1,
+                dialogs: vec![telegram_api::Dialog::dialog(telegram_api::dialog {
+                    peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 77,
+                    })),
+                    top_message: 700,
+                    read_inbox_max_id: 700,
+                    flags: 1, // the PTS flag bit — a user dialog must not carry pts
+                    pts: 5,
+                    folder_id: 0,
+                    ..telegram_api::dialog::default()
+                })],
+                messages: Vec::new(),
+                chats: Vec::new(),
+                users: vec![wire_user(77, "Pts")],
+            },
+        )
+        .store(&mut bad_page);
+        net_complete(page, bad_page);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        {
+            let errors = callback.errors.lock();
+            let error = errors
+                .iter()
+                .find(|(id, _)| *id == 8)
+                .map(|(_, error)| error.clone())
+                .expect("the parked task errored through the failed load");
+            assert_eq!(error.code, 500);
+            assert_eq!(
+                error.message,
+                "Wrong query result returned: receive user or basic group chat with PTS"
             );
         }
     }

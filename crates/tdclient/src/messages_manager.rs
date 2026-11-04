@@ -8839,18 +8839,6 @@ pub struct MessagesManager {
     /// handler's own `Promise<Unit>`); FIFO popped by the answers.
     pub(crate) pending_paid_reaction_privacy:
         std::collections::VecDeque<tdutils::promise::Promise<()>>,
-    /// The parked `GetDialogListQuery` legs — the C++ handler's own
-    /// `Promise<Unit>` (MessagesManager.cpp:458-460) captured over the
-    /// unit slot, keyed per folder and FIFO popped by the answers (the
-    /// per-folder program order — concurrent folder loads are gated by
-    /// the in-flight latch; the count-repair probe rides the same queue
-    /// with `is_folder_load` false).
-    pub(crate) pending_get_dialog_list_legs:
-        HashMap<FolderId, std::collections::VecDeque<PendingDialogListLeg>>,
-    /// The parked `GetPinnedDialogsQuery` legs (MessagesManager.cpp:178-180)
-    /// — the same shape over the pinned family.
-    pub(crate) pending_get_pinned_dialogs_legs:
-        HashMap<FolderId, std::collections::VecDeque<PendingDialogListLeg>>,
     /// The folder-load fan-in's first error (the MultiPromiseActor picks
     /// the first errored future at the zero crossing, MultiPromise.cpp
     /// `raw_event` — settle order here, the futures-order walk needs a
@@ -15616,7 +15604,17 @@ fn set_dialog_folder_id(
     if get_dialog_pinned_order_by_id(mm, DialogListId::from_folder(old_folder_id), dialog_id)
         != DEFAULT_ORDER
     {
-        set_dialog_is_pinned(ctx, mm, dialog_id, false);
+        // the direct form with need_update_dialog_lists=false
+        // (MessagesManager.cpp:29230-29232) — the folder move runs its
+        // own list walk below
+        set_dialog_is_pinned_in_list(
+            ctx,
+            mm,
+            DialogListId::from_folder(old_folder_id),
+            dialog_id,
+            false,
+            false,
+        );
     }
 
     let dialog_date = DialogDate::new(order, dialog_id);
@@ -15914,7 +15912,9 @@ fn update_dialog_lists(
     if order == DEFAULT_ORDER {
         for (&old_list_id, old_position) in &old_positions {
             if old_position.is_pinned {
-                set_dialog_is_pinned_in_list(ctx, mm, old_list_id, dialog_id, false, true);
+                // need_update_dialog_lists=false (MessagesManager.cpp:
+                // 34019-34022) — this walk IS the list update
+                set_dialog_is_pinned_in_list(ctx, mm, old_list_id, dialog_id, false, false);
             }
         }
 
@@ -18377,16 +18377,23 @@ pub fn get_dialogs_from_list(
     mm: &mut MessagesManager,
     dialog_list_id: DialogListId,
     limit: i32,
-    promise: Option<tdutils::promise::Promise<td_api::Chats>>,
+    mut promise: Option<tdutils::promise::Promise<td_api::Chats>>,
 ) -> GetDialogsFromListResult {
     assert!(!state.is_bot());
 
     let Some(list) = mm.dialog_lists.get(&dialog_list_id) else {
+        // the promise settles here exactly like the C++ (cpp:14391-14393)
+        if let Some(mut promise) = promise.take() {
+            promise.set_error(Status::error(400, "Chat list not found"));
+        }
         return GetDialogsFromListResult::Error(400, "Chat list not found".to_owned());
     };
     let dialog_list_unique_id = list.unique_id;
 
     if limit <= 0 {
+        if let Some(mut promise) = promise.take() {
+            promise.set_error(Status::error(400, "Parameter limit must be positive"));
+        }
         return GetDialogsFromListResult::Error(400, "Parameter limit must be positive".to_owned());
     }
 
@@ -18499,21 +18506,32 @@ pub(crate) fn rerun_dialogs_tasks_for_list(
         .collect();
     for task_id in task_ids {
         let outcome = on_get_dialogs_from_list(state, mm, task_id, result.clone());
-        let task_promise = mm
-            .get_dialogs_tasks
-            .get_mut(&task_id)
-            .and_then(|task| task.promise.take());
-        match (outcome, task_promise) {
-            (GetDialogsFromListResult::Chats(chats), Some(mut promise)) => {
-                promise.set_value(chats);
+        match outcome {
+            GetDialogsFromListResult::Chats(chats) => {
+                if let Some(mut promise) = mm
+                    .get_dialogs_tasks
+                    .get_mut(&task_id)
+                    .and_then(|task| task.promise.take())
+                {
+                    promise.set_value(chats);
+                }
             }
-            (GetDialogsFromListResult::Error(code, message), Some(mut promise)) => {
-                promise.set_error(Status::error(code, &message));
+            GetDialogsFromListResult::Error(code, message) => {
+                // the task is gone — its promise (if any still parked)
+                // settles with the error
+                if let Some(mut promise) = mm
+                    .get_dialogs_tasks
+                    .get_mut(&task_id)
+                    .and_then(|task| task.promise.take())
+                {
+                    promise.set_error(Status::error(code, &message));
+                }
             }
-            (GetDialogsFromListResult::Pending(_), _) => {
-                // still parked — the next load round re-runs it
+            GetDialogsFromListResult::Pending(_) => {
+                // still parked — the promise stays on the task; the next
+                // load round re-runs it (taking it here would drop it
+                // unsettled)
             }
-            (_, None) => {}
         }
     }
 }
@@ -34307,28 +34325,6 @@ pub(crate) fn new_dialog_list_leg(is_folder_load: bool) -> PendingDialogListLeg 
     }
 }
 
-/// Pop the oldest parked `GetDialogListQuery` leg of the folder.
-pub(crate) fn pop_get_dialog_list_leg(
-    manager: &mut MessagesManager,
-    folder_id: FolderId,
-) -> Option<PendingDialogListLeg> {
-    manager
-        .pending_get_dialog_list_legs
-        .get_mut(&folder_id)?
-        .pop_front()
-}
-
-/// Pop the oldest parked `GetPinnedDialogsQuery` leg of the folder.
-pub(crate) fn pop_get_pinned_dialogs_leg(
-    manager: &mut MessagesManager,
-    folder_id: FolderId,
-) -> Option<PendingDialogListLeg> {
-    manager
-        .pending_get_pinned_dialogs_legs
-        .get_mut(&folder_id)?
-        .pop_front()
-}
-
 /// Pop the oldest parked `TogglePaidReactionPrivacyQuery` promise.
 pub(crate) fn pop_paid_reaction_privacy_promise(
     manager: &mut MessagesManager,
@@ -34372,7 +34368,8 @@ pub fn set_paid_message_reaction_type(
     // `PaidReactionType(td, type)` (PaidReactionType.cpp:46-71) — the
     // td_api intake over the context probes: the Anonymous arm flips the
     // flag, the Chat arm gates on the dialog access + the broadcast
-    // check (the failing gates degrade to the Regular default).
+    // check (the failing gates keep Type::Dialog with the invalid
+    // dialog — the anonymous privacy/reactor bands, cpp:59-66).
     let paid_reaction_type = {
         let mut result = crate::paid_reaction_type::PaidReactionType::default();
         if let Some(type_) = type_ {
@@ -34392,10 +34389,13 @@ pub fn set_paid_message_reaction_type(
                         "PaidReactionType",
                     )
                     .is_ok();
+                    // the invalid dialog id marks the failing gates —
+                    // `get_dialog_id` then answers the anonymous band
+                    let mut stored_dialog_id = DialogId::new(0);
                     if is_accessible && ctx.is_broadcast_channel_dialog(dialog_id_of_type) {
-                        result =
-                            crate::paid_reaction_type::PaidReactionType::dialog(dialog_id_of_type);
+                        stored_dialog_id = dialog_id_of_type;
                     }
+                    result = crate::paid_reaction_type::PaidReactionType::dialog(stored_dialog_id);
                 }
             }
         }
@@ -34411,11 +34411,20 @@ pub fn set_paid_message_reaction_type(
             reactions.pending_paid_reaction_type = paid_reaction_type.clone();
         }
         let my_dialog_id = ctx.my_dialog_id();
+        // `MessageReactor::add_count(0, paid_reaction_type.get_dialog_id(
+        // my_dialog_id), my_dialog_id)` (MessageReaction.cpp:1082): the
+        // invalid reactor id collapses onto my id + the anonymous flag,
+        // the valid one names itself public
+        let reactor_dialog_id = paid_reaction_type.get_dialog_id(my_dialog_id);
         for top_reactor in &mut reactions.top_reactors {
             if top_reactor.is_me() {
-                // `MessageReactor::add_count(0, ...)` inline
-                top_reactor.dialog_id = my_dialog_id;
-                top_reactor.is_anonymous = true;
+                if !reactor_dialog_id.is_valid() {
+                    top_reactor.dialog_id = my_dialog_id;
+                    top_reactor.is_anonymous = true;
+                } else {
+                    top_reactor.dialog_id = reactor_dialog_id;
+                    top_reactor.is_anonymous = false;
+                }
                 found_me = true;
                 break;
             }
