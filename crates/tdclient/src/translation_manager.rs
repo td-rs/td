@@ -553,11 +553,15 @@ pub trait TranslationManagerEnv {
     // -- the `[blocked: net]` query tails; each one drops the promise,
     // -- which keeps the C++ request unanswered offline
     /// `TranslateTextQuery::send` (TranslationManager.cpp:34-85); the
+    /// `message_full_id` flips the wire between the PEER form (a valid
+    /// message id) and the TEXT form, and the
     /// `skip_bot_commands`/`max_media_timestamp` pair rides along for
     /// the `on_get_translated_texts` chain-in.
+    #[allow(clippy::too_many_arguments)] // the C++ send signature has the same shape
     fn send_translate_text_query(
         &mut self,
         texts: Vec<FormattedText>,
+        message_full_id: crate::messages_manager::MessageFullId,
         to_language_code: String,
         tone: String,
         skip_bot_commands: bool,
@@ -869,14 +873,15 @@ impl TranslationManager {
     }
 
     /// `TranslationManager::translate_text(td_api::formattedText, ...)`
-    /// (TranslationManager.cpp:674-679, 681-699) — the message-content
-    /// overload lands with the message plane (M.10).
+    /// (TranslationManager.cpp:674-679) — the td_api-text form delegates
+    /// to the message overload with the null full id (the TEXT-flag wire
+    /// shape).
     pub fn translate_text(
         &self,
         env: &mut (impl TranslationManagerEnv + crate::message_entity::UserManagerLike),
         text: Option<td_api::FormattedText>,
         to_language_code: String,
-        mut tone: String,
+        tone: String,
         mut promise: Promise<td_api::FormattedText>,
     ) {
         let input_text = match self.get_input_text(env, text) {
@@ -886,12 +891,37 @@ impl TranslationManager {
                 return;
             }
         };
+        self.translate_input_text(
+            env,
+            input_text,
+            crate::messages_manager::MessageFullId::default(),
+            to_language_code,
+            tone,
+            promise,
+        );
+    }
+
+    /// `TranslationManager::translate_text(InputText, MessageFullId, ...)`
+    /// (TranslationManager.cpp:681-699) — the shared send body: the tone
+    /// gate, then `TranslateTextQuery` with the message full id riding
+    /// along (a valid id flips the wire to the PEER form; the §3.8
+    /// net-drain 25 shape).
+    pub fn translate_input_text(
+        &self,
+        env: &mut (impl TranslationManagerEnv + crate::message_entity::UserManagerLike),
+        input_text: InputText,
+        message_full_id: crate::messages_manager::MessageFullId,
+        to_language_code: String,
+        mut tone: String,
+        mut promise: Promise<td_api::FormattedText>,
+    ) {
         if let Result::Err(status) = Self::check_tone(&mut tone) {
             promise.set_error(status);
             return;
         }
         env.send_translate_text_query(
             vec![input_text.text],
+            message_full_id,
             to_language_code,
             tone,
             input_text.skip_bot_commands,
@@ -1456,6 +1486,7 @@ mod tests {
         fn send_translate_text_query(
             &mut self,
             _texts: Vec<FormattedText>,
+            _message_full_id: crate::messages_manager::MessageFullId,
             _to_language_code: String,
             _tone: String,
             skip_bot_commands: bool,

@@ -6018,15 +6018,21 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         Function::getChats(request) => {
-            // `Requests.cpp:2653-2657` — the chat-list task answers the
-            // loaded window synchronously; the load-needed Pending parks
-            // (the db/net legs are the seams), the same caller-retry
-            // contract as getChatHistory's empty window.
+            // `Requests.cpp:3260-3266` — the request promise rides the
+            // get-dialogs task (MessagesManager.cpp:14385-14405): the
+            // loaded window answers synchronously, the load-needed
+            // task parks until the folder-load legs complete (the
+            // update_last_dialog_date set_promises chain re-runs the
+            // parked tasks, cpp:34234-34239).
             if !check_is_user(td, id) {
                 return;
             }
             let dialog_list_id =
                 crate::messages_manager::DialogListId::from_chat_list(request.chat_list.as_ref());
+            // the deferred form: the task settles it exactly where the
+            // C++ task_promise does (both the ok and the error bands)
+            let promise =
+                td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
             let mut manager = std::mem::take(&mut td.messages_manager);
             // SAFETY: the state alias is used strictly sequentially inside
             // the callee.
@@ -6037,21 +6043,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 &mut manager,
                 dialog_list_id,
                 request.limit,
+                Some(promise),
             );
             td.messages_manager = manager;
-            match result {
-                crate::messages_manager::GetDialogsFromListResult::Chats(chats) => {
-                    td.send_result(id, Object::chats(chats))
-                }
-                crate::messages_manager::GetDialogsFromListResult::Pending(_) => {
-                    // the load legs are the net/db seams; the request
-                    // stays unanswered like the C++ promise without a
-                    // network
-                }
-                crate::messages_manager::GetDialogsFromListResult::Error(code, message) => {
-                    td.send_error_impl(id, code, &message)
-                }
-            }
+            // every return path settled the deferred promise (the
+            // synchronous window, the parked task's load completion,
+            // and both error bands) — the return value itself is the
+            // no-promise test surface, nothing to answer inline
+            let _ = result;
         }
         Function::setChatEmojiStatus(request) => {
             // `Requests.cpp:3722-3728`.
@@ -14905,17 +14904,30 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let _promise = td.deferred_promise::<(), _>(id, |()| ok_object());
         }
         Function::translateMessageText(request) => {
+            // `Requests.cpp:2867-2873` — CHECK_IS_USER, clean the two
+            // strings, then the messages-manager glue (the §3.8 net-drain
+            // 25 `translateText` PEER shape).
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(_lang) = clean_or_utf8_error(td, id, &request.to_language_code) else {
+            let Some(to_language_code) = clean_or_utf8_error(td, id, &request.to_language_code)
+            else {
                 return;
             };
-            let Some(_tone) = clean_or_utf8_error(td, id, &request.tone) else {
+            let Some(tone) = clean_or_utf8_error(td, id, &request.tone) else {
                 return;
             };
-            let _promise =
+            let promise =
                 td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+            td.translate_message_text(
+                crate::messages_manager::MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                to_language_code,
+                tone,
+                promise,
+            );
         }
         Function::translateMessageRichMessage(request) => {
             if !check_is_user(td, id) {

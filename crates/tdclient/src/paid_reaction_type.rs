@@ -164,6 +164,18 @@ impl PaidReactionType {
         &self,
         env: &impl PaidReactionTypeEnv,
     ) -> telegram_api::PaidReactionPrivacy {
+        self.input_paid_reaction_privacy(env.get_input_peer(self.dialog_id))
+    }
+
+    /// The wire form over a pre-resolved write peer — the send legs of
+    /// the paid-reaction families (`SendPaidReactionQuery`/
+    /// `TogglePaidReactionPrivacyQuery`) resolve the peer through their
+    /// own dialog-manager read; the null band degrades to the anonymous
+    /// form exactly like the C++ (PaidReactionType.cpp:98-104).
+    pub fn input_paid_reaction_privacy(
+        &self,
+        input_peer: Option<telegram_api::InputPeer>,
+    ) -> telegram_api::PaidReactionPrivacy {
         match self.type_ {
             Type::Regular => telegram_api::PaidReactionPrivacy::paidReactionPrivacyDefault(
                 telegram_api::paidReactionPrivacyDefault {},
@@ -172,7 +184,7 @@ impl PaidReactionType {
                 telegram_api::paidReactionPrivacyAnonymous {},
             ),
             Type::Dialog => {
-                let Some(input_peer) = env.get_input_peer(self.dialog_id) else {
+                let Some(input_peer) = input_peer else {
                     return telegram_api::PaidReactionPrivacy::paidReactionPrivacyAnonymous(
                         telegram_api::paidReactionPrivacyAnonymous {},
                     );
@@ -231,6 +243,17 @@ impl PaidReactionType {
             Type::Regular => my_dialog_id,
             Type::Anonymous => DialogId::new(0),
             Type::Dialog => self.dialog_id,
+        }
+    }
+
+    /// The privacy peer target — `Some(dialog_id)` only on the Dialog
+    /// arm (`get_input_paid_reaction_privacy`'s read leg,
+    /// PaidReactionType.cpp:96-104): the send legs resolve the write
+    /// peer through their own dialog-manager read.
+    pub fn privacy_dialog_id(&self) -> Option<DialogId> {
+        match self.type_ {
+            Type::Dialog => Some(self.dialog_id),
+            _ => None,
         }
     }
 

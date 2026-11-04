@@ -88,8 +88,8 @@ use crate::manager_option_states::ManagerOptionStates;
 use crate::message_content::*;
 use crate::message_entity::FormattedText;
 use crate::messages_manager::{
-    DialogId, EphemeralMessageFullId, FileUploadId, MessageFullId, QuickReplyMessageFullId,
-    QuickReplyShortcutId, StoryFullId, StoryId,
+    DialogId, EphemeralMessageFullId, FileUploadId, FolderId, MessageFullId,
+    QuickReplyMessageFullId, QuickReplyShortcutId, StoryFullId, StoryId,
 };
 use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
@@ -612,8 +612,12 @@ impl crate::message_content::MessageContentContext for Td {
     fn get_channel_effective_restricted_rights(&self, _channel_id: ChannelId) -> RestrictedRights {
         RestrictedRights::default()
     }
-    fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
-        false
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+        // `ChatManager::is_broadcast_channel` (ChatManager.cpp:8624-8626)
+        // — flipped at the §3.8 net-drain 25 slice (the paid-reaction
+        // ladder's `DialogManager::is_broadcast_channel` gate reads the
+        // channel record; the false stub was the offline band)
+        self.chat_manager.is_broadcast_channel(channel_id)
     }
     fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
         false
@@ -2212,6 +2216,76 @@ impl crate::messages_manager::ReadStateContext for Td {
     }
 
     fn remove_dialog_pinned_message_notification(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    fn send_get_dialog_list_query(
+        &mut self,
+        folder_id: FolderId,
+        offset_date: i32,
+        offset_message_id: i32,
+        offset_dialog_id: DialogId,
+        limit: i32,
+        is_folder_load: bool,
+    ) {
+        // `GetDialogListQuery::send` (MessagesManager.cpp:466-475) — the
+        // forced offset peer (the empty form is the C++ CHECK's
+        // guaranteed non-null), the folder flag the only flag, hash 0
+        let leg = crate::messages_manager::new_dialog_list_leg(is_folder_load);
+        match self.messages_net() {
+            Some(net) => {
+                self.pending_get_dialog_list_legs
+                    .entry(folder_id)
+                    .or_default()
+                    .push_back(leg);
+                net.dispatch(
+                    crate::messages_manager::MessagesNetKind::GetDialogList { folder_id },
+                    telegram_api::Function::messages_getDialogs(
+                        telegram_api::messages_getDialogs {
+                            flags: 1 << 1, // FOLDER_ID_MASK — the only flag
+                            exclude_pinned: true,
+                            folder_id: folder_id.get(),
+                            offset_date,
+                            offset_id: offset_message_id,
+                            offset_peer: Some(Box::new(
+                                crate::dialog_manager::get_input_peer_force(offset_dialog_id),
+                            )),
+                            limit,
+                            hash: 0,
+                        },
+                    ),
+                );
+            }
+            None => {
+                tdutils::log_info!("Send messages.getDialogs for {folder_id:?} — [net-inert]");
+            }
+        }
+    }
+
+    fn send_get_pinned_dialogs_query(&mut self, folder_id: FolderId, is_folder_load: bool) {
+        // `GetPinnedDialogsQuery::send` (MessagesManager.cpp:186-190) —
+        // the folder id is the whole payload
+        let leg = crate::messages_manager::new_dialog_list_leg(is_folder_load);
+        match self.messages_net() {
+            Some(net) => {
+                self.pending_get_pinned_dialogs_legs
+                    .entry(folder_id)
+                    .or_default()
+                    .push_back(leg);
+                net.dispatch(
+                    crate::messages_manager::MessagesNetKind::GetPinnedDialogs { folder_id },
+                    telegram_api::Function::messages_getPinnedDialogs(
+                        telegram_api::messages_getPinnedDialogs {
+                            folder_id: folder_id.get(),
+                        },
+                    ),
+                );
+            }
+            None => {
+                tdutils::log_info!(
+                    "Send messages.getPinnedDialogs for {folder_id:?} — [net-inert]"
+                );
+            }
+        }
+    }
 }
 
 /// The reactions half of the receive adapter: the banned-chat read is the
@@ -2468,6 +2542,13 @@ impl crate::messages_manager::SendMessageContext for Td {
                 self,
                 dialog_id.get_channel_id(),
             )
+    }
+
+    /// `ChatManager::get_channel_autotranslation(channel_id)`
+    /// (ChatManager.cpp:3100-3106) — the message-translate PEER gate (the
+    /// §3.8 net-drain 25 `translateText` shape).
+    fn get_channel_autotranslation(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_autotranslation(channel_id)
     }
 
     /// The `SendMessageQuery::send` wire leg (MessagesManager.cpp:1207-1249):
@@ -4244,6 +4325,31 @@ pub struct Td {
     /// send arms fill and `on_payments_net_answer` pops — Payments.cpp
     /// is free functions over `Td`, so the lot lives here).
     payments_net_pending: crate::payments::PendingNetQueries,
+    /// The parked `SendMultiMediaQuery` random-id lists (the C++
+    /// handler's `random_ids_` member, MessagesManager.cpp:1401-1410) —
+    /// FIFO popped by the answers (the validation ladder + the error
+    /// fan-out); the §3.8 net-drain 25 family queue.
+    pending_multi_media_random_ids: std::collections::VecDeque<Vec<i64>>,
+    /// The parked `GetDialogListQuery` legs — the C++ handler's own
+    /// `Promise<Unit>` (MessagesManager.cpp:458-460) captured over the
+    /// unit slot, keyed per folder and FIFO popped by the answers (the
+    /// per-folder program order — concurrent folder loads are gated by
+    /// the in-flight latch; the count-repair probe rides the same queue
+    /// with `is_folder_load` false). Td-held, not manager-held: the send
+    /// legs can run inside a taken-manager scope (the getChats arm's
+    /// `std::mem::take`), where a manager-side park would be lost with
+    /// the temporary.
+    pub(crate) pending_get_dialog_list_legs: std::collections::HashMap<
+        crate::messages_manager::FolderId,
+        std::collections::VecDeque<crate::messages_manager::PendingDialogListLeg>,
+    >,
+    /// The parked `GetPinnedDialogsQuery` legs
+    /// (MessagesManager.cpp:178-180) — the same shape over the pinned
+    /// family.
+    pub(crate) pending_get_pinned_dialogs_legs: std::collections::HashMap<
+        crate::messages_manager::FolderId,
+        std::collections::VecDeque<crate::messages_manager::PendingDialogListLeg>,
+    >,
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
@@ -4725,6 +4831,9 @@ impl Td {
             messages_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_pending: crate::payments::PendingNetQueries::default(),
+            pending_multi_media_random_ids: std::collections::VecDeque::new(),
+            pending_get_dialog_list_legs: std::collections::HashMap::new(),
+            pending_get_pinned_dialogs_legs: std::collections::HashMap::new(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
@@ -16833,6 +16942,202 @@ impl Td {
         self.drain_sink();
     }
 
+    /// `td_->star_manager_->add_pending_owned_star_count(star_count,
+    /// is_final)` (StarManager.cpp:1481-1496) — the paid-reaction ledger
+    /// legs of the `SendPaidReactionQuery` answer halves
+    /// (MessageReaction.cpp:126/:137).
+    fn star_add_pending_owned(&mut self, star_count: i64, move_to_owned: bool) {
+        let (mut manager, mut env) = crate::td::star_env_split(self);
+        manager.add_pending_owned_star_count(&mut env, star_count, move_to_owned);
+        self.star_manager = manager;
+    }
+
+    /// The `SendMultiMediaQuery` error fan-out (MessagesManager.cpp:1501-1520)
+    /// over the collapsed actor shape — the close+message-db guard keeps
+    /// the messages for the restart resend, the paid-message star-count
+    /// rewrite re-prefixes the status, the dialog-error head runs, then
+    /// every random id fails.
+    fn run_send_multi_media_error(
+        &mut self,
+        dialog_id: DialogId,
+        random_ids: &[i64],
+        status: Status,
+    ) {
+        if self.global.close_flag() && self.use_message_database {
+            // do not send error, message will be re-sent after restart
+            return;
+        }
+        // `process_file_reference_error` — the FileReferenceManager head
+        // parks with the Files plane (no file ids ride the query yet)
+        let mut status = status;
+        let star_count = crate::messages_manager::get_required_paid_message_star_count(
+            status.code(),
+            status.message(),
+        );
+        if star_count > 0 {
+            let per_message = star_count / random_ids.len() as i64;
+            status = Status::error(
+                status.code(),
+                &format!("ALLOW_PAYMENT_REQUIRED_{per_message}"),
+            );
+        }
+        crate::dialog_manager::on_get_dialog_error(
+            &self.global,
+            dialog_id,
+            &status,
+            "SendMultiMediaQuery",
+        );
+        for &random_id in random_ids {
+            self.run_send_message_fail(random_id, status.code(), status.message());
+        }
+    }
+
+    /// `SendMultiMediaQuery::on_result` (MessagesManager.cpp:1466-1499)
+    /// over the collapsed actor shape — the random-id validation ladder
+    /// (every id sent, no extras, the sizes and dialog ids match; a wrong
+    /// result fails the unsent ids and schedules a getDifference), then
+    /// the updates re-enter the engine.
+    fn run_send_multi_media_result(
+        &mut self,
+        dialog_id: DialogId,
+        random_ids: Vec<i64>,
+        updates: telegram_api::Updates,
+    ) {
+        // `UpdatesManager::get_sent_messages_random_ids` + the ladder
+        // (cpp:1472-1493)
+        let mut sent_random_ids = crate::updates_manager::get_sent_messages_random_ids(&updates);
+        let mut is_result_wrong = false;
+        let sent_random_ids_size = sent_random_ids.len();
+        for &random_id in &random_ids {
+            if sent_random_ids.remove(&random_id) {
+                continue;
+            }
+            if random_ids.len() == 1 {
+                is_result_wrong = true;
+            }
+            self.run_send_message_fail(random_id, 400, "Message was not sent");
+        }
+        if !sent_random_ids.is_empty() {
+            is_result_wrong = true;
+        }
+        if !is_result_wrong {
+            let sent_messages = crate::updates_manager::get_new_messages(&updates);
+            if sent_random_ids_size != sent_messages.len() {
+                is_result_wrong = true;
+            }
+            for (sent_message, _) in sent_messages {
+                if DialogId::get_message_dialog_id(sent_message) != dialog_id {
+                    is_result_wrong = true;
+                }
+            }
+        }
+        if is_result_wrong {
+            tdutils::log_error!(
+                "Receive wrong result for SendMultiMediaQuery with random ids {random_ids:?} to {dialog_id:?}"
+            );
+            // `schedule_get_difference("Wrong sendMultiMedia result")`
+            self.with_updates_env(|um, env| {
+                um.schedule_get_difference(env, "Wrong sendMultiMedia result")
+            });
+        }
+        // `on_get_updates(ptr, Promise<Unit>())` — the engine hop
+        self.um_send_later(UmMessage::OnGetUpdates {
+            updates: Box::new(updates),
+            promise: Promise::default(),
+        });
+        self.drain_sink();
+    }
+
+    /// The `on_set_message_reactions` completion chain over the collapsed
+    /// actor shape (the C++ query-promise lambda of
+    /// `commit_paid_message_reactions`, MessagesManager.cpp:20433-20439).
+    fn on_set_message_reactions_chain(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        result: tdutils::status::Result<()>,
+        promise: Promise<()>,
+    ) {
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        // SAFETY: the ctx view aliases one Td and is used strictly
+        // sequentially inside the callee (the split_context_alias
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+        crate::messages_manager::on_set_message_reactions(
+            &mut manager,
+            ctx,
+            message_full_id,
+            result,
+            promise,
+        );
+        self.messages_manager = manager;
+        self.drain_sink();
+    }
+
+    /// `MessagesManager::translate_message_text`
+    /// (MessagesManager.cpp:15146-15168) — the request glue: the
+    /// messages-side gates run over the split contexts, then the
+    /// translation manager's send body carries the input text with the
+    /// autotranslation-picked wire form (the §3.8 net-drain 25
+    /// `translateText` PEER shape).
+    pub(crate) fn translate_message_text(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        to_language_code: String,
+        tone: String,
+        mut promise: Promise<td_api::FormattedText>,
+    ) {
+        use crate::messages_manager::TranslateMessageTextAction;
+        let action = {
+            let mut global = std::mem::take(&mut self.global);
+            let mut manager = std::mem::take(&mut self.messages_manager);
+            // SAFETY: the ctx view aliases one Td and is used strictly
+            // sequentially inside the callee (the split_context_alias
+            // contract).
+            let td_ptr = std::ptr::from_mut(self);
+            let ctx: &mut crate::td::Td = unsafe { &mut *td_ptr };
+            let action = crate::messages_manager::translate_message_text_gates(
+                &mut global,
+                &mut manager,
+                ctx,
+                message_full_id,
+            );
+            self.global = global;
+            self.messages_manager = manager;
+            action
+        };
+        match action {
+            TranslateMessageTextAction::NotFound => {
+                promise.set_error(Status::error(400, "Message not found"));
+            }
+            TranslateMessageTextAction::Empty => {
+                promise.set_value(td_api::FormattedText {
+                    text: String::new(),
+                    entities: Vec::new(),
+                });
+            }
+            TranslateMessageTextAction::Translate {
+                input_text,
+                has_autotranslation,
+            } => {
+                let (translation, mut env) = crate::td::translation_env_split(self);
+                translation.translate_input_text(
+                    &mut env,
+                    input_text,
+                    if has_autotranslation {
+                        message_full_id
+                    } else {
+                        crate::messages_manager::MessageFullId::default()
+                    },
+                    to_language_code,
+                    tone,
+                    promise,
+                );
+                self.translation_manager = translation;
+            }
+        }
+    }
+
     /// Drain the callback-parked star-gift answers (the §3.6 families) +
     /// the ConvertStarGiftQuery continuation queue (the reload completes
     /// into `on_dialog_gift_transferred`).
@@ -17579,7 +17884,421 @@ impl Td {
                     result,
                 );
             }
+            // `SendPaidReactionQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:121-146) — the star-balance ledger
+            // re-add, then the updates re-enter the engine with the
+            // `on_set_message_reactions` chain; the error bands settle
+            // through the same chain (the MESSAGE_NOT_MODIFIED ok band
+            // included).
+            crate::messages_manager::MessagesNetKind::SendPaidReaction {
+                dialog_id,
+                star_count,
+            } => {
+                let Some((message_full_id, promise)) =
+                    crate::messages_manager::pop_paid_reaction_promise(&mut self.messages_manager)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    // the `on_error` head (MessageReaction.cpp:132-145)
+                    if status.message() == "MESSAGE_NOT_MODIFIED" {
+                        self.star_add_pending_owned(star_count, true);
+                        self.on_set_message_reactions_chain(
+                            message_full_id,
+                            tdutils::status::Result::Ok(()),
+                            promise,
+                        );
+                        return;
+                    }
+                    self.star_add_pending_owned(star_count, false);
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "SendPaidReactionQuery",
+                    );
+                    self.on_set_message_reactions_chain(
+                        message_full_id,
+                        tdutils::status::Result::Err(status),
+                        promise,
+                    );
+                    return;
+                }
+                let updates = match telegram_api::Updates::parse(query.ok()) {
+                    Result::Ok(updates) => updates,
+                    Result::Err(_) => {
+                        // the fetch_result parse failure runs on_error with
+                        // the 500 (the C++ `fetch_result` error path)
+                        let status = Status::error(
+                            500,
+                            "Failed to parse the messages_sendPaidReaction answer",
+                        );
+                        self.star_add_pending_owned(star_count, false);
+                        self.on_set_message_reactions_chain(
+                            message_full_id,
+                            tdutils::status::Result::Err(status),
+                            promise,
+                        );
+                        return;
+                    }
+                };
+                // the ok half (MessageReaction.cpp:125-130): the ledger
+                // re-add (is_final), then the updates run through the
+                // engine with the promise chain
+                self.star_add_pending_owned(star_count, true);
+                self.um_send_later(UmMessage::OnGetUpdatesPaidReaction {
+                    updates: Box::new(updates),
+                    message_full_id,
+                    promise,
+                });
+                self.drain_sink();
+            }
+            // `TogglePaidReactionPrivacyQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:172-187) — the promise settles
+            // directly; the error head runs the dialog error intake.
+            crate::messages_manager::MessagesNetKind::TogglePaidReactionPrivacy { dialog_id } => {
+                let Some(mut promise) = crate::messages_manager::pop_paid_reaction_privacy_promise(
+                    &mut self.messages_manager,
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "TogglePaidReactionPrivacyQuery",
+                    );
+                    promise.set_error(status);
+                    return;
+                }
+                match parse_wire_bool(query.ok()) {
+                    Some(()) => promise.set_value(()),
+                    // the fetch failure runs on_error with the 500
+                    None => promise.set_error(Status::error(
+                        500,
+                        "Failed to parse the messages_togglePaidReactionPrivacy answer",
+                    )),
+                }
+            }
+            // `SendMultiMediaQuery::on_result`/`on_error`
+            // (MessagesManager.cpp:1466-1521) — the random-id validation
+            // ladder + the engine re-entry, or the paid-message error
+            // rewrite + the per-random-id fail fan-out.
+            crate::messages_manager::MessagesNetKind::SendMultiMedia { dialog_id } => {
+                let Some(random_ids) = self.pending_multi_media_random_ids.pop_front() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.run_send_multi_media_error(dialog_id, &random_ids, status);
+                    return;
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => {
+                        self.run_send_multi_media_result(dialog_id, random_ids, updates);
+                    }
+                    Err(_) => {
+                        // the fetch_result failure runs on_error with the 500
+                        self.run_send_multi_media_error(
+                            dialog_id,
+                            &random_ids,
+                            Status::error(
+                                500,
+                                "Failed to parse the messages_sendMultiMedia answer",
+                            ),
+                        );
+                    }
+                }
+            }
+            // `GetDialogListQuery::on_result`/`on_error`
+            // (MessagesManager.cpp:476-513) — the users/chats intakes,
+            // then the `on_get_dialogs` walk with the handler's own
+            // promise; the dialogsNotModified 500 and the folder-load
+            // fan-in tail.
+            crate::messages_manager::MessagesNetKind::GetDialogList { folder_id } => {
+                let Some(leg) = self
+                    .pending_get_dialog_list_legs
+                    .get_mut(&folder_id)
+                    .and_then(|legs| legs.pop_front())
+                else {
+                    return;
+                };
+                let fetched: tdutils::status::Result<telegram_api::messages_Dialogs> =
+                    if query.is_error() {
+                        // `on_error` (cpp:510-512): promise_.set_error —
+                        // no dialog-error head for this family
+                        tdutils::status::Result::Err(query.error().clone())
+                    } else {
+                        match telegram_api::messages_Dialogs::parse(query.ok()) {
+                            Ok(dialogs) => tdutils::status::Result::Ok(dialogs),
+                            // the fetch_result parse failure runs on_error
+                            // with the 500
+                            Err(_) => tdutils::status::Result::Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getDialogs answer",
+                            )),
+                        }
+                    };
+                match fetched {
+                    tdutils::status::Result::Err(status) => {
+                        let crate::messages_manager::PendingDialogListLeg {
+                            is_folder_load,
+                            slot,
+                            mut promise,
+                        } = leg;
+                        promise.set_error(status);
+                        self.finish_dialog_list_leg(folder_id, is_folder_load, slot);
+                    }
+                    tdutils::status::Result::Ok(
+                        telegram_api::messages_Dialogs::messages_dialogs(dialogs),
+                    ) => {
+                        // `messages_dialogs` (cpp:481-491): the total is
+                        // the page size
+                        self.intake_users(dialogs.users, "GetDialogListQuery");
+                        self.intake_chats(dialogs.chats, "GetDialogListQuery");
+                        let total_count = dialogs.dialogs.len() as i32;
+                        self.run_on_get_dialogs(
+                            folder_id,
+                            dialogs.dialogs,
+                            total_count,
+                            dialogs.messages,
+                            leg,
+                        );
+                    }
+                    tdutils::status::Result::Ok(
+                        telegram_api::messages_Dialogs::messages_dialogsSlice(dialogs),
+                    ) => {
+                        // `messages_dialogsSlice` (cpp:492-499): the
+                        // server total, clamped
+                        self.intake_users(dialogs.users, "GetDialogListQuery slice");
+                        self.intake_chats(dialogs.chats, "GetDialogListQuery slice");
+                        let total_count = dialogs.count.max(0);
+                        self.run_on_get_dialogs(
+                            folder_id,
+                            dialogs.dialogs,
+                            total_count,
+                            dialogs.messages,
+                            leg,
+                        );
+                    }
+                    tdutils::status::Result::Ok(
+                        telegram_api::messages_Dialogs::messages_dialogsNotModified(_),
+                    ) => {
+                        // the wrong-answer band (cpp:501-504): LOG(ERROR),
+                        // then on_error with the 500
+                        tdutils::log_error!(
+                            "Receive messages.dialogsNotModified for {folder_id:?}"
+                        );
+                        let crate::messages_manager::PendingDialogListLeg {
+                            is_folder_load,
+                            slot,
+                            mut promise,
+                        } = leg;
+                        promise.set_error(Status::error(
+                            500,
+                            "Receive wrong server response messages.dialogsNotModified",
+                        ));
+                        self.finish_dialog_list_leg(folder_id, is_folder_load, slot);
+                    }
+                }
+            }
+            // `GetPinnedDialogsQuery::on_result`/`on_error`
+            // (MessagesManager.cpp:192-207) — the pinned page walks the
+            // same intake with the -2 total; the C++ reads the common
+            // base fields without a variant switch, so the slice form
+            // runs its vectors and the notModified form runs empty ones.
+            crate::messages_manager::MessagesNetKind::GetPinnedDialogs { folder_id } => {
+                let Some(leg) = self
+                    .pending_get_pinned_dialogs_legs
+                    .get_mut(&folder_id)
+                    .and_then(|legs| legs.pop_front())
+                else {
+                    return;
+                };
+                let fetched: tdutils::status::Result<telegram_api::messages_Dialogs> =
+                    if query.is_error() {
+                        // `on_error` (cpp:205-207): promise_.set_error
+                        tdutils::status::Result::Err(query.error().clone())
+                    } else {
+                        match telegram_api::messages_Dialogs::parse(query.ok()) {
+                            Ok(dialogs) => tdutils::status::Result::Ok(dialogs),
+                            // the fetch_result parse failure runs on_error
+                            // with the 500
+                            Err(_) => tdutils::status::Result::Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getPinnedDialogs answer",
+                            )),
+                        }
+                    };
+                match fetched {
+                    tdutils::status::Result::Err(status) => {
+                        let crate::messages_manager::PendingDialogListLeg {
+                            is_folder_load,
+                            slot,
+                            mut promise,
+                        } = leg;
+                        promise.set_error(status);
+                        self.finish_dialog_list_leg(folder_id, is_folder_load, slot);
+                    }
+                    tdutils::status::Result::Ok(
+                        telegram_api::messages_Dialogs::messages_dialogs(dialogs),
+                    ) => {
+                        self.intake_users(dialogs.users, "GetPinnedDialogsQuery");
+                        self.intake_chats(dialogs.chats, "GetPinnedDialogsQuery");
+                        self.run_on_get_dialogs(
+                            folder_id,
+                            dialogs.dialogs,
+                            -2,
+                            dialogs.messages,
+                            leg,
+                        );
+                    }
+                    tdutils::status::Result::Ok(
+                        telegram_api::messages_Dialogs::messages_dialogsSlice(dialogs),
+                    ) => {
+                        self.intake_users(dialogs.users, "GetPinnedDialogsQuery");
+                        self.intake_chats(dialogs.chats, "GetPinnedDialogsQuery");
+                        self.run_on_get_dialogs(
+                            folder_id,
+                            dialogs.dialogs,
+                            -2,
+                            dialogs.messages,
+                            leg,
+                        );
+                    }
+                    tdutils::status::Result::Ok(
+                        telegram_api::messages_Dialogs::messages_dialogsNotModified(_),
+                    ) => {
+                        // the empty-vector walk the C++ base-class read
+                        // runs for the notModified form
+                        self.intake_users(Vec::new(), "GetPinnedDialogsQuery");
+                        self.intake_chats(Vec::new(), "GetPinnedDialogsQuery");
+                        self.run_on_get_dialogs(folder_id, Vec::new(), -2, Vec::new(), leg);
+                    }
+                }
+            }
         }
+    }
+
+    /// `on_get_dialogs` over the split-context alias pair — the C++
+    /// handler bodies' shared tail (MessagesManager.cpp:487-499/:199-204),
+    /// then the folder-load fan-in completion (the handler's promise
+    /// settles inside the walk — its early `set_error` returns are the
+    /// validation-ladder 500s the slot captures).
+    fn run_on_get_dialogs(
+        &mut self,
+        folder_id: crate::messages_manager::FolderId,
+        dialogs: Vec<telegram_api::Dialog>,
+        total_count: i32,
+        messages: Vec<telegram_api::Message>,
+        leg: crate::messages_manager::PendingDialogListLeg,
+    ) {
+        let crate::messages_manager::PendingDialogListLeg {
+            is_folder_load,
+            slot,
+            promise,
+        } = leg;
+        // SAFETY: the alias pair derives from `td_ptr`; the walk uses the
+        // contexts strictly one at a time (global/manager/ctxs never
+        // alias the same field simultaneously).
+        let td_ptr = std::ptr::from_mut(self);
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+            unsafe { &mut *td_ptr };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MmRequestContext = unsafe { &mut *td_ptr };
+        // SAFETY: as the pair above — the shared-ref context (the C++
+        // `d` reads only).
+        let reactions_ctx: &dyn crate::messages_manager::DialogReactionsContext =
+            unsafe { &*td_ptr };
+        crate::messages_manager::on_get_dialogs(
+            global,
+            manager,
+            msgctx,
+            state,
+            ctx,
+            reactions_ctx,
+            folder_id,
+            dialogs,
+            total_count,
+            messages,
+            promise,
+        );
+        self.finish_dialog_list_leg(folder_id, is_folder_load, slot);
+    }
+
+    /// The folder-load fan-in tail — the MultiPromiseActor completion
+    /// (MultiPromise.cpp `raw_event`, the zero crossing over the legs
+    /// MessagesManager.cpp:14203-14228 counted): the outstanding count
+    /// decrement, the ok-path `recalc_unread_count` sink, then
+    /// `on_load_folder_dialog_list` (the first error wins — the
+    /// settle-order collapse of the C++ futures-order walk).
+    fn finish_dialog_list_leg(
+        &mut self,
+        folder_id: crate::messages_manager::FolderId,
+        is_folder_load: bool,
+        slot: crate::messages_manager::DialogListLegSlot,
+    ) {
+        if !is_folder_load {
+            // the count-repair probe rides no fan-in (its C++ promise is
+            // the empty one)
+            return;
+        }
+        let outcome = slot.lock().unwrap().take();
+        {
+            let manager = &mut self.messages_manager;
+            if let Some(folder) = manager.dialog_folders.get_mut(&folder_id) {
+                folder.load_folder_dialog_list_outstanding_promises -= 1;
+            }
+            if let Some(tdutils::status::Result::Err(status)) = &outcome {
+                manager
+                    .folder_load_first_errors
+                    .entry(folder_id)
+                    .or_insert_with(|| (status.code(), status.message().to_owned()));
+            }
+        }
+        let outstanding = self
+            .messages_manager
+            .dialog_folders
+            .get(&folder_id)
+            .map(|folder| folder.load_folder_dialog_list_outstanding_promises)
+            .unwrap_or(0);
+        if outstanding > 0 {
+            return;
+        }
+        let result = match self
+            .messages_manager
+            .folder_load_first_errors
+            .remove(&folder_id)
+        {
+            Some((code, message)) => Err((code, message)),
+            None => Ok(()),
+        };
+        // SAFETY: the alias pair derives from `td_ptr`; the sinks use the
+        // contexts strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        if result.is_ok() {
+            // the ok-path sink (cpp:14203-14207)
+            crate::messages_manager::recalc_unread_count(
+                state,
+                manager,
+                crate::messages_manager::DialogListId::from_folder(folder_id),
+                -1,
+                true,
+            );
+        }
+        // the completion sink (cpp:14199-14201)
+        crate::messages_manager::on_load_folder_dialog_list(state, manager, folder_id, result);
     }
 
     /// Route one auth answer (the two-step `CheckPassword` re-dispatches
@@ -22425,6 +23144,18 @@ pub(crate) enum UmMessage {
         updates: Box<telegram_api::Updates>,
         tail: crate::story_manager::StoryNetTail,
     },
+    /// `on_get_updates` + the paid-reaction chain tail — the C++
+    /// `PromiseCreator::lambda` chain of
+    /// `MessagesManager::commit_paid_message_reactions`
+    /// (MessagesManager.cpp:20433-20439): the Updates run through the
+    /// engine, then the chain result completes
+    /// `on_set_message_reactions` with the request promise (the lambda
+    /// runs on both the ok and the error paths — the exact C++ order).
+    OnGetUpdatesPaidReaction {
+        updates: Box<telegram_api::Updates>,
+        message_full_id: crate::messages_manager::MessageFullId,
+        promise: Promise<()>,
+    },
     /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
     /// (cpp:522, :364).
     OnGetDifference {
@@ -22457,6 +23188,30 @@ impl UmMessage {
         match self {
             UmMessage::OnGetUpdates { updates, promise } => {
                 td.with_updates_env(|um, env| um.on_get_updates(env, *updates, promise));
+            }
+            UmMessage::OnGetUpdatesPaidReaction {
+                updates,
+                message_full_id,
+                promise,
+            } => {
+                // the chain's promise captures the engine result — the
+                // `unit_slot_promise` shape (the updates engine completes
+                // it synchronously; the slot carries the result into
+                // `on_set_message_reactions`'s need_reload band)
+                let slot: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                let capture = std::sync::Arc::clone(&slot);
+                let updates_promise =
+                    tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                        *capture.lock().unwrap() = Some(result);
+                    });
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, updates_promise));
+                let result = slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(tdutils::status::Result::Ok(()));
+                td.on_set_message_reactions_chain(message_full_id, result, promise);
             }
             UmMessage::OnGetUpdatesMigrateChat {
                 updates,
@@ -23706,10 +24461,14 @@ impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> 
     }
 
     /// `TranslateTextQuery::send` (TranslationManager.cpp:44-66) — the
-    /// text form (the PEER form stays with the message-translate flow).
+    /// two wire forms: a valid message full id flips to the PEER form
+    /// (the resolved read peer + the message ids, the §3.8 net-drain 25
+    /// `translateText` shape), otherwise the TEXT form packs the
+    /// input texts.
     fn send_translate_text_query(
         &mut self,
         texts: Vec<FormattedText>,
+        message_full_id: crate::messages_manager::MessageFullId,
         to_language_code: String,
         tone: String,
         skip_bot_commands: bool,
@@ -23721,20 +24480,47 @@ impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> 
             tdutils::log_info!("Translate text — [net-inert]");
             return;
         };
-        let mut flags = 2; // TEXT_MASK
+        let mut flags = 0;
         if !tone.is_empty() {
             flags |= 4; // TONE_MASK
         }
-        let input_texts = texts
-            .iter()
-            .map(|text| {
-                crate::message_entity::get_input_text_with_entities(
-                    Some(&mut *self),
-                    text,
-                    "TranslateTextQuery",
-                )
-            })
-            .collect();
+        // `CHECK(texts.size() == 1u)` on the PEER arm (TranslationManager.cpp:49)
+        let (peer, message_ids, input_texts) = if message_full_id.get_message_id().is_valid() {
+            flags |= 1; // PEER_MASK
+            let dialog_id = message_full_id.get_dialog_id();
+            // the C++ `CHECK(input_peer != nullptr)` — the manager gate
+            // proved the read access; the None band falls back to the
+            // empty peer the wire rejects (the offline shape)
+            let peer = crate::dialog_manager::get_input_peer(
+                self.td,
+                dialog_id,
+                crate::user_manager::AccessRights::Read,
+            )
+            .map(Box::new);
+            (
+                peer,
+                vec![
+                    message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                ],
+                Vec::new(),
+            )
+        } else {
+            flags |= 2; // TEXT_MASK
+            let input_texts = texts
+                .iter()
+                .map(|text| {
+                    crate::message_entity::get_input_text_with_entities(
+                        Some(&mut *self),
+                        text,
+                        "TranslateTextQuery",
+                    )
+                })
+                .collect();
+            (None, Vec::new(), input_texts)
+        };
         self.td
             .translation_promises
             .push(PendingTranslationQuery::TranslateText {
@@ -23746,8 +24532,8 @@ impl crate::translation_manager::TranslationManagerEnv for TdTranslationEnv<'_> 
             TranslationNetKind::TranslateText,
             telegram_api::Function::messages_translateText(telegram_api::messages_translateText {
                 flags,
-                peer: None,
-                id: Vec::new(),
+                peer,
+                id: message_ids,
                 text: input_texts,
                 to_lang: to_language_code,
                 tone,
@@ -35838,6 +36624,99 @@ impl crate::dialog_invite_link_manager::DialogInviteLinkManagerEnv for TdDialogI
     }
 }
 
+/// `SendMultiMediaQuery::send` (MessagesManager.cpp:1400-1464) — the
+/// §3.8 net-drain 25 dispatch leg: the random ids ride the handler's
+/// family queue, the write peer resolves at the send leg (the null band
+/// runs the inline `on_error`), and the reply flag rides the built
+/// `InputReplyTo`. The caller is the album wiring
+/// (`do_send_message_group`'s consumer — the M.10.20/M.12 upload tail);
+/// the per-message `inputSingleMedia` assembly parks with the Files
+/// plane, so the params arrive prebuilt.
+#[allow(dead_code)] // the producer is the upload fan-in tail
+// (`on_upload_message_media_finished` → the M.12
+// resume-upload seam); the netted test drives the
+// wire + answer halves until that lands
+pub(crate) fn send_multi_media_query(
+    td: &mut Td,
+    params: crate::messages_manager::MultiMediaQueryParams,
+) {
+    use crate::messages_manager::MessagesNetKind;
+    let crate::messages_manager::MultiMediaQueryParams {
+        flags,
+        dialog_id,
+        reply_to_message_id,
+        top_msg_id,
+        input_single_media,
+        schedule_date,
+        effect,
+        paid_message_star_count,
+    } = params;
+    // the random ids come off the media rows (cpp:1407-1414); the file
+    // references extraction parks with the Files plane
+    let random_ids: Vec<i64> = input_single_media
+        .iter()
+        .map(|media| media.random_id)
+        .collect();
+    // `get_input_peer(dialog_id, AccessRights::Write) == nullptr →
+    // on_error(400 "Have no write access to the chat")` (cpp:1416-1420)
+    let Some(peer) = crate::dialog_manager::get_input_peer(
+        td,
+        dialog_id,
+        crate::user_manager::AccessRights::Write,
+    ) else {
+        td.run_send_multi_media_error(
+            dialog_id,
+            &random_ids,
+            Status::error(400, "Have no write access to the chat"),
+        );
+        return;
+    };
+    let Some(net) = td.messages_net() else {
+        tdutils::log_info!("Send messages.sendMultiMedia — [net-inert]");
+        return;
+    };
+    let mut flags = flags;
+    let reply_to = reply_to_message_id.map(|reply_to_msg_id| {
+        // the REPLY_TO flag + the inputReplyToMessage build
+        flags |= 1; // REPLY_TO_MASK
+        const TOP_MSG_ID_MASK: i32 = 1;
+        telegram_api::InputReplyTo::inputReplyToMessage(telegram_api::inputReplyToMessage {
+            flags: if top_msg_id != 0 { TOP_MSG_ID_MASK } else { 0 },
+            reply_to_msg_id,
+            top_msg_id,
+            reply_to_peer_id: None,
+            quote_text: String::new(),
+            quote_entities: Vec::new(),
+            quote_offset: 0,
+            monoforum_peer_id: None,
+            todo_item_id: 0,
+            poll_option: Vec::new(),
+        })
+    });
+    td.pending_multi_media_random_ids.push_back(random_ids);
+    net.dispatch(
+        MessagesNetKind::SendMultiMedia { dialog_id },
+        telegram_api::Function::messages_sendMultiMedia(telegram_api::messages_sendMultiMedia {
+            flags,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: Some(Box::new(peer)),
+            reply_to,
+            multi_media: input_single_media,
+            schedule_date,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect,
+            allow_paid_stars: paid_message_star_count,
+        }),
+    );
+}
+
 pub(crate) fn star_env_split(td: &mut Td) -> (crate::star_manager::StarManager, TdStarEnv<'_>) {
     let manager = std::mem::take(&mut td.star_manager);
     let env = TdStarEnv { td: &mut *td };
@@ -35929,6 +36808,128 @@ impl crate::messages_manager::MmRequestContext for Td {
 
     fn my_dialog_id(&self) -> crate::messages_manager::DialogId {
         crate::messages_manager::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    // -- the paid-reaction wire tails (the §3.8 net-drain 25 families;
+    // MessageReaction.cpp:93-187) — the pure dispatch legs; the manager
+    // the caller holds runs the swap and parks the promises
+
+    /// `SendPaidReactionQuery::send` (MessageReaction.cpp:100-118): the
+    /// resolved read peer, the PRIVATE flag/privacy form over the params,
+    /// the dispatch. The null-peer band is the `Err` the caller completes
+    /// through the inline `on_error` shape.
+    fn send_paid_message_reaction_on_server(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        star_count: i32,
+        params: &crate::messages_manager::SendPaidReactionParams,
+    ) -> Result<(), Status> {
+        use crate::messages_manager::MessagesNetKind;
+        let dialog_id = message_full_id.get_dialog_id();
+        // `get_input_peer(dialog_id, AccessRights::Read) == nullptr →
+        // on_error(400 "Can't access the chat")` (MessageReaction.cpp:105)
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return Err(Status::error(400, "Can't access the chat"));
+        };
+        let Some(net) = self.messages_net() else {
+            tdutils::log_info!("Send messages.sendPaidReaction — [net-inert]");
+            return Ok(());
+        };
+        let mut flags = 0;
+        let privacy = if params.use_default_paid_reaction_type {
+            None
+        } else {
+            // the PRIVATE flag + `get_input_paid_reaction_privacy` over the
+            // write peer (the Dialog arm's read)
+            flags |= 1; // PRIVATE_MASK
+            let write_peer =
+                params
+                    .paid_reaction_type
+                    .privacy_dialog_id()
+                    .and_then(|privacy_dialog_id| {
+                        crate::dialog_manager::get_input_peer(
+                            self,
+                            privacy_dialog_id,
+                            crate::user_manager::AccessRights::Write,
+                        )
+                    });
+            Some(
+                params
+                    .paid_reaction_type
+                    .input_paid_reaction_privacy(write_peer),
+            )
+        };
+        net.dispatch(
+            MessagesNetKind::SendPaidReaction {
+                dialog_id,
+                star_count: i64::from(star_count),
+            },
+            telegram_api::Function::messages_sendPaidReaction(
+                telegram_api::messages_sendPaidReaction {
+                    flags,
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    count: star_count,
+                    random_id: params.random_id,
+                    private: privacy,
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// `TogglePaidReactionPrivacyQuery::send` (MessageReaction.cpp:161-169)
+    /// — the resolved read peer carries the toggle; the promise parks in
+    /// the family queue at the manager the caller holds.
+    fn toggle_paid_reaction_privacy_on_server(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        paid_reaction_type: &crate::paid_reaction_type::PaidReactionType,
+    ) -> Result<(), Status> {
+        use crate::messages_manager::MessagesNetKind;
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return Err(Status::error(400, "Can't access the chat"));
+        };
+        let Some(net) = self.messages_net() else {
+            tdutils::log_info!("Send messages.togglePaidReactionPrivacy — [net-inert]");
+            return Ok(());
+        };
+        let write_peer = paid_reaction_type
+            .privacy_dialog_id()
+            .and_then(|privacy_dialog_id| {
+                crate::dialog_manager::get_input_peer(
+                    self,
+                    privacy_dialog_id,
+                    crate::user_manager::AccessRights::Write,
+                )
+            });
+        let privacy = paid_reaction_type.input_paid_reaction_privacy(write_peer);
+        net.dispatch(
+            MessagesNetKind::TogglePaidReactionPrivacy { dialog_id },
+            telegram_api::Function::messages_togglePaidReactionPrivacy(
+                telegram_api::messages_togglePaidReactionPrivacy {
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    private: Some(privacy),
+                },
+            ),
+        );
+        Ok(())
     }
 
     fn get_chat_id_object(
@@ -61310,5 +62311,1209 @@ mod tests {
         }
 
         assert!(td.payments_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- net-drain 25 (§3.8): the messages-plane send families ----
+
+    /// Seed a broadcast channel with the autotranslation flag on — the
+    /// `translateMessageText` PEER gate reads it off the channel record.
+    fn seed_autotranslation_channel(td: &mut Td, channel_id: i64) {
+        seed_my_user(td);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        chat_manager.on_get_chat(
+            &mut *user_manager,
+            &mut env,
+            telegram_api::Chat::channel(telegram_api::channel {
+                creator: true,
+                broadcast: true,
+                megagroup: false,
+                id: channel_id,
+                access_hash: 999,
+                title: "channel".to_owned(),
+                autotranslation: true,
+                ..telegram_api::channel::default()
+            }),
+            "test",
+        );
+    }
+
+    #[test]
+    fn messages_translate_message_text_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_translate_message_text_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 `translateText` PEER round-trip
+    /// (TranslationManager.cpp:44-56/681-699,
+    /// MessagesManager.cpp:15146-15168): the autotranslation channel keeps
+    /// the message full id — the wire flips to the PEER form (the read
+    /// peer + the server message id, no input texts); the plain band
+    /// keeps the TEXT form; the empty-text and not-found bands settle
+    /// before the wire.
+    fn messages_translate_message_text_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain25-translate-peertext");
+        let channel_id = 2147483642;
+        seed_autotranslation_channel(&mut td, channel_id);
+        assert!(
+            td.chat_manager
+                .get_channel_autotranslation(crate::chat_manager::ChannelId::new(channel_id)),
+            "the seeded channel carries the autotranslation flag"
+        );
+        let dialog_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(channel_id),
+        );
+        let chat_id = dialog_id.get();
+        let message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(700),
+        );
+        let text_message = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(701),
+        );
+        {
+            let mut dialog = Box::new(crate::messages_manager::Dialog::default());
+            dialog.dialog_id = dialog_id;
+            dialog.is_update_new_chat_sent = true;
+            let mut message = crate::messages_manager::Message {
+                message_id,
+                content: Some(crate::message_content::MessageContent::Text(
+                    crate::message_content::MessageText {
+                        text: crate::message_entity::FormattedText {
+                            text: "hello world".to_owned(),
+                            entities: Vec::new(),
+                        },
+                        ..crate::message_content::MessageText::default()
+                    },
+                )),
+                ..crate::messages_manager::Message::default()
+            };
+            message.random_id = 1;
+            dialog.messages.insert(message_id, Box::new(message));
+            let empty = crate::messages_manager::Message {
+                message_id: text_message,
+                content: Some(crate::message_content::MessageContent::Text(
+                    crate::message_content::MessageText::default(),
+                )),
+                ..crate::messages_manager::Message::default()
+            };
+            dialog.messages.insert(text_message, Box::new(empty));
+            td.messages_manager.dialogs.insert(dialog_id, dialog);
+        }
+
+        // 1. the PEER form — the autotranslation channel keeps the full
+        //    id: the read peer + the server message id ride the wire,
+        //    the input texts stay empty, and the translated answer
+        //    resolves the request promise.
+        td.request(
+            1,
+            Function::translateMessageText(td_api::translateMessageText {
+                chat_id,
+                message_id: message_id.get(),
+                to_language_code: "de".to_owned(),
+                tone: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_translateText::ID,
+        );
+        let body = telegram_api::messages_translateText::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags & 1, 1, "the PEER flag");
+        assert_eq!(body.flags & 2, 0, "no TEXT flag");
+        assert_eq!(body.id, vec![700]);
+        assert!(body.text.is_empty(), "no input texts on the PEER form");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, channel_id);
+            }
+            other => panic!("the translate peer: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::messages_TranslatedText {
+            result: vec![telegram_api::TextWithEntities {
+                text: "hallo welt".to_owned(),
+                entities: vec![],
+            }],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_translation_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::formattedText(text)) => assert_eq!(text.text, "hallo welt"),
+            other => panic!("the translated text: {other:?}"),
+        }
+
+        // 2. the empty-text band — the empty formattedText settles before
+        //    the wire.
+        td.request(
+            2,
+            Function::translateMessageText(td_api::translateMessageText {
+                chat_id,
+                message_id: text_message.get(),
+                to_language_code: "de".to_owned(),
+                tone: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            !rec.sent
+                .lock()
+                .iter()
+                .any(|query| query.tl_constructor() == telegram_api::messages_translateText::ID),
+            "the empty band sends nothing"
+        );
+        match responses_of(&callback, 2).first() {
+            Some(Object::formattedText(text)) => assert_eq!(text.text, ""),
+            other => panic!("the empty text band: {other:?}"),
+        }
+
+        // 3. the not-found band — the 400 settles before the wire.
+        td.request(
+            3,
+            Function::translateMessageText(td_api::translateMessageText {
+                chat_id,
+                message_id: 999999,
+                to_language_code: "de".to_owned(),
+                tone: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+    }
+
+    /// Seed a broadcast-channel dialog carrying one server message with
+    /// an empty reactions block and the paid-reactions-available table —
+    /// the `addPendingPaidMessageReaction` gates open on this state.
+    fn seed_paid_reaction_channel(
+        td: &mut Td,
+    ) -> (
+        crate::messages_manager::DialogId,
+        crate::messages_manager::MessageId,
+    ) {
+        seed_my_user(td);
+        let channel_id = 2147483641;
+        seed_dialog_channel(td, channel_id, true, false);
+        let dialog_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(channel_id),
+        );
+        let mut dialog = Box::new(crate::messages_manager::Dialog::default());
+        dialog.dialog_id = dialog_id;
+        dialog.is_update_new_chat_sent = true;
+        dialog.available_reactions = crate::messages_manager::ChatReactions {
+            paid_reactions_available: true,
+            ..crate::messages_manager::ChatReactions::default()
+        };
+        let message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(500),
+        );
+        let message = crate::messages_manager::Message {
+            message_id,
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            reactions: Some(crate::messages_manager::MessageReactions::default()),
+            ..crate::messages_manager::Message::default()
+        };
+        dialog.messages.insert(message_id, Box::new(message));
+        td.messages_manager.dialogs.insert(dialog_id, dialog);
+        (dialog_id, message_id)
+    }
+
+    #[test]
+    fn messages_paid_reaction_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_paid_reaction_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 round-trips: `SendPaidReactionQuery` +
+    /// `TogglePaidReactionPrivacyQuery` (MessageReaction.cpp:93-187) —
+    /// the wire constructions at the send arms (the PRIVATE flag gate,
+    /// the privacy form), the answer halves behind
+    /// `on_messages_net_answer` (the star ledger re-adds, the
+    /// on_get_updates → `on_set_message_reactions` chain, the
+    /// MESSAGE_NOT_MODIFIED band, the dialog-error head), and the
+    /// send-leg 400 band.
+    fn messages_paid_reaction_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain25-paid-reactions");
+        let (dialog_id, message_id) = seed_paid_reaction_channel(&mut td);
+        let chat_id = dialog_id.get();
+
+        // 1. addPendingPaidMessageReaction — the pending ladder seeds the
+        //    local pending trio (5 stars, the default type).
+        td.request(
+            1,
+            Function::addPendingPaidMessageReaction(td_api::addPendingPaidMessageReaction {
+                chat_id,
+                message_id: message_id.get(),
+                star_count: 5,
+                r#type: None,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(!responses_of(&callback, 1).is_empty(), "the pending add ok");
+
+        // 2. commitPendingPaidMessageReactions — SendPaidReactionQuery
+        //    rides the dispatcher: the default type keeps the PRIVATE
+        //    flag off, the count is the pending 5.
+        td.request(
+            2,
+            Function::commitPendingPaidMessageReactions(
+                td_api::commitPendingPaidMessageReactions {
+                    chat_id,
+                    message_id: message_id.get(),
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendPaidReaction::ID,
+        );
+        let body = telegram_api::messages_sendPaidReaction::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags & 1, 0, "no PRIVATE flag for the default type");
+        assert!(body.private.is_none());
+        assert_eq!(body.msg_id, 500);
+        assert_eq!(body.count, 5);
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerChannel(peer)) => {
+                assert_eq!(peer.channel_id, 2147483641);
+            }
+            other => panic!("the send peer: {other:?}"),
+        }
+        // the ok answer: the ledger re-add runs, the updates re-enter the
+        // engine, the chain completes the request promise
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        assert!(!responses_of(&callback, 2).is_empty(), "the commit ok");
+        // the swap consumed the pendings: the paid row landed
+        {
+            let d = td
+                .messages_manager
+                .get_dialog(dialog_id)
+                .expect("the dialog");
+            let m = crate::messages_manager::get_message(d, message_id).expect("the message");
+            let reactions = m.reactions.as_ref().expect("the reactions");
+            assert_eq!(reactions.pending_paid_reactions, 0, "pendings consumed");
+            assert_eq!(
+                reactions
+                    .top_reactors
+                    .iter()
+                    .find(|reactor| reactor.is_me())
+                    .map(|reactor| reactor.count),
+                Some(5),
+                "the me-row absorbed the pending stars"
+            );
+        }
+
+        // 3. the MESSAGE_NOT_MODIFIED band — the promise completes ok
+        //    through the chain (the ledger re-add with is_final).
+        td.request(
+            3,
+            Function::addPendingPaidMessageReaction(td_api::addPendingPaidMessageReaction {
+                chat_id,
+                message_id: message_id.get(),
+                star_count: 3,
+                r#type: Some(td_api::PaidReactionType::paidReactionTypeAnonymous(
+                    td_api::paidReactionTypeAnonymous {},
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        td.request(
+            4,
+            Function::commitPendingPaidMessageReactions(
+                td_api::commitPendingPaidMessageReactions {
+                    chat_id,
+                    message_id: message_id.get(),
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendPaidReaction::ID,
+        );
+        net_fail(sent, 400, "MESSAGE_NOT_MODIFIED");
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        assert!(
+            !responses_of(&callback, 4).is_empty(),
+            "the not-modified band completes ok"
+        );
+
+        // 4. the error band — the dialog-error head runs and the promise
+        //    errors through the chain.
+        td.request(
+            5,
+            Function::addPendingPaidMessageReaction(td_api::addPendingPaidMessageReaction {
+                chat_id,
+                message_id: message_id.get(),
+                star_count: 2,
+                r#type: None,
+            }),
+        );
+        td.flush_deferred_results();
+        td.request(
+            6,
+            Function::commitPendingPaidMessageReactions(
+                td_api::commitPendingPaidMessageReactions {
+                    chat_id,
+                    message_id: message_id.get(),
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendPaidReaction::ID,
+        );
+        net_fail(sent, 420, "REACTION_INVALID");
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "REACTION_INVALID")
+        );
+
+        // 5. setPaidMessageReactionType — the me-row exists (case 2's
+        //    swap), so TogglePaidReactionPrivacyQuery rides the
+        //    dispatcher with the anonymous privacy form.
+        td.request(
+            7,
+            Function::setPaidMessageReactionType(td_api::setPaidMessageReactionType {
+                chat_id,
+                message_id: message_id.get(),
+                r#type: Some(td_api::PaidReactionType::paidReactionTypeAnonymous(
+                    td_api::paidReactionTypeAnonymous {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePaidReactionPrivacy::ID,
+        );
+        let body = telegram_api::messages_togglePaidReactionPrivacy::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.msg_id, 500);
+        assert!(matches!(
+            body.private,
+            Some(telegram_api::PaidReactionPrivacy::paidReactionPrivacyAnonymous(_))
+        ));
+        let mut answer = Vec::new();
+        // boolTrue#997275b5
+        answer.extend_from_slice(&0x9972_75b5u32.to_le_bytes());
+        net_complete(sent, answer);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        assert!(!responses_of(&callback, 7).is_empty(), "the toggle ok");
+
+        // 6. the toggle error band — the dialog-error head + the promise
+        //    error.
+        td.request(
+            8,
+            Function::setPaidMessageReactionType(td_api::setPaidMessageReactionType {
+                chat_id,
+                message_id: message_id.get(),
+                r#type: Some(td_api::PaidReactionType::paidReactionTypeAnonymous(
+                    td_api::paidReactionTypeAnonymous {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_togglePaidReactionPrivacy::ID,
+        );
+        net_fail(sent, 420, "CHAT_WRITE_FORBIDDEN");
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "CHAT_WRITE_FORBIDDEN")
+        );
+
+        assert!(td.messages_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// The `SendMultiMediaQuery` seeding: a user dialog with one
+    /// yet-unsent message registered under `random_id` in the being-sent
+    /// table (the fail ladder's read point).
+    fn seed_multi_media_dialog(td: &mut Td) -> crate::messages_manager::DialogId {
+        seed_my_user(td);
+        seed_dialog_user(td);
+        let dialog_id = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        );
+        let mut dialog = Box::new(crate::messages_manager::Dialog::default());
+        dialog.dialog_id = dialog_id;
+        dialog.is_update_new_chat_sent = true;
+        let message_id = crate::messages_manager::MessageId::min();
+        let message = crate::messages_manager::Message {
+            message_id,
+            random_id: 22,
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            ..crate::messages_manager::Message::default()
+        };
+        dialog.messages.insert(message_id, Box::new(message));
+        // the fail ladder's delete walks the ordered tree + the LRU —
+        // register the seeded row the `add_message_to_dialog` way
+        dialog.ordered_messages.insert(
+            message_id,
+            false,
+            crate::messages_manager::MessageId::default(),
+            "seed",
+        );
+        dialog.message_lru_list.put_back(message_id);
+        td.messages_manager.dialogs.insert(dialog_id, dialog);
+        td.messages_manager.being_sent_messages.insert(
+            22,
+            crate::messages_manager::MessageFullId::new(dialog_id, message_id),
+        );
+        dialog_id
+    }
+
+    /// The wire `inputSingleMedia` row.
+    fn single_media_row(random_id: i64, caption: &str) -> telegram_api::InputSingleMedia {
+        telegram_api::InputSingleMedia {
+            flags: 0,
+            media: Some(Box::new(telegram_api::InputMedia::inputMediaEmpty(
+                telegram_api::inputMediaEmpty,
+            ))),
+            random_id,
+            message: caption.to_owned(),
+            entities: Vec::new(),
+        }
+    }
+
+    /// The `updateNewMessage` body of the album answer.
+    fn album_answer_message(id: i32, user_id: i64) -> telegram_api::Message {
+        telegram_api::Message::message(telegram_api::message {
+            out: true,
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id,
+            })),
+            id,
+            date: 100,
+            message: "album row".to_owned(),
+            media: Some(Box::new(telegram_api::MessageMedia::messageMediaEmpty(
+                telegram_api::messageMediaEmpty,
+            ))),
+            ..telegram_api::message::default()
+        })
+    }
+
+    #[test]
+    fn messages_send_multi_media_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_send_multi_media_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 `SendMultiMediaQuery` round-trip
+    /// (MessagesManager.cpp:1400-1521): the wire construction (the write
+    /// peer, the REPLY_TO flag + the built reply, the media rows), the
+    /// answer halves behind `on_messages_net_answer` (the random-id
+    /// validation ladder, the wrong-result fail band, the
+    /// ALLOW_PAYMENT_REQUIRED rewrite + the per-random-id fail fan-out),
+    /// and the send-leg null-peer band. The per-message `inputSingleMedia`
+    /// assembly parks with the Files plane — the rows arrive prebuilt.
+    fn messages_send_multi_media_rides_the_dispatcher_impl() {
+        let (mut td, rec, _callback) = netted_td_with_callback("netdrain25-send-multi-media");
+        let dialog_id = seed_multi_media_dialog(&mut td);
+
+        // 1. the wire form — the write peer, two rows, the REPLY_TO flag
+        //    + the built reply.
+        crate::td::send_multi_media_query(
+            &mut td,
+            crate::messages_manager::MultiMediaQueryParams {
+                flags: 0,
+                dialog_id,
+                reply_to_message_id: Some(300),
+                top_msg_id: 0,
+                input_single_media: vec![
+                    single_media_row(11, "first"),
+                    single_media_row(22, "second"),
+                ],
+                schedule_date: 0,
+                effect: 0,
+                paid_message_star_count: 0,
+            },
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendMultiMedia::ID,
+        );
+        let body = telegram_api::messages_sendMultiMedia::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags & 1, 1, "the REPLY_TO flag");
+        assert_eq!(body.multi_media.len(), 2);
+        assert_eq!(body.multi_media[0].random_id, 11);
+        assert_eq!(body.multi_media[1].random_id, 22);
+        match (body.peer.as_deref(), body.reply_to.as_ref()) {
+            (
+                Some(telegram_api::InputPeer::inputPeerUser(peer)),
+                Some(telegram_api::InputReplyTo::inputReplyToMessage(reply)),
+            ) => {
+                assert_eq!(peer.user_id, 700000001);
+                assert_eq!(reply.reply_to_msg_id, 300);
+            }
+            other => panic!("the peer/reply pair: {other:?}"),
+        }
+
+        // 2. the wrong-result band — the answer carries only the first
+        //    random id: the missing second id fails (400 "Message was not
+        //    sent"), the seeded yet-unsent message re-adds failed.
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![
+                telegram_api::Update::updateMessageID(telegram_api::updateMessageID {
+                    id: 100,
+                    random_id: 11,
+                }),
+                telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+                    message: Some(album_answer_message(100, 700000001)),
+                    ..telegram_api::updateNewMessage::default()
+                }),
+            ],
+            chats: Vec::new(),
+            users: vec![crate::td::tests::wire_user(700000001, "Peer")],
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_messages_net();
+        assert!(
+            td.messages_net_completed.lock().is_empty(),
+            "the answer drained"
+        );
+        {
+            let d = td
+                .messages_manager
+                .get_dialog(dialog_id)
+                .expect("the dialog");
+            let failed = d
+                .messages
+                .values()
+                .find(|message| message.is_failed_to_send);
+            assert!(
+                failed.is_some(),
+                "the missing random id re-adds failed (the seeded row failed)"
+            );
+            assert!(
+                !td.messages_manager.being_sent_messages.contains_key(&22),
+                "the being-sent entry popped"
+            );
+        }
+
+        // 3. the error band — the ALLOW_PAYMENT_REQUIRED rewrite fans out
+        //    per random id (the registered second row fails again — the
+        //    already-failed early return drops it).
+        crate::td::send_multi_media_query(
+            &mut td,
+            crate::messages_manager::MultiMediaQueryParams {
+                flags: 0,
+                dialog_id,
+                reply_to_message_id: None,
+                top_msg_id: 0,
+                input_single_media: vec![single_media_row(11, "first")],
+                schedule_date: 0,
+                effect: 0,
+                paid_message_star_count: 0,
+            },
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendMultiMedia::ID,
+        );
+        net_fail(sent, 403, "ALLOW_PAYMENT_REQUIRED_50");
+        td.dispatch_completed_messages_net();
+        assert!(td.messages_net_completed.lock().is_empty(), "drained");
+
+        // 4. the null-peer band — an unknown dialog runs the inline
+        //    on_error (400 "Have no write access to the chat").
+        crate::td::send_multi_media_query(
+            &mut td,
+            crate::messages_manager::MultiMediaQueryParams {
+                flags: 0,
+                dialog_id: crate::messages_manager::DialogId::new(-777),
+                reply_to_message_id: None,
+                top_msg_id: 0,
+                input_single_media: vec![single_media_row(31, "row")],
+                schedule_date: 0,
+                effect: 0,
+                paid_message_star_count: 0,
+            },
+        );
+        assert!(
+            rec.sent
+                .lock()
+                .iter()
+                .all(|query| query.tl_constructor() != telegram_api::messages_sendMultiMedia::ID),
+            "the null-peer band dispatches nothing new"
+        );
+        assert!(
+            td.pending_multi_media_random_ids.is_empty(),
+            "the failed sends leave no parked ids"
+        );
+    }
+
+    /// Split one recorded batch into the two family queries (the pinned
+    /// page and the dialog-list page, in send order).
+    fn take_two_sent(sent: Vec<NetQuery>, first: i32, second: i32) -> (NetQuery, NetQuery) {
+        let mut sent = sent;
+        let pos = sent
+            .iter()
+            .position(|query| query.tl_constructor() == first)
+            .expect("the first query under test was dispatched");
+        let first_query = sent.remove(pos);
+        let second_query = take_sent(sent, second);
+        (first_query, second_query)
+    }
+
+    #[test]
+    fn messages_get_dialog_list_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_get_dialog_list_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 `GetDialogListQuery`/`GetPinnedDialogsQuery`
+    /// round-trip (MessagesManager.cpp:176-213/455-513): the folder-load
+    /// legs' wire forms (the pinned family's bare folder id; the page's
+    /// FOLDER_ID flag + exclude_pinned + the cursor and the forced
+    /// offset peer + limit 100), the `on_get_dialogs` walk behind
+    /// `on_messages_net_answer` (the dialog intake at its last message,
+    /// the slice total, the cursor advance), the folder-load fan-in (the
+    /// outstanding decrement, the `on_load_folder_dialog_list` crossing
+    /// releasing the in-flight latch), the dialogsNotModified 500 band,
+    /// and the failed crossing (the first error wins).
+    fn messages_get_dialog_list_rides_the_dispatcher_impl() {
+        use crate::messages_manager::{
+            DialogDate, DialogId, DialogListId, FolderId, FolderLoadAction, MessageId,
+            ServerMessageId, add_dialog_list, load_folder_dialog_list,
+        };
+        use crate::user_manager::UserId;
+        let (mut td, rec) = netted_td("netdrain25-get-dialog-list");
+        let folder_id = FolderId::main();
+        let main = DialogListId::from_folder(folder_id);
+
+        // the folder/list seeding (the m10_12 shape): the finite cursor
+        // at (date 1700000001, server id 20, user 2) — the page position
+        {
+            let mm = &mut td.messages_manager;
+            add_dialog_list(mm, main);
+            mm.dialog_folders.insert(
+                folder_id,
+                crate::messages_manager::DialogFolder {
+                    folder_id,
+                    ..crate::messages_manager::DialogFolder::default()
+                },
+            );
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.folder_last_dialog_date = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(20)),
+                    1700000001,
+                ),
+                DialogId::from_user_id(UserId::new(2)),
+            );
+            folder.last_server_dialog_date = folder.folder_last_dialog_date;
+        }
+
+        // 1. the folder load dispatches both legs — the pinned page and
+        //    the dialog-list page at the cursor.
+        {
+            // SAFETY: the alias pair derives from `td_ptr`; the load
+            // uses the contexts strictly one at a time.
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let mm: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            assert!(matches!(
+                load_folder_dialog_list(state, mm, folder_id, 100, false),
+                FolderLoadAction::FromServer { .. }
+            ));
+        }
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_getPinnedDialogs::parse(pinned.query())
+                .expect("the pinned body")
+                .folder_id,
+            0
+        );
+        let body = telegram_api::messages_getDialogs::parse(page.query()).expect("the page body");
+        assert_eq!(body.flags & (1 << 1), 1 << 1, "the FOLDER_ID flag");
+        assert!(body.exclude_pinned);
+        assert_eq!(body.folder_id, 0);
+        assert_eq!(body.offset_date, 1700000001);
+        assert_eq!(body.offset_id, 20);
+        match body.offset_peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 2);
+                assert_eq!(peer.access_hash, 0, "the forced zero-access-hash form");
+            }
+            other => panic!("the forced offset peer: {other:?}"),
+        }
+        assert_eq!(body.limit, 100);
+        // both legs parked — the fan-in counts two outstanding, the
+        // in-flight latch holds
+        {
+            let folder = td.messages_manager.dialog_folders.get(&folder_id).unwrap();
+            assert_eq!(folder.load_folder_dialog_list_outstanding_promises, 2);
+            assert_eq!(folder.load_folder_dialog_list_promise_count, 1);
+            assert_eq!(td.pending_get_pinned_dialogs_legs[&folder_id].len(), 1);
+            assert_eq!(td.pending_get_dialog_list_legs[&folder_id].len(), 1);
+        }
+
+        // 2. the pinned answer (the empty page) — the -2 walk settles
+        //    one leg of the fan-in; no crossing yet.
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        {
+            let folder = td.messages_manager.dialog_folders.get(&folder_id).unwrap();
+            assert_eq!(folder.load_folder_dialog_list_outstanding_promises, 1);
+            assert!(td.pending_get_pinned_dialogs_legs[&folder_id].is_empty());
+            // the -2 walk initialized the pinned window
+            let list = td.messages_manager.dialog_lists.get(&main).unwrap();
+            assert!(list.are_pinned_dialogs_inited);
+        }
+
+        // 3. the page answer (the slice) — the walk adds the dialog at
+        //    its last message, the slice total lands, the cursor
+        //    advances, and the second settle crosses: the
+        //    on_load_folder_dialog_list ok path releases the latch.
+        let dialog_user = 42;
+        let dialog_id = DialogId::from_user_id(UserId::new(dialog_user));
+        let mut page_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogsSlice(
+            telegram_api::messages_dialogsSlice {
+                count: 5,
+                dialogs: vec![telegram_api::Dialog::dialog(telegram_api::dialog {
+                    peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: dialog_user,
+                    })),
+                    top_message: 500,
+                    read_inbox_max_id: 500,
+                    unread_count: 1,
+                    folder_id: 0,
+                    ..telegram_api::dialog::default()
+                })],
+                messages: vec![list_answer_message(500, 1700000000, dialog_user)],
+                chats: Vec::new(),
+                users: vec![wire_user(dialog_user, "List")],
+            },
+        )
+        .store(&mut page_answer);
+        net_complete(page, page_answer);
+        td.dispatch_completed_messages_net();
+        {
+            let mm = &td.messages_manager;
+            let folder = mm.dialog_folders.get(&folder_id).unwrap();
+            assert_eq!(
+                folder.load_folder_dialog_list_outstanding_promises, 0,
+                "the crossing"
+            );
+            assert_eq!(
+                folder.load_folder_dialog_list_promise_count, 0,
+                "the latch released"
+            );
+            let list = mm.dialog_lists.get(&main).unwrap();
+            assert_eq!(list.server_dialog_total_count, 5, "the slice total");
+            assert_eq!(
+                folder.last_server_dialog_date,
+                DialogDate::new(
+                    DialogDate::get_dialog_order(
+                        MessageId::from_server_message_id(ServerMessageId::new(500)),
+                        1700000000,
+                    ),
+                    dialog_id,
+                ),
+                "the cursor advance"
+            );
+            assert!(mm.get_dialog(dialog_id).is_some(), "the dialog added");
+            assert!(td.pending_get_dialog_list_legs[&folder_id].is_empty());
+            assert!(mm.folder_load_first_errors.is_empty());
+        }
+
+        // 4. the dialogsNotModified band + the failed crossing — the
+        //    wrong page 500s the leg; with the pinned leg errored too,
+        //    the crossing fails the load (the first error wins) and
+        //    still releases the latch without advancing the cursor.
+        {
+            let folder = td
+                .messages_manager
+                .dialog_folders
+                .get_mut(&folder_id)
+                .unwrap();
+            folder.folder_last_dialog_date = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(600)),
+                    1700000010,
+                ),
+                dialog_id,
+            );
+            folder.last_server_dialog_date = folder.folder_last_dialog_date;
+        }
+        {
+            // SAFETY: as the load above.
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let mm: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            assert!(matches!(
+                load_folder_dialog_list(state, mm, folder_id, 100, false),
+                FolderLoadAction::FromServer { .. }
+            ));
+        }
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+        net_fail(pinned, 400, "FLOOD_WAIT");
+        td.dispatch_completed_messages_net();
+        {
+            let folder = td.messages_manager.dialog_folders.get(&folder_id).unwrap();
+            assert_eq!(folder.load_folder_dialog_list_outstanding_promises, 1);
+        }
+        let mut not_modified = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogsNotModified(
+            telegram_api::messages_dialogsNotModified { count: 0 },
+        )
+        .store(&mut not_modified);
+        net_complete(page, not_modified);
+        td.dispatch_completed_messages_net();
+        {
+            let folder = td.messages_manager.dialog_folders.get(&folder_id).unwrap();
+            assert_eq!(folder.load_folder_dialog_list_outstanding_promises, 0);
+            assert_eq!(
+                folder.load_folder_dialog_list_promise_count, 0,
+                "the failed crossing releases the latch"
+            );
+            assert!(
+                td.messages_manager.folder_load_first_errors.is_empty(),
+                "the first error reset at the crossing"
+            );
+            assert_eq!(
+                folder.last_server_dialog_date, folder.folder_last_dialog_date,
+                "the failed page does not advance the cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn messages_get_chats_rides_the_load_promise() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(messages_get_chats_rides_the_load_promise_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 25 `getChats` promise round-trip (Requests.cpp:3260,
+    /// MessagesManager.cpp:14385-14405): the request promise rides the
+    /// get-dialogs task, the task parks on the folder-load legs, and the
+    /// page answer's `update_last_dialog_date` set_promises chain re-runs
+    /// it into the chats object (cpp:34234-34239). The error band walks
+    /// the same chain: the validation-ladder 500 fails the load, the
+    /// parked task re-runs with the error, and the client receives it.
+    fn messages_get_chats_rides_the_load_promise_impl() {
+        use crate::messages_manager::{
+            DialogDate, DialogId, DialogListId, FolderId, MessageId, ServerMessageId,
+            add_dialog_list,
+        };
+        use crate::user_manager::UserId;
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain25-get-chats");
+        let folder_id = FolderId::main();
+        let main = DialogListId::from_folder(folder_id);
+
+        // the loaded window ends mid-list (the m10_12 retry-table shape):
+        // the exact-limit walk can't complete, the folder load sends
+        {
+            let mm = &mut td.messages_manager;
+            add_dialog_list(mm, main);
+            mm.dialog_folders.insert(
+                folder_id,
+                crate::messages_manager::DialogFolder {
+                    folder_id,
+                    ..crate::messages_manager::DialogFolder::default()
+                },
+            );
+            let window_end = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(20)),
+                    1700000001,
+                ),
+                DialogId::from_user_id(UserId::new(2)),
+            );
+            {
+                let list = mm.dialog_lists.get_mut(&main).unwrap();
+                list.list_last_dialog_date = window_end;
+            }
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.folder_last_dialog_date = window_end;
+            folder.last_server_dialog_date = window_end;
+        }
+
+        // 1. the request parks — no answer yet, both load legs dispatch
+        td.request(
+            7,
+            Function::getChats(td_api::getChats {
+                chat_list: None,
+                limit: 2,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            callback.responses.lock().iter().all(|(id, _)| *id == 0),
+            "the task parks behind the folder load (only the option broadcasts)"
+        );
+        assert!(callback.errors.lock().is_empty());
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+
+        // 2. the pinned leg answers empty, the page leg returns one
+        //    older dialog — the walk registers it, the list advances,
+        //    the set_promises chain re-runs the task into the answer
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        let mut page_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogsSlice(
+            telegram_api::messages_dialogsSlice {
+                count: 1,
+                dialogs: vec![telegram_api::Dialog::dialog(telegram_api::dialog {
+                    peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 42,
+                    })),
+                    top_message: 500,
+                    read_inbox_max_id: 500,
+                    unread_count: 0,
+                    folder_id: 0,
+                    ..telegram_api::dialog::default()
+                })],
+                messages: vec![list_answer_message(500, 1700000000, 42)],
+                chats: Vec::new(),
+                users: vec![wire_user(42, "Chats")],
+            },
+        )
+        .store(&mut page_answer);
+        net_complete(page, page_answer);
+        td.dispatch_completed_messages_net();
+
+        // the "+1" tail of get_dialog_total_count (the unknown-server-
+        // total heuristic, MessagesManager.cpp:9696-9699) re-arms the
+        // load once — the second page answers empty, the folder
+        // exhausts, and the re-run completes through the max branch
+        assert!(
+            !rec.sent.lock().is_empty(),
+            "the heuristic re-arm dispatched the second round"
+        );
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        let mut empty_page = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut empty_page);
+        net_complete(page, empty_page);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        {
+            let responses = callback.responses.lock();
+            let chats = responses
+                .iter()
+                .find(|(id, _)| *id == 7)
+                .map(|(_, object)| match object {
+                    Object::chats(chats) => chats.clone(),
+                    other => panic!("expected chats, got {other:?}"),
+                })
+                .expect("the parked task answered through the load");
+            assert_eq!(chats.chat_ids, vec![42], "the loaded dialog");
+            assert!(chats.total_count >= 1);
+            assert!(callback.errors.lock().is_empty());
+        }
+
+        // 3. the error band — a fresh park, the page answer carries a
+        //    user dialog WITH pts (the validation-ladder 500,
+        //    MessagesManager.cpp:12810-12816): the load fails, the
+        //    crossing fails the list promises, the re-run errors the
+        //    parked task, the client receives the 500
+        {
+            let fresh_window = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(600)),
+                    1700000010,
+                ),
+                DialogId::from_user_id(UserId::new(3)),
+            );
+            let mm = &mut td.messages_manager;
+            let list = mm.dialog_lists.get_mut(&main).unwrap();
+            list.list_last_dialog_date = fresh_window;
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.folder_last_dialog_date = fresh_window;
+            folder.last_server_dialog_date = fresh_window;
+        }
+        td.request(
+            8,
+            Function::getChats(td_api::getChats {
+                chat_list: None,
+                limit: 2,
+            }),
+        );
+        td.flush_deferred_results();
+        let (pinned, page) = take_two_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPinnedDialogs::ID,
+            telegram_api::messages_getDialogs::ID,
+        );
+        let mut pinned_answer = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogs(telegram_api::messages_dialogs {
+            dialogs: Vec::new(),
+            messages: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+        .store(&mut pinned_answer);
+        net_complete(pinned, pinned_answer);
+        td.dispatch_completed_messages_net();
+        let mut bad_page = Vec::new();
+        telegram_api::messages_Dialogs::messages_dialogsSlice(
+            telegram_api::messages_dialogsSlice {
+                count: 1,
+                dialogs: vec![telegram_api::Dialog::dialog(telegram_api::dialog {
+                    peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 77,
+                    })),
+                    top_message: 700,
+                    read_inbox_max_id: 700,
+                    flags: 1, // the PTS flag bit — a user dialog must not carry pts
+                    pts: 5,
+                    folder_id: 0,
+                    ..telegram_api::dialog::default()
+                })],
+                messages: Vec::new(),
+                chats: Vec::new(),
+                users: vec![wire_user(77, "Pts")],
+            },
+        )
+        .store(&mut bad_page);
+        net_complete(page, bad_page);
+        td.dispatch_completed_messages_net();
+        td.flush_deferred_results();
+        {
+            let errors = callback.errors.lock();
+            let error = errors
+                .iter()
+                .find(|(id, _)| *id == 8)
+                .map(|(_, error)| error.clone())
+                .expect("the parked task errored through the failed load");
+            assert_eq!(error.code, 500);
+            assert_eq!(
+                error.message,
+                "Wrong query result returned: receive user or basic group chat with PTS"
+            );
+        }
+    }
+
+    /// The `on_get_dialogs` walk's wire message — the last-message row
+    /// with the peer/date pair the cursor reads.
+    fn list_answer_message(id: i32, date: i32, user_id: i64) -> telegram_api::Message {
+        telegram_api::Message::message(telegram_api::message {
+            out: true,
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id,
+            })),
+            id,
+            date,
+            message: "list row".to_owned(),
+            media: Some(Box::new(telegram_api::MessageMedia::messageMediaEmpty(
+                telegram_api::messageMediaEmpty,
+            ))),
+            ..telegram_api::message::default()
+        })
     }
 }
