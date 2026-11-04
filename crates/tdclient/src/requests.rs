@@ -10935,8 +10935,14 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise = ok_promise!(td);
             let cid = connection_id(&request.business_connection_id);
-            business_arm(td, |env, _, connection_manager| {
-                connection_manager.set_business_name(env, cid, &first_name, &last_name, promise);
+            business_arm(td, |_, business_manager, connection_manager| {
+                connection_manager.set_business_name(
+                    business_manager,
+                    cid,
+                    &first_name,
+                    &last_name,
+                    promise,
+                );
             });
         }
 
@@ -10950,8 +10956,8 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise = ok_promise!(td);
             let cid = connection_id(&request.business_connection_id);
-            business_arm(td, |env, _, connection_manager| {
-                connection_manager.set_business_about(env, cid, &bio, promise);
+            business_arm(td, |_, business_manager, connection_manager| {
+                connection_manager.set_business_about(business_manager, cid, &bio, promise);
             });
         }
 
@@ -10965,8 +10971,8 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise = ok_promise!(td);
             let cid = connection_id(&request.business_connection_id);
-            business_arm(td, |env, _, connection_manager| {
-                connection_manager.set_business_username(env, cid, &username, promise);
+            business_arm(td, |_, business_manager, connection_manager| {
+                connection_manager.set_business_username(business_manager, cid, &username, promise);
             });
         }
 
@@ -10977,8 +10983,13 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = ok_promise!(td);
             let cid = connection_id(&request.business_connection_id);
-            business_arm(td, |env, _, connection_manager| {
-                connection_manager.set_business_gift_settings(env, cid, request.settings, promise);
+            business_arm(td, |_, business_manager, connection_manager| {
+                connection_manager.set_business_gift_settings(
+                    business_manager,
+                    cid,
+                    request.settings,
+                    promise,
+                );
             });
         }
 
@@ -10989,8 +11000,8 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise::<td_api::StarAmount, _>(id, Object::starAmount);
             let cid = connection_id(&request.business_connection_id);
-            business_arm(td, |env, _, connection_manager| {
-                connection_manager.get_business_star_status(env, cid, promise);
+            business_arm(td, |env, business_manager, connection_manager| {
+                connection_manager.get_business_star_status(env, business_manager, cid, promise);
             });
         }
 
@@ -11001,8 +11012,13 @@ fn run_business_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = ok_promise!(td);
             let cid = connection_id(&request.business_connection_id);
-            business_arm(td, |env, _, connection_manager| {
-                connection_manager.transfer_business_stars(env, cid, request.star_count, promise);
+            business_arm(td, |_, business_manager, connection_manager| {
+                connection_manager.transfer_business_stars(
+                    business_manager,
+                    cid,
+                    request.star_count,
+                    promise,
+                );
             });
         }
 

@@ -3,9 +3,10 @@
 //!
 //! The connection registry (the `botBusinessConnection` intake, the
 //! connection checks, the user-id/dc-id lookups, `get_current_state`) is
-//! real; the message send/edit/delete halves and the account/stars
-//! halves park behind the [blocked: net] / [blocked: M.10 message plane]
-//! env seams with their local validation inline (the C++
+//! real; the message send/edit/delete halves park behind the
+//! [blocked: M.10 message plane] env seams with their local validation
+//! inline (the account/stars halves dispatch over the business net
+//! plane; the C++
 //! `check_business_connection` / `check_business_message_id` /
 //! `check_business_story_id` gates).
 
@@ -471,10 +472,12 @@ impl BusinessConnectionManager {
         env.delete_business_story_query(business_connection_id, promise);
     }
 
-    /// `set_business_name` (BusinessConnectionManager.cpp:1829-1840).
+    /// `set_business_name` (BusinessConnectionManager.cpp:1829-1840) —
+    /// the wire query rides the business net plane (the
+    /// `UpdateBusinessProfileQuery` send with the name halves).
     pub fn set_business_name(
         &self,
-        env: &mut impl BusinessEnv,
+        business_manager: &mut crate::business_manager::BusinessManager,
         business_connection_id: BusinessConnectionId,
         first_name: &str,
         last_name: &str,
@@ -494,13 +497,22 @@ impl BusinessConnectionManager {
             ));
             return;
         }
-        env.set_business_name_query(business_connection_id, first_name, last_name, promise);
+        let user_id = self.get_business_connection_user_id(&business_connection_id);
+        let dc_id = self.get_business_connection_dc_id(&business_connection_id);
+        business_manager.send_update_business_name_query(
+            &business_connection_id,
+            dc_id,
+            user_id,
+            first_name,
+            last_name,
+            promise,
+        );
     }
 
     /// `set_business_about` (BusinessConnectionManager.cpp:1854-1861).
     pub fn set_business_about(
         &self,
-        env: &mut impl BusinessEnv,
+        business_manager: &mut crate::business_manager::BusinessManager,
         business_connection_id: BusinessConnectionId,
         about: &str,
         mut promise: Promise<()>,
@@ -510,13 +522,22 @@ impl BusinessConnectionManager {
             promise.set_error(status);
             return;
         }
-        env.set_business_about_query(business_connection_id, about, promise);
+        let user_id = self.get_business_connection_user_id(&business_connection_id);
+        let dc_id = self.get_business_connection_dc_id(&business_connection_id);
+        business_manager.send_update_business_about_query(
+            &business_connection_id,
+            dc_id,
+            user_id,
+            about,
+            promise,
+        );
     }
 
-    /// `set_business_username` (BusinessConnectionManager.cpp:1875-1882).
+    /// `set_business_username` (BusinessConnectionManager.cpp:1875-1882)
+    /// — the `is_allowed_username` band first.
     pub fn set_business_username(
         &self,
-        env: &mut impl BusinessEnv,
+        business_manager: &mut crate::business_manager::BusinessManager,
         business_connection_id: BusinessConnectionId,
         username: &str,
         mut promise: Promise<()>,
@@ -526,15 +547,27 @@ impl BusinessConnectionManager {
             promise.set_error(status);
             return;
         }
-        env.set_business_username_query(business_connection_id, username, promise);
+        if !username.is_empty() && !crate::misc::is_allowed_username(username) {
+            promise.set_error(Status::error(400, "Username is invalid"));
+            return;
+        }
+        let user_id = self.get_business_connection_user_id(&business_connection_id);
+        let dc_id = self.get_business_connection_dc_id(&business_connection_id);
+        business_manager.send_update_business_username_query(
+            &business_connection_id,
+            dc_id,
+            user_id,
+            username,
+            promise,
+        );
     }
 
     /// `set_business_gift_settings` (BusinessConnectionManager.cpp:1901-1908).
     pub fn set_business_gift_settings(
         &self,
-        env: &mut impl BusinessEnv,
+        business_manager: &mut crate::business_manager::BusinessManager,
         business_connection_id: BusinessConnectionId,
-        _settings: Option<td_api::GiftSettings>,
+        settings: Option<td_api::GiftSettings>,
         mut promise: Promise<()>,
     ) {
         let status = self.check_business_connection(&business_connection_id);
@@ -542,13 +575,22 @@ impl BusinessConnectionManager {
             promise.set_error(status);
             return;
         }
-        env.set_business_gift_settings_query(business_connection_id, promise);
+        let user_id = self.get_business_connection_user_id(&business_connection_id);
+        let dc_id = self.get_business_connection_dc_id(&business_connection_id);
+        business_manager.send_update_business_gift_settings_query(
+            &business_connection_id,
+            dc_id,
+            user_id,
+            settings,
+            promise,
+        );
     }
 
     /// `get_business_star_status` (BusinessConnectionManager.cpp:1927-1934).
     pub fn get_business_star_status(
         &self,
         env: &mut impl BusinessEnv,
+        business_manager: &mut crate::business_manager::BusinessManager,
         business_connection_id: BusinessConnectionId,
         mut promise: Promise<td_api::StarAmount>,
     ) {
@@ -557,13 +599,22 @@ impl BusinessConnectionManager {
             promise.set_error(status);
             return;
         }
-        env.get_business_star_status_query(business_connection_id, promise);
+        let user_id = self.get_business_connection_user_id(&business_connection_id);
+        let dc_id = self.get_business_connection_dc_id(&business_connection_id);
+        business_manager.send_get_business_stars_status_query(
+            env,
+            &business_connection_id,
+            dc_id,
+            user_id,
+            promise,
+        );
     }
 
-    /// `transfer_business_stars` (BusinessConnectionManager.cpp:1951-1958).
+    /// `transfer_business_stars` (BusinessConnectionManager.cpp:1951-1958)
+    /// — the amount band first, then the payment-form chain head.
     pub fn transfer_business_stars(
         &self,
-        env: &mut impl BusinessEnv,
+        business_manager: &mut crate::business_manager::BusinessManager,
         business_connection_id: BusinessConnectionId,
         star_count: i64,
         mut promise: Promise<()>,
@@ -573,7 +624,20 @@ impl BusinessConnectionManager {
             promise.set_error(status);
             return;
         }
-        env.transfer_business_stars_query(business_connection_id, star_count, promise);
+        if star_count <= 0 || star_count > 1000000000 {
+            promise.set_error(Status::error(
+                400,
+                "Invalid amount of Telegram Stars to transfer specified",
+            ));
+            return;
+        }
+        let dc_id = self.get_business_connection_dc_id(&business_connection_id);
+        business_manager.send_transfer_business_stars_query(
+            &business_connection_id,
+            dc_id,
+            star_count,
+            promise,
+        );
     }
 
     /// `get_current_state` (BusinessConnectionManager.cpp:2247-2253) — the
@@ -641,5 +705,71 @@ mod tests {
     fn name_length_limit_matches_the_cpp_constant() {
         // BusinessConnectionManager.h:123 — the server-side 64-char cap.
         assert_eq!(MAX_NAME_LENGTH, 64);
+    }
+
+    fn recorded_unit() -> (
+        Promise<()>,
+        std::sync::Arc<std::sync::Mutex<Option<Status>>>,
+    ) {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = recorded.clone();
+        (
+            tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *slot.lock().unwrap() = Some(match result {
+                    tdutils::status::Result::Ok(()) => Status::ok(),
+                    tdutils::status::Result::Err(status) => status,
+                });
+            }),
+            recorded,
+        )
+    }
+
+    fn error_of(recorded: &std::sync::Arc<std::sync::Mutex<Option<Status>>>) -> (i32, String) {
+        let status = recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the settled promise");
+        (status.code(), status.message().to_owned())
+    }
+
+    /// The name-length band of `set_business_name`
+    /// (BusinessConnectionManager.cpp:1829-1840).
+    #[test]
+    fn set_business_name_rejects_overlong_names() {
+        let manager = BusinessConnectionManager::new();
+        let mut business_manager = crate::business_manager::BusinessManager::new();
+        let long_name = "x".repeat(65);
+        let (promise, recorded) = recorded_unit();
+        // the empty registry rejects the connection first, so seed one
+        // connection by reaching the same check the update path runs
+        manager.set_business_name(
+            &mut business_manager,
+            connection_id("bc-1"),
+            &long_name,
+            "",
+            promise,
+        );
+        assert_eq!(
+            error_of(&recorded),
+            (400, "Business connection not found".to_owned())
+        );
+    }
+
+    /// The amount band of `transfer_business_stars`
+    /// (BusinessConnectionManager.cpp:1951-1958) — the check runs after
+    /// the connection check, so the empty registry answers first here
+    /// too; the amount band itself is exercised over the seeded
+    /// connection in the td.rs netted round-trips.
+    #[test]
+    fn transfer_business_stars_checks_the_connection_first() {
+        let manager = BusinessConnectionManager::new();
+        let mut business_manager = crate::business_manager::BusinessManager::new();
+        let (promise, recorded) = recorded_unit();
+        manager.transfer_business_stars(&mut business_manager, connection_id("bc-1"), 0, promise);
+        assert_eq!(
+            error_of(&recorded),
+            (400, "Business connection not found".to_owned())
+        );
     }
 }

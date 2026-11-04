@@ -2856,7 +2856,46 @@ impl<K: NetAnswerKind> NetKindHandle<K> {
         self.dispatch_query(kind, function, dc_id, AuthFlag::On);
     }
 
-    /// The unauth form — the C++ `create_unauth` (the pre-auth window
+    /// The `create_with_prefix` form (NetQueryCreator.cpp:36-39) — the
+    /// serialized prefix function rides the payload head (the
+    /// business-connection invoke wrapper) and the inner function's
+    /// constructor id carries the query; the C++ `{{"me"}}` chains of
+    /// the business senders collapse onto the plain per-DC dispatch.
+    pub(crate) fn dispatch_with_prefix(
+        &self,
+        kind: K,
+        prefix: telegram_api::Function,
+        function: telegram_api::Function,
+        dc_id: DcId,
+    ) {
+        let mut bytes = Vec::new();
+        prefix.store(&mut bytes);
+        let mut inner = Vec::new();
+        function.store(&mut inner);
+        bytes.extend_from_slice(&inner);
+        let tl_constructor = i32::from_le_bytes(inner[0..4].try_into().unwrap());
+        let net_query = NetQuery::new(
+            0,
+            dc_id,
+            NetQueryType::Common,
+            AuthFlag::On,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        self.dispatcher.dispatch_with_callback(
+            net_query,
+            Box::new(NetKindDispatchCallback {
+                kind,
+                completed: Arc::clone(&self.completed),
+                shared: self.shared.clone(),
+            }),
+        );
+    }
+
+    /// The unauth form — the C++ `create_unauth`    /// The unauth form — the C++ `create_unauth` (the pre-auth window
     /// queries: the country/help families).
     fn dispatch_unauth(&self, kind: K, function: telegram_api::Function) {
         self.dispatch_query(kind, function, DcId::main(), AuthFlag::Off);
@@ -3371,6 +3410,13 @@ pub(crate) type PaymentsNetHandle = NetKindHandle<crate::payments::PaymentsNetKi
 /// the answers drain through
 /// [`Td::dispatch_completed_secure_net`].
 pub(crate) type SecureNetHandle = NetKindHandle<crate::secure_manager::SecureNetKind>;
+
+/// The cloned business dispatch surface (the §3.9 net-drain 26
+/// families — the manager-held `BusinessManager::net` handle; the
+/// queries ride the main DC or the business-connection invoke prefix
+/// over the connection DC); the answers drain through
+/// [`Td::dispatch_completed_business_net`].
+pub(crate) type BusinessNetHandle = NetKindHandle<crate::business_manager::BusinessNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -4328,6 +4374,11 @@ pub struct Td {
     /// halves of the net-drain 23 families — the
     /// [`Td::on_payments_net_answer`] drain).
     payments_net_completed: Arc<Mutex<Vec<(crate::payments::PaymentsNetKind, NetQuery)>>>,
+    /// The callback-parked business answers (the C++ ResultHandler
+    /// halves of the net-drain 26 families — the
+    /// [`Td::on_business_net_answer`] drain).
+    business_net_completed: Arc<Mutex<Vec<(crate::business_manager::BusinessNetKind, NetQuery)>>>,
+
     /// The parked payments query promises (the per-family queues the
     /// send arms fill and `on_payments_net_answer` pops — Payments.cpp
     /// is free functions over `Td`, so the lot lives here).
@@ -4841,6 +4892,7 @@ impl Td {
             star_gift_net_completed: Arc::new(Mutex::new(Vec::new())),
             messages_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_completed: Arc::new(Mutex::new(Vec::new())),
+            business_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_pending: crate::payments::PendingNetQueries::default(),
             pending_multi_media_random_ids: std::collections::VecDeque::new(),
             pending_get_dialog_list_legs: std::collections::HashMap::new(),
@@ -5328,6 +5380,7 @@ impl Td {
         self.dialog_manager.net = self.dialog_net();
         self.story_manager.net = self.story_net();
         self.star_gift_manager.net = self.star_gift_net();
+        self.business_manager.net = self.business_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -7130,6 +7183,7 @@ impl Td {
         self.dispatch_completed_bot_info_net();
         self.dispatch_completed_payments_net();
         self.dispatch_completed_secure_net();
+        self.dispatch_completed_business_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -7305,6 +7359,16 @@ impl Td {
         Some(PaymentsNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.payments_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned business dispatch surface (the `BusinessManager::net`
+    /// handle — the net-drain 26 families).
+    pub(crate) fn business_net(&self) -> Option<BusinessNetHandle> {
+        Some(BusinessNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.business_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -14532,7 +14596,847 @@ impl Td {
         }
     }
 
-    /// Drain the callback-parked payments answers — the C++
+    /// Drain the callback-parked business answers — the C++
+    /// ResultHandler halves of the net-drain 26 families
+    /// (BusinessManager.cpp:49-560, BusinessConnectionManager.cpp:635-905).
+    fn dispatch_completed_business_net(&mut self) {
+        let completed = std::mem::take(&mut *self.business_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_business_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one business net answer by kind — the ResultHandler halves
+    /// of the net-drain 26 families. The two dialog-carrying kinds run
+    /// the `on_get_dialog_error` head before the promise error (the C++
+    /// `on_error` first line); the promises pair FIFO per kind (the §5
+    /// convention).
+    fn on_business_net_answer(
+        &mut self,
+        kind: crate::business_manager::BusinessNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        use crate::business_manager::BusinessEnv as _;
+        use crate::business_manager::BusinessNetKind;
+        /// Pop the oldest parked promise — the §5 FIFO-per-kind
+        /// convention (the `pop_head` shape of the sibling planes).
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+        /// The dialog-error head of the two dialog-carrying kinds (the
+        /// C++ `on_error` first line).
+        fn dialog_error_head(
+            td: &Td,
+            dialog_id: crate::dialog_id::DialogId,
+            status: &Status,
+            source: &str,
+        ) {
+            crate::dialog_manager::on_get_dialog_error(&td.global, dialog_id, status, source);
+        }
+        /// The Bool-answer band of the `()` families — both bool
+        /// constructors settle ok (the false bands log the C++ INFO).
+        fn bool_unit_result(
+            query: &NetQuery,
+            what: &str,
+            fail_log: Option<&str>,
+        ) -> Result<(), Status> {
+            if query.is_error() {
+                return Err(query.error().clone());
+            }
+            match parse_wire_bool_value(query.ok()) {
+                Some(true) => Ok(()),
+                Some(false) => {
+                    if let Some(fail_log) = fail_log {
+                        tdutils::log_info!("{fail_log}");
+                    }
+                    Ok(())
+                }
+                None => Err(parse_error(what)),
+            }
+        }
+        match kind {
+            // `GetConnectedBotsQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:58-69) — the users intake, the >1
+            // bots 500, the empty answer None, the invalid-bot 500.
+            BusinessNetKind::GetConnectedBots => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.get_connected_bots)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::account_ConnectedBots::parse(query.ok()) {
+                            Ok(result) => {
+                                let Td {
+                                    global,
+                                    option_manager,
+                                    auth_manager,
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                    ..
+                                } = self;
+                                let mut env = BusinessTdEnv {
+                                    global,
+                                    options: option_manager.as_mut(),
+                                    auth_is_bot: auth_manager.is_bot(),
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                };
+                                env.on_get_users(result.users, "GetConnectedBotsQuery");
+                                if result.connected_bots.len() > 1 {
+                                    promise
+                                        .set_error(Status::error(500, "Receive invalid response"));
+                                } else if result.connected_bots.is_empty() {
+                                    promise.set_value(None);
+                                } else {
+                                    let bot = crate::business_connected_bot::BusinessConnectedBot::from_telegram(
+                                        result.connected_bots.into_iter().next().unwrap(),
+                                    );
+                                    if !bot.is_valid() {
+                                        promise
+                                            .set_error(Status::error(500, "Receive invalid bot"));
+                                    } else {
+                                        promise.set_value(Some(
+                                            bot.get_business_connected_bot_info_object(&mut env),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => promise.set_error(parse_error("account.getConnectedBots")),
+                        }
+                    }
+                }
+            }
+            // `UpdateConnectedBotQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:113-127) — the ok half is
+            // Updates-typed: the manage-bar flush rides the M.10 message
+            // plane (the seam default), the updates + promise ride the um
+            // bridge.
+            BusinessNetKind::UpdateConnectedBot => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.update_connected_bot)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send_later(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => promise.set_error(parse_error("account.updateConnectedBot")),
+                        }
+                    }
+                }
+            }
+            // `ConfirmBotConnectionQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:81-89) — the Bool answer band.
+            BusinessNetKind::ConfirmBotConnection => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.confirm_bot_connection)
+                {
+                    match bool_unit_result(&query, "account.confirmBotConnection", None) {
+                        Ok(()) => promise.set_value(()),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `ToggleConnectedBotPausedQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:150-161).
+            BusinessNetKind::ToggleConnectedBotPaused { dialog_id } => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.toggle_connected_bot_paused)
+                {
+                    match bool_unit_result(
+                        &query,
+                        "account.toggleConnectedBotPaused",
+                        Some("Failed to toggle business bot is paused"),
+                    ) {
+                        Ok(()) => promise.set_value(()),
+                        Err(status) => {
+                            dialog_error_head(
+                                self,
+                                dialog_id,
+                                &status,
+                                "ToggleConnectedBotPausedQuery",
+                            );
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `DisablePeerConnectedBotQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:183-195) — the true half runs the
+            // removed-bot intake (the seam default — the bars are the
+            // M.10 message plane).
+            BusinessNetKind::DisablePeerConnectedBot { dialog_id } => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.disable_peer_connected_bot)
+                {
+                    if query.is_error() {
+                        let status = query.error().clone();
+                        dialog_error_head(self, dialog_id, &status, "DisablePeerConnectedBotQuery");
+                        promise.set_error(status);
+                    } else {
+                        match parse_wire_bool_value(query.ok()) {
+                            Some(true) => {
+                                let Td {
+                                    global,
+                                    option_manager,
+                                    auth_manager,
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                    ..
+                                } = self;
+                                let mut env = BusinessTdEnv {
+                                    global,
+                                    options: option_manager.as_mut(),
+                                    auth_is_bot: auth_manager.is_bot(),
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                };
+                                env.on_update_dialog_business_bot_removed(dialog_id);
+                                promise.set_value(());
+                            }
+                            Some(false) => {
+                                tdutils::log_info!("Failed to remove business bot");
+                                promise.set_value(());
+                            }
+                            None => {
+                                promise.set_error(parse_error("account.disablePeerConnectedBot"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `GetBusinessChatLinksQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:243-253) — the users/chats intakes,
+            // the container conversion.
+            BusinessNetKind::GetBusinessChatLinks => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.get_business_chat_links)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::account_BusinessChatLinks::parse(query.ok()) {
+                            Ok(result) => {
+                                let Td {
+                                    global,
+                                    option_manager,
+                                    auth_manager,
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                    ..
+                                } = self;
+                                let mut env = BusinessTdEnv {
+                                    global,
+                                    options: option_manager.as_mut(),
+                                    auth_is_bot: auth_manager.is_bot(),
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                };
+                                env.on_get_users(result.users, "GetBusinessChatLinksQuery");
+                                env.on_get_chats(result.chats, "GetBusinessChatLinksQuery");
+                                let links =
+                                    crate::business_chat_link::BusinessChatLinks::from_telegram(
+                                        &mut env,
+                                        result.links,
+                                    );
+                                promise.set_value(links.get_business_chat_links_object(&mut env));
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("account.getBusinessChatLinks"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `CreateBusinessChatLinkQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:287-297).
+            BusinessNetKind::CreateBusinessChatLink => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.create_business_chat_link)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::BusinessChatLink::parse(query.ok()) {
+                            Ok(result) => {
+                                let Td {
+                                    global,
+                                    option_manager,
+                                    auth_manager,
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                    ..
+                                } = self;
+                                let mut env = BusinessTdEnv {
+                                    global,
+                                    options: option_manager.as_mut(),
+                                    auth_is_bot: auth_manager.is_bot(),
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                };
+                                let link =
+                                    crate::business_chat_link::BusinessChatLink::from_telegram(
+                                        &mut env, result,
+                                    );
+                                promise.set_value(link.get_business_chat_link_object(&mut env));
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("account.createBusinessChatLink"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `EditBusinessChatLinkQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:314-324).
+            BusinessNetKind::EditBusinessChatLink => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.edit_business_chat_link)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::BusinessChatLink::parse(query.ok()) {
+                            Ok(result) => {
+                                let Td {
+                                    global,
+                                    option_manager,
+                                    auth_manager,
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                    ..
+                                } = self;
+                                let mut env = BusinessTdEnv {
+                                    global,
+                                    options: option_manager.as_mut(),
+                                    auth_is_bot: auth_manager.is_bot(),
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                };
+                                let link =
+                                    crate::business_chat_link::BusinessChatLink::from_telegram(
+                                        &mut env, result,
+                                    );
+                                promise.set_value(link.get_business_chat_link_object(&mut env));
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("account.editBusinessChatLink"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `DeleteBusinessChatLinkQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:341-349) — the Bool answer band.
+            BusinessNetKind::DeleteBusinessChatLink => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.delete_business_chat_link)
+                {
+                    match bool_unit_result(&query, "account.deleteBusinessChatLink", None) {
+                        Ok(()) => promise.set_value(()),
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `ResolveBusinessChatLinkQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:377-408) — the text conversions, the
+            // '@'-prefix band, the non-user dialog 500, the forced
+            // dialog create.
+            BusinessNetKind::ResolveBusinessChatLink => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.resolve_business_chat_link)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::account_ResolvedBusinessChatLinks::parse(query.ok()) {
+                            Ok(result) => {
+                                let Td {
+                                    global,
+                                    option_manager,
+                                    auth_manager,
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                    ..
+                                } = self;
+                                let mut env = BusinessTdEnv {
+                                    global,
+                                    options: option_manager.as_mut(),
+                                    auth_is_bot: auth_manager.is_bot(),
+                                    time_zone_manager,
+                                    user_manager,
+                                    chat_manager,
+                                };
+                                env.on_get_users(result.users, "ResolveBusinessChatLinkQuery");
+                                env.on_get_chats(result.chats, "ResolveBusinessChatLinkQuery");
+                                let mut text = crate::message_entity::get_message_text(
+                                    Some(&mut env),
+                                    result.message,
+                                    result.entities,
+                                    true,
+                                    true,
+                                    0,
+                                    false,
+                                    "ResolveBusinessChatLinkQuery",
+                                );
+                                if text.text.starts_with('@') {
+                                    text.text.insert(0, ' ');
+                                    for entity in &mut text.entities {
+                                        entity.offset += 1;
+                                    }
+                                }
+                                let Some(peer) = result.peer else {
+                                    promise
+                                        .set_error(parse_error("account.resolveBusinessChatLink"));
+                                    return;
+                                };
+                                let dialog_id = crate::dialog_id::DialogId::from_peer(&peer);
+                                if dialog_id.get_type() != crate::dialog_id::DialogType::User {
+                                    tdutils::log_error!("Receive {dialog_id:?}");
+                                    promise.set_error(Status::error(
+                                        500,
+                                        "Receive invalid business chat",
+                                    ));
+                                    return;
+                                }
+                                crate::message_entity::remove_unallowed_entities(
+                                    &mut text,
+                                    crate::message_content::to_message_entity_dialog_id(dialog_id),
+                                    Some(&env),
+                                    None,
+                                    false,
+                                );
+                                env.force_create_dialog(
+                                    dialog_id,
+                                    "ResolveBusinessChatLinkQuery",
+                                    false,
+                                );
+                                promise.set_value(td_api::BusinessChatLinkInfo {
+                                    chat_id: env
+                                        .get_chat_id_object(dialog_id, "businessChatLinkInfo"),
+                                    text: Some(crate::message_entity::get_formatted_text_object(
+                                        Some(&mut env),
+                                        &text,
+                                        true,
+                                        -1,
+                                    )),
+                                });
+                            }
+                            Err(_) => {
+                                promise.set_error(parse_error("account.resolveBusinessChatLink"))
+                            }
+                        }
+                    }
+                }
+            }
+            // `UpdateBusinessLocationQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:419-427) — the parked member runs the
+            // my-user location tail (the seam default — the user-full
+            // plane).
+            BusinessNetKind::UpdateBusinessLocation => {
+                if let Some((location, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_location)
+                {
+                    match bool_unit_result(&query, "account.updateBusinessLocation", None) {
+                        Ok(()) => {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                                ..
+                            } = self;
+                            let mut env = BusinessTdEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                            };
+                            env.on_update_my_user_location(location);
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `UpdateBusinessWorkHoursQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:453-461).
+            BusinessNetKind::UpdateBusinessWorkHours => {
+                if let Some((work_hours, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_work_hours)
+                {
+                    match bool_unit_result(&query, "account.updateBusinessWorkHours", None) {
+                        Ok(()) => {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                                ..
+                            } = self;
+                            let mut env = BusinessTdEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                            };
+                            env.on_update_my_user_work_hours(&work_hours);
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `UpdateBusinessGreetingMessageQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:485-493).
+            BusinessNetKind::UpdateBusinessGreetingMessage => {
+                if let Some((greeting_message, mut promise)) = pop_head(
+                    &mut self
+                        .business_manager
+                        .pending
+                        .update_business_greeting_message,
+                ) {
+                    match bool_unit_result(&query, "account.updateBusinessGreetingMessage", None) {
+                        Ok(()) => {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                                ..
+                            } = self;
+                            let mut env = BusinessTdEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                            };
+                            env.on_update_my_user_greeting_message(&greeting_message);
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `UpdateBusinessAwayMessageQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:517-525).
+            BusinessNetKind::UpdateBusinessAwayMessage => {
+                if let Some((away_message, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_away_message)
+                {
+                    match bool_unit_result(&query, "account.updateBusinessAwayMessage", None) {
+                        Ok(()) => {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                                ..
+                            } = self;
+                            let mut env = BusinessTdEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                            };
+                            env.on_update_my_user_away_message(&away_message);
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `UpdateBusinessIntroQuery::on_result`/`on_error`
+            // (BusinessManager.cpp:549-557).
+            BusinessNetKind::UpdateBusinessIntro => {
+                if let Some((intro, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_intro)
+                {
+                    match bool_unit_result(&query, "account.updateBusinessIntro", None) {
+                        Ok(()) => {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                                ..
+                            } = self;
+                            let mut env = BusinessTdEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                time_zone_manager,
+                                user_manager,
+                                chat_manager,
+                            };
+                            env.on_update_my_user_intro(&intro);
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `UpdateBusinessProfileQuery::on_result`/`on_error`
+            // (BusinessConnectionManager.cpp:668-686) — the set-name
+            // half runs the name intake, the set-about half invalidates
+            // the user full.
+            BusinessNetKind::UpdateBusinessProfile => {
+                if let Some((members, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_profile)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::User::parse(query.ok()) {
+                            Ok(_) => {
+                                if members.set_name && members.user_id.is_valid() {
+                                    let Some(options) = self.option_manager.as_mut() else {
+                                        promise.set_value(());
+                                        return;
+                                    };
+                                    let mut user_env = crate::user_manager::UserEnv {
+                                        global: &mut self.global,
+                                        options,
+                                        auth_is_bot: self.auth_manager.is_bot(),
+                                    };
+                                    self.user_manager.on_update_user_name(
+                                        &mut user_env,
+                                        members.user_id,
+                                        members.first_name.clone(),
+                                        members.last_name.clone(),
+                                    );
+                                }
+                                if members.set_about && members.user_id.is_valid() {
+                                    let Some(options) = self.option_manager.as_mut() else {
+                                        promise.set_value(());
+                                        return;
+                                    };
+                                    let mut user_env = crate::user_manager::UserEnv {
+                                        global: &mut self.global,
+                                        options,
+                                        auth_is_bot: self.auth_manager.is_bot(),
+                                    };
+                                    self.user_manager
+                                        .invalidate_user_full(&mut user_env, members.user_id);
+                                }
+                                promise.set_value(());
+                            }
+                            Err(_) => promise.set_error(parse_error("account.updateProfile")),
+                        }
+                    }
+                }
+            }
+            // `UpdateBusinessUsernameQuery::on_result`/`on_error`
+            // (BusinessConnectionManager.cpp:706-716) — the user intake.
+            BusinessNetKind::UpdateBusinessUsername => {
+                if let Some((_user_id, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_username)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::User::parse(query.ok()) {
+                            Ok(user) => {
+                                let Some(options) = self.option_manager.as_mut() else {
+                                    promise.set_value(());
+                                    return;
+                                };
+                                let mut user_env = crate::user_manager::UserEnv {
+                                    global: &mut self.global,
+                                    options,
+                                    auth_is_bot: self.auth_manager.is_bot(),
+                                };
+                                self.user_manager.on_get_user(
+                                    &mut user_env,
+                                    user,
+                                    "UpdateBusinessUsernameQuery",
+                                );
+                                promise.set_value(());
+                            }
+                            Err(_) => promise.set_error(parse_error("account.updateUsername")),
+                        }
+                    }
+                }
+            }
+            // `UpdateBusinessGiftSettingsQuery::on_result`/`on_error`
+            // (BusinessConnectionManager.cpp:747-757) — the user-full
+            // invalidation.
+            BusinessNetKind::UpdateBusinessGiftSettings => {
+                if let Some((user_id, mut promise)) =
+                    pop_head(&mut self.business_manager.pending.update_business_gift_settings)
+                {
+                    match bool_unit_result(&query, "account.setGlobalPrivacySettings", None) {
+                        Ok(()) => {
+                            if user_id.is_valid() {
+                                let Some(options) = self.option_manager.as_mut() else {
+                                    promise.set_value(());
+                                    return;
+                                };
+                                let mut user_env = crate::user_manager::UserEnv {
+                                    global: &mut self.global,
+                                    options,
+                                    auth_is_bot: self.auth_manager.is_bot(),
+                                };
+                                self.user_manager
+                                    .invalidate_user_full(&mut user_env, user_id);
+                            }
+                            promise.set_value(());
+                        }
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `GetBusinessStarsStatusQuery::on_result`/`on_error`
+            // (BusinessConnectionManager.cpp:785-801) — the balance must
+            // be the plain starsAmount (the 500 band).
+            BusinessNetKind::GetBusinessStarsStatus => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.get_business_stars_status)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_StarsStatus::parse(query.ok()) {
+                            Ok(result) => match result.balance {
+                                Some(telegram_api::StarsAmount::starsAmount(_)) => {
+                                    let star_amount = crate::message_content::StarAmount::from_wire(
+                                        result.balance.as_ref(),
+                                        true,
+                                    );
+                                    promise.set_value(star_amount.get_star_amount_object());
+                                }
+                                _ => promise
+                                    .set_error(Status::error(500, "Receive invalid response")),
+                            },
+                            Err(_) => promise.set_error(parse_error("payments.getStarsStatus")),
+                        }
+                    }
+                }
+            }
+            // `GetBusinessStarTransferPaymentFormQuery::on_result`/
+            // `on_error` (BusinessConnectionManager.cpp:875-905) — the
+            // plain form is the C++ 500 "Unsupported", the stars/gift
+            // forms run the price check then dispatch the send tail.
+            BusinessNetKind::GetBusinessStarTransferPaymentForm { .. } => {
+                if let Some((chain, mut promise)) = pop_head(
+                    &mut self
+                        .business_manager
+                        .pending
+                        .get_business_star_transfer_payment_form,
+                ) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_PaymentForm::parse(query.ok()) {
+                            Ok(telegram_api::payments_PaymentForm::payments_paymentForm(_)) => {
+                                promise.set_error(Status::error(500, "Unsupported"));
+                            }
+                            Ok(form) => {
+                                let (form_id, invoice) = match &form {
+                                    telegram_api::payments_PaymentForm::payments_paymentFormStars(f) => {
+                                        (f.form_id, f.invoice.as_ref())
+                                    }
+                                    telegram_api::payments_PaymentForm::payments_paymentFormStarGift(f) => {
+                                        (f.form_id, f.invoice.as_ref())
+                                    }
+                                    telegram_api::payments_PaymentForm::payments_paymentForm(_) => unreachable!(),
+                                };
+                                let prices_ok = invoice.is_some_and(|invoice| {
+                                    invoice.prices.len() == 1
+                                        && invoice.prices[0].amount == chain.star_count
+                                });
+                                if !prices_ok {
+                                    promise.set_error(Status::error(
+                                        400,
+                                        "Wrong transfer price specified",
+                                    ));
+                                    return;
+                                }
+                                self.business_manager
+                                    .send_transfer_business_stars_form_query(
+                                        &chain.connection_id,
+                                        chain.dc_id,
+                                        form_id,
+                                        chain.star_count,
+                                        promise,
+                                    );
+                            }
+                            Err(_) => promise.set_error(parse_error("payments.getPaymentForm")),
+                        }
+                    }
+                }
+            }
+            // `TransferBusinessStarsQuery::on_result`/`on_error`
+            // (BusinessConnectionManager.cpp:821-838) — the
+            // verification-needed 500 and the FORM_SUBMIT_DUPLICATE log.
+            BusinessNetKind::TransferBusinessStars => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.business_manager.pending.transfer_business_stars)
+                {
+                    if query.is_error() {
+                        if query.error().message() == "FORM_SUBMIT_DUPLICATE" {
+                            tdutils::log_error!("Receive FORM_SUBMIT_DUPLICATE");
+                        }
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::payments_PaymentResult::parse(query.ok()) {
+                            Ok(telegram_api::payments_PaymentResult::payments_paymentResult(_)) => {
+                                promise.set_value(())
+                            }
+                            Ok(telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
+                                _,
+                            )) => promise.set_error(Status::error(500, "Receive invalid response")),
+                            Err(_) => promise.set_error(parse_error("payments.sendStarsForm")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// Drain the callback-parked payments answers    /// Drain the callback-parked payments answers — the C++
     /// ResultHandler halves of the net-drain 23 families (Payments.cpp).
     fn dispatch_completed_payments_net(&mut self) {
         let completed = std::mem::take(&mut *self.payments_net_completed.lock());
@@ -33779,9 +34683,199 @@ impl crate::business_manager::BusinessEnv for BusinessTdEnv<'_> {
         };
         self.user_manager.get_input_user(&user_env, user_id)
     }
+
+    fn get_option_boolean(&mut self, name: &str, default_value: bool) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|options| options.get_option_boolean(name, default_value))
+    }
+
+    // `DialogManager::get_input_peer` (DialogManager.cpp:1377-1395) — the
+    // Write/Read send legs of the connected-bot families and the
+    // star-status query (the StoryEnv split shape).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                let crate::td::BusinessTdEnv {
+                    global,
+                    options,
+                    auth_is_bot,
+                    user_manager,
+                    ..
+                } = self;
+                let env = crate::user_manager::UserEnv {
+                    global,
+                    options: options
+                        .as_deref_mut()
+                        .expect("business requests run with the initialized option manager"),
+                    auth_is_bot: *auth_is_bot,
+                };
+                user_manager.get_input_peer_user(&env, user_id, access_rights)
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let channel_id = dialog_id.get_channel_id();
+                let crate::td::BusinessTdEnv {
+                    global,
+                    options,
+                    auth_is_bot,
+                    ..
+                } = self;
+                let env = crate::user_manager::UserEnv {
+                    global,
+                    options: options
+                        .as_deref_mut()
+                        .expect("business requests run with the initialized option manager"),
+                    auth_is_bot: *auth_is_bot,
+                };
+                self.chat_manager
+                    .get_input_peer_channel(&env, channel_id, access_rights)
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    fn get_my_dialog_id(&mut self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    // `get_formatted_text(td_, my_dialog_id, text, false, true, true,
+    // false)` (MessageEntity.h:260) — the inputBusinessChatLink draft
+    // parse (the message_content caller shape; the premium-emoji halves
+    // ride the current Td stubs).
+    fn get_formatted_text_input(
+        &mut self,
+        text: Option<td_api::FormattedText>,
+    ) -> std::result::Result<td_api::FormattedText, tdutils::status::Status> {
+        let parsed = crate::message_entity::get_formatted_text_of_input(
+            None::<&mut BusinessTdEnv<'_>>,
+            crate::message_content::to_message_entity_dialog_id(self.get_my_dialog_id()),
+            text,
+            false,
+            true,
+            true,
+            false,
+            None,
+            self.get_option_boolean("always_parse_markdown", false),
+            self.get_option_integer("session_count", 0) as i32,
+            None,
+            false,
+        )?;
+        Ok(crate::message_entity::get_formatted_text_object(
+            None::<&mut BusinessTdEnv<'_>>,
+            &parsed,
+            false,
+            -1,
+        ))
+    }
+
+    fn get_input_message_entities(
+        &mut self,
+        text: &td_api::FormattedText,
+    ) -> Vec<telegram_api::MessageEntity> {
+        let entities = crate::message_entity::get_message_entities(
+            None::<&mut BusinessTdEnv<'_>>,
+            text.entities.clone(),
+            true,
+        )
+        .unwrap_or_default();
+        crate::message_entity::get_input_message_entities(
+            None::<&mut BusinessTdEnv<'_>>,
+            &entities,
+            "get_input_business_chat_link",
+        )
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let Some(options) = self.options.as_deref_mut() else {
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let Some(options) = self.options.as_deref_mut() else {
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .on_get_chats(self.user_manager, &mut env, chats, source);
+    }
 }
 
-/// Field-split the `Td` for the WebPagesManager calls.
+/// The `get_message_text`/`remove_unallowed_entities` resolver half of
+/// [`BusinessTdEnv`] (the `PremiumTdEnv` shape over the user manager).
+impl crate::message_entity::UserManagerLike for BusinessTdEnv<'_> {
+    fn resolve_user_id_object(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+        source: &str,
+    ) -> i64 {
+        let Some(options) = self.options.as_deref_mut() else {
+            return user_id.get();
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: crate::user_manager::UserId) -> Result<(), Status> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return Err(Status::error(400, "Have no access to the user"));
+        };
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> telegram_api::InputUser {
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("business requests run with the initialized option manager");
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user_force(&env, user_id)
+    }
+}
+
+/// Field-split the `Td` for the WebPagesManager calls./// Field-split the `Td` for the WebPagesManager calls.
 pub(crate) fn web_pages_env_split(
     td: &mut Td,
 ) -> (
@@ -40865,6 +41959,7 @@ mod tests {
         td.dialog_manager.net = td.dialog_net();
         td.story_manager.net = td.story_net();
         td.star_gift_manager.net = td.star_gift_net();
+        td.business_manager.net = td.business_net();
         (td, rec, callback)
     }
 
@@ -64331,5 +65426,1114 @@ kQIDAQAB\n\
             ))),
             ..telegram_api::message::default()
         })
+    }
+
+    #[test]
+    fn business_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(business_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Strip the `invokeWithBusinessConnectionPrefix` head (the
+    /// serialized prefix function — NetQueryCreator.cpp:42-59) off a
+    /// dispatched business-connection payload, leaving the inner
+    /// function's bytes.
+    fn strip_business_prefix(bytes: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            &bytes[0..4],
+            &telegram_api::invokeWithBusinessConnectionPrefix::ID.to_le_bytes(),
+            "the business invoke prefix rides the head"
+        );
+        let len = bytes[4] as usize;
+        let padded = (1 + len + 3) & !3; // the length byte + data, 4-aligned
+        bytes[4 + padded..].to_vec()
+    }
+
+    /// The net-drain 26 round-trips (net-drain 26 / #35): the nineteen
+    /// business families ride the live td_api arms through the
+    /// BusinessNetKind plane — the constructor asserts, the happy paths
+    /// and the C++ bands (the >1 bots 500, the invalid-business-chat 500,
+    /// the transfer chain bands).
+    fn business_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain26-business");
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+        seed_my_user(&mut td); // my id 42
+
+        // 1. getBusinessConnectedBot — the single-bot answer converts
+        //    through the users intake + the info object.
+        td.request(
+            1,
+            Function::getBusinessConnectedBot(td_api::getBusinessConnectedBot {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getConnectedBots::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_ConnectedBots {
+            connected_bots: vec![telegram_api::ConnectedBot {
+                flags: 0,
+                bot_id: 700000001,
+                recipients: Some(telegram_api::BusinessBotRecipients::default()),
+                rights: Some(telegram_api::BusinessBotRights::default()),
+                device: "D".to_owned(),
+                date: 1700000000,
+                location: "".to_owned(),
+            }],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::businessConnectedBotInfo(info)) => {
+                assert_eq!(info.bot.as_ref().expect("the bot").bot_user_id, 700000001);
+            }
+            other => panic!("the connected bot info: {other:?}"),
+        }
+
+        // 2. getBusinessConnectedBot — the >1 bots band is the C++ 500
+        //    "Receive invalid response" (BusinessManager.cpp:63-65).
+        td.request(
+            2,
+            Function::getBusinessConnectedBot(td_api::getBusinessConnectedBot {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getConnectedBots::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_ConnectedBots {
+            connected_bots: vec![
+                telegram_api::ConnectedBot {
+                    bot_id: 700000001,
+                    ..telegram_api::ConnectedBot::default()
+                },
+                telegram_api::ConnectedBot {
+                    bot_id: 700000002,
+                    ..telegram_api::ConnectedBot::default()
+                },
+            ],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 3. getBusinessConnectedBot — the empty answer parks None (the
+        //    request arm's 404 mapping).
+        td.request(
+            3,
+            Function::getBusinessConnectedBot(td_api::getBusinessConnectedBot {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getConnectedBots::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_ConnectedBots::default().store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        // the arm's deferred mapping renders the None as the 404 error
+        // object response
+        match responses_of(&callback, 3).first() {
+            Some(Object::error(error)) => {
+                assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            }
+            other => panic!("the empty bots answer: {other:?}"),
+        }
+
+        // 4. setBusinessLocation — the ADDRESS flag rides flags.0, the
+        //    empty geo point keeps GEO_POINT off
+        //    (BusinessManager.cpp:405-417).
+        td.request(
+            4,
+            Function::setBusinessLocation(td_api::setBusinessLocation {
+                location: Some(td_api::BusinessLocation {
+                    location: None,
+                    address: "Addr".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateBusinessLocation::ID,
+        );
+        let body =
+            telegram_api::account_updateBusinessLocation::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1); // ADDRESS_MASK only
+        assert_eq!(body.address, "Addr");
+        assert!(body.geo_point.is_none());
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 5. setBusinessOpeningHours — the empty member keeps the flag
+        //    off (BusinessManager.cpp:441-451).
+        td.request(
+            5,
+            Function::setBusinessOpeningHours(td_api::setBusinessOpeningHours {
+                opening_hours: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateBusinessWorkHours::ID,
+        );
+        let body =
+            telegram_api::account_updateBusinessWorkHours::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 0);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6. setBusinessGreetingMessageSettings — the empty member
+        //    (BusinessManager.cpp:473-483).
+        td.request(
+            6,
+            Function::setBusinessGreetingMessageSettings(
+                td_api::setBusinessGreetingMessageSettings {
+                    greeting_message_settings: None,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateBusinessGreetingMessage::ID,
+        );
+        let body = telegram_api::account_updateBusinessGreetingMessage::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.flags, 0);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. setBusinessAwayMessageSettings (BusinessManager.cpp:505-515).
+        td.request(
+            7,
+            Function::setBusinessAwayMessageSettings(td_api::setBusinessAwayMessageSettings {
+                away_message_settings: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateBusinessAwayMessage::ID,
+        );
+        let body =
+            telegram_api::account_updateBusinessAwayMessage::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 0);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. setBusinessStartPage (BusinessManager.cpp:537-547).
+        td.request(
+            8,
+            Function::setBusinessStartPage(td_api::setBusinessStartPage { start_page: None }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateBusinessIntro::ID,
+        );
+        let body =
+            telegram_api::account_updateBusinessIntro::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 0);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 9. getBusinessChatLinks — the container answer runs the
+        //    users/chats intakes + the link conversion.
+        td.request(
+            9,
+            Function::getBusinessChatLinks(td_api::getBusinessChatLinks {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getBusinessChatLinks::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_BusinessChatLinks {
+            links: vec![telegram_api::BusinessChatLink {
+                flags: 1 << 1, // the title flag
+                link: "https://t.me/x".to_owned(),
+                message: "Hi".to_owned(),
+                entities: vec![],
+                title: "T".to_owned(),
+                views: 3,
+            }],
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 9).first() {
+            Some(Object::businessChatLinks(links)) => {
+                assert_eq!(links.links.len(), 1);
+                let link = links.links.first().expect("the link");
+                assert_eq!(link.link, "https://t.me/x");
+                assert_eq!(link.title, "T");
+                assert_eq!(link.view_count, 3);
+            }
+            other => panic!("the chat links: {other:?}"),
+        }
+
+        // 10. createBusinessChatLink — the input text/title ride the
+        //     ENTITIES/TITLE flags (InputBusinessChatLink.cpp:28-38).
+        td.request(
+            10,
+            Function::createBusinessChatLink(td_api::createBusinessChatLink {
+                link_info: Some(td_api::InputBusinessChatLink {
+                    text: Some(td_api::FormattedText {
+                        text: "Hello".to_owned(),
+                        entities: vec![],
+                    }),
+                    title: "L".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_createBusinessChatLink::ID,
+        );
+        let body =
+            telegram_api::account_createBusinessChatLink::parse(sent.query()).expect("the body");
+        match body.link {
+            Some(link) => {
+                assert_eq!(link.flags, 1 << 1); // TITLE_MASK only
+                assert_eq!(link.message, "Hello");
+                assert_eq!(link.title, "L");
+            }
+            None => panic!("the wire link"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::BusinessChatLink {
+            flags: 0,
+            link: "https://t.me/y".to_owned(),
+            message: "Hey".to_owned(),
+            entities: vec![],
+            title: "Y".to_owned(),
+            views: 1,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 10).first() {
+            Some(Object::businessChatLink(link)) => {
+                assert_eq!(link.link, "https://t.me/y");
+            }
+            other => panic!("the created link: {other:?}"),
+        }
+
+        // 11. editBusinessChatLink — the slug rides the wire, the
+        //     link object answers.
+        td.request(
+            11,
+            Function::editBusinessChatLink(td_api::editBusinessChatLink {
+                link: "old".to_owned(),
+                link_info: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_editBusinessChatLink::ID,
+        );
+        let body =
+            telegram_api::account_editBusinessChatLink::parse(sent.query()).expect("the body");
+        assert_eq!(body.slug, "old");
+        let mut answer = Vec::new();
+        telegram_api::BusinessChatLink {
+            flags: 0,
+            link: "https://t.me/z".to_owned(),
+            message: "Zz".to_owned(),
+            entities: vec![],
+            title: "Z".to_owned(),
+            views: 2,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 11).first() {
+            Some(Object::businessChatLink(link)) => {
+                assert_eq!(link.link, "https://t.me/z");
+            }
+            other => panic!("the edited link: {other:?}"),
+        }
+
+        // 12. deleteBusinessChatLink — the Bool answer band.
+        td.request(
+            13,
+            Function::deleteBusinessChatLink(td_api::deleteBusinessChatLink {
+                link: "old".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_deleteBusinessChatLink::ID,
+        );
+        let body =
+            telegram_api::account_deleteBusinessChatLink::parse(sent.query()).expect("the body");
+        assert_eq!(body.slug, "old");
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. getBusinessChatLinkInfo — the '@'-prefixed username text
+        //     gains the leading space (BusinessManager.cpp:387-391), the
+        //     peer becomes the chat id.
+        td.request(
+            14,
+            Function::getBusinessChatLinkInfo(td_api::getBusinessChatLinkInfo {
+                link_name: "x".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_resolveBusinessChatLink::ID,
+        );
+        let body =
+            telegram_api::account_resolveBusinessChatLink::parse(sent.query()).expect("the body");
+        assert_eq!(body.slug, "x");
+        let mut answer = Vec::new();
+        telegram_api::account_ResolvedBusinessChatLinks {
+            flags: 0,
+            peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 700000001,
+            })),
+            message: "@user".to_owned(),
+            entities: vec![],
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 14).first() {
+            Some(Object::businessChatLinkInfo(info)) => {
+                assert_eq!(info.chat_id, 700000001);
+                assert!(
+                    info.text
+                        .as_ref()
+                        .is_some_and(|text| text.text.starts_with(" @user"))
+                );
+            }
+            other => panic!("the chat link info: {other:?}"),
+        }
+
+        // 14. getBusinessChatLinkInfo — the non-user peer is the C++ 500
+        //     "Receive invalid business chat" (BusinessManager.cpp:394-397).
+        td.request(
+            15,
+            Function::getBusinessChatLinkInfo(td_api::getBusinessChatLinkInfo {
+                link_name: "x".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_resolveBusinessChatLink::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::account_ResolvedBusinessChatLinks {
+            flags: 0,
+            peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                channel_id: 777,
+            })),
+            message: String::new(),
+            entities: vec![],
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 15);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid business chat")
+        );
+
+        // 15. toggleBusinessConnectedBotChatIsPaused — the Write-access
+        //     peer resolves at the send leg (BusinessManager.cpp:141-148).
+        td.request(
+            16,
+            Function::toggleBusinessConnectedBotChatIsPaused(
+                td_api::toggleBusinessConnectedBotChatIsPaused {
+                    chat_id: 700000001,
+                    is_paused: true,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_toggleConnectedBotPaused::ID,
+        );
+        let body =
+            telegram_api::account_toggleConnectedBotPaused::parse(sent.query()).expect("the body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!((peer.user_id, peer.access_hash), (700000001, 5));
+            }
+            other => panic!("the toggle peer: {other:?}"),
+        }
+        assert!(body.paused);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 16).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 16. toggleBusinessConnectedBotChatIsPaused — the wire error
+        //     runs the dialog-error head then errors the promise.
+        td.request(
+            17,
+            Function::toggleBusinessConnectedBotChatIsPaused(
+                td_api::toggleBusinessConnectedBotChatIsPaused {
+                    chat_id: 700000001,
+                    is_paused: false,
+                },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_toggleConnectedBotPaused::ID,
+        );
+        net_fail(sent, 400, "PEER_FLOOD");
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 17);
+        assert_eq!((error.code, error.message.as_str()), (400, "PEER_FLOOD"));
+
+        // 17. removeBusinessConnectedBotFromChat — the Bool answer band
+        //     (the true half runs the removed-bot seam).
+        td.request(
+            18,
+            Function::removeBusinessConnectedBotFromChat(
+                td_api::removeBusinessConnectedBotFromChat { chat_id: 700000001 },
+            ),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_disablePeerConnectedBot::ID,
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 18).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 18. setBusinessConnectedBot — the RIGHTS_MASK flag over the
+        //     bot's rights/recipients (BusinessManager.cpp:96-103); the
+        //     ok half is Updates-typed.
+        td.request(
+            19,
+            Function::setBusinessConnectedBot(td_api::setBusinessConnectedBot {
+                bot: Some(td_api::BusinessConnectedBot {
+                    bot_user_id: 700000001,
+                    recipients: Some(td_api::BusinessRecipients::default()),
+                    rights: Some(td_api::BusinessBotRights::default()),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateConnectedBot::ID,
+        );
+        let body = telegram_api::account_updateConnectedBot::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1); // RIGHTS_MASK
+        assert!(!body.deleted);
+        assert!(body.rights.is_some());
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 19).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 19. deleteBusinessConnectedBot — the delete form: no flags,
+        //     `deleted`, the empty recipients
+        //     (BusinessManager.cpp:105-111).
+        td.request(
+            20,
+            Function::deleteBusinessConnectedBot(td_api::deleteBusinessConnectedBot {
+                bot_user_id: 700000001,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateConnectedBot::ID,
+        );
+        let body = telegram_api::account_updateConnectedBot::parse(sent.query()).expect("the body");
+        // the stored flags carry the `deleted` bit (bit 1); the RIGHTS
+        // bit stays off
+        assert_eq!(body.flags & 1, 0);
+        assert!(body.deleted);
+        assert!(body.rights.is_none());
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 20).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 20. confirmBusinessConnectedBot — the input user rides the
+        //     wire (BusinessManager.cpp:76-79).
+        td.request(
+            21,
+            Function::confirmBusinessConnectedBot(td_api::confirmBusinessConnectedBot {
+                bot_user_id: 700000001,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_confirmBotConnection::ID,
+        );
+        let body =
+            telegram_api::account_confirmBotConnection::parse(sent.query()).expect("the body");
+        match body.bot_id {
+            Some(telegram_api::InputUser::inputUser(user)) => {
+                assert_eq!((user.user_id, user.access_hash), (700000001, 5));
+            }
+            other => panic!("the confirm input user: {other:?}"),
+        }
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 21).first(),
+            Some(Object::ok(_))
+        ));
+
+        // -- the bot half: the business-connection families dispatch over
+        //    the invoke prefix on the connection DC --
+        td.auth_manager.restore_is_bot(true);
+        {
+            let crate::td::Td {
+                business_connection_manager,
+                global,
+                option_manager,
+                auth_manager,
+                time_zone_manager,
+                user_manager,
+                chat_manager,
+                ..
+            } = &mut td;
+            let mut env = crate::td::BusinessTdEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                time_zone_manager,
+                user_manager,
+                chat_manager,
+            };
+            business_connection_manager.on_update_bot_business_connect(
+                &mut env,
+                &telegram_api::BotBusinessConnection {
+                    flags: 0,
+                    disabled: false,
+                    connection_id: "bc-1".to_owned(),
+                    user_id: 700000001,
+                    dc_id: 2,
+                    date: 1700000000,
+                    rights: Some(telegram_api::BusinessBotRights::default()),
+                },
+            );
+        }
+
+        // 21. setBusinessAccountName — the prefixed account.updateProfile
+        //     with FIRST_NAME|LAST_NAME
+        //     (BusinessConnectionManager.cpp:647-667).
+        td.request(
+            22,
+            Function::setBusinessAccountName(td_api::setBusinessAccountName {
+                business_connection_id: "bc-1".to_owned(),
+                first_name: "A".to_owned(),
+                last_name: "B".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateProfile::ID,
+        );
+        let body = telegram_api::account_updateProfile::parse(&strip_business_prefix(sent.query()))
+            .expect("the body");
+        assert_eq!(body.flags, 1 | (1 << 1));
+        assert_eq!(
+            (body.first_name.as_str(), body.last_name.as_str()),
+            ("A", "B")
+        );
+        let mut answer = Vec::new();
+        telegram_api::User::user(telegram_api::user {
+            id: 700000001,
+            flags: 1,
+            access_hash: 5,
+            first_name: "A".to_owned(),
+            ..telegram_api::user::default()
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 22).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 22. setBusinessAccountBio — the ABOUT flag.
+        td.request(
+            23,
+            Function::setBusinessAccountBio(td_api::setBusinessAccountBio {
+                business_connection_id: "bc-1".to_owned(),
+                bio: "About me".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateProfile::ID,
+        );
+        let body = telegram_api::account_updateProfile::parse(&strip_business_prefix(sent.query()))
+            .expect("the body");
+        assert_eq!(body.flags, 1 << 2);
+        assert_eq!(body.about, "About me");
+        net_complete(sent, bool_answer(false)); // not a User: the parse fails
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 23);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the account.updateProfile answer")
+        );
+
+        // 23. setBusinessAccountUsername — the invalid-username band
+        //     (BusinessConnectionManager.cpp:1873-1875) answers before
+        //     the wire.
+        td.request(
+            24,
+            Function::setBusinessAccountUsername(td_api::setBusinessAccountUsername {
+                business_connection_id: "bc-1".to_owned(),
+                username: "not valid!".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 24);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Username is invalid")
+        );
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the invalid username never dispatches"
+        );
+
+        // 24. setBusinessAccountUsername — the prefixed
+        //     account.updateUsername, the User answer intake.
+        td.request(
+            25,
+            Function::setBusinessAccountUsername(td_api::setBusinessAccountUsername {
+                business_connection_id: "bc-1".to_owned(),
+                username: "valid_name".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateUsername::ID,
+        );
+        let body =
+            telegram_api::account_updateUsername::parse(&strip_business_prefix(sent.query()))
+                .expect("the body");
+        assert_eq!(body.username, "valid_name");
+        let mut answer = Vec::new();
+        telegram_api::User::user(telegram_api::user {
+            id: 700000001,
+            flags: 1,
+            access_hash: 5,
+            username: "valid_name".to_owned(),
+            ..telegram_api::user::default()
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 25).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 25. setBusinessAccountGiftSettings — the
+        //     account.setGlobalPrivacySettings form with the
+        //     DISALLOWED_GIFTS flag + the display-gifts-button half
+        //     (BusinessConnectionManager.cpp:731-746).
+        td.request(
+            26,
+            Function::setBusinessAccountGiftSettings(td_api::setBusinessAccountGiftSettings {
+                business_connection_id: "bc-1".to_owned(),
+                settings: Some(td_api::GiftSettings {
+                    show_gift_button: true,
+                    accepted_gift_types: Some(td_api::AcceptedGiftTypes {
+                        unlimited_gifts: false,
+                        limited_gifts: true,
+                        upgraded_gifts: true,
+                        gifts_from_channels: true,
+                        premium_subscription: false,
+                    }),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setGlobalPrivacySettings::ID,
+        );
+        let body = telegram_api::account_setGlobalPrivacySettings::parse(&strip_business_prefix(
+            sent.query(),
+        ))
+        .expect("the body");
+        let settings = body.settings.expect("the settings");
+        assert_eq!(settings.flags & (1 << 6), 1 << 6); // DISALLOWED_GIFTS_MASK
+        assert!(settings.display_gifts_button);
+        assert!(settings.disallowed_gifts.is_some());
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 26).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 26. getBusinessAccountStarAmount — the prefixed
+        //     payments.getStarsStatus with the connection user's peer;
+        //     the starsAmount balance converts.
+        td.request(
+            27,
+            Function::getBusinessAccountStarAmount(td_api::getBusinessAccountStarAmount {
+                business_connection_id: "bc-1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarsStatus::ID,
+        );
+        let body =
+            telegram_api::payments_getStarsStatus::parse(&strip_business_prefix(sent.query()))
+                .expect("the body");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!(peer.user_id, 700000001);
+            }
+            other => panic!("the star-status peer: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsStatus {
+            balance: Some(telegram_api::StarsAmount::starsAmount(
+                telegram_api::starsAmount {
+                    amount: 777,
+                    nanos: 0,
+                },
+            )),
+            ..telegram_api::payments_StarsStatus::default()
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 27).first() {
+            Some(Object::starAmount(amount)) => {
+                assert_eq!(amount.star_count, 777);
+            }
+            other => panic!("the star amount: {other:?}"),
+        }
+
+        // 27. getBusinessAccountStarAmount — the non-starsAmount balance
+        //     is the C++ 500 (BusinessConnectionManager.cpp:792-796).
+        td.request(
+            28,
+            Function::getBusinessAccountStarAmount(td_api::getBusinessAccountStarAmount {
+                business_connection_id: "bc-1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarsStatus::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsStatus {
+            balance: Some(telegram_api::StarsAmount::starsTonAmount(
+                telegram_api::starsTonAmount { amount: 5 },
+            )),
+            ..telegram_api::payments_StarsStatus::default()
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 28);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 28. transferBusinessAccountStars — the payment-form chain head
+        //     (the prefixed payments.getPaymentForm with the self
+        //     invoice), then the send tail on the matching price
+        //     (BusinessConnectionManager.cpp:861-905/807-819).
+        td.request(
+            29,
+            Function::transferBusinessAccountStars(td_api::transferBusinessAccountStars {
+                business_connection_id: "bc-1".to_owned(),
+                star_count: 50,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let body =
+            telegram_api::payments_getPaymentForm::parse(&strip_business_prefix(sent.query()))
+                .expect("the body");
+        match body.invoice {
+            Some(telegram_api::InputInvoice::inputInvoiceBusinessBotTransferStars(invoice)) => {
+                match invoice.bot {
+                    Some(telegram_api::InputUser::inputUserSelf(_)) => {}
+                    other => panic!("the transfer invoice bot: {other:?}"),
+                }
+                assert_eq!(invoice.stars, 50);
+            }
+            other => panic!("the transfer invoice: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                form_id: 9,
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "stars".to_owned(),
+                        amount: 50,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentFormStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        // the payment-form answer drains first; its tail dispatches the
+        // send-form query
+        td.dispatch_completed_business_net();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_sendStarsForm::ID,
+        );
+        let body =
+            telegram_api::payments_sendStarsForm::parse(&strip_business_prefix(sent.query()))
+                .expect("the body");
+        assert_eq!(body.form_id, 9);
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentResult(
+            telegram_api::payments_paymentResult { updates: None },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 29).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 29. transferBusinessAccountStars — the mismatched price is the
+        //     400 "Wrong transfer price specified"
+        //     (BusinessConnectionManager.cpp:886-893).
+        td.request(
+            30,
+            Function::transferBusinessAccountStars(td_api::transferBusinessAccountStars {
+                business_connection_id: "bc-1".to_owned(),
+                star_count: 51,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStars(
+            telegram_api::payments_paymentFormStars {
+                form_id: 10,
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "stars".to_owned(),
+                        amount: 999,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+                ..telegram_api::payments_paymentFormStars::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 30);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Wrong transfer price specified")
+        );
+
+        // 30. transferBusinessAccountStars — the amount band answers
+        //     before the wire (BusinessConnectionManager.cpp:1954-1957).
+        td.request(
+            31,
+            Function::transferBusinessAccountStars(td_api::transferBusinessAccountStars {
+                business_connection_id: "bc-1".to_owned(),
+                star_count: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 31);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                400,
+                "Invalid amount of Telegram Stars to transfer specified"
+            )
+        );
+
+        // 31. transferBusinessAccountStars — the plain paymentForm is the
+        //     C++ 500 "Unsupported" (BusinessConnectionManager.cpp:880-883).
+        td.request(
+            32,
+            Function::transferBusinessAccountStars(td_api::transferBusinessAccountStars {
+                business_connection_id: "bc-1".to_owned(),
+                star_count: 52,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentForm(
+            telegram_api::payments_paymentForm {
+                ..telegram_api::payments_paymentForm::default()
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 32);
+        assert_eq!((error.code, error.message.as_str()), (500, "Unsupported"));
+
+        // 32. transferBusinessAccountStars — the verification-needed tail
+        //     is the C++ 500 (BusinessConnectionManager.cpp:830-834).
+        td.request(
+            33,
+            Function::transferBusinessAccountStars(td_api::transferBusinessAccountStars {
+                business_connection_id: "bc-1".to_owned(),
+                star_count: 53,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getPaymentForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentForm::payments_paymentFormStarGift(
+            telegram_api::payments_paymentFormStarGift {
+                form_id: 11,
+                invoice: Some(telegram_api::Invoice {
+                    prices: vec![telegram_api::LabeledPrice {
+                        label: "stars".to_owned(),
+                        amount: 53,
+                    }],
+                    ..telegram_api::Invoice::default()
+                }),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_sendStarsForm::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
+            telegram_api::payments_paymentVerificationNeeded::default(),
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_business_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 33);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        assert!(td.business_net_completed.lock().is_empty(), "drained");
     }
 }
