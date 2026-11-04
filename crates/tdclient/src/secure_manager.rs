@@ -7,15 +7,17 @@
 //!   `GetAllSecureValues`, `SetSecureValue`, `DeleteSecureValue`,
 //!   `SetSecureValueErrorsQuery`, `GetPassportAuthorizationForm`,
 //!   `GetPassportConfig`) plus the container-dispatched
-//!   `account.acceptAuthorization` are the `[blocked: net]` query seams —
-//!   the sends log and the promises park (the M.31 convention); the answer
-//!   handlers (`on_get_secure_value_result`,
+//!   `account.acceptAuthorization` dispatch through the env net
+//!   handle (the net-drain 27 slice — the `SecureNetKind` plane; a
+//!   handle-less env logs `[net-inert]`); the answer handlers
+//!   (`on_get_secure_value_result`,
 //!   `on_get_all_secure_values_result`, `on_set_secure_value_result`,
 //!   `on_delete_secure_value_result`, `on_set_secure_value_errors_result`,
 //!   `on_get_passport_authorization_form`,
 //!   `on_get_passport_authorization_form_secret`,
 //!   `on_accept_authorization_result`, `on_get_passport_config_result`)
-//!   are real and unit-tested.
+//!   are real and unit-tested, and the wire answers drain into them
+//!   through `Td::on_secure_net_answer`.
 //! - `PasswordManager::get_secure_secret`/`drop_cached_secret` are
 //!   [blocked: PasswordManager] env seams (the manager is its own track);
 //!   the collapsed secret answer is synchronous — a seam error fails the
@@ -70,9 +72,48 @@ pub type TdApiSecureValuesWithErrors = td_api::PassportElementsWithErrors;
 /// `SecureManager::TdApiAuthorizationForm` (SecureManager.h:34).
 pub type TdApiAuthorizationForm = td_api::PassportAuthorizationForm;
 
+/// The SecureManager in-flight query kinds — the C++ handler classes of
+/// the §3.9 secure families (SecureManager.cpp:35-812): the kinds carry
+/// the Copy handler members the answer halves route by (the element type
+/// keying `set_secure_value_queries_`/the delete position scan, the form
+/// id keying `authorization_forms_`); the non-Copy handler state (the
+/// promises, the encrypted values) parks in the manager's per-family
+/// queues beside them — the §5 FIFO-per-kind convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SecureNetKind {
+    /// `GetSecureValue` (SecureManager.cpp:35) — `account.getSecureValue`;
+    /// the answers pop the parked queries FIFO.
+    GetSecureValue,
+    /// `GetAllSecureValues` (SecureManager.cpp:56) —
+    /// `account.getAllSecureValues`; the single parked query.
+    GetAllSecureValues,
+    /// `SetSecureValue` (SecureManager.cpp:75) — `account.saveSecureValue`;
+    /// the kind carries the handler's element type (the map key the answer
+    /// routes by, SecureManager.cpp:595).
+    SetSecureValue { type_: SecureValueType },
+    /// `DeleteSecureValue` (SecureManager.cpp:660) —
+    /// `account.deleteSecureValue`; the kind carries the handler's element
+    /// type (the pending-queue key, SecureManager.cpp:678).
+    DeleteSecureValue { type_: SecureValueType },
+    /// `SetSecureValueErrorsQuery` (SecureManager.cpp:139) —
+    /// `users.setSecureValueErrors`.
+    SetSecureValueErrors,
+    /// `GetPassportAuthorizationForm` (SecureManager.cpp:689) —
+    /// `account.getAuthorizationForm`; the kind carries the generated
+    /// authorization-form id the answer intake runs on.
+    GetAuthorizationForm { authorization_form_id: i32 },
+    /// the container-dispatched `account.acceptAuthorization`
+    /// (SecureManager.cpp:1284-1293).
+    AcceptAuthorization,
+    /// `GetPassportConfig` (SecureManager.cpp:760) —
+    /// `help.getPassportConfig` (the preferred-country-language ride).
+    GetPassportConfig,
+}
+
 /// The `G()`/`td_` surface of the manager on top of the value plane
-/// ([`SecureValueEnv`]). The net queries are the `[blocked: net]` seams;
-/// the secret surface is [blocked: PasswordManager].
+/// ([`SecureValueEnv`]). The net queries dispatch through the env net
+/// handle (the default arms log `[net-inert]` — the net-inert tests and
+/// the pre-init windows); the secret surface is [blocked: PasswordManager].
 pub trait SecureManagerEnv: SecureValueEnv {
     /// `td_->user_manager_->on_get_users(users, source)` (the
     /// authorization-form intake, SecureManager.cpp:998-999).
@@ -114,85 +155,91 @@ pub trait SecureManagerEnv: SecureValueEnv {
         tdutils::log_info!("PasswordManager::drop_cached_secret — [blocked: PasswordManager]");
     }
 
-    /// `GetSecureValue::start_up` (SecureManager.cpp:217-223) —
-    /// `[blocked: net]`; the answer arrives through
+    /// `GetSecureValue::start_up` (SecureManager.cpp:217-223) — dispatches
+    /// `account.getSecureValue` (the default arm is the net-inert log);
+    /// the answer arrives through
     /// [`SecureManager::on_get_secure_value_result`].
     fn send_get_secure_value_query(&mut self, type_: SecureValueType) {
-        tdutils::log_info!("Send account.getSecureValue — [blocked: net]");
+        tdutils::log_info!("Send account.getSecureValue — [net-inert]");
         let _ = type_;
     }
 
     /// `GetAllSecureValues::start_up` (SecureManager.cpp:300-303) —
-    /// `[blocked: net]`; the answer arrives through
+    /// dispatches `account.getAllSecureValues`; the answer arrives through
     /// [`SecureManager::on_get_all_secure_values_result`].
     fn send_get_all_secure_values_query(&mut self) {
-        tdutils::log_info!("Send account.getAllSecureValues — [blocked: net]");
+        tdutils::log_info!("Send account.getAllSecureValues — [net-inert]");
     }
 
-    /// `SetSecureValue::loop` (SecureManager.cpp:578-582) —
-    /// `[blocked: net]`; the answer arrives through
+    /// `SetSecureValue::loop` (SecureManager.cpp:578-582) — dispatches
+    /// `account.saveSecureValue` keyed by the element type; the answer
+    /// arrives through
     /// [`SecureManager::on_set_secure_value_result`].
     fn send_save_secure_value_query(
         &mut self,
+        type_: SecureValueType,
         value: telegram_api::InputSecureValue,
         secure_secret_id: i64,
     ) {
         tdutils::log_info!(
-            "Send account.saveSecureValue(secure_secret_id = {secure_secret_id}) — [blocked: net]"
+            "Send account.saveSecureValue(secure_secret_id = {secure_secret_id}) — [net-inert]"
         );
-        let _ = value;
+        let _ = (type_, value);
     }
 
     /// `DeleteSecureValue::start_up` (SecureManager.cpp:671-676) —
-    /// `[blocked: net]`; the answer arrives through
+    /// dispatches `account.deleteSecureValue` keyed by the element type;
+    /// the answer arrives through
     /// [`SecureManager::on_delete_secure_value_result`].
     fn send_delete_secure_value_query(&mut self, type_: SecureValueType) {
-        tdutils::log_info!("Send account.deleteSecureValue — [blocked: net]");
+        tdutils::log_info!("Send account.deleteSecureValue — [net-inert]");
         let _ = type_;
     }
 
     /// `SetSecureValueErrorsQuery::send` (SecureManager.cpp:146-150) —
-    /// `[blocked: net]`; the answer arrives through
+    /// dispatches `users.setSecureValueErrors`; the answer arrives through
     /// [`SecureManager::on_set_secure_value_errors_result`].
     fn send_set_secure_value_errors_query(
         &mut self,
         input_user: telegram_api::InputUser,
         input_errors: Vec<telegram_api::SecureValueError>,
     ) {
-        tdutils::log_info!("Send users.setSecureValueErrors — [blocked: net]");
+        tdutils::log_info!("Send users.setSecureValueErrors — [net-inert]");
         let _ = (input_user, input_errors);
     }
 
     /// `GetPassportAuthorizationForm::start_up` (SecureManager.cpp:716-721)
-    /// — `[blocked: net]`; the answer arrives through
+    /// — dispatches `account.getAuthorizationForm` for the generated form
+    /// id; the answer arrives through
     /// [`SecureManager::on_get_passport_authorization_form`].
     fn send_get_authorization_form_query(
         &mut self,
+        authorization_form_id: i32,
         bot_user_id: UserId,
         scope: &str,
         public_key: &str,
     ) {
-        tdutils::log_info!("Send account.getAuthorizationForm — [blocked: net]");
-        let _ = (bot_user_id, scope, public_key);
+        tdutils::log_info!("Send account.getAuthorizationForm — [net-inert]");
+        let _ = (authorization_form_id, bot_user_id, scope, public_key);
     }
 
     /// `SecureManager::send_passport_authorization_form`'s
     /// `account.acceptAuthorization` (SecureManager.cpp:1284-1293) —
-    /// `[blocked: net]`; the answer arrives through
+    /// dispatches the built query; the answer arrives through
     /// [`SecureManager::on_accept_authorization_result`].
     fn send_accept_authorization_query(
         &mut self,
         query: telegram_api::account_acceptAuthorization,
     ) {
-        tdutils::log_info!("Send account.acceptAuthorization — [blocked: net]");
+        tdutils::log_info!("Send account.acceptAuthorization — [net-inert]");
         let _ = query;
     }
 
     /// `GetPassportConfig::start_up` (SecureManager.cpp:772-775) —
-    /// `[blocked: net]`; the answer arrives through
+    /// dispatches `help.getPassportConfig`; the answer arrives through
     /// [`SecureManager::on_get_passport_config_result`].
     fn send_get_passport_config_query(&mut self, hash: i32) {
-        tdutils::log_info!("Send help.getPassportConfig(hash = {hash}) — [blocked: net]");
+        tdutils::log_info!("Send help.getPassportConfig(hash = {hash}) — [net-inert]");
     }
 }
 
@@ -572,7 +619,11 @@ impl SetSecureValueQuery {
             &mut self.selfie,
             &mut self.translations_to_upload,
         );
-        env.send_save_secure_value_query(input_secure_value, secret.get_hash());
+        env.send_save_secure_value_query(
+            self.secure_value.type_,
+            input_secure_value,
+            secret.get_hash(),
+        );
         self.state = SetSecureValueState::WaitSetValue;
         true
     }
@@ -980,8 +1031,8 @@ impl SecureManager {
     //     SetSecureValueErrorsQuery) ---
 
     /// `SecureManager::set_secure_value_errors` — the td_api → telegram
-    /// error conversion runs here; the query send is the `[blocked: net]`
-    /// seam and the promise parks.
+    /// error conversion runs here; the query send dispatches through the
+    /// env net handle and the promise parks.
     pub fn set_secure_value_errors(
         &mut self,
         env: &mut impl SecureManagerEnv,
@@ -1046,7 +1097,12 @@ impl SecureManager {
                 promise: Some(promise),
             },
         );
-        env.send_get_authorization_form_query(bot_user_id, scope, public_key);
+        env.send_get_authorization_form_query(
+            authorization_form_id,
+            bot_user_id,
+            scope,
+            public_key,
+        );
     }
 
     /// `SecureManager::on_get_passport_authorization_form`
@@ -1168,28 +1224,22 @@ impl SecureManager {
         mut promise: Promise<TdApiSecureValuesWithErrors>,
         r_secret: Result<Secret>,
     ) {
-        let (options, mut values, errors) = {
-            let Some(form) = self.authorization_forms.get_mut(&authorization_form_id) else {
-                return promise.set_error(Status::error(
-                    400,
-                    "Authorization form has already been sent",
-                ));
-            };
-            assert!(form.is_received);
-            if form.is_decrypted {
-                return promise.set_error(Status::error(
-                    400,
-                    "Authorization form has already been decrypted",
-                ));
-            }
-            form.is_decrypted = true;
-            (
-                std::mem::take(&mut form.options),
-                std::mem::take(&mut form.values),
-                std::mem::take(&mut form.errors),
-            )
+        // the C++ order (SecureManager.cpp:1064-1096): the form checks and
+        // the secret answer precede the `is_decrypted` mark — a secret
+        // error leaves the form intact for a retry
+        let Some(form) = self.authorization_forms.get_mut(&authorization_form_id) else {
+            return promise.set_error(Status::error(
+                400,
+                "Authorization form has already been sent",
+            ));
         };
-
+        assert!(form.is_received);
+        if form.is_decrypted {
+            return promise.set_error(Status::error(
+                400,
+                "Authorization form has already been decrypted",
+            ));
+        }
         let secret = match r_secret {
             Result::Ok(secret) => secret,
             Result::Err(mut error) => {
@@ -1202,6 +1252,12 @@ impl SecureManager {
                 return promise.set_error(error);
             }
         };
+        form.is_decrypted = true;
+        let (options, mut values, errors) = (
+            std::mem::take(&mut form.options),
+            std::mem::take(&mut form.values),
+            std::mem::take(&mut form.errors),
+        );
 
         let mut td_values: Vec<td_api::PassportElement> = Vec::new();
         let mut all_credentials: BTreeMap<SecureValueType, SecureValueCredentials> =
@@ -1899,11 +1955,12 @@ kQIDAQAB\n\
 
         fn send_save_secure_value_query(
             &mut self,
+            type_: SecureValueType,
             _value: telegram_api::InputSecureValue,
             secure_secret_id: i64,
         ) {
             self.queries
-                .push(format!("saveSecureValue:{secure_secret_id}"));
+                .push(format!("saveSecureValue:{type_}:{secure_secret_id}"));
         }
 
         fn send_delete_secure_value_query(&mut self, type_: SecureValueType) {
@@ -1922,12 +1979,13 @@ kQIDAQAB\n\
 
         fn send_get_authorization_form_query(
             &mut self,
+            authorization_form_id: i32,
             bot_user_id: UserId,
             scope: &str,
             _public_key: &str,
         ) {
             self.queries.push(format!(
-                "getAuthorizationForm:{}:{scope}",
+                "getAuthorizationForm:{authorization_form_id}:{}:{scope}",
                 bot_user_id.get()
             ));
         }
@@ -2186,7 +2244,7 @@ kQIDAQAB\n\
         );
         assert_eq!(
             env.queries,
-            vec!["getAuthorizationForm:777:scope".to_owned()]
+            vec!["getAuthorizationForm:1:777:scope".to_owned()]
         );
         let authorization_form_id = 1;
         let required_types = vec![Box::new(
@@ -2351,8 +2409,11 @@ kQIDAQAB\n\
         let master_secret = env.secret.unwrap();
         manager.set_secure_value(&mut env, "pwd", secure_value, promise);
         assert!(
-            env.queries
-                .contains(&format!("saveSecureValue:{}", master_secret.get_hash())),
+            env.queries.contains(&format!(
+                "saveSecureValue:{}:{}",
+                SecureValueType::EmailAddress,
+                master_secret.get_hash()
+            )),
             "the save query fires for the zero-file element: {:?}",
             env.queries
         );

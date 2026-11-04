@@ -3365,6 +3365,13 @@ pub(crate) type StarGiftNetHandle = NetKindHandle<crate::star_gift_manager::Star
 /// [`Td::dispatch_completed_payments_net`].
 pub(crate) type PaymentsNetHandle = NetKindHandle<crate::payments::PaymentsNetKind>;
 
+/// The cloned secure dispatch surface the [`SecureEnv`] senders use — the
+/// per-kind handle over the SecureManager.cpp handler kinds (the net-drain
+/// 27 plane: the eight wire queries behind the nine passport families);
+/// the answers drain through
+/// [`Td::dispatch_completed_secure_net`].
+pub(crate) type SecureNetHandle = NetKindHandle<crate::secure_manager::SecureNetKind>;
+
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
 /// completes into `on_dialog_gift_transferred` with the empty to-dialog
@@ -4350,6 +4357,10 @@ pub struct Td {
         crate::messages_manager::FolderId,
         std::collections::VecDeque<crate::messages_manager::PendingDialogListLeg>,
     >,
+    /// The callback-parked secure answers (the C++ ResultHandler halves
+    /// of the net-drain 27 families — the
+    /// [`Td::on_secure_net_answer`] drain).
+    secure_net_completed: Arc<Mutex<Vec<(crate::secure_manager::SecureNetKind, NetQuery)>>>,
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
@@ -4834,6 +4845,7 @@ impl Td {
             pending_multi_media_random_ids: std::collections::VecDeque::new(),
             pending_get_dialog_list_legs: std::collections::HashMap::new(),
             pending_get_pinned_dialogs_legs: std::collections::HashMap::new(),
+            secure_net_completed: Arc::new(Mutex::new(Vec::new())),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
@@ -7117,6 +7129,7 @@ impl Td {
         self.dispatch_completed_story_net();
         self.dispatch_completed_bot_info_net();
         self.dispatch_completed_payments_net();
+        self.dispatch_completed_secure_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -7341,6 +7354,16 @@ impl Td {
         Some(StarGiftNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.star_gift_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned secure dispatch surface (the §3.9 families' send legs —
+    /// the env-held handle over [`SecureEnv::net`]).
+    pub(crate) fn secure_net(&self) -> Option<SecureNetHandle> {
+        Some(SecureNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.secure_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -14517,6 +14540,198 @@ impl Td {
             self.on_payments_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked secure answers — the C++ ResultHandler
+    /// halves of the net-drain 27 families (SecureManager.cpp).
+    fn dispatch_completed_secure_net(&mut self) {
+        let completed = std::mem::take(&mut *self.secure_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_secure_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Build the [`SecureEnv`] view over the split Td borrows and run the
+    /// closure with it + the secure manager (the `secure_env!` shape —
+    /// the net-answer drain's twin; the passport answers only run
+    /// post-init, so the option manager exists).
+    fn with_secure_manager<R>(
+        &mut self,
+        run: impl FnOnce(&mut SecureEnv<'_>, &mut crate::secure_manager::SecureManager) -> R,
+    ) -> R {
+        let net = self.secure_net();
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            secure_manager,
+            file_manager,
+            file_load_manager,
+            close_flag,
+            ..
+        } = self;
+        let mut env = SecureEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("the secure answers drain post-init"),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            file_manager: Arc::clone(file_manager),
+            file_load_manager: Arc::clone(file_load_manager),
+            close_flag: *close_flag != 0,
+            net,
+        };
+        run(&mut env, secure_manager)
+    }
+
+    /// Route one secure net answer by kind — the ResultHandler halves of
+    /// the net-drain 27 families (SecureManager.cpp:35-812): the wire
+    /// answers parse here and the landed manager intakes run over the
+    /// [`SecureEnv`] field split (the parse failures settle through the
+    /// manager error tails, the landed-flip convention, §5).
+    fn on_secure_net_answer(
+        &mut self,
+        kind: crate::secure_manager::SecureNetKind,
+        query: NetQuery,
+    ) {
+        use crate::secure_manager::SecureNetKind;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        /// The Bool-answer unit band — the C++ `on_result`s ignore the
+        /// payload, so both bool constructors settle the promise
+        /// (SecureManager.cpp:152-161, 678-687, 1288-1292).
+        fn unit_bool_result(query: &NetQuery, what: &str) -> tdutils::status::Result<()> {
+            if query.is_error() {
+                return tdutils::status::Result::Err(query.error().clone());
+            }
+            match parse_wire_bool(query.ok()) {
+                Some(()) => tdutils::status::Result::Ok(()),
+                None => tdutils::status::Result::Err(parse_error(what)),
+            }
+        }
+        match kind {
+            // `GetSecureValue::on_result` (SecureManager.cpp:231-249) —
+            // the `Vector<SecureValue>` answer pops the oldest parked
+            // query.
+            SecureNetKind::GetSecureValue => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_wire_vector(query.ok(), telegram_api::SecureValue::read) {
+                        Some(values) => tdutils::status::Result::Ok(values),
+                        None => tdutils::status::Result::Err(parse_error("account.getSecureValue")),
+                    }
+                };
+                self.with_secure_manager(|env, manager| {
+                    manager.on_get_secure_value_result(env, result)
+                });
+            }
+            // `GetAllSecureValues::on_result`
+            // (SecureManager.cpp:311-319) — the `Vector<SecureValue>`
+            // answer resolves the single parked query.
+            SecureNetKind::GetAllSecureValues => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_wire_vector(query.ok(), telegram_api::SecureValue::read) {
+                        Some(values) => tdutils::status::Result::Ok(values),
+                        None => {
+                            tdutils::status::Result::Err(parse_error("account.getAllSecureValues"))
+                        }
+                    }
+                };
+                self.with_secure_manager(|env, manager| {
+                    manager.on_get_all_secure_values_result(env, result)
+                });
+            }
+            // `SetSecureValue::on_result` (SecureManager.cpp:595-647) —
+            // the `SecureValue` answer routes by the element type (the
+            // map key the parked query lives under).
+            SecureNetKind::SetSecureValue { type_ } => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::SecureValue::parse(query.ok()) {
+                        Ok(value) => tdutils::status::Result::Ok(value),
+                        Err(_) => {
+                            tdutils::status::Result::Err(parse_error("account.saveSecureValue"))
+                        }
+                    }
+                };
+                self.with_secure_manager(|env, manager| {
+                    manager.on_set_secure_value_result(env, type_, result)
+                });
+            }
+            // `DeleteSecureValue::on_result`
+            // (SecureManager.cpp:678-687) — the Bool answer settles the
+            // parked promise (the payload is ignored, like the C++).
+            SecureNetKind::DeleteSecureValue { type_ } => {
+                let result = unit_bool_result(&query, "account.deleteSecureValue");
+                self.with_secure_manager(|_, manager| {
+                    manager.on_delete_secure_value_result(type_, result)
+                });
+            }
+            // `SetSecureValueErrorsQuery::on_result`
+            // (SecureManager.cpp:152-161) — the Bool answer settles the
+            // parked promise.
+            SecureNetKind::SetSecureValueErrors => {
+                let result = unit_bool_result(&query, "users.setSecureValueErrors");
+                self.with_secure_manager(|_, manager| {
+                    manager.on_set_secure_value_errors_result(result)
+                });
+            }
+            // `GetPassportAuthorizationForm::on_result`
+            // (SecureManager.cpp:735-741) — the `account.authorizationForm`
+            // answer runs the form intake for its generated id.
+            SecureNetKind::GetAuthorizationForm {
+                authorization_form_id,
+            } => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::account_AuthorizationForm::parse(query.ok()) {
+                        Ok(form) => tdutils::status::Result::Ok(form),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "account.getAuthorizationForm",
+                        )),
+                    }
+                };
+                self.with_secure_manager(|env, manager| {
+                    manager.on_get_passport_authorization_form(env, authorization_form_id, result)
+                });
+            }
+            // the `account.acceptAuthorization` fetch_result collapse
+            // (SecureManager.cpp:1288-1292) — the Bool answer settles
+            // the parked promise.
+            SecureNetKind::AcceptAuthorization => {
+                let result = unit_bool_result(&query, "account.acceptAuthorization");
+                self.with_secure_manager(|_, manager| {
+                    manager.on_accept_authorization_result(result)
+                });
+            }
+            // `GetPassportConfig::on_result` (SecureManager.cpp:777-811)
+            // — the `help.passportConfig` answer feeds the
+            // preferred-country-language parse.
+            SecureNetKind::GetPassportConfig => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::help_PassportConfig::parse(query.ok()) {
+                        Ok(config) => tdutils::status::Result::Ok(config),
+                        Err(_) => {
+                            tdutils::status::Result::Err(parse_error("help.getPassportConfig"))
+                        }
+                    }
+                };
+                self.with_secure_manager(|_, manager| {
+                    manager.on_get_passport_config_result(result)
+                });
+            }
+        }
     }
 
     /// Route one payments net answer by kind — the ResultHandler halves
@@ -30448,6 +30663,10 @@ pub(crate) struct SecureEnv<'a> {
     pub(crate) file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
     /// the snapshot of `Td::close_flag`
     pub(crate) close_flag: bool,
+    /// The live dispatch surface (the C++ ResultHandler send legs of the
+    /// passport families); the `None` arm logs the send instead of
+    /// dispatching (the net-inert posture).
+    pub(crate) net: Option<SecureNetHandle>,
 }
 
 impl crate::secure_value::SecureValueEnv for SecureEnv<'_> {
@@ -30610,6 +30829,140 @@ impl crate::secure_manager::SecureManagerEnv for SecureEnv<'_> {
         match self.user_manager.get_input_user(&user_env, user_id) {
             Ok(input_user) => tdutils::status::Result::Ok(input_user),
             Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    // -- the §3.9 send legs: the wire queries the C++ handlers build at
+    //    their send sites (SecureManager.cpp:146-150, 217-223, 300-303,
+    //    578-582, 671-676, 716-721, 772-775, 1284-1293) --
+
+    fn send_get_secure_value_query(&mut self, type_: crate::secure_value::SecureValueType) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::GetSecureValue,
+                telegram_api::Function::account_getSecureValue(
+                    telegram_api::account_getSecureValue {
+                        types: vec![crate::secure_value::get_input_secure_value_type(type_)],
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getSecureValue — [net-inert]"),
+        }
+    }
+
+    fn send_get_all_secure_values_query(&mut self) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::GetAllSecureValues,
+                telegram_api::Function::account_getAllSecureValues(
+                    telegram_api::account_getAllSecureValues,
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getAllSecureValues — [net-inert]"),
+        }
+    }
+
+    fn send_save_secure_value_query(
+        &mut self,
+        type_: crate::secure_value::SecureValueType,
+        value: telegram_api::InputSecureValue,
+        secure_secret_id: i64,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::SetSecureValue { type_ },
+                telegram_api::Function::account_saveSecureValue(
+                    telegram_api::account_saveSecureValue {
+                        value: Some(value),
+                        secure_secret_id,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send account.saveSecureValue(secure_secret_id = {secure_secret_id}) — [net-inert]"
+            ),
+        }
+    }
+
+    fn send_delete_secure_value_query(&mut self, type_: crate::secure_value::SecureValueType) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::DeleteSecureValue { type_ },
+                telegram_api::Function::account_deleteSecureValue(
+                    telegram_api::account_deleteSecureValue {
+                        types: vec![crate::secure_value::get_input_secure_value_type(type_)],
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.deleteSecureValue — [net-inert]"),
+        }
+    }
+
+    fn send_set_secure_value_errors_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        input_errors: Vec<telegram_api::SecureValueError>,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::SetSecureValueErrors,
+                telegram_api::Function::users_setSecureValueErrors(
+                    telegram_api::users_setSecureValueErrors {
+                        id: Some(input_user),
+                        errors: input_errors,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send users.setSecureValueErrors — [net-inert]"),
+        }
+    }
+
+    fn send_get_authorization_form_query(
+        &mut self,
+        authorization_form_id: i32,
+        bot_user_id: UserId,
+        scope: &str,
+        public_key: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::GetAuthorizationForm {
+                    authorization_form_id,
+                },
+                telegram_api::Function::account_getAuthorizationForm(
+                    telegram_api::account_getAuthorizationForm {
+                        bot_id: bot_user_id.get(),
+                        scope: scope.to_owned(),
+                        public_key: public_key.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getAuthorizationForm — [net-inert]"),
+        }
+    }
+
+    fn send_accept_authorization_query(
+        &mut self,
+        query: telegram_api::account_acceptAuthorization,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::AcceptAuthorization,
+                telegram_api::Function::account_acceptAuthorization(query),
+            ),
+            None => tdutils::log_info!("Send account.acceptAuthorization — [net-inert]"),
+        }
+    }
+
+    fn send_get_passport_config_query(&mut self, hash: i32) {
+        match &self.net {
+            Some(net) => net.dispatch(
+                crate::secure_manager::SecureNetKind::GetPassportConfig,
+                telegram_api::Function::help_getPassportConfig(
+                    telegram_api::help_getPassportConfig { hash },
+                ),
+            ),
+            None => tdutils::log_info!("Send help.getPassportConfig(hash = {hash}) — [net-inert]"),
         }
     }
 }
@@ -60444,6 +60797,469 @@ mod tests {
 
         assert!(rec.sent.lock().is_empty(), "no stray queries");
         assert!(td.star_gift_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn secure_passport_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(secure_passport_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn secure_passport_families_ride_the_dispatcher_impl() {
+        /// The M.44 test RSA public key (the accept-authorization
+        /// envelope — the same fixture as the secure_manager band tests).
+        const TEST_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArX7B/IqARVFnfrtT0TMs\n\
+F52TAQm821m9Ow4jFRpuSpYKwYbWZWOJDRCuy0SOXvRXm/vTLhF5TpqneF0xcolu\n\
+75jTQ1V59dRx4fKw4AYwPTKsguGYPaehiyJ+OM2TLMdV1XB3QmAQwfgMWiDkmD77\n\
+6eZBdm+OFXwQO27wUiKtxNg/ir/AlktWK/YOEK8xUZkeEwZ8dmD8di3i5s9VfIuY\n\
+3X24cblu+Mh96HSqjOzUuKohkqFtPCDReSmgLgjBeQL4beoC6+pRdBxlbrn7b7b5\n\
+jMvDdweuSqa9uNt+Jo7u1r3EXyAWtXrLSOqz1Iy4B+JMuM8J849J5NShTbLGzJhw\n\
+kQIDAQAB\n\
+-----END PUBLIC KEY-----";
+
+        fn bool_true() -> Vec<u8> {
+            0x9972_75b5u32.to_le_bytes().to_vec()
+        }
+
+        /// `Vector<SecureValue>` over the bare-element read — the
+        /// `account.getSecureValue`/`account.getAllSecureValues` answer
+        /// shape (the empty form; the parse band only).
+        fn empty_secure_values() -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+            out.extend_from_slice(&0i32.to_le_bytes());
+            out
+        }
+
+        /// `account.authorizationForm` requiring the email element (the
+        /// form intake fixture of the manager band tests; flags.0 carries
+        /// the privacy-policy url).
+        fn authorization_form_answer() -> Vec<u8> {
+            let form = telegram_api::account_AuthorizationForm {
+                flags: 1,
+                required_types: vec![Box::new(
+                    telegram_api::SecureRequiredType::secureRequiredType(
+                        telegram_api::secureRequiredType {
+                            flags: 0,
+                            native_names: false,
+                            selfie_required: false,
+                            translation_required: false,
+                            r#type: Some(telegram_api::SecureValueType::secureValueTypeEmail(
+                                telegram_api::secureValueTypeEmail,
+                            )),
+                        },
+                    ),
+                )],
+                values: Vec::new(),
+                errors: Vec::new(),
+                users: Vec::new(),
+                privacy_policy_url: "https://example.com/privacy".to_owned(),
+            };
+            let mut out = Vec::new();
+            form.store_boxed(&mut out);
+            out
+        }
+
+        /// `help.passportConfig` carrying the countries-langs map.
+        fn passport_config_answer(data: &str) -> Vec<u8> {
+            let config = telegram_api::help_passportConfig {
+                hash: 0,
+                countries_langs: Some(telegram_api::DataJSON {
+                    data: data.to_owned(),
+                }),
+            };
+            let mut out = Vec::new();
+            config.store_boxed(&mut out);
+            out
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain27-secure-passport");
+
+        // 1. getPassportAuthorizationForm — the full round trip: the
+        //    wire body carries the bot/scope/public_key triple
+        td.request(
+            1,
+            Function::getPassportAuthorizationForm(td_api::getPassportAuthorizationForm {
+                bot_user_id: 777,
+                nonce: "the-nonce".to_owned(),
+                scope: "scope".to_owned(),
+                public_key: TEST_PUBLIC_KEY.to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getAuthorizationForm::ID,
+        );
+        let body =
+            telegram_api::account_getAuthorizationForm::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.bot_id, 777);
+        assert_eq!(body.scope, "scope");
+        assert_eq!(body.public_key, TEST_PUBLIC_KEY);
+        net_complete(sent, authorization_form_answer());
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::passportAuthorizationForm(form))
+                if form.id == 1
+                    && form.required_elements.len() == 1
+                    && form.privacy_policy_url == "https://example.com/privacy"
+        ));
+
+        // 1b. the form wire-error band — the promise error passes through
+        td.request(
+            21,
+            Function::getPassportAuthorizationForm(td_api::getPassportAuthorizationForm {
+                bot_user_id: 778,
+                nonce: "n".to_owned(),
+                scope: "s".to_owned(),
+                public_key: TEST_PUBLIC_KEY.to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getAuthorizationForm::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 21);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 2. getPassportAuthorizationFormAvailableElements over form 1 —
+        //    no net query; the promise fails through the collapsed
+        //    [blocked: PasswordManager] secret seam (the C++ parks on the
+        //    PasswordManager actor), and the form stays retryable
+        td.request(
+            2,
+            Function::getPassportAuthorizationFormAvailableElements(
+                td_api::getPassportAuthorizationFormAvailableElements {
+                    authorization_form_id: 1,
+                    password: "pwd".to_owned(),
+                },
+            ),
+        );
+        assert!(rec.sent.lock().is_empty(), "no wire query on this leg");
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "PasswordManager is not implemented yet")
+        );
+
+        // 3. getPassportElement — the C++ sends the wire query before the
+        //    secret request (GetSecureValue::start_up), so the query goes
+        //    out and the promise parks at the secret seam
+        td.request(
+            3,
+            Function::getPassportElement(td_api::getPassportElement {
+                password: "pwd".to_owned(),
+                r#type: Some(
+                    td_api::PassportElementType::passportElementTypeEmailAddress(
+                        td_api::passportElementTypeEmailAddress,
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getSecureValue::ID,
+        );
+        let body =
+            telegram_api::account_getSecureValue::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.types.len(), 1);
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "PasswordManager is not implemented yet")
+        );
+        // the stray wire answer drops — no query parked for it
+        net_complete(sent, empty_secure_values());
+        td.dispatch_completed_secure_net();
+
+        // 4. getAllPassportElements — the same send-then-secret shape
+        td.request(
+            4,
+            Function::getAllPassportElements(td_api::getAllPassportElements {
+                password: "pwd".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getAllSecureValues::ID,
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "PasswordManager is not implemented yet")
+        );
+        net_complete(sent, empty_secure_values());
+        td.dispatch_completed_secure_net();
+
+        // 5. setPassportElement — the save query fires only after the
+        //    secret + uploads (SetSecureValue::loop), so nothing goes out
+        //    while the secret seam is blocked
+        td.request(
+            5,
+            Function::setPassportElement(td_api::setPassportElement {
+                element: Some(
+                    td_api::InputPassportElement::inputPassportElementEmailAddress(
+                        td_api::inputPassportElementEmailAddress {
+                            email_address: "user@example.com".to_owned(),
+                        },
+                    ),
+                ),
+                password: "pwd".to_owned(),
+            }),
+        );
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the save query waits for the secret"
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "PasswordManager is not implemented yet")
+        );
+
+        // 6. deletePassportElement — the full round trip
+        td.request(
+            6,
+            Function::deletePassportElement(td_api::deletePassportElement {
+                r#type: Some(
+                    td_api::PassportElementType::passportElementTypeEmailAddress(
+                        td_api::passportElementTypeEmailAddress,
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_deleteSecureValue::ID,
+        );
+        let body =
+            telegram_api::account_deleteSecureValue::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.types.len(), 1);
+        net_complete(sent, bool_true());
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 6b. the delete wire-error band
+        td.request(
+            26,
+            Function::deletePassportElement(td_api::deletePassportElement {
+                r#type: Some(td_api::PassportElementType::passportElementTypePhoneNumber(
+                    td_api::passportElementTypePhoneNumber,
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_deleteSecureValue::ID,
+        );
+        net_fail(sent, 400, "SECURE_VALUE_EMPTY");
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 26);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "SECURE_VALUE_EMPTY")
+        );
+
+        // 8. getPreferredCountryLanguage — the full round trip
+        td.request(
+            8,
+            Function::getPreferredCountryLanguage(td_api::getPreferredCountryLanguage {
+                country_code: "us".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPassportConfig::ID,
+        );
+        let body =
+            telegram_api::help_getPassportConfig::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0);
+        net_complete(
+            sent,
+            passport_config_answer("{\"US\":\"en\",\"DE\":\"de\"}"),
+        );
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::text(text)) if text.text == "en"
+        ));
+
+        // 8b. the missing-country band — the C++ nullptr answers the 404
+        //     Not Found rewrite
+        td.request(
+            28,
+            Function::getPreferredCountryLanguage(td_api::getPreferredCountryLanguage {
+                country_code: "XX".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPassportConfig::ID,
+        );
+        net_complete(sent, passport_config_answer("{\"US\":\"en\"}"));
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 28).first(),
+            Some(Object::error(error)) if error.code == 404 && error.message == "Not Found"
+        ));
+
+        // 9. sendPassportAuthorizationForm over form 1 — seed the email
+        //    credentials in the value cache first (the manager API the
+        //    decrypt intakes fill), then the full accept round trip
+        //    including the RSA credentials envelope
+        let secret = crate::secure_storage::Secret::create_new();
+        td.with_secure_manager(|env, manager| {
+            let value = crate::secure_value::SecureValue {
+                type_: crate::secure_value::SecureValueType::EmailAddress,
+                data: "user@example.com".to_owned(),
+                ..crate::secure_value::SecureValue::default()
+            };
+            let encrypted = crate::secure_value::encrypt_secure_value(env, &secret, &value);
+            let decrypted =
+                match crate::secure_value::decrypt_secure_value(env, &secret, &encrypted) {
+                    tdutils::status::Result::Ok(value) => value,
+                    tdutils::status::Result::Err(error) => {
+                        panic!("the seeded credentials: {error}")
+                    }
+                };
+            manager.on_get_secure_value(decrypted);
+        });
+        td.request(
+            9,
+            Function::sendPassportAuthorizationForm(td_api::sendPassportAuthorizationForm {
+                authorization_form_id: 1,
+                types: vec![
+                    td_api::PassportElementType::passportElementTypeEmailAddress(
+                        td_api::passportElementTypeEmailAddress,
+                    ),
+                ],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_acceptAuthorization::ID,
+        );
+        let body =
+            telegram_api::account_acceptAuthorization::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.bot_id, 777);
+        assert_eq!(body.scope, "scope");
+        assert_eq!(body.value_hashes.len(), 1);
+        let credentials = body.credentials.expect("the RSA envelope");
+        assert_eq!(credentials.secret.len(), 256, "the modulus-sized secret");
+        assert!(!credentials.data.is_empty());
+        net_complete(sent, bool_true());
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 7. setPassportElementErrors — the bot-only family runs last
+        //    (the forced bot flag closes the user-only arms above): the
+        //    non-bot 400 band first
+        td.request(
+            27,
+            Function::setPassportElementErrors(td_api::setPassportElementErrors {
+                user_id: 555,
+                errors: Vec::new(),
+            }),
+        );
+        let error = error_of(&callback, 27);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Only bots can use the method")
+        );
+        // then the bot-mode full round trip: the bot env resolves the
+        // input user without an access hash (get_input_user's bot band)
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            7,
+            Function::setPassportElementErrors(td_api::setPassportElementErrors {
+                user_id: 555,
+                errors: vec![td_api::InputPassportElementError {
+                    r#type: Some(td_api::PassportElementType::passportElementTypeAddress(
+                        td_api::passportElementTypeAddress,
+                    )),
+                    message: "Bad address".to_owned(),
+                    source: Some(
+                        td_api::InputPassportElementErrorSource::inputPassportElementErrorSourceDataField(
+                            td_api::inputPassportElementErrorSourceDataField {
+                                field_name: "city".to_owned(),
+                                data_hash: vec![1, 2, 3],
+                            },
+                        ),
+                    ),
+                }],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::users_setSecureValueErrors::ID,
+        );
+        let body =
+            telegram_api::users_setSecureValueErrors::parse(sent.query()).expect("the sent body");
+        match &body.id {
+            Some(telegram_api::InputUser::inputUser(user)) => {
+                assert_eq!(user.user_id, 555);
+                assert_eq!(user.access_hash, 0);
+            }
+            other => panic!("the input user: {other:?}"),
+        }
+        assert_eq!(body.errors.len(), 1);
+        match &body.errors[0] {
+            telegram_api::SecureValueError::secureValueErrorData(error) => {
+                assert_eq!(error.field, "city");
+                assert_eq!(error.data_hash, vec![1, 2, 3]);
+            }
+            other => panic!("the wire error: {other:?}"),
+        }
+        net_complete(sent, bool_true());
+        td.dispatch_completed_secure_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.secure_net_completed.lock().is_empty(), "drained");
+        let stray_count = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .filter(|query| {
+                ![
+                    telegram_api::account_getAuthorizationForm::ID,
+                    telegram_api::account_getSecureValue::ID,
+                    telegram_api::account_getAllSecureValues::ID,
+                    telegram_api::account_deleteSecureValue::ID,
+                    telegram_api::users_setSecureValueErrors::ID,
+                    telegram_api::help_getPassportConfig::ID,
+                    telegram_api::account_acceptAuthorization::ID,
+                ]
+                .contains(&query.tl_constructor())
+            })
+            .count();
+        assert_eq!(stray_count, 0, "no stray queries");
     }
 
     #[test]

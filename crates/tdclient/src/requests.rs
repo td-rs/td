@@ -83,7 +83,8 @@ const NOT_IMPLEMENTED_YET: &str = "TDLib function is not implemented yet";
 /// `user_env!` to keep the field-disjoint borrows (the M.12 file plane
 /// rides its `Arc` clone).
 macro_rules! secure_env {
-    ($td:expr) => {
+    ($td:expr) => {{
+        let net = $td.secure_net();
         crate::td::SecureEnv {
             global: &mut $td.global,
             options: $td
@@ -95,8 +96,9 @@ macro_rules! secure_env {
             file_manager: std::sync::Arc::clone(&$td.file_manager),
             file_load_manager: std::sync::Arc::clone(&$td.file_load_manager),
             close_flag: $td.close_flag != 0,
+            net,
         }
-    };
+    }};
 }
 
 macro_rules! user_env {
@@ -4413,11 +4415,6 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 }
             }
         }
-        Function::setPassportElementErrors(_) => {
-            // the passport plane (the Wave-3 SecureManager slice)
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
-        }
-
         // --- the AnimationsManager arm set (M.20): Requests.cpp:1793-1830.
         // The saved-animations ring answers offline; the GetSavedGifsQuery/
         // SaveGifQuery tails are the [blocked: net] env seams and park the
@@ -6031,8 +6028,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 crate::messages_manager::DialogListId::from_chat_list(request.chat_list.as_ref());
             // the deferred form: the task settles it exactly where the
             // C++ task_promise does (both the ok and the error bands)
-            let promise =
-                td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
+            let promise = td.deferred_promise::<crate::td_api::Chats, _>(id, Object::chats);
             let mut manager = std::mem::take(&mut td.messages_manager);
             // SAFETY: the state alias is used strictly sequentially inside
             // the callee.
