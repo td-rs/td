@@ -584,7 +584,7 @@ pub trait UpdatesSink {
         pts: i32,
         pts_count: i32,
         promise: Promise<()>,
-        source: &str,
+        source: &'static str,
     );
     /// `MessagesManager::on_update_message_id`; returns whether the
     /// random_id was known (C++ logs the container again on `false`).
@@ -7359,7 +7359,7 @@ mod tests {
             pts: i32,
             pts_count: i32,
             _promise: Promise<()>,
-            _source: &str,
+            _source: &'static str,
         ) {
             let peer_id = match peer {
                 Some(telegram_api::Peer::peerChannel(channel)) => channel.channel_id,
@@ -9376,7 +9376,7 @@ mod tests {
             _pts: i32,
             _pts_count: i32,
             _promise: Promise<()>,
-            _source: &str,
+            _source: &'static str,
         ) {
         }
     }

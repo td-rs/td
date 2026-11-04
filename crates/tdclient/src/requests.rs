@@ -17379,9 +17379,10 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
         Function::getGiveawayInfo(request) => {
             // Requests.cpp:9087-9091 → Premium.cpp:720-725: the
             // `get_giveaway_message_id` band (the giveaway-message
-            // lookup, MessagesManager.cpp:36676) rides the M.10
-            // get_message_force seam; the payments.getGiveawayInfo query
-            // parks in the premium manager.
+            // lookup, MessagesManager.cpp:36676) rides the M.10.19
+            // get_message_force seam (net-drain 24); the
+            // payments.getGiveawayInfo query parks in the premium
+            // manager.
             if !check_is_user(td, id) {
                 return;
             }

@@ -209,11 +209,26 @@ pub(crate) struct TdSink {
     /// are the unported receive planes).
     pub(crate) after_get_difference_marks_load: bool,
     /// `MessagesManager::on_update_channel_too_long`
-    /// (MessagesManager.cpp:4667-4685, the b4d436d2e shape) — the hops
-    /// record here; the drain runs the collapsed ladder (no immediate
-    /// dialog creation — the pts read and the difference send are the
-    /// db/net seams).
+    /// (MessagesManager.cpp:4667-4712, the b4d436d2e shape) — the hops
+    /// record here; the drain runs the real ladder (M.10.19).
     pub(crate) channel_too_long: Vec<tdmtproto::telegram_api::updateChannelTooLong>,
+    /// `MessagesManager::add_pending_channel_update`
+    /// (MessagesManager.cpp:5679) — the channel-pts machine runs at the
+    /// sink's batching boundary: the tuple parks here, the drain runs
+    /// the ported machine (the gap detector of the M.10.19 design note).
+    pub(crate) pending_channel_updates: Vec<ChannelDifferencePendingUpdate>,
+}
+
+/// One parked channel-pts update — the drain's
+/// `add_pending_channel_update` input (the C++ `const char *source`
+/// contract: callers pass literals).
+pub(crate) struct ChannelDifferencePendingUpdate {
+    dialog_id: crate::messages_manager::DialogId,
+    update: crate::updates_manager::PendingUpdate,
+    pts: i32,
+    pts_count: i32,
+    promise: tdutils::promise::Promise<()>,
+    source: &'static str,
 }
 
 /// One `on_update(updateWallet...)` hop — the C++ arm set routed to the
@@ -521,23 +536,31 @@ impl UpdatesSink for TdSink {
         self.new_messages.push((message, "get_difference"));
     }
     /// `MessagesManager::add_pending_channel_update` — the channel-pts
-    /// machine's applied updates ride the same collector. The port's
-    /// collapsed receive path already creates the dialog for a new
-    /// channel message (`add_dialog_for_new_message` in `create_message`,
-    /// the 03ba555d1 behavior); the pts-gap ladder (the `pts < new_pts`
-    /// advancing check, `get_channel_difference` and the
-    /// `need_update_dialog_pos` form of the case-4 add) is the [blocked:
-    /// net] channel-pts seam.
+    /// machine parks here and the drain runs the ported ladder (M.10.19):
+    /// the gap detection, the postpone map and the force-first difference
+    /// run at the sink's batching boundary (same actor turn, one flush).
     fn add_pending_channel_update(
         &mut self,
-        _peer: Option<tdmtproto::telegram_api::Peer>,
+        peer: Option<tdmtproto::telegram_api::Peer>,
         update: PendingUpdate,
-        _pts: i32,
-        _pts_count: i32,
-        _promise: Promise<()>,
-        _source: &str,
+        pts: i32,
+        pts_count: i32,
+        promise: Promise<()>,
+        source: &'static str,
     ) {
-        self.process_pts_update(update);
+        let dialog_id = match peer.as_ref() {
+            Some(peer) => crate::messages_manager::DialogId::from_peer(peer),
+            None => crate::messages_manager::DialogId::default(),
+        };
+        self.pending_channel_updates
+            .push(ChannelDifferencePendingUpdate {
+                dialog_id,
+                update,
+                pts,
+                pts_count,
+                promise,
+                source,
+            });
     }
     /// `MessagesManager::on_update_dialog_is_marked_as_unread` — the
     /// marked-as-unread intake (UpdatesManager.cpp:4096-4106): the
@@ -2193,6 +2216,170 @@ impl crate::messages_manager::ReadStateContext for Td {
 
 /// The reactions half of the receive adapter: the banned-chat read is the
 /// ChatManager status cache, false until that receive slice lands.
+/// The Td-side [`crate::messages_manager::ChannelDifferenceContext`]
+/// adapter — the M.10.19 ladder's cross-manager reads and sends (the
+/// C++ `td_->chat_manager_`/`dialog_manager_`/`updates_manager_` surfaces
+/// plus the query dispatch). Runs over the split-context alias pair — the
+/// impl must never touch `messages_manager` (the ladder owns it as a
+/// separate alias).
+impl crate::messages_manager::ChannelDifferenceContext for Td {
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn close_flag(&self) -> bool {
+        self.close_flag != 0
+    }
+
+    fn ignore_background_updates(&self) -> bool {
+        self.can_ignore_background_updates && self.auth_manager.is_authorized()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+
+    fn get_input_channel(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<telegram_api::InputChannel> {
+        let options = self.option_manager.as_mut()?;
+        let env = UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        self.chat_manager.get_input_channel(&env, channel_id)
+    }
+
+    fn have_input_peer_read(&mut self, dialog_id: crate::messages_manager::DialogId) -> bool {
+        crate::dialog_manager::get_input_peer(
+            self,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        )
+        .is_some()
+    }
+
+    fn have_channel(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.have_channel(channel_id)
+    }
+
+    fn have_min_channel(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.have_min_channel(channel_id)
+    }
+
+    fn is_channel_member(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_status(channel_id).is_member()
+    }
+
+    fn schedule_get_difference(&mut self, source: &str) {
+        let net = self.updates_net();
+        let mut env = TdUpdatesEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("the ladder runs on the initialized td"),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+            net,
+        };
+        self.updates_manager
+            .schedule_get_difference(&mut env, source);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let options = self.option_manager.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            self.user_manager.on_get_users(&mut env, users, source);
+        }
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let options = self.option_manager.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            self.chat_manager
+                .on_get_chats(&mut self.user_manager, &mut env, chats, source);
+        }
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        status: &tdutils::status::Status,
+        source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error(&self.global, dialog_id, status, source);
+    }
+
+    fn force_create_dialog(&mut self, dialog_id: crate::messages_manager::DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self, dialog_id, source);
+    }
+
+    fn send_get_channel_difference_query(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        input_channel: telegram_api::InputChannel,
+        pts: i32,
+        limit: i32,
+        force: bool,
+    ) {
+        // `GetChannelDifferenceQuery::send` (MessagesManager.cpp:2247-2253)
+        // — the kind carries the handler's dialog/pts/limit state
+        match self.messages_net() {
+            Some(net) => net.dispatch(
+                crate::messages_manager::MessagesNetKind::GetChannelDifference {
+                    dialog_id,
+                    pts,
+                    limit,
+                },
+                telegram_api::Function::updates_getChannelDifference(
+                    telegram_api::updates_getChannelDifference {
+                        flags: 0,
+                        force,
+                        channel: Some(input_channel),
+                        filter: Some(
+                            telegram_api::ChannelMessagesFilter::channelMessagesFilterEmpty(
+                                telegram_api::channelMessagesFilterEmpty,
+                            ),
+                        ),
+                        pts,
+                        limit,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!(
+                    "Send updates.getChannelDifference for {dialog_id:?} — [net-inert]"
+                );
+            }
+        }
+    }
+
+    fn process_channel_update(&mut self, update: crate::updates_manager::PendingUpdate) {
+        // the sink's applied-update switch — the collectors drain at the
+        // answer tail (`drain_sink` after the routing)
+        self.updates_manager.sink().process_pts_update(update);
+    }
+}
+
 /// The Td-side [`crate::messages_manager::SendMessageContext`] adapter —
 /// the M.10.20 dispatch flip. The real reads are the Td-owned surfaces
 /// (clock, auth, the messages_manager registry); the manager-facade reads
@@ -3069,6 +3256,12 @@ pub(crate) type ChatNetHandle = NetKindHandle<crate::chat_manager::ChatNetKind>;
 /// The cloned dialog dispatch surface (the `DialogManager::net` handle);
 /// the answers drain through [`Td::dispatch_completed_dialog_net`].
 pub(crate) type DialogNetHandle = NetKindHandle<crate::dialog_manager::DialogNetKind>;
+
+/// The messages-plane in-flight query kinds —
+/// [`crate::messages_manager::MessagesNetKind`] (the
+/// `GetChannelDifferenceQuery` ladder round, MessagesManager.cpp:2240).
+/// The answers drain through [`Td::dispatch_completed_messages_net`].
+pub(crate) type MessagesNetHandle = NetKindHandle<crate::messages_manager::MessagesNetKind>;
 
 /// The cloned bot-info dispatch surface the [`BotInfoEnv`] senders use —
 /// the answers drain through [`Td::dispatch_completed_bot_info_net`].
@@ -4039,6 +4232,10 @@ pub struct Td {
     /// halves of the §3.6 families — the
     /// [`Td::on_star_gift_net_answer`] drain).
     star_gift_net_completed: Arc<Mutex<Vec<(crate::star_gift_manager::StarGiftNetKind, NetQuery)>>>,
+    /// The messages-plane completed answers (the
+    /// `GetChannelDifferenceQuery` ResultHandler halves) — drained by
+    /// `dispatch_completed_messages_net`.
+    messages_net_completed: Arc<Mutex<Vec<(crate::messages_manager::MessagesNetKind, NetQuery)>>>,
     /// The callback-parked payments answers (the C++ ResultHandler
     /// halves of the net-drain 23 families — the
     /// [`Td::on_payments_net_answer`] drain).
@@ -4525,6 +4722,7 @@ impl Td {
             bot_info_net_completed: Arc::new(Mutex::new(Vec::new())),
             story_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_gift_net_completed: Arc::new(Mutex::new(Vec::new())),
+            messages_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_completed: Arc::new(Mutex::new(Vec::new())),
             payments_net_pending: crate::payments::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -6345,6 +6543,15 @@ impl Td {
         {
             expire_time = updates_deadline;
         }
+        // The messages ladder's channel-difference deadlines (M.10.19):
+        // the C++ ChannelGetDifferenceRetryTimeout/
+        // ChannelGetDifferenceTimeout MultiTimeouts.
+        if let Some(ladder_deadline) =
+            crate::messages_manager::next_channel_difference_deadline(&self.messages_manager)
+            && (expire_time == 0.0 || ladder_deadline < expire_time)
+        {
+            expire_time = ladder_deadline;
+        }
         // The StorageManager's auto-gc window joins it too (M.12.10 T.8):
         // the fire re-checks `auto_gc_due` like the C++ actor timeout.
         if let Some(storage_gc_deadline) = self.next_storage_gc_deadline()
@@ -6803,6 +7010,7 @@ impl Td {
         self.dispatch_completed_payments_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
+        self.dispatch_completed_messages_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -7024,6 +7232,18 @@ impl Td {
         Some(StarGiftNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.star_gift_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned messages-plane dispatch surface (the M.10.19 ladder's
+    /// `GetChannelDifferenceQuery` send leg). The handle is Td-held (not
+    /// manager-held): the ladder runs over the split-context alias pair,
+    /// so the send arm must not touch `messages_manager`.
+    pub(crate) fn messages_net(&self) -> Option<MessagesNetHandle> {
+        Some(MessagesNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.messages_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17277,6 +17497,91 @@ impl Td {
         }
     }
 
+    /// Drain the callback-parked messages-plane answers — the C++
+    /// `GetChannelDifferenceQuery::on_result`/`on_error` halves
+    /// (MessagesManager.cpp:2257-2275).
+    fn dispatch_completed_messages_net(&mut self) {
+        let completed = std::mem::take(&mut *self.messages_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_messages_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one messages-plane net answer by kind — the answer parses
+    /// at the ResultHandler shape, the error head runs
+    /// `on_get_dialog_error` (suppressed only for the log gate), then the
+    /// ladder's `on_get_channel_difference` runs over the split-context
+    /// alias pair.
+    fn on_messages_net_answer(
+        &mut self,
+        kind: crate::messages_manager::MessagesNetKind,
+        query: NetQuery,
+    ) {
+        match kind {
+            // `GetChannelDifferenceQuery` (MessagesManager.cpp:2240-2275)
+            crate::messages_manager::MessagesNetKind::GetChannelDifference {
+                dialog_id,
+                pts,
+                limit,
+            } => {
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    // the `on_error` head (cpp:2266-2274): the head always
+                    // runs; the error log is gated on head-false && not
+                    // PERSISTENT_TIMESTAMP_INVALID
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetChannelDifferenceQuery",
+                    );
+                    Err(status)
+                } else {
+                    match telegram_api::updates_ChannelDifference::parse(query.ok()) {
+                        Ok(difference) => Ok(difference),
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the updates_getChannelDifference answer",
+                        )),
+                    }
+                };
+                // SAFETY: the alias pair derives from `td_ptr`; the
+                // ladder uses the contexts strictly one at a time
+                // (global/manager/ctxs never alias the same field
+                // simultaneously).
+                let td_ptr = std::ptr::from_mut(self);
+                let manager: &mut crate::messages_manager::MessagesManager =
+                    unsafe { &mut (*td_ptr).messages_manager };
+                let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+                let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                    unsafe { &mut *td_ptr };
+                let state: &mut dyn crate::messages_manager::ReadStateContext =
+                    unsafe { crate::td::split_context_alias(td_ptr) };
+                let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                    unsafe { &mut *td_ptr };
+                // SAFETY: as the pair above — the shared-ref contexts
+                // (the C++ `d` reads only).
+                let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+                let reactions_ctx: &dyn crate::messages_manager::DialogReactionsContext =
+                    unsafe { &*td_ptr };
+                crate::messages_manager::on_get_channel_difference(
+                    global,
+                    manager,
+                    msgctx,
+                    state,
+                    sendctx,
+                    reactions_ctx,
+                    cdctx,
+                    dialog_id,
+                    pts,
+                    limit,
+                    result,
+                );
+            }
+        }
+    }
+
     /// Route one auth answer (the two-step `CheckPassword` re-dispatches
     /// inside).
     fn on_auth_answer(
@@ -19185,23 +19490,115 @@ impl Td {
             crate::dialog_manager::load_dialog_marks_as_unread(self);
         }
         // `MessagesManager::on_update_channel_too_long`
-        // (MessagesManager.cpp:4667-4685, b4d436d2e) — no immediate chat
-        // creation: the dialog's pts when known, else the `load_channel_pts`
-        // dialog-db seam (0 offline); the advancing-pts band fires the
-        // `get_channel_difference` net seam.
+        // (MessagesManager.cpp:4683-4712, b4d436d2e) — the real ladder:
+        // the pts gate + `get_channel_difference(force=true)`, or the
+        // `schedule_get_difference` hop for an unknown dialog.
         for too_long in sink.channel_too_long {
             let channel_id = crate::chat_manager::ChannelId::new(too_long.channel_id);
-            let dialog_id = crate::messages_manager::DialogId::from_channel_id(channel_id);
-            let pts = match self.messages_manager.get_dialog(dialog_id) {
-                Some(d) => d.pts,
-                None => 0, // `load_channel_pts` — the dialog-db receive seam
-            };
-            if pts != 0 && (too_long.pts == 0 || too_long.pts > pts) {
-                tdutils::log_info!(
-                    "Get channel difference for {channel_id:?} from {pts} to {} — [blocked: net]",
-                    too_long.pts
-                );
+            if !channel_id.is_valid() {
+                tdutils::log_error!("Receive invalid {channel_id:?} in updateChannelTooLong");
+                continue;
             }
+            // `have_channel_force` — the db-load leg is the dialog-db seam
+            if !self.chat_manager.have_channel(channel_id) {
+                tdutils::log_info!("Skip updateChannelTooLong about unknown {channel_id:?}");
+                continue;
+            }
+            let dialog_id = crate::messages_manager::DialogId::from_channel_id(channel_id);
+            // SAFETY: the alias pair derives from `td_ptr`; the ladder
+            // uses the contexts strictly one at a time.
+            let td_ptr = std::ptr::from_mut(self);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            let have_dialog = manager.get_dialog(dialog_id).is_some();
+            if !have_dialog {
+                let pts = crate::messages_manager::load_channel_pts(global, cdctx, dialog_id);
+                if pts > 0 {
+                    // `add_dialog` carries the loaded pts
+                    manager.add_dialog_for_new_message(dialog_id);
+                    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+                        d.pts = pts;
+                    }
+                }
+            }
+            match manager.get_dialog(dialog_id) {
+                Some(d) if too_long.pts == 0 || too_long.pts > d.pts => {
+                    let pts = d.pts;
+                    crate::messages_manager::get_channel_difference(
+                        global,
+                        manager,
+                        msgctx,
+                        sendctx,
+                        state,
+                        cdctx,
+                        dialog_id,
+                        pts,
+                        too_long.pts,
+                        crate::messages_manager::MessageId::default(),
+                        true,
+                        "on_update_channel_too_long 1",
+                        false,
+                    );
+                }
+                Some(_) => {}
+                // `force_apply` — the update rides getDifference's
+                // force band there (the engine passes false here)
+                None => {
+                    let mut env = {
+                        let net = self.updates_net();
+                        TdUpdatesEnv {
+                            global: &mut self.global,
+                            options: self
+                                .option_manager
+                                .as_mut()
+                                .expect("the ladder runs on the initialized td"),
+                            auth_is_authorized: self.auth_manager.is_authorized(),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                            my_id: self.user_manager.get_my_id().get(),
+                            can_ignore_background_updates: self.can_ignore_background_updates,
+                            net,
+                        }
+                    };
+                    self.updates_manager
+                        .schedule_get_difference(&mut env, "on_update_channel_too_long 3");
+                }
+            }
+        }
+        // `MessagesManager::add_pending_channel_update` — the channel-pts
+        // machine over the parked tuples (the M.10.19 gap detector).
+        for parked in sink.pending_channel_updates {
+            let ChannelDifferencePendingUpdate {
+                dialog_id,
+                update,
+                pts,
+                pts_count,
+                promise,
+                source,
+            } = parked;
+            // SAFETY: as the too-long drain above.
+            let td_ptr = std::ptr::from_mut(self);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            crate::messages_manager::add_pending_channel_update(
+                global, manager, msgctx, sendctx, state, cdctx, dialog_id, update, pts, pts_count,
+                promise, source, false,
+            );
         }
         // the users feed the UserManager container first — the C++
         // `process_updates_users_and_chats` tail (`td_->user_manager_->
@@ -22328,6 +22725,33 @@ impl Actor for Td {
         {
             let (mut env, poll_manager) = poll_env_split(self);
             poll_manager.tick_timeouts(&mut env);
+        }
+        // The messages ladder's channel-difference deadlines (M.10.19):
+        // the retry ladder + the final poll timeout fire the shared
+        // `on_channel_get_difference_timeout` entry over the alias pair.
+        {
+            let now = tdutils::time::now();
+            let due =
+                crate::messages_manager::next_channel_difference_deadline(&self.messages_manager)
+                    .is_some_and(|deadline| deadline <= now);
+            if due {
+                // SAFETY: the alias pair derives from `td_ptr`; the
+                // contexts are used strictly one at a time.
+                let td_ptr = std::ptr::from_mut(self);
+                let manager: &mut crate::messages_manager::MessagesManager =
+                    unsafe { &mut (*td_ptr).messages_manager };
+                let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+                let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                    unsafe { &mut *td_ptr };
+                let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+                let state: &mut dyn crate::messages_manager::ReadStateContext =
+                    unsafe { crate::td::split_context_alias(td_ptr) };
+                let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                    unsafe { &mut *td_ptr };
+                crate::messages_manager::tick_channel_difference_timeouts(
+                    global, manager, msgctx, sendctx, state, cdctx, now,
+                );
+            }
         }
         let actions = self
             .config_manager
@@ -26070,6 +26494,42 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         self.td
             .user_manager
             .get_user_id_object(&mut env, user_id, source)
+    }
+
+    // `MessagesManager::get_giveaway_message_id` (MessagesManager.cpp
+    // :36676-36697) — the M.10.19 force-lookup band over the alias pair
+    // (the memory probe + the message-db load seam + the content/id
+    // bands).
+    fn get_giveaway_message_id(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        message_id: crate::messages_manager::MessageId,
+    ) -> tdutils::status::Result<crate::messages_manager::ServerMessageId> {
+        // SAFETY: the alias pair derives from `td_ptr`; the band uses
+        // the contexts strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self.td);
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let reactions_ctx: &dyn crate::messages_manager::DialogReactionsContext =
+            unsafe { &*td_ptr };
+        match crate::messages_manager::get_giveaway_message_id(
+            global,
+            manager,
+            sendctx,
+            state,
+            reactions_ctx,
+            dialog_id,
+            message_id,
+        ) {
+            std::result::Result::Ok(server_message_id) => {
+                tdutils::status::Result::Ok(server_message_id)
+            }
+            std::result::Result::Err(status) => tdutils::status::Result::Err(status),
+        }
     }
 
     // `GetPremiumPromoQuery::send` (Premium.cpp:321-323).
@@ -45380,6 +45840,419 @@ mod tests {
         );
     }
 
+    /// The M.10.19 ladder over the netted dispatcher: the schedule/tick
+    /// fire, the pts round-trip, the `!final` re-entry, the error bands
+    /// and the too-long resync (the design note's two mechanisms).
+    #[test]
+    fn channel_difference_ladder_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_difference_ladder_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn channel_difference_ladder_rides_the_dispatcher_impl() {
+        use crate::messages_manager::{
+            DialogId, MessageId, ServerMessageId, get_channel_difference,
+            schedule_get_channel_difference, tick_channel_difference_timeouts,
+        };
+        let (mut td, rec) = netted_td("netfix-channel-difference");
+        seed_dialog_channel(&mut td, 1_000_000_000, false, true);
+        let dialog_id =
+            DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1_000_000_000));
+        // the channel dialog with pts 10 — the ladder's read point; the
+        // updateNewChat announcement flag matches the seeded chat object
+        // (the chat-manager receive slice owns the real emission)
+        let seeded_dialog = td.messages_manager.add_dialog_for_new_message(dialog_id);
+        seeded_dialog.pts = 10;
+        seeded_dialog.is_update_new_chat_sent = true;
+
+        // 1. the gap-timeout fire: schedule + the due tick dispatches
+        //    updates.getChannelDifference (the virtual-clock MultiTimeout
+        //    pair joined into the shared alarm slot).
+        {
+            let manager = &mut td.messages_manager;
+            schedule_get_channel_difference(
+                manager,
+                dialog_id,
+                0,
+                MessageId::default(),
+                0.001,
+                tdutils::time::now(),
+                "test",
+            );
+        }
+        // SAFETY: the alias pair derives from `td_ptr`; the ladder uses
+        // the contexts strictly one at a time.
+        {
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            tick_channel_difference_timeouts(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                cdctx,
+                tdutils::time::now() + 0.002,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "one ladder round dispatched");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getChannelDifference::ID
+        );
+        // the constructor + the request shape: force from the d->pts
+        // (on_channel_get_difference_timeout's true), pts 10, limit 100
+        let request = telegram_api::updates_getChannelDifference::parse(sent[0].query()).unwrap();
+        assert!(request.force);
+        assert_eq!(request.pts, 10);
+        assert_eq!(request.limit, 100);
+
+        // 2. the happy path: the paged difference lands the message and
+        //    advances the pts (the gap closes)
+        let mut answer = Vec::new();
+        telegram_api::updates_ChannelDifference::updates_channelDifference(
+            telegram_api::updates_channelDifference {
+                flags: 1 << 10, // FINAL_MASK
+                r#final: true,
+                pts: 12,
+                timeout: 0,
+                new_messages: vec![telegram_api::Message::message(telegram_api::message {
+                    id: 100,
+                    peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 1_000_000_000,
+                    })),
+                    date: 1_700_000_000,
+                    message: "difference".to_string(),
+                    ..telegram_api::message::default()
+                })],
+                other_updates: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_messages_net();
+        assert_eq!(
+            td.messages_manager.get_dialog(dialog_id).map(|d| d.pts),
+            Some(12),
+            "the difference answer advances the pts"
+        );
+        let message_landed = td.messages_manager.get_dialog(dialog_id).is_some_and(|d| {
+            crate::messages_manager::have_message_in_dialog_memory(
+                d,
+                MessageId::from_server_message_id(ServerMessageId::new(100)),
+            )
+        });
+        assert!(message_landed, "the difference message landed");
+        assert!(
+            !td.messages_manager
+                .active_get_channel_differences
+                .contains_key(&dialog_id),
+            "the round closed"
+        );
+        assert_eq!(td.messages_manager.get_channel_difference_count, 0);
+
+        // 3. the `!final` re-entry: a non-final answer re-runs the ladder
+        //    force-first without any timeout (the pagination loop)
+        {
+            let manager = &mut td.messages_manager;
+            schedule_get_channel_difference(
+                manager,
+                dialog_id,
+                0,
+                MessageId::default(),
+                0.001,
+                tdutils::time::now(),
+                "test",
+            );
+        }
+        {
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            tick_channel_difference_timeouts(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                cdctx,
+                tdutils::time::now() + 0.002,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let mut answer = Vec::new();
+        telegram_api::updates_ChannelDifference::updates_channelDifference(
+            telegram_api::updates_channelDifference {
+                flags: 0,
+                r#final: false,
+                pts: 14,
+                timeout: 0,
+                new_messages: vec![telegram_api::Message::message(telegram_api::message {
+                    id: 101,
+                    peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 1_000_000_000,
+                    })),
+                    date: 1_700_000_001,
+                    message: "page".to_string(),
+                    ..telegram_api::message::default()
+                })],
+                other_updates: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_messages_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent.len(),
+            1,
+            "the non-final answer re-entered the ladder immediately"
+        );
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getChannelDifference::ID
+        );
+        let request = telegram_api::updates_getChannelDifference::parse(sent[0].query()).unwrap();
+        assert_eq!(request.pts, 14, "the re-entry runs from the new pts");
+        assert!(request.force);
+        assert_eq!(
+            td.messages_manager.get_dialog(dialog_id).map(|d| d.pts),
+            Some(14)
+        );
+        // close the open round with a final empty difference
+        let mut answer = Vec::new();
+        telegram_api::updates_ChannelDifference::updates_channelDifferenceEmpty(
+            telegram_api::updates_channelDifferenceEmpty {
+                flags: 1 << 10,
+                r#final: true,
+                pts: 14,
+                timeout: 0,
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_messages_net();
+        assert!(
+            td.messages_manager
+                .active_get_channel_differences
+                .is_empty()
+        );
+
+        // 4. the error bands: CHANNEL_INVALID drops without a retry; a
+        //    plain error re-schedules through the backoff ladder
+        {
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            get_channel_difference(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                cdctx,
+                dialog_id,
+                14,
+                0,
+                MessageId::default(),
+                true,
+                "test error band",
+                false,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "CHANNEL_INVALID");
+        td.dispatch_completed_messages_net();
+        assert!(
+            !td.messages_manager
+                .channel_get_difference_retry_deadlines
+                .contains_key(&dialog_id),
+            "CHANNEL_INVALID drops the round without a retry"
+        );
+
+        {
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            get_channel_difference(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                cdctx,
+                dialog_id,
+                14,
+                0,
+                MessageId::default(),
+                true,
+                "test error band",
+                false,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 500, "TIMEOUT");
+        td.dispatch_completed_messages_net();
+        assert_eq!(
+            td.messages_manager
+                .channel_get_difference_retry_timeouts
+                .get(&dialog_id),
+            Some(&2),
+            "the error band armed the doubled backoff (1 -> 2)"
+        );
+        assert!(
+            td.messages_manager
+                .channel_get_difference_retry_deadlines
+                .contains_key(&dialog_id)
+        );
+        // clear the armed retry so the too-long round runs now
+        td.messages_manager
+            .channel_get_difference_retry_deadlines
+            .remove(&dialog_id);
+        td.messages_manager.get_channel_difference_count = 0;
+
+        // 5. the too-long resync: the dialog answer resets the last
+        //    message window and adopts the server pts
+        {
+            let td_ptr = std::ptr::from_mut(&mut td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+            let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+                unsafe { &mut *td_ptr };
+            let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let cdctx: &mut dyn crate::messages_manager::ChannelDifferenceContext =
+                unsafe { &mut *td_ptr };
+            get_channel_difference(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                cdctx,
+                dialog_id,
+                14,
+                0,
+                MessageId::default(),
+                true,
+                "test too long",
+                false,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let mut answer = Vec::new();
+        telegram_api::updates_ChannelDifference::updates_channelDifferenceTooLong(
+            telegram_api::updates_channelDifferenceTooLong {
+                flags: 1 << 10,
+                r#final: true,
+                timeout: 0,
+                dialog: Some(telegram_api::Dialog::dialog(telegram_api::dialog {
+                    flags: 1, // PTS_MASK — the pts field rides flags.0
+                    pinned: false,
+                    unread_mark: false,
+                    view_forum_as_messages: false,
+                    peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 1_000_000_000,
+                    })),
+                    top_message: 300,
+                    read_inbox_max_id: 250,
+                    read_outbox_max_id: 240,
+                    unread_count: 7,
+                    unread_mentions_count: 0,
+                    unread_reactions_count: 0,
+                    unread_poll_votes_count: 0,
+                    notify_settings: None,
+                    pts: 1000,
+                    draft: None,
+                    folder_id: 0,
+                    ttl_period: 0,
+                })),
+                messages: vec![telegram_api::Message::message(telegram_api::message {
+                    id: 300,
+                    peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 1_000_000_000,
+                    })),
+                    date: 1_700_000_002,
+                    message: "too long top".to_string(),
+                    ..telegram_api::message::default()
+                })],
+                chats: Vec::new(),
+                users: Vec::new(),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_messages_net();
+        assert_eq!(
+            td.messages_manager.get_dialog(dialog_id).map(|d| d.pts),
+            Some(1000),
+            "the too-long answer adopts the server pts"
+        );
+        let last_new = td
+            .messages_manager
+            .get_dialog(dialog_id)
+            .map(|d| d.last_new_message_id);
+        assert_eq!(
+            last_new,
+            Some(MessageId::from_server_message_id(ServerMessageId::new(300))),
+            "the too-long resync re-adds the top message as the last new"
+        );
+        assert!(
+            td.messages_manager
+                .get_dialog(dialog_id)
+                .is_some_and(|d| d.is_channel_difference_finished),
+            "the finished flag lands"
+        );
+    }
+
     #[test]
     fn chat_description_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -49949,6 +50822,30 @@ mod tests {
         let server_message_id = crate::messages_manager::MessageId::from_server_message_id(
             crate::messages_manager::ServerMessageId::new(1234),
         );
+        // The §6 row 2 flip (net-drain 24): the giveaway band probes the
+        // message through `get_message_force` before the query goes out —
+        // seed a giveaway message in the user dialog through the real
+        // receive head.
+        td.apply_new_message(
+            &telegram_api::Message::message(telegram_api::message {
+                id: 1234,
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 700000001,
+                })),
+                date: 1_700_000_000,
+                media: Some(Box::new(telegram_api::MessageMedia::messageMediaGiveaway(
+                    telegram_api::messageMediaGiveaway {
+                        channels: vec![1_000_000_000],
+                        quantity: 10,
+                        months: 3,
+                        until_date: 1_800_000_000,
+                        ..telegram_api::messageMediaGiveaway::default()
+                    },
+                ))),
+                ..telegram_api::message::default()
+            }),
+            "test",
+        );
         let (promise, slot) = record_giveaway_info();
         with_premium_manager(&mut td, |manager, env| {
             manager.get_premium_giveaway_info(env, 700000001, server_message_id.get(), promise);
@@ -50029,8 +50926,10 @@ mod tests {
             other => panic!("unexpected giveaway results: {other:?}"),
         }
 
-        // 8. getGiveawayInfo — the missing-peer send arm (the channel
-        //    stub): "Can't access the chat", nothing dispatched.
+        // 8. getGiveawayInfo — the unknown channel answers the force
+        //    lookup first (the C++ order: get_giveaway_message_id runs
+        //    before the peer resolution), so the band is "Message not
+        //    found" and nothing dispatches.
         let (promise, slot) = record_giveaway_info();
         with_premium_manager(&mut td, |manager, env| {
             manager.get_premium_giveaway_info(
@@ -50041,12 +50940,48 @@ mod tests {
             );
         });
         let sent = std::mem::take(&mut *rec.sent.lock());
-        assert!(sent.is_empty(), "no query without the Read peer");
+        assert!(sent.is_empty(), "no query without the giveaway message");
         match slot.lock().unwrap().take() {
             Some(tdutils::status::Result::Err(status)) => {
-                assert_eq!(status.message(), "Can't access the chat");
+                assert_eq!(status.message(), "Message not found");
             }
-            other => panic!("the missing-peer arm: {other:?}"),
+            other => panic!("the missing-message arm: {other:?}"),
+        }
+
+        // 8b. getGiveawayInfo — the wrong-content band: a plain text
+        //     message in the user dialog answers "Message has wrong
+        //     type" (the §6 row 2 content pair).
+        td.apply_new_message(
+            &telegram_api::Message::message(telegram_api::message {
+                id: 1235,
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 700000001,
+                })),
+                date: 1_700_000_001,
+                message: "plain".to_string(),
+                ..telegram_api::message::default()
+            }),
+            "test",
+        );
+        let (promise, slot) = record_giveaway_info();
+        with_premium_manager(&mut td, |manager, env| {
+            manager.get_premium_giveaway_info(
+                env,
+                700000001,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::messages_manager::ServerMessageId::new(1235),
+                )
+                .get(),
+                promise,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert!(sent.is_empty(), "no query for the wrong content");
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Message has wrong type");
+            }
+            other => panic!("the wrong-content arm: {other:?}"),
         }
 
         // 9. checkGiftCode — the creator resolves over the seeded user

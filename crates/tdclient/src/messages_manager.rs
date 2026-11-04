@@ -8743,6 +8743,38 @@ pub struct MessagesManager {
     /// `pending_reactions_` (MessagesManager.h) — the in-flight reaction
     /// query counts, collapsed to the counter the C++ record carries.
     pub(crate) pending_reactions: HashMap<MessageFullId, i32>,
+    /// `channel_get_difference_retry_timeouts_` (MessagesManager.h:3427)
+    /// — the per-dialog backoff delay (seconds; 0 = none).
+    pub(crate) channel_get_difference_retry_timeouts: HashMap<DialogId, i32>,
+    /// `channel_get_difference_retry_timeout_` (MultiTimeout,
+    /// MessagesManager.h:3429) — the retry ladder's virtual-clock
+    /// deadline view (dialog → absolute time).
+    pub(crate) channel_get_difference_retry_deadlines: HashMap<DialogId, f64>,
+    /// `channel_get_difference_timeout_` (MultiTimeout,
+    /// MessagesManager.h:3428) — the final poll timeout's deadline view
+    /// (the server `timeout` seconds re-run for open dialogs).
+    pub(crate) channel_get_difference_deadlines: HashMap<DialogId, f64>,
+    /// `active_get_channel_differences_` (MessagesManager.h:3420) — the
+    /// in-flight rounds (dialog → source).
+    pub(crate) active_get_channel_differences: HashMap<DialogId, &'static str>,
+    /// `pending_get_channel_differences_` (MessagesManager.h:3424) — the
+    /// queued rounds.
+    pub(crate) pending_get_channel_differences:
+        std::collections::VecDeque<PendingGetChannelDifference>,
+    /// `get_channel_difference_count_` (MessagesManager.h:3418) — the
+    /// in-flight count behind the 10-round concurrency cap.
+    pub(crate) get_channel_difference_count: i32,
+    /// `postponed_channel_updates_` (MessagesManager.h:3410) — the
+    /// pts-ordered park (the std::map collapse).
+    pub(crate) postponed_channel_updates:
+        HashMap<DialogId, std::collections::BTreeMap<i32, PostponedChannelUpdate>>,
+    /// `expected_channel_pts_` (MessagesManager.h:3425).
+    pub(crate) expected_channel_pts: HashMap<DialogId, i32>,
+    /// `expected_channel_max_message_id_` (MessagesManager.h:3426).
+    pub(crate) expected_channel_max_message_id: HashMap<DialogId, MessageId>,
+    /// `is_channel_difference_finished_` (MessagesManager.h:3422) — the
+    /// no-dialog form (the Dialog field covers the rest).
+    pub(crate) is_channel_difference_finished: HashSet<DialogId>,
 }
 
 /// `MessagesManager::PendingMessageGroupSend` (MessagesManager.h:3326-3332).
@@ -14779,8 +14811,9 @@ pub fn get_messages_object(
 //   NotificationManager sends (M.13 integration).
 // - Server legs — `read_all_dialog_mentions_on_server` /
 //   `read_all_topic_mentions_on_server` (MessageQueryManager),
-//   `repair_server_unread_count`'s delayed `send_get_dialog_query`,
-//   `schedule_get_channel_difference` — [blocked: net], seam-logged.
+//   `repair_server_unread_count`'s delayed `send_get_dialog_query` —
+//   seam-logged; `schedule_get_channel_difference` rides the M.10.19
+//   ladder.
 // - `ttl_read_history` (MessagesManager.cpp:10229) — the SecretChats track;
 //   the computed view date is seam-logged.
 // - the admined-monoforum read walk inside the inbox setter
@@ -17844,12 +17877,17 @@ fn read_history_inbox_dialog(
     }
 
     if max_message_id > last_new_message_id && dialog_id.get_type() == DialogType::Channel {
-        // `schedule_get_channel_difference(dialog_id, 0, max_message_id, 0.001, ...)` —
-        // [blocked: net], the difference engine's
-        tracing::info!(
-            "schedule_get_channel_difference seam: dialog {:?} up to {} from read_history_inbox",
+        // `schedule_get_channel_difference(dialog_id, 0, max_message_id,
+        // 0.001, "read_history_inbox")` (MessagesManager.cpp:9583) — the
+        // M.10.19 ladder arm
+        schedule_get_channel_difference(
+            manager,
             dialog_id,
-            DisplayMessageId(max_message_id)
+            0,
+            max_message_id,
+            0.001,
+            ctx.now(),
+            "read_history_inbox",
         );
     }
 
@@ -27023,7 +27061,18 @@ pub fn on_get_message_full(
                     DisplayMessageId(message_id),
                     source
                 );
-                // schedule_get_channel_difference — the net seam
+                // `schedule_get_channel_difference(dialog_id, 0,
+                // message_id, 0.001, "on_get_message")`
+                // (MessagesManager.cpp:11964) — the M.10.19 ladder arm
+                schedule_get_channel_difference(
+                    manager,
+                    dialog_id,
+                    0,
+                    message_id,
+                    0.001,
+                    ctx.now(),
+                    "on_get_message",
+                );
                 return MessageFullId::default();
             }
         }
@@ -32254,6 +32303,2235 @@ pub fn set_paid_message_reaction_type(
         true,
         "toggle_paid_message_reaction_is_anonymous",
     );
+}
+
+// ---------------------------------------------------------------------------
+// M.10.19 — the channel-difference ladder (`schedule_get_channel_difference`,
+// `get_channel_difference`, `GetChannelDifferenceQuery`,
+// `on_get_channel_difference`, `on_get_channel_dialog`,
+// `add_pending_channel_update`) — net-drain 24 / #33.
+//
+// OWN DESIGN NOTE (REMAINING_WORK §3.8) — the ladder's two load-bearing
+// mechanisms and their Rust shape:
+//
+// 1. **Gap detection** runs at two levels, both over the same
+//    `Dialog::pts` + the persisted `ch.p{channel_id}` binlog-pmc row.
+//    - *Intake-side* (`add_pending_channel_update`, MessagesManager.cpp
+//      5679-5830): every channel-pts update checks
+//      `old_pts == new_pts - pts_count` (with the `old_pts == 0` first-
+//      update seed). A mismatch is a gap: the update parks on the
+//      per-dialog `postponed_channel_updates` pts-ordered map and the
+//      ladder runs force-first (`get_channel_difference(old_pts, ...,
+//      force=true, "PTS mismatch")`) when the dialog is opened/member/
+//      sponsored — otherwise the update drops (the C++ promise
+//      completes). Updates arriving while a difference runs park the
+//      same way. The parked map drains inside `after_get_channel_difference`
+//      (pts order, promises completing) — and the drain re-enters the
+//      machine via `add_pending_channel_update(..., is_postponed_update
+//      = true)`, exactly the C++ loop.
+//    - *Answer-side* (`after_get_channel_difference`, MessagesManager.cpp
+//      35571-35586): the schedule sites park their expectations
+//      (`expected_channel_pts`/`expected_channel_max_message_id`); when a
+//      successful difference still hasn't reached them, the ladder
+//      re-schedules at the fixed 1.0s delay (cpp:35575/35583).
+//    The intake machine runs at the sink's batching boundary: the
+//    `TdSink::add_pending_channel_update` arm parks the tuple and the
+//    `drain_sink` tail runs the ported machine below (the collectors
+//    convention — same actor turn, one flush point).
+// 2. **Too-long re-entry** (`updates_channelDifferenceTooLong`, cpp
+//      35352-35436): the server says "your pts is too far behind; here is
+//      the dialog resync" — the arm answers through the ported
+//      `on_get_channel_dialog` (the database-id reset legs + the
+//      last-new-message reset + the read-counter tail over the M.10.7
+//      setters) and then `set_channel_pts`. The *pagination loop* is the
+//      shared re-entry: every non-`final` answer re-runs
+//      `get_channel_difference(d->pts, ..., force=true)` (cpp:35448),
+//      with the active-map + the pending queue (max 10 concurrent,
+//      cpp:34903) serializing the rounds; the final arm arms the poll
+//      timeout (server `timeout` seconds) for open dialogs. Error
+//      answers re-schedule through the doubled backoff ladder
+//      (`channel_get_difference_retry_timeouts`, 1s doubling capped at
+//      Random(60, 80), cpp:35210-35220).
+//
+// Timeout shape: the C++ `channel_get_difference_retry_timeout_`/
+// `channel_get_difference_timeout_` MultiTimeout pair becomes two
+// virtual-clock deadline maps on the manager (`*_deadlines`), joined into
+// the Td shared alarm slot; both fire the same `on_channel_get_difference_timeout`
+// entry (MessagesManager.cpp:34752).
+//
+// Seams kept (their owning planes): the `GetChannelDifferenceLogEvent`
+// binlog add/erase pair (the restart-safety slice), the notification
+// `before/after_get_chat_difference` pair (M.13), the
+// `postponed_chat_read_inbox_updates_` map + `run_after_get_channel_difference_`
+// promises + `pending_channel_on_get_dialogs_` (the dialogs plane,
+// M.10.12+), `load_last_dialog_message` (M.10.15), the folder/view-as-messages/
+// notify-settings/draft/pin resync setters of the too-long arm (the
+// dialog-list/drafts/notification-settings slices), `repair_channel_server_unread_count`'s
+// `send_get_dialog_query` tail (cpp:9445+), and the `get_message_from_server`
+// dependency-repair refire (the message-query plane, §3.9).
+// ---------------------------------------------------------------------------
+
+/// `MIN_CHANNEL_DIFFERENCE` (MessagesManager.h:1676).
+const MIN_CHANNEL_DIFFERENCE: i32 = 1;
+/// `MAX_CHANNEL_DIFFERENCE` (MessagesManager.h:1677).
+const MAX_CHANNEL_DIFFERENCE: i32 = 100;
+/// `MAX_BOT_CHANNEL_DIFFERENCE` (MessagesManager.h:1678) — the server-side
+/// limit.
+const MAX_BOT_CHANNEL_DIFFERENCE: i32 = 100_000;
+/// `MAX_CONCURRENT_GET_CHANNEL_DIFFERENCES`
+/// (MessagesManager.cpp:34902).
+const MAX_CONCURRENT_GET_CHANNEL_DIFFERENCES: i32 = 10;
+
+/// `MessagesManager::PendingGetChannelDifference`
+/// (MessagesManager.h:3415-3423) — the queued difference round.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingGetChannelDifference {
+    pub dialog_id: DialogId,
+    pub pts: i32,
+    pub limit: i32,
+    pub force: bool,
+    pub input_channel: telegram_api::InputChannel,
+    pub source: &'static str,
+}
+
+/// `MessagesManager::PostponedChannelUpdate` (MessagesManager.h:3410-3413)
+/// — a channel-pts update parked behind a gap or a running difference;
+/// the map is pts-ordered (the `std::map<int32, …>` collapse), so the
+/// drain applies the updates strictly in pts order.
+pub(crate) struct PostponedChannelUpdate {
+    pub update: crate::updates_manager::PendingUpdate,
+    pub pts: i32,
+    pub pts_count: i32,
+    pub promise: tdutils::promise::Promise<()>,
+}
+
+impl std::fmt::Debug for PostponedChannelUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // the promise has no Debug payload — the pts pair carries the log
+        f.debug_struct("PostponedChannelUpdate")
+            .field("pts", &self.pts)
+            .field("pts_count", &self.pts_count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The messages-plane in-flight query kinds (the C++ ResultHandler classes
+/// whose sends ride the messages manager). `GetChannelDifferenceQuery`
+/// (MessagesManager.cpp:2240-2275) — the kind carries the handler's
+/// `dialog_id_`/`pts_`/`limit_` state the answer half feeds into
+/// `on_get_channel_difference`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MessagesNetKind {
+    /// `GetChannelDifferenceQuery` — the `updates.getChannelDifference`
+    /// ladder round; the answer drains through
+    /// `Td::on_messages_net_answer`.
+    GetChannelDifference {
+        dialog_id: DialogId,
+        pts: i32,
+        limit: i32,
+    },
+}
+
+/// The M.10.19 context plane — the cross-manager reads and sends the
+/// channel-difference ladder makes through `Td *` in the C++. The real
+/// wiring is the Td-side impl; the tests answer from fixtures.
+pub trait ChannelDifferenceContext {
+    /// `Time::now()` — the ladder's clock (the deadline math).
+    fn now(&self) -> f64;
+    /// `G()->unix_time()`.
+    fn unix_time(&self) -> i32;
+    /// `G()->close_flag()`.
+    fn close_flag(&self) -> bool;
+    /// `td_->ignore_background_updates()` (Td.cpp) — the persistent-pts
+    /// gate.
+    fn ignore_background_updates(&self) -> bool;
+    /// `td_->auth_manager_->is_bot()`.
+    fn is_bot(&self) -> bool;
+    /// `td_->chat_manager_->get_input_channel(channel_id)`
+    /// (ChatManager.cpp) — the send-leg peer resolution.
+    fn get_input_channel(&mut self, channel_id: ChannelId) -> Option<telegram_api::InputChannel>;
+    /// `td_->dialog_manager_->have_input_peer(dialog_id, false,
+    /// AccessRights::Read)` — the read gate.
+    fn have_input_peer_read(&mut self, dialog_id: DialogId) -> bool;
+    /// `td_->chat_manager_->have_channel(channel_id)`.
+    fn have_channel(&self, channel_id: ChannelId) -> bool;
+    /// `td_->chat_manager_->have_min_channel(channel_id)`.
+    fn have_min_channel(&self, channel_id: ChannelId) -> bool;
+    /// `td_->chat_manager_->get_channel_status(channel_id).is_member()`.
+    fn is_channel_member(&self, channel_id: ChannelId) -> bool;
+    /// `td_->updates_manager_->schedule_get_difference(source)`
+    /// (UpdatesManager.cpp:1335) — the min-channel hop.
+    fn schedule_get_difference(&mut self, source: &str);
+    /// `td_->user_manager_->on_get_users(users, source)`.
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str);
+    /// `td_->chat_manager_->on_get_chats(chats, source)`.
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str);
+    /// `td_->dialog_manager_->on_get_dialog_error(dialog_id, status,
+    /// source)` — the ResultHandler `on_error` head.
+    fn on_get_dialog_error(&mut self, dialog_id: DialogId, status: &Status, source: &str);
+    /// `td_->dialog_manager_->force_create_dialog(dialog_id, source)`
+    /// (DialogManager.cpp:1540).
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str);
+    /// `GetChannelDifferenceQuery::send` (MessagesManager.cpp:2247-2253)
+    /// — the dispatch arm over the manager-held net handle.
+    fn send_get_channel_difference_query(
+        &mut self,
+        dialog_id: DialogId,
+        input_channel: telegram_api::InputChannel,
+        pts: i32,
+        limit: i32,
+        force: bool,
+    );
+    /// `MessagesManager::process_channel_update`
+    /// (MessagesManager.cpp:5909) — the applied-update switch rides the
+    /// sink's collectors (drained at the answer's tail).
+    fn process_channel_update(&mut self, update: crate::updates_manager::PendingUpdate);
+}
+
+/// `MessagesManager::get_channel_pts_key` (MessagesManager.cpp:34634-34638).
+fn get_channel_pts_key(dialog_id: DialogId) -> String {
+    format!("ch.p{}", dialog_id.get_channel_id().get())
+}
+
+/// `MessagesManager::need_persistent_channel_pts`
+/// (MessagesManager.cpp:34640-34648) — the message-database-gated member
+/// read.
+fn need_persistent_channel_pts(
+    global: &crate::global::Global,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+) -> bool {
+    if ctx.ignore_background_updates() || dialog_id.get_type() != DialogType::Channel {
+        return false;
+    }
+    let channel_id = dialog_id.get_channel_id();
+    if global.use_message_database() {
+        // `have_input_peer_channel(channel_id, AccessRights::Read)` — the
+        // ctx read gate over the channel dialog
+        ctx.have_input_peer_read(dialog_id)
+    } else {
+        ctx.is_channel_member(channel_id)
+    }
+}
+
+/// `MessagesManager::load_channel_pts` (MessagesManager.cpp:34649-34660)
+/// — the `ch.p{channel_id}` binlog-pmc row.
+pub fn load_channel_pts(
+    global: &mut crate::global::Global,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+) -> i32 {
+    // the in-memory `Global` (no db) has no pmc row to read
+    if !global.has_db() {
+        return 0;
+    }
+    if !need_persistent_channel_pts(global, ctx, dialog_id) {
+        // just in case (cpp:34652) — the in-memory `Global` (no db) skips
+        // the row erase
+        if global.has_db() {
+            global.binlog_pmc().erase(&get_channel_pts_key(dialog_id));
+        }
+        return 0;
+    }
+    let pts: i32 = global
+        .binlog_pmc()
+        .get(&get_channel_pts_key(dialog_id))
+        .parse()
+        .unwrap_or(0);
+    tracing::info!("Load {dialog_id:?} PTS = {pts}");
+    pts
+}
+
+/// `MessagesManager::set_channel_pts` (MessagesManager.cpp:34662-34708) —
+/// the pts advance rule (up, or a cardinal drop), the binlog-pmc persist
+/// and the pending-read-channel-inbox flush (the read-state update that
+/// arrived behind the gap replays through the M.10.7 inbox core).
+#[allow(clippy::too_many_arguments)]
+pub fn set_channel_pts(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    cdctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    new_pts: i32,
+    source: &str,
+) {
+    assert!(dialog_id.get_type() == DialogType::Channel);
+    if running_get_channel_difference(manager, dialog_id) {
+        log_error!(
+            "Set PTS of {dialog_id:?} to {new_pts} from {source} while running getChannelDifference"
+        );
+    }
+
+    // TODO delete_first_messages support in channels (cpp:34675)
+    if new_pts == i32::MAX {
+        log_error!("Update {dialog_id:?} PTS to -1 from {source}");
+        if global.has_db() {
+            global.binlog_pmc().erase(&get_channel_pts_key(dialog_id));
+        }
+        if let Some(d) = manager.get_dialog_mut(dialog_id) {
+            d.pts = i32::MAX;
+            d.pending_read_channel_inbox_pts = 0;
+        }
+        return;
+    }
+    let old_pts = manager.get_dialog(dialog_id).map_or(0, |d| d.pts);
+    if new_pts > old_pts || (0 < new_pts && new_pts < old_pts - 99999) {
+        // PTS can only go up or drop cardinally
+        if new_pts < old_pts - 99999 {
+            tdutils::log_warning!(
+                "PTS of {dialog_id:?} decreases from {old_pts} to {new_pts} from {source}"
+            );
+        } else {
+            tracing::info!("Update {dialog_id:?} PTS to {new_pts} from {source}");
+        }
+
+        let pending = {
+            let Some(d) = manager.get_dialog_mut(dialog_id) else {
+                return;
+            };
+            d.pts = new_pts;
+            if d.pending_read_channel_inbox_pts != 0 && d.pending_read_channel_inbox_pts <= d.pts {
+                let pts = d.pending_read_channel_inbox_pts;
+                d.pending_read_channel_inbox_pts = 0;
+                Some(pts)
+            } else {
+                None
+            }
+        };
+        if let Some(pts) = pending {
+            // `on_dialog_updated` (cpp:34689) — the dialog-db persist seam
+            let (max_message_id, server_unread_count) = {
+                let d = manager.get_dialog(dialog_id).expect("checked above");
+                (
+                    d.pending_read_channel_inbox_max_message_id,
+                    d.pending_read_channel_inbox_server_unread_count,
+                )
+            };
+            if current_dialog_pts(manager, dialog_id) == pts {
+                read_history_inbox(
+                    manager,
+                    msgctx,
+                    state,
+                    dialog_id,
+                    max_message_id,
+                    server_unread_count,
+                    "set_channel_pts",
+                );
+            } else if current_dialog_pts(manager, dialog_id) > pts {
+                // `repair_channel_server_unread_count(d)` — the
+                // `send_get_dialog_query` tail is the dialogs-plane seam;
+                // the local unread leg is the M.10.7 core
+                repair_channel_server_unread_count(manager, msgctx, state, dialog_id);
+            }
+        }
+        if need_persistent_channel_pts(global, cdctx, dialog_id) && global.has_db() {
+            global
+                .binlog_pmc()
+                .set(&get_channel_pts_key(dialog_id), &new_pts.to_string());
+        }
+    } else if new_pts < old_pts {
+        log_error!(
+            "Receive wrong PTS {new_pts} in {dialog_id:?} from {source}. Current PTS is {old_pts}"
+        );
+    }
+}
+
+/// The current `d->pts` read (the C++ re-reads the dialog after the
+/// pending bookkeeping).
+fn current_dialog_pts(manager: &MessagesManager, dialog_id: DialogId) -> i32 {
+    manager.get_dialog(dialog_id).map_or(0, |d| d.pts)
+}
+
+/// `MessagesManager::repair_channel_server_unread_count`
+/// (MessagesManager.cpp:9436-9477) — the bot gate, the all-read band and
+/// the `read_history_inbox(last_read_inbox, -1)` repair; the
+/// `send_get_dialog_query` tail (cpp:9470-9474) rides the dialogs plane.
+fn repair_channel_server_unread_count(
+    manager: &mut MessagesManager,
+    msgctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return;
+    };
+    assert!(dialog_id.get_type() == DialogType::Channel);
+    if msgctx.is_bot() {
+        return;
+    }
+    if d.last_read_inbox_message_id >= d.last_new_message_id {
+        // all messages are already read
+        return;
+    }
+    let server_unread_count = d.server_unread_count;
+    let last_read_inbox_message_id = d.last_read_inbox_message_id;
+    if server_unread_count <= 0 {
+        manager
+            .get_dialog_mut(dialog_id)
+            .expect("checked above")
+            .need_repair_channel_server_unread_count = false;
+        // `send_get_dialog_query` — the dialogs-plane seam (cpp:9470)
+        tracing::info!("send_get_dialog_query seam: repair channel unread count for {dialog_id:?}");
+        return;
+    }
+    manager
+        .get_dialog_mut(dialog_id)
+        .expect("checked above")
+        .need_repair_channel_server_unread_count = false;
+    read_history_inbox(
+        manager,
+        msgctx,
+        state,
+        dialog_id,
+        last_read_inbox_message_id,
+        -1,
+        "repair_channel_server_unread_count",
+    );
+}
+
+/// `MessagesManager::running_get_channel_difference`
+/// (MessagesManager.cpp:34730-34732).
+pub fn running_get_channel_difference(manager: &MessagesManager, dialog_id: DialogId) -> bool {
+    manager
+        .active_get_channel_differences
+        .contains_key(&dialog_id)
+}
+
+/// `MessagesManager::update_expected_channel_pts`
+/// (MessagesManager.cpp:34788-34797).
+fn update_expected_channel_pts(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    expected_pts: i32,
+) {
+    if expected_pts <= 0 {
+        return;
+    }
+    assert!(dialog_id.is_valid());
+    let old_pts = manager.expected_channel_pts.entry(dialog_id).or_insert(0);
+    if *old_pts < expected_pts {
+        *old_pts = expected_pts;
+    }
+}
+
+/// `MessagesManager::update_expected_channel_max_message_id`
+/// (MessagesManager.cpp:34799-34808).
+fn update_expected_channel_max_message_id(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    expected_max_message_id: MessageId,
+    is_bot: bool,
+) {
+    if expected_max_message_id == MessageId::default() || is_bot {
+        return;
+    }
+    assert!(dialog_id.is_valid());
+    let old_max_message_id = manager
+        .expected_channel_max_message_id
+        .entry(dialog_id)
+        .or_default();
+    if *old_max_message_id < expected_max_message_id {
+        *old_max_message_id = expected_max_message_id;
+    }
+}
+
+/// `MessagesManager::schedule_get_channel_difference`
+/// (MessagesManager.cpp:34810-34817) — the expectations + the retry-timeout
+/// arm (`add_timeout_in` memcache semantics: an armed key keeps its
+/// earlier deadline).
+pub fn schedule_get_channel_difference(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    expected_pts: i32,
+    expected_max_message_id: MessageId,
+    delay: f64,
+    now: f64,
+    source: &str,
+) {
+    tracing::info!("Schedule getDifference in {dialog_id:?} from {source}");
+    update_expected_channel_pts(manager, dialog_id, expected_pts);
+    update_expected_channel_max_message_id(
+        manager,
+        dialog_id,
+        expected_max_message_id,
+        manager.bot_mode,
+    );
+    manager
+        .channel_get_difference_retry_deadlines
+        .entry(dialog_id)
+        .or_insert(now + delay);
+}
+
+/// `MessagesManager::get_channel_difference`
+/// (MessagesManager.cpp:34819-34866) — the gates (the armed retry timeout,
+/// the active map, the input channel, the read access) then the queue
+/// tail. The `GetChannelDifferenceLogEvent` binlog pair (cpp:34845-34861)
+/// rides the restart-safety slice (the seam note above).
+#[allow(clippy::too_many_arguments)]
+pub fn get_channel_difference(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    pts: i32,
+    expected_pts: i32,
+    expected_max_message_id: MessageId,
+    force: bool,
+    source: &'static str,
+    is_old: bool,
+) {
+    update_expected_channel_pts(manager, dialog_id, expected_pts);
+    update_expected_channel_max_message_id(
+        manager,
+        dialog_id,
+        expected_max_message_id,
+        manager.bot_mode,
+    );
+
+    if manager
+        .channel_get_difference_retry_deadlines
+        .contains_key(&dialog_id)
+    {
+        tracing::info!(
+            "Skip running channels.getDifference for {dialog_id:?} from {source} because it is scheduled for later time"
+        );
+        return;
+    }
+    assert!(
+        dialog_id.get_type() == DialogType::Channel,
+        "{dialog_id:?} {source}"
+    );
+
+    if manager
+        .active_get_channel_differences
+        .contains_key(&dialog_id)
+    {
+        tracing::info!(
+            "Skip running channels.getDifference for {dialog_id:?} from {source} because it has already been run"
+        );
+        return;
+    }
+
+    let input_channel = match ctx.get_input_channel(dialog_id.get_channel_id()) {
+        Some(input_channel) => input_channel,
+        None => {
+            log_error!(
+                "Skip running channels.getDifference for {dialog_id:?} from {source} because the channel is unknown"
+            );
+            after_get_channel_difference(
+                global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+            );
+            return;
+        }
+    };
+    if !ctx.have_input_peer_read(dialog_id) {
+        tracing::info!(
+            "Skip running channels.getDifference for {dialog_id:?} from {source} because have no read access to it"
+        );
+        after_get_channel_difference(
+            global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+        );
+        return;
+    }
+
+    do_get_channel_difference(
+        manager,
+        ctx,
+        dialog_id,
+        pts,
+        force,
+        input_channel,
+        is_old,
+        source,
+    );
+}
+
+/// `MessagesManager::do_get_channel_difference`
+/// (MessagesManager.cpp:34868-34901) — the active-map insert, the limit
+/// table and the pending queue.
+#[allow(clippy::too_many_arguments)]
+fn do_get_channel_difference(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    mut pts: i32,
+    force: bool,
+    input_channel: telegram_api::InputChannel,
+    is_old: bool,
+    source: &'static str,
+) {
+    if manager
+        .active_get_channel_differences
+        .contains_key(&dialog_id)
+    {
+        tracing::info!(
+            "Skip running channels.getDifference for {dialog_id:?} from {source} because it has already been run"
+        );
+        return;
+    }
+    // must work even when we know nothing about the dialog
+    manager
+        .active_get_channel_differences
+        .insert(dialog_id, source);
+
+    // `NotificationManager::before_get_chat_difference` (cpp:34877-34887)
+    // — the M.13 seam (no notification groups yet)
+    tracing::info!("before_get_chat_difference seam: dialog {dialog_id:?} from {source}");
+
+    let mut limit = if ctx.is_bot() && !is_old {
+        MAX_BOT_CHANNEL_DIFFERENCE
+    } else {
+        MAX_CHANNEL_DIFFERENCE
+    };
+    if pts <= 0 {
+        pts = 1;
+        limit = MIN_CHANNEL_DIFFERENCE;
+    }
+
+    manager
+        .pending_get_channel_differences
+        .push_back(PendingGetChannelDifference {
+            dialog_id,
+            pts,
+            limit,
+            force,
+            input_channel,
+            source,
+        });
+    process_pending_get_channel_differences(manager, ctx);
+}
+
+/// `MessagesManager::process_pending_get_channel_differences`
+/// (MessagesManager.cpp:34903-34922) — the concurrency cap + the send.
+fn process_pending_get_channel_differences(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn ChannelDifferenceContext,
+) {
+    if manager.pending_get_channel_differences.is_empty()
+        || manager.get_channel_difference_count >= MAX_CONCURRENT_GET_CHANNEL_DIFFERENCES
+    {
+        return;
+    }
+
+    manager.get_channel_difference_count += 1;
+
+    let query = manager
+        .pending_get_channel_differences
+        .pop_front()
+        .expect("checked non-empty");
+
+    tracing::info!(
+        "-----BEGIN GET CHANNEL DIFFERENCE----- for {:?} with PTS {} and limit {} from {}",
+        query.dialog_id,
+        query.pts,
+        query.limit,
+        query.source
+    );
+
+    ctx.send_get_channel_difference_query(
+        query.dialog_id,
+        query.input_channel,
+        query.pts,
+        query.limit,
+        query.force,
+    );
+}
+
+/// `MessagesManager::retry_get_channel_difference_later`
+/// (MessagesManager.cpp:35210-35220) — the doubled backoff capped at
+/// `Random(60, 80)` seconds.
+fn retry_get_channel_difference_later(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    now: f64,
+) {
+    let delay = {
+        let delay = manager
+            .channel_get_difference_retry_timeouts
+            .entry(dialog_id)
+            .or_insert(0);
+        if *delay == 0 {
+            *delay = 1;
+        }
+        *delay
+    };
+    schedule_get_channel_difference(
+        manager,
+        dialog_id,
+        0,
+        MessageId::default(),
+        f64::from(tdutils::random::fast(delay * 800, delay * 1200)) * 1e-3,
+        now,
+        "retry_get_channel_difference_later",
+    );
+    let delay = manager
+        .channel_get_difference_retry_timeouts
+        .get_mut(&dialog_id)
+        .expect("just inserted");
+    *delay *= 2;
+    if *delay > 60 {
+        *delay = tdutils::random::fast(60, 80);
+    }
+}
+
+/// `MessagesManager::get_message_date` (MessagesManager.cpp) — the wire
+/// date accessor (`.max(1)`, like the C++).
+fn channel_difference_message_date(message: &telegram_api::Message) -> i32 {
+    match message {
+        telegram_api::Message::messageEmpty(_) => 0,
+        telegram_api::Message::message(message) => message.date.max(1),
+        telegram_api::Message::messageService(message) => message.date.max(1),
+    }
+}
+
+/// The ladder's `on_get_message(dialog_id, message, from_update, false,
+/// source)` head — the parse + the complete receive head (the M.10.20
+/// dispatcher form); the returned full id answers the C++ validity check.
+#[allow(clippy::too_many_arguments)]
+fn ladder_on_get_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    message: telegram_api::Message,
+    from_update: bool,
+    source: &'static str,
+) -> MessageFullId {
+    let message_info = parse_telegram_api_message(msgctx, message, false, false, source);
+    on_get_message_full(
+        global,
+        manager,
+        msgctx,
+        sendctx,
+        state,
+        message_info,
+        from_update,
+        source,
+    )
+}
+
+/// `MessagesManager::on_get_channel_difference`
+/// (MessagesManager.cpp:35233-35457) — the answer half: the error band
+/// (the have-access retry vs the drop), the three difference arms (the
+/// empty / the paged difference / the too-long resync), the `!final`
+/// re-entry and the final poll-timeout arm, then the after tail.
+#[allow(clippy::too_many_arguments)]
+pub fn on_get_channel_difference(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    sendctx: &dyn SendMessageContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    request_pts: i32,
+    request_limit: i32,
+    result: Result<telegram_api::updates_ChannelDifference, Status>,
+) {
+    manager.get_channel_difference_count -= 1;
+    assert!(manager.get_channel_difference_count >= 0);
+    process_pending_get_channel_differences(manager, ctx);
+    tracing::info!("----- END  GET CHANNEL DIFFERENCE----- for {dialog_id:?}");
+    let Some(source) = manager.active_get_channel_differences.remove(&dialog_id) else {
+        // the C++ CHECK(it != end) — the active map entry is owned by the
+        // round that queued the query
+        log_error!(
+            "Receive getChannelDifference result for {dialog_id:?} without an active difference"
+        );
+        return;
+    };
+    // `get_dialog_force` (cpp:35242) — the db-load leg is the dialog-db
+    // receive seam; the in-memory form
+    let mut have_dialog = manager.get_dialog(dialog_id).is_some();
+
+    let difference = match result {
+        Result::Err(status) => {
+            // the nullptr + error form (cpp:35244-35264)
+            let have_access = ctx.have_input_peer_read(dialog_id)
+                && ctx.have_channel(dialog_id.get_channel_id())
+                && status.message() != "CHANNEL_INVALID";
+            if have_access {
+                if !have_dialog {
+                    ctx.force_create_dialog(dialog_id, "on_get_channel_difference failed");
+                    have_dialog = manager.get_dialog(dialog_id).is_some();
+                    if !have_dialog {
+                        after_get_channel_difference(
+                            global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+                        );
+                        return;
+                    }
+                }
+                retry_get_channel_difference_later(manager, dialog_id, ctx.now());
+            } else {
+                after_get_channel_difference(
+                    global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+                );
+            }
+            return;
+        }
+        Result::Ok(difference) => difference,
+    };
+
+    tracing::info!(
+        "Receive result of getChannelDifference for {dialog_id:?} with PTS = {request_pts} and limit = {request_limit} from {source}"
+    );
+
+    // the add_dialog_for_new_message flag (have_new_messages) collapsed
+    // into the ported fresh-dialog core (the `need_update_dialog_pos`
+    // form is the dialog-list seam)
+    match &difference {
+        telegram_api::updates_ChannelDifference::updates_channelDifferenceEmpty(_) => {
+            if !have_dialog {
+                // no need to create the dialog (cpp:35276)
+                manager
+                    .channel_get_difference_retry_timeouts
+                    .remove(&dialog_id);
+                after_get_channel_difference(
+                    global, manager, msgctx, sendctx, state, ctx, dialog_id, true,
+                );
+                return;
+            }
+        }
+        // `have_new_messages` (both arms) feeds the C++
+        // add_dialog_for_new_message flag — collapsed into the ported
+        // fresh-dialog core below; the invalid-poll reget (cpp:35293-35303)
+        // parks at the poll content plane
+        telegram_api::updates_ChannelDifference::updates_channelDifference(_) => {}
+        telegram_api::updates_ChannelDifference::updates_channelDifferenceTooLong(_) => {}
+    }
+
+    manager
+        .channel_get_difference_retry_timeouts
+        .remove(&dialog_id);
+
+    // `add_dialog_for_new_message` (cpp:35310) — the ported fresh-dialog
+    // core (the `need_update_dialog_pos` form is the dialog-list seam)
+    if !have_dialog {
+        manager.add_dialog_for_new_message(dialog_id);
+    }
+
+    let cur_pts = {
+        let d = manager.get_dialog(dialog_id).expect("dialog ensured above");
+        if d.pts <= 0 { 1 } else { d.pts }
+    };
+    if cur_pts != request_pts {
+        log_error!(
+            "Channel PTS has changed from {request_pts} to {cur_pts} in {dialog_id:?} during getChannelDifference from {source}"
+        );
+    }
+
+    let is_final;
+    let mut is_old = false;
+    let timeout;
+    match difference {
+        telegram_api::updates_ChannelDifference::updates_channelDifferenceEmpty(difference) => {
+            is_final = difference.r#final;
+            timeout = difference.timeout;
+            if !is_final {
+                log_error!(
+                    "Receive channelDifferenceEmpty as result of getChannelDifference from {source} with PTS = {request_pts} and limit = {request_limit} in {dialog_id:?}, but it is not final"
+                );
+            }
+            // bots can receive channelDifferenceEmpty with PTS bigger than
+            // known PTS; also for monoforum and deleted channels
+            if request_pts != difference.pts && !ctx.is_bot() && ctx.have_input_peer_read(dialog_id)
+            {
+                // `!is_monoforum_channel` — folded (the monoforum channel
+                // reads ride the dialog plane)
+                log_error!(
+                    "Receive channelDifferenceEmpty as result of getChannelDifference from {source} with PTS = {request_pts} and limit = {request_limit} in {dialog_id:?}, but PTS has changed to {}",
+                    difference.pts
+                );
+            }
+            set_channel_pts(
+                global,
+                manager,
+                msgctx,
+                state,
+                ctx,
+                dialog_id,
+                difference.pts,
+                "channel difference empty",
+            );
+        }
+        telegram_api::updates_ChannelDifference::updates_channelDifference(mut difference) => {
+            ctx.on_get_users(
+                std::mem::take(&mut difference.users),
+                "updates.channelDifference",
+            );
+            ctx.on_get_chats(
+                std::mem::take(&mut difference.chats),
+                "updates.channelDifference",
+            );
+            is_final = difference.r#final;
+            timeout = difference.timeout;
+
+            let mut new_pts = difference.pts;
+            if request_pts >= new_pts && request_pts > 1 && (request_pts > new_pts || !ctx.is_bot())
+            {
+                log_error!(
+                    "Receive channelDifference as result of getChannelDifference from {source} with PTS = {request_pts} and limit = {request_limit} in {dialog_id:?}, but PTS has changed to {new_pts}"
+                );
+                new_pts = request_pts + 1;
+            }
+
+            if !MessageId::is_message_id_order_ascending(
+                &difference.new_messages,
+                "on_get_channel_difference",
+            ) {
+                after_get_channel_difference(
+                    global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+                );
+                return;
+            }
+            if !is_final && !difference.new_messages.is_empty() && ctx.is_bot() {
+                let date = channel_difference_message_date(
+                    difference.new_messages.last().expect("checked non-empty"),
+                );
+                if 0 < date && date < ctx.unix_time() - 2 * 86400 {
+                    is_old = true;
+                }
+            }
+
+            process_get_channel_difference_updates(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                ctx,
+                dialog_id,
+                new_pts,
+                std::mem::take(&mut difference.new_messages),
+                std::mem::take(&mut difference.other_updates),
+            );
+
+            set_channel_pts(
+                global,
+                manager,
+                msgctx,
+                state,
+                ctx,
+                dialog_id,
+                new_pts,
+                "channel difference",
+            );
+        }
+        telegram_api::updates_ChannelDifference::updates_channelDifferenceTooLong(
+            mut difference,
+        ) => {
+            ctx.on_get_users(
+                std::mem::take(&mut difference.users),
+                "updates.channelDifferenceTooLong",
+            );
+            ctx.on_get_chats(
+                std::mem::take(&mut difference.chats),
+                "updates.channelDifferenceTooLong",
+            );
+            let telegram_api::Dialog::dialog(dialog) =
+                difference.dialog.clone().unwrap_or_default()
+            else {
+                // `dialogFolder`/`dialogCommunity` (cpp:35363-35366) —
+                // after(false) for both
+                after_get_channel_difference(
+                    global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+                );
+                return;
+            };
+            if dialog.pts <= 0 {
+                log_error!("Receive {dialog_id:?} without PTS");
+                after_get_channel_difference(
+                    global, manager, msgctx, sendctx, state, ctx, dialog_id, false,
+                );
+                return;
+            }
+
+            is_final = difference.r#final;
+            timeout = difference.timeout;
+
+            let mut new_pts = dialog.pts;
+            if request_pts > new_pts - request_limit {
+                log_error!(
+                    "Receive channelDifferenceTooLong as result of getChannelDifference from {source} with PTS = {request_pts} and limit = {request_limit} in {dialog_id:?}, but PTS has changed to {new_pts}"
+                );
+                if request_pts >= new_pts {
+                    new_pts = request_pts + 1;
+                }
+            }
+
+            // the folder/view-as-messages/notify-settings/draft resync
+            // setters (cpp:35411-35421) — the dialog-list/drafts/
+            // notification-settings planes own their setters; the
+            // seam-logged legs ride those slices
+            tracing::info!(
+                "on_get_channel_dialog field resync seam: dialog {dialog_id:?} folder {} view_as_messages {} notify_settings {:?} draft {:?}",
+                dialog.folder_id,
+                dialog.view_forum_as_messages,
+                dialog.notify_settings.is_some(),
+                dialog.draft.is_some(),
+            );
+
+            let is_marked_as_unread = dialog.unread_mark;
+            {
+                let d = manager.get_dialog(dialog_id).expect("dialog ensured above");
+                if is_marked_as_unread != d.is_marked_as_unread {
+                    set_dialog_is_marked_as_unread(
+                        manager,
+                        msgctx,
+                        state,
+                        dialog_id,
+                        is_marked_as_unread,
+                    );
+                }
+            }
+
+            on_get_channel_dialog(
+                global,
+                manager,
+                msgctx,
+                state,
+                sendctx,
+                reactions_ctx,
+                ctx,
+                dialog_id,
+                MessageId::from_server_message_id(ServerMessageId::new(dialog.top_message)),
+                MessageId::from_server_message_id(ServerMessageId::new(dialog.read_inbox_max_id)),
+                dialog.unread_count,
+                dialog.unread_mentions_count,
+                dialog.unread_reactions_count,
+                dialog.unread_poll_votes_count,
+                MessageId::from_server_message_id(ServerMessageId::new(dialog.read_outbox_max_id)),
+                difference.messages,
+            );
+            // `update_dialog_pos` + the pin re-check (cpp:35438-35445) —
+            // the dialog-list slice
+
+            set_channel_pts(
+                global,
+                manager,
+                msgctx,
+                state,
+                ctx,
+                dialog_id,
+                new_pts,
+                "channel difference too long",
+            );
+        }
+    }
+
+    if !is_final {
+        if timeout > 0 {
+            log_error!("Have timeout in non-final ChannelDifference in {dialog_id:?}");
+        }
+        let pts = manager.get_dialog(dialog_id).map_or(1, |d| d.pts);
+        get_channel_difference(
+            global,
+            manager,
+            msgctx,
+            sendctx,
+            state,
+            ctx,
+            dialog_id,
+            pts,
+            0,
+            MessageId::default(),
+            true,
+            "on_get_channel_difference",
+            is_old,
+        );
+        return;
+    }
+
+    if timeout == 0 {
+        log_error!("Have no timeout in final ChannelDifference in {dialog_id:?}");
+    }
+    if timeout > 0
+        && manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| d.open_count > 0)
+    {
+        // `add_timeout_in` memcache semantics — an armed poll keeps its
+        // earlier deadline (MultiTimeout.h:59)
+        manager
+            .channel_get_difference_deadlines
+            .entry(dialog_id)
+            .or_insert(ctx.now() + f64::from(timeout));
+    }
+    after_get_channel_difference(
+        global, manager, msgctx, sendctx, state, ctx, dialog_id, true,
+    );
+}
+
+/// `MessagesManager::process_get_channel_difference_updates`
+/// (MessagesManager.cpp:34924-35088) — the answer's message/update walk:
+/// the updateMessageID head, the per-dialog filter (delete/edit/pinned),
+/// the awaited-sent-message merge with the postponed map, the in-order
+/// `on_get_message` fan and the `process_channel_update` tail.
+#[allow(clippy::too_many_arguments)]
+pub fn process_get_channel_difference_updates(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    new_pts: i32,
+    mut new_messages: Vec<telegram_api::Message>,
+    other_updates: Vec<telegram_api::Update>,
+) {
+    tracing::info!(
+        "In get channel difference for {dialog_id:?} receive {} messages and {} other updates",
+        new_messages.len(),
+        other_updates.len()
+    );
+
+    // identifiers of edited and deleted messages (cpp:34935-34974); a
+    // `None` update is the C++ consumed `update_ptr = nullptr` marker
+    // (the C++ `dummyUpdate` sentinel is not a wire constructor here)
+    let mut changed_message_ids: HashSet<MessageId> = HashSet::new();
+    let mut other_updates: Vec<Option<telegram_api::Update>> =
+        other_updates.into_iter().map(Some).collect();
+    for update in other_updates.iter_mut() {
+        let Some(update_ref) = update else { continue };
+        let mut is_good_update = true;
+        match update_ref {
+            telegram_api::Update::updateMessageID(update_message_id) => {
+                // in channels.getDifference updateMessageID can't be received
+                // for scheduled messages
+                on_update_message_id(
+                    manager,
+                    update_message_id.random_id,
+                    MessageId::from_server_message_id(ServerMessageId::new(update_message_id.id)),
+                    "get_channel_difference",
+                );
+                *update = None;
+                continue;
+            }
+            telegram_api::Update::updateDeleteChannelMessages(update) => {
+                if DialogId::from_channel_id(ChannelId::new(update.channel_id)) != dialog_id {
+                    is_good_update = false;
+                } else {
+                    for message in &update.messages {
+                        changed_message_ids.insert(MessageId::from_server_message_id(
+                            ServerMessageId::new(*message),
+                        ));
+                    }
+                }
+            }
+            telegram_api::Update::updateEditChannelMessage(update) => {
+                let message = update.message.as_ref().expect("non-empty message");
+                if DialogId::get_message_dialog_id(message) != dialog_id {
+                    is_good_update = false;
+                } else {
+                    changed_message_ids.insert(MessageId::get_message_id(message, false));
+                }
+            }
+            telegram_api::Update::updatePinnedChannelMessages(update) => {
+                if DialogId::from_channel_id(ChannelId::new(update.channel_id)) != dialog_id {
+                    is_good_update = false;
+                }
+            }
+            _ => is_good_update = false,
+        }
+        if !is_good_update {
+            log_error!("Receive wrong update in channelDifference of {dialog_id:?}");
+            *update = None;
+        }
+    }
+
+    let is_edited_message = |message: &telegram_api::Message| matches!(message, telegram_api::Message::message(message) if message.edit_date > 0);
+
+    for message in &new_messages {
+        if is_edited_message(message) {
+            let message_id = MessageId::get_message_id(message, false);
+            if message_id.is_valid() {
+                changed_message_ids.insert(message_id);
+            }
+        }
+    }
+
+    // extract awaited sent messages, which were edited or deleted after
+    // that (cpp:34981-35022)
+    struct AwaitedMessage {
+        message: telegram_api::Message,
+        promise: tdutils::promise::Promise<()>,
+    }
+    let mut awaited_messages: std::collections::BTreeMap<MessageId, AwaitedMessage> =
+        std::collections::BTreeMap::new();
+    if let Some(updates) = manager.postponed_channel_updates.get_mut(&dialog_id) {
+        let due: Vec<i32> = updates
+            .keys()
+            .take_while(|&&update_pts| update_pts <= new_pts)
+            .copied()
+            .collect();
+        for update_pts in due {
+            let PostponedChannelUpdate {
+                update,
+                pts,
+                pts_count,
+                mut promise,
+            } = updates.remove(&update_pts).expect("listed above");
+            if let crate::updates_manager::PendingUpdate::Wire(
+                telegram_api::Update::updateNewChannelMessage(update_new_channel_message),
+            ) = update
+            {
+                let message_id = MessageId::get_message_id(
+                    update_new_channel_message
+                        .message
+                        .as_ref()
+                        .expect("non-empty message"),
+                    false,
+                );
+                if manager
+                    .update_message_ids
+                    .contains_key(&(dialog_id, message_id))
+                    && changed_message_ids.contains(&message_id)
+                {
+                    changed_message_ids.remove(&message_id);
+                    awaited_messages.insert(
+                        message_id,
+                        AwaitedMessage {
+                            message: update_new_channel_message
+                                .message
+                                .expect("non-empty message"),
+                            promise,
+                        },
+                    );
+                    continue;
+                }
+            }
+            tracing::info!(
+                "Skip to be applied from getChannelDifference (pts {pts}, count {pts_count})"
+            );
+            promise.set_value(());
+        }
+        if updates.is_empty() {
+            manager.postponed_channel_updates.remove(&dialog_id);
+        }
+    }
+
+    // if last message is pretty old, we might have missed the update
+    // (cpp:35024-35025)
+    let need_repair_unread_count = !new_messages.is_empty()
+        && channel_difference_message_date(&new_messages[0]) < ctx.unix_time() - 2 * 86400;
+
+    let mut it = awaited_messages.iter_mut().peekable();
+    for message_slot in new_messages.iter_mut() {
+        let message_id = MessageId::get_message_id(message_slot, false);
+        while it.peek().is_some_and(|entry| *entry.0 < message_id) {
+            let (_, awaited) = it.next().expect("peeked");
+            ladder_on_get_message(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                std::mem::take(&mut awaited.message),
+                true,
+                "postponed channel update",
+            );
+            awaited.promise.set_value(());
+        }
+        let mut carried_promise: Option<tdutils::promise::Promise<()>> = None;
+        if it.peek().is_some_and(|entry| *entry.0 == message_id) {
+            let (_, awaited) = it.next().expect("peeked");
+            if is_edited_message(message_slot) {
+                // the new message is edited, apply postponed one and move
+                // this to updateEditChannelMessage
+                other_updates.push(Some(telegram_api::Update::updateEditChannelMessage(
+                    telegram_api::updateEditChannelMessage {
+                        message: Some(std::mem::take(message_slot)),
+                        pts: new_pts,
+                        pts_count: 0,
+                    },
+                )));
+                *message_slot = std::mem::take(&mut awaited.message);
+                carried_promise = Some(std::mem::take(&mut awaited.promise));
+            } else {
+                awaited.promise.set_value(());
+            }
+        }
+        ladder_on_get_message(
+            global,
+            manager,
+            msgctx,
+            sendctx,
+            state,
+            std::mem::take(message_slot),
+            true,
+            "get channel difference",
+        );
+        if let Some(mut promise) = carried_promise {
+            promise.set_value(());
+        }
+    }
+    for (_, awaited) in it {
+        ladder_on_get_message(
+            global,
+            manager,
+            msgctx,
+            sendctx,
+            state,
+            std::mem::take(&mut awaited.message),
+            true,
+            "postponed channel update 2",
+        );
+        awaited.promise.set_value(());
+    }
+
+    for update in other_updates.into_iter().flatten() {
+        ctx.process_channel_update(crate::updates_manager::PendingUpdate::Wire(update));
+    }
+    if running_get_channel_difference(manager, dialog_id) {
+        log_error!(
+            "getChannelDifference is run again inside the answer processing for {dialog_id:?}"
+        );
+    }
+
+    if need_repair_unread_count {
+        repair_channel_server_unread_count(manager, msgctx, state, dialog_id);
+    }
+}
+
+/// `MessagesManager::on_get_channel_dialog`
+/// (MessagesManager.cpp:35092-35208) — the too-long resync: the last-
+/// message/database-id reset legs ("begin from scratch" for the memory
+/// window) + the read-counter tail over the M.10.7 setters. The C++
+// gap-handling comment block (35122-35138) documents the strategy; the
+// unload leg (`is_message_unload_enabled`, 35140-35146) is the unload
+/// plane seam.
+#[allow(clippy::too_many_arguments)]
+fn on_get_channel_dialog(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    sendctx: &dyn SendMessageContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    last_message_id: MessageId,
+    mut read_inbox_max_message_id: MessageId,
+    server_unread_count: i32,
+    unread_mention_count: i32,
+    unread_reaction_count: i32,
+    unread_poll_vote_count: i32,
+    read_outbox_max_message_id: MessageId,
+    messages: Vec<telegram_api::Message>,
+) {
+    let mut message_full_id_to_message: HashMap<MessageFullId, telegram_api::Message> =
+        HashMap::new();
+    for message in messages {
+        let message_id = MessageId::get_message_id(&message, false);
+        if !message_id.is_valid() {
+            continue;
+        }
+        let mut message_dialog_id = DialogId::get_message_dialog_id(&message);
+        if !message_dialog_id.is_valid() {
+            message_dialog_id = dialog_id;
+        }
+        message_full_id_to_message
+            .insert(MessageFullId::new(message_dialog_id, message_id), message);
+    }
+    let last_message_full_id = MessageFullId::new(dialog_id, last_message_id);
+
+    if last_message_id.is_valid() && !message_full_id_to_message.contains_key(&last_message_full_id)
+    {
+        log_error!(
+            "Last {} in {dialog_id:?} not found. Have {} messages",
+            DisplayMessageId(last_message_id),
+            message_full_id_to_message.len()
+        );
+        return;
+    }
+    assert!(!last_message_id.is_scheduled());
+
+    if manager.get_dialog(dialog_id).is_none() {
+        log_error!("on_get_channel_dialog without the dialog {dialog_id:?}");
+        return;
+    }
+
+    // the reset pair (cpp:35150-35156) — the begin-from-scratch window
+    if last_message_id
+        > manager
+            .get_dialog(dialog_id)
+            .map(|d| d.last_new_message_id)
+            .unwrap_or_default()
+        && !ctx.is_bot()
+    {
+        // TODO properly support last_message_id <= d->last_new_message_id
+        set_dialog_first_database_message_id(
+            manager,
+            dialog_id,
+            MessageId::default(),
+            "on_get_channel_dialog 6",
+        );
+        set_dialog_last_database_message_id(
+            manager,
+            dialog_id,
+            MessageId::default(),
+            "on_get_channel_dialog 7",
+            false,
+        );
+        {
+            let d = manager.get_dialog_mut(dialog_id).expect("checked above");
+            d.have_full_history = false;
+            d.have_full_history_source = 0;
+            d.is_empty = false;
+            // cpp:35157-35159 — both run unconditionally
+            invalidate_message_indexes(d);
+        }
+        // `history_generation` — the container seam (M.10.9)
+        on_dialog_updated(manager, dialog_id, "on_get_channel_dialog 10");
+    }
+
+    // TODO properly support last_message_id <= d->last_new_message_id
+    // (cpp:35162-35197)
+    if last_message_id
+        > manager
+            .get_dialog(dialog_id)
+            .map(|d| d.last_new_message_id)
+            .unwrap_or_default()
+        && !ctx.is_bot()
+    {
+        // if last message is really a new message
+        {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            if !d.last_new_message_id.is_valid() && last_message_id <= d.max_added_message_id {
+                let prev_message_id = MessageId::from_server_message_id(ServerMessageId::new(
+                    last_message_id.get_server_message_id().get() - 1,
+                ));
+                remove_dialog_newer_messages(
+                    global,
+                    manager,
+                    dialog_id,
+                    prev_message_id,
+                    "on_get_channel_dialog 15",
+                );
+            }
+        }
+        if let Some(d) = manager.get_dialog_mut(dialog_id) {
+            d.last_new_message_id = MessageId::default();
+        }
+        set_dialog_last_message_id(
+            manager,
+            dialog_id,
+            MessageId::default(),
+            "on_get_channel_dialog 20",
+        );
+        send_update_chat_last_message(
+            manager,
+            sendctx,
+            state,
+            reactions_ctx,
+            dialog_id,
+            "on_get_channel_dialog 30",
+        );
+        if last_message_id.is_valid() {
+            let added_message = message_full_id_to_message
+                .remove(&last_message_full_id)
+                .expect("checked above");
+            let added_message_full_id = ladder_on_get_message(
+                global,
+                manager,
+                msgctx,
+                sendctx,
+                state,
+                added_message,
+                true,
+                "channel difference too long",
+            );
+            if added_message_full_id.get_message_id().is_valid() {
+                let last_new_message_id = manager
+                    .get_dialog(dialog_id)
+                    .map(|d| d.last_new_message_id)
+                    .unwrap_or_default();
+                if added_message_full_id.get_message_id() == last_new_message_id {
+                    // CHECK(last_message_full_id == added_message_full_id)
+                    if !ctx.is_bot() {
+                        let d = manager.get_dialog(dialog_id).expect("checked above");
+                        assert_eq!(d.last_message_id, d.last_new_message_id);
+                    }
+                } else {
+                    log_error!(
+                        "{} doesn't became last new message, which is {}",
+                        DisplayMessageId(added_message_full_id.get_message_id()),
+                        DisplayMessageId(last_new_message_id)
+                    );
+                }
+            } else if last_message_id
+                > manager
+                    .get_dialog(dialog_id)
+                    .map(|d| d.last_new_message_id)
+                    .unwrap_or_default()
+            {
+                // skip updates about some messages (cpp:35193)
+                set_dialog_last_new_message_id(
+                    global,
+                    manager,
+                    sendctx,
+                    dialog_id,
+                    last_message_id,
+                    "on_get_channel_dialog 40",
+                );
+            }
+        }
+    }
+
+    // the read-counter tail (cpp:35199-35234)
+    {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        if d.last_read_inbox_message_id.is_valid()
+            && !d.last_read_inbox_message_id.is_server()
+            && read_inbox_max_message_id
+                == d.last_read_inbox_message_id.get_prev_server_message_id()
+        {
+            read_inbox_max_message_id = d.last_read_inbox_message_id;
+        }
+    }
+    {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        if d.server_unread_count != server_unread_count
+            || d.last_read_inbox_message_id != read_inbox_max_message_id
+        {
+            let local_unread_count = d.local_unread_count;
+            set_dialog_last_read_inbox_message_id(
+                manager,
+                msgctx,
+                state,
+                dialog_id,
+                read_inbox_max_message_id,
+                server_unread_count,
+                local_unread_count,
+                false,
+                "on_get_channel_dialog 50",
+            );
+        }
+    }
+    if !ctx.is_bot() {
+        let (mention_count, reaction_count, poll_vote_count) = {
+            let d = manager.get_dialog(dialog_id).expect("checked above");
+            (
+                d.unread_mention_count,
+                d.unread_reaction_count,
+                d.unread_poll_vote_count,
+            )
+        };
+        if mention_count != unread_mention_count {
+            set_dialog_unread_mention_count(manager, dialog_id, unread_mention_count);
+            // `update_dialog_mention_notification_count` (M.13 seam) +
+            // `send_update_chat_unread_mention_count` (the outbox seam)
+        }
+        if reaction_count != unread_reaction_count {
+            set_dialog_unread_reaction_count(
+                manager.get_dialog_mut(dialog_id).expect("checked above"),
+                unread_reaction_count,
+            );
+        }
+        if poll_vote_count != unread_poll_vote_count {
+            set_dialog_unread_poll_vote_count(
+                manager.get_dialog_mut(dialog_id).expect("checked above"),
+                unread_poll_vote_count,
+            );
+        }
+    }
+    {
+        let d = manager.get_dialog(dialog_id).expect("checked above");
+        if d.last_read_outbox_message_id != read_outbox_max_message_id {
+            set_dialog_last_read_outbox_message_id(
+                manager,
+                msgctx,
+                state,
+                dialog_id,
+                read_outbox_max_message_id,
+            );
+        }
+    }
+}
+
+/// `MessagesManager::after_get_channel_difference`
+/// (MessagesManager.cpp:35464-35588) — the finish flag, the postponed-
+/// updates drain (the gap machine's other half) and the expected-pts/max
+/// re-schedule legs. The binlog log-event erase, the postponed read-inbox
+/// map, the `run_after` promises and the pending getDialogs flush ride
+/// their owning planes (the seam note above).
+#[allow(clippy::too_many_arguments)]
+pub fn after_get_channel_difference(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    success: bool,
+) {
+    tracing::info!(
+        "After {}successful get channel difference in {dialog_id:?}",
+        if success { "" } else { "un" }
+    );
+    if running_get_channel_difference(manager, dialog_id) {
+        log_error!("After get channel difference for {dialog_id:?} while it is running");
+    }
+
+    // `get_channel_difference_to_log_event_id_` erase (cpp:35473-35481) —
+    // the restart-safety seam
+
+    let have_dialog = manager.get_dialog(dialog_id).is_some();
+    let have_access =
+        ctx.have_input_peer_read(dialog_id) && ctx.have_channel(dialog_id.get_channel_id());
+    let pts = if have_dialog {
+        manager.get_dialog(dialog_id).map_or(0, |d| d.pts)
+    } else {
+        load_channel_pts(global, ctx, dialog_id)
+    };
+
+    // the postponed drain (cpp:35490-35542) — each update re-enters the
+    // full machine; a drain that can't apply stops and (outside the
+    // near-pts hope window) drops the rest
+    let postponed_exists = manager.postponed_channel_updates.contains_key(&dialog_id);
+    if postponed_exists {
+        tracing::info!("Begin to apply postponed channel updates in {dialog_id:?}");
+        while let Some(updates) = manager.postponed_channel_updates.get_mut(&dialog_id) {
+            let Some(&update_pts) = updates.keys().next() else {
+                break;
+            };
+            let old_size = updates.len();
+            let PostponedChannelUpdate {
+                update,
+                pts: update_pts,
+                pts_count,
+                mut promise,
+            } = updates.remove(&update_pts).expect("first key just read");
+            let update_id = update.get_id();
+            if have_access {
+                add_pending_channel_update(
+                    global,
+                    manager,
+                    msgctx,
+                    sendctx,
+                    state,
+                    ctx,
+                    dialog_id,
+                    update,
+                    update_pts,
+                    pts_count,
+                    promise,
+                    "apply postponed channel updates",
+                    true,
+                );
+            } else {
+                promise.set_value(());
+            }
+            let new_size = manager
+                .postponed_channel_updates
+                .get(&dialog_id)
+                .map_or(0, |updates| updates.len());
+            if new_size != old_size || running_get_channel_difference(manager, dialog_id) {
+                if success && update_pts - 10000 < pts && pts_count == 1 {
+                    // if getChannelDifference was successful and update PTS
+                    // is near channel PTS, we hope that the update
+                    // eventually can be applied
+                    tracing::info!("Can't apply postponed channel updates");
+                } else {
+                    // otherwise protect from getChannelDifference repeating
+                    // calls by dropping postponed updates
+                    tdutils::log_warning!(
+                        "Failed to apply postponed updates of type {update_id} in {dialog_id:?} with PTS {pts}, update PTS is {update_pts}, update PTS count is {pts_count}"
+                    );
+                    if let Some(updates) = manager.postponed_channel_updates.get_mut(&dialog_id) {
+                        let mut update_promises: Vec<tdutils::promise::Promise<()>> = updates
+                            .values_mut()
+                            .map(|postponed| std::mem::take(&mut postponed.promise))
+                            .collect();
+                        updates.clear();
+                        for mut update_promise in update_promises.drain(..) {
+                            update_promise.set_value(());
+                        }
+                    }
+                    manager.postponed_channel_updates.remove(&dialog_id);
+                }
+                break;
+            }
+        }
+        if manager
+            .postponed_channel_updates
+            .get(&dialog_id)
+            .is_some_and(|updates| updates.is_empty())
+        {
+            manager.postponed_channel_updates.remove(&dialog_id);
+        }
+        tracing::info!("Finish to apply postponed channel updates");
+    }
+
+    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+        d.is_channel_difference_finished = true;
+    } else {
+        manager.is_channel_difference_finished.insert(dialog_id);
+    }
+
+    // `postponed_chat_read_inbox_updates_` (cpp:35549-35551) — the
+    // read-state seam; `run_after_get_channel_difference_` promises and
+    // `pending_channel_on_get_dialogs_` (cpp:35553-35567) — the dialogs
+    // plane; `load_last_dialog_message` (cpp:35569-35571) — M.10.15
+
+    // the expected re-schedule legs (cpp:35572-35586)
+    if let Some(expected_pts) = manager.expected_channel_pts.remove(&dialog_id)
+        && success
+        && have_dialog
+        && expected_pts > pts
+    {
+        schedule_get_channel_difference(
+            manager,
+            dialog_id,
+            0,
+            MessageId::default(),
+            1.0,
+            ctx.now(),
+            "after_get_channel_difference",
+        );
+    }
+    let last_new_message_id = manager
+        .get_dialog(dialog_id)
+        .map_or(MessageId::default(), |d| d.last_new_message_id);
+    if let Some(expected_max_message_id) =
+        manager.expected_channel_max_message_id.remove(&dialog_id)
+        && success
+        && have_dialog
+        && expected_max_message_id > last_new_message_id
+    {
+        schedule_get_channel_difference(
+            manager,
+            dialog_id,
+            0,
+            MessageId::default(),
+            1.0,
+            ctx.now(),
+            "after_get_channel_difference 2",
+        );
+    }
+}
+
+/// `MessagesManager::add_postponed_channel_update`
+/// (MessagesManager.h:3428-3436 + the call sites) — the pts-ordered park
+/// behind a gap or a running difference.
+fn add_postponed_channel_update(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    update: crate::updates_manager::PendingUpdate,
+    pts: i32,
+    pts_count: i32,
+    promise: tdutils::promise::Promise<()>,
+) {
+    tracing::info!(
+        "Postpone channel update with PTS {pts} in {dialog_id:?} because getChannelDifference is run"
+    );
+    manager
+        .postponed_channel_updates
+        .entry(dialog_id)
+        .or_default()
+        .insert(
+            pts,
+            PostponedChannelUpdate {
+                update,
+                pts,
+                pts_count,
+                promise,
+            },
+        );
+}
+
+/// `MessagesManager::add_pending_channel_update`
+/// (MessagesManager.cpp:5679-5830) — the channel-pts machine: the sanity
+/// gates, the gap check (`old_pts == new_pts - pts_count`) with the
+/// force-first ladder run, the postpone-while-running rule and the
+/// apply+`set_channel_pts` tail. THE gap detector of the design note.
+#[allow(clippy::too_many_arguments)]
+pub fn add_pending_channel_update(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+    update: crate::updates_manager::PendingUpdate,
+    new_pts: i32,
+    pts_count: i32,
+    mut promise: tdutils::promise::Promise<()>,
+    source: &str,
+    _is_postponed_update: bool,
+) {
+    if dialog_id.get_type() != DialogType::Channel {
+        log_error!("Receive channel update in invalid {dialog_id:?} from {source}");
+        promise.set_value(());
+        return;
+    }
+    if pts_count < 0 || new_pts <= pts_count {
+        log_error!(
+            "Receive channel update from {source} with wrong PTS = {new_pts} or pts_count = {pts_count}"
+        );
+        promise.set_value(());
+        return;
+    }
+
+    let channel_id = dialog_id.get_channel_id();
+    if !ctx.have_channel(channel_id) && ctx.have_min_channel(channel_id) {
+        ctx.schedule_get_difference("add_pending_channel_update 1");
+        promise.set_value(());
+        return;
+    }
+
+    // TODO need to save all updates that can change result of running
+    // queries not associated with PTS (for example getHistory) and apply
+    // them to result of these queries (cpp:5704-5706)
+
+    let mut have_dialog = manager.get_dialog(dialog_id).is_some();
+    if !have_dialog {
+        let pts = load_channel_pts(global, ctx, dialog_id);
+        if pts > 0 {
+            if !ctx.have_channel(channel_id) {
+                // do not create dialog if there is no info about the channel
+                tracing::info!(
+                    "There is no info about {channel_id:?}, so ignore the pending update"
+                );
+                promise.set_value(());
+                return;
+            }
+
+            // `add_dialog` (cpp:5724) — the fresh-dialog core carries the
+            // loaded pts
+            manager.add_dialog_for_new_message(dialog_id);
+            if let Some(d) = manager.get_dialog_mut(dialog_id) {
+                d.pts = pts;
+            }
+            have_dialog = true;
+            // `update_dialog_pos` (cpp:5728) — the dialog-list seam
+        }
+    }
+    if !have_dialog {
+        // if there is no dialog, it can be created by the update
+        tracing::info!("Receive from {source} pending update about unknown {dialog_id:?}");
+        if running_get_channel_difference(manager, dialog_id) {
+            add_postponed_channel_update(manager, dialog_id, update, new_pts, pts_count, promise);
+            return;
+        }
+    } else {
+        let mut old_pts = manager.get_dialog(dialog_id).map_or(0, |d| d.pts);
+        if new_pts <= old_pts {
+            // very old or useless update (cpp:5740-5779)
+            let mut awaited_message: Option<telegram_api::Message> = None;
+            match &update {
+                crate::updates_manager::PendingUpdate::Wire(
+                    telegram_api::Update::updateNewChannelMessage(update),
+                ) => {
+                    let message_id = MessageId::get_message_id(
+                        update.message.as_ref().expect("non-empty message"),
+                        false,
+                    );
+                    if manager
+                        .update_message_ids
+                        .contains_key(&(dialog_id, message_id))
+                    {
+                        // apply sent channel message
+                        awaited_message = Some(update.message.clone().expect("non-empty message"));
+                    }
+                }
+                crate::updates_manager::PendingUpdate::SentMessage { random_id, .. }
+                    if manager.being_sent_messages.contains_key(random_id) =>
+                {
+                    // apply sent channel message — the send-completion
+                    // fan-out rides the send plane (M.10.8 seam)
+                    tracing::info!(
+                        "on_send_message_success seam: old updateSentMessage random_id {random_id}"
+                    );
+                    promise.set_value(());
+                    return;
+                }
+                _ => {}
+            }
+            if let Some(message) = awaited_message {
+                let added_full_id = ladder_on_get_message(
+                    global,
+                    manager,
+                    msgctx,
+                    sendctx,
+                    state,
+                    message,
+                    true,
+                    "updateNewChannelMessage with an awaited message",
+                );
+                if !added_full_id.get_message_id().is_valid() {
+                    log_error!(
+                        "Failed to add an awaited channel message in {dialog_id:?} from {source}"
+                    );
+                }
+                promise.set_value(());
+                return;
+            }
+
+            tracing::info!("Skip already applied channel update with PTS {new_pts} from {source}");
+            promise.set_value(());
+            return;
+        }
+
+        tracing::info!("Receive from {source} pending channel update");
+        if running_get_channel_difference(manager, dialog_id) {
+            tracing::info!("Postpone channel update, because getChannelDifference is run");
+            add_postponed_channel_update(manager, dialog_id, update, new_pts, pts_count, promise);
+            return;
+        }
+
+        if old_pts == 0 {
+            old_pts = new_pts - pts_count;
+            tracing::info!(
+                "Receive first update in {dialog_id:?} with PTS = {new_pts} from {source}"
+            );
+        } else if old_pts != new_pts - pts_count {
+            tracing::info!(
+                "Found a gap in the {dialog_id:?} with PTS = {old_pts}. new_pts = {new_pts}, pts_count = {pts_count} in update from {source}"
+            );
+            // the gap: postpone the update and run the ladder force-first
+            // when the dialog is opened/member/sponsored (cpp:5789-5798)
+            let was_opened = manager.get_dialog(dialog_id).is_some_and(|d| d.was_opened);
+            if was_opened || ctx.is_channel_member(channel_id) {
+                add_postponed_channel_update(
+                    manager, dialog_id, update, new_pts, pts_count, promise,
+                );
+                get_channel_difference(
+                    global,
+                    manager,
+                    msgctx,
+                    sendctx,
+                    state,
+                    ctx,
+                    dialog_id,
+                    old_pts,
+                    new_pts,
+                    MessageId::default(),
+                    true,
+                    "add_pending_channel_update PTS mismatch",
+                    false,
+                );
+            } else {
+                promise.set_value(());
+            }
+            return;
+        }
+        debug_assert!(old_pts + pts_count == new_pts); // the update can be applied
+    }
+
+    if !have_dialog || pts_count > 0 {
+        // `process_channel_update` answers false only for the un-appliable
+        // kinds (the edit of an unknown message); the sink's applied
+        // switch collects every kind, so the C++ early-drop arm
+        // (process false && retry armed) never fires
+        ctx.process_channel_update(update);
+        if running_get_channel_difference(manager, dialog_id) {
+            log_error!("getChannelDifference is run after applying a channel update");
+        }
+    } else {
+        // Skip useless channel update (cpp:5812-5814)
+        tracing::info!("Skip useless channel update from {source}");
+    }
+
+    if !have_dialog && manager.get_dialog(dialog_id).is_none() {
+        tracing::info!("Update didn't create {dialog_id:?}");
+        promise.set_value(());
+        return;
+    }
+
+    let new_pts_after = {
+        let d = manager.get_dialog(dialog_id).expect("dialog ensured above");
+        assert!(new_pts > d.pts);
+        new_pts
+    };
+    set_channel_pts(
+        global,
+        manager,
+        msgctx,
+        state,
+        ctx,
+        dialog_id,
+        new_pts_after,
+        source,
+    );
+    promise.set_value(());
+}
+
+/// `MessagesManager::on_channel_get_difference_timeout`
+/// (MessagesManager.cpp:34752-34762) — the shared fire of both
+/// MultiTimeouts: the retry ladder's deadline and the final poll timeout.
+fn on_channel_get_difference_timeout(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    dialog_id: DialogId,
+) {
+    if ctx.close_flag() {
+        return;
+    }
+
+    assert!(dialog_id.get_type() == DialogType::Channel);
+    let pts = manager.get_dialog(dialog_id).map_or(0, |d| d.pts);
+    get_channel_difference(
+        global,
+        manager,
+        msgctx,
+        sendctx,
+        state,
+        ctx,
+        dialog_id,
+        pts,
+        0,
+        MessageId::default(),
+        true,
+        "on_channel_get_difference_timeout",
+        false,
+    );
+}
+
+/// The earliest armed channel-difference deadline (both timeout maps) —
+/// the Td shared alarm slot joins it.
+pub fn next_channel_difference_deadline(manager: &MessagesManager) -> Option<f64> {
+    manager
+        .channel_get_difference_retry_deadlines
+        .values()
+        .chain(manager.channel_get_difference_deadlines.values())
+        .copied()
+        .min_by(f64::total_cmp)
+}
+
+/// The MultiTimeout fire — `tick_channel_difference_timeouts` runs every
+/// due deadline (the C++ `timeout_expired` collects all expired keys,
+/// re-arms, then fires each callback; the fixpoint cap mirrors the
+/// updates manager's tick).
+pub fn tick_channel_difference_timeouts(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    msgctx: &mut dyn MessageObjectContext,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    ctx: &mut dyn ChannelDifferenceContext,
+    now: f64,
+) {
+    for _ in 0..100 {
+        let Some(deadline) = next_channel_difference_deadline(manager) else {
+            break;
+        };
+        if deadline > now {
+            break;
+        }
+        let due: Vec<DialogId> = manager
+            .channel_get_difference_retry_deadlines
+            .iter()
+            .chain(manager.channel_get_difference_deadlines.iter())
+            .filter(|&(_, deadline)| *deadline <= now)
+            .map(|(&dialog_id, _)| dialog_id)
+            .collect();
+        for dialog_id in due {
+            manager
+                .channel_get_difference_retry_deadlines
+                .remove(&dialog_id);
+            manager.channel_get_difference_deadlines.remove(&dialog_id);
+            on_channel_get_difference_timeout(
+                global, manager, msgctx, sendctx, state, ctx, dialog_id,
+            );
+        }
+    }
+}
+
+/// `MessagesManager::on_get_message_from_database(Dialog *, MessageId,
+/// const MessageDbDialogMessage &, bool, const char *)`
+/// (MessagesManager.cpp:30691-30757) — the parse, the access gate, the
+/// memory-wins rule and the `from_database` add. The
+/// `Dependencies::resolve_force` fan-out (cpp:30743-30748) — the
+/// referenced user/dialog loads + the unresolved `get_message_from_server`
+/// refire — rides the message-query plane (§3.9 seam).
+#[allow(clippy::too_many_arguments)]
+fn on_get_message_from_database(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    expected_message_id: MessageId,
+    value: &[u8],
+    is_scheduled: bool,
+    source: &'static str,
+) -> Option<MessageFullId> {
+    if value.is_empty() {
+        return None;
+    }
+    let time = crate::user_manager::TimeCtx::from_global(global);
+    let message = parse_message(&time, expected_message_id, value, is_scheduled)?;
+    let message_id = message.message_id;
+
+    // `have_input_peer(dialog_id, true, AccessRights::Read)` (cpp:30709)
+    if !state.have_input_peer(dialog_id, true) {
+        return None;
+    }
+
+    // data in the database is always outdated, so return a message from
+    // the memory (cpp:30711-30743)
+    if let Some(d) = manager.get_dialog(dialog_id)
+        && get_message_in_dialog(d, message_id).is_some()
+    {
+        return Some(MessageFullId::new(dialog_id, message_id));
+    }
+
+    let mut need_update = false;
+    let mut need_update_dialog_pos = false;
+    let result = add_message_to_dialog(
+        global,
+        manager,
+        reactions_ctx,
+        sendctx,
+        state,
+        dialog_id,
+        message,
+        true,
+        false,
+        &mut need_update,
+        &mut need_update_dialog_pos,
+        source,
+    );
+    if need_update_dialog_pos {
+        log_error!(
+            "Need update chat position after loading of a message in {dialog_id:?} from {source}"
+        );
+    }
+    result.ok()
+}
+
+/// `MessagesManager::get_message_force(Dialog *, MessageId, const char *)`
+/// (MessagesManager.cpp:30644-30676) — the memory probe + the message-db
+/// load seam (net-drain 24): the request-gate callers
+/// ([`get_message_for_request`]/[`have_message_request`]) keep the
+/// in-memory form until their own slices; the premium giveaway band
+/// (§6 row 2) is the live leg.
+#[allow(clippy::too_many_arguments)]
+pub fn get_message_force_from_database(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    source: &'static str,
+) -> Option<MessageFullId> {
+    if !message_id.is_valid() && !message_id.is_valid_scheduled() {
+        return None;
+    }
+
+    if let Some(d) = manager.get_dialog(dialog_id)
+        && get_message_in_dialog(d, message_id).is_some()
+    {
+        return Some(MessageFullId::new(dialog_id, message_id));
+    }
+
+    let (use_message_database, is_deleted, has_loaded_scheduled) = {
+        let d = manager.get_dialog(dialog_id)?;
+        (
+            global.use_message_database(),
+            is_deleted_message(d, message_id),
+            d.has_loaded_scheduled_messages_from_database,
+        )
+    };
+    if !use_message_database
+        || message_id.is_yet_unsent()
+        || is_deleted
+        || (message_id.is_scheduled() && has_loaded_scheduled)
+    {
+        return None;
+    }
+
+    tracing::info!(
+        "Trying to load {}:{} from database from {source}",
+        dialog_id.get(),
+        message_id.get()
+    );
+    // `get_message_db_sync()->get_message` (cpp:30668) — the synchronous
+    // row read over the shared connection
+    let row = global
+        .message_db_sync()
+        .with_db(|db| db.get_message(MessageFullId::new(dialog_id, message_id)));
+    let row = match row {
+        tdutils::status::Result::Ok(row) => row,
+        tdutils::status::Result::Err(_) => return None,
+    };
+    on_get_message_from_database(
+        global,
+        manager,
+        sendctx,
+        state,
+        reactions_ctx,
+        dialog_id,
+        message_id,
+        &row.data,
+        message_id.is_scheduled(),
+        source,
+    )
+}
+
+/// `MessagesManager::get_giveaway_message_id(MessageFullId)`
+/// (MessagesManager.cpp:36676-36697) — the premium giveaway-info band
+/// (§6 row 2): the force lookup, the giveaway-content pair and the id
+/// bands in the C++ order.
+#[allow(clippy::too_many_arguments)]
+pub fn get_giveaway_message_id(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> Result<ServerMessageId, Status> {
+    let message_full_id = get_message_force_from_database(
+        global,
+        manager,
+        sendctx,
+        state,
+        reactions_ctx,
+        dialog_id,
+        message_id,
+        "get_giveaway_message_id",
+    );
+    let Some(found) = message_full_id else {
+        return Result::Err(Status::error(400, "Message not found"));
+    };
+    let found_id = found.get_message_id();
+    let content_type = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message_in_dialog(d, found_id))
+        .and_then(|m| m.content.as_ref())
+        .map(|content| content.get_type());
+    match content_type {
+        Some(MessageContentType::Giveaway) | Some(MessageContentType::GiveawayWinners) => {}
+        _ => return Result::Err(Status::error(400, "Message has wrong type")),
+    }
+    if found_id.is_scheduled() {
+        return Result::Err(Status::error(400, "Wrong scheduled message identifier"));
+    }
+    if !found_id.is_server() {
+        return Result::Err(Status::error(400, "Wrong message identifier"));
+    }
+
+    Result::Ok(found_id.get_server_message_id())
 }
 
 #[cfg(test)]
@@ -41645,5 +43923,492 @@ mod tests {
             // ephemeral helper pins the actual-content form.
             assert!(!is_ephemeral_message(&m));
         }
+    }
+
+    // ==== M.10.19 tests — the channel-difference ladder ====
+
+    /// The [`ChannelDifferenceContext`] stand-in: the recorded send legs
+    /// + the gate knobs the ladder reads.
+    struct ChannelDifferenceTestContext {
+        now: f64,
+        unix_time: i32,
+        close: bool,
+        ignore_background_updates: bool,
+        is_bot: bool,
+        have_channel: bool,
+        have_min_channel: bool,
+        is_member: bool,
+        have_input_peer_read: bool,
+        sent: Vec<(DialogId, i32, i32, bool)>,
+        processed_updates: Vec<&'static str>,
+    }
+
+    impl Default for ChannelDifferenceTestContext {
+        fn default() -> Self {
+            ChannelDifferenceTestContext {
+                now: 1000.0,
+                unix_time: 1_700_000_000,
+                close: false,
+                ignore_background_updates: false,
+                is_bot: false,
+                have_channel: true,
+                have_min_channel: false,
+                is_member: true,
+                have_input_peer_read: true,
+                sent: Vec::new(),
+                processed_updates: Vec::new(),
+            }
+        }
+    }
+
+    impl ChannelDifferenceContext for ChannelDifferenceTestContext {
+        fn now(&self) -> f64 {
+            self.now
+        }
+        fn unix_time(&self) -> i32 {
+            self.unix_time
+        }
+        fn close_flag(&self) -> bool {
+            self.close
+        }
+        fn ignore_background_updates(&self) -> bool {
+            self.ignore_background_updates
+        }
+        fn is_bot(&self) -> bool {
+            self.is_bot
+        }
+        fn get_input_channel(
+            &mut self,
+            _channel_id: ChannelId,
+        ) -> Option<telegram_api::InputChannel> {
+            Some(telegram_api::InputChannel::inputChannel(
+                telegram_api::inputChannel {
+                    channel_id: 900,
+                    access_hash: 7,
+                },
+            ))
+        }
+        fn have_input_peer_read(&mut self, _dialog_id: DialogId) -> bool {
+            self.have_input_peer_read
+        }
+        fn have_channel(&self, _channel_id: ChannelId) -> bool {
+            self.have_channel
+        }
+        fn have_min_channel(&self, _channel_id: ChannelId) -> bool {
+            self.have_min_channel
+        }
+        fn is_channel_member(&self, _channel_id: ChannelId) -> bool {
+            self.is_member
+        }
+        fn schedule_get_difference(&mut self, _source: &str) {}
+        fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
+        fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
+        fn on_get_dialog_error(&mut self, _dialog_id: DialogId, _status: &Status, _source: &str) {}
+        fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {}
+        fn send_get_channel_difference_query(
+            &mut self,
+            dialog_id: DialogId,
+            _input_channel: telegram_api::InputChannel,
+            pts: i32,
+            limit: i32,
+            force: bool,
+        ) {
+            self.sent.push((dialog_id, pts, limit, force));
+        }
+        fn process_channel_update(&mut self, update: crate::updates_manager::PendingUpdate) {
+            let name = match update {
+                crate::updates_manager::PendingUpdate::Wire(update) => match update {
+                    telegram_api::Update::updateNewChannelMessage(_) => "updateNewChannelMessage",
+                    telegram_api::Update::updateDeleteChannelMessages(_) => {
+                        "updateDeleteChannelMessages"
+                    }
+                    telegram_api::Update::updateEditChannelMessage(_) => "updateEditChannelMessage",
+                    telegram_api::Update::updatePinnedChannelMessages(_) => {
+                        "updatePinnedChannelMessages"
+                    }
+                    _ => "other",
+                },
+                crate::updates_manager::PendingUpdate::Dummy => "dummyUpdate",
+                crate::updates_manager::PendingUpdate::SentMessage { .. } => "updateSentMessage",
+            };
+            self.processed_updates.push(name);
+        }
+    }
+
+    /// A channel dialog with the given pts.
+    fn ladder_channel_dialog(manager: &mut MessagesManager, pts: i32) -> DialogId {
+        let dialog_id = DialogId::from_channel_id(ChannelId::new(900));
+        let d = manager.add_dialog_for_new_message(dialog_id);
+        d.pts = pts;
+        dialog_id
+    }
+
+    /// `add_pending_channel_update`'s gap detector: a pts mismatch parks
+    /// the update and runs the ladder force-first; a contiguous update
+    /// applies and advances the pts; an old update drops.
+    #[test]
+    fn m10_19_gap_detection_postpones_applies_and_skips() {
+        let mut global = crate::global::Global::new();
+        let mut manager = MessagesManager::new();
+        let dialog_id = ladder_channel_dialog(&mut manager, 10);
+        let mut msgctx = TestObjectContext::default();
+        let sendctx = SendTestContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut ctx = ChannelDifferenceTestContext::default();
+
+        // a gap: old_pts 10 vs new_pts 15 - pts_count 1
+        let (promise, slot) = unit_promise();
+        add_pending_channel_update(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            crate::updates_manager::PendingUpdate::Wire(
+                telegram_api::Update::updateDeleteChannelMessages(
+                    telegram_api::updateDeleteChannelMessages {
+                        channel_id: 900,
+                        messages: vec![55],
+                        pts: 15,
+                        pts_count: 1,
+                    },
+                ),
+            ),
+            15,
+            1,
+            promise,
+            "test gap",
+            false,
+        );
+        assert!(
+            ctx.sent == [(dialog_id, 10, 100, true)],
+            "the gap runs the ladder force-first from old_pts: {:?}",
+            ctx.sent
+        );
+        assert_eq!(
+            manager
+                .postponed_channel_updates
+                .get(&dialog_id)
+                .map(|updates| updates.len()),
+            Some(1),
+            "the gapped update parks"
+        );
+        assert!(
+            manager
+                .active_get_channel_differences
+                .contains_key(&dialog_id)
+        );
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the gapped promise stays behind the difference"
+        );
+
+        // a contiguous update applies + advances
+        let mut manager = MessagesManager::new();
+        let dialog_id = ladder_channel_dialog(&mut manager, 10);
+        let (promise, slot) = unit_promise();
+        ctx.sent.clear();
+        add_pending_channel_update(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            crate::updates_manager::PendingUpdate::Wire(
+                telegram_api::Update::updateDeleteChannelMessages(
+                    telegram_api::updateDeleteChannelMessages {
+                        channel_id: 900,
+                        messages: vec![56],
+                        pts: 11,
+                        pts_count: 1,
+                    },
+                ),
+            ),
+            11,
+            1,
+            promise,
+            "test contiguous",
+            false,
+        );
+        assert!(ctx.sent.is_empty(), "no difference for a contiguous update");
+        assert_eq!(
+            manager.get_dialog(dialog_id).map(|d| d.pts),
+            Some(11),
+            "the applied update advances the pts"
+        );
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // an old update drops
+        let (promise, slot) = unit_promise();
+        add_pending_channel_update(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            crate::updates_manager::PendingUpdate::Wire(
+                telegram_api::Update::updateDeleteChannelMessages(
+                    telegram_api::updateDeleteChannelMessages {
+                        channel_id: 900,
+                        messages: vec![57],
+                        pts: 9,
+                        pts_count: 1,
+                    },
+                ),
+            ),
+            9,
+            1,
+            promise,
+            "test old",
+            false,
+        );
+        assert!(ctx.sent.is_empty(), "no difference for an old update");
+        assert_eq!(manager.get_dialog(dialog_id).map(|d| d.pts), Some(11));
+
+        // the sanity gates: a negative pts_count drops without any state
+        let (promise, _slot) = unit_promise();
+        add_pending_channel_update(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            crate::updates_manager::PendingUpdate::Dummy,
+            20,
+            -1,
+            promise,
+            "test sanity",
+            false,
+        );
+        assert!(ctx.sent.is_empty());
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+    }
+
+    /// `add_pending_channel_update`'s first-update seed: a pts of 0 adopts
+    /// `new_pts - pts_count` and applies.
+    #[test]
+    fn m10_19_first_update_seeds_the_pts() {
+        let mut global = crate::global::Global::new();
+        let mut manager = MessagesManager::new();
+        let dialog_id = ladder_channel_dialog(&mut manager, 0);
+        let mut msgctx = TestObjectContext::default();
+        let sendctx = SendTestContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut ctx = ChannelDifferenceTestContext::default();
+
+        let (promise, slot) = unit_promise();
+        add_pending_channel_update(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            crate::updates_manager::PendingUpdate::Wire(
+                telegram_api::Update::updateDeleteChannelMessages(
+                    telegram_api::updateDeleteChannelMessages {
+                        channel_id: 900,
+                        messages: vec![58],
+                        pts: 5,
+                        pts_count: 1,
+                    },
+                ),
+            ),
+            5,
+            1,
+            promise,
+            "test seed",
+            false,
+        );
+        assert!(ctx.sent.is_empty(), "the seeded first update applies");
+        assert_eq!(manager.get_dialog(dialog_id).map(|d| d.pts), Some(5));
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+    }
+
+    /// The retry ladder's doubled backoff capped at Random(60, 80) and
+    /// the schedule/tick fire (the virtual-clock MultiTimeout pair).
+    #[test]
+    fn m10_19_retry_backoff_and_the_tick() {
+        let mut global = crate::global::Global::new();
+        let mut manager = MessagesManager::new();
+        let dialog_id = ladder_channel_dialog(&mut manager, 10);
+        let mut msgctx = TestObjectContext::default();
+        let sendctx = SendTestContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut ctx = ChannelDifferenceTestContext::default();
+
+        // schedule + the tick fires the query (the gap-timeout entry)
+        schedule_get_channel_difference(
+            &mut manager,
+            dialog_id,
+            0,
+            MessageId::default(),
+            0.001,
+            1000.0,
+            "test schedule",
+        );
+        assert_eq!(
+            manager
+                .channel_get_difference_retry_deadlines
+                .get(&dialog_id),
+            Some(&1000.001)
+        );
+        // the not-yet-due tick is a no-op
+        tick_channel_difference_timeouts(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            1000.0005,
+        );
+        assert!(ctx.sent.is_empty());
+        // the due tick fires (pts from the dialog, force)
+        tick_channel_difference_timeouts(
+            &mut global,
+            &mut manager,
+            &mut msgctx,
+            &sendctx,
+            &mut state,
+            &mut ctx,
+            1000.002,
+        );
+        assert_eq!(ctx.sent, [(dialog_id, 10, 100, true)]);
+
+        // the backoff: 1 doubling to 2, the deadline re-armed in [0.8, 1.2]
+        manager.get_channel_difference_count = 0;
+        manager.active_get_channel_differences.clear();
+        retry_get_channel_difference_later(&mut manager, dialog_id, 2000.0);
+        assert_eq!(
+            manager
+                .channel_get_difference_retry_timeouts
+                .get(&dialog_id),
+            Some(&2),
+            "the delay doubled"
+        );
+        let deadline = *manager
+            .channel_get_difference_retry_deadlines
+            .get(&dialog_id)
+            .expect("re-armed");
+        assert!((2000.8..=2001.2).contains(&deadline), "{deadline}");
+    }
+
+    /// `set_channel_pts`'s advance rule: up, the cardinal-drop band, and
+    /// the monotone-back error band.
+    #[test]
+    fn m10_19_set_channel_pts_advance_rule() {
+        let mut global = crate::global::Global::new();
+        let mut manager = MessagesManager::new();
+        let dialog_id = ladder_channel_dialog(&mut manager, 10);
+        let msgctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut ctx = ChannelDifferenceTestContext::default();
+
+        set_channel_pts(
+            &mut global,
+            &mut manager,
+            &msgctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            15,
+            "test",
+        );
+        assert_eq!(manager.get_dialog(dialog_id).map(|d| d.pts), Some(15));
+
+        // a small step back is refused
+        set_channel_pts(
+            &mut global,
+            &mut manager,
+            &msgctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            12,
+            "test",
+        );
+        assert_eq!(manager.get_dialog(dialog_id).map(|d| d.pts), Some(15));
+
+        // a cardinal drop (> 99999 below) goes through
+        set_channel_pts(
+            &mut global,
+            &mut manager,
+            &msgctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            150_000,
+            "test",
+        );
+        assert_eq!(manager.get_dialog(dialog_id).map(|d| d.pts), Some(150_000));
+        set_channel_pts(
+            &mut global,
+            &mut manager,
+            &msgctx,
+            &mut state,
+            &mut ctx,
+            dialog_id,
+            5,
+            "test",
+        );
+        assert_eq!(manager.get_dialog(dialog_id).map(|d| d.pts), Some(5));
+    }
+
+    /// The `get_giveaway_message_id` bands (§6 row 2): the not-found band
+    /// first, the content pair, then the id bands.
+    #[test]
+    fn m10_19_giveaway_message_id_bands() {
+        let mut global = crate::global::Global::new();
+        let mut manager = MessagesManager::new();
+        let dialog_id = ladder_channel_dialog(&mut manager, 10);
+        let sendctx = SendTestContext::default();
+        let mut state = ReadStateTestContext::default();
+
+        // the probe miss without a message-db answers the not-found band
+        let status = get_giveaway_message_id(
+            &mut global,
+            &mut manager,
+            &sendctx,
+            &mut state,
+            &NoDialogReactionsContext,
+            dialog_id,
+            MessageId::from_server_message_id(ServerMessageId::new(100)),
+        )
+        .unwrap_err();
+        assert_eq!(status.message(), "Message not found");
+    }
+
+    /// A unit promise + the shared completion slot (the
+    /// dialog_manager.rs `UnitSlot` shape).
+    type UnitResultSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    fn unit_promise() -> (tdutils::promise::Promise<()>, UnitResultSlot) {
+        let slot: UnitResultSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<()>| {
+                *capture.lock().unwrap() = Some(result);
+            },
+        );
+        (promise, slot)
     }
 }
