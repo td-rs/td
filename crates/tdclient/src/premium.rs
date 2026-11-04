@@ -194,6 +194,16 @@ pub trait PremiumEnv {
     /// `td_->user_manager_->get_user_id_object(user_id, source)`.
     fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64;
 
+    /// `td_->messages_manager_->get_giveaway_message_id
+    /// (MessageFullId)` (MessagesManager.cpp:36676-36697) — the M.10.19
+    /// force-lookup band (the memory probe + the message-db load seam +
+    /// the giveaway-content pair + the id bands, in the C++ order).
+    fn get_giveaway_message_id(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+    ) -> Result<crate::messages_manager::ServerMessageId>;
+
     // ---- the query sends — the dispatcher arms live at the Td env ----
     fn send_get_premium_promo_query(&mut self) {
         tdutils::log_info!("Send help.getPremiumPromo — [net-inert]");
@@ -1300,8 +1310,8 @@ impl PremiumManager {
 
     /// `get_premium_giveaway_info` (Premium.cpp:1437-1442) →
     /// `MessagesManager::get_giveaway_message_id` (cpp:36676-36697): the
-    /// `get_message_force` + giveaway-content bands ride the M.10 seam,
-    /// the pure id bands run here →
+    /// `get_message_force` + giveaway-content bands ride the M.10.19
+    /// seam (the memory probe + the message-db load), then →
     /// `GetGiveawayInfoQuery::send` (cpp:741-748): the Read input peer
     /// resolves at the send leg; the `None` arm is the handler's
     /// `on_error` (cpp:820-824 — the dialog-error tail, then `set_error`).
@@ -1313,15 +1323,15 @@ impl PremiumManager {
         mut promise: Promise<td_api::GiveawayInfo>,
     ) {
         let full_message_id = crate::messages_manager::MessageId::new(message_id);
-        if full_message_id.is_scheduled() {
-            return promise.set_error(Status::error(400, "Wrong scheduled message identifier"));
-        }
-        let server_message_id = if full_message_id.is_server() {
-            full_message_id.get_server_message_id()
-        } else {
-            return promise.set_error(Status::error(400, "Wrong message identifier"));
-        };
         let dialog = DialogId::new(dialog_id);
+        // `TRY_RESULT_PROMISE(promise, server_message_id,
+        // get_giveaway_message_id(...))` — the force lookup + the
+        // content/id bands in the C++ order (Message not found → wrong
+        // type → scheduled → not-server)
+        let server_message_id = match env.get_giveaway_message_id(dialog, full_message_id) {
+            Result::Ok(server_message_id) => server_message_id,
+            Result::Err(status) => return promise.set_error(status),
+        };
         let input_peer = match env.get_input_peer(dialog, AccessRights::Read) {
             Some(peer) => peer,
             None => {
@@ -1748,6 +1758,16 @@ mod tests {
         }
 
         fn on_get_dialog_error(&mut self, _dialog_id: DialogId, _status: &Status, _source: &str) {}
+
+        // the in-memory probe only — the M.10.19 db-load leg is the Td
+        // env's (the seeded-dialog band tests drive the memory form)
+        fn get_giveaway_message_id(
+            &mut self,
+            _dialog_id: DialogId,
+            _message_id: crate::messages_manager::MessageId,
+        ) -> Result<crate::messages_manager::ServerMessageId> {
+            Result::Err(Status::error(400, "Message not found"))
+        }
 
         fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
 

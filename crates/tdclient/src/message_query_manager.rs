@@ -115,7 +115,7 @@ pub trait MessageQueryManagerEnv {
         _pts: i32,
         _pts_count: i32,
         _promise: Promise<()>,
-        _source: &str,
+        _source: &'static str,
     ) {
     }
 
@@ -4245,7 +4245,7 @@ mod tests {
             pts: i32,
             pts_count: i32,
             _promise: Promise<()>,
-            _source: &str,
+            _source: &'static str,
         ) {
             self.channel_pts_updates.push((pts, pts_count));
         }
