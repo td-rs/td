@@ -3080,6 +3080,42 @@ pub(crate) type BotInfoNetHandle = NetKindHandle<crate::bot_info_manager::BotInf
 /// [`Td::dispatch_completed_story_net`].
 pub(crate) type StoryNetHandle = NetKindHandle<crate::story_manager::StoryNetKind>;
 
+/// The cloned star-gift dispatch surface (the §3.6 catalog/transformation
+/// families — the manager-held `StarGiftManager::net` handle); the answers
+/// drain through [`Td::dispatch_completed_star_net`].
+pub(crate) type StarGiftNetHandle = NetKindHandle<crate::star_gift_manager::StarGiftNetKind>;
+
+/// The `ConvertStarGiftQuery` continuation queue — the C++
+/// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
+/// completes into `on_dialog_gift_transferred` with the empty to-dialog
+/// (the queue decouples the promise interface from the manager borrow, the
+/// `FinishCreateCommunityChain` convention).
+type ConvertGiftQueue = Arc<Mutex<Vec<(crate::dialog_id::DialogId, Promise<()>)>>>;
+
+/// The ConvertStarGiftQuery promise chain — the ok half queues the
+/// transfer tail, the error half fails the promise (the C++ lambda).
+struct ConvertGiftChain {
+    from_dialog_id: crate::dialog_id::DialogId,
+    promise: Option<Promise<()>>,
+    convert_queue: ConvertGiftQueue,
+}
+
+impl tdutils::promise::PromiseInterface<()> for ConvertGiftChain {
+    fn set_value(&mut self, _value: ()) {
+        if let Some(promise) = self.promise.take() {
+            self.convert_queue
+                .lock()
+                .push((self.from_dialog_id, promise));
+        }
+    }
+
+    fn set_error(&mut self, error: Status) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_error(error);
+        }
+    }
+}
+
 /// The parked auto-download promises (the C++ handlers' own promises).
 enum PendingAutoDownloadQuery {
     /// The `GetAutoDownloadSettingsQuery` promise (cpp:35).
@@ -3993,6 +4029,13 @@ pub struct Td {
     /// the §3.5 net-drain 20 families — the [`Td::on_story_net_answer`]
     /// drain).
     story_net_completed: Arc<Mutex<Vec<(crate::story_manager::StoryNetKind, NetQuery)>>>,
+    /// The callback-parked star-gift answers (the C++ ResultHandler halves
+    /// of the §3.6 catalog/transformation families — the
+    /// [`Td::on_star_gift_net_answer`] drain).
+    star_gift_net_completed: Arc<Mutex<Vec<(crate::star_gift_manager::StarGiftNetKind, NetQuery)>>>,
+    /// The ConvertStarGiftQuery continuation queue (the reload-completes-
+    /// into-transfer-tail hop).
+    convert_gift_queue: ConvertGiftQueue,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -4467,6 +4510,8 @@ impl Td {
             dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_info_net_completed: Arc::new(Mutex::new(Vec::new())),
             story_net_completed: Arc::new(Mutex::new(Vec::new())),
+            star_gift_net_completed: Arc::new(Mutex::new(Vec::new())),
+            convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -4947,6 +4992,7 @@ impl Td {
         self.chat_manager.net = self.chat_net();
         self.dialog_manager.net = self.dialog_net();
         self.story_manager.net = self.story_net();
+        self.star_gift_manager.net = self.star_gift_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -6739,6 +6785,7 @@ impl Td {
         self.dispatch_completed_story_net();
         self.dispatch_completed_bot_info_net();
         self.dispatch_completed_story_net();
+        self.dispatch_completed_star_gift_net();
         self.dispatch_completed_send_message_net();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
@@ -6942,6 +6989,94 @@ impl Td {
             completed: Arc::clone(&self.story_net_completed),
             shared: self.net_shared.clone(),
         })
+    }
+
+    /// The cloned star-gift dispatch surface (the §3.6 families' send
+    /// legs — the manager-held handle).
+    pub(crate) fn star_gift_net(&self) -> Option<StarGiftNetHandle> {
+        Some(StarGiftNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.star_gift_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// Build the [`StarGiftTdEnv`] view over the split Td borrows and run
+    /// the closure with it + the star-gift manager (the `star_gift_env!`
+    /// shape — the net-answer drain's twin).
+    fn with_star_gift_manager<R>(
+        &mut self,
+        run: impl FnOnce(&mut StarGiftTdEnv<'_>, &mut crate::star_gift_manager::StarGiftManager) -> R,
+    ) -> R {
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            star_gift_manager,
+            notification_updates,
+            ..
+        } = self;
+        let mut env = StarGiftTdEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            my_dialog_id,
+            updates: notification_updates,
+        };
+        run(&mut env, star_gift_manager)
+    }
+
+    /// The field-split [`crate::user_manager::UserEnv`] borrow over the
+    /// Td (the `user_env!` shape for the Td impl — the cross-manager
+    /// tails the net answers run).
+    fn with_user_manager_env<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::user_manager::UserManager, &mut crate::user_manager::UserEnv) -> R,
+    ) -> R {
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("the option manager is set for the netted td"),
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        let result = f(&mut user_manager, &mut env);
+        self.user_manager = user_manager;
+        result
+    }
+
+    /// The chat twin of [`Self::with_user_manager_env`] — the
+    /// `reload_channel_full` tail's manager pair.
+    fn with_chat_manager_env<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut crate::chat_manager::ChatManager,
+            &mut crate::user_manager::UserManager,
+            &mut crate::user_manager::UserEnv,
+        ) -> R,
+    ) -> R {
+        let mut chat_manager = std::mem::take(&mut self.chat_manager);
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("the option manager is set for the netted td"),
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        let result = f(&mut chat_manager, &mut user_manager, &mut env);
+        self.user_manager = user_manager;
+        self.chat_manager = chat_manager;
+        result
     }
 
     /// The cloned bot-info dispatch surface (the `BotInfoEnv` senders —
@@ -16132,6 +16267,396 @@ impl Td {
         self.global = global;
         self.messages_manager = manager;
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked star-gift answers (the §3.6 families) +
+    /// the ConvertStarGiftQuery continuation queue (the reload completes
+    /// into `on_dialog_gift_transferred`).
+    fn dispatch_completed_star_gift_net(&mut self) {
+        let completed = std::mem::take(&mut *self.star_gift_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_star_gift_net_answer(kind, query);
+        }
+        let convert_tail = std::mem::take(&mut *self.convert_gift_queue.lock());
+        for (from_dialog_id, promise) in convert_tail {
+            self.with_star_gift_manager(|env, manager| {
+                manager.on_dialog_gift_transferred(
+                    env,
+                    from_dialog_id,
+                    crate::dialog_id::DialogId::default(),
+                    promise,
+                )
+            });
+        }
+        self.drain_sink();
+    }
+
+    /// Route one star-gift net answer by kind — the ResultHandler halves
+    /// of the §3.6 catalog/transformation families
+    /// (StarGiftManager.cpp). The wire-error heads run here
+    /// (`on_get_dialog_error`); the parse failures settle through the
+    /// manager error tails without the head (the landed-flip convention,
+    /// §5).
+    fn on_star_gift_net_answer(
+        &mut self,
+        kind: crate::star_gift_manager::StarGiftNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        use crate::star_gift_manager::StarGiftNetKind;
+        match kind {
+            // `GetStarGiftsQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:63-133) — the wrong-constructor band
+            // is the C++ 500.
+            StarGiftNetKind::GetStarGifts => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGifts::parse(query.ok()) {
+                        Ok(telegram_api::payments_StarGifts::payments_starGifts(ptr)) => Ok(ptr),
+                        Ok(_) => {
+                            tdutils::log_error!(
+                                "Receive an unexpected payments.getStarGifts answer"
+                            );
+                            Err(Status::error(500, "Receive unexpected response"))
+                        }
+                        Err(_) => Err(parse_error("payments.getStarGifts")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_available_gifts(env, result)
+                });
+            }
+            // `GetStarGiftAuctionStateQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:409-421) — the pass-through
+            // `payments_starGiftAuctionState` answer routes through the
+            // `on_get_auction_state` continuation.
+            StarGiftNetKind::GetStarGiftAuctionState => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftAuctionState::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getStarGiftAuctionState")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_auction_state(env, result)
+                });
+            }
+            // `GetStarGiftActiveAuctionsQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:434-447).
+            StarGiftNetKind::GetStarGiftActiveAuctions => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftActiveAuctions::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getStarGiftActiveAuctions")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_active_gift_auctions(env, result)
+                });
+            }
+            // `GetStarGiftAuctionAcquiredGiftsQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:466-489).
+            StarGiftNetKind::GetStarGiftAuctionAcquiredGifts => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftAuctionAcquiredGifts::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getStarGiftAuctionAcquiredGifts")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_gift_auction_acquired_gifts(env, result)
+                });
+            }
+            // `ConvertStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:511-528) — the ok half routes the
+            // reload tail by dialog type, the reload completes into the
+            // transfer continuation.
+            StarGiftNetKind::ConvertStarGift { dialog_id } => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ConvertStarGiftQuery",
+                    );
+                    self.with_star_gift_manager(|_env, manager| {
+                        manager.on_get_convert_star_gift(Err(status));
+                    });
+                    return;
+                }
+                let Some(()) = parse_wire_bool(query.ok()) else {
+                    self.with_star_gift_manager(|_env, manager| {
+                        manager
+                            .on_get_convert_star_gift(Err(parse_error("payments.convertStarGift")));
+                    });
+                    return;
+                };
+                let Some(promise) = self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_convert_star_gift(Ok(()))
+                }) else {
+                    return;
+                };
+                let chain = ConvertGiftChain {
+                    from_dialog_id: dialog_id,
+                    promise: Some(promise),
+                    convert_queue: Arc::clone(&self.convert_gift_queue),
+                };
+                let mut chain_promise: Promise<()> = Promise::from_interface(chain);
+                let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
+                if dialog_id == my_dialog_id {
+                    let my_id = self.user_manager.get_my_id();
+                    self.with_user_manager_env(|user_manager, env| {
+                        user_manager.reload_user_full(
+                            env,
+                            my_id,
+                            chain_promise,
+                            "ConvertStarGiftQuery",
+                        )
+                    });
+                } else if dialog_id.get_type() == crate::dialog_id::DialogType::Channel {
+                    let channel_id = dialog_id.get_channel_id();
+                    self.with_chat_manager_env(|chat_manager, _user_manager, env| {
+                        chat_manager.reload_channel_full(
+                            env,
+                            channel_id,
+                            chain_promise,
+                            "ConvertStarGiftQuery",
+                        )
+                    });
+                } else {
+                    chain_promise.set_value(());
+                }
+            }
+            // `SaveStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:549-561).
+            StarGiftNetKind::SaveStarGift { dialog_id } => {
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "SaveStarGiftQuery",
+                    );
+                    Err(status)
+                } else {
+                    match parse_wire_bool(query.ok()) {
+                        Some(()) => Ok(()),
+                        None => Err(parse_error("payments.saveStarGift")),
+                    }
+                };
+                self.with_star_gift_manager(|_env, manager| manager.on_get_save_star_gift(result));
+            }
+            // `GetUpgradeGiftPreviewQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:641-702).
+            StarGiftNetKind::GetUpgradeGiftPreview => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftUpgradePreview::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getStarGiftUpgradePreview")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_gift_upgrade_preview(env, result)
+                });
+            }
+            // `GetStarGiftUpgradeAttributesQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:721-774).
+            StarGiftNetKind::GetStarGiftUpgradeAttributes => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftUpgradeAttributes::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getStarGiftUpgradeAttributes")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_gift_upgrade_variants(env, result)
+                });
+            }
+            // `CraftStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1138-1157) — the Updates answer
+            // re-enters `on_get_updates` with the crafted-gift promise
+            // chain, then the emoji-statuses refetch fires.
+            StarGiftNetKind::CraftStarGift => {
+                let pending_updates = if query.is_error() {
+                    let status = query.error().clone();
+                    self.with_star_gift_manager(|_env, manager| {
+                        manager.on_get_craft_star_gift_error(status);
+                    });
+                    None
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            tdutils::log_info!(
+                                "Receive result for CraftStarGiftQuery: {updates:?}"
+                            );
+                            self.with_star_gift_manager(|_env, manager| {
+                                manager.on_get_craft_star_gift(Ok(updates))
+                            })
+                        }
+                        Err(_) => {
+                            self.with_star_gift_manager(|_env, manager| {
+                                manager.on_get_craft_star_gift(Err(parse_error(
+                                    "payments.craftStarGift",
+                                )));
+                            });
+                            None
+                        }
+                    }
+                };
+                if let Some((updates, promise)) = pending_updates {
+                    self.um_send_later(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    });
+                    // `get_upgraded_gift_emoji_statuses(td_, Auto())` —
+                    // the fire-and-forget refetch
+                    self.with_user_manager_env(|user_manager, env| {
+                        user_manager.get_upgraded_gift_emoji_statuses(env, Promise::default());
+                    });
+                }
+            }
+            // `GetSavedStarGiftsQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1694-1747) — the error head runs only
+            // on the non-business leg.
+            StarGiftNetKind::GetSavedStarGifts {
+                dialog_id,
+                is_full_list: _,
+                is_business,
+            } => {
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    if !is_business {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "GetSavedStarGiftsQuery",
+                        );
+                    }
+                    Err(status)
+                } else {
+                    match telegram_api::payments_SavedStarGifts::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getSavedStarGifts")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_saved_star_gifts(env, result)
+                });
+            }
+            // `GetSavedStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1761-1784).
+            StarGiftNetKind::GetSavedStarGift { dialog_id } => {
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetSavedStarGiftQuery",
+                    );
+                    Err(status)
+                } else {
+                    match telegram_api::payments_SavedStarGifts::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getSavedStarGift")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_saved_star_gift(env, result)
+                });
+            }
+            // `GetCraftStarGiftsQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1800-1848).
+            StarGiftNetKind::GetCraftStarGifts => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_SavedStarGifts::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getCraftStarGifts")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_craft_star_gifts(env, result)
+                });
+            }
+            // `GetUniqueStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1865-1885).
+            StarGiftNetKind::GetUniqueStarGift => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_UniqueStarGift::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getUniqueStarGift")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_upgraded_gift(env, result)
+                });
+            }
+            // `GetUniqueStarGiftValueInfoQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1902-1918).
+            StarGiftNetKind::GetUniqueStarGiftValueInfo => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_UniqueStarGiftValueInfo::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getUniqueStarGiftValueInfo")),
+                    }
+                };
+                self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_upgraded_gift_value_info(result)
+                });
+            }
+            // `GetStarGiftWithdrawalUrlQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:1940-1952).
+            StarGiftNetKind::GetStarGiftWithdrawalUrl => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftWithdrawalUrl::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getStarGiftWithdrawalUrl")),
+                    }
+                };
+                self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_star_gift_withdrawal_url(result)
+                });
+            }
+            // `GetResaleStarGiftsQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:2012-2128).
+            StarGiftNetKind::GetResaleStarGifts => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_ResaleStarGifts::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.getResaleStarGifts")),
+                    }
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_get_resale_star_gifts(env, result)
+                });
+            }
+        }
     }
 
     /// Drain the callback-parked `SendMessageQuery` answers.
@@ -37617,6 +38142,7 @@ mod tests {
         td.chat_manager.net = td.chat_net();
         td.dialog_manager.net = td.dialog_net();
         td.story_manager.net = td.story_net();
+        td.star_gift_manager.net = td.star_gift_net();
         (td, rec, callback)
     }
 
@@ -56549,5 +57075,892 @@ mod tests {
 
         assert!(rec.sent.lock().is_empty(), "no stray queries");
         assert!(td.story_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the §3.6 star-gift net slice: the catalog/transformation
+    // families ride the dispatcher (StarGiftManager.cpp). ----
+
+    /// A valid wire backdrop attribute — the env-free attribute the
+    /// netted answers carry (the model/symbol halves need the sticker
+    /// plane's `on_get_sticker_document`, [blocked: M.15]).
+    fn wire_star_gift_backdrop() -> telegram_api::StarGiftAttribute {
+        telegram_api::StarGiftAttribute::starGiftAttributeBackdrop(
+            telegram_api::starGiftAttributeBackdrop {
+                name: "sky".to_owned(),
+                backdrop_id: 7,
+                center_color: 0x305070,
+                edge_color: 0x203040,
+                pattern_color: 0xFFFFFF,
+                text_color: 0x000000,
+                rarity: Some(
+                    telegram_api::StarGiftAttributeRarity::starGiftAttributeRarity(
+                        telegram_api::starGiftAttributeRarity { permille: 500 },
+                    ),
+                ),
+            },
+        )
+    }
+
+    /// A minimal wire `starGiftUnique` — invalid in the netted env (the
+    /// model/pattern attributes register no sticker file), so the
+    /// gift-carrying answers exercise the C++ invalid bands.
+    fn wire_unique_star_gift(id: i64) -> telegram_api::StarGift {
+        telegram_api::StarGift::starGiftUnique(telegram_api::starGiftUnique {
+            id,
+            gift_id: id,
+            title: "Sky Gift".to_owned(),
+            slug: "SkyGift".to_owned(),
+            num: 42,
+            owner_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 7,
+            })),
+            attributes: vec![wire_star_gift_backdrop()],
+            ..Default::default()
+        })
+    }
+
+    /// The wire `boolTrue` answer — `payments_saveStarGift`/`convertStarGift`
+    /// answer `Bool`.
+    fn bool_true_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x9972_75b5u32.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn star_gift_catalog_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(star_gift_catalog_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn star_gift_catalog_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain21-star-gift-catalog");
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+        seed_my_user(&mut td); // my id 42
+
+        // 1. getAvailableGifts — the `GetStarGiftsQuery::send` hash +
+        //    the invalid-gift skip (the sticker plane has not registered
+        //    the gift, so the option drops like the C++ unparsable gift)
+        td.request(1, Function::getAvailableGifts(td_api::getAvailableGifts));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGifts::ID,
+        );
+        let body = telegram_api::payments_getStarGifts::parse(sent.query()).expect("the body");
+        assert_eq!(body.hash, 0);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGifts::payments_starGifts(telegram_api::payments_starGifts {
+            hash: 0,
+            gifts: vec![telegram_api::StarGift::starGift(telegram_api::starGift {
+                id: 1,
+                stars: 25,
+                ..Default::default()
+            })],
+            chats: vec![],
+            users: vec![],
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::availableGifts(gifts)) => {
+                assert!(gifts.gifts.is_empty(), "the sticker-less gift drops");
+            }
+            other => panic!("the available gifts: {other:?}"),
+        }
+
+        // the NotModified variant is the C++ 500 band
+        td.request(2, Function::getAvailableGifts(td_api::getAvailableGifts));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGifts::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGifts::payments_starGiftsNotModified(
+            telegram_api::payments_starGiftsNotModified,
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive unexpected response")
+        );
+
+        // 2. getGiftUpgradePreview — the backdrop attribute + the price
+        //    star-count clamp
+        td.request(
+            3,
+            Function::getGiftUpgradePreview(td_api::getGiftUpgradePreview { regular_gift_id: 9 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGiftUpgradePreview::ID,
+        );
+        let body = telegram_api::payments_getStarGiftUpgradePreview::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.gift_id, 9);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGiftUpgradePreview {
+            sample_attributes: vec![wire_star_gift_backdrop()],
+            prices: vec![telegram_api::StarGiftUpgradePrice {
+                date: 100,
+                // beyond the ±2^51 Star-amount ceiling — the
+                // `get_star_count` clamp band
+                upgrade_stars: (1 << 51) + 5,
+            }],
+            next_prices: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 3).first() {
+            Some(Object::giftUpgradePreview(preview)) => {
+                assert_eq!(preview.backdrops.len(), 1);
+                assert_eq!(preview.prices.len(), 1);
+                assert_eq!(preview.prices[0].star_count, 1 << 51);
+                assert!(preview.models.is_empty() && preview.symbols.is_empty());
+            }
+            other => panic!("the upgrade preview: {other:?}"),
+        }
+
+        // 3. getUpgradedGiftVariants — the same wire constructor (the
+        //    return_*_models flags are the client-side filter)
+        td.request(
+            4,
+            Function::getUpgradedGiftVariants(td_api::getUpgradedGiftVariants {
+                regular_gift_id: 9,
+                return_upgrade_models: false,
+                return_craft_models: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGiftUpgradeAttributes::ID,
+        );
+        let body = telegram_api::payments_getStarGiftUpgradeAttributes::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.gift_id, 9);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGiftUpgradeAttributes {
+            attributes: vec![wire_star_gift_backdrop()],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 4).first() {
+            Some(Object::giftUpgradeVariants(variants)) => {
+                assert_eq!(variants.backdrops.len(), 1);
+            }
+            other => panic!("the upgrade variants: {other:?}"),
+        }
+
+        // 4. getUpgradedGift — the slug rides the wire; the sticker-less
+        //    unique gift is the C++ "Gift not found" 400 band
+        td.request(
+            5,
+            Function::getUpgradedGift(td_api::getUpgradedGift {
+                name: "SkyGift".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getUniqueStarGift::ID,
+        );
+        let body = telegram_api::payments_getUniqueStarGift::parse(sent.query()).expect("the body");
+        assert_eq!(body.slug, "SkyGift");
+        let mut answer = Vec::new();
+        telegram_api::payments_UniqueStarGift {
+            gift: Some(wire_unique_star_gift(777)),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Gift not found")
+        );
+
+        // 5. getUpgradedGiftValueInfo — the date clamps
+        td.request(
+            6,
+            Function::getUpgradedGiftValueInfo(td_api::getUpgradedGiftValueInfo {
+                name: "SkyGift".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getUniqueStarGiftValueInfo::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_UniqueStarGiftValueInfo {
+            flags: 1,
+            last_sale_on_fragment: true,
+            value_is_average: true,
+            currency: "TON".to_owned(),
+            value: 7,
+            initial_sale_date: -5,
+            initial_sale_stars: 25,
+            initial_sale_price: 3,
+            last_sale_date: 100,
+            last_sale_price: 5,
+            floor_price: 1,
+            average_price: 2,
+            listed_count: 10,
+            fragment_listed_count: 4,
+            fragment_listed_url: "url".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 6).first() {
+            Some(Object::upgradedGiftValueInfo(info)) => {
+                assert_eq!(info.initial_sale_date, 0, "max(0, -5)");
+                assert!(info.is_last_sale_on_fragment);
+            }
+            other => panic!("the value info: {other:?}"),
+        }
+
+        // 6. getGiftsForCrafting — the offset/limit wire + the permille
+        //    probabilities (the non-unique gift drop needs no sticker)
+        td.request(
+            7,
+            Function::getGiftsForCrafting(td_api::getGiftsForCrafting {
+                regular_gift_id: 5,
+                offset: "".to_owned(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getCraftStarGifts::ID,
+        );
+        let body = telegram_api::payments_getCraftStarGifts::parse(sent.query()).expect("the body");
+        assert_eq!(
+            (body.gift_id, body.offset.as_str(), body.limit),
+            (5, "", 10)
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_SavedStarGifts {
+            flags: 1, // NEXT_OFFSET_MASK (bit 0)
+            count: 1,
+            chat_notifications_enabled: false,
+            gifts: vec![telegram_api::SavedStarGift {
+                flags: 0,
+                from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 7,
+                })),
+                date: 500,
+                gift: Some(wire_unique_star_gift(777)),
+                msg_id: 9,
+                ..Default::default()
+            }],
+            next_offset: "next".to_owned(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 7).first() {
+            Some(Object::giftsForCrafting(gifts)) => {
+                assert_eq!(gifts.total_count, 1);
+                assert!(gifts.gifts.is_empty(), "the sticker-less gift drops");
+                assert_eq!(gifts.attribute_persistence_probabilities.len(), 4);
+                assert_eq!(gifts.next_offset, "next");
+            }
+            other => panic!("the gifts for crafting: {other:?}"),
+        }
+
+        // 7. searchGiftsForResale — the order/offset flag bits; the
+        //    backdrop counter lands, the sticker-less gift drops
+        td.request(
+            8,
+            Function::searchGiftsForResale(td_api::searchGiftsForResale {
+                gift_id: 5,
+                order: Some(td_api::GiftForResaleOrder::giftForResaleOrderPrice(
+                    td_api::giftForResaleOrderPrice,
+                )),
+                for_crafting: true,
+                for_stars: false,
+                attributes: vec![],
+                offset: "off".to_owned(),
+                limit: 8,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getResaleStarGifts::ID,
+        );
+        let body =
+            telegram_api::payments_getResaleStarGifts::parse(sent.query()).expect("the body");
+        // sort_by_price (bit 1), for_craft (bit 4); a non-empty offset
+        // with no attributes carries neither vector flag
+        assert_eq!(body.flags, (1 << 1) | (1 << 4));
+        assert!(body.sort_by_price && !body.sort_by_num && body.for_craft && !body.stars_only);
+        assert_eq!(
+            (body.gift_id, body.offset.as_str(), body.limit),
+            (5, "off", 8)
+        );
+        let mut answer = Vec::new();
+        telegram_api::payments_ResaleStarGifts {
+            flags: (1 << 1) | (1 << 2), // ATTRIBUTES_MASK | COUNTERS_MASK
+            count: 1,
+            gifts: vec![wire_unique_star_gift(777)],
+            next_offset: String::new(),
+            attributes: vec![wire_star_gift_backdrop()],
+            attributes_hash: 0,
+            chats: vec![],
+            counters: vec![telegram_api::StarGiftAttributeCounter {
+                attribute: Some(
+                    telegram_api::StarGiftAttributeId::starGiftAttributeIdBackdrop(
+                        telegram_api::starGiftAttributeIdBackdrop { backdrop_id: 7 },
+                    ),
+                ),
+                count: 3,
+            }],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 8).first() {
+            Some(Object::giftsForResale(gifts)) => {
+                assert_eq!(gifts.total_count, 1);
+                assert!(gifts.gifts.is_empty(), "the sticker-less gift drops");
+                assert_eq!(gifts.backdrops.len(), 1);
+                assert_eq!(gifts.backdrops[0].total_count, 3);
+            }
+            other => panic!("the gifts for resale: {other:?}"),
+        }
+
+        // the empty-offset + empty-attributes form sets the hash bit
+        // (the wire idiom — the server answers notModified on a rehash)
+        td.request(
+            9,
+            Function::searchGiftsForResale(td_api::searchGiftsForResale {
+                gift_id: 5,
+                order: Some(td_api::GiftForResaleOrder::giftForResaleOrderNumber(
+                    td_api::giftForResaleOrderNumber,
+                )),
+                for_crafting: false,
+                for_stars: true,
+                attributes: vec![],
+                offset: "".to_owned(),
+                limit: 8,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getResaleStarGifts::ID,
+        );
+        let body =
+            telegram_api::payments_getResaleStarGifts::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 | (1 << 2) | (1 << 5));
+        net_fail(sent, 420, "SLOWMODE_WAIT");
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 9);
+        assert_eq!((error.code, error.message.as_str()), (420, "SLOWMODE_WAIT"));
+
+        // 8. getGiftAuctionAcquiredGifts — the sender conversion + the
+        //    bid star-count clamp
+        td.request(
+            10,
+            Function::getGiftAuctionAcquiredGifts(td_api::getGiftAuctionAcquiredGifts {
+                gift_id: 5,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGiftAuctionAcquiredGifts::ID,
+        );
+        let body = telegram_api::payments_getStarGiftAuctionAcquiredGifts::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.gift_id, 5);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGiftAuctionAcquiredGifts {
+            gifts: vec![telegram_api::StarGiftAuctionAcquiredGift {
+                flags: 1 << 2, // GIFT_NUM_MASK
+                name_hidden: false,
+                peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 7,
+                })),
+                date: 500,
+                bid_amount: 2_500_000_001, // within the ±2^51 clamp — unchanged
+                round: 2,
+                pos: 1,
+                message: None,
+                gift_num: 42,
+            }],
+            users: vec![],
+            chats: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 10).first() {
+            Some(Object::giftAuctionAcquiredGifts(gifts)) => {
+                assert_eq!(gifts.gifts.len(), 1);
+                assert_eq!(gifts.gifts[0].star_count, 2_500_000_001);
+                assert_eq!(gifts.gifts[0].auction_round_number, 2);
+                assert_eq!(gifts.gifts[0].unique_gift_number, 42);
+                // the sender object rides the MessagesManager plane
+                // ([blocked: M.6]) — the null receiver is the parked band
+                assert!(gifts.gifts[0].receiver_id.is_none());
+            }
+            other => panic!("the acquired gifts: {other:?}"),
+        }
+
+        // 9. getGiftAuctionState — the slug input form + the C++ invalid
+        //    gift 500 (the auction gift registers no sticker file)
+        td.request(
+            11,
+            Function::getGiftAuctionState(td_api::getGiftAuctionState {
+                auction_id: "auction".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGiftAuctionState::ID,
+        );
+        let body =
+            telegram_api::payments_getStarGiftAuctionState::parse(sent.query()).expect("the body");
+        match body.auction {
+            Some(telegram_api::InputStarGiftAuction::inputStarGiftAuctionSlug(ref auction)) => {
+                assert_eq!(auction.slug, "auction");
+            }
+            other => panic!("the auction slug: {other:?}"),
+        }
+        assert_eq!(body.version, 0);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGiftAuctionState {
+            gift: Some(telegram_api::StarGift::starGift(telegram_api::starGift {
+                id: 1,
+                auction: true,
+                ..Default::default()
+            })),
+            state: Some(telegram_api::StarGiftAuctionState::starGiftAuctionState(
+                telegram_api::starGiftAuctionState {
+                    version: 1,
+                    ..Default::default()
+                },
+            )),
+            user_state: Some(telegram_api::StarGiftAuctionUserState::default()),
+            timeout: 30,
+            users: vec![],
+            chats: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 10. the scheduled active-auctions reload (the manager fire
+        //     point — no td_api request) + the NotModified log band
+        td.with_star_gift_manager(|env, manager| manager.reload_active_gift_auctions(env));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getStarGiftActiveAuctions::ID,
+        );
+        let body = telegram_api::payments_getStarGiftActiveAuctions::parse(sent.query())
+            .expect("the body");
+        assert_eq!(body.hash, 0);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarGiftActiveAuctions::payments_starGiftActiveAuctionsNotModified(
+            telegram_api::payments_starGiftActiveAuctionsNotModified,
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        // the NotModified band only logs — no request to fail
+
+        assert!(rec.sent.lock().is_empty(), "no stray queries");
+        assert!(td.star_gift_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn star_gift_saved_and_transform_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(star_gift_saved_and_transform_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn star_gift_saved_and_transform_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain21-star-gift-transform");
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+        seed_my_user(&mut td); // my id 42
+        let user_chat = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+
+        // 1. getReceivedGifts — the exclude bits + the Read peer ride the
+        //    wire; the is_full_list gift-count intake runs for the user
+        //    dialog (the sticker-less gift drops, the count stays)
+        td.request(
+            1,
+            Function::getReceivedGifts(td_api::getReceivedGifts {
+                owner_id: Some(td_api::MessageSender::messageSenderChat(
+                    td_api::messageSenderChat { chat_id: user_chat },
+                )),
+                business_connection_id: String::new(),
+                collection_id: 0,
+                exclude_unsaved: true,
+                exclude_saved: false,
+                exclude_unlimited: true,
+                exclude_upgradable: true,
+                exclude_non_upgradable: true,
+                exclude_upgraded: true,
+                exclude_without_colors: true,
+                exclude_hosted: false,
+                sort_by_price: true,
+                offset: "o".to_owned(),
+                limit: 7,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getSavedStarGifts::ID,
+        );
+        let body = telegram_api::payments_getSavedStarGifts::parse(sent.query()).expect("the body");
+        assert!(body.exclude_unsaved && body.exclude_unlimited && body.exclude_unique);
+        assert!(body.exclude_upgradable && body.exclude_unupgradable);
+        assert!(body.peer_color_available && body.sort_by_value);
+        assert!(!body.exclude_saved && !body.exclude_hosted);
+        assert_eq!(body.flags & (1 << 6), 0, "no collection id");
+        match body.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(peer)) => {
+                assert_eq!((peer.user_id, peer.access_hash), (700000001, 5));
+            }
+            other => panic!("the read peer: {other:?}"),
+        }
+        assert_eq!((body.offset.as_str(), body.limit), ("o", 7));
+        let mut answer = Vec::new();
+        telegram_api::payments_SavedStarGifts {
+            flags: 0,
+            count: 1,
+            chat_notifications_enabled: false,
+            gifts: vec![telegram_api::SavedStarGift {
+                flags: 0,
+                from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 7,
+                })),
+                date: 500,
+                gift: Some(wire_unique_star_gift(777)),
+                msg_id: 9,
+                ..Default::default()
+            }],
+            next_offset: String::new(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::receivedGifts(gifts)) => {
+                assert_eq!(gifts.total_count, 1);
+                assert!(gifts.gifts.is_empty(), "the sticker-less gift drops");
+                assert!(!gifts.are_notifications_enabled);
+            }
+            other => panic!("the received gifts: {other:?}"),
+        }
+
+        // the collection-id bit + the null-peer 400 (the send-leg band
+        // runs the full on_error tail through the completed queue — an
+        // inaccessible sender user resolves a dialog with no input peer)
+        seed_dialog_user_id(&mut td, 700000009, -1); // the inaccessible hash
+        td.request(
+            2,
+            Function::getReceivedGifts(td_api::getReceivedGifts {
+                owner_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 700000009 },
+                )),
+                business_connection_id: String::new(),
+                collection_id: 3,
+                exclude_unsaved: false,
+                exclude_saved: false,
+                exclude_unlimited: false,
+                exclude_upgradable: false,
+                exclude_non_upgradable: false,
+                exclude_upgraded: false,
+                exclude_without_colors: false,
+                exclude_hosted: false,
+                sort_by_price: false,
+                offset: String::new(),
+                limit: 7,
+            }),
+        );
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't access the chat")
+        );
+        assert!(
+            rec.sent
+                .lock()
+                .iter()
+                .all(|query| query.tl_constructor() != telegram_api::payments_getSavedStarGifts::ID),
+            "no wire query on the null peer"
+        );
+
+        // 2. getReceivedGift — the one-element inputSavedStarGiftUser
+        //    vector; the empty answer is the "Gift not found" 400
+        td.request(
+            3,
+            Function::getReceivedGift(td_api::getReceivedGift {
+                received_gift_id: "123".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_getSavedStarGift::ID,
+        );
+        let body = telegram_api::payments_getSavedStarGift::parse(sent.query()).expect("the body");
+        match body.stargift.as_slice() {
+            [telegram_api::InputSavedStarGift::inputSavedStarGiftUser(gift)] => {
+                assert_eq!(gift.msg_id, 123);
+            }
+            other => panic!("the saved star gift vector: {other:?}"),
+        }
+        let mut answer = Vec::new();
+        telegram_api::payments_SavedStarGifts {
+            flags: 0,
+            count: 0,
+            chat_notifications_enabled: false,
+            gifts: vec![],
+            next_offset: String::new(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Gift not found")
+        );
+
+        // 3. toggleGiftIsSaved — the unsave wire negation, the Bool
+        //    answer settles the request
+        td.request(
+            4,
+            Function::toggleGiftIsSaved(td_api::toggleGiftIsSaved {
+                received_gift_id: "123".to_owned(),
+                is_saved: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_saveStarGift::ID,
+        );
+        let body = telegram_api::payments_saveStarGift::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 0);
+        assert!(!body.unsave, "is_saved=true sends the save form");
+        net_complete(sent, bool_true_bytes());
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // the unsave form + the error band
+        td.request(
+            5,
+            Function::toggleGiftIsSaved(td_api::toggleGiftIsSaved {
+                received_gift_id: "123".to_owned(),
+                is_saved: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_saveStarGift::ID,
+        );
+        let body = telegram_api::payments_saveStarGift::parse(sent.query()).expect("the body");
+        assert!(body.unsave, "is_saved=false sends the unsave form");
+        net_fail(sent, 400, "GIFT_ALREADY_SAVED");
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "GIFT_ALREADY_SAVED")
+        );
+
+        // 4. sellGift — the ForDialog id resolves the owner dialog (not
+        //    mine), so the ok chain settles through the transfer tail
+        //    without the reload hop
+        td.request(
+            6,
+            Function::sellGift(td_api::sellGift {
+                business_connection_id: String::new(),
+                received_gift_id: format!("{user_chat}_5"),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_convertStarGift::ID,
+        );
+        let body = telegram_api::payments_convertStarGift::parse(sent.query()).expect("the body");
+        match body.stargift.as_ref() {
+            Some(telegram_api::InputSavedStarGift::inputSavedStarGiftChat(gift)) => {
+                assert_eq!(gift.saved_id, 5);
+            }
+            other => panic!("the convert gift: {other:?}"),
+        }
+        net_complete(sent, bool_true_bytes());
+        td.dispatch_completed_star_gift_net(); // the transfer-tail drain rides the same pass
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 6).first(), Some(Object::ok(_))),
+            "the convert chain settles through the transfer tail"
+        );
+
+        // the convert error band forwards bare
+        td.request(
+            7,
+            Function::sellGift(td_api::sellGift {
+                business_connection_id: String::new(),
+                received_gift_id: "124".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_convertStarGift::ID,
+        );
+        net_fail(sent, 400, "GIFT_ID_INVALID");
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "GIFT_ID_INVALID")
+        );
+
+        // 5. craftGift — the vector form; the STARGIFT_CRAFT_* error
+        //    bands answer success values off the error path
+        td.request(
+            8,
+            Function::craftGift(td_api::craftGift {
+                received_gift_ids: vec!["1".to_owned(), "2".to_owned()],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_craftStarGift::ID,
+        );
+        let body = telegram_api::payments_craftStarGift::parse(sent.query()).expect("the body");
+        assert_eq!(body.stargift.len(), 2);
+        net_fail(sent, 400, "STARGIFT_CRAFT_TOO_EARLY_60");
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 8).first() {
+            Some(Object::craftGiftResultTooEarly(result)) => assert_eq!(result.retry_after, 60),
+            other => panic!("the too-early band: {other:?}"),
+        }
+
+        td.request(
+            9,
+            Function::craftGift(td_api::craftGift {
+                received_gift_ids: vec!["1".to_owned()],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_craftStarGift::ID,
+        );
+        net_fail(sent, 400, "STARGIFT_ALREADY_CRAFTED");
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::craftGiftResultInvalidGift(_))
+        ));
+
+        // the non-craft Updates body is the C++ 500
+        td.request(
+            10,
+            Function::craftGift(td_api::craftGift {
+                received_gift_ids: vec!["1".to_owned()],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::payments_craftStarGift::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::Updates::updatesTooLong(telegram_api::updatesTooLong).store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_star_gift_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 10);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid server response")
+        );
+
+        // 6. getUpgradedGiftWithdrawalUrl — the empty-password band; the
+        //    srp hop parks on the password plane ([blocked: M.25])
+        td.request(
+            11,
+            Function::getUpgradedGiftWithdrawalUrl(td_api::getUpgradedGiftWithdrawalUrl {
+                received_gift_id: "123".to_owned(),
+                password: String::new(),
+            }),
+        );
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "PASSWORD_HASH_INVALID")
+        );
+
+        // the updatesTooLong re-entry re-arms the difference engine (its
+        // getState/getDifference dispatches are the updates plane's own
+        // queries) and the craft tail refetches the emoji statuses (the
+        // C++ `get_upgraded_gift_emoji_statuses` fire-and-forget)
+        let stray_count = rec
+            .sent
+            .lock()
+            .iter()
+            .filter(|query| {
+                query.tl_constructor() != telegram_api::updates_getDifference::ID
+                    && query.tl_constructor() != telegram_api::updates_getState::ID
+                    && query.tl_constructor()
+                        != telegram_api::account_getCollectibleEmojiStatuses::ID
+            })
+            .count();
+        assert_eq!(stray_count, 0, "no stray queries");
+        assert!(td.star_gift_net_completed.lock().is_empty(), "drained");
     }
 }

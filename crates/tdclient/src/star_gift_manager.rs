@@ -32,9 +32,18 @@
 //! - BusinessConnectionManager (`check_business_connection`) — the M.38
 //!   business plane; the default rejects every connection id like an
 //!   unknown one.
-//! - Every `td_->create_handler<...>->send(...)` query is the
-//!   `[blocked: net]` query seam: the send logs the query name and parks
-//!   the promise in `StarGiftManager::pending`. The answer halves that
+//! - The §3.6 catalog/transformation families (GetStarGiftsQuery, the
+//!   auction trio, ConvertStarGiftQuery, SaveStarGiftQuery, the upgrade
+//!   preview/attributes pair, CraftStarGiftQuery, the saved/craft/unique/
+//!   withdrawal/resale reads) ride the manager-held net dispatch handle
+//!   (the `UserManager::net` convention);
+//!   the query construction lives at the manager send sites and the
+//!   answers drain through `Td::on_star_gift_net_answer`. The remaining
+//!   `td_->create_handler<...>->send(...)` queries are the
+//!   `[blocked: net]` query seams: the send logs the query name and parks
+//!   the promise in `StarGiftManager::pending` (the payment-form chains
+//!   SendGiftQuery and friends, checkCanSendGift, the pinned/notifications
+//!   toggles, the collections and the offers). The answer halves that
 //!   only need the value plane and the user/chat intakes are real
 //!   (`on_get_available_gifts`, `on_get_saved_star_gifts`, the auction
 //!   plane, the collections, ...) and unit-tested; the payment-form query
@@ -3056,11 +3065,6 @@ pub trait StarGiftEnv {
 
     // -- the [blocked: net] query seams; the promise parks in the manager --
 
-    /// `GetStarGiftsQuery::send` (StarGiftManager.cpp:59-61).
-    fn send_get_star_gifts_query(&mut self) {
-        tdutils::log_info!("Send payments.getStarGifts — [blocked: net]");
-    }
-
     /// `CheckCanSendGiftQuery::send` (StarGiftManager.cpp:146-148).
     fn send_check_can_send_gift_query(&mut self, gift_id: i64) {
         tdutils::log_info!("Send payments.checkCanSendGift(gift_id = {gift_id}) — [blocked: net]");
@@ -3081,51 +3085,6 @@ pub trait StarGiftEnv {
             "Send payments.getPaymentForm for the star gift {gift_id} (star_count = {star_count}, \
              is_private = {is_private}, pay_for_upgrade = {pay_for_upgrade}, has_message = {has_message}) — [blocked: net]"
         );
-    }
-
-    /// `GetStarGiftAuctionStateQuery::send`
-    /// (StarGiftManager.cpp:404-407).
-    fn send_get_star_gift_auction_state_query(
-        &mut self,
-        auction: &telegram_api::InputStarGiftAuction,
-        version: i32,
-    ) {
-        let target = match auction {
-            telegram_api::InputStarGiftAuction::inputStarGiftAuction(auction) => {
-                format!("gift_id = {}", auction.gift_id)
-            }
-            telegram_api::InputStarGiftAuction::inputStarGiftAuctionSlug(auction) => {
-                format!("slug = {}", auction.slug)
-            }
-        };
-        tdutils::log_info!(
-            "Send payments.getStarGiftAuctionState({target}, version = {version}) — [blocked: net]"
-        );
-    }
-
-    /// `GetStarGiftActiveAuctionsQuery::send` (StarGiftManager.cpp:434-436).
-    fn send_get_star_gift_active_auctions_query(&mut self) {
-        tdutils::log_info!("Send payments.getStarGiftActiveAuctions — [blocked: net]");
-    }
-
-    /// `GetStarGiftAuctionAcquiredGiftsQuery::send`
-    /// (StarGiftManager.cpp:462-464).
-    fn send_get_star_gift_auction_acquired_gifts_query(&mut self, gift_id: i64) {
-        tdutils::log_info!(
-            "Send payments.getStarGiftAuctionAcquiredGifts(gift_id = {gift_id}) — [blocked: net]"
-        );
-    }
-
-    /// `ConvertStarGiftQuery::send` (StarGiftManager.cpp:502-509).
-    fn send_convert_star_gift_query(&mut self, star_gift_id: &StarGiftId) {
-        let _ = star_gift_id;
-        tdutils::log_info!("Send payments.convertStarGift — [blocked: net]");
-    }
-
-    /// `SaveStarGiftQuery::send` (StarGiftManager.cpp:542-548).
-    fn send_save_star_gift_query(&mut self, star_gift_id: &StarGiftId, is_saved: bool) {
-        let _ = star_gift_id;
-        tdutils::log_info!("Send payments.saveStarGift(is_saved = {is_saved}) — [blocked: net]");
     }
 
     /// `ToggleStarGiftsPinnedToTopQuery::send` (StarGiftManager.cpp:573-581).
@@ -3149,21 +3108,6 @@ pub trait StarGiftEnv {
         );
     }
 
-    /// `GetUpgradeGiftPreviewQuery::send` (StarGiftManager.cpp:637-639).
-    fn send_get_upgrade_gift_preview_query(&mut self, gift_id: i64) {
-        tdutils::log_info!(
-            "Send payments.getStarGiftUpgradePreview(gift_id = {gift_id}) — [blocked: net]"
-        );
-    }
-
-    /// `GetStarGiftUpgradeAttributesQuery::send`
-    /// (StarGiftManager.cpp:715-719).
-    fn send_get_star_gift_upgrade_attributes_query(&mut self, gift_id: i64) {
-        tdutils::log_info!(
-            "Send payments.getStarGiftUpgradeAttributes(gift_id = {gift_id}) — [blocked: net]"
-        );
-    }
-
     /// the upgrade payment chains (`UpgradeStarGiftQuery`,
     /// `GetGiftUpgradePaymentFormQuery`, `PrepaidUpgradeGiftQuery`,
     /// `GetGiftPrepaidUpgradePaymentFormQuery`) — StarGiftManager.cpp:832-838/
@@ -3172,14 +3116,6 @@ pub trait StarGiftEnv {
         tdutils::log_info!(
             "Send the gift upgrade payment chain (star_count = {star_count}, \
              keep_original_details = {keep_original_details}) — [blocked: net]"
-        );
-    }
-
-    /// `CraftStarGiftQuery::send` (StarGiftManager.cpp:1131-1134).
-    fn send_craft_star_gift_query(&mut self, star_gift_ids: &[StarGiftId]) {
-        tdutils::log_info!(
-            "Send payments.craftStarGift({} gifts) — [blocked: net]",
-            star_gift_ids.len()
         );
     }
 
@@ -3222,54 +3158,10 @@ pub trait StarGiftEnv {
         );
     }
 
-    /// `GetSavedStarGiftsQuery::send` (StarGiftManager.cpp:1661-1688).
-    fn send_get_saved_star_gifts_query(&mut self, dialog_id: DialogId) {
-        tdutils::log_info!(
-            "Send payments.getSavedStarGifts(dialog {}) — [blocked: net]",
-            dialog_id.get()
-        );
-    }
-
-    /// `GetSavedStarGiftQuery::send` (StarGiftManager.cpp:1751-1759).
-    fn send_get_saved_star_gift_query(&mut self, star_gift_id: &StarGiftId) {
-        let _ = star_gift_id;
-        tdutils::log_info!("Send payments.getSavedStarGift — [blocked: net]");
-    }
-
-    /// `GetCraftStarGiftsQuery::send` (StarGiftManager.cpp:1796-1798).
-    fn send_get_craft_star_gifts_query(&mut self, gift_id: i64) {
-        tdutils::log_info!("Send payments.getCraftStarGifts(gift_id = {gift_id}) — [blocked: net]");
-    }
-
-    /// `GetUniqueStarGiftQuery::send` (StarGiftManager.cpp:1861-1863).
-    fn send_get_unique_star_gift_query(&mut self, name: &str) {
-        tdutils::log_info!("Send payments.getUniqueStarGift({name}) — [blocked: net]");
-    }
-
-    /// `GetUniqueStarGiftValueInfoQuery::send`
-    /// (StarGiftManager.cpp:1898-1900).
-    fn send_get_unique_star_gift_value_info_query(&mut self, name: &str) {
-        tdutils::log_info!("Send payments.getUniqueStarGiftValueInfo({name}) — [blocked: net]");
-    }
-
-    /// `GetStarGiftWithdrawalUrlQuery::send`
-    /// (StarGiftManager.cpp:1930-1938).
-    fn send_get_star_gift_withdrawal_url_query(&mut self, star_gift_id: &StarGiftId) {
-        let _ = star_gift_id;
-        tdutils::log_info!("Send payments.getStarGiftWithdrawalUrl — [blocked: net]");
-    }
-
     /// `UpdateStarGiftPriceQuery::send` (StarGiftManager.cpp:1962-1969).
     fn send_update_star_gift_price_query(&mut self, star_gift_id: &StarGiftId) {
         let _ = star_gift_id;
         tdutils::log_info!("Send payments.updateStarGiftPrice — [blocked: net]");
-    }
-
-    /// `GetResaleStarGiftsQuery::send` (StarGiftManager.cpp:1996-2010).
-    fn send_get_resale_star_gifts_query(&mut self, gift_id: i64) {
-        tdutils::log_info!(
-            "Send payments.getResaleStarGifts(gift_id = {gift_id}) — [blocked: net]"
-        );
     }
 
     /// `GetStarGiftCollectionsQuery::send` (StarGiftManager.cpp:2139-2144).
@@ -3330,6 +3222,85 @@ pub trait StarGiftEnv {
         tdutils::log_info!(
             "get_message_from_server for the gift poll — [blocked: M.6 MessagesManager]"
         );
+    }
+}
+
+/// The StarGiftManager in-flight query kinds — the C++ ResultHandler
+/// classes of the §3.6 catalog/transformation families
+/// (StarGiftManager.cpp:51-2055): the kinds carry the Copy handler
+/// members the answer halves read (the dialog ids for the
+/// `on_get_dialog_error` heads, the full-list flag); the non-Copy
+/// handler state (the promises) parks in the manager's per-family
+/// queues beside them — the §5 FIFO-per-kind convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StarGiftNetKind {
+    /// `GetStarGiftsQuery` (StarGiftManager.cpp:51).
+    GetStarGifts,
+    /// `GetStarGiftAuctionStateQuery` (StarGiftManager.cpp:395) — the
+    /// answer routes through `on_get_auction_state`; the continuation
+    /// state parks in `pending.auction_state` (the C++ promise lambda).
+    GetStarGiftAuctionState,
+    /// `GetStarGiftActiveAuctionsQuery` (StarGiftManager.cpp:425) — the
+    /// promise-less reload (the answer hop is
+    /// `on_get_active_gift_auctions`).
+    GetStarGiftActiveAuctions,
+    /// `GetStarGiftAuctionAcquiredGiftsQuery` (StarGiftManager.cpp:454).
+    GetStarGiftAuctionAcquiredGifts,
+    /// `ConvertStarGiftQuery` (StarGiftManager.cpp:494) — the handler's
+    /// `dialog_id_` member (the reload-tail routing + the error head).
+    ConvertStarGift { dialog_id: DialogId },
+    /// `SaveStarGiftQuery` (StarGiftManager.cpp:533) — the handler's
+    /// `dialog_id_` member (the error head).
+    SaveStarGift { dialog_id: DialogId },
+    /// `GetUpgradeGiftPreviewQuery` (StarGiftManager.cpp:629).
+    GetUpgradeGiftPreview,
+    /// `GetStarGiftUpgradeAttributesQuery` (StarGiftManager.cpp:705).
+    GetStarGiftUpgradeAttributes,
+    /// `CraftStarGiftQuery` (StarGiftManager.cpp:1123).
+    CraftStarGift,
+    /// `GetSavedStarGiftsQuery` (StarGiftManager.cpp:1650) — the
+    /// handler's `dialog_id_`/`is_full_list_`/`business_connection_id_`
+    /// members (the gift-count intakes, the error head skip).
+    GetSavedStarGifts {
+        dialog_id: DialogId,
+        is_full_list: bool,
+        is_business: bool,
+    },
+    /// `GetSavedStarGiftQuery` (StarGiftManager.cpp:1742) — the
+    /// handler's `dialog_id_` member.
+    GetSavedStarGift { dialog_id: DialogId },
+    /// `GetCraftStarGiftsQuery` (StarGiftManager.cpp:1788).
+    GetCraftStarGifts,
+    /// `GetUniqueStarGiftQuery` (StarGiftManager.cpp:1853).
+    GetUniqueStarGift,
+    /// `GetUniqueStarGiftValueInfoQuery` (StarGiftManager.cpp:1890).
+    GetUniqueStarGiftValueInfo,
+    /// `GetStarGiftWithdrawalUrlQuery` (StarGiftManager.cpp:1923).
+    GetStarGiftWithdrawalUrl,
+    /// `GetResaleStarGiftsQuery` (StarGiftManager.cpp:1988).
+    GetResaleStarGifts,
+}
+
+/// The `get_gift_craft_promise` fail-arm chain (StarGiftManager.cpp:1090-1095)
+/// — the craft-fail update removed from the container, the fail object
+/// lands once the updates processing completes.
+struct CraftFailChain {
+    promise: Option<Promise<td_api::CraftGiftResult>>,
+}
+
+impl tdutils::promise::PromiseInterface<()> for CraftFailChain {
+    fn set_value(&mut self, _value: ()) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_value(td_api::CraftGiftResult::craftGiftResultFail(
+                td_api::craftGiftResultFail,
+            ));
+        }
+    }
+
+    fn set_error(&mut self, error: Status) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_error(error);
+        }
     }
 }
 
@@ -3401,6 +3372,17 @@ struct PendingQueries {
     /// The answerless chains (payment forms, updates-routed queries):
     /// the promise parks until the net step completes it.
     unit_answers: Vec<Promise<()>>,
+    /// The parked `SaveStarGiftQuery` promises (the §3.6 net slice —
+    /// kept off [`Self::unit_answers`] whose still-inert families must
+    /// not settle on these answers).
+    save_star_gift: Vec<Promise<()>>,
+    /// The parked `ConvertStarGiftQuery` promises — one popped per ok
+    /// answer for the Td-side reload tail.
+    convert_star_gift: Vec<Promise<()>>,
+    /// The parked crafted-gift promises — the MessagesManager
+    /// `finish_gift_craft` half (the M.6 plane; the SendStory-tail park
+    /// convention).
+    pending_finish_gift_craft: Vec<Promise<td_api::CraftGiftResult>>,
 }
 
 /// The port of `td::StarGiftManager` (StarGiftManager.h:41-261).
@@ -3427,12 +3409,41 @@ pub struct StarGiftManager {
     being_reloaded_gift_messages: Vec<crate::message_id::MessageFullId>,
     /// The parked query promises.
     pending: PendingQueries,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in
+    /// the net-inert tests; set at the dispatcher install).
+    pub(crate) net: Option<crate::td::StarGiftNetHandle>,
 }
 
 impl StarGiftManager {
     /// `StarGiftManager::StarGiftManager` (StarGiftManager.cpp:2391-2397).
     pub fn new() -> StarGiftManager {
         StarGiftManager::default()
+    }
+
+    /// The `td_->create_handler<…>()->send(...)` collapse — the wire
+    /// query construction lives at the manager send sites; `None` keeps
+    /// the net-inert posture (the tests drive the answer halves).
+    fn send_star_gift_net_query(
+        &self,
+        kind: StarGiftNetKind,
+        function: telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
+    /// The send-leg failure band — the C++ `ResultHandler::send` that
+    /// calls `on_error(Status)` inline when it can't resolve the inputs;
+    /// the net-inert form settles the parked promises directly.
+    fn complete_star_gift_net_error(&mut self, kind: StarGiftNetKind, code: i32, message: &str) {
+        match &self.net {
+            Some(net) => net.complete_error(kind, code, message),
+            None => tdutils::log_info!("Send error {message} — [net-inert]"),
+        }
     }
 
     // -- the star gift price cache --
@@ -3468,7 +3479,15 @@ impl StarGiftManager {
         env: &mut impl StarGiftEnv,
         promise: Promise<td_api::AvailableGifts>,
     ) {
-        env.send_get_star_gifts_query();
+        let _ = env;
+        // `GetStarGiftsQuery::send` (StarGiftManager.cpp:59-61)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGifts,
+            telegram_api::Function::payments_getStarGifts(telegram_api::payments_getStarGifts {
+                hash: 0,
+            }),
+            "payments.getStarGifts",
+        );
         self.pending.gift_payment_options.push(promise);
     }
 
@@ -3749,7 +3768,18 @@ impl StarGiftManager {
         version: i32,
         pending: PendingAuctionStateQuery,
     ) {
-        env.send_get_star_gift_auction_state_query(&input_auction, version);
+        let _ = env;
+        // `GetStarGiftAuctionStateQuery::send` (StarGiftManager.cpp:402-405)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGiftAuctionState,
+            telegram_api::Function::payments_getStarGiftAuctionState(
+                telegram_api::payments_getStarGiftAuctionState {
+                    auction: Some(input_auction),
+                    version,
+                },
+            ),
+            "payments.getStarGiftAuctionState",
+        );
         self.pending.auction_state.push(pending);
     }
 
@@ -3928,10 +3958,17 @@ impl StarGiftManager {
     /// (StarGiftManager.cpp:2619-2626) — the public fire point of the
     /// reload timeout.
     pub fn reload_active_gift_auctions(&mut self, env: &mut impl StarGiftEnv) {
-        env.send_get_star_gift_active_auctions_query();
-        // the answer lands through on_get_active_gift_auctions; the C++
-        // parks nothing (the promise is the answer hop)
-        self.pending.unit_answers.push(Promise::default());
+        let _ = env;
+        // `GetStarGiftActiveAuctionsQuery::send`
+        // (StarGiftManager.cpp:432-434) — the promise-less reload (the
+        // C++ parks nothing; the answer hop is the manager method)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGiftActiveAuctions,
+            telegram_api::Function::payments_getStarGiftActiveAuctions(
+                telegram_api::payments_getStarGiftActiveAuctions { hash: 0 },
+            ),
+            "payments.getStarGiftActiveAuctions",
+        );
     }
 
     /// `StarGiftManager::on_get_active_gift_auctions`
@@ -3989,7 +4026,16 @@ impl StarGiftManager {
         gift_id: i64,
         promise: Promise<td_api::GiftAuctionAcquiredGifts>,
     ) {
-        env.send_get_star_gift_auction_acquired_gifts_query(gift_id);
+        let _ = env;
+        // `GetStarGiftAuctionAcquiredGiftsQuery::send`
+        // (StarGiftManager.cpp:461-463)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGiftAuctionAcquiredGifts,
+            telegram_api::Function::payments_getStarGiftAuctionAcquiredGifts(
+                telegram_api::payments_getStarGiftAuctionAcquiredGifts { gift_id },
+            ),
+            "payments.getStarGiftAuctionAcquiredGifts",
+        );
         self.pending.gift_auction_acquired_gifts.push(promise);
     }
 
@@ -4260,12 +4306,7 @@ impl StarGiftManager {
         let _ = message;
         let _ = is_private;
         env.add_pending_owned_star_count(old_star_count - star_count, false);
-        env.send_get_star_gift_auction_state_query(
-            &telegram_api::InputStarGiftAuction::inputStarGiftAuction(
-                telegram_api::inputStarGiftAuction { gift_id },
-            ),
-            0,
-        );
+        tdutils::log_info!("Send the gift auction bid payment chain — [blocked: net]");
         self.pending.unit_answers.push(promise);
     }
 
@@ -4321,12 +4362,7 @@ impl StarGiftManager {
         }
         // the GetGiftAuctionBidPaymentFormQuery head — the seam
         env.add_pending_owned_star_count(old_star_count - star_count, false);
-        env.send_get_star_gift_auction_state_query(
-            &telegram_api::InputStarGiftAuction::inputStarGiftAuction(
-                telegram_api::inputStarGiftAuction { gift_id },
-            ),
-            0,
-        );
+        tdutils::log_info!("Send the gift auction bid payment chain — [blocked: net]");
         self.pending.unit_answers.push(promise);
     }
 
@@ -4345,7 +4381,8 @@ impl StarGiftManager {
         {
             return promise.set_error(status);
         }
-        if star_gift_id.get_input_saved_star_gift(env).is_none() {
+        let input_gift = star_gift_id.get_input_saved_star_gift(env);
+        if input_gift.is_none() {
             return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
         }
         let dialog_id = if business_connection_id.is_valid() {
@@ -4353,11 +4390,53 @@ impl StarGiftManager {
         } else {
             star_gift_id.get_dialog_id(env)
         };
-        // the ConvertStarGiftQuery head; the answer continues through
+        let kind = StarGiftNetKind::ConvertStarGift { dialog_id };
+        if business_connection_id.is_valid() {
+            // `create_with_prefix(business_connection_id.get_invoke_prefix(),
+            // …)` — the business-invoke prefix dispatch rides the
+            // BusinessConnectionManager plane (no landed family carries
+            // it); the promise parks like the C++ send's continuation.
+            tdutils::log_info!("Send payments.convertStarGift (business) — [blocked: net]");
+        } else {
+            // `ConvertStarGiftQuery::send` (StarGiftManager.cpp:502-509)
+            self.send_star_gift_net_query(
+                kind,
+                telegram_api::Function::payments_convertStarGift(
+                    telegram_api::payments_convertStarGift {
+                        stargift: input_gift,
+                    },
+                ),
+                "payments.convertStarGift",
+            );
+        }
+        // the answer continues through the Td-side reload tail into
         // on_dialog_gift_transferred with to_dialog_id empty
-        let _ = dialog_id;
-        env.send_convert_star_gift_query(&star_gift_id);
-        self.pending.unit_answers.push(promise);
+        self.pending.convert_star_gift.push(promise);
+    }
+
+    /// `ConvertStarGiftQuery::on_result`/`on_error` — the ok half pops
+    /// the head promise for the Td-side reload tail
+    /// (StarGiftManager.cpp:512-523); the error half fails every parked
+    /// promise (the dialog-error head runs on the Td side).
+    pub(crate) fn on_get_convert_star_gift(
+        &mut self,
+        result: Result<(), Status>,
+    ) -> Option<Promise<()>> {
+        match result {
+            Ok(()) => {
+                if self.pending.convert_star_gift.is_empty() {
+                    None
+                } else {
+                    Some(self.pending.convert_star_gift.remove(0))
+                }
+            }
+            Err(status) => {
+                for mut promise in std::mem::take(&mut self.pending.convert_star_gift) {
+                    promise.set_error(status.clone());
+                }
+                None
+            }
+        }
     }
 
     /// `StarGiftManager::save_gift` (StarGiftManager.cpp:2887-2892).
@@ -4368,11 +4447,43 @@ impl StarGiftManager {
         is_saved: bool,
         mut promise: Promise<()>,
     ) {
-        if star_gift_id.get_input_saved_star_gift(env).is_none() {
+        let input_gift = star_gift_id.get_input_saved_star_gift(env);
+        if input_gift.is_none() {
             return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
         }
-        env.send_save_star_gift_query(&star_gift_id, is_saved);
-        self.pending.unit_answers.push(promise);
+        let dialog_id = star_gift_id.get_dialog_id(env);
+        // `SaveStarGiftQuery::send` (StarGiftManager.cpp:542-548) — the
+        // unsave flag is the wire negation; the dialog dependency rides
+        // the kind's dialog id.
+        self.send_star_gift_net_query(
+            StarGiftNetKind::SaveStarGift { dialog_id },
+            telegram_api::Function::payments_saveStarGift(telegram_api::payments_saveStarGift {
+                flags: 0,
+                unsave: !is_saved,
+                stargift: input_gift,
+            }),
+            "payments.saveStarGift",
+        );
+        self.pending.save_star_gift.push(promise);
+    }
+
+    /// `SaveStarGiftQuery::on_result`/`on_error` — the ok half settles
+    /// every parked promise (StarGiftManager.cpp:549-561; the
+    /// dialog-error head runs on the Td side).
+    pub(crate) fn on_get_save_star_gift(&mut self, result: Result<(), Status>) {
+        let pending = std::mem::take(&mut self.pending.save_star_gift);
+        match result {
+            Ok(()) => {
+                for mut promise in pending {
+                    promise.set_value(());
+                }
+            }
+            Err(status) => {
+                for mut promise in pending {
+                    promise.set_error(status.clone());
+                }
+            }
+        }
     }
 
     /// `StarGiftManager::check_star_gift_id` (StarGiftManager.cpp:2894-2902).
@@ -4456,7 +4567,15 @@ impl StarGiftManager {
         gift_id: i64,
         promise: Promise<td_api::GiftUpgradePreview>,
     ) {
-        env.send_get_upgrade_gift_preview_query(gift_id);
+        let _ = env;
+        // `GetUpgradeGiftPreviewQuery::send` (StarGiftManager.cpp:636-638)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetUpgradeGiftPreview,
+            telegram_api::Function::payments_getStarGiftUpgradePreview(
+                telegram_api::payments_getStarGiftUpgradePreview { gift_id },
+            ),
+            "payments.getStarGiftUpgradePreview",
+        );
         self.pending.gift_upgrade_preview.push(promise);
     }
 
@@ -4545,7 +4664,17 @@ impl StarGiftManager {
         return_craft_models: bool,
         promise: Promise<td_api::GiftUpgradeVariants>,
     ) {
-        env.send_get_star_gift_upgrade_attributes_query(gift_id);
+        let _ = env;
+        // `GetStarGiftUpgradeAttributesQuery::send`
+        // (StarGiftManager.cpp:715-719) — the return_*_models flags are
+        // the handler's client-side filters, not wire flags.
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetStarGiftUpgradeAttributes,
+            telegram_api::Function::payments_getStarGiftUpgradeAttributes(
+                telegram_api::payments_getStarGiftUpgradeAttributes { gift_id },
+            ),
+            "payments.getStarGiftUpgradeAttributes",
+        );
         self.pending.gift_upgrade_variants.push((
             return_upgrade_models,
             return_craft_models,
@@ -4695,8 +4824,122 @@ impl StarGiftManager {
         if let Err(status) = self.check_star_gift_ids(env, &star_gift_ids, my_dialog_id) {
             return promise.set_error(status);
         }
-        env.send_craft_star_gift_query(&star_gift_ids);
+        // `CraftStarGiftQuery::send` (StarGiftManager.cpp:1130-1134) — the
+        // check gate proved every id resolves; the C++ vector may carry
+        // the nulls the gate excludes.
+        let stargift = StarGiftId::get_input_saved_star_gifts(env, &star_gift_ids)
+            .into_iter()
+            .flatten()
+            .collect();
+        self.send_star_gift_net_query(
+            StarGiftNetKind::CraftStarGift,
+            telegram_api::Function::payments_craftStarGift(telegram_api::payments_craftStarGift {
+                stargift,
+            }),
+            "payments.craftStarGift",
+        );
         self.pending.craft_result.push(promise);
+    }
+
+    /// `CraftStarGiftQuery::on_error` (StarGiftManager.cpp:1149-1157) —
+    /// the STARGIFT_CRAFT_* bands answer success values off the error
+    /// path; the other errors fail every parked promise.
+    pub(crate) fn on_get_craft_star_gift_error(&mut self, status: Status) {
+        let pending = std::mem::take(&mut self.pending.craft_result);
+        for mut promise in pending {
+            let message = status.message();
+            const TOO_EARLY_PREFIX: &str = "STARGIFT_CRAFT_TOO_EARLY_";
+            if let Some(seconds) = message.strip_prefix(TOO_EARLY_PREFIX) {
+                promise.set_value(td_api::CraftGiftResult::craftGiftResultTooEarly(
+                    td_api::craftGiftResultTooEarly {
+                        // `to_integer` answers 0 on the malformed suffix
+                        retry_after: seconds.parse::<i32>().unwrap_or(0),
+                    },
+                ));
+            } else if message == "STARGIFT_CRAFT_UNAVAILABLE"
+                || message == "STARGIFT_ALREADY_CRAFTED"
+            {
+                promise.set_value(td_api::CraftGiftResult::craftGiftResultInvalidGift(
+                    td_api::craftGiftResultInvalidGift,
+                ));
+            } else {
+                promise.set_error(status.clone());
+            }
+        }
+    }
+
+    /// `CraftStarGiftQuery::on_result` (StarGiftManager.cpp:1138-1147)
+    /// — the `get_gift_craft_promise` scan (cpp:1086-1121): the
+    /// craft-fail update maps to the fail object after the updates
+    /// processing completes, the single crafted service message parks
+    /// its finish half for the MessagesManager plane, everything else
+    /// is the 500 band. Returns the `(updates, promise)` the Td side
+    /// re-enters `on_get_updates` with.
+    pub(crate) fn on_get_craft_star_gift(
+        &mut self,
+        result: Result<telegram_api::Updates, Status>,
+    ) -> Option<(telegram_api::Updates, Promise<()>)> {
+        let mut updates = match result {
+            Ok(updates) => updates,
+            Err(status) => {
+                self.on_get_craft_star_gift_error(status);
+                return None;
+            }
+        };
+        let mut promise = if self.pending.craft_result.is_empty() {
+            Promise::default()
+        } else {
+            self.pending.craft_result.remove(0)
+        };
+        if crate::updates_manager::extract_star_gift_craft_fail(&mut updates) {
+            // the crafted gift failed — the fail object lands after the
+            // updates processing completes (the C++ lambda)
+            return Some((
+                updates,
+                Promise::from_interface(CraftFailChain {
+                    promise: Some(promise),
+                }),
+            ));
+        }
+        let new_messages = crate::updates_manager::get_new_messages(&updates);
+        let invalid_response = || Status::error(500, "Receive invalid server response");
+        if new_messages.len() != 1
+            || new_messages[0].1
+            || !matches!(new_messages[0].0, telegram_api::Message::messageService(_))
+        {
+            promise.set_error(invalid_response());
+            return Some((updates, Promise::default()));
+        }
+        let telegram_api::Message::messageService(message) = new_messages[0].0 else {
+            unreachable!("the messageService arm matched above")
+        };
+        let Some(telegram_api::MessageAction::messageActionStarGiftUnique(action)) =
+            message.action.as_ref()
+        else {
+            promise.set_error(invalid_response());
+            return Some((updates, Promise::default()));
+        };
+        let is_crafted = action.craft
+            && !action.transferred
+            && !action.refunded
+            && matches!(
+                action.gift.as_ref(),
+                Some(telegram_api::StarGift::starGiftUnique(_))
+            );
+        if !is_crafted {
+            promise.set_error(invalid_response());
+            return Some((updates, Promise::default()));
+        }
+        let message_full_id =
+            crate::message_id::MessageFullId::get_message_full_id(new_messages[0].0, false);
+        // `MessagesManager::finish_gift_craft` — the M.6 plane; the
+        // promise parks like the C++ `pending_story_` tail until that
+        // plane lands (the SendStory convention).
+        tdutils::log_info!(
+            "finish_gift_craft for {message_full_id:?} — [blocked: M.6 MessagesManager]"
+        );
+        self.pending.pending_finish_gift_craft.push(promise);
+        Some((updates, Promise::default()))
     }
 
     /// `StarGiftManager::transfer_gift` (StarGiftManager.cpp:2998-3042).
@@ -4934,19 +5177,6 @@ impl StarGiftManager {
         limit: i32,
         mut promise: Promise<td_api::ReceivedGifts>,
     ) {
-        let _ = (
-            exclude_unsaved,
-            exclude_saved,
-            exclude_unlimited,
-            exclude_upgradable,
-        );
-        let _ = (
-            exclude_non_upgradable,
-            exclude_unique,
-            peer_color_available,
-            exclude_hosted,
-        );
-        let _ = (sort_by_value, offset);
         if limit < 0 {
             return promise.set_error(Status::error(400, "Limit must be non-negative"));
         }
@@ -4969,13 +5199,52 @@ impl StarGiftManager {
             && !exclude_unique
             && !peer_color_available
             && !exclude_hosted;
-        if env.get_input_peer(dialog_id).is_none() {
-            return promise.set_error(Status::error(400, "Can't access the chat"));
-        }
-        env.send_get_saved_star_gifts_query(dialog_id);
+        let kind = StarGiftNetKind::GetSavedStarGifts {
+            dialog_id,
+            is_full_list,
+            is_business: business_connection_id.is_valid(),
+        };
         self.pending
             .saved_star_gifts
             .push((dialog_id, is_full_list, promise));
+        if business_connection_id.is_valid() {
+            // `create_with_prefix(business_connection_id.get_invoke_prefix(),
+            // …)` — the business-invoke prefix dispatch rides the
+            // BusinessConnectionManager plane; the promise parks like
+            // the C++ send's continuation.
+            tdutils::log_info!("Send payments.getSavedStarGifts (business) — [blocked: net]");
+            return;
+        }
+        // `GetSavedStarGiftsQuery::send` (StarGiftManager.cpp:1661-1692) —
+        // the null peer band is the synchronous on_error (the answer
+        // half runs the head + the promise error).
+        let Some(input_peer) = env.get_input_peer(dialog_id) else {
+            self.complete_star_gift_net_error(kind, 400, "Can't access the chat");
+            return;
+        };
+        let flags = if collection_id.is_valid() { 1 << 6 } else { 0 };
+        self.send_star_gift_net_query(
+            kind,
+            telegram_api::Function::payments_getSavedStarGifts(
+                telegram_api::payments_getSavedStarGifts {
+                    flags,
+                    exclude_unsaved,
+                    exclude_saved,
+                    exclude_unlimited,
+                    exclude_unique,
+                    sort_by_value,
+                    exclude_upgradable,
+                    exclude_unupgradable: exclude_non_upgradable,
+                    peer_color_available,
+                    exclude_hosted,
+                    peer: Some(Box::new(input_peer)),
+                    collection_id: collection_id.get(),
+                    offset: offset.to_owned(),
+                    limit,
+                },
+            ),
+            "payments.getSavedStarGifts",
+        );
     }
 
     /// `GetSavedStarGiftsQuery::on_result` (StarGiftManager.cpp:1690-1739).
@@ -5052,9 +5321,26 @@ impl StarGiftManager {
         if !star_gift_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
         }
+        let input_gift = star_gift_id.get_input_saved_star_gift(env);
         let dialog_id = star_gift_id.get_dialog_id(env);
-        env.send_get_saved_star_gift_query(&star_gift_id);
+        let kind = StarGiftNetKind::GetSavedStarGift { dialog_id };
         self.pending.saved_star_gift.push((dialog_id, promise));
+        // `GetSavedStarGiftQuery::send` (StarGiftManager.cpp:1749-1759) —
+        // the null-input band is the synchronous on_error
+        // ("Gift not found", the answer half runs the head + the error).
+        let Some(input_gift) = input_gift else {
+            self.complete_star_gift_net_error(kind, 400, "Gift not found");
+            return;
+        };
+        self.send_star_gift_net_query(
+            kind,
+            telegram_api::Function::payments_getSavedStarGift(
+                telegram_api::payments_getSavedStarGift {
+                    stargift: vec![input_gift],
+                },
+            ),
+            "payments.getSavedStarGift",
+        );
     }
 
     /// `GetSavedStarGiftQuery::on_result` (StarGiftManager.cpp:1762-1780).
@@ -5098,11 +5384,22 @@ impl StarGiftManager {
         limit: i32,
         mut promise: Promise<td_api::GiftsForCrafting>,
     ) {
-        let _ = offset;
+        let _ = env;
         if limit < 0 {
             return promise.set_error(Status::error(400, "Limit must be non-negative"));
         }
-        env.send_get_craft_star_gifts_query(gift_id);
+        // `GetCraftStarGiftsQuery::send` (StarGiftManager.cpp:1795-1797)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetCraftStarGifts,
+            telegram_api::Function::payments_getCraftStarGifts(
+                telegram_api::payments_getCraftStarGifts {
+                    gift_id,
+                    offset: offset.to_owned(),
+                    limit,
+                },
+            ),
+            "payments.getCraftStarGifts",
+        );
         self.pending.gifts_for_crafting.push(promise);
     }
 
@@ -5179,7 +5476,17 @@ impl StarGiftManager {
         name: &str,
         promise: Promise<td_api::UpgradedGift>,
     ) {
-        env.send_get_unique_star_gift_query(name);
+        let _ = env;
+        // `GetUniqueStarGiftQuery::send` (StarGiftManager.cpp:1860-1862)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetUniqueStarGift,
+            telegram_api::Function::payments_getUniqueStarGift(
+                telegram_api::payments_getUniqueStarGift {
+                    slug: name.to_owned(),
+                },
+            ),
+            "payments.getUniqueStarGift",
+        );
         self.pending.upgraded_gift.push(promise);
     }
 
@@ -5228,7 +5535,18 @@ impl StarGiftManager {
         name: &str,
         promise: Promise<td_api::UpgradedGiftValueInfo>,
     ) {
-        env.send_get_unique_star_gift_value_info_query(name);
+        let _ = env;
+        // `GetUniqueStarGiftValueInfoQuery::send`
+        // (StarGiftManager.cpp:1897-1899)
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetUniqueStarGiftValueInfo,
+            telegram_api::Function::payments_getUniqueStarGiftValueInfo(
+                telegram_api::payments_getUniqueStarGiftValueInfo {
+                    slug: name.to_owned(),
+                },
+            ),
+            "payments.getUniqueStarGiftValueInfo",
+        );
         self.pending.upgraded_gift_value_info.push(promise);
     }
 
@@ -5289,14 +5607,48 @@ impl StarGiftManager {
             self.pending.star_gift_withdrawal_url.push(promise);
             return;
         };
-        // send_get_star_gift_withdrawal_url_query
-        // (StarGiftManager.cpp:3208-3215)
-        let _ = input_check_password;
-        if star_gift_id.get_input_saved_star_gift(env).is_none() {
-            return promise.set_error(Status::error(400, "Gift not found"));
-        }
-        env.send_get_star_gift_withdrawal_url_query(&star_gift_id);
+        // `GetStarGiftWithdrawalUrlQuery::send`
+        // (StarGiftManager.cpp:1930-1938) — the null-input band is the
+        // synchronous on_error ("Gift not found").
+        let input_gift = star_gift_id.get_input_saved_star_gift(env);
+        let kind = StarGiftNetKind::GetStarGiftWithdrawalUrl;
         self.pending.star_gift_withdrawal_url.push(promise);
+        let Some(input_gift) = input_gift else {
+            self.complete_star_gift_net_error(kind, 400, "Gift not found");
+            return;
+        };
+        self.send_star_gift_net_query(
+            kind,
+            telegram_api::Function::payments_getStarGiftWithdrawalUrl(
+                telegram_api::payments_getStarGiftWithdrawalUrl {
+                    stargift: Some(input_gift),
+                    password: Some(input_check_password),
+                },
+            ),
+            "payments.getStarGiftWithdrawalUrl",
+        );
+    }
+
+    /// `GetStarGiftWithdrawalUrlQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:1940-1952).
+    pub(crate) fn on_get_star_gift_withdrawal_url(
+        &mut self,
+        result: Result<telegram_api::payments_StarGiftWithdrawalUrl, Status>,
+    ) {
+        let pending = std::mem::take(&mut self.pending.star_gift_withdrawal_url);
+        match result {
+            Ok(ptr) => {
+                let url = ptr.url;
+                for mut query in pending {
+                    query.set_value(url.clone());
+                }
+            }
+            Err(status) => {
+                for mut query in pending {
+                    query.set_error(status.clone());
+                }
+            }
+        }
     }
 
     /// `StarGiftManager::set_star_gift_price` (StarGiftManager.cpp:3217-3222).
@@ -5329,19 +5681,55 @@ impl StarGiftManager {
         limit: i32,
         mut promise: Promise<td_api::GiftsForResale>,
     ) {
-        let _ = (for_craft, for_stars, offset);
         if limit < 0 {
             return promise.set_error(Status::error(400, "Limit must be non-negative"));
         }
-        if order.is_none() {
+        let Some(order) = order else {
             return promise.set_error(Status::error(400, "Gift sort order must be non-empty"));
-        }
+        };
         let attribute_ids = match StarGiftAttributeId::get_star_gift_attribute_ids(attributes) {
             Ok(attribute_ids) => attribute_ids,
             Err(status) => return promise.set_error(status),
         };
-        let _ = attribute_ids;
-        env.send_get_resale_star_gifts_query(gift_id);
+        let _ = env;
+        // `GetResaleStarGiftsQuery::send` (StarGiftManager.cpp:1995-2010)
+        // — the order object collapses to the two wire bools, the
+        // attributes to the input ids (the hash bit rides an empty hash).
+        let sort_by_price = matches!(
+            order,
+            td_api::GiftForResaleOrder::giftForResaleOrderPrice(_)
+        );
+        let sort_by_num = matches!(
+            order,
+            td_api::GiftForResaleOrder::giftForResaleOrderNumber(_)
+        );
+        let attributes =
+            StarGiftAttributeId::get_input_star_gift_attribute_ids_object(&attribute_ids);
+        let mut flags = 0;
+        if !attributes.is_empty() {
+            flags |= 1 << 3; // ATTRIBUTES_MASK
+        }
+        if offset.is_empty() && attributes.is_empty() {
+            flags |= 1; // ATTRIBUTES_HASH_MASK
+        }
+        self.send_star_gift_net_query(
+            StarGiftNetKind::GetResaleStarGifts,
+            telegram_api::Function::payments_getResaleStarGifts(
+                telegram_api::payments_getResaleStarGifts {
+                    flags,
+                    sort_by_price,
+                    sort_by_num,
+                    for_craft,
+                    stars_only: for_stars,
+                    attributes_hash: 0,
+                    gift_id,
+                    attributes,
+                    offset: offset.to_owned(),
+                    limit,
+                },
+            ),
+            "payments.getResaleStarGifts",
+        );
         self.pending.gifts_for_resale.push(promise);
     }
 
@@ -6083,46 +6471,8 @@ mod tests {
             self.owned_star_count >= star_count
         }
 
-        fn send_get_star_gifts_query(&mut self) {
-            self.queries.push("getStarGifts".to_owned());
-        }
-
         fn send_check_can_send_gift_query(&mut self, gift_id: i64) {
             self.queries.push(format!("checkCanSendGift:{gift_id}"));
-        }
-
-        fn send_get_star_gift_active_auctions_query(&mut self) {
-            self.queries.push("getStarGiftActiveAuctions".to_owned());
-        }
-
-        fn send_get_unique_star_gift_query(&mut self, name: &str) {
-            self.queries.push(format!("getUniqueStarGift:{name}"));
-        }
-
-        fn send_get_saved_star_gift_query(&mut self, _star_gift_id: &StarGiftId) {
-            self.queries.push("getSavedStarGift".to_owned());
-        }
-
-        fn send_get_saved_star_gifts_query(&mut self, dialog_id: crate::dialog_id::DialogId) {
-            self.queries
-                .push(format!("getSavedStarGifts:{}", dialog_id.get()));
-        }
-
-        fn send_get_star_gift_auction_state_query(
-            &mut self,
-            auction: &telegram_api::InputStarGiftAuction,
-            version: i32,
-        ) {
-            let target = match auction {
-                telegram_api::InputStarGiftAuction::inputStarGiftAuction(auction) => {
-                    format!("gift:{}", auction.gift_id)
-                }
-                telegram_api::InputStarGiftAuction::inputStarGiftAuctionSlug(auction) => {
-                    format!("slug:{}", auction.slug)
-                }
-            };
-            self.queries
-                .push(format!("getStarGiftAuctionState:{target}:{version}"));
         }
     }
 
@@ -6742,7 +7092,6 @@ mod tests {
 
         let (promise, recorded) = recording_promise();
         manager.get_gift_payment_options(&mut env, promise);
-        assert_eq!(env.queries, vec!["getStarGifts"]);
         assert!(recorded.value().is_none());
 
         let answer = telegram_api::payments_starGifts {
@@ -6761,11 +7110,7 @@ mod tests {
         manager.on_get_available_gifts(&mut env, Result::Ok(answer));
         assert_eq!(
             env.queries,
-            vec![
-                "getStarGifts",
-                "GetStarGiftsQuery:0 users",
-                "GetStarGiftsQuery:0 chats"
-            ]
+            vec!["GetStarGiftsQuery:0 users", "GetStarGiftsQuery:0 chats"]
         );
         let answer = recorded.value().expect("answered").expect("ok");
         assert_eq!(answer.gifts.len(), 1);
@@ -7001,7 +7346,6 @@ mod tests {
 
         let (promise, recorded) = recording_promise();
         manager.get_gift_auction_state(&mut env, "auction", promise);
-        assert_eq!(env.queries, vec!["getStarGiftAuctionState:slug:auction:0"]);
         assert!(recorded.value().is_none());
 
         manager.on_get_auction_state(&mut env, Result::Ok(sample_auction_answer(1, 1)));
@@ -7019,10 +7363,10 @@ mod tests {
         let mut manager = StarGiftManager::new();
 
         // opening an unknown auction reloads first, then the recursion
-        // completes through the parked continuation
+        // completes through the parked continuation (the wire send is
+        // the netted test's assert; the manager drives the answer half)
         let (promise, recorded) = recording_promise();
         manager.open_gift_auction(&mut env, 1, false, promise);
-        assert_eq!(env.queries, vec!["getStarGiftAuctionState:gift:1:0"]);
         assert!(recorded.value().is_none());
         manager.on_get_auction_state(&mut env, Result::Ok(sample_auction_answer(1, 1)));
         assert_eq!(recorded.value().expect("answered").expect("ok"), ());
@@ -7069,15 +7413,12 @@ mod tests {
         manager.on_update_gift_auction_state(&mut env, 1, state);
         assert!(env.updates.len() > updates_after_load);
 
-        // an unknown gift triggers the active-auctions reload
+        // an unknown gift triggers the active-auctions reload — the wire
+        // send is the netted test's assert (the manager keeps no flag for
+        // the direct reload; only the schedule path sets one)
         let answer = sample_auction_answer(1, 5);
         let state = answer.state;
         manager.on_update_gift_auction_state(&mut env, 99, state);
-        assert!(
-            env.queries
-                .iter()
-                .any(|query| query == "getStarGiftActiveAuctions")
-        );
 
         // the user-state update broadcasts on change only
         let updates_before = env.updates.len();
@@ -7214,11 +7555,43 @@ mod tests {
             "Invalid gift identifier specified"
         );
 
-        // save: a valid slug parks
+        // save: a valid slug parks (the dedicated §3.6 queue — off the
+        // still-inert unit_answers lot)
         let (promise, recorded) = recording_promise();
         manager.save_gift(&mut env, StarGiftId::from_slug("name"), true, promise);
         assert!(recorded.value().is_none());
-        assert_eq!(manager.pending.unit_answers.len(), 1);
+        assert_eq!(manager.pending.save_star_gift.len(), 1);
+        // the ok half settles it
+        manager.on_get_save_star_gift(Result::Ok(()));
+        assert_eq!(recorded.value().expect("answered").expect("ok"), ());
+
+        // convert: valid slugs park, the ok half hands the head promise
+        // to the Td-side reload tail (unsettled), the error half fails
+        // the rest
+        let (promise, _recorded) = recording_promise();
+        manager.convert_gift(
+            &mut env,
+            BusinessConnectionId::default(),
+            StarGiftId::from_slug("name"),
+            promise,
+        );
+        let (promise, recorded_error) = recording_promise();
+        manager.convert_gift(
+            &mut env,
+            BusinessConnectionId::default(),
+            StarGiftId::from_slug("other"),
+            promise,
+        );
+        assert!(manager.on_get_convert_star_gift(Result::Ok(())).is_some());
+        manager.on_get_convert_star_gift(Result::Err(Status::error(400, "oops")));
+        assert_eq!(
+            recorded_error
+                .value()
+                .expect("answered")
+                .unwrap_err()
+                .code(),
+            400
+        );
     }
 
     #[test]
@@ -7487,7 +7860,8 @@ mod tests {
             10,
             promise,
         );
-        assert_eq!(env.queries.len(), 1);
+        // the send is the netted test's assert; the promise parks here
+        assert!(recorded.value().is_none());
 
         let answer = telegram_api::payments_SavedStarGifts {
             flags: (1 << 1) | 1,
@@ -7600,7 +7974,7 @@ mod tests {
 
         let (promise, recorded) = recording_promise();
         manager.get_upgraded_gift(&mut env, "SkyGift", promise);
-        assert_eq!(env.queries, vec!["getUniqueStarGift:SkyGift"]);
+        assert!(recorded.value().is_none());
 
         manager.on_get_upgraded_gift(
             &mut env,
@@ -7661,6 +8035,154 @@ mod tests {
         assert_eq!(answer.initial_sale_star_count, 25);
         assert!(answer.is_last_sale_on_fragment);
         assert_eq!(answer.fragment_url, "url");
+    }
+
+    #[test]
+    fn withdrawal_url_answer_settles() {
+        let mut env = TestEnv::default();
+        let mut manager = StarGiftManager::new();
+
+        // the password-plane park (the srp seam answers nothing) — the
+        // promise rides the family queue
+        let (promise, recorded) = recording_promise();
+        manager.get_star_gift_withdrawal_url(
+            &mut env,
+            StarGiftId::from_slug("name"),
+            "pass",
+            promise,
+        );
+        assert!(recorded.value().is_none());
+
+        // the answer half settles the parked promise with the url
+        manager.on_get_star_gift_withdrawal_url(Result::Ok(
+            telegram_api::payments_StarGiftWithdrawalUrl {
+                url: "https://fragment.io/withdraw".to_owned(),
+            },
+        ));
+        assert_eq!(
+            recorded.value().expect("answered").expect("ok"),
+            "https://fragment.io/withdraw"
+        );
+
+        // the error half forwards
+        manager.on_get_star_gift_withdrawal_url(Result::Err(Status::error(
+            400,
+            "PASSWORD_HASH_INVALID",
+        )));
+    }
+
+    #[test]
+    fn craft_gift_answer_bands() {
+        let mut env = TestEnv::default();
+        let mut manager = StarGiftManager::new();
+
+        // the craft-fail update — the fail object lands when the updates
+        // processing completes (the chain promise)
+        let (promise, recorded) = recording_promise();
+        manager.craft_gift(&mut env, vec![StarGiftId::from_string("1")], promise);
+        let mut updates = telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![telegram_api::Update::updateStarGiftCraftFail(
+                telegram_api::updateStarGiftCraftFail,
+            )],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq: 0,
+        });
+        let Some((stripped, mut chain)) =
+            manager.on_get_craft_star_gift(Result::Ok(updates.clone()))
+        else {
+            panic!("the fail chain parks for the updates re-entry");
+        };
+        let _ = &mut updates;
+        // the update was stripped from the container
+        match &stripped {
+            telegram_api::Updates::updates(updates) => assert!(updates.updates.is_empty()),
+            other => panic!("the updates container: {other:?}"),
+        }
+        chain.set_value(());
+        assert!(matches!(
+            recorded.value().expect("answered").expect("ok"),
+            td_api::CraftGiftResult::craftGiftResultFail(_)
+        ));
+
+        // the single crafted service message parks the finish half on the
+        // MessagesManager plane ([blocked: M.6])
+        let (promise, recorded) = recording_promise();
+        manager.craft_gift(&mut env, vec![StarGiftId::from_string("2")], promise);
+        let updates = telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![telegram_api::Update::updateNewMessage(
+                telegram_api::updateNewMessage {
+                    message: Some(telegram_api::Message::messageService(
+                        telegram_api::messageService {
+                            id: 5,
+                            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                                user_id: 42,
+                            })),
+                            action: Some(telegram_api::MessageAction::messageActionStarGiftUnique(
+                                telegram_api::messageActionStarGiftUnique {
+                                    craft: true,
+                                    gift: Some(sample_unique_gift()),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                    pts: 1,
+                    pts_count: 1,
+                },
+            )],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq: 0,
+        });
+        assert!(
+            manager
+                .on_get_craft_star_gift(Result::Ok(updates))
+                .is_some()
+        );
+        assert!(recorded.value().is_none(), "the promise parks on M.6");
+        assert_eq!(manager.pending.pending_finish_gift_craft.len(), 1);
+
+        // a non-crafted action is the 500 band
+        let (promise, recorded) = recording_promise();
+        manager.craft_gift(&mut env, vec![StarGiftId::from_string("3")], promise);
+        let updates = telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![telegram_api::Update::updateNewMessage(
+                telegram_api::updateNewMessage {
+                    message: Some(telegram_api::Message::messageService(
+                        telegram_api::messageService {
+                            id: 6,
+                            action: Some(telegram_api::MessageAction::messageActionStarGiftUnique(
+                                telegram_api::messageActionStarGiftUnique {
+                                    craft: false,
+                                    gift: Some(sample_unique_gift()),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                    pts: 1,
+                    pts_count: 1,
+                },
+            )],
+            users: vec![],
+            chats: vec![],
+            date: 0,
+            seq: 0,
+        });
+        assert!(
+            manager
+                .on_get_craft_star_gift(Result::Ok(updates))
+                .is_some()
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Receive invalid server response"
+        );
     }
 
     #[test]
