@@ -2923,9 +2923,9 @@ impl<K: NetAnswerKind> NetKindHandle<K> {
         );
     }
 
-    /// The unauth form — the C++ `create_unauth`    /// The unauth form — the C++ `create_unauth` (the pre-auth window
+    /// The unauth form — the C++ `create_unauth` (the pre-auth window
     /// queries: the country/help families).
-    fn dispatch_unauth(&self, kind: K, function: telegram_api::Function) {
+    pub(crate) fn dispatch_unauth(&self, kind: K, function: telegram_api::Function) {
         self.dispatch_query(kind, function, DcId::main(), AuthFlag::Off);
     }
 
@@ -3233,6 +3233,10 @@ pub(crate) enum StarNetKind {
 /// The cloned star dispatch surface the [`TdStarEnv`] senders use —
 /// the answers drain through [`Td::on_star_net_answer`].
 type StarNetHandle = NetKindHandle<StarNetKind>;
+
+/// The cloned link dispatch surface the `LinkManager` senders hold —
+/// the answers drain through [`Td::on_link_net_answer`].
+pub(crate) type LinkNetHandle = NetKindHandle<crate::link_manager::LinkNetKind>;
 
 /// The Support query kinds — the C++ ResultHandler classes of
 /// Support.cpp:37-113 (the user-support-info pair + the support name).
@@ -5712,6 +5716,10 @@ pub struct Td {
     /// The callback-parked StarManager query answers, parked by kind (the
     /// `Td::on_star_net_answer` drain).
     star_net_completed: Arc<Mutex<Vec<(StarNetKind, NetQuery)>>>,
+    /// The link-net completed queue (the `LinkNetKind` answers park here
+    /// through the dispatcher callback; the `Td` drain routes them
+    /// through `Td::on_link_net_answer`).
+    link_net_completed: Arc<Mutex<Vec<(crate::link_manager::LinkNetKind, NetQuery)>>>,
     /// The callback-parked Support query answers, parked by kind (the
     /// `Td::on_support_net_answer` drain).
     support_net_completed: Arc<Mutex<Vec<(SupportNetKind, NetQuery)>>>,
@@ -6299,6 +6307,7 @@ impl Td {
             community_net_completed: Arc::new(Mutex::new(Vec::new())),
             account_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_net_completed: Arc::new(Mutex::new(Vec::new())),
+            link_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_info_promises: Vec::new(),
             support_name_promises: Vec::new(),
@@ -7005,6 +7014,15 @@ impl Td {
         // block) — the autologin-token slice (M.3.9.1); the link surface
         // is Wave 2.
         self.link_manager = Some(LinkManager::new());
+        // The net-drain 32 dispatch surface (§0's shared-env shape: the
+        // handle rides the manager, the answers drain through
+        // `Td::on_link_net_answer`).
+        {
+            let net = self.link_net();
+            if let Some(link_manager) = self.link_manager.as_mut() {
+                link_manager.net = net;
+            }
+        }
         // `LinkManager::start_up` (LinkManager.cpp:1895-1908) — the
         // collapsed actor start restores the three pmc domain lists (M.23).
         {
@@ -8599,6 +8617,7 @@ impl Td {
         self.dispatch_completed_community_net();
         self.dispatch_completed_account_net();
         self.dispatch_completed_star_net();
+        self.dispatch_completed_link_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
         self.dispatch_completed_promo_net();
@@ -8687,6 +8706,17 @@ impl Td {
         Some(StarNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.star_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned link dispatch surface the `LinkManager` holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn link_net(&self) -> Option<LinkNetHandle> {
+        Some(LinkNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.link_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10110,6 +10140,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.star_net_completed.lock());
         for (kind, query) in completed {
             self.on_star_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked LinkManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 32
+    /// families (LinkManager.cpp:1508-1780).
+    fn dispatch_completed_link_net(&mut self) {
+        let completed = std::mem::take(&mut *self.link_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_link_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -21101,6 +21142,420 @@ impl Td {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The shared `urlAuthResultRequest` bot intake — `on_get_user`
+    /// under the C++ `"RequestUrlAuthQuery"` label (both urlAuth
+    /// handlers' on_result halves use it, cpp:1684/1751) plus the
+    /// `get_user_id_object` under the caller's label; `None` when the
+    /// bot is absent or the id comes back invalid (the C++
+    /// invalid-bot band).
+    fn url_auth_request_bot_user_id(
+        &mut self,
+        bot: Option<telegram_api::User>,
+        object_label: &str,
+    ) -> Option<i64> {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options: self
+                .option_manager
+                .as_mut()
+                .expect("link answers run with the initialized option manager"),
+            auth_is_bot: self.auth_manager.is_bot(),
+        };
+        let user_id = match bot {
+            Some(bot) => self
+                .user_manager
+                .on_get_user(&mut env, bot, "RequestUrlAuthQuery"),
+            None => return None,
+        };
+        if !user_id.is_valid() {
+            return None;
+        }
+        Some(
+            self.user_manager
+                .get_user_id_object(&mut env, user_id, object_label),
+        )
+    }
+
+    /// Route one LinkManager net answer by kind — the ResultHandler
+    /// halves of the net-drain 32 families (LinkManager.cpp:1508-1780):
+    /// the wire answers parse here, run the users/chats intakes and the
+    /// recentMeUrl ladder, and settle the parked family promises (the
+    /// parse failures settle through the same error tails, the
+    /// landed-flip convention, §5).
+    fn on_link_net_answer(&mut self, kind: crate::link_manager::LinkNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+        // `RequestUrlAuthQuery::on_error` (cpp:1703-1717) — the shared
+        // error tail the wire errors, the parse failures and the
+        // invalid-bot band all funnel through (the C++ `return
+        // on_error(...)` reentry, cpp:1685-1687): the dialog-keyed
+        // intake, the URL_EXPIRED/URL_INVALID passthrough, then the
+        // default-open fallback.
+        fn url_auth_error(
+            td: &Td,
+            url: String,
+            dialog_id: Option<crate::dialog_id::DialogId>,
+            status: Status,
+            promise: &mut tdutils::promise::Promise<td_api::LoginUrlInfo>,
+        ) {
+            let handled = dialog_id.is_some_and(|dialog_id| {
+                crate::dialog_manager::on_get_dialog_error(
+                    &td.global,
+                    dialog_id,
+                    &status,
+                    "RequestUrlAuthQuery",
+                )
+            });
+            if !handled {
+                tdutils::log_info!(
+                    "Receive error for RequestUrlAuthQuery: {}",
+                    status.message()
+                );
+            }
+            if status.message() == "URL_EXPIRED" || status.message() == "URL_INVALID" {
+                return promise.set_error(status);
+            }
+            promise.set_value(td_api::LoginUrlInfo::loginUrlInfoOpen(
+                td_api::loginUrlInfoOpen {
+                    url,
+                    skip_confirmation: false,
+                },
+            ));
+        }
+        match kind {
+            // `GetRecentMeUrlsQuery::on_result` (cpp:1533-1601) — the
+            // users/chats intakes, then the recentMeUrl ladder over the
+            // user/chat/invite/sticker arms (the invalid ids drop their
+            // URLs, the unknown arm skips).
+            crate::link_manager::LinkNetKind::RecentMeUrls => {
+                let promise = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.recent_me_urls));
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let result = match telegram_api::help_RecentMeUrls::parse(query.ok()) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("help_getRecentMeUrls"));
+                        }
+                        return;
+                    }
+                };
+                {
+                    let mut env = crate::user_manager::UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("link answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    };
+                    self.user_manager.on_get_users(
+                        &mut env,
+                        result.users.clone(),
+                        "GetRecentMeUrlsQuery",
+                    );
+                }
+                self.intake_chats(result.chats.clone(), "GetRecentMeUrlsQuery");
+                let mut urls = Vec::new();
+                for url_ptr in result.urls {
+                    match url_ptr {
+                        telegram_api::RecentMeUrl::recentMeUrlUser(url) => {
+                            let user_id = UserId::new(url.user_id);
+                            if !user_id.is_valid() {
+                                tdutils::log_error!("Receive invalid {user_id:?}");
+                                continue;
+                            }
+                            let type_user_id = {
+                                let mut env = crate::user_manager::UserEnv {
+                                    global: &mut self.global,
+                                    options: self.option_manager.as_mut().expect(
+                                        "link answers run with the initialized option manager",
+                                    ),
+                                    auth_is_bot: self.auth_manager.is_bot(),
+                                };
+                                self.user_manager.get_user_id_object(
+                                    &mut env,
+                                    user_id,
+                                    "tMeUrlTypeUser",
+                                )
+                            };
+                            urls.push(td_api::TMeUrl {
+                                url: url.url,
+                                r#type: Some(td_api::TMeUrlType::tMeUrlTypeUser(
+                                    td_api::tMeUrlTypeUser {
+                                        user_id: type_user_id,
+                                    },
+                                )),
+                            });
+                        }
+                        telegram_api::RecentMeUrl::recentMeUrlChat(url) => {
+                            let channel_id = crate::chat_manager::ChannelId::new(url.chat_id);
+                            if !channel_id.is_valid() {
+                                tdutils::log_error!("Receive invalid {channel_id:?}");
+                                continue;
+                            }
+                            let supergroup_id = self
+                                .chat_manager
+                                .get_supergroup_id_object(channel_id, "tMeUrlTypeSupergroup");
+                            urls.push(td_api::TMeUrl {
+                                url: url.url,
+                                r#type: Some(td_api::TMeUrlType::tMeUrlTypeSupergroup(
+                                    td_api::tMeUrlTypeSupergroup { supergroup_id },
+                                )),
+                            });
+                        }
+                        telegram_api::RecentMeUrl::recentMeUrlChatInvite(url) => {
+                            // The `on_get_dialog_invite_link_info` intake
+                            // (cpp:1564-1566) rides the un-landed
+                            // checkDialogInviteLink net family — the map
+                            // lookup misses and the URL drops like the
+                            // C++ null-info band.
+                            let info_object = {
+                                let (mut env, invite_manager) = dialog_invite_link_env_split(self);
+                                invite_manager
+                                    .get_chat_invite_link_info_object_by_url(&mut env, &url.url)
+                            };
+                            match info_object {
+                                Some(info_object) => {
+                                    urls.push(td_api::TMeUrl {
+                                        url: url.url,
+                                        r#type: Some(td_api::TMeUrlType::tMeUrlTypeChatInvite(
+                                            td_api::tMeUrlTypeChatInvite {
+                                                info: Some(info_object),
+                                            },
+                                        )),
+                                    });
+                                }
+                                None => continue,
+                            }
+                        }
+                        telegram_api::RecentMeUrl::recentMeUrlStickerSet(_url) => {
+                            // `StickersManager::on_get_sticker_set_covered`
+                            // (cpp:1586-1596) is an un-landed intake —
+                            // the set can't register, so the URL drops
+                            // like the C++ invalid-set band.
+                            tdutils::log_info!(
+                                "recentMeUrlStickerSet — the sticker-set intake is [blocked: \
+                                 stickers]"
+                            );
+                        }
+                        telegram_api::RecentMeUrl::recentMeUrlUnknown(_) => {}
+                    }
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(Some(td_api::TMeUrls { urls }));
+                }
+            }
+            // `GetDeepLinkInfoQuery::on_result` (cpp:1624-1643) — the
+            // empty constructor answers the null band (the M.18-outline
+            // 404 at the request closure), the full one converts the
+            // formatted text.
+            crate::link_manager::LinkNetKind::DeepLinkInfo => {
+                let promise = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.deep_link_info));
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let info = match telegram_api::help_DeepLinkInfo::parse(query.ok()) {
+                    Ok(telegram_api::help_DeepLinkInfo::help_deepLinkInfoEmpty(_)) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_value(None);
+                        }
+                        return;
+                    }
+                    Ok(telegram_api::help_DeepLinkInfo::help_deepLinkInfo(info)) => info,
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("help_getDeepLinkInfo"));
+                        }
+                        return;
+                    }
+                };
+                let text = crate::message_entity::get_formatted_text::<()>(
+                    None,
+                    info.message,
+                    info.entities,
+                    true,
+                    true,
+                    "GetDeepLinkInfoQuery",
+                );
+                let text_object = {
+                    let mut env = BotEnv { td: self };
+                    crate::message_entity::get_formatted_text_object(
+                        Some(&mut env),
+                        &text,
+                        true,
+                        -1,
+                    )
+                };
+                if let Some(mut promise) = promise {
+                    promise.set_value(Some(td_api::DeepLinkInfo {
+                        text: Some(text_object),
+                        need_update_application: info.update_app,
+                    }));
+                }
+            }
+            // `RequestUrlAuthQuery` (cpp:1646-1719) — the three-way
+            // urlAuthResult ladder over the parked url/dialog_id/promise
+            // triple; the error tail keeps the dialog-error intake, the
+            // URL_EXPIRED/URL_INVALID passthrough and the default-open
+            // fallback.
+            crate::link_manager::LinkNetKind::RequestUrlAuth => {
+                let Some((url, dialog_id, mut promise)) = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.url_auth))
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return url_auth_error(
+                        self,
+                        url,
+                        dialog_id,
+                        query.error().clone(),
+                        &mut promise,
+                    );
+                }
+                let result = match telegram_api::UrlAuthResult::parse(query.ok()) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return url_auth_error(
+                            self,
+                            url,
+                            dialog_id,
+                            parse_error("messages_requestUrlAuth"),
+                            &mut promise,
+                        );
+                    }
+                };
+                match result {
+                    telegram_api::UrlAuthResult::urlAuthResultRequest(request) => {
+                        let bot_user_id =
+                            self.url_auth_request_bot_user_id(request.bot, "RequestUrlAuthQuery");
+                        let Some(bot_user_id) = bot_user_id else {
+                            // the invalid-bot band reenters the C++
+                            // `on_error` tail (cpp:1685-1687) — the intake
+                            // + the default-open fallback, not a raw 500
+                            return url_auth_error(
+                                self,
+                                url,
+                                dialog_id,
+                                Status::error(500, "Receive invalid bot_user_id"),
+                                &mut promise,
+                            );
+                        };
+                        if request.request_phone_number
+                            || !request.browser.is_empty()
+                            || !request.platform.is_empty()
+                            || !request.ip.is_empty()
+                            || !request.region.is_empty()
+                            || !request.match_codes.is_empty()
+                        {
+                            tdutils::log_error!("Receive invalid login URL details");
+                        }
+                        promise.set_value(td_api::LoginUrlInfo::loginUrlInfoRequestConfirmation(
+                            td_api::loginUrlInfoRequestConfirmation {
+                                url,
+                                domain: request.domain,
+                                bot_user_id,
+                                request_write_access: request.request_write_access,
+                            },
+                        ));
+                    }
+                    telegram_api::UrlAuthResult::urlAuthResultAccepted(accepted) => {
+                        promise.set_value(td_api::LoginUrlInfo::loginUrlInfoOpen(
+                            td_api::loginUrlInfoOpen {
+                                url: accepted.url,
+                                skip_confirmation: true,
+                            },
+                        ));
+                    }
+                    telegram_api::UrlAuthResult::urlAuthResultDefault(_) => {
+                        promise.set_value(td_api::LoginUrlInfo::loginUrlInfoOpen(
+                            td_api::loginUrlInfoOpen {
+                                url,
+                                skip_confirmation: false,
+                            },
+                        ));
+                    }
+                }
+            }
+            // `RequestUrlOauthQuery` (cpp:1722-1780) — the request arm
+            // answers the oauthLinkInfo over the parked url, the
+            // accepted/default arms and the error tail settle through
+            // the URL_EXPIRED error.
+            crate::link_manager::LinkNetKind::RequestUrlOauth => {
+                let Some((url, mut promise)) = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.url_oauth))
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let result = match telegram_api::UrlAuthResult::parse(query.ok()) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return promise.set_error(parse_error("messages_requestUrlAuth"));
+                    }
+                };
+                let telegram_api::UrlAuthResult::urlAuthResultRequest(request) = result else {
+                    // the accepted/default arms (cpp:1767-1769) — the
+                    // oauth flow demands the request form
+                    return promise.set_error(Status::error(400, "URL_EXPIRED"));
+                };
+                let bot_user_id = self.url_auth_request_bot_user_id(request.bot, "oauthLinkInfo");
+                let Some(bot_user_id) = bot_user_id else {
+                    return promise.set_error(Status::error(500, "Receive invalid bot_user_id"));
+                };
+                let mut user_id_hint = UserId::new(request.user_id_hint);
+                if user_id_hint != UserId::default() && !user_id_hint.is_valid() {
+                    tdutils::log_error!("Receive an invalid urlAuthResultRequest user_id_hint");
+                    user_id_hint = UserId::default();
+                }
+                promise.set_value(td_api::OauthLinkInfo {
+                    user_id: user_id_hint.get(),
+                    url,
+                    domain: request.domain,
+                    from_app: request.is_app,
+                    verified_app_name: request.verified_app_name,
+                    bot_user_id,
+                    request_write_access: request.request_write_access,
+                    request_phone_number_access: request.request_phone_number,
+                    browser: request.browser,
+                    platform: request.platform,
+                    ip_address: request.ip,
+                    location: request.region,
+                    match_code_first: request.match_codes_first,
+                    match_codes: request.match_codes,
+                });
             }
         }
     }
@@ -47468,6 +47923,12 @@ mod tests {
         td.story_manager.net = td.story_net();
         td.star_gift_manager.net = td.star_gift_net();
         td.business_manager.net = td.business_net();
+        {
+            let net = td.link_net();
+            if let Some(link_manager) = td.link_manager.as_mut() {
+                link_manager.net = net;
+            }
+        }
         (td, rec, callback)
     }
 
@@ -69022,6 +69483,571 @@ kQIDAQAB\n\
         // the drain ran clean — nothing parked, no strays
         assert!(td.web_app_net_completed.lock().is_empty(), "drained");
         assert!(!td.web_app_manager.has_pending_queries());
+    }
+
+    #[test]
+    fn link_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(link_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The mock env driving `RequestUrlAuthQuery`'s peer form (the
+    /// button-URL + input-peer seams the live flow parks at [blocked:
+    /// M.10 integration]).
+    struct PeerFormLinkEnv;
+
+    impl crate::link_manager::LinkEnv for PeerFormLinkEnv {
+        fn get_login_button_url(
+            &mut self,
+            _message_full_id: crate::messages_manager::MessageFullId,
+            _button_id: i64,
+        ) -> tdutils::status::Result<String> {
+            tdutils::status::Result::Ok("https://btn.example/auth".to_owned())
+        }
+
+        fn get_input_peer_read(
+            &mut self,
+            _dialog_id: crate::dialog_id::DialogId,
+        ) -> Option<telegram_api::InputPeer> {
+            Some(telegram_api::InputPeer::inputPeerUser(
+                telegram_api::inputPeerUser {
+                    user_id: 900,
+                    access_hash: 555,
+                },
+            ))
+        }
+    }
+
+    /// The promise sink recording the peer-form answer (the request-level
+    /// collectors ride the deferred plane, which the manager-level call
+    /// bypasses).
+    #[derive(Default)]
+    struct RecLoginUrlInfo {
+        settled: Arc<parking_lot::Mutex<Vec<Result<td_api::LoginUrlInfo, Status>>>>,
+    }
+
+    impl tdutils::promise::PromiseInterface<td_api::LoginUrlInfo> for RecLoginUrlInfo {
+        fn set_value(&mut self, value: td_api::LoginUrlInfo) {
+            self.settled.lock().push(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            self.settled.lock().push(Err(error));
+        }
+    }
+
+    fn link_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain32-link");
+
+        // 1. getRecentlyVisitedTMeUrls — the referrer rides the wire; the
+        //    answer runs the users intake + the recentMeUrl ladder
+        td.request(
+            1,
+            Function::getRecentlyVisitedTMeUrls(td_api::getRecentlyVisitedTMeUrls {
+                referrer: "ref".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getRecentMeUrls::ID,
+        );
+        let body = telegram_api::help_getRecentMeUrls::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.referer, "ref");
+        net_complete(
+            sent,
+            wire!(telegram_api::help_RecentMeUrls {
+                urls: vec![
+                    telegram_api::RecentMeUrl::recentMeUrlUser(telegram_api::recentMeUrlUser {
+                        url: "https://t.me/user".to_owned(),
+                        user_id: 900,
+                    }),
+                    // the invalid-id band (cpp:1544-1547) — the url drops
+                    telegram_api::RecentMeUrl::recentMeUrlUser(telegram_api::recentMeUrlUser {
+                        url: "https://t.me/bad".to_owned(),
+                        user_id: 0,
+                    }),
+                    telegram_api::RecentMeUrl::recentMeUrlChat(telegram_api::recentMeUrlChat {
+                        url: "https://t.me/c/500000000000".to_owned(),
+                        chat_id: 500_000_000_000,
+                    }),
+                    telegram_api::RecentMeUrl::recentMeUrlUnknown(
+                        telegram_api::recentMeUrlUnknown {
+                            url: "https://t.me/x".to_owned(),
+                        },
+                    ),
+                ],
+                chats: vec![],
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1, // USER_ACCESS_HASH_MASK
+                    id: 900,
+                    access_hash: 555,
+                    first_name: "UrlUser".to_owned(),
+                    ..telegram_api::user::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::tMeUrls(urls)) if urls.urls.len() == 2
+                && matches!(
+                    (&urls.urls[0].r#type, &urls.urls[1].r#type),
+                    (
+                        Some(td_api::TMeUrlType::tMeUrlTypeUser(t)),
+                        Some(td_api::TMeUrlType::tMeUrlTypeSupergroup(s))
+                    ) if t.user_id == 900 && s.supergroup_id == 500_000_000_000
+                )
+                && urls.urls[0].url == "https://t.me/user"
+        ));
+
+        // 1b. the wire-error band — the promise error passes through
+        td.request(
+            11,
+            Function::getRecentlyVisitedTMeUrls(td_api::getRecentlyVisitedTMeUrls {
+                referrer: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getRecentMeUrls::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 11);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 2. getDeepLinkInfo — the local tg: strip rides the wire (the
+        //    unauth form) and the answer converts the formatted text
+        td.request(
+            2,
+            Function::getDeepLinkInfo(td_api::getDeepLinkInfo {
+                link: "tg://share?x=1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getDeepLinkInfo::ID,
+        );
+        assert_eq!(sent.auth_flag(), tdnet::net_query::AuthFlag::Off);
+        let body = telegram_api::help_getDeepLinkInfo::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.path, "share");
+        net_complete(
+            sent,
+            wire!(telegram_api::help_deepLinkInfo {
+                flags: 0,
+                update_app: true,
+                message: "Open the app".to_owned(),
+                entities: vec![],
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::deepLinkInfo(info)) if info.need_update_application
+                && info.text.as_ref().map(|t| t.text.as_str()) == Some("Open the app")
+        ));
+
+        // 2b. the empty band — the null answer surfaces as the M.18 404
+        td.request(
+            12,
+            Function::getDeepLinkInfo(td_api::getDeepLinkInfo {
+                link: "tg://share".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getDeepLinkInfo::ID,
+        );
+        net_complete(sent, wire!(telegram_api::help_deepLinkInfoEmpty));
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        // the null answer settles as a value through the request
+        // closure, which renders the M.18-outline 404
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::error(error)) if error.code == 404 && error.message == "Not Found"
+        ));
+
+        // 2c. the wire-error band — the promise error passes through
+        td.request(
+            17,
+            Function::getDeepLinkInfo(td_api::getDeepLinkInfo {
+                link: "tg://share?x=2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getDeepLinkInfo::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_3");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 17);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_3"));
+
+        // 3. getExternalLinkInfo over a url_auth_domain — the URL-form
+        //    RequestUrlAuthQuery (no peer context, the bare-url mask)
+        {
+            let mut manager = td.link_manager.take().expect("the link manager");
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            manager.update_autologin_domains(
+                &mut env,
+                vec![],
+                vec!["auth.example".to_owned()],
+                vec![],
+            );
+            td.link_manager = Some(manager);
+        }
+        td.request(
+            3,
+            Function::getExternalLinkInfo(td_api::getExternalLinkInfo {
+                link: "https://auth.example/login?x=1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_requestUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 2); // URL_MASK
+        assert!(body.peer.is_none());
+        assert_eq!(
+            (body.msg_id, body.button_id, body.url.as_str()),
+            (0, 0, "https://auth.example/login?x=1")
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultRequest {
+                flags: 0,
+                request_write_access: true,
+                request_phone_number: false,
+                match_codes_first: false,
+                is_app: false,
+                bot: Some(telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    bot: true,
+                    id: 901,
+                    access_hash: 556,
+                    first_name: "AuthBot".to_owned(),
+                    ..telegram_api::user::default()
+                })),
+                domain: "auth.example".to_owned(),
+                browser: String::new(),
+                platform: String::new(),
+                ip: String::new(),
+                region: String::new(),
+                match_codes: vec![],
+                user_id_hint: 0,
+                verified_app_name: String::new(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::loginUrlInfoRequestConfirmation(c)) if c.url == "https://auth.example/login?x=1"
+                && c.domain == "auth.example" && c.bot_user_id == 901
+                && c.request_write_access
+        ));
+
+        // 3b. the default arm — the same url answers open without
+        //     confirmation
+        td.request(
+            13,
+            Function::getExternalLinkInfo(td_api::getExternalLinkInfo {
+                link: "https://auth.example/other".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        net_complete(sent, wire!(telegram_api::urlAuthResultDefault));
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::loginUrlInfoOpen(o)) if o.url == "https://auth.example/other"
+                && !o.skip_confirmation
+        ));
+
+        // 3c. the error ladder — URL_INVALID passes the error through,
+        //     a generic error falls back to the default open (the host
+        //     change needs its own url_auth_domain first)
+        {
+            let mut manager = td.link_manager.take().expect("the link manager");
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            manager.update_autologin_domains(&mut env, vec![], vec!["auth.com".to_owned()], vec![]);
+            td.link_manager = Some(manager);
+        }
+        td.request(
+            14,
+            Function::getExternalLinkInfo(td_api::getExternalLinkInfo {
+                link: "https://auth.com/expired".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        net_fail(sent, 400, "URL_INVALID");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!((error.code, error.message.as_str()), (400, "URL_INVALID"));
+
+        td.request(
+            15,
+            Function::getExternalLinkInfo(td_api::getExternalLinkInfo {
+                link: "https://auth.com/fallback".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        net_fail(sent, 500, "AUTH_KEY_UNREGISTERED");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 15).first(),
+            Some(Object::loginUrlInfoOpen(o)) if o.url == "https://auth.com/fallback"
+                && !o.skip_confirmation
+        ));
+
+        // 3d. the accepted arm — the wire's own url answers open with
+        //     skip_confirmation (auth.com: the 3c setup replaced the
+        //     url_auth_domain list)
+        td.request(
+            18,
+            Function::getExternalLinkInfo(td_api::getExternalLinkInfo {
+                link: "https://auth.com/accepted".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultAccepted {
+                flags: 1, // URL_MASK of the answer's own url field
+                url: "https://accepted.example/done".to_owned(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 18).first(),
+            Some(Object::loginUrlInfoOpen(o)) if o.url == "https://accepted.example/done"
+                && o.skip_confirmation
+        ));
+
+        // 3e. the invalid-bot band — the C++ reenters the on_error tail
+        //     (cpp:1685-1687 → 1703-1717): neither URL_EXPIRED nor
+        //     URL_INVALID, so the fallback answers the default open
+        td.request(
+            19,
+            Function::getExternalLinkInfo(td_api::getExternalLinkInfo {
+                link: "https://auth.com/no-bot".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultRequest {
+                flags: 0,
+                request_write_access: false,
+                request_phone_number: false,
+                match_codes_first: false,
+                is_app: false,
+                bot: None,
+                domain: "auth.com".to_owned(),
+                browser: String::new(),
+                platform: String::new(),
+                ip: String::new(),
+                region: String::new(),
+                match_codes: vec![],
+                user_id_hint: 0,
+                verified_app_name: String::new(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 19).first(),
+            Some(Object::loginUrlInfoOpen(o)) if o.url == "https://auth.com/no-bot"
+                && !o.skip_confirmation
+        ));
+
+        // 4. getOauthLinkInfo — the oauth form (URL_MASK plus the
+        //    in-app origin mask, the url from the parsed tg:// link)
+        td.request(
+            4,
+            Function::getOauthLinkInfo(td_api::getOauthLinkInfo {
+                url: "tg://oauth?token=tok".to_owned(),
+                in_app_origin: "origin".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_requestUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, (1 << 2) | (1 << 3)); // URL | IN_APP_ORIGIN
+        assert_eq!(
+            (body.url.as_str(), body.in_app_origin.as_str()),
+            ("tg://oauth?token=tok", "origin")
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultRequest {
+                flags: (1 << 2) | (1 << 3) | (1 << 4) | (1 << 7), // browser set + match_codes + hint + verified name
+                request_write_access: true,
+                request_phone_number: true,
+                match_codes_first: true,
+                is_app: true,
+                bot: Some(telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    bot: true,
+                    id: 902,
+                    access_hash: 557,
+                    first_name: "OauthBot".to_owned(),
+                    ..telegram_api::user::default()
+                })),
+                domain: "oauth.example".to_owned(),
+                browser: "Safari".to_owned(),
+                platform: "iOS".to_owned(),
+                ip: "10.0.0.1".to_owned(),
+                region: "EU".to_owned(),
+                match_codes: vec!["code1".to_owned(), "code2".to_owned()],
+                user_id_hint: 777,
+                verified_app_name: "VerifiedApp".to_owned(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::oauthLinkInfo(o)) if o.user_id == 777
+                && o.url == "tg://oauth?token=tok"
+                && o.domain == "oauth.example"
+                && o.from_app
+                && o.verified_app_name == "VerifiedApp"
+                && o.bot_user_id == 902
+                && o.request_write_access
+                && o.request_phone_number_access
+                && o.browser == "Safari"
+                && o.platform == "iOS"
+                && o.ip_address == "10.0.0.1"
+                && o.location == "EU"
+                && o.match_code_first
+                && o.match_codes == vec!["code1".to_owned(), "code2".to_owned()]
+        ));
+
+        // 4b. the accepted arm — the oauth flow demands the request form
+        td.request(
+            16,
+            Function::getOauthLinkInfo(td_api::getOauthLinkInfo {
+                url: "tg://oauth?token=acc".to_owned(),
+                in_app_origin: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultAccepted {
+                flags: 1, // URL_MASK of the answer's own url field
+                url: "https://accepted.example/done".to_owned(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 16);
+        assert_eq!((error.code, error.message.as_str()), (400, "URL_EXPIRED"));
+
+        // 5. the peer form — the manager-level drive over the mock env
+        //    (the request arm parks at the M.10 button seam): the dialog
+        //    rides the peer mask with the server message id + button id,
+        //    and the default arm settles the parked promise
+        let peer_sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let mut manager = td.link_manager.take().expect("the link manager");
+            let promise = tdutils::promise::Promise::from_interface(RecLoginUrlInfo {
+                settled: Arc::clone(&peer_sink),
+            });
+            manager.get_login_url_info(
+                &mut PeerFormLinkEnv,
+                crate::messages_manager::MessageFullId::new(
+                    crate::dialog_id::DialogId::from_user_id(UserId::new(900)),
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::messages_manager::ServerMessageId::new(123),
+                    ),
+                ),
+                7,
+                promise,
+            );
+            td.link_manager = Some(manager);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_requestUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 1); // PEER_MASK
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerUser(p)) if p.user_id == 900
+        ));
+        assert_eq!((body.msg_id, body.button_id), (123, 7));
+        net_complete(sent, wire!(telegram_api::urlAuthResultDefault));
+        td.dispatch_completed_link_net();
+        assert!(matches!(
+            peer_sink.lock().first(),
+            Some(Ok(td_api::LoginUrlInfo::loginUrlInfoOpen(o))) if o.url == "https://btn.example/auth"
+                && !o.skip_confirmation
+        ));
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(td.link_net_completed.lock().is_empty(), "drained");
+        {
+            let pending = &td.link_manager.as_ref().expect("the link manager").pending;
+            assert!(
+                pending.recent_me_urls.is_empty()
+                    && pending.deep_link_info.is_empty()
+                    && pending.url_auth.is_empty()
+                    && pending.url_oauth.is_empty()
+            );
+        }
     }
 
     #[test]

@@ -4480,17 +4480,21 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
-        // --- the LinkManager arm set (M.23): Requests.cpp:3592-3642 +
-        // 8948-8954 + 9258-9264. The local halves run in the collapsed
-        // manager; every net query tail is the [blocked: net] env seam
-        // and parks the promise offline, exactly like the C++ request
-        // without a network ---
+        // --- the LinkManager arm set (M.23 + net-drain 32):
+        // Requests.cpp:3592-3642 + 8948-8954 + 9258-9264. The local
+        // halves run in the collapsed manager; the net-drain 32
+        // families (GetRecentMeUrls/GetDeepLinkInfo/RequestUrlAuth/
+        // RequestUrlOauth) ride the LinkNetKind plane, the remaining
+        // tails (accept/decline/match-code) stay the [blocked: net]
+        // seams and park the promise offline ---
         // --- the dialog-scoped LinkManager arms (M.23): the
         // button-URL resolution rides the [blocked: M.10 integration]
         // message plane and answers the C++ not-found band offline; the
         // net query tails are the [blocked: net] env seams ---
         Function::getLoginUrlInfo(request) => {
-            // Requests.cpp:8166-8172; the RequestUrlAuthQuery tail parks
+            // Requests.cpp:8166-8172; the button-URL resolution (the
+            // [blocked: M.10] seam) precedes the RequestUrlAuthQuery
+            // peer-form send
             if !check_is_user(td, id) {
                 return;
             }
@@ -4537,7 +4541,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getDeepLinkInfo(request) => {
             // Requests.cpp:9258-9264: no auth gate; the local tg: strip +
-            // host split, then help.getDeepLinkInfo parks
+            // host split, then help.getDeepLinkInfo rides the unauth
+            // dispatch
             let Some(link) = clean_or_utf8_error(td, id, &request.link) else {
                 return;
             };
@@ -4559,15 +4564,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 // created in the Td init block before requests flow.
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
-            let mut env = TdLinkEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-            };
-            link_manager.get_deep_link_info(&mut env, &link, promise);
+            link_manager.get_deep_link_info(&link, promise);
         }
         Function::getExternalLinkInfo(request) => {
             // Requests.cpp:3592-3598; the local machine answers
-            // loginUrlInfoOpen or parks on messages.requestUrlAuth
+            // loginUrlInfoOpen or sends the URL-form
+            // messages.requestUrlAuth over the url_auth_domain hosts
             if !check_is_user(td, id) {
                 return;
             }
@@ -4585,7 +4587,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             link_manager.get_external_link_info(&mut env, link, promise);
         }
         Function::getRecentlyVisitedTMeUrls(request) => {
-            // Requests.cpp:8948-8954; help.getRecentMeUrls parks
+            // Requests.cpp:8948-8954; help.getRecentMeUrls rides the
+            // dispatch
             if !check_is_user(td, id) {
                 return;
             }
@@ -4607,11 +4610,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let Some(link_manager) = td.link_manager.as_mut() else {
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
-            let mut env = TdLinkEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-            };
-            link_manager.get_recent_me_urls(&mut env, referrer, promise);
+            link_manager.get_recent_me_urls(referrer, promise);
         }
         Function::getExternalLink(request) => {
             // Requests.cpp:3596-3601: the HTTP-URL promise band
@@ -4636,7 +4635,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getOauthLinkInfo(request) => {
             // Requests.cpp:3612-3618; the local parse + type check, then
-            // messages.requestUrlAuth (with the in-app origin) parks
+            // the oauth-form messages.requestUrlAuth (with the in-app
+            // origin) rides the dispatch
             if !check_is_user(td, id) {
                 return;
             }
