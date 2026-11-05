@@ -3554,6 +3554,14 @@ pub(crate) type WebAppNetHandle = NetKindHandle<crate::web_app_manager::WebAppNe
 /// [`crate::web_browser_manager::WebBrowserManager::net`] field): the
 /// send legs run inside the manager, the env carries nothing wire-facing.
 pub(crate) type WebBrowserNetHandle = NetKindHandle<crate::web_browser_manager::WebBrowserNetKind>;
+/// The cloned DialogParticipant dispatch surface the
+/// [`TdDialogParticipantEnv`] senders use — the per-kind handle over the
+/// DialogParticipantManager.cpp ResultHandler kinds (the net-drain 35
+/// plane: the member-query trio); the answers drain through
+/// [`Td::dispatch_completed_dialog_participant_net`]. Env-held like the
+/// secure plane: the split env view resolves the peers at the send leg.
+pub(crate) type DialogParticipantNetHandle =
+    NetKindHandle<crate::dialog_participant_manager::DialogParticipantNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -5938,6 +5946,17 @@ pub struct Td {
     /// [`Td::on_web_browser_net_answer`] drain).
     web_browser_net_completed:
         Arc<Mutex<Vec<(crate::web_browser_manager::WebBrowserNetKind, NetQuery)>>>,
+    /// The callback-parked DialogParticipant answers (the C++ ResultHandler
+    /// halves of the net-drain 35 member-query trio — the
+    /// [`Td::on_dialog_participant_net_answer`] drain).
+    dialog_participant_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::dialog_participant_manager::DialogParticipantNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The parked query state of the net-drain 28/29 families (the
     /// handler vectors, search offsets/filters and promises the `Copy`
     /// kinds can't carry) — popped by
@@ -6438,6 +6457,7 @@ impl Td {
             message_query_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_app_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_browser_net_completed: Arc::new(Mutex::new(Vec::new())),
+            dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
@@ -8740,6 +8760,7 @@ impl Td {
         self.dispatch_completed_message_query_net();
         self.dispatch_completed_web_app_net();
         self.dispatch_completed_web_browser_net();
+        self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9039,6 +9060,17 @@ impl Td {
         Some(WebBrowserNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.web_browser_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned DialogParticipant dispatch surface (the net-drain 35
+    /// member-query trio). Env-held like the secure plane: the split env
+    /// view captures the handle at split time.
+    pub(crate) fn dialog_participant_net(&self) -> Option<DialogParticipantNetHandle> {
+        Some(DialogParticipantNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.dialog_participant_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17120,6 +17152,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked DialogParticipant answers — the C++
+    /// ResultHandler halves of the net-drain 35 member-query trio
+    /// (DialogParticipantManager.cpp:342-443, 904-946).
+    fn dispatch_completed_dialog_participant_net(&mut self) {
+        let completed = std::mem::take(&mut *self.dialog_participant_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_dialog_participant_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -18440,6 +18483,83 @@ impl Td {
         };
         self.web_browser_manager
             .on_get_web_browser_settings(&mut env, result, promise);
+    }
+
+    /// Route one DialogParticipant net answer by kind — the ResultHandler
+    /// halves of the net-drain 35 member-query trio: the wire answers
+    /// parse here and the manager intakes run the landed tails (the parse
+    /// failures settle through the same error tails, the landed-flip
+    /// convention, §5).
+    fn on_dialog_participant_net_answer(
+        &mut self,
+        kind: crate::dialog_participant_manager::DialogParticipantNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetChannelParticipantQuery::on_result`/`on_error`
+            // (DialogParticipantManager.cpp:365-394).
+            crate::dialog_participant_manager::DialogParticipantNetKind::ChannelParticipant => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::channels_ChannelParticipant::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("channels_getParticipant")),
+                    }
+                };
+                let (mut env, manager) = crate::td::dialog_participant_env_split(self);
+                manager.on_get_channel_participant_answer(&mut env, result);
+            }
+            // `GetChannelParticipantsQuery::on_result`/`on_error`
+            // (DialogParticipantManager.cpp:418-442) — the NotModified band
+            // logs and funnels through the error tail.
+            crate::dialog_participant_manager::DialogParticipantNetKind::ChannelParticipants => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::channels_ChannelParticipants::parse(query.ok()) {
+                        Ok(telegram_api::channels_ChannelParticipants::channels_channelParticipants(
+                            participants,
+                        )) => Ok(participants),
+                        Ok(
+                            telegram_api::channels_ChannelParticipants::channels_channelParticipantsNotModified(_),
+                        ) => {
+                            tdutils::log_error!("Receive channelParticipantsNotModified");
+                            Err(Status::error(500, "Receive channelParticipantsNotModified"))
+                        }
+                        Err(_) => Err(parse_error("channels_getParticipants")),
+                    }
+                };
+                let (mut env, manager) = crate::td::dialog_participant_env_split(self);
+                manager.on_get_channel_participants_answer(&mut env, result);
+            }
+            // `EditChatCreatorQuery::on_result`/`on_error`
+            // (DialogParticipantManager.cpp:928-945) — the manager bands
+            // run over the split env; the updates walk the promise rides
+            // hops to the updates env (cpp:939).
+            crate::dialog_participant_manager::DialogParticipantNetKind::EditChatCreator => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => Ok(updates),
+                        Err(_) => Err(parse_error("messages_editChatCreator")),
+                    }
+                };
+                let walk = {
+                    let (mut env, manager) = crate::td::dialog_participant_env_split(self);
+                    manager.on_edit_chat_creator_answer(&mut env, result)
+                };
+                if let Some((updates, promise)) = walk {
+                    self.with_updates_env(|updates_manager, env| {
+                        updates_manager.on_get_updates(env, updates, promise);
+                    });
+                }
+            }
+        }
     }
 
     /// Build the [`MessageQueryEnv`] view over the split Td borrows and
@@ -43320,6 +43440,7 @@ pub(crate) fn dialog_participant_env_split(
     TdDialogParticipantEnv<'_>,
     &mut crate::dialog_participant_manager::DialogParticipantManager,
 ) {
+    let net = td.dialog_participant_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -43336,6 +43457,7 @@ pub(crate) fn dialog_participant_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
         },
         dialog_participant_manager,
     )
@@ -43558,6 +43680,66 @@ pub(crate) struct TdDialogParticipantEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The live dispatch surface (the net-drain 35 member-query trio send
+    /// legs); the `None` arm logs the send instead of dispatching (the
+    /// net-inert posture).
+    pub(crate) net: Option<DialogParticipantNetHandle>,
+}
+
+impl TdDialogParticipantEnv<'_> {
+    /// The `DialogManager::get_input_peer(dialog_id, rights)` ladder over
+    /// the split borrows — the same shape as the free
+    /// `crate::dialog_manager::get_input_peer(td, …)`, which the field
+    /// split can't call (no whole-`Td` borrow).
+    fn dialog_participant_get_input_peer(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        access_rights: AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::chat_manager::DialogType::User => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &user_env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
+            }
+            crate::chat_manager::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::chat_manager::DialogType::Channel => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &user_env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::chat_manager::DialogType::SecretChat => None,
+            crate::chat_manager::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+    }
 }
 
 impl crate::dialog_participant_filter::DialogParticipantFilterEnv for TdDialogParticipantEnv<'_> {
@@ -43573,6 +43755,18 @@ impl crate::dialog_participant_filter::DialogParticipantFilterEnv for TdDialogPa
 impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialogParticipantEnv<'_> {
     fn close_flag(&self) -> bool {
         self.global.close_flag()
+    }
+
+    fn close_status(&self) -> Status {
+        if self.global.close_flag() {
+            Status::error(500, "Request aborted")
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
     }
 
     fn now(&self) -> f64 {
@@ -43686,8 +43880,29 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
         dialog_id.get()
     }
 
-    fn have_input_peer_know(&mut self, dialog_id: crate::chat_manager::DialogId) -> bool {
-        self.have_dialog_force(dialog_id, "get_input_peer")
+    fn get_input_peer_know(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        // the DialogManager::get_input_peer(Know) ladder over the split
+        // borrows — the same shape as the free `get_input_peer(td, …)`
+        self.dialog_participant_get_input_peer(dialog_id, AccessRights::Know)
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        status: &tdutils::status::Status,
+        source: &str,
+    ) -> bool {
+        // the manager plane rides the M.5-era chat_manager::DialogId
+        // stand-in; the dialog intake takes the messages_manager one
+        crate::dialog_manager::on_get_dialog_error(
+            self.global,
+            crate::messages_manager::DialogId::new(dialog_id.get()),
+            status,
+            source,
+        )
     }
 
     fn get_chat_is_active(&mut self, chat_id: ChatId) -> bool {
@@ -43716,6 +43931,101 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
     fn is_broadcast_channel(&mut self, channel_id: ChannelId) -> bool {
         self.chat_manager.get_channel_type_by_id(channel_id)
             == crate::chat_manager::ChannelType::Broadcast
+    }
+
+    fn is_megagroup_channel(&mut self, channel_id: ChannelId) -> bool {
+        self.chat_manager.get_channel_type_by_id(channel_id)
+            == crate::chat_manager::ChannelType::Megagroup
+    }
+
+    fn get_channel_type(&mut self, channel_id: ChannelId) -> crate::chat_manager::ChannelType {
+        // the C++ get_channel_type: a missing channel answers the
+        // non-Broadcast/Megagroup stand-in (the Rust Unknown)
+        self.chat_manager.get_channel_type_by_id(channel_id)
+    }
+
+    fn get_channel_effective_has_hidden_participants(
+        &mut self,
+        channel_id: ChannelId,
+        _source: &str,
+    ) -> bool {
+        self.chat_manager
+            .get_channel_effective_has_hidden_participants(channel_id)
+    }
+
+    fn get_input_channel(
+        &mut self,
+        channel_id: ChannelId,
+    ) -> Option<tdmtproto::telegram_api::InputChannel> {
+        let options = self.options.as_deref_mut()?;
+        let user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.get_input_channel(&user_env, channel_id)
+    }
+
+    fn invalidate_channel_full(
+        &mut self,
+        channel_id: ChannelId,
+        need_drop_slow_mode_delay: bool,
+        source: &str,
+    ) {
+        let Some(options) = self.options.as_deref_mut() else {
+            return;
+        };
+        let mut user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.invalidate_channel_full(
+            self.user_manager,
+            &mut user_env,
+            channel_id,
+            need_drop_slow_mode_delay,
+            source,
+        );
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str) {
+        if chats.is_empty() {
+            return;
+        }
+        let Some(options) = self.options.as_deref_mut() else {
+            return;
+        };
+        let mut user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .on_get_chats(self.user_manager, &mut user_env, chats, source);
+    }
+
+    fn on_get_channel_error(
+        &mut self,
+        channel_id: ChannelId,
+        status: &tdutils::status::Status,
+        source: &str,
+    ) {
+        let Some(options) = self.options.as_deref_mut() else {
+            return;
+        };
+        let mut user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.on_get_channel_error(
+            self.user_manager,
+            &mut user_env,
+            channel_id,
+            status,
+            source,
+        );
     }
 
     fn get_chat_participants(
@@ -43795,6 +44105,53 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
 
     fn have_user_force(&mut self, user_id: UserId, _source: &str) -> bool {
         self.user_manager.have_accessible_user(user_id)
+    }
+
+    fn is_user_online(&mut self, user_id: UserId, unix_time: i32) -> bool {
+        let Some(options) = self.options.as_deref_mut() else {
+            return false;
+        };
+        let user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        // the C++ `is_user_online(user_id, 0, unix_time)` — zero tolerance
+        self.user_manager
+            .is_user_online_of(&user_env, user_id, 0, unix_time)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return Err(tdutils::status::Status::error(
+                400,
+                "The user manager is not ready",
+            ));
+        };
+        let user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        match self.user_manager.get_input_user(&user_env, user_id) {
+            Ok(input_user) => Ok(input_user),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        let Some(options) = self.options.as_deref_mut() else {
+            return;
+        };
+        let mut user_env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source);
     }
 
     fn is_user_deleted(&mut self, user_id: UserId) -> bool {
@@ -43916,22 +44273,71 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
         // GetChannelAdministratorsQuery [blocked: net]
     }
 
-    fn get_channel_participants_query(
+    /// `GetChannelParticipantsQuery::send`
+    /// (DialogParticipantManager.cpp:407-416): the input channel resolves
+    /// here; `None` is the 400 "Supergroup not found" band the manager
+    /// settles on its parked lot head.
+    fn send_get_channel_participants_query(
         &mut self,
-        _channel_id: ChannelId,
-        _filter: &crate::dialog_participant_filter::ChannelParticipantFilter,
-        _offset: i32,
-        _limit: i32,
-    ) {
-        // GetChannelParticipantsQuery [blocked: net]
+        channel_id: ChannelId,
+        filter: &crate::dialog_participant_filter::ChannelParticipantFilter,
+        offset: i32,
+        limit: i32,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = match self.net.as_ref() {
+            Some(net) => net.clone(),
+            None => {
+                tdutils::log_info!("Send channels.getParticipants — [net-inert]");
+                return Ok(());
+            }
+        };
+        let Some(input_channel) = self.get_input_channel(channel_id) else {
+            return Err(tdutils::status::Status::error(400, "Supergroup not found"));
+        };
+        net.dispatch(
+            crate::dialog_participant_manager::DialogParticipantNetKind::ChannelParticipants,
+            telegram_api::Function::channels_getParticipants(
+                telegram_api::channels_getParticipants {
+                    channel: Some(input_channel),
+                    filter: Some(filter.get_input_channel_participants_filter()),
+                    offset,
+                    limit,
+                    hash: 0,
+                },
+            ),
+        );
+        Ok(())
     }
 
-    fn get_channel_participant_query(
+    /// `GetChannelParticipantQuery::send`
+    /// (DialogParticipantManager.cpp:351-363) — the input peer arrives
+    /// pre-resolved from the manager's gate; the input channel resolves
+    /// here with the same 400 band.
+    fn send_get_channel_participant_query(
         &mut self,
-        _channel_id: ChannelId,
-        _participant_dialog_id: crate::chat_manager::DialogId,
-    ) {
-        // GetChannelParticipantQuery [blocked: net]
+        channel_id: ChannelId,
+        input_peer: tdmtproto::telegram_api::InputPeer,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = match self.net.as_ref() {
+            Some(net) => net.clone(),
+            None => {
+                tdutils::log_info!("Send channels.getParticipant — [net-inert]");
+                return Ok(());
+            }
+        };
+        let Some(input_channel) = self.get_input_channel(channel_id) else {
+            return Err(tdutils::status::Status::error(400, "Supergroup not found"));
+        };
+        net.dispatch(
+            crate::dialog_participant_manager::DialogParticipantNetKind::ChannelParticipant,
+            telegram_api::Function::channels_getParticipant(
+                telegram_api::channels_getParticipant {
+                    channel: Some(input_channel),
+                    participant: Some(Box::new(input_peer)),
+                },
+            ),
+        );
+        Ok(())
     }
 
     fn get_chat_join_requests_query(
@@ -43972,12 +44378,63 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
         // GetFutureChatCreatorAfterLeaveQuery [blocked: net]
     }
 
+    /// `PasswordManager::get_input_check_password_srp(password, …)` —
+    /// [blocked: PasswordManager]; the promise stays parked in the
+    /// manager's `EditChatCreatorQuery` lot (the C++ request awaiting its
+    /// own SRP round-trip).
     fn transfer_chat_ownership_seam(
         &mut self,
         _dialog_id: crate::chat_manager::DialogId,
         _user_id: UserId,
+        _password: String,
     ) {
-        // get_input_check_password_srp + EditChatCreatorQuery [blocked: net]
+        tdutils::log_info!(
+            "PasswordManager::get_input_check_password_srp — [blocked: PasswordManager]"
+        );
+    }
+
+    /// `EditChatCreatorQuery::send`
+    /// (DialogParticipantManager.cpp:913-926) — the peer/user resolve at
+    /// the send leg: the peer band reenters the C++ `on_error` tail
+    /// through the completed queue (the dialog-keyed intake runs there),
+    /// the user band settles the parked promise directly.
+    fn send_edit_chat_creator_query(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        user_id: UserId,
+        input_check_password: tdmtproto::telegram_api::InputCheckPasswordSRP,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = match self.net.as_ref() {
+            Some(net) => net.clone(),
+            None => {
+                tdutils::log_info!("Send messages.editChatCreator — [net-inert]");
+                return Ok(());
+            }
+        };
+        let Some(input_peer) =
+            self.dialog_participant_get_input_peer(dialog_id, AccessRights::Read)
+        else {
+            // the C++ `return on_error(Status::Error(400, "Have no access
+            // to the chat"))` — the full tail reenters through the queue
+            net.complete_error(
+                crate::dialog_participant_manager::DialogParticipantNetKind::EditChatCreator,
+                400,
+                "Have no access to the chat",
+            );
+            return Ok(());
+        };
+        let input_user = self.get_input_user(user_id)?;
+        net.dispatch(
+            crate::dialog_participant_manager::DialogParticipantNetKind::EditChatCreator,
+            telegram_api::Function::messages_editChatCreator(
+                telegram_api::messages_editChatCreator {
+                    peer: Some(Box::new(input_peer)),
+                    user_id: Some(input_user),
+                    password: Some(input_check_password),
+                },
+            ),
+        );
+        Ok(())
     }
 
     fn edit_chat_participant_rank_query(
@@ -71561,6 +72018,473 @@ kQIDAQAB\n\
                     && pending.url_oauth.is_empty()
             );
         }
+    }
+
+    #[test]
+    fn dialog_participant_member_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(dialog_participant_member_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The settled-`Result<()>` recorder — the transfer promise tail.
+    #[derive(Default, Clone)]
+    struct RecUnit {
+        settled: Arc<parking_lot::Mutex<Vec<Result<(), Status>>>>,
+    }
+
+    impl tdutils::promise::PromiseInterface<()> for RecUnit {
+        fn set_value(&mut self, _: ()) {
+            self.settled.lock().push(Ok(()));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            self.settled.lock().push(Err(error));
+        }
+    }
+
+    /// The net-drain 35 netted round trips: the member-query trio
+    /// dispatches through the real dispatcher, the wire bodies carry the
+    /// C++ payloads (DialogParticipantManager.cpp:342-443, 904-946, and
+    /// the getSupergroupMembers/searchChatMembers arms), and the answers
+    /// drain through `Td::on_dialog_participant_net_answer` into the
+    /// landed intakes.
+    fn dialog_participant_member_queries_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain35-dialog-participant");
+        seed_dialog_channel(&mut td, 705, false, true);
+        seed_dialog_user_id(&mut td, 900, 555);
+        seed_dialog_user_id(&mut td, 901, 556);
+        seed_dialog_user_id(&mut td, 902, 557);
+        let megagroup_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(705),
+        )
+        .get();
+
+        // 1. getChatMember — the GetChannelParticipantQuery round trip:
+        //    the seeded channel rides the wire with its access hash, the
+        //    member peer resolves inputPeerUser(900, 555)
+        td.request(
+            1,
+            Function::getChatMember(td_api::getChatMember {
+                chat_id: megagroup_dialog,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 900 },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getParticipant::ID,
+        );
+        let body =
+            telegram_api::channels_getParticipant::parse(sent.query()).expect("the sent body");
+        let telegram_api::InputChannel::inputChannel(channel) = body.channel.expect("channel")
+        else {
+            panic!("the inputChannel reference");
+        };
+        assert_eq!((channel.channel_id, channel.access_hash), (705, 779));
+        let telegram_api::InputPeer::inputPeerUser(peer) =
+            body.participant.as_deref().expect("peer")
+        else {
+            panic!("the inputPeerUser member peer");
+        };
+        assert_eq!((peer.user_id, peer.access_hash), (900, 555));
+        net_complete(
+            sent,
+            wire!(telegram_api::channels_ChannelParticipant {
+                participant: Some(telegram_api::ChannelParticipant::channelParticipant(
+                    telegram_api::channelParticipant {
+                        flags: 0,
+                        user_id: 900,
+                        date: 1_700_000_000,
+                        subscription_until_date: 0,
+                        rank: "vet".to_owned(),
+                    },
+                )),
+                chats: vec![],
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    id: 900,
+                    access_hash: 555,
+                    first_name: "Member".to_owned(),
+                    ..telegram_api::user::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::chatMember(member)) if matches!(
+                &member.member_id,
+                Some(td_api::MessageSender::messageSenderUser(u)) if u.user_id == 900
+            ) && matches!(
+                member.status.as_ref(),
+                Some(td_api::ChatMemberStatus::chatMemberStatusMember(_))
+            )
+        ));
+
+        // 1b. the USER_NOT_PARTICIPANT error band — the left-member value
+        //     path (cpp:385-388) answers the member object, not an error
+        td.request(
+            2,
+            Function::getChatMember(td_api::getChatMember {
+                chat_id: megagroup_dialog,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 901 },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getParticipant::ID,
+        );
+        net_fail(sent, 400, "USER_NOT_PARTICIPANT");
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::chatMember(member)) if matches!(
+                member.status.as_ref(),
+                Some(td_api::ChatMemberStatus::chatMemberStatusLeft(_))
+            )
+        ));
+
+        // 1c. a wire error of another kind — the channel-error intake runs
+        //     and the error passes through (cpp:390-393)
+        td.request(
+            12,
+            Function::getChatMember(td_api::getChatMember {
+                chat_id: megagroup_dialog,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 902 },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getParticipant::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 2. getSupergroupMembers — the GetChannelParticipantsQuery round
+        //    trip: the recent filter rides the wire, the page converts
+        td.request(
+            3,
+            Function::getSupergroupMembers(td_api::getSupergroupMembers {
+                supergroup_id: 705,
+                filter: None,
+                offset: 0,
+                limit: 50,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getParticipants::ID,
+        );
+        let body =
+            telegram_api::channels_getParticipants::parse(sent.query()).expect("the sent body");
+        assert_eq!((body.offset, body.limit, body.hash), (0, 50, 0));
+        assert!(matches!(
+            body.filter,
+            Some(telegram_api::ChannelParticipantsFilter::channelParticipantsRecent(_))
+        ));
+        let telegram_api::InputChannel::inputChannel(channel) = body.channel.expect("channel")
+        else {
+            panic!("the inputChannel reference");
+        };
+        assert_eq!((channel.channel_id, channel.access_hash), (705, 779));
+        net_complete(
+            sent,
+            wire!(telegram_api::channels_channelParticipants {
+                count: 2,
+                participants: vec![
+                    telegram_api::ChannelParticipant::channelParticipant(
+                        telegram_api::channelParticipant {
+                            flags: 0,
+                            user_id: 900,
+                            date: 1_700_000_000,
+                            subscription_until_date: 0,
+                            rank: String::new(),
+                        }
+                    ),
+                    telegram_api::ChannelParticipant::channelParticipantCreator(
+                        telegram_api::channelParticipantCreator {
+                            flags: 0,
+                            user_id: 901,
+                            admin_rights: Some(telegram_api::ChatAdminRights::default()),
+                            rank: "owner".to_owned(),
+                        },
+                    ),
+                ],
+                chats: vec![],
+                users: vec![
+                    telegram_api::User::user(telegram_api::user {
+                        flags: 1,
+                        id: 900,
+                        access_hash: 555,
+                        first_name: "Member".to_owned(),
+                        ..telegram_api::user::default()
+                    }),
+                    telegram_api::User::user(telegram_api::user {
+                        flags: 1,
+                        id: 901,
+                        access_hash: 556,
+                        first_name: "Owner".to_owned(),
+                        ..telegram_api::user::default()
+                    }),
+                ],
+            }),
+        );
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::chatMembers(members)) if members.total_count == 2
+                && members.members.len() == 2
+                && matches!(
+                    members.members[1].status.as_ref(),
+                    Some(td_api::ChatMemberStatus::chatMemberStatusCreator(_))
+                )
+        ));
+
+        // 2b. the searchChatMembers wiring — the member filter's query
+        //     rides the SERVER-side search filter (cpp:2239-2241)
+        td.request(
+            4,
+            Function::searchChatMembers(td_api::searchChatMembers {
+                chat_id: megagroup_dialog,
+                query: "alice".to_owned(),
+                limit: 10,
+                filter: Some(td_api::ChatMembersFilter::chatMembersFilterMembers(
+                    td_api::chatMembersFilterMembers {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getParticipants::ID,
+        );
+        let body =
+            telegram_api::channels_getParticipants::parse(sent.query()).expect("the sent body");
+        assert_eq!((body.offset, body.limit), (0, 10));
+        let Some(telegram_api::ChannelParticipantsFilter::channelParticipantsSearch(search)) =
+            body.filter
+        else {
+            panic!("the server-side search filter");
+        };
+        assert_eq!(search.q, "alice");
+        net_complete(
+            sent,
+            wire!(telegram_api::channels_channelParticipants {
+                count: 1,
+                participants: vec![telegram_api::ChannelParticipant::channelParticipant(
+                    telegram_api::channelParticipant {
+                        flags: 0,
+                        user_id: 900,
+                        date: 1_700_000_000,
+                        subscription_until_date: 0,
+                        rank: String::new(),
+                    },
+                )],
+                chats: vec![],
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    id: 900,
+                    access_hash: 555,
+                    first_name: "Member".to_owned(),
+                    ..telegram_api::user::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::chatMembers(members)) if members.total_count == 1
+        ));
+
+        // 2c. the no-query form — the user query searches the fixed
+        //     100-member page client-side (cpp:2243-2244); the admins
+        //     filter rides bare and the additional pass drops every
+        //     non-matching member (the search-text stand-in matches
+        //     nothing)
+        td.request(
+            5,
+            Function::searchChatMembers(td_api::searchChatMembers {
+                chat_id: megagroup_dialog,
+                query: "bob".to_owned(),
+                limit: 10,
+                filter: Some(td_api::ChatMembersFilter::chatMembersFilterAdministrators(
+                    td_api::chatMembersFilterAdministrators {},
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getParticipants::ID,
+        );
+        let body =
+            telegram_api::channels_getParticipants::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.limit, 100);
+        assert!(matches!(
+            body.filter,
+            Some(telegram_api::ChannelParticipantsFilter::channelParticipantsAdmins(_))
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::channels_channelParticipants {
+                count: 1,
+                participants: vec![telegram_api::ChannelParticipant::channelParticipantCreator(
+                    telegram_api::channelParticipantCreator {
+                        flags: 0,
+                        user_id: 901,
+                        admin_rights: Some(telegram_api::ChatAdminRights::default()),
+                        rank: "owner".to_owned(),
+                    },
+                )],
+                chats: vec![],
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    id: 901,
+                    access_hash: 556,
+                    first_name: "Owner".to_owned(),
+                    ..telegram_api::user::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::chatMembers(members)) if members.total_count == 0
+                && members.members.is_empty()
+        ));
+
+        // 3. transferChatOwnership — the SRP half is [blocked:
+        //    PasswordManager]; the promise parks in the EditChatCreator
+        //    lot, no wire send, no response
+        td.request(
+            6,
+            Function::transferChatOwnership(td_api::transferChatOwnership {
+                chat_id: megagroup_dialog,
+                user_id: 900,
+                password: "pw".to_owned(),
+            }),
+        );
+        assert!(
+            std::mem::take(&mut *rec.sent.lock())
+                .iter()
+                .all(|query| query.tl_constructor() != telegram_api::messages_editChatCreator::ID),
+            "the SRP half blocks the wire send"
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 6).is_empty() && error_of_id(&callback, 6).is_none(),
+            "the parked transfer promise"
+        );
+        {
+            let pending = &td.dialog_participant_manager.pending;
+            assert_eq!(
+                pending.transfer_ownership_srp.len(),
+                1,
+                "parked at the SRP seam"
+            );
+            assert!(pending.edit_chat_creator.is_empty(), "no wire send yet");
+        }
+
+        // 3b. the resolved-SRP tail — `transfer_chat_ownership` sends the
+        //     wire query (the peer/user resolve at the send leg) and the
+        //     updates answer settles the promise (cpp:928-945)
+        let transfer_sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let (mut env, manager) = crate::td::dialog_participant_env_split(&mut td);
+            let promise = tdutils::promise::Promise::from_interface(RecUnit {
+                settled: Arc::clone(&transfer_sink),
+            });
+            manager.transfer_chat_ownership(
+                &mut env,
+                crate::chat_manager::DialogId::from_channel_id(
+                    crate::chat_manager::ChannelId::new(705),
+                ),
+                crate::user_manager::UserId::new(900),
+                telegram_api::InputCheckPasswordSRP::inputCheckPasswordEmpty(
+                    telegram_api::inputCheckPasswordEmpty {},
+                ),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editChatCreator::ID,
+        );
+        let body =
+            telegram_api::messages_editChatCreator::parse(sent.query()).expect("the sent body");
+        let telegram_api::InputPeer::inputPeerChannel(creator_peer) =
+            body.peer.as_deref().expect("peer")
+        else {
+            panic!("the inputPeerChannel dialog peer");
+        };
+        assert_eq!(
+            (creator_peer.channel_id, creator_peer.access_hash),
+            (705, 779)
+        );
+        let telegram_api::InputUser::inputUser(creator_user) = body.user_id.as_ref().expect("user")
+        else {
+            panic!("the inputUser successor");
+        };
+        assert_eq!((creator_user.user_id, creator_user.access_hash), (900, 555));
+        assert!(matches!(
+            body.password.as_ref(),
+            Some(telegram_api::InputCheckPasswordSRP::inputCheckPasswordEmpty(_))
+        ));
+        net_complete(sent, wire!(telegram_api::updatesTooLong {}));
+        td.dispatch_completed_dialog_participant_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(transfer_sink.lock().first(), Some(Ok(()))),
+            "the transfer promise settled through the updates intake"
+        );
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(
+            td.dialog_participant_net_completed.lock().is_empty(),
+            "drained"
+        );
+        {
+            let pending = &td.dialog_participant_manager.pending;
+            // the request-side park from step 3 stays (the SRP never
+            // resolves); the send-side lots drained
+            assert_eq!(pending.transfer_ownership_srp.len(), 1);
+            assert!(pending.edit_chat_creator.is_empty());
+            assert!(pending.channel_participant.is_empty());
+            assert!(pending.channel_participants.is_empty());
+        }
+    }
+
+    /// The optional error lookup — the parked-promise asserts need "no
+    /// response, no error", which `error_of` can't express (it panics).
+    fn error_of_id(callback: &CollectCallback, id: u64) -> Option<td_api::Error> {
+        callback
+            .errors
+            .lock()
+            .iter()
+            .find(|(error_id, _)| *error_id == id)
+            .map(|(_, error)| error.clone())
     }
 
     #[test]
