@@ -4994,7 +4994,7 @@ impl UserManager {
     /// `UserManager::have_input_peer_user(const User *, ...)`
     /// (UserManager.cpp:5271-5286); the registry admission is the
     /// `user_messages_.count(user_id) != 0` check.
-    fn have_input_peer_user_for(
+    pub(crate) fn have_input_peer_user_for(
         &self,
         u: Option<&User>,
         user_id: UserId,

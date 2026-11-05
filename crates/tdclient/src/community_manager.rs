@@ -468,11 +468,22 @@ impl CommunityManager {
         env: &impl CommunityManagerEnv,
         community_id: CommunityId,
     ) -> Option<telegram_api::InputChannel> {
+        self.get_input_community_impl(env.auth_is_bot(), community_id)
+    }
+
+    /// The `get_input_community` body over the bot flag — the env-free form
+    /// for the callers that hold the flag without the full community env
+    /// (the MessageQueryManager search arm).
+    pub(crate) fn get_input_community_impl(
+        &self,
+        auth_is_bot: bool,
+        community_id: CommunityId,
+    ) -> Option<telegram_api::InputChannel> {
         let mut access_hash = 0;
         match self.get_community(community_id) {
             Some(community) => access_hash = community.access_hash,
             None => {
-                if !env.auth_is_bot() || !community_id.is_valid() {
+                if !auth_is_bot || !community_id.is_valid() {
                     return None;
                 }
             }

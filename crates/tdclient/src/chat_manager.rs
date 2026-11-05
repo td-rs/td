@@ -14980,14 +14980,14 @@ impl ChatManager {
     /// fan-out answers false until the DialogInviteLinkManager step.
     fn have_input_peer_channel(
         &self,
-        env: &UserEnv,
+        auth_is_bot: bool,
         c: Option<&Channel>,
         channel_id: ChannelId,
         access_rights: AccessRights,
         from_linked: bool,
     ) -> bool {
         let Some(c) = c else {
-            if env.auth_is_bot && channel_id.is_valid() {
+            if auth_is_bot && channel_id.is_valid() {
                 return true;
             }
             return self.channel_messages.contains_key(&channel_id.get());
@@ -14996,14 +14996,14 @@ impl ChatManager {
             return true;
         }
         if !from_linked && c.is_monoforum {
-            if env.auth_is_bot {
+            if auth_is_bot {
                 return c.is_admined_monoforum;
             }
             let monoforum_channel_id = c.monoforum_channel_id;
             let monoforum_channel = self.get_channel(monoforum_channel_id);
             if let Some(monoforum_channel) = monoforum_channel {
                 return self.have_input_peer_channel(
-                    env,
+                    auth_is_bot,
                     Some(monoforum_channel),
                     monoforum_channel_id,
                     AccessRights::Read,
@@ -15038,7 +15038,7 @@ impl ChatManager {
                 let linked_channel_id = ChannelId::new(linked_channel_id);
                 if linked_channel_id.is_valid() && self.have_channel(linked_channel_id) {
                     if self.have_input_peer_channel(
-                        env,
+                        auth_is_bot,
                         self.get_channel(linked_channel_id),
                         linked_channel_id,
                         access_rights,
@@ -15055,7 +15055,7 @@ impl ChatManager {
             return false;
         }
 
-        if !from_linked && c.is_megagroup && !env.auth_is_bot && c.has_linked_channel {
+        if !from_linked && c.is_megagroup && !auth_is_bot && c.has_linked_channel {
             let linked_channel_id = self
                 .linked_channel_ids
                 .get(&channel_id.get())
@@ -15065,7 +15065,7 @@ impl ChatManager {
             if linked_channel_id.is_valid() && (is_public || self.have_channel(linked_channel_id)) {
                 return is_public
                     || self.have_input_peer_channel(
-                        env,
+                        auth_is_bot,
                         self.get_channel(linked_channel_id),
                         linked_channel_id,
                         AccessRights::Read,
@@ -15084,8 +15084,21 @@ impl ChatManager {
         channel_id: ChannelId,
         access_rights: AccessRights,
     ) -> bool {
+        self.have_input_peer_channel_by_id(env.auth_is_bot, channel_id, access_rights)
+    }
+
+    /// The by-id probe over the bot flag — the env-free form for the
+    /// callers that hold the flag without a `UserEnv` (the
+    /// `ReadStateContext` input-peer ladder over the split-context
+    /// alias).
+    pub(crate) fn have_input_peer_channel_by_id(
+        &self,
+        auth_is_bot: bool,
+        channel_id: ChannelId,
+        access_rights: AccessRights,
+    ) -> bool {
         let c = self.get_channel(channel_id);
-        self.have_input_peer_channel(env, c, channel_id, access_rights, false)
+        self.have_input_peer_channel(auth_is_bot, c, channel_id, access_rights, false)
     }
 
     /// `have_input_peer_chat(const Chat *, AccessRights)`
@@ -15145,7 +15158,7 @@ impl ChatManager {
         access_rights: AccessRights,
     ) -> Option<telegram_api::InputPeer> {
         let c = self.get_channel(channel_id);
-        if !self.have_input_peer_channel(env, c, channel_id, access_rights, false) {
+        if !self.have_input_peer_channel(env.auth_is_bot, c, channel_id, access_rights, false) {
             return None;
         }
         let Some(c) = c else {
