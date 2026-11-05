@@ -7,15 +7,15 @@
 //!
 //! Seams:
 //! - The eight `Td::ResultHandler` queries ride the
-//!   [`WebAppManagerEnv`] net seams — `[blocked: net]`, the promises park
-//!   (the M.41 convention); the answer handlers
-//!   ([`WebAppManager::on_get_popular_app_bots`],
+//!   `WebAppNetKind` plane over the [`WebAppManagerEnv`] send arms
+//!   (the net-drain 30 slice — the handle-less env logs `[net-inert]`);
+//!   the answers drain through `Td::on_web_app_net_answer` into the
+//!   landed intakes ([`WebAppManager::on_get_popular_app_bots`],
 //!   [`WebAppManager::on_get_bot_app`], [`WebAppManager::on_get_app_web_view`],
 //!   [`WebAppManager::on_get_main_web_view`],
 //!   [`WebAppManager::on_get_web_view`], [`WebAppManager::on_prolong_web_view`],
 //!   [`WebAppManager::on_get_custom_request_result`],
-//!   [`WebAppManager::on_check_download_file_params`])
-//!   are real and unit-tested.
+//!   [`WebAppManager::on_check_download_file_params`]).
 //! - The `StateManager` online callback (WebAppManager.cpp:406-422) is
 //!   the [`WebAppManager::on_online`] entry — the StateManager lands
 //!   with the net step.
@@ -324,6 +324,136 @@ impl MessageInputReplyTo {
     pub fn is_valid(&self) -> bool {
         !self.is_empty()
     }
+
+    /// `MessageInputReplyTo::get_input_reply_to(td, message_topic)`
+    /// (MessageInputReplyTo.cpp:97-176) — the arms the Web-App wire
+    /// exercises: the empty reply, the implicit thread/forum reply
+    /// (`MessageTopic::get_implicit_reply_to_message_id`,
+    /// MessageTopic.cpp:271-290) and the plain message reply over
+    /// `inputReplyToMessage`. The story/ephemeral/quote/todo/poll arms
+    /// stay the MessagesManager slice (this `MessageInputReplyTo`
+    /// carries none of those fields), and the monoforum
+    /// `get_saved_input_peer` dialog-state read stays [blocked: M.10].
+    pub fn get_input_reply_to(
+        &self,
+        env: &mut impl WebAppManagerEnv,
+        message_topic: &MessageTopic,
+    ) -> Option<telegram_api::InputReplyTo> {
+        let mut reply_to_message_id = self.message_id;
+        if reply_to_message_id == MessageId::default() {
+            if message_topic.is_monoforum() {
+                // `MessageTopic::get_saved_input_peer` reads the saved-
+                // messages dialog state — [blocked: M.10]
+                tdutils::log_debug!(
+                    "The monoforum saved-input-peer reply arm stays the MessagesManager seam"
+                );
+                return None;
+            }
+            if message_topic.is_empty() {
+                return None;
+            }
+            // `get_implicit_reply_to_message_id` (MessageTopic.cpp:271-290)
+            reply_to_message_id = match message_topic.kind {
+                MessageTopicKind::Thread => message_topic.top_thread_message_id,
+                MessageTopicKind::Forum => {
+                    let dialog_type = message_topic.dialog_id.get_type();
+                    // the bot's user-dialog forums and the channel
+                    // General topic keep the empty implicit reply
+                    // (MessageTopic.cpp:276-283)
+                    if (env.is_bot() && dialog_type == crate::dialog_id::DialogType::User)
+                        || (dialog_type == crate::dialog_id::DialogType::Channel
+                            && message_topic.forum_topic_id == ForumTopicId::general())
+                    {
+                        MessageId::default()
+                    } else {
+                        MessageId::from_server_message_id(
+                            crate::messages_manager::ServerMessageId::new(
+                                message_topic.forum_topic_id.get(),
+                            ),
+                        )
+                    }
+                }
+                _ => MessageId::default(),
+            };
+        }
+
+        let mut flags = 0;
+        let top_msg_id = message_topic.get_input_top_msg_id();
+        if top_msg_id != 0 {
+            flags |= 1; // inputReplyToMessage::TOP_MSG_ID_MASK
+        }
+        let mut input_peer = None;
+        if self.dialog_id != DialogId::new(0) {
+            let peer = env.get_input_peer(self.dialog_id, AccessRights::Read)?;
+            flags |= 1 << 1; // inputReplyToMessage::REPLY_TO_PEER_ID_MASK
+            input_peer = Some(Box::new(peer));
+        }
+        if reply_to_message_id != MessageId::default() && !reply_to_message_id.is_server() {
+            // the C++ LOG(FATAL) band — the thread topics arrive
+            // server-validated, so this is unreachable; the
+            // sent-correspondence seam keeps the defensive drop (the
+            // `get_input_reply_to_for_send` convention)
+            tdutils::log_debug!(
+                "Reply to a non-server message id stays the sent-correspondence seam"
+            );
+            return None;
+        }
+        Some(telegram_api::InputReplyTo::inputReplyToMessage(
+            telegram_api::inputReplyToMessage {
+                flags,
+                reply_to_msg_id: reply_to_message_id.get_server_message_id().get(),
+                top_msg_id,
+                reply_to_peer_id: input_peer,
+                quote_text: String::new(),
+                quote_entities: Vec::new(),
+                quote_offset: 0,
+                monoforum_peer_id: None,
+                todo_item_id: 0,
+                poll_option: Vec::new(),
+            },
+        ))
+    }
+}
+
+/// The Web-App-plane in-flight query kinds — the `Td::ResultHandler`
+/// classes of WebAppManager.cpp (the net-drain 30 families). The
+/// completions park by kind behind the Td-held net handle
+/// (`crate::td::WebAppNetHandle`); `Td::on_web_app_net_answer` routes
+/// them. The per-query ResultHandler members (the `RequestWebViewQuery`
+/// dialog/topic/reply coordinates, the `RequestMainWebViewQuery`
+/// `is_full_screen_`, the `ProlongWebViewQuery` `dialog_id_`) park in
+/// the manager's pending queues — the C++ promise rides the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebAppNetKind {
+    /// `GetPopularAppBotsQuery` (WebAppManager.cpp:32-66) —
+    /// `bots.getPopularAppBots`.
+    GetPopularAppBots,
+    /// `GetBotAppQuery` (WebAppManager.cpp:68-96) —
+    /// `messages.getBotApp` over `inputBotAppShortName`.
+    GetBotApp,
+    /// `RequestAppWebViewQuery` (WebAppManager.cpp:98-141) —
+    /// `messages.requestAppWebView`; the peer resolves at the send leg
+    /// (the C++ `CHECK(input_peer != nullptr)`).
+    RequestAppWebView,
+    /// `RequestMainWebViewQuery` (WebAppManager.cpp:143-195) —
+    /// `messages.requestMainWebView`; `is_full_screen_` parks in the
+    /// manager's pending queue.
+    RequestMainWebView,
+    /// `RequestWebViewQuery` (WebAppManager.cpp:197-289) —
+    /// `messages.requestWebView`; the `start://`/`menu://` URL parse,
+    /// the reply-to wire form and the send-as peer build at the send
+    /// leg, the open-web-view coordinates park in the manager.
+    RequestWebView,
+    /// `ProlongWebViewQuery` (WebAppManager.cpp:291-339) —
+    /// `messages.prolongWebView`; the send leg can be inert
+    /// (cpp:299-303 — a failed peer/user resolve sends nothing).
+    ProlongWebView,
+    /// `InvokeWebViewCustomMethodQuery` (WebAppManager.cpp:341-371) —
+    /// `bots.invokeWebViewCustomMethod`.
+    InvokeWebViewCustomMethod,
+    /// `CheckDownloadFileParamsQuery` (WebAppManager.cpp:373-401) —
+    /// `bots.checkDownloadFileParams`.
+    CheckDownloadFileParams,
 }
 
 /// The `G()`/manager slice the collapsed manager reads through.
@@ -469,25 +599,28 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
         );
     }
 
-    /// `GetPopularAppBotsQuery::send` (WebAppManager.cpp:40-42) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`WebAppManager::on_get_popular_app_bots`].
+    /// `GetPopularAppBotsQuery::send` (WebAppManager.cpp:40-42) — the
+    /// wire query rides the `WebAppNetKind::GetPopularAppBots`
+    /// dispatch; the handle-less env keeps the net-inert posture (the
+    /// answer arrives through
+    /// [`WebAppManager::on_get_popular_app_bots`]).
     fn send_get_popular_app_bots_query(&mut self, offset: &str, limit: i32) {
         let _ = (offset, limit);
-        tdutils::log_info!("Send bots.getPopularAppBots — [blocked: net]");
+        tdutils::log_info!("Send bots.getPopularAppBots — [net-inert]");
     }
 
-    /// `GetBotAppQuery::send` (WebAppManager.cpp:76-80) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`WebAppManager::on_get_bot_app`].
-    fn send_get_bot_app_query(&mut self, bot_user_id: UserId, short_name: &str) {
-        let _ = (bot_user_id, short_name);
-        tdutils::log_info!("Send messages.getBotApp — [blocked: net]");
+    /// `GetBotAppQuery::send` (WebAppManager.cpp:76-80) — the resolved
+    /// input user rides the `inputBotAppShortName` app reference; the
+    /// answer arrives through [`WebAppManager::on_get_bot_app`].
+    fn send_get_bot_app_query(&mut self, input_user: telegram_api::InputUser, short_name: &str) {
+        let _ = (input_user, short_name);
+        tdutils::log_info!("Send messages.getBotApp — [net-inert]");
     }
 
-    /// `RequestAppWebViewQuery::send` (WebAppManager.cpp:106-124) —
-    /// `[blocked: net]`; the theme parameters arrive pre-wrapped in the
-    /// `dataJSON` (the WebAppOpenParameters form).
+    /// `RequestAppWebViewQuery::send` (WebAppManager.cpp:106-124) — the
+    /// peer resolves at the send leg (the C++
+    /// `CHECK(input_peer != nullptr)`); the theme parameters arrive
+    /// pre-wrapped in the `dataJSON` (the WebAppOpenParameters form).
     fn send_request_app_web_view_query(
         &mut self,
         dialog_id: DialogId,
@@ -505,11 +638,12 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
             parameters,
             allow_write_access,
         );
-        tdutils::log_info!("Send messages.requestAppWebView — [blocked: net]");
+        tdutils::log_info!("Send messages.requestAppWebView — [net-inert]");
     }
 
-    /// `RequestMainWebViewQuery::send` (WebAppManager.cpp:152-169) —
-    /// `[blocked: net]`.
+    /// `RequestMainWebViewQuery::send` (WebAppManager.cpp:152-169) — the
+    /// peer resolves at the send leg (the C++
+    /// `CHECK(input_peer != nullptr)`).
     fn send_request_main_web_view_query(
         &mut self,
         dialog_id: DialogId,
@@ -518,11 +652,12 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
         parameters: &WebAppOpenParameters,
     ) {
         let _ = (dialog_id, input_user, start_parameter, parameters);
-        tdutils::log_info!("Send messages.requestMainWebView — [blocked: net]");
+        tdutils::log_info!("Send messages.requestMainWebView — [net-inert]");
     }
 
-    /// `RequestWebViewQuery::send` (WebAppManager.cpp:211-265) —
-    /// `[blocked: net]`.
+    /// `RequestWebViewQuery::send` (WebAppManager.cpp:211-265) — the
+    /// `start://`/`menu://` URL parse, the reply-to wire form and the
+    /// send-as peer build at the send leg.
     #[allow(clippy::too_many_arguments)]
     fn send_request_web_view_query(
         &mut self,
@@ -547,11 +682,14 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
             silent,
             as_dialog_id,
         );
-        tdutils::log_info!("Send messages.requestWebView — [blocked: net]");
+        tdutils::log_info!("Send messages.requestWebView — [net-inert]");
     }
 
-    /// `ProlongWebViewQuery::send` (WebAppManager.cpp:295-322) —
-    /// `[blocked: net]`.
+    /// `ProlongWebViewQuery::send` (WebAppManager.cpp:295-322) — the
+    /// peer/user resolve happens here and can be inert (cpp:299-303: a
+    /// failed resolve sends no query); `true` means the query went out
+    /// (or would have — the net-inert posture) and the manager parks
+    /// its pending entry, `false` means nothing was sent.
     #[allow(clippy::too_many_arguments)]
     fn send_prolong_web_view_query(
         &mut self,
@@ -562,7 +700,7 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
         input_reply_to: &MessageInputReplyTo,
         silent: bool,
         as_dialog_id: DialogId,
-    ) {
+    ) -> bool {
         let _ = (
             dialog_id,
             bot_user_id,
@@ -572,11 +710,12 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
             silent,
             as_dialog_id,
         );
-        tdutils::log_info!("Send messages.prolongWebView — [blocked: net]");
+        tdutils::log_info!("Send messages.prolongWebView — [net-inert]");
+        true
     }
 
     /// `InvokeWebViewCustomMethodQuery::send`
-    /// (WebAppManager.cpp:349-356) — `[blocked: net]`.
+    /// (WebAppManager.cpp:349-356).
     fn send_invoke_web_view_custom_method_query(
         &mut self,
         input_user: telegram_api::InputUser,
@@ -584,11 +723,10 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
         parameters: &str,
     ) {
         let _ = (input_user, method, parameters);
-        tdutils::log_info!("Send bots.invokeWebViewCustomMethod — [blocked: net]");
+        tdutils::log_info!("Send bots.invokeWebViewCustomMethod — [net-inert]");
     }
 
-    /// `CheckDownloadFileParamsQuery::send` (WebAppManager.cpp:380-384) —
-    /// `[blocked: net]`.
+    /// `CheckDownloadFileParamsQuery::send` (WebAppManager.cpp:380-384).
     fn send_check_download_file_params_query(
         &mut self,
         input_user: telegram_api::InputUser,
@@ -596,7 +734,7 @@ pub trait WebAppManagerEnv: crate::web_app::WebAppEnv {
         url: &str,
     ) {
         let _ = (input_user, file_name, url);
-        tdutils::log_info!("Send bots.checkDownloadFileParams — [blocked: net]");
+        tdutils::log_info!("Send bots.checkDownloadFileParams — [net-inert]");
     }
 }
 
@@ -683,6 +821,17 @@ pub struct WebAppManager {
     pending_check_download_file_params_queries: Vec<PendingCheckDownloadFileParamsQuery>,
 }
 
+/// Pop the oldest parked entry — the §5 FIFO-per-kind convention (the
+/// C++ promise rides its own ResultHandler; the net completes the
+/// same-family queries in dispatch order, so the head pairs).
+fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
+}
+
 impl WebAppManager {
     /// `WebAppManager::WebAppManager` (WebAppManager.cpp:403-404).
     pub fn new() -> WebAppManager {
@@ -736,7 +885,9 @@ impl WebAppManager {
         let opened_web_views: BTreeMap<i64, OpenedWebView> = self.opened_web_views.clone();
         for (query_id, opened_web_view) in &opened_web_views {
             let silent = env.get_dialog_silent_send_message(opened_web_view.dialog_id);
-            env.send_prolong_web_view_query(
+            // the C++ send leg can be inert (WebAppManager.cpp:299-303) —
+            // a failed peer/user resolve sends no query and parks nothing
+            if env.send_prolong_web_view_query(
                 opened_web_view.dialog_id,
                 opened_web_view.bot_user_id,
                 *query_id,
@@ -744,11 +895,12 @@ impl WebAppManager {
                 &opened_web_view.input_reply_to,
                 silent,
                 opened_web_view.as_dialog_id,
-            );
-            self.pending_prolong_web_view_queries
-                .push(PendingProlongWebViewQuery {
-                    dialog_id: opened_web_view.dialog_id,
-                });
+            ) {
+                self.pending_prolong_web_view_queries
+                    .push(PendingProlongWebViewQuery {
+                        dialog_id: opened_web_view.dialog_id,
+                    });
+            }
         }
 
         self.schedule_ping_web_view();
@@ -761,7 +913,7 @@ impl WebAppManager {
         env: &mut impl WebAppManagerEnv,
         result: Result<bool, Status>,
     ) {
-        let Some(query) = self.pending_prolong_web_view_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_prolong_web_view_queries) else {
             tdutils::log_info!("Receive an unexpected messages.prolongWebView answer");
             return;
         };
@@ -799,7 +951,7 @@ impl WebAppManager {
         env: &mut impl WebAppManagerEnv,
         result: Result<telegram_api::bots_PopularAppBots, Status>,
     ) {
-        let Some(query) = self.pending_popular_app_bots_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_popular_app_bots_queries) else {
             tdutils::log_info!("Receive an unexpected bots.getPopularAppBots answer");
             return;
         };
@@ -829,13 +981,14 @@ impl WebAppManager {
         web_app_short_name: &str,
         mut promise: Promise<Option<td_api::FoundWebApp>>,
     ) {
-        if let Err(error) = env.get_input_user(bot_user_id) {
-            return promise.set_error(error);
-        }
+        let input_user = match env.get_input_user(bot_user_id) {
+            Ok(input_user) => input_user,
+            Err(error) => return promise.set_error(error),
+        };
         if let Err(error) = env.get_bot_data(bot_user_id) {
             return promise.set_error(error);
         }
-        env.send_get_bot_app_query(bot_user_id, web_app_short_name);
+        env.send_get_bot_app_query(input_user, web_app_short_name);
         self.pending_get_bot_app_queries
             .push(PendingGetBotAppQuery {
                 bot_user_id,
@@ -864,7 +1017,7 @@ impl WebAppManager {
         env: &mut impl WebAppManagerEnv,
         result: Result<telegram_api::messages_BotApp, Status>,
     ) {
-        let Some(query) = self.pending_get_bot_app_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_get_bot_app_queries) else {
             tdutils::log_info!("Receive an unexpected messages.getBotApp answer");
             return;
         };
@@ -965,7 +1118,7 @@ impl WebAppManager {
     /// `RequestAppWebViewQuery::on_result`/`on_error`
     /// (WebAppManager.cpp:126-140).
     pub fn on_get_app_web_view(&mut self, result: Result<telegram_api::WebViewResult, Status>) {
-        let Some(query) = self.pending_request_app_web_view_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_request_app_web_view_queries) else {
             tdutils::log_info!("Receive an unexpected messages.requestAppWebView answer");
             return;
         };
@@ -1023,7 +1176,7 @@ impl WebAppManager {
     /// `RequestMainWebViewQuery::on_result`/`on_error`
     /// (WebAppManager.cpp:171-194).
     pub fn on_get_main_web_view(&mut self, result: Result<telegram_api::WebViewResult, Status>) {
-        let Some(query) = self.pending_request_main_web_view_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_request_main_web_view_queries) else {
             tdutils::log_info!("Receive an unexpected messages.requestMainWebView answer");
             return;
         };
@@ -1121,7 +1274,7 @@ impl WebAppManager {
         env: &mut impl WebAppManagerEnv,
         result: Result<telegram_api::WebViewResult, Status>,
     ) {
-        let Some(query) = self.pending_request_web_view_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_request_web_view_queries) else {
             tdutils::log_info!("Receive an unexpected messages.requestWebView answer");
             return;
         };
@@ -1219,7 +1372,7 @@ impl WebAppManager {
     /// `InvokeWebViewCustomMethodQuery::on_result`/`on_error`
     /// (WebAppManager.cpp:358-370).
     pub fn on_get_custom_request_result(&mut self, result: Result<telegram_api::DataJSON, Status>) {
-        let Some(query) = self.pending_invoke_web_view_custom_method_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_invoke_web_view_custom_method_queries) else {
             tdutils::log_info!("Receive an unexpected bots.invokeWebViewCustomMethod answer");
             return;
         };
@@ -1260,7 +1413,7 @@ impl WebAppManager {
     /// `CheckDownloadFileParamsQuery::on_result`/`on_error`
     /// (WebAppManager.cpp:386-400).
     pub fn on_check_download_file_params(&mut self, result: Result<bool, Status>) {
-        let Some(query) = self.pending_check_download_file_params_queries.pop() else {
+        let Some(query) = pop_head(&mut self.pending_check_download_file_params_queries) else {
             tdutils::log_info!("Receive an unexpected bots.checkDownloadFileParams answer");
             return;
         };
@@ -1605,9 +1758,18 @@ mod tests {
                 .push(format!("getPopularAppBots:{offset}:{limit}"));
         }
 
-        fn send_get_bot_app_query(&mut self, bot_user_id: UserId, short_name: &str) {
+        fn send_get_bot_app_query(
+            &mut self,
+            input_user: telegram_api::InputUser,
+            short_name: &str,
+        ) {
+            let bot_user_id = match input_user {
+                telegram_api::InputUser::inputUser(user) => user.user_id,
+                telegram_api::InputUser::inputUserSelf(_) => 0,
+                _ => -1,
+            };
             self.queries
-                .push(format!("getBotApp:{bot_user_id:?}:{short_name}"));
+                .push(format!("getBotApp:{bot_user_id}:{short_name}"));
         }
 
         fn send_request_app_web_view_query(
@@ -1662,11 +1824,12 @@ mod tests {
             _input_reply_to: &MessageInputReplyTo,
             silent: bool,
             _as_dialog_id: DialogId,
-        ) {
+        ) -> bool {
             self.queries.push(format!(
                 "prolongWebView:{}:{query_id}:{silent}",
                 dialog_id.get()
             ));
+            true
         }
 
         fn send_invoke_web_view_custom_method_query(
@@ -1826,7 +1989,7 @@ mod tests {
 
         let (promise, outcomes) = recording_promise();
         manager.get_web_app(&mut env, UserId::new(5), "app", promise);
-        assert_eq!(env.queries, vec!["getBotApp:UserId(5):app"]);
+        assert_eq!(env.queries, vec!["getBotApp:5:app"]);
 
         manager.on_get_bot_app(&mut env, Err(Status::error(400, "BOT_APP_INVALID")));
         assert!(outcomes.lock().unwrap()[0].is_ok());
@@ -1897,23 +2060,26 @@ mod tests {
         );
 
         // a healthy bot parks the query
-        let (promise, outcomes) = recording_promise();
+        let (plain_promise, plain_outcomes) = recording_promise();
         manager.request_main_web_view(
             &mut env,
             DialogId::new(7),
             UserId::new(5),
             "start",
             &WebAppOpenParameters::default(),
-            promise,
+            plain_promise,
         );
         assert!(
             env.queries
                 .iter()
                 .any(|q| q.starts_with("requestMainWebView:"))
         );
-        assert!(outcomes.lock().unwrap().is_empty());
+        assert!(plain_outcomes.lock().unwrap().is_empty());
 
-        // the full-screen request form keeps the C++ open-mode priority
+        // the full-screen request form keeps the C++ open-mode priority;
+        // the FIFO pairing settles the OLDEST parked promise first (the
+        // C++ promise rides its own ResultHandler), so the plain query
+        // answers before the full-screen one
         let parameters = WebAppOpenParameters::from_td_api(Some(td_api::WebAppOpenParameters {
             theme: None,
             application_name: String::new(),
@@ -1921,30 +2087,49 @@ mod tests {
                 td_api::webAppOpenModeFullScreen,
             )),
         }));
-        let (promise, outcomes) = recording_promise();
+        let (full_promise, full_outcomes) = recording_promise();
         manager.request_main_web_view(
             &mut env,
             DialogId::new(7),
             UserId::new(5),
             "start",
             &parameters,
-            promise,
+            full_promise,
         );
-        let result = telegram_api::WebViewResult {
+        // the first answer settles the parked plain query — the server
+        // fullsize flag picks the full-size mode for the plain form
+        manager.on_get_main_web_view(Ok(telegram_api::WebViewResult {
+            flags: 0,
+            fullsize: true,
+            fullscreen: false,
+            same_origin: false,
+            query_id: 0,
+            url: "https://plain".to_owned(),
+        }));
+        {
+            let plain = plain_outcomes.lock().unwrap();
+            let main = plain[0].as_ref().expect("the plain query answered");
+            assert_eq!(main.url.as_ref().expect("url").url, "https://plain");
+            assert!(matches!(
+                main.mode,
+                Some(td_api::WebAppOpenMode::webAppOpenModeFullSize(_))
+            ));
+        }
+        // the second answer settles the full-screen query — the client
+        // priority wins over the server fullsize flag
+        manager.on_get_main_web_view(Ok(telegram_api::WebViewResult {
             flags: 0,
             fullsize: true,
             fullscreen: false,
             same_origin: true,
             query_id: 9,
             url: "https://app".to_owned(),
-        };
-        manager.on_get_main_web_view(Ok(result));
-        let outcomes = outcomes.lock().unwrap();
+        }));
+        let outcomes = full_outcomes.lock().unwrap();
         let main = outcomes[0].as_ref().expect("answered");
         let url = main.url.as_ref().expect("url");
         assert_eq!(url.url, "https://app");
         assert!(url.require_same_origin);
-        // is_full_screen wins over the server fullsize flag
         assert!(matches!(
             main.mode,
             Some(td_api::WebAppOpenMode::webAppOpenModeFullScreen(_))
@@ -2145,6 +2330,109 @@ mod tests {
         manager.invoke_web_view_custom_method(&mut env, UserId::new(0), "m", "{}", promise);
         assert!(
             matches!(&outcomes.lock().unwrap()[0], Err(message) if message == "400 User not found")
+        );
+    }
+
+    /// `MessageId::from_server_message_id(ServerMessageId::new(id))` —
+    /// the test shorthand for the server ids the reply arms carry.
+    fn server_message_id(id: i32) -> MessageId {
+        MessageId::from_server_message_id(crate::messages_manager::ServerMessageId::new(id))
+    }
+
+    #[test]
+    fn get_input_reply_to_builds_the_wire_arms() {
+        let mut env = TestEnv::default();
+
+        // the empty reply on the empty topic — no reply on the wire
+        assert!(
+            MessageInputReplyTo::default()
+                .get_input_reply_to(&mut env, &MessageTopic::default())
+                .is_none()
+        );
+
+        // the thread topic's implicit reply — the top thread message id
+        // answers as both the reply and the top id
+        // (MessageTopic.cpp:273-275, MessageInputReplyTo.cpp:120-125)
+        let thread = MessageTopic::thread(DialogId::new(7), server_message_id(31));
+        let telegram_api::InputReplyTo::inputReplyToMessage(reply) = MessageInputReplyTo::default()
+            .get_input_reply_to(&mut env, &thread)
+            .expect("the implicit thread reply")
+        else {
+            panic!("the inputReplyToMessage wire form");
+        };
+        assert_eq!(reply.flags, 1); // TOP_MSG_ID_MASK
+        assert_eq!(reply.reply_to_msg_id, 31);
+        assert_eq!(reply.top_msg_id, 31);
+        assert!(reply.reply_to_peer_id.is_none());
+
+        // the forum topic — the forum topic id is the implicit reply
+        // (ForumTopicId::to_top_thread_message_id, ForumTopicId.h:35-37)
+        let forum = MessageTopic::forum(
+            DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1234)),
+            ForumTopicId::new(33),
+        );
+        let telegram_api::InputReplyTo::inputReplyToMessage(reply) = MessageInputReplyTo::default()
+            .get_input_reply_to(&mut env, &forum)
+            .expect("the implicit forum reply")
+        else {
+            panic!("the inputReplyToMessage wire form");
+        };
+        assert_eq!(reply.reply_to_msg_id, 33);
+        assert_eq!(reply.top_msg_id, 33);
+
+        // the general forum topic on a channel keeps the empty implicit
+        // reply (MessageTopic.cpp:280-283) — only the top id rides
+        let general = MessageTopic::forum(
+            DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1234)),
+            ForumTopicId::general(),
+        );
+        let telegram_api::InputReplyTo::inputReplyToMessage(reply) = MessageInputReplyTo::default()
+            .get_input_reply_to(&mut env, &general)
+            .expect("the general topic reply")
+        else {
+            panic!("the inputReplyToMessage wire form");
+        };
+        assert_eq!(reply.flags, 1); // TOP_MSG_ID_MASK only
+        assert_eq!(reply.reply_to_msg_id, 0);
+        assert_eq!(reply.top_msg_id, 1);
+
+        // the explicit regular reply over the empty topic — no top id
+        let telegram_api::InputReplyTo::inputReplyToMessage(reply) =
+            MessageInputReplyTo::regular(server_message_id(52))
+                .get_input_reply_to(&mut env, &MessageTopic::default())
+                .expect("the explicit reply")
+        else {
+            panic!("the inputReplyToMessage wire form");
+        };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.reply_to_msg_id, 52);
+        assert_eq!(reply.top_msg_id, 0);
+
+        // the cross-dialog reply arm — the Read peer rides the
+        // REPLY_TO_PEER_ID flag (MessageInputReplyTo.cpp:141-148)
+        let cross = MessageInputReplyTo {
+            message_id: server_message_id(52),
+            dialog_id: DialogId::new(9),
+        };
+        let telegram_api::InputReplyTo::inputReplyToMessage(reply) = cross
+            .get_input_reply_to(&mut env, &MessageTopic::default())
+            .expect("the cross-dialog reply")
+        else {
+            panic!("the inputReplyToMessage wire form");
+        };
+        assert_eq!(reply.flags, 1 << 1); // REPLY_TO_PEER_ID_MASK
+        assert!(reply.reply_to_peer_id.is_some());
+
+        // the monoforum empty-reply arm — the saved-input-peer read is
+        // the [blocked: M.10] seam, so no reply on the wire
+        let monoforum = MessageTopic::monoforum(
+            DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1234)),
+            SavedMessagesTopicId::new(5),
+        );
+        assert!(
+            MessageInputReplyTo::default()
+                .get_input_reply_to(&mut env, &monoforum)
+                .is_none()
         );
     }
 
