@@ -15,12 +15,13 @@
 //! - The six `Td::ResultHandler` queries (`GetBackgroundsQuery`,
 //!   `GetBackgroundQuery`, `InstallBackgroundQuery`, `UploadBackgroundQuery`,
 //!   `UnsaveBackgroundQuery`, `ResetBackgroundsQuery`) and the
-//!   `SetChatWallPaperQuery` are the [`BackgroundManagerEnv`] query seams —
-//!   `[blocked: net]` with the caller promise parked (the M.31
-//!   convention); the answer handlers (`on_get_backgrounds`,
-//!   `on_installed_background`, `on_uploaded_background_file`,
-//!   `on_removed_background`, `on_reset_background`) are real and
-//!   unit-tested.
+//!   `SetChatWallPaperQuery` ride the `BackgroundNetKind` plane (net-drain
+//!   33) — the whole-Td env send arms dispatch the wire queries and the
+//!   answers drain through `Td::on_background_net_answer` into the landed
+//!   handlers (`on_get_backgrounds`, `on_installed_background`,
+//!   `on_uploaded_background_file`, `on_removed_background`,
+//!   `on_reset_background`); the trait defaults keep the `[net-inert]`
+//!   posture for the hermetic tests.
 //! - `FileManager::upload` + the `UploadBackgroundFileCallback` hop ride
 //!   [`BackgroundManagerEnv::start_background_file_upload`] — the collapsed
 //!   line has no upload-completion pump yet (the M.12 transfer loop parks
@@ -28,16 +29,21 @@
 //!   / `on_upload_background_file_error` are real and unit-tested. The
 //!   future wiring also grows the resolved `InputFile` delivery (the Rust
 //!   `UploadCallback` collapse carries only the id, files.rs:15594-15598).
+//!   The `account.uploadWallPaper` wire half past that hop is landed (the
+//!   `UploadBackground` kind); the file-source delivery rides the Files
+//!   plane landing.
 //! - The C++ `FileSourceBackground` repair (`FileReferenceManager.cpp:533`
 //!   → `BackgroundManager::reload_background`) is the
 //!   [`BackgroundManager::reload_background`] public entry; the Rust
 //!   files.rs repair ladder does not call it yet.
-//! - The C++ `SetChatWallPaperQuery` success/error machinery (the
-//!   `messages_setChatWallPaper` result through `UpdatesManager::on_get_updates`,
-//!   the `on_update_dialog_background` remove-half, the revert retry) rides
-//!   [`BackgroundManagerEnv::send_set_chat_wallpaper_query`] — wired when the
-//!   net lands; `MessagesManager::on_update_dialog_background` does not exist
-//!   in Rust yet.
+//! - The `SetChatWallPaperQuery` wire send/answer rides the
+//!   [`BackgroundManagerEnv::send_set_chat_wallpaper_query`] override (the
+//!   input-peer send leg, the flags, the `UpdatesManager::on_get_updates`
+//!   result routing and the `WALLPAPER_NOT_FOUND` revert retry);
+//!   `MessagesManager::on_update_dialog_background` (the `is_remove_`
+//!   halves, cpp:123-125/154-156) and `DialogManager::reload_dialog_info_full`
+//!   (the remove-error head, cpp:162) do not exist in Rust yet — those two
+//!   bands log the seam until the dialog-inventory plane lands.
 //! - `ThemeManager`'s four background seams (`ThemeManagerEnv`::
 //!   `on_get_theme_background`/`get_theme_background_object`/
 //!   `store_background_row`/`parse_background_row`) route to this manager in
@@ -52,8 +58,11 @@
 //!   "Not Found" and only the second search hits the name cache. The
 //!   Rust collapsed line keeps the same shape: the db-load path resolves
 //!   the promise with `None` (the 404 in the arm). The `RequestActor`
-//!   `set_tries(3)` ladder rides the future net impl of
-//!   `send_get_background_query` (the `load_user(id, tries)` precedent).
+//!   `set_tries(3)` ladder rides the net answer (the `load_user(id, tries)`
+//!   precedent): a null `account.getWallPaper` answer re-sends up to three
+//!   wire queries, then answers the tries-exhausted 500 — where the C++
+//!   errors at the third park, the collapse consumes the third answer
+//!   first (same wire traffic, same terminal error).
 //! - The search/install/upload promises carry the `td_api::Background`
 //!   answer directly (`None` models the C++ `send_result(nullptr)` 404)
 //!   instead of the C++ actor re-reading its captured members after a
@@ -511,7 +520,6 @@ impl BackgroundType {
     }
 
     /// `BackgroundType::get_mime_type` (BackgroundType.cpp:247-250).
-    #[allow(dead_code)] // the UploadBackgroundQuery seam's future net impl
     pub(crate) fn get_mime_type(&self) -> &'static str {
         assert!(self.has_file());
         if self.r#type == BackgroundTypeType::Pattern {
@@ -864,9 +872,43 @@ struct UploadedFileInfo {
     target: UploadedBackgroundTarget,
 }
 
+/// The BackgroundManager in-flight query kinds — the C++ ResultHandler
+/// classes of the net-drain 33 families (BackgroundManager.cpp:46-304).
+/// The handler state the answers read (the `background_id_`/name pair, the
+/// dialog flags, the upload members, every `promise_`) rides the
+/// `PendingBackgroundQueries` lots on the whole-Td env side — the kinds
+/// stay `Copy`.
+#[derive(Clone, Copy)]
+pub(crate) enum BackgroundNetKind {
+    /// `GetBackgroundQuery` (cpp:46) — `account.getWallPaper`; the answer
+    /// runs the `on_get_background` intake and the SearchBackgroundRequest
+    /// object conversion (the tries ladder rides the lot).
+    GetBackground,
+    /// `GetBackgroundsQuery` (cpp:81) — `account.getWallPapers`; the
+    /// answer re-enters `on_get_backgrounds` (the manager's own pending
+    /// queue carries the promises).
+    GetBackgrounds,
+    /// `SetChatWallPaperQuery` (cpp:107) — `messages.setChatWallPaper`
+    /// (the `setChatBackground`/`deleteChatBackground` wire legs).
+    SetChatWallPaper,
+    /// `InstallBackgroundQuery` (cpp:171) — `account.installWallPaper`
+    /// (the `setDefaultBackground` install tail).
+    InstallBackground,
+    /// `UploadBackgroundQuery` (cpp:198) — `account.uploadWallPaper` (the
+    /// upload tail's wire half; the file-source delivery rides Files).
+    UploadBackground,
+    /// `UnsaveBackgroundQuery` (cpp:245) — `account.saveWallPaper` (the
+    /// `removeInstalledBackground` wire leg).
+    UnsaveBackground,
+    /// `ResetBackgroundsQuery` (cpp:276) — `account.resetWallPapers` (the
+    /// `resetInstalledBackgrounds` wire leg).
+    ResetBackgrounds,
+}
+
 /// The [`BackgroundManager`] seams over the `Td` fields — the env
-/// convention; the `[blocked: net]` query seams park the caller promise
-/// (the M.31 convention) and the answer handlers are the manager methods.
+/// convention; the query seams dispatch over the `BackgroundNetKind`
+/// plane (the whole-Td env overrides; the defaults keep the net-inert
+/// posture) and the answer handlers are the manager methods.
 #[allow(clippy::too_many_arguments)]
 pub trait BackgroundManagerEnv {
     /// `td_->auth_manager_->is_bot()`.
@@ -1001,45 +1043,78 @@ pub trait BackgroundManagerEnv {
         );
     }
 
-    /// `GetBackgroundsQuery::send` (BackgroundManager.cpp:89-91) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`BackgroundManager::on_get_backgrounds`].
-    fn send_get_backgrounds_query(&mut self) {
-        tdutils::log_info!("Send account.getWallPapers — [blocked: net]");
+    /// `FileManager::delete_partial_remote_location_if_needed`
+    /// (FileManager.cpp) — the upload-query error tail's cleanup half; the
+    /// whole-Td env runs the real call.
+    fn file_delete_partial_remote_location_if_needed(
+        &mut self,
+        _file_upload_id: FileUploadId,
+        _status: &Status,
+    ) {
+        tdutils::log_info!(
+            "FileManager::delete_partial_remote_location_if_needed — [blocked: whole-Td env]"
+        );
     }
 
-    /// `GetBackgroundQuery::send` (BackgroundManager.cpp:55-60) —
-    /// `[blocked: net]`; the answer arrives through
+    /// `GetBackgroundsQuery::send` (BackgroundManager.cpp:89-91) — the
+    /// whole-Td env dispatches; the answer arrives through
+    /// [`BackgroundManager::on_get_backgrounds`].
+    fn send_get_backgrounds_query(&mut self) {
+        tdutils::log_info!("Send account.getWallPapers — [net-inert]");
+    }
+
+    /// `GetBackgroundQuery::send` (BackgroundManager.cpp:55-60) — the
+    /// whole-Td env dispatches; the answer arrives through
     /// [`BackgroundManager::on_get_background`] + the promise (the
-    /// `SearchBackgroundRequest` `set_tries(3)` ladder is the future net
-    /// impl's, the `load_user(id, tries)` precedent).
+    /// `SearchBackgroundRequest` re-entry state rides the parked lot:
+    /// the full `search_name` whose link parameters the answer applies
+    /// (cpp:548-550) and the `set_tries(3)` counter — 1 for the
+    /// non-search reloads, the `load_user(id, tries)` precedent).
     fn send_get_background_query(
         &mut self,
         background_id: BackgroundId,
         name: &str,
         input_wallpaper: Option<telegram_api::InputWallPaper>,
+        search_name: &str,
+        tries_left: i32,
         promise: Promise<Option<td_api::Background>>,
     ) {
-        let _ = (background_id, name, input_wallpaper, promise);
-        tdutils::log_info!("Send account.getWallPaper — [blocked: net]");
+        let _ = (
+            background_id,
+            name,
+            input_wallpaper,
+            search_name,
+            tries_left,
+            promise,
+        );
+        tdutils::log_info!("Send account.getWallPaper — [net-inert]");
     }
 
     /// `InstallBackgroundQuery::send` (BackgroundManager.cpp:178-181) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`BackgroundManager::on_installed_background`].
+    /// the whole-Td env dispatches; the answer arrives through
+    /// [`BackgroundManager::on_installed_background`]. The
+    /// `background_id`/`type`/`for_dark_theme` members are the C++
+    /// promise-lambda captures (cpp:899-903).
     fn send_install_background_query(
         &mut self,
+        background_id: BackgroundId,
         input_wallpaper: Option<telegram_api::InputWallPaper>,
         type_: &BackgroundType,
         for_dark_theme: bool,
         promise: Promise<Option<td_api::Background>>,
     ) {
-        let _ = (input_wallpaper, type_, for_dark_theme, promise);
-        tdutils::log_info!("Send account.installWallPaper — [blocked: net]");
+        let _ = (
+            background_id,
+            input_wallpaper,
+            type_,
+            for_dark_theme,
+            promise,
+        );
+        tdutils::log_info!("Send account.installWallPaper — [net-inert]");
     }
 
     /// `UnsaveBackgroundQuery::send` (BackgroundManager.cpp:252-255) —
-    /// `[blocked: net]`; the answer arrives through
+    /// the whole-Td env dispatches; the answer arrives through
     /// [`BackgroundManager::on_removed_background`].
     fn send_unsave_background_query(
         &mut self,
@@ -1048,21 +1123,22 @@ pub trait BackgroundManagerEnv {
         promise: Promise<()>,
     ) {
         let _ = (background_id, input_wallpaper, promise);
-        tdutils::log_info!("Send account.saveWallPaper(unsave) — [blocked: net]");
+        tdutils::log_info!("Send account.saveWallPaper(unsave) — [net-inert]");
     }
 
     /// `ResetBackgroundsQuery::send` (BackgroundManager.cpp:283-285) —
-    /// `[blocked: net]`; the answer arrives through
+    /// the whole-Td env dispatches; the answer arrives through
     /// [`BackgroundManager::on_reset_background`].
     fn send_reset_backgrounds_query(&mut self, promise: Promise<()>) {
         let _ = promise;
-        tdutils::log_info!("Send account.resetWallPapers — [blocked: net]");
+        tdutils::log_info!("Send account.resetWallPapers — [net-inert]");
     }
 
     /// `SetChatWallPaperQuery::send` (BackgroundManager.cpp:117-144) —
-    /// `[blocked: net]`; the future impl carries the input-peer check, the
-    /// masks, the `on_update_dialog_background` remove-half, the
-    /// `UpdatesManager::on_get_updates` result routing and the
+    /// the whole-Td env resolves the write-access input peer, computes the
+    /// `is_remove_` flag (the `on_update_dialog_background` remove-half is
+    /// the dialog-plane seam) and dispatches over the masks; the answer
+    /// runs the `UpdatesManager::on_get_updates` result routing and the
     /// `WALLPAPER_NOT_FOUND` revert retry (cpp:146-168).
     fn send_set_chat_wallpaper_query(
         &mut self,
@@ -1083,11 +1159,11 @@ pub trait BackgroundManagerEnv {
             revert,
             promise,
         );
-        tdutils::log_info!("Send messages.setChatWallPaper — [blocked: net]");
+        tdutils::log_info!("Send messages.setChatWallPaper — [net-inert]");
     }
 
     /// `UploadBackgroundQuery::send` (BackgroundManager.cpp:210-219) —
-    /// `[blocked: net]`; the answer arrives through
+    /// the whole-Td env dispatches; the answer arrives through
     /// [`BackgroundManager::on_uploaded_background_file`] (the manager keeps
     /// the continuation in `pending_upload_queries` until then).
     fn send_upload_background_query(
@@ -1099,7 +1175,7 @@ pub trait BackgroundManagerEnv {
         for_dark_theme: bool,
     ) {
         let _ = (file_upload_id, input_file, type_, dialog_id, for_dark_theme);
-        tdutils::log_info!("Send account.uploadWallPaper — [blocked: net]");
+        tdutils::log_info!("Send account.uploadWallPaper — [net-inert]");
     }
 }
 
@@ -1365,18 +1441,25 @@ impl BackgroundManager {
                     access_hash,
                 },
             )),
+            "",
+            1,
             promise,
         );
     }
 
     /// `BackgroundManager::reload_background_from_server`
-    /// (BackgroundManager.cpp:522-529).
+    /// (BackgroundManager.cpp:522-529) — the re-entry state params are the
+    /// collapsed `SearchBackgroundRequest` members ("" / 1 for the
+    /// non-search reloads).
+    #[allow(clippy::too_many_arguments)]
     fn reload_background_from_server(
         &mut self,
         env: &mut impl BackgroundManagerEnv,
         background_id: BackgroundId,
         background_name: &str,
         input_wallpaper: Option<telegram_api::InputWallPaper>,
+        search_name: &str,
+        tries_left: i32,
         mut promise: Promise<Option<td_api::Background>>,
     ) {
         if let status = env.close_status()
@@ -1385,7 +1468,14 @@ impl BackgroundManager {
             promise.set_error(status);
             return;
         }
-        env.send_get_background_query(background_id, background_name, input_wallpaper, promise);
+        env.send_get_background_query(
+            background_id,
+            background_name,
+            input_wallpaper,
+            search_name,
+            tries_left,
+            promise,
+        );
     }
 
     /// `BackgroundManager::search_background` (BackgroundManager.cpp:537-586).
@@ -1452,6 +1542,8 @@ impl BackgroundManager {
                     slug: slug.to_string(),
                 },
             )),
+            name,
+            3,
             promise,
         );
     }
@@ -2097,6 +2189,7 @@ impl BackgroundManager {
         }
 
         env.send_install_background_query(
+            background_id,
             Some(telegram_api::InputWallPaper::inputWallPaper(
                 telegram_api::inputWallPaper {
                     id: background_id.get(),
@@ -2516,6 +2609,30 @@ impl BackgroundManager {
                 );
             }
         }
+    }
+
+    /// `UploadBackgroundQuery::on_error` (BackgroundManager.cpp:231-242)
+    /// — the upload-query error half: the missing-parts branch is the C++
+    /// TODO (inert), the else branch runs the partial-remote-location
+    /// cleanup, the upload cancels, and the parked continuation (the C++
+    /// handler's own `promise_`) fails.
+    pub fn on_upload_background_query_error(
+        &mut self,
+        env: &mut impl BackgroundManagerEnv,
+        file_upload_id: FileUploadId,
+        status: Status,
+    ) {
+        assert!(file_upload_id.is_valid());
+        assert!(status.is_error());
+        if crate::files::get_missing_file_parts(&status).is_empty() {
+            env.file_delete_partial_remote_location_if_needed(file_upload_id, &status);
+        }
+        env.file_cancel_upload(file_upload_id);
+        let Some(info) = self.pending_upload_queries.remove(&file_upload_id) else {
+            // the C++ CHECK
+            return;
+        };
+        fail_upload_target(info.target, &status);
     }
 
     /// `BackgroundManager::remove_background` (BackgroundManager.cpp:1087-1110)
@@ -3096,6 +3213,7 @@ mod tests {
         next_file_source_id: i32,
         next_internal_upload_id: i64,
         uploaded: Vec<FileUploadId>,
+        deleted_partial: Vec<FileUploadId>,
     }
 
     impl TestEnv {
@@ -3112,6 +3230,7 @@ mod tests {
                 next_file_source_id: 1,
                 next_internal_upload_id: 0,
                 uploaded: Vec::new(),
+                deleted_partial: Vec::new(),
             }
         }
     }
@@ -3271,6 +3390,14 @@ mod tests {
 
         fn start_background_file_upload(&mut self, file_upload_id: FileUploadId) {
             self.uploaded.push(file_upload_id);
+        }
+
+        fn file_delete_partial_remote_location_if_needed(
+            &mut self,
+            file_upload_id: FileUploadId,
+            _status: &Status,
+        ) {
+            self.deleted_partial.push(file_upload_id);
         }
     }
 
@@ -4229,6 +4356,70 @@ mod tests {
         assert_eq!(background.id, 3_000_000_200);
         // the merged upload was canceled
         assert_eq!(env.uploaded[2], upload_id);
+    }
+
+    #[test]
+    fn upload_background_query_error_fails_the_continuation() {
+        let mut env = TestEnv::new();
+        let mut manager = BackgroundManager::new();
+
+        // park the upload continuation (the upload callback answered with
+        // a resolved input file — the query is in flight)
+        env.file_views.insert(
+            FileId::new(1, 0),
+            FileViewInfo {
+                has_full_local_location: true,
+                main_file_id: FileId::new(1, 0),
+                ..FileViewInfo::default()
+            },
+        );
+        let (promise, slot) = capture();
+        manager.set_background(
+            &mut env,
+            Some(&local_file_input()),
+            Some(&wallpaper_type()),
+            false,
+            promise,
+        );
+        assert!(captured(&slot).is_none());
+        let upload_id = FileUploadId::new(FileId::new(1, 0), 1);
+        manager.on_upload_background_file(
+            &mut env,
+            upload_id,
+            Some(telegram_api::InputFile::inputFile(
+                telegram_api::inputFile {
+                    id: 3,
+                    parts: 1,
+                    name: String::new(),
+                    md5_checksum: String::new(),
+                },
+            )),
+        );
+        assert!(captured(&slot).is_none()); // parked at the wire query
+
+        // the plain error band — the partial location cleans up, the
+        // upload cancels, the continuation fails (cpp:231-242)
+        manager.on_upload_background_query_error(
+            &mut env,
+            upload_id,
+            Status::error(400, "WALLPAPER_INVALID"),
+        );
+        assert_eq!(env.deleted_partial, vec![upload_id]);
+        assert_eq!(env.uploaded.last(), Some(&upload_id));
+        assert_eq!(captured_err(&slot).message(), "WALLPAPER_INVALID");
+
+        // the FILE_PART_MISSING band skips the partial-location cleanup
+        // (the C++ TODO branch)
+        env.deleted_partial.clear();
+        manager.on_upload_background_query_error(
+            &mut env,
+            upload_id,
+            Status::error(400, "FILE_PART_1_MISSING"),
+        );
+        assert!(env.deleted_partial.is_empty());
+        // no continuation left — the second error is a no-op past the
+        // upload cancel
+        assert_eq!(env.uploaded.len(), 3);
     }
 
     #[test]

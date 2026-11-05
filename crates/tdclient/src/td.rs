@@ -3239,6 +3239,80 @@ type StarNetHandle = NetKindHandle<StarNetKind>;
 /// the answers drain through [`Td::on_link_net_answer`].
 pub(crate) type LinkNetHandle = NetKindHandle<crate::link_manager::LinkNetKind>;
 
+/// The cloned background dispatch surface the `BackgroundEnv` senders
+/// use — the answers drain through [`Td::on_background_net_answer`].
+type BackgroundNetHandle = NetKindHandle<crate::background_manager::BackgroundNetKind>;
+
+/// The parked ResultHandler members of the in-flight background net
+/// queries (BackgroundManager.cpp:46-304) — the promise/state the C++
+/// handler objects hold; FIFO-paired per family (§5).
+/// The `GetBackgroundQuery` handler members + the SearchBackgroundRequest
+/// re-entry state — the `get_background` lot entry.
+struct PendingGetBackgroundQuery {
+    /// `GetBackgroundQuery::background_id_`.
+    background_id: crate::background_manager::BackgroundId,
+    /// `GetBackgroundQuery::background_name_` (the expected slug).
+    background_name: String,
+    /// the query's own `input_wallpaper` (the tries-ladder re-send reads
+    /// it).
+    input_wallpaper: Option<telegram_api::InputWallPaper>,
+    /// `SearchBackgroundRequest::name_` — the full link name whose
+    /// parameters the actor's re-run applies to the answer type ("" for
+    /// the non-search reloads).
+    search_name: String,
+    /// `SearchBackgroundRequest`'s `set_tries(3)` counter (1 for the
+    /// non-search reloads — the C++ repairs carry a plain promise).
+    tries_left: i32,
+    /// `SearchBackgroundRequest::promise_` (the collapsed-actor shape).
+    promise: tdutils::promise::Promise<Option<td_api::Background>>,
+}
+
+/// Pop the head of a pending lot — the FIFO §5 pairing (the
+/// `StarManager::take_pending` shape; `Vec::pop` would pair answers with
+/// the newest lot).
+fn take_pending_head<T>(lot: &mut Vec<T>) -> Option<T> {
+    if lot.is_empty() {
+        None
+    } else {
+        Some(lot.remove(0))
+    }
+}
+
+#[derive(Default)]
+struct PendingBackgroundQueries {
+    /// `GetBackgroundQuery`'s handler members (the
+    /// [`PendingGetBackgroundQuery`] lot).
+    get_background: Vec<PendingGetBackgroundQuery>,
+    /// `SetChatWallPaperQuery`'s `dialog_id_`/`is_remove_`/`is_revert_` +
+    /// `promise_`.
+    set_chat_wallpaper: Vec<(DialogId, bool, bool, tdutils::promise::Promise<()>)>,
+    /// `InstallBackgroundQuery`'s promise-lambda captures (cpp:899-903):
+    /// `background_id`/`type`/`for_dark_theme` + the caller promise.
+    install_background: Vec<(
+        crate::background_manager::BackgroundId,
+        crate::theme_manager::BackgroundType,
+        bool,
+        tdutils::promise::Promise<Option<td_api::Background>>,
+    )>,
+    /// `UploadBackgroundQuery`'s `file_upload_id_`/`type_`/`dialog_id_`/
+    /// `for_dark_theme_` (the continuation rides the manager's own
+    /// `pending_upload_queries`).
+    upload_background: Vec<(
+        crate::files::FileUploadId,
+        crate::theme_manager::BackgroundType,
+        DialogId,
+        bool,
+    )>,
+    /// `UnsaveBackgroundQuery`'s answer re-entry members
+    /// (`on_removed_background` reads the id) + `promise_`.
+    unsave_background: Vec<(
+        crate::background_manager::BackgroundId,
+        tdutils::promise::Promise<()>,
+    )>,
+    /// `ResetBackgroundsQuery::promise_`.
+    reset_backgrounds: Vec<tdutils::promise::Promise<()>>,
+}
+
 /// The Support query kinds — the C++ ResultHandler classes of
 /// Support.cpp:37-113 (the user-support-info pair + the support name).
 #[derive(Clone, Copy)]
@@ -5729,6 +5803,14 @@ pub struct Td {
     /// through the dispatcher callback; the `Td` drain routes them
     /// through `Td::on_link_net_answer`).
     link_net_completed: Arc<Mutex<Vec<(crate::link_manager::LinkNetKind, NetQuery)>>>,
+    /// The background-net completed queue (the `BackgroundNetKind`
+    /// answers park here through the dispatcher callback; the `Td` drain
+    /// routes them through `Td::on_background_net_answer`).
+    background_net_completed:
+        Arc<Mutex<Vec<(crate::background_manager::BackgroundNetKind, NetQuery)>>>,
+    /// The parked ResultHandler members of the in-flight background net
+    /// queries (the C++ handler objects' promise/state).
+    pending_background_queries: PendingBackgroundQueries,
     /// The callback-parked Support query answers, parked by kind (the
     /// `Td::on_support_net_answer` drain).
     support_net_completed: Arc<Mutex<Vec<(SupportNetKind, NetQuery)>>>,
@@ -6322,6 +6404,8 @@ impl Td {
             account_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_net_completed: Arc::new(Mutex::new(Vec::new())),
             link_net_completed: Arc::new(Mutex::new(Vec::new())),
+            background_net_completed: Arc::new(Mutex::new(Vec::new())),
+            pending_background_queries: PendingBackgroundQueries::default(),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_info_promises: Vec::new(),
             support_name_promises: Vec::new(),
@@ -8634,6 +8718,7 @@ impl Td {
         self.dispatch_completed_account_net();
         self.dispatch_completed_star_net();
         self.dispatch_completed_link_net();
+        self.dispatch_completed_background_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
         self.dispatch_completed_promo_net();
@@ -8734,6 +8819,17 @@ impl Td {
         Some(LinkNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.link_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned background dispatch surface for the `BackgroundEnv`
+    /// senders — `None` keeps the net-inert posture (the pre-init
+    /// windows).
+    fn background_net(&self) -> Option<BackgroundNetHandle> {
+        Some(BackgroundNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.background_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10179,6 +10275,16 @@ impl Td {
         let completed = std::mem::take(&mut *self.link_net_completed.lock());
         for (kind, query) in completed {
             self.on_link_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked background answers — the
+    /// `BackgroundNetKind` route of the net-drain 33 families.
+    fn dispatch_completed_background_net(&mut self) {
+        let completed = std::mem::take(&mut *self.background_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_background_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -19192,6 +19298,344 @@ impl Td {
             }
         }
         self.theme_manager = manager;
+    }
+
+    /// Run one manager call under the whole-Td background env (the
+    /// `with_web_app_manager` convention — the manager is
+    /// `std::mem::take`n out for the call).
+    fn with_background_manager<R>(
+        &mut self,
+        run: impl FnOnce(&mut BackgroundEnv<'_>, &mut crate::background_manager::BackgroundManager) -> R,
+    ) -> R {
+        let mut manager = std::mem::take(&mut self.background_manager);
+        let result = {
+            let mut env = BackgroundEnv { td: self };
+            run(&mut env, &mut manager)
+        };
+        self.background_manager = manager;
+        result
+    }
+
+    /// Route one background net answer by kind into the manager intakes —
+    /// the C++ ResultHandler halves (BackgroundManager.cpp:46-304) over
+    /// the parked [`PendingBackgroundQueries`] lots (FIFO, §5).
+    fn on_background_net_answer(
+        &mut self,
+        kind: crate::background_manager::BackgroundNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetBackgroundsQuery::on_result`/`on_error` (cpp:93-104) —
+            // the promise chains straight into `on_get_backgrounds` (the
+            // manager's own pending queue carries the caller promises).
+            crate::background_manager::BackgroundNetKind::GetBackgrounds => {
+                let result = if query.is_error() {
+                    tdutils::status::Result::from_status(query.error().clone())
+                } else {
+                    match telegram_api::account_WallPapers::parse(query.ok()) {
+                        Ok(wallpapers) => tdutils::status::Result::Ok(wallpapers),
+                        Err(_) => tdutils::status::Result::from_status(parse_error(
+                            "account.getWallPapers",
+                        )),
+                    }
+                };
+                self.with_background_manager(|env, manager| {
+                    manager.on_get_backgrounds(env, result);
+                });
+            }
+            // `GetBackgroundQuery::on_result`/`on_error` (cpp:62-78) — the
+            // wallPaper intake with the handler's expected id/name, then
+            // the SearchBackgroundRequest object conversion
+            // (`do_send_result`, Requests.cpp:1892-1894); a null intake
+            // re-enters the RequestActor `set_tries(3)` ladder.
+            crate::background_manager::BackgroundNetKind::GetBackground => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    tdutils::log_info!("Receive error for GetBackgroundQuery: {status}");
+                    if let Some(mut pending) =
+                        take_pending_head(&mut self.pending_background_queries.get_background)
+                    {
+                        pending.promise.set_error(status);
+                    }
+                    return;
+                }
+                let wallpaper = match telegram_api::WallPaper::parse(query.ok()) {
+                    Ok(wallpaper) => Some(wallpaper),
+                    Err(_) => {
+                        // the fetch failure band — the C++ fetch_result
+                        // failure routes on_error (the landed-flip
+                        // convention, §5)
+                        if let Some(mut pending) =
+                            take_pending_head(&mut self.pending_background_queries.get_background)
+                        {
+                            pending
+                                .promise
+                                .set_error(parse_error("account.getWallPaper"));
+                        }
+                        return;
+                    }
+                };
+                let Some(mut pending) =
+                    take_pending_head(&mut self.pending_background_queries.get_background)
+                else {
+                    return;
+                };
+                let added = self.with_background_manager(|env, manager| {
+                    manager.on_get_background(
+                        env,
+                        pending.background_id,
+                        &pending.background_name,
+                        wallpaper,
+                        true,
+                        false,
+                        false,
+                    )
+                });
+                match added {
+                    Some((added_id, mut added_type)) => {
+                        // the actor's re-run applies the link parameters
+                        // from its captured `name_` on the cache-hit
+                        // branch (cpp:548-550) before `do_send_result`
+                        // reads the type (Requests.cpp:1893)
+                        if !pending.search_name.is_empty() {
+                            added_type.apply_parameters_from_link(&pending.search_name);
+                        }
+                        self.with_background_manager(|env, manager| {
+                            pending.promise.set_value(manager.get_background_object(
+                                env,
+                                added_id,
+                                false,
+                                Some(&added_type),
+                            ));
+                        });
+                    }
+                    None => {
+                        // the RequestActor loop re-runs search_background
+                        // while tries remain (RequestActor.h:47-76); the
+                        // third park is where the C++ errors — the collapse
+                        // consumes the third answer first
+                        if pending.tries_left > 1 {
+                            let Some(net) = self.background_net() else {
+                                return;
+                            };
+                            pending.tries_left -= 1;
+                            let function = telegram_api::Function::account_getWallPaper(
+                                telegram_api::account_getWallPaper {
+                                    wallpaper: pending.input_wallpaper.clone(),
+                                },
+                            );
+                            self.pending_background_queries.get_background.push(pending);
+                            net.dispatch(kind, function);
+                        } else {
+                            pending
+                                .promise
+                                .set_error(Status::error(500, "Requested data is inaccessible"));
+                        }
+                    }
+                }
+            }
+            // `SetChatWallPaperQuery::on_result` (cpp:146-158) — the
+            // remove-half re-run, then the Updates answer re-enters
+            // `on_get_updates` with the popped promise.
+            crate::background_manager::BackgroundNetKind::SetChatWallPaper => {
+                let Some((dialog_id, is_remove, is_revert, promise)) =
+                    take_pending_head(&mut self.pending_background_queries.set_chat_wallpaper)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    // `SetChatWallPaperQuery::on_error` (cpp:160-168) —
+                    // the remove band's full-info reload, the revert retry
+                    // re-entry, then the dialog-error head + the promise
+                    // error.
+                    let status = query.error().clone();
+                    if is_remove {
+                        // C++: reload_dialog_info_full (DialogManager.cpp:
+                        // 1656-1682) — the dialog-inventory plane seam
+                        tdutils::log_info!(
+                            "reload_dialog_info_full {dialog_id:?} — [blocked: dialog-inventory plane]"
+                        );
+                    } else if is_revert && status.message() == "WALLPAPER_NOT_FOUND" {
+                        return self.with_background_manager(|env, manager| {
+                            manager.delete_dialog_background(env, dialog_id, false, promise);
+                        });
+                    }
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "SetChatWallPaperQuery",
+                    );
+                    let mut promise = promise;
+                    promise.set_error(status);
+                    return;
+                }
+                if is_remove {
+                    // C++: MessagesManager::on_update_dialog_background
+                    // (MessagesManager.cpp:28972-28989) — the
+                    // dialog-inventory plane seam
+                    tdutils::log_info!(
+                        "on_update_dialog_background {dialog_id:?} remove — [blocked: dialog-inventory plane]"
+                    );
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => {
+                        self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        });
+                    }
+                    Err(_) => {
+                        let mut promise = promise;
+                        promise.set_error(parse_error("messages.setChatWallPaper"));
+                    }
+                }
+            }
+            // `InstallBackgroundQuery::on_result`/`on_error`
+            // (cpp:183-195) — any ok Bool settles (the false band logs
+            // in the C++); the promise-lambda captures re-enter
+            // `on_installed_background`.
+            crate::background_manager::BackgroundNetKind::InstallBackground => {
+                let Some((background_id, type_, for_dark_theme, promise)) =
+                    take_pending_head(&mut self.pending_background_queries.install_background)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    tdutils::status::Result::from_status(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => tdutils::status::Result::Ok(()),
+                        Some(false) => {
+                            tdutils::log_info!("Receive false from account.installWallPaper");
+                            tdutils::status::Result::Ok(())
+                        }
+                        None => tdutils::status::Result::from_status(parse_error(
+                            "account.installWallPaper",
+                        )),
+                    }
+                };
+                self.with_background_manager(|env, manager| {
+                    manager.on_installed_background(
+                        env,
+                        background_id,
+                        type_,
+                        for_dark_theme,
+                        result,
+                        promise,
+                    );
+                });
+            }
+            // `UploadBackgroundQuery::on_result`/`on_error`
+            // (cpp:221-242) — the ok half re-enters
+            // `on_uploaded_background_file` with the handler members (the
+            // continuation rides the manager's own queue); the error half
+            // is the manager's cleanup + continuation failure.
+            crate::background_manager::BackgroundNetKind::UploadBackground => {
+                let Some((file_upload_id, type_, dialog_id, for_dark_theme)) =
+                    take_pending_head(&mut self.pending_background_queries.upload_background)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.with_background_manager(|env, manager| {
+                        manager.on_upload_background_query_error(env, file_upload_id, status);
+                    });
+                    return;
+                }
+                match telegram_api::WallPaper::parse(query.ok()) {
+                    Ok(wallpaper) => {
+                        self.with_background_manager(|env, manager| {
+                            manager.on_uploaded_background_file(
+                                env,
+                                file_upload_id,
+                                type_,
+                                dialog_id,
+                                for_dark_theme,
+                                wallpaper,
+                            );
+                        });
+                    }
+                    Err(_) => {
+                        // the C++ fetch failure runs on_error with a parse
+                        // status; the parse band here keeps the cleanup
+                        // tail (the landed-flip convention, §5)
+                        self.with_background_manager(|env, manager| {
+                            manager.on_upload_background_query_error(
+                                env,
+                                file_upload_id,
+                                parse_error("account.uploadWallPaper"),
+                            );
+                        });
+                    }
+                }
+            }
+            // `UnsaveBackgroundQuery::on_result`/`on_error`
+            // (cpp:257-273) — any ok Bool settles; the answer re-enters
+            // `on_removed_background` with the parked id.
+            crate::background_manager::BackgroundNetKind::UnsaveBackground => {
+                let Some((background_id, promise)) =
+                    take_pending_head(&mut self.pending_background_queries.unsave_background)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    if !self.global.is_expected_error(query.error()) {
+                        tdutils::log_error!("Receive error for save background: {}", query.error());
+                    }
+                    tdutils::status::Result::from_status(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(value) => {
+                            tdutils::log_info!("Receive result for save background: {value}");
+                            tdutils::status::Result::Ok(())
+                        }
+                        None => tdutils::status::Result::from_status(parse_error(
+                            "account.saveWallPaper",
+                        )),
+                    }
+                };
+                self.with_background_manager(|env, manager| {
+                    manager.on_removed_background(env, background_id, result, promise);
+                });
+            }
+            // `ResetBackgroundsQuery::on_result`/`on_error`
+            // (cpp:287-303) — the same Bool shape over
+            // `on_reset_background`.
+            crate::background_manager::BackgroundNetKind::ResetBackgrounds => {
+                let Some(promise) =
+                    take_pending_head(&mut self.pending_background_queries.reset_backgrounds)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    if !self.global.is_expected_error(query.error()) {
+                        tdutils::log_error!(
+                            "Receive error for reset backgrounds: {}",
+                            query.error()
+                        );
+                    }
+                    tdutils::status::Result::from_status(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(value) => {
+                            tdutils::log_info!("Receive result for reset backgrounds: {value}");
+                            tdutils::status::Result::Ok(())
+                        }
+                        None => tdutils::status::Result::from_status(parse_error(
+                            "account.resetWallPapers",
+                        )),
+                    }
+                };
+                self.with_background_manager(|env, manager| {
+                    manager.on_reset_background(env, result, promise);
+                });
+            }
+        }
     }
 
     /// Route one quick-reply net answer by kind — the ok values drop
@@ -35592,6 +36036,257 @@ impl crate::background_manager::BackgroundManagerEnv for BackgroundEnv<'_> {
         secret_chat_id: crate::user_manager::SecretChatId,
     ) -> crate::user_manager::UserId {
         self.td.user_manager.get_secret_chat_user_id(secret_chat_id)
+    }
+
+    fn file_delete_partial_remote_location_if_needed(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: &Status,
+    ) {
+        // the error overload (FileManager.cpp:3626-3632): a likely-fatal
+        // error drops the partial remote, a retryable one only cancels
+        let close_flag = self.td.global.close_flag();
+        let mut files = self.td.file_manager.lock();
+        let mut file_load_manager = self.td.file_load_manager.lock();
+        files.delete_partial_remote_location_on_error(
+            file_upload_id,
+            status,
+            close_flag,
+            &mut file_load_manager,
+        );
+    }
+
+    // ---- The net query senders — the C++ ResultHandler send legs
+    // (BackgroundManager.cpp:46-304). The handler state + promises park
+    // in the `pending_background_queries` lots; the answers drain
+    // through `Td::on_background_net_answer`. ----
+
+    /// `GetBackgroundsQuery::send` (cpp:89-91) — `account.getWallPapers`
+    /// with the zero hash (the manager parks the caller promises).
+    fn send_get_backgrounds_query(&mut self) {
+        match self.td.background_net() {
+            Some(net) => net.dispatch(
+                crate::background_manager::BackgroundNetKind::GetBackgrounds,
+                telegram_api::Function::account_getWallPapers(
+                    telegram_api::account_getWallPapers { hash: 0 },
+                ),
+            ),
+            None => tdutils::log_info!("Send account.getWallPapers — [net-inert]"),
+        }
+    }
+
+    /// `GetBackgroundQuery::send` (cpp:55-60) — the handler's expected
+    /// id/name + the promise park in the family lot (the tries counter is
+    /// the SearchBackgroundRequest `set_tries(3)`).
+    fn send_get_background_query(
+        &mut self,
+        background_id: crate::background_manager::BackgroundId,
+        name: &str,
+        input_wallpaper: Option<telegram_api::InputWallPaper>,
+        search_name: &str,
+        tries_left: i32,
+        promise: tdutils::promise::Promise<Option<td_api::Background>>,
+    ) {
+        let Some(net) = self.td.background_net() else {
+            let _ = promise;
+            return tdutils::log_info!("Send account.getWallPaper — [net-inert]");
+        };
+        self.td
+            .pending_background_queries
+            .get_background
+            .push(PendingGetBackgroundQuery {
+                background_id,
+                background_name: name.to_owned(),
+                input_wallpaper: input_wallpaper.clone(),
+                search_name: search_name.to_owned(),
+                tries_left,
+                promise,
+            });
+        net.dispatch(
+            crate::background_manager::BackgroundNetKind::GetBackground,
+            telegram_api::Function::account_getWallPaper(telegram_api::account_getWallPaper {
+                wallpaper: input_wallpaper,
+            }),
+        );
+    }
+
+    /// `InstallBackgroundQuery::send` (cpp:178-181) — the wire settings
+    /// are the type's; the lambda captures (cpp:899-903) park in the lot.
+    fn send_install_background_query(
+        &mut self,
+        background_id: crate::background_manager::BackgroundId,
+        input_wallpaper: Option<telegram_api::InputWallPaper>,
+        type_: &crate::theme_manager::BackgroundType,
+        for_dark_theme: bool,
+        promise: tdutils::promise::Promise<Option<td_api::Background>>,
+    ) {
+        let Some(net) = self.td.background_net() else {
+            let _ = promise;
+            return tdutils::log_info!("Send account.installWallPaper — [net-inert]");
+        };
+        self.td.pending_background_queries.install_background.push((
+            background_id,
+            type_.clone(),
+            for_dark_theme,
+            promise,
+        ));
+        net.dispatch(
+            crate::background_manager::BackgroundNetKind::InstallBackground,
+            telegram_api::Function::account_installWallPaper(
+                telegram_api::account_installWallPaper {
+                    wallpaper: input_wallpaper,
+                    settings: Some(type_.get_input_wallpaper_settings()),
+                },
+            ),
+        );
+    }
+
+    /// `UnsaveBackgroundQuery::send` (cpp:252-255) —
+    /// `account.saveWallPaper` with `unsave` and the empty settings.
+    fn send_unsave_background_query(
+        &mut self,
+        background_id: crate::background_manager::BackgroundId,
+        input_wallpaper: Option<telegram_api::InputWallPaper>,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let Some(net) = self.td.background_net() else {
+            let _ = promise;
+            return tdutils::log_info!("Send account.saveWallPaper(unsave) — [net-inert]");
+        };
+        self.td
+            .pending_background_queries
+            .unsave_background
+            .push((background_id, promise));
+        net.dispatch(
+            crate::background_manager::BackgroundNetKind::UnsaveBackground,
+            telegram_api::Function::account_saveWallPaper(telegram_api::account_saveWallPaper {
+                wallpaper: input_wallpaper,
+                unsave: true,
+                settings: Some(telegram_api::WallPaperSettings::default()),
+            }),
+        );
+    }
+
+    /// `ResetBackgroundsQuery::send` (cpp:283-285).
+    fn send_reset_backgrounds_query(&mut self, promise: tdutils::promise::Promise<()>) {
+        let Some(net) = self.td.background_net() else {
+            let _ = promise;
+            return tdutils::log_info!("Send account.resetWallPapers — [net-inert]");
+        };
+        self.td
+            .pending_background_queries
+            .reset_backgrounds
+            .push(promise);
+        net.dispatch(
+            crate::background_manager::BackgroundNetKind::ResetBackgrounds,
+            telegram_api::Function::account_resetWallPapers(telegram_api::account_resetWallPapers),
+        );
+    }
+
+    /// `SetChatWallPaperQuery::send` (cpp:117-144) — the `is_remove_`
+    /// flag + the remove-half, the write-access input peer (the no-peer
+    /// band runs the C++ `on_error` 400 through the completed queue so
+    /// the answer half runs the full error tail), the flag masks and the
+    /// dispatch.
+    fn send_set_chat_wallpaper_query(
+        &mut self,
+        dialog_id: DialogId,
+        input_wallpaper: Option<telegram_api::InputWallPaper>,
+        settings: Option<telegram_api::WallPaperSettings>,
+        old_message_id: i32,
+        for_both: bool,
+        revert: bool,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        let kind = crate::background_manager::BackgroundNetKind::SetChatWallPaper;
+        let Some(net) = self.td.background_net() else {
+            let _ = promise;
+            return tdutils::log_info!("Send messages.setChatWallPaper — [net-inert]");
+        };
+        let is_remove = input_wallpaper.is_none() && settings.is_none() && !revert;
+        if is_remove {
+            // C++: MessagesManager::on_update_dialog_background
+            // (MessagesManager.cpp:28972-28989) — the dialog-inventory
+            // plane seam
+            tdutils::log_info!(
+                "on_update_dialog_background {dialog_id:?} remove — [blocked: dialog-inventory plane]"
+            );
+        }
+        let Some(input_peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            self.td
+                .pending_background_queries
+                .set_chat_wallpaper
+                .push((dialog_id, is_remove, revert, promise));
+            net.complete_error(kind, 400, "Can't access the chat");
+            return;
+        };
+        let mut flags = 0;
+        if input_wallpaper.is_some() {
+            flags |= 1; // WALLPAPER_MASK
+        }
+        if settings.is_some() {
+            flags |= 1 << 2; // SETTINGS_MASK
+        }
+        if old_message_id != 0 {
+            flags |= 1 << 1; // ID_MASK
+        }
+        self.td
+            .pending_background_queries
+            .set_chat_wallpaper
+            .push((dialog_id, is_remove, revert, promise));
+        net.dispatch(
+            kind,
+            telegram_api::Function::messages_setChatWallPaper(
+                telegram_api::messages_setChatWallPaper {
+                    flags,
+                    for_both,
+                    revert,
+                    peer: Some(Box::new(input_peer)),
+                    wallpaper: input_wallpaper,
+                    settings,
+                    id: old_message_id,
+                },
+            ),
+        );
+    }
+
+    /// `UploadBackgroundQuery::send` (cpp:210-219) — the C++
+    /// `CHECK(input_file != nullptr)` band; the mime type and settings
+    /// ride the type, `for_chat` is the valid-dialog flag.
+    fn send_upload_background_query(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+        type_: &crate::theme_manager::BackgroundType,
+        dialog_id: DialogId,
+        for_dark_theme: bool,
+    ) {
+        let Some(net) = self.td.background_net() else {
+            return tdutils::log_info!("Send account.uploadWallPaper — [net-inert]");
+        };
+        let input_file = input_file.expect("the resolved background InputFile");
+        self.td.pending_background_queries.upload_background.push((
+            file_upload_id,
+            type_.clone(),
+            dialog_id,
+            for_dark_theme,
+        ));
+        net.dispatch(
+            crate::background_manager::BackgroundNetKind::UploadBackground,
+            telegram_api::Function::account_uploadWallPaper(
+                telegram_api::account_uploadWallPaper {
+                    flags: 0,
+                    for_chat: dialog_id.is_valid(),
+                    file: Some(input_file),
+                    mime_type: type_.get_mime_type().to_owned(),
+                    settings: Some(type_.get_input_wallpaper_settings()),
+                },
+            ),
+        );
     }
 }
 
@@ -69727,6 +70422,580 @@ kQIDAQAB\n\
         // the drain ran clean — nothing parked, no strays
         assert!(td.web_browser_net_completed.lock().is_empty(), "drained");
         assert!(td.web_browser_manager.pop_update_promise().is_none());
+    }
+
+    #[test]
+    fn background_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(background_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A file wallpaper fixture (the document intake needs the real
+    /// documents env; the netted td wires it).
+    fn bg_file_wallpaper(id: i64) -> telegram_api::WallPaper {
+        telegram_api::WallPaper::wallPaper(telegram_api::wallPaper {
+            id,
+            flags: 0,
+            creator: false,
+            default: true,
+            pattern: false,
+            dark: false,
+            access_hash: 42,
+            slug: format!("slug{}", id),
+            document: Some(telegram_api::Document::document(telegram_api::document {
+                id,
+                access_hash: 7,
+                file_reference: b"fr".to_vec(),
+                date: 12,
+                mime_type: "image/jpeg".to_owned(),
+                size: 4096,
+                dc_id: 1,
+                attributes: vec![],
+                ..telegram_api::document::default()
+            })),
+            settings: None,
+        })
+    }
+
+    fn background_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain33-background");
+        // seed the writable user dialog (chat 900)
+        td.user_manager.on_get_user(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut().expect("option manager"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            telegram_api::User::user(telegram_api::user {
+                flags: 1, // USER_ACCESS_HASH_MASK
+                id: 900,
+                access_hash: 555,
+                first_name: "BgUser".to_owned(),
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+
+        // 1. getInstalledBackgrounds — the zero hash on the wire, the
+        //    wallPaper + wallPaperNoFile intakes, the Backgrounds answer
+        td.request(
+            1,
+            Function::getInstalledBackgrounds(td_api::getInstalledBackgrounds {
+                for_dark_theme: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getWallPapers::ID,
+        );
+        assert_eq!(
+            telegram_api::account_getWallPapers::parse(sent.query())
+                .expect("the sent body")
+                .hash,
+            0
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::account_WallPapers::account_wallPapers(
+                telegram_api::account_wallPapers {
+                    hash: 7,
+                    wallpapers: vec![
+                        bg_file_wallpaper(5_000_000_001),
+                        telegram_api::WallPaper::wallPaperNoFile(telegram_api::wallPaperNoFile {
+                            id: 5_000_000_002,
+                            flags: 1 << 2, // SETTINGS_MASK
+                            default: false,
+                            dark: false,
+                            settings: Some(telegram_api::WallPaperSettings {
+                                flags: 1, // BACKGROUND_COLOR_MASK
+                                background_color: 0x123456,
+                                ..telegram_api::WallPaperSettings::default()
+                            }),
+                        },),
+                    ],
+                }
+            )),
+        );
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::backgrounds(b)) if b.backgrounds.len() == 2
+        ));
+
+        // 2. setDefaultBackground(remote) — the install wire (the type's
+        //    settings + the inputWallPaper id/access-hash), the Bool answer
+        td.request(
+            2,
+            Function::setDefaultBackground(td_api::setDefaultBackground {
+                background: Some(td_api::InputBackground::inputBackgroundRemote(
+                    td_api::inputBackgroundRemote {
+                        background_id: 5_000_000_001,
+                    },
+                )),
+                r#type: Some(td_api::BackgroundType::backgroundTypeWallpaper(
+                    td_api::backgroundTypeWallpaper {
+                        is_blurred: true,
+                        is_moving: false,
+                    },
+                )),
+                for_dark_theme: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_installWallPaper::ID,
+        );
+        let body =
+            telegram_api::account_installWallPaper::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            (&body.wallpaper, &body.settings),
+            (
+                Some(telegram_api::InputWallPaper::inputWallPaper(w)),
+                Some(settings),
+            ) if w.id == 5_000_000_001 && w.access_hash == 42 && settings.blur
+        ));
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::background(b)) if b.id == 5_000_000_001
+        ));
+
+        // 2b. the install error band — the promise error passes through
+        td.request(
+            12,
+            Function::setDefaultBackground(td_api::setDefaultBackground {
+                background: Some(td_api::InputBackground::inputBackgroundRemote(
+                    td_api::inputBackgroundRemote {
+                        background_id: 5_000_000_001,
+                    },
+                )),
+                r#type: Some(td_api::BackgroundType::backgroundTypeWallpaper(
+                    td_api::backgroundTypeWallpaper {
+                        is_blurred: false,
+                        is_moving: false,
+                    },
+                )),
+                for_dark_theme: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_installWallPaper::ID,
+        );
+        net_fail(sent, 400, "WALLPAPER_INVALID");
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "WALLPAPER_INVALID")
+        );
+
+        // 3. removeInstalledBackground — account.saveWallPaper(unsave)
+        td.request(
+            3,
+            Function::removeInstalledBackground(td_api::removeInstalledBackground {
+                background_id: 5_000_000_001,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_saveWallPaper::ID,
+        );
+        let body = telegram_api::account_saveWallPaper::parse(sent.query()).expect("the sent body");
+        assert!(body.unsave);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. resetInstalledBackgrounds — account.resetWallPapers
+        td.request(
+            4,
+            Function::resetInstalledBackgrounds(td_api::resetInstalledBackgrounds {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_resetWallPapers::ID,
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 5. searchBackground — the slug form, the noFile pattern answer
+        td.request(
+            5,
+            Function::searchBackground(td_api::searchBackground {
+                name: "slugfourteen0001".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getWallPaper::ID,
+        );
+        let body = telegram_api::account_getWallPaper::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.wallpaper,
+            Some(telegram_api::InputWallPaper::inputWallPaperSlug(ref w))
+                if w.slug == "slugfourteen0001"
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::WallPaper::wallPaperNoFile(
+                telegram_api::wallPaperNoFile {
+                    id: 5_000_000_003,
+                    flags: 1 << 2, // SETTINGS_MASK
+                    default: false,
+                    dark: false,
+                    settings: Some(telegram_api::WallPaperSettings {
+                        flags: (1 << 3) | 1, // INTENSITY | BACKGROUND_COLOR
+                        intensity: 50,
+                        background_color: 0x123456,
+                        ..telegram_api::WallPaperSettings::default()
+                    }),
+                }
+            )),
+        );
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::background(b)) if b.id == 5_000_000_003
+        ));
+
+        // 5b. the search error band — the promise error passes through
+        td.request(
+            15,
+            Function::searchBackground(td_api::searchBackground {
+                name: "slugfourteen0002".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getWallPaper::ID,
+        );
+        net_fail(sent, 400, "WALLPAPER_INVALID");
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 15);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "WALLPAPER_INVALID")
+        );
+
+        // 5c. the link-parameter band — the cache-miss search applies the
+        //     actor name's mode parameters to the answer type
+        //     (cpp:548-550 over Requests.cpp:1893)
+        td.request(
+            16,
+            Function::searchBackground(td_api::searchBackground {
+                name: "slugfourteen0010?mode=blur motion".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getWallPaper::ID,
+        );
+        let body = telegram_api::account_getWallPaper::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.wallpaper,
+            Some(telegram_api::InputWallPaper::inputWallPaperSlug(ref w))
+                if w.slug == "slugfourteen0010"
+        ));
+        net_complete(sent, wire!(bg_file_wallpaper(5_000_000_010)));
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 16).first(),
+            Some(Object::background(b)) if matches!(
+                b.r#type.as_ref(),
+                Some(td_api::BackgroundType::backgroundTypeWallpaper(t))
+                    if t.is_blurred && t.is_moving
+            )
+        ));
+
+        // 6. the tries ladder — a null intake re-sends (twice), then the
+        //    RequestActor tries-exhausted 500
+        td.request(
+            6,
+            Function::searchBackground(td_api::searchBackground {
+                name: "slugfourteen0003".to_owned(),
+            }),
+        );
+        for i in 0..3 {
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::account_getWallPaper::ID,
+            );
+            net_complete(
+                sent,
+                wire!(telegram_api::WallPaper::wallPaperNoFile(
+                    telegram_api::wallPaperNoFile {
+                        id: 5_000_000_004 + i,
+                        flags: 0,
+                        default: false,
+                        dark: false,
+                        settings: None, // the null-intake band
+                    }
+                )),
+            );
+            td.dispatch_completed_background_net();
+        }
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Requested data is inaccessible")
+        );
+
+        // 7. setChatBackground — the write peer, the noFile+settings
+        //    flags, the Updates answer through on_get_updates
+        td.request(
+            7,
+            Function::setChatBackground(td_api::setChatBackground {
+                chat_id: 900,
+                background: None,
+                r#type: Some(td_api::BackgroundType::backgroundTypeFill(
+                    td_api::backgroundTypeFill {
+                        fill: Some(td_api::BackgroundFill::backgroundFillSolid(
+                            td_api::backgroundFillSolid { color: 0x123456 },
+                        )),
+                    },
+                )),
+                dark_theme_dimming: 0,
+                only_for_self: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatWallPaper::ID,
+        );
+        let body =
+            telegram_api::messages_setChatWallPaper::parse(sent.query()).expect("the sent body");
+        assert_eq!((body.flags, body.for_both, body.revert), (13, true, false));
+        assert!(matches!(
+            (&body.peer, &body.wallpaper, &body.settings),
+            (
+                Some(peer),
+                Some(telegram_api::InputWallPaper::inputWallPaperNoFile(_)),
+                Some(_),
+            ) if matches!(
+                &**peer,
+                telegram_api::InputPeer::inputPeerUser(user)
+                    if user.user_id == 900 && user.access_hash == 555
+            )
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::Updates::updatesTooLong(
+                telegram_api::updatesTooLong
+            )),
+        );
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. deleteChatBackground(restore) — the WALLPAPER_NOT_FOUND
+        //    revert retry re-enters delete_dialog_background(false); the
+        //    second query is the remove form, its answer settles
+        td.request(
+            8,
+            Function::deleteChatBackground(td_api::deleteChatBackground {
+                chat_id: 900,
+                restore_previous: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatWallPaper::ID,
+        );
+        assert!(
+            telegram_api::messages_setChatWallPaper::parse(sent.query())
+                .expect("the sent body")
+                .revert
+        );
+        net_fail(sent, 400, "WALLPAPER_NOT_FOUND");
+        td.dispatch_completed_background_net();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setChatWallPaper::ID,
+        );
+        let body =
+            telegram_api::messages_setChatWallPaper::parse(sent.query()).expect("the sent body");
+        assert!(
+            !body.revert && body.wallpaper.is_none() && body.settings.is_none(),
+            "the retry is the remove form"
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::Updates::updatesTooLong(
+                telegram_api::updatesTooLong
+            )),
+        );
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 9. the unseeded-dialog band — the manager access error answers
+        //    before any wire query
+        td.request(
+            9,
+            Function::setChatBackground(td_api::setChatBackground {
+                chat_id: 777,
+                background: None,
+                r#type: Some(td_api::BackgroundType::backgroundTypeFill(
+                    td_api::backgroundTypeFill {
+                        fill: Some(td_api::BackgroundFill::backgroundFillSolid(
+                            td_api::backgroundFillSolid { color: 0x123456 },
+                        )),
+                    },
+                )),
+                dark_theme_dimming: 0,
+                only_for_self: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 9);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(td.background_net_completed.lock().is_empty(), "drained");
+        assert!(td.pending_background_queries.get_background.is_empty());
+        assert!(td.pending_background_queries.set_chat_wallpaper.is_empty());
+        assert!(td.pending_background_queries.install_background.is_empty());
+        assert!(td.pending_background_queries.upload_background.is_empty());
+        assert!(td.pending_background_queries.unsave_background.is_empty());
+        assert!(td.pending_background_queries.reset_backgrounds.is_empty());
+    }
+
+    #[test]
+    fn background_upload_query_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(background_upload_query_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn background_upload_query_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain33-bg-upload");
+        // a real local file (register_local stats it)
+        let dir = temp_db_dir("netdrain33-bg-upload-file");
+        let path = format!("{dir}/bg.png");
+        std::fs::write(&path, b"0123456789abcdef").unwrap();
+
+        // setDefaultBackground(local pattern) parks at the Files-plane
+        // upload tail (the completion pump seam) — the wire half below
+        // the hop is this slice's
+        td.request(
+            1,
+            Function::setDefaultBackground(td_api::setDefaultBackground {
+                background: Some(td_api::InputBackground::inputBackgroundLocal(
+                    td_api::inputBackgroundLocal {
+                        background: Some(td_api::InputFile::inputFileLocal(
+                            td_api::inputFileLocal { path },
+                        )),
+                    },
+                )),
+                r#type: Some(td_api::BackgroundType::backgroundTypePattern(
+                    td_api::backgroundTypePattern {
+                        fill: Some(td_api::BackgroundFill::backgroundFillSolid(
+                            td_api::backgroundFillSolid { color: 0x123456 },
+                        )),
+                        intensity: 50,
+                        is_inverted: false,
+                        is_moving: false,
+                    },
+                )),
+                for_dark_theme: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 1).is_empty(),
+            "parked at the upload tail"
+        );
+
+        // the Files-plane completion hop: the resolved InputFile arrives
+        // (the first local file + the first internal upload id are
+        // deterministic in the fresh td)
+        let file_upload_id = crate::files::FileUploadId::new(FileId::new(1, 0), 1);
+        td.with_background_manager(|env, manager| {
+            manager.on_upload_background_file(
+                env,
+                file_upload_id,
+                Some(telegram_api::InputFile::inputFile(
+                    telegram_api::inputFile {
+                        id: 3,
+                        parts: 1,
+                        name: "bg.png".to_owned(),
+                        md5_checksum: String::new(),
+                    },
+                )),
+            );
+        });
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_uploadWallPaper::ID,
+        );
+        let body =
+            telegram_api::account_uploadWallPaper::parse(sent.query()).expect("the sent body");
+        assert_eq!(
+            (body.for_chat, body.mime_type.as_str()),
+            (false, "image/png")
+        );
+        let settings = body.settings.expect("the pattern settings");
+        assert_eq!(settings.intensity, 50);
+
+        // the answer registers the wallpaper + resolves the parked
+        // setDefaultBackground promise
+        net_complete(sent, wire!(bg_file_wallpaper(5_000_000_009)));
+        td.dispatch_completed_background_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::background(b)) if b.id == 5_000_000_009
+        ));
+        assert!(td.background_net_completed.lock().is_empty(), "drained");
+        assert!(td.pending_background_queries.upload_background.is_empty());
     }
 
     #[test]
