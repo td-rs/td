@@ -3161,7 +3161,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::getSupergroupMembers(request) => {
-            // Requests.cpp:7393-7411
+            // Requests.cpp:7393-7411 — the additional pair is `string(),
+            // -1` (no client-side search pass over the page)
             let channel_id = crate::chat_manager::ChannelId::new(request.supergroup_id);
             let filter = crate::dialog_participant_filter::ChannelParticipantFilter::from_td_api(
                 crate::chat_manager::DialogId::from_channel_id(channel_id),
@@ -3173,9 +3174,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 &mut env,
                 channel_id,
                 &filter,
+                String::new(),
                 request.offset,
                 request.limit,
+                -1,
                 promise,
+                "getSupergroupMembers",
             );
         }
         Function::getGuardBotWebAppUrl(request) => {

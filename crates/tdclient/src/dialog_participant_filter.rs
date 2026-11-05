@@ -257,6 +257,87 @@ impl ChannelParticipantFilter {
     pub fn is_banned(&self) -> bool {
         self.filter_type == ChannelParticipantFilterType::Banned
     }
+
+    /// `ChannelParticipantFilter::get_input_channel_participants_filter`
+    /// (ChannelParticipantFilter.cpp:10-50) — the wire filter map; the
+    /// Mention arm carries the query/topic masks. The stored topic rides
+    /// the raw td_api value (the [blocked: MessageTopic] plane), so the
+    /// top-msg id extracts per variant like
+    /// [`crate::web_app_manager::MessageTopic::get_input_top_msg_id`].
+    pub fn get_input_channel_participants_filter(
+        &self,
+    ) -> tdmtproto::telegram_api::ChannelParticipantsFilter {
+        use tdmtproto::telegram_api as wire;
+        match self.filter_type {
+            ChannelParticipantFilterType::Recent => {
+                wire::ChannelParticipantsFilter::channelParticipantsRecent(
+                    wire::channelParticipantsRecent {},
+                )
+            }
+            ChannelParticipantFilterType::Contacts => {
+                wire::ChannelParticipantsFilter::channelParticipantsContacts(
+                    wire::channelParticipantsContacts {
+                        q: self.query.clone(),
+                    },
+                )
+            }
+            ChannelParticipantFilterType::Administrators => {
+                wire::ChannelParticipantsFilter::channelParticipantsAdmins(
+                    wire::channelParticipantsAdmins {},
+                )
+            }
+            ChannelParticipantFilterType::Search => {
+                wire::ChannelParticipantsFilter::channelParticipantsSearch(
+                    wire::channelParticipantsSearch {
+                        q: self.query.clone(),
+                    },
+                )
+            }
+            ChannelParticipantFilterType::Mention => {
+                let mut flags = 0;
+                if !self.query.is_empty() {
+                    flags |= 1 << 0; // channelParticipantsMentions::Q_MASK
+                }
+                let top_msg_id = match self.message_topic.as_ref() {
+                    Some(td_api::MessageTopic::messageTopicThread(topic)) => {
+                        // the C++ force-form get_server_message_id().get()
+                        topic.message_thread_id as i32
+                    }
+                    Some(td_api::MessageTopic::messageTopicForum(topic)) => topic.forum_topic_id,
+                    _ => 0,
+                };
+                if top_msg_id != 0 {
+                    flags |= 1 << 1; // channelParticipantsMentions::TOP_MSG_ID_MASK
+                }
+                wire::ChannelParticipantsFilter::channelParticipantsMentions(
+                    wire::channelParticipantsMentions {
+                        flags,
+                        q: self.query.clone(),
+                        top_msg_id,
+                    },
+                )
+            }
+            ChannelParticipantFilterType::Restricted => {
+                wire::ChannelParticipantsFilter::channelParticipantsBanned(
+                    wire::channelParticipantsBanned {
+                        q: self.query.clone(),
+                    },
+                )
+            }
+            ChannelParticipantFilterType::Banned => {
+                wire::ChannelParticipantsFilter::channelParticipantsKicked(
+                    wire::channelParticipantsKicked {
+                        q: self.query.clone(),
+                    },
+                )
+            }
+            ChannelParticipantFilterType::Bots => {
+                wire::ChannelParticipantsFilter::channelParticipantsBots(
+                    wire::channelParticipantsBots {},
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
