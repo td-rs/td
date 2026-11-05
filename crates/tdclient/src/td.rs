@@ -42,6 +42,7 @@ use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 use crate::premium::{PremiumEnv, PremiumManager, PremiumNetKind};
 use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv, QuickReplyNetKind};
 use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
+use crate::web_app_manager::WebAppNetKind;
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
@@ -3420,6 +3421,14 @@ pub(crate) type BusinessNetHandle = NetKindHandle<crate::business_manager::Busin
 pub(crate) type MessageQueryNetHandle =
     NetKindHandle<crate::message_query_manager::MessageQueryNetKind>;
 
+/// The cloned Web-App dispatch surface the [`BotEnv`] senders use — the
+/// per-kind handle over the WebAppManager.cpp ResultHandler kinds (the
+/// net-drain 30 plane: the eight wire queries behind the Mini App
+/// families); the answers drain through
+/// [`Td::dispatch_completed_web_app_net`]. Td-held (not manager-held):
+/// the shared [`BotEnv`] view resolves the peers at the send leg.
+pub(crate) type WebAppNetHandle = NetKindHandle<crate::web_app_manager::WebAppNetKind>;
+
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
 /// completes into `on_dialog_gift_transferred` with the empty to-dialog
@@ -4419,6 +4428,10 @@ pub struct Td {
     /// [`Td::on_message_query_net_answer`] drain).
     message_query_net_completed:
         Arc<Mutex<Vec<(crate::message_query_manager::MessageQueryNetKind, NetQuery)>>>,
+    /// The callback-parked Web-App answers (the C++ ResultHandler halves
+    /// of the net-drain 30 families — the
+    /// [`Td::on_web_app_net_answer`] drain).
+    web_app_net_completed: Arc<Mutex<Vec<(crate::web_app_manager::WebAppNetKind, NetQuery)>>>,
     /// The parked query state of the net-drain 28 families (the
     /// handler vectors and promises the `Copy` kinds can't carry).
     message_query_net_pending: crate::message_query_manager::PendingNetQueries,
@@ -4909,6 +4922,7 @@ impl Td {
             pending_get_pinned_dialogs_legs: std::collections::HashMap::new(),
             secure_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_query_net_completed: Arc::new(Mutex::new(Vec::new())),
+            web_app_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
@@ -7197,6 +7211,7 @@ impl Td {
         self.dispatch_completed_secure_net();
         self.dispatch_completed_business_net();
         self.dispatch_completed_message_query_net();
+        self.dispatch_completed_web_app_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -7452,6 +7467,17 @@ impl Td {
         Some(MessageQueryNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.message_query_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned Web-App dispatch surface (the net-drain 30 families'
+    /// send legs — the Td-held handle the shared [`BotEnv`] send arms
+    /// resolve their peers over).
+    pub(crate) fn web_app_net(&self) -> Option<WebAppNetHandle> {
+        Some(WebAppNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.web_app_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -15491,6 +15517,16 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked Web-App answers — the C++ ResultHandler
+    /// halves of the net-drain 30 families (WebAppManager.cpp).
+    fn dispatch_completed_web_app_net(&mut self) {
+        let completed = std::mem::take(&mut *self.web_app_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_web_app_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -16073,8 +16109,8 @@ impl Td {
                     .read_contents
                     .iter()
                     .position(|(_, _, parked_intake)| *parked_intake == intake);
-                let Some((dialog_id, message_ids, _)) = index
-                    .map(|index| self.message_query_net_pending.read_contents.remove(index))
+                let Some((dialog_id, message_ids, _)) =
+                    index.map(|index| self.message_query_net_pending.read_contents.remove(index))
                 else {
                     return;
                 };
@@ -16219,6 +16255,167 @@ impl Td {
                     }
                     Err(_) => promise.set_error(parse_error("messages.summarizeText")),
                 }
+            }
+        }
+    }
+
+    /// Build the [`BotEnv`] view over the split Td borrow and run the
+    /// closure with it + the Web-App manager (the `with_secure_manager`
+    /// shape — the request arms' take/put dance collapsed).
+    fn with_web_app_manager<R>(
+        &mut self,
+        run: impl FnOnce(&mut BotEnv<'_>, &mut crate::web_app_manager::WebAppManager) -> R,
+    ) -> R {
+        let mut manager = std::mem::take(&mut self.web_app_manager);
+        let result = {
+            let mut env = BotEnv { td: self };
+            run(&mut env, &mut manager)
+        };
+        self.web_app_manager = manager;
+        result
+    }
+
+    /// Route one Web-App net answer by kind — the ResultHandler halves
+    /// of the net-drain 30 families (WebAppManager.cpp:32-401): the wire
+    /// answers parse here and feed the landed manager intakes over the
+    /// shared [`BotEnv`] (the parse failures settle through the manager
+    /// error tails, the landed-flip convention, §5).
+    fn on_web_app_net_answer(
+        &mut self,
+        kind: crate::web_app_manager::WebAppNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        /// The Bool-answer value form — `messages.prolongWebView` and
+        /// `bots.checkDownloadFileParams` answer Bool (the C++
+        /// `fetch_result<T>::ok()` collapse, WebAppManager.cpp:325-333,
+        /// 386-399).
+        fn wire_bool_result(query: &NetQuery, what: &str) -> Result<bool, Status> {
+            if query.is_error() {
+                return Err(query.error().clone());
+            }
+            match parse_wire_bool_value(query.ok()) {
+                Some(value) => Ok(value),
+                None => Err(parse_error(what)),
+            }
+        }
+        match kind {
+            // `GetPopularAppBotsQuery::on_result` (WebAppManager.cpp:44-61)
+            // — the `bots.popularAppBots` answer feeds the user intake
+            // and the bot filter.
+            WebAppNetKind::GetPopularAppBots => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::bots_PopularAppBots::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("bots.getPopularAppBots")),
+                    }
+                };
+                self.with_web_app_manager(|env, manager| {
+                    manager.on_get_popular_app_bots(env, result);
+                });
+            }
+            // `GetBotAppQuery::on_result` (WebAppManager.cpp:82-95) — the
+            // promise lambda hops into `on_get_web_app` with the request
+            // coordinates (the manager's parked queue carries them).
+            WebAppNetKind::GetBotApp => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotApp::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("messages.getBotApp")),
+                    }
+                };
+                self.with_web_app_manager(|env, manager| {
+                    manager.on_get_bot_app(env, result);
+                });
+            }
+            // `RequestAppWebViewQuery::on_result`
+            // (WebAppManager.cpp:126-140) — the non-empty query-id band
+            // logs, the url/same-origin pair answers.
+            WebAppNetKind::RequestAppWebView => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewResult::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("messages.requestAppWebView")),
+                    }
+                };
+                self.with_web_app_manager(|_, manager| {
+                    manager.on_get_app_web_view(result);
+                });
+            }
+            // `RequestMainWebViewQuery::on_result`
+            // (WebAppManager.cpp:171-194) — the parked `is_full_screen_`
+            // picks the open mode over the server fullsize flag.
+            WebAppNetKind::RequestMainWebView => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewResult::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("messages.requestMainWebView")),
+                    }
+                };
+                self.with_web_app_manager(|_, manager| {
+                    manager.on_get_main_web_view(result);
+                });
+            }
+            // `RequestWebViewQuery::on_result` (WebAppManager.cpp:267-279)
+            // — the empty query-id band logs, the answer opens the web
+            // view (arming the 60-second prolong ping) and answers the
+            // info object.
+            WebAppNetKind::RequestWebView => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewResult::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("messages.requestWebView")),
+                    }
+                };
+                self.with_web_app_manager(|env, manager| {
+                    manager.on_get_web_view(env, result);
+                });
+            }
+            // `ProlongWebViewQuery::on_result`/`on_error`
+            // (WebAppManager.cpp:324-338) — the false band logs, the
+            // error runs the dialog-error head.
+            WebAppNetKind::ProlongWebView => {
+                let result = wire_bool_result(&query, "messages.prolongWebView");
+                self.with_web_app_manager(|env, manager| {
+                    manager.on_prolong_web_view(env, result);
+                });
+            }
+            // `InvokeWebViewCustomMethodQuery::on_result`
+            // (WebAppManager.cpp:358-370) — the DataJSON payload answers
+            // the custom request result.
+            WebAppNetKind::InvokeWebViewCustomMethod => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::DataJSON::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("bots.invokeWebViewCustomMethod")),
+                    }
+                };
+                self.with_web_app_manager(|_, manager| {
+                    manager.on_get_custom_request_result(result);
+                });
+            }
+            // `CheckDownloadFileParamsQuery::on_result`
+            // (WebAppManager.cpp:386-400) — the false band answers the
+            // 400 download error.
+            WebAppNetKind::CheckDownloadFileParams => {
+                let result = wire_bool_result(&query, "bots.checkDownloadFileParams");
+                self.with_web_app_manager(|_, manager| {
+                    manager.on_check_download_file_params(result);
+                });
             }
         }
     }
@@ -26902,10 +27099,9 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
                 // under the allow flag (the field-split twin of
                 // `dialog_manager::have_input_peer`)
                 allow_secret_chats
-                    && self.user_manager.have_input_encrypted_peer(
-                        dialog_id.get_secret_chat_id(),
-                        access_rights,
-                    )
+                    && self
+                        .user_manager
+                        .have_input_encrypted_peer(dialog_id.get_secret_chat_id(), access_rights)
             }
             crate::dialog_id::DialogType::None => false,
         }
@@ -27155,13 +27351,17 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
                         telegram_api::messages_readMessageContents { id: server_ids },
                     ),
                 );
-                self.pending.read_contents.push((dialog_id, message_ids, intake));
+                self.pending
+                    .read_contents
+                    .push((dialog_id, message_ids, intake));
             }
             crate::dialog_id::DialogType::Channel => {
                 let Some(input_channel) = self.env_input_channel(dialog_id.get_channel_id()) else {
                     // cpp:2259-2263 — the null channel answers 400
                     net.complete_error(kind, 400, "Can't access the chat");
-                    self.pending.read_contents.push((dialog_id, message_ids, intake));
+                    self.pending
+                        .read_contents
+                        .push((dialog_id, message_ids, intake));
                     return;
                 };
                 net.dispatch(
@@ -27173,7 +27373,9 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
                         },
                     ),
                 );
-                self.pending.read_contents.push((dialog_id, message_ids, intake));
+                self.pending
+                    .read_contents
+                    .push((dialog_id, message_ids, intake));
             }
             crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => {
                 // the secret-chat open-message leg is the tde2e plane; the
@@ -34382,6 +34584,330 @@ impl crate::web_app_manager::WebAppManagerEnv for BotEnv<'_> {
         self.td
             .file_reference_manager
             .add_file_source(file_id, file_source_id);
+    }
+
+    // -- the net-drain 30 send legs (the WebAppManager.cpp ResultHandler
+    //    `send` halves; the peers resolve here, at the send leg) --
+
+    /// `GetPopularAppBotsQuery::send` (WebAppManager.cpp:40-42).
+    fn send_get_popular_app_bots_query(&mut self, offset: &str, limit: i32) {
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::GetPopularAppBots,
+                telegram_api::Function::bots_getPopularAppBots(
+                    telegram_api::bots_getPopularAppBots {
+                        offset: offset.to_owned(),
+                        limit,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send bots.getPopularAppBots — [net-inert]"),
+        }
+    }
+
+    /// `GetBotAppQuery::send` (WebAppManager.cpp:76-80) — the
+    /// `inputBotAppShortName` reference over the resolved bot, hash 0.
+    fn send_get_bot_app_query(&mut self, input_user: telegram_api::InputUser, short_name: &str) {
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::GetBotApp,
+                telegram_api::Function::messages_getBotApp(telegram_api::messages_getBotApp {
+                    app: Some(telegram_api::InputBotApp::inputBotAppShortName(
+                        telegram_api::inputBotAppShortName {
+                            bot_id: Some(input_user),
+                            short_name: short_name.to_owned(),
+                        },
+                    )),
+                    hash: 0,
+                }),
+            ),
+            None => tdutils::log_info!("Send messages.getBotApp — [net-inert]"),
+        }
+    }
+
+    /// `RequestAppWebViewQuery::send` (WebAppManager.cpp:106-124) — the
+    /// peer resolves at the send leg over the manager's
+    /// `have_input_peer(Read)` guard (the C++
+    /// `CHECK(input_peer != nullptr)`); the flags carry the theme and
+    /// the non-empty start parameter.
+    fn send_request_app_web_view_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_user: telegram_api::InputUser,
+        web_app_short_name: &str,
+        start_parameter: &str,
+        parameters: &crate::web_app::WebAppOpenParameters,
+        allow_write_access: bool,
+    ) {
+        let input_peer =
+            crate::dialog_manager::get_input_peer(self.td, dialog_id, AccessRights::Read)
+                .expect("the manager checked have_input_peer");
+        let mut flags = 0;
+        let theme_parameters = parameters.get_input_theme_parameters();
+        if theme_parameters.is_some() {
+            flags |= 1 << 2; // messages_requestAppWebView::THEME_PARAMS_MASK
+        }
+        if !start_parameter.is_empty() {
+            flags |= 1 << 1; // messages_requestAppWebView::START_PARAM_MASK
+        }
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::RequestAppWebView,
+                telegram_api::Function::messages_requestAppWebView(
+                    telegram_api::messages_requestAppWebView {
+                        flags,
+                        write_allowed: allow_write_access,
+                        compact: parameters.is_compact(),
+                        fullscreen: parameters.is_full_screen(),
+                        peer: Some(Box::new(input_peer)),
+                        app: Some(telegram_api::InputBotApp::inputBotAppShortName(
+                            telegram_api::inputBotAppShortName {
+                                bot_id: Some(input_user),
+                                short_name: web_app_short_name.to_owned(),
+                            },
+                        )),
+                        start_param: start_parameter.to_owned(),
+                        theme_params: theme_parameters,
+                        platform: parameters.get_application_name().to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.requestAppWebView — [net-inert]"),
+        }
+    }
+
+    /// `RequestMainWebViewQuery::send` (WebAppManager.cpp:152-169) —
+    /// same send-leg peer resolve; `is_full_screen_` parks in the
+    /// manager's pending queue (the answer's open-mode priority).
+    fn send_request_main_web_view_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_user: telegram_api::InputUser,
+        start_parameter: &str,
+        parameters: &crate::web_app::WebAppOpenParameters,
+    ) {
+        let input_peer =
+            crate::dialog_manager::get_input_peer(self.td, dialog_id, AccessRights::Read)
+                .expect("the manager checked have_input_peer");
+        let mut flags = 0;
+        let theme_parameters = parameters.get_input_theme_parameters();
+        if theme_parameters.is_some() {
+            flags |= 1; // messages_requestMainWebView::THEME_PARAMS_MASK
+        }
+        if !start_parameter.is_empty() {
+            flags |= 1 << 1; // messages_requestMainWebView::START_PARAM_MASK
+        }
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::RequestMainWebView,
+                telegram_api::Function::messages_requestMainWebView(
+                    telegram_api::messages_requestMainWebView {
+                        flags,
+                        compact: parameters.is_compact(),
+                        fullscreen: parameters.is_full_screen(),
+                        peer: Some(Box::new(input_peer)),
+                        bot: Some(input_user),
+                        start_param: start_parameter.to_owned(),
+                        theme_params: theme_parameters,
+                        platform: parameters.get_application_name().to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.requestMainWebView — [net-inert]"),
+        }
+    }
+
+    /// `RequestWebViewQuery::send` (WebAppManager.cpp:211-265) — the
+    /// `start://`/`menu://` URL parse, the reply-to wire form and the
+    /// send-as peer build here; the open-web-view coordinates park in
+    /// the manager's pending queue (the `bot_user_id` the manager
+    /// carries itself).
+    #[allow(clippy::too_many_arguments)]
+    fn send_request_web_view_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _bot_user_id: UserId,
+        input_user: telegram_api::InputUser,
+        url: &str,
+        parameters: &crate::web_app::WebAppOpenParameters,
+        message_topic: &crate::web_app_manager::MessageTopic,
+        input_reply_to: &crate::web_app_manager::MessageInputReplyTo,
+        silent: bool,
+        as_dialog_id: crate::dialog_id::DialogId,
+    ) {
+        let mut flags = 0;
+        let input_peer =
+            crate::dialog_manager::get_input_peer(self.td, dialog_id, AccessRights::Write)
+                .expect("check_dialog_access passed above");
+
+        // the `start://`/`menu://` parse (WebAppManager.cpp:225-241); the
+        // empty-URL else arm is the manager's from_attach_menu flag
+        let mut url = url.to_owned();
+        let mut start_parameter = String::new();
+        let mut from_bot_menu = false;
+        if url.starts_with("start://") {
+            start_parameter = url[8..].to_owned();
+            url = String::new();
+            flags |= 1 << 3; // messages_requestWebView::START_PARAM_MASK
+        } else if url.starts_with("menu://") {
+            url = url[7..].to_owned();
+            from_bot_menu = true;
+            flags |= 1 << 1; // messages_requestWebView::URL_MASK
+        } else if !url.is_empty() {
+            flags |= 1 << 1; // messages_requestWebView::URL_MASK
+        }
+
+        let theme_parameters = parameters.get_input_theme_parameters();
+        if theme_parameters.is_some() {
+            flags |= 1 << 2; // messages_requestWebView::THEME_PARAMS_MASK
+        }
+
+        let reply_to = input_reply_to.get_input_reply_to(self, message_topic);
+        if reply_to.is_some() {
+            flags |= 1; // messages_requestWebView::REPLY_TO_MASK
+        }
+
+        let mut as_input_peer = None;
+        if as_dialog_id.is_valid()
+            && let Some(peer) =
+                crate::dialog_manager::get_input_peer(self.td, as_dialog_id, AccessRights::Write)
+        {
+            as_input_peer = Some(Box::new(peer));
+            flags |= 1 << 13; // messages_requestWebView::SEND_AS_MASK
+        }
+
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::RequestWebView,
+                telegram_api::Function::messages_requestWebView(
+                    telegram_api::messages_requestWebView {
+                        flags,
+                        from_bot_menu,
+                        silent,
+                        compact: parameters.is_compact(),
+                        fullscreen: parameters.is_full_screen(),
+                        peer: Some(Box::new(input_peer)),
+                        bot: Some(input_user),
+                        url,
+                        start_param: start_parameter,
+                        theme_params: theme_parameters,
+                        platform: parameters.get_application_name().to_owned(),
+                        reply_to,
+                        send_as: as_input_peer,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.requestWebView — [net-inert]"),
+        }
+    }
+
+    /// `ProlongWebViewQuery::send` (WebAppManager.cpp:295-322) — the
+    /// send-leg resolves can be inert (cpp:299-303): a failed peer/user
+    /// resolve sends no query and the caller parks nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn send_prolong_web_view_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        bot_user_id: UserId,
+        query_id: i64,
+        message_topic: &crate::web_app_manager::MessageTopic,
+        input_reply_to: &crate::web_app_manager::MessageInputReplyTo,
+        silent: bool,
+        as_dialog_id: crate::dialog_id::DialogId,
+    ) -> bool {
+        let Some(input_peer) =
+            crate::dialog_manager::get_input_peer(self.td, dialog_id, AccessRights::Write)
+        else {
+            return false;
+        };
+        let input_user = {
+            let (env, user_manager) = bot_user_split(self.td);
+            match user_manager.get_input_user(&env, bot_user_id) {
+                Ok(input_user) => input_user,
+                Err(_) => return false,
+            }
+        };
+
+        let mut flags = 0;
+        let reply_to = input_reply_to.get_input_reply_to(self, message_topic);
+        if reply_to.is_some() {
+            flags |= 1; // messages_prolongWebView::REPLY_TO_MASK
+        }
+        let mut as_input_peer = None;
+        if as_dialog_id.is_valid()
+            && let Some(peer) =
+                crate::dialog_manager::get_input_peer(self.td, as_dialog_id, AccessRights::Write)
+        {
+            as_input_peer = Some(Box::new(peer));
+            flags |= 1 << 13; // messages_prolongWebView::SEND_AS_MASK
+        }
+
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::ProlongWebView,
+                telegram_api::Function::messages_prolongWebView(
+                    telegram_api::messages_prolongWebView {
+                        flags,
+                        silent,
+                        peer: Some(Box::new(input_peer)),
+                        bot: Some(input_user),
+                        query_id,
+                        reply_to,
+                        send_as: as_input_peer,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.prolongWebView — [net-inert]"),
+        }
+        true
+    }
+
+    /// `InvokeWebViewCustomMethodQuery::send`
+    /// (WebAppManager.cpp:349-356) — the parameters ride the `dataJSON`.
+    fn send_invoke_web_view_custom_method_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        method: &str,
+        parameters: &str,
+    ) {
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::InvokeWebViewCustomMethod,
+                telegram_api::Function::bots_invokeWebViewCustomMethod(
+                    telegram_api::bots_invokeWebViewCustomMethod {
+                        bot: Some(input_user),
+                        custom_method: method.to_owned(),
+                        params: Some(telegram_api::DataJSON {
+                            data: parameters.to_owned(),
+                        }),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send bots.invokeWebViewCustomMethod — [net-inert]"),
+        }
+    }
+
+    /// `CheckDownloadFileParamsQuery::send`
+    /// (WebAppManager.cpp:380-384).
+    fn send_check_download_file_params_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        file_name: &str,
+        url: &str,
+    ) {
+        match self.td.web_app_net() {
+            Some(net) => net.dispatch(
+                WebAppNetKind::CheckDownloadFileParams,
+                telegram_api::Function::bots_checkDownloadFileParams(
+                    telegram_api::bots_checkDownloadFileParams {
+                        bot: Some(input_user),
+                        file_name: file_name.to_owned(),
+                        url: url.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send bots.checkDownloadFileParams — [net-inert]"),
+        }
     }
 }
 
@@ -63870,6 +64396,635 @@ kQIDAQAB\n\
     }
 
     #[test]
+    fn web_app_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(web_app_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Seed one bot user (the `seed_dialog_user_id` shape + the bot and
+    /// main-app flags the Web-App guards read).
+    fn seed_web_app_bot(td: &mut Td, id: i64, has_main_app: bool) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        user_manager.on_get_user(
+            &mut env,
+            telegram_api::User::user(telegram_api::user {
+                flags: 1, // USER_ACCESS_HASH_MASK
+                bot: true,
+                bot_has_main_app: has_main_app,
+                id,
+                access_hash: 555,
+                first_name: "Bot".to_owned(),
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+    }
+
+    fn web_app_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain30-web-app");
+        seed_web_app_bot(&mut td, 900, false);
+        seed_web_app_bot(&mut td, 902, true);
+
+        // 1. getGrossingWebAppBots — the offset/limit ride the wire
+        td.request(
+            1,
+            Function::getGrossingWebAppBots(td_api::getGrossingWebAppBots {
+                offset: "off".to_owned(),
+                limit: 3,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPopularAppBots::ID,
+        );
+        let body =
+            telegram_api::bots_getPopularAppBots::parse(sent.query()).expect("the sent body");
+        assert_eq!((body.offset.as_str(), body.limit), ("off", 3));
+        net_complete(
+            sent,
+            wire!(telegram_api::bots_PopularAppBots {
+                flags: 1, // NEXT_OFFSET_MASK
+                next_offset: "next".to_owned(),
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    bot: true,
+                    id: 901,
+                    access_hash: 556,
+                    first_name: "PopularBot".to_owned(),
+                    ..telegram_api::user::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::foundUsers(found)) if found.user_ids == vec![901]
+                && found.next_offset == "next"
+        ));
+
+        // 1b. the wire-error band — the promise error passes through
+        td.request(
+            11,
+            Function::getGrossingWebAppBots(td_api::getGrossingWebAppBots {
+                offset: String::new(),
+                limit: 1,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getPopularAppBots::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 11);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 2. searchWebApp — the inputBotAppShortName reference + hash 0
+        td.request(
+            2,
+            Function::searchWebApp(td_api::searchWebApp {
+                bot_user_id: 900,
+                web_app_short_name: "app".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotApp::ID,
+        );
+        let body = telegram_api::messages_getBotApp::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0);
+        let telegram_api::InputBotApp::inputBotAppShortName(app) = body.app.expect("app") else {
+            panic!("the inputBotAppShortName reference");
+        };
+        let telegram_api::InputUser::inputUser(bot) = app.bot_id.expect("bot") else {
+            panic!("the resolved bot");
+        };
+        assert_eq!((bot.user_id, bot.access_hash), (900, 555));
+        assert_eq!(app.short_name, "app");
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_BotApp {
+                flags: 0,
+                inactive: false,
+                request_write_access: true,
+                has_settings: false,
+                app: Some(telegram_api::BotApp::botApp(telegram_api::botApp {
+                    flags: 0,
+                    id: 100,
+                    access_hash: 200,
+                    short_name: "app".to_owned(),
+                    title: "Test App".to_owned(),
+                    description: "app".to_owned(),
+                    photo: None,
+                    document: None,
+                    hash: 300,
+                })),
+            }),
+        );
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::foundWebApp(found))
+                if found.request_write_access
+                    && found.skip_confirmation
+                    && found.web_app.as_ref().expect("web app").short_name == "app"
+        ));
+
+        // 2b. the BOT_APP_INVALID band — the null foundWebApp answers 404
+        td.request(
+            12,
+            Function::searchWebApp(td_api::searchWebApp {
+                bot_user_id: 900,
+                web_app_short_name: "gone".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotApp::ID,
+        );
+        net_fail(sent, 400, "BOT_APP_INVALID");
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::error(error)) if error.code == 404
+        ));
+
+        // 3. getWebAppLinkUrl — the theme/start flags, the write-access
+        //    bit and the Read peer resolve at the send leg
+        td.request(
+            3,
+            Function::getWebAppLinkUrl(td_api::getWebAppLinkUrl {
+                chat_id: 900,
+                bot_user_id: 900,
+                web_app_short_name: "app".to_owned(),
+                start_parameter: "start".to_owned(),
+                allow_write_access: true,
+                parameters: Some(td_api::WebAppOpenParameters {
+                    theme: Some(td_api::ThemeParameters {
+                        background_color: 0x00FF_FFFF,
+                        ..Default::default()
+                    }),
+                    application_name: "app".to_owned(),
+                    mode: Some(td_api::WebAppOpenMode::webAppOpenModeCompact(
+                        td_api::webAppOpenModeCompact,
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestAppWebView::ID,
+        );
+        let body =
+            telegram_api::messages_requestAppWebView::parse(sent.query()).expect("the sent body");
+        // the parsed flags carry the auto-stored bools too:
+        // write_allowed (bit 0) + START_PARAM + THEME_PARAMS + compact
+        // (bit 7)
+        assert_eq!(
+            body.flags,
+            (1 << 0) | (1 << 1) | (1 << 2) | (1 << 7),
+            "write_allowed | START_PARAM | THEME_PARAMS | compact"
+        );
+        assert!(body.write_allowed);
+        assert!(body.compact);
+        assert!(!body.fullscreen);
+        assert_eq!(body.start_param, "start");
+        assert_eq!(body.platform, "app");
+        assert!(
+            body.theme_params
+                .as_ref()
+                .expect("theme")
+                .data
+                .contains("\"bg_color\":\"#ffffff\"")
+        );
+        let telegram_api::InputPeer::inputPeerUser(peer) = *body.peer.expect("peer") else {
+            panic!("the user peer");
+        };
+        assert_eq!((peer.user_id, peer.access_hash), (900, 555));
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewResult {
+                flags: 0,
+                fullsize: false,
+                fullscreen: false,
+                same_origin: true,
+                query_id: 0,
+                url: "https://app".to_owned(),
+            }),
+        );
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::webAppUrl(url)) if url.url == "https://app" && url.require_same_origin
+        ));
+
+        // 4. getMainWebApp — the full-screen request form; the answered
+        //    mode keeps the client priority over the server fullsize flag
+        td.request(
+            4,
+            Function::getMainWebApp(td_api::getMainWebApp {
+                chat_id: 902,
+                bot_user_id: 902,
+                start_parameter: String::new(),
+                parameters: Some(td_api::WebAppOpenParameters {
+                    theme: None,
+                    application_name: String::new(),
+                    mode: Some(td_api::WebAppOpenMode::webAppOpenModeFullScreen(
+                        td_api::webAppOpenModeFullScreen,
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestMainWebView::ID,
+        );
+        let body =
+            telegram_api::messages_requestMainWebView::parse(sent.query()).expect("the sent body");
+        // no theme, no start parameter — the parsed flags carry only the
+        // auto-stored fullscreen bool (bit 8)
+        assert_eq!(body.flags, 1 << 8, "fullscreen only");
+        assert!(body.fullscreen);
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewResult {
+                flags: 0,
+                fullsize: true,
+                fullscreen: false,
+                same_origin: false,
+                query_id: 0,
+                url: "https://main".to_owned(),
+            }),
+        );
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::mainWebApp(main))
+                if main.url.as_ref().expect("url").url == "https://main"
+                    && matches!(
+                        main.mode,
+                        Some(td_api::WebAppOpenMode::webAppOpenModeFullScreen(_))
+                    )
+        ));
+
+        // 4b. a bot without the main app answers the 400 band
+        td.request(
+            14,
+            Function::getMainWebApp(td_api::getMainWebApp {
+                chat_id: 900,
+                bot_user_id: 900,
+                start_parameter: String::new(),
+                parameters: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "The bot has no main Mini App")
+        );
+
+        // 5. openWebApp — the plain URL arm: the URL flag, the Write
+        //    peer, the empty reply-to; the answer opens the web view
+        //    (arming the 60-second ping) and answers the info object
+        td.request(
+            5,
+            Function::openWebApp(td_api::openWebApp {
+                chat_id: 902,
+                bot_user_id: 902,
+                url: "https://web".to_owned(),
+                topic_id: None,
+                reply_to: None,
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestWebView::ID,
+        );
+        let body =
+            telegram_api::messages_requestWebView::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 1, "URL_MASK only");
+        assert!(!body.from_bot_menu);
+        assert!(!body.silent);
+        assert_eq!(body.url, "https://web");
+        assert!(body.start_param.is_empty());
+        assert!(body.reply_to.is_none());
+        assert!(body.send_as.is_none());
+        let telegram_api::InputPeer::inputPeerUser(peer) = *body.peer.expect("peer") else {
+            panic!("the user peer");
+        };
+        assert_eq!(peer.user_id, 902);
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewResult {
+                flags: 1, // QUERY_ID_MASK — the launch id that opens the view
+                fullsize: false,
+                fullscreen: false,
+                same_origin: false,
+                query_id: 55,
+                url: "https://web".to_owned(),
+            }),
+        );
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::webAppInfo(info)) if info.launch_id == 55
+                && info.url.as_ref().expect("url").url == "https://web"
+        ));
+        assert!(
+            td.web_app_manager.ping_web_view_deadline().is_some(),
+            "the opened view armed the ping"
+        );
+
+        // 5b. the `start://` arm — the start parameter replaces the URL
+        td.request(
+            15,
+            Function::openWebApp(td_api::openWebApp {
+                chat_id: 902,
+                bot_user_id: 902,
+                url: "start://abc".to_owned(),
+                topic_id: None,
+                reply_to: None,
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestWebView::ID,
+        );
+        let body =
+            telegram_api::messages_requestWebView::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 3, "START_PARAM_MASK only");
+        assert!(body.url.is_empty());
+        assert_eq!(body.start_param, "abc");
+        // settle the parked query — the plain error passes through (the
+        // start arm never reloads the attach menu bots)
+        net_fail(sent, 400, "START_PARAM_EMPTY");
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 15);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "START_PARAM_EMPTY")
+        );
+
+        // 5c. the `menu://` arm — the bot-menu flag rides the stripped
+        //     URL (WebAppManager.cpp:232-236)
+        td.request(
+            18,
+            Function::openWebApp(td_api::openWebApp {
+                chat_id: 902,
+                bot_user_id: 902,
+                url: "menu://https://bot".to_owned(),
+                topic_id: None,
+                reply_to: None,
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestWebView::ID,
+        );
+        let body =
+            telegram_api::messages_requestWebView::parse(sent.query()).expect("the sent body");
+        // the parsed flags carry the auto-stored from_bot_menu bool
+        // (bit 4) beside the URL flag
+        assert_eq!(body.flags, (1 << 1) | (1 << 4), "URL_MASK | from_bot_menu");
+        assert!(body.from_bot_menu);
+        assert_eq!(body.url, "https://bot");
+        net_fail(sent, 400, "MENU_CLOSED");
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 18);
+        assert_eq!((error.code, error.message.as_str()), (400, "MENU_CLOSED"));
+
+        // 6. the prolong ping — one query per opened view over the Write
+        //    peer; the bool answer drains the parked entry
+        {
+            let mut manager = std::mem::take(&mut td.web_app_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.ping_web_view(&mut env);
+            }
+            td.web_app_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_prolongWebView::ID,
+        );
+        let body =
+            telegram_api::messages_prolongWebView::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.query_id, 55);
+        assert!(!body.silent);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_web_app_net();
+
+        // 6b. the inert send leg — a view on an unknown dialog sends
+        //     nothing and parks nothing (WebAppManager.cpp:299-303)
+        td.request(
+            16,
+            Function::closeWebApp(td_api::closeWebApp {
+                web_app_launch_id: 55,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 16).first(),
+            Some(Object::ok(_))
+        ));
+        {
+            let mut manager = std::mem::take(&mut td.web_app_manager);
+            manager.open_web_view(
+                77,
+                crate::dialog_id::DialogId::new(999_999),
+                UserId::new(902),
+                crate::web_app_manager::MessageTopic::default(),
+                crate::web_app_manager::MessageInputReplyTo::default(),
+                crate::dialog_id::DialogId::new(0),
+            );
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.ping_web_view(&mut env);
+            }
+            td.web_app_manager = manager;
+        }
+        assert!(
+            !rec.sent
+                .lock()
+                .iter()
+                .any(|query| query.tl_constructor() == telegram_api::messages_prolongWebView::ID),
+            "the inert prolong leg sends nothing"
+        );
+        assert!(
+            !td.web_app_manager.has_pending_queries(),
+            "the inert leg parks nothing"
+        );
+
+        // 6c. the reply-to and send-as wire arms — a thread-topic view
+        //     carries the implicit reply (REPLY_TO_MASK) and the valid
+        //     as-dialog the send-as peer (SEND_AS_MASK,
+        //     WebAppManager.cpp:248-259, 306-317)
+        {
+            let mut manager = std::mem::take(&mut td.web_app_manager);
+            manager.open_web_view(
+                78,
+                crate::dialog_id::DialogId::new(902),
+                UserId::new(902),
+                crate::web_app_manager::MessageTopic::thread(
+                    crate::dialog_id::DialogId::new(902),
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::messages_manager::ServerMessageId::new(31),
+                    ),
+                ),
+                crate::web_app_manager::MessageInputReplyTo::default(),
+                crate::dialog_id::DialogId::new(900),
+            );
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.ping_web_view(&mut env);
+            }
+            td.web_app_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_prolongWebView::ID,
+        );
+        let body =
+            telegram_api::messages_prolongWebView::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.query_id, 78);
+        assert_eq!(body.flags, 1 | (1 << 13), "REPLY_TO | SEND_AS");
+        let telegram_api::InputReplyTo::inputReplyToMessage(reply) =
+            body.reply_to.expect("the implicit reply")
+        else {
+            panic!("the inputReplyToMessage wire form");
+        };
+        assert_eq!(reply.reply_to_msg_id, 31);
+        assert_eq!(reply.top_msg_id, 31);
+        let telegram_api::InputPeer::inputPeerUser(send_as) = *body.send_as.expect("send_as")
+        else {
+            panic!("the send-as peer");
+        };
+        assert_eq!(send_as.user_id, 900);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_web_app_net();
+
+        // 7. sendWebAppCustomRequest — the parameters ride the dataJSON
+        td.request(
+            6,
+            Function::sendWebAppCustomRequest(td_api::sendWebAppCustomRequest {
+                bot_user_id: 900,
+                method: "m".to_owned(),
+                parameters: "{}".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_invokeWebViewCustomMethod::ID,
+        );
+        let body = telegram_api::bots_invokeWebViewCustomMethod::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.custom_method, "m");
+        assert_eq!(body.params.expect("params").data, "{}");
+        net_complete(
+            sent,
+            wire!(telegram_api::DataJSON {
+                data: "\"ok\"".to_owned(),
+            }),
+        );
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::customRequestResult(result)) if result.result == "\"ok\""
+        ));
+
+        // 8. checkWebAppFileDownload — the false band answers the 400
+        //    download error, the true band the ok
+        td.request(
+            7,
+            Function::checkWebAppFileDownload(td_api::checkWebAppFileDownload {
+                bot_user_id: 900,
+                file_name: "f.bin".to_owned(),
+                url: "https://f".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_checkDownloadFileParams::ID,
+        );
+        let body =
+            telegram_api::bots_checkDownloadFileParams::parse(sent.query()).expect("the sent body");
+        assert_eq!(
+            (body.file_name.as_str(), body.url.as_str()),
+            ("f.bin", "https://f")
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "The file can't be downloaded")
+        );
+
+        td.request(
+            17,
+            Function::checkWebAppFileDownload(td_api::checkWebAppFileDownload {
+                bot_user_id: 900,
+                file_name: "f.bin".to_owned(),
+                url: "https://f".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_checkDownloadFileParams::ID,
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_web_app_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 17).first(),
+            Some(Object::ok(_))
+        ));
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(td.web_app_net_completed.lock().is_empty(), "drained");
+        assert!(!td.web_app_manager.has_pending_queries());
+    }
+
+    #[test]
     fn message_query_per_message_families_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -64637,9 +65792,9 @@ kQIDAQAB\n\
         }
         let mut contents_queries: Vec<NetQuery> = std::mem::take(&mut *rec.sent.lock())
             .into_iter()
-            .filter(
-                |query| query.tl_constructor() == telegram_api::messages_readMessageContents::ID,
-            )
+            .filter(|query| {
+                query.tl_constructor() == telegram_api::messages_readMessageContents::ID
+            })
             .collect();
         assert_eq!(contents_queries.len(), 2, "both contents queries in flight");
         let sent_poll = contents_queries.remove(1); // the second send
