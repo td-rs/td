@@ -2066,12 +2066,39 @@ impl crate::messages_manager::ReadStateContext for Td {
     }
 
     fn have_input_peer(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
-        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
-            && !allow_secret_chats
-        {
-            return false;
+        // `DialogManager::have_input_peer` (DialogManager.cpp:1480-1508)
+        // — the user/chat/secret ladders over the registries; the probes
+        // read the live user/chat managers (not the messages_manager
+        // map, which the split-context take empties mid-request)
+        use crate::dialog_id::DialogType;
+        use crate::user_manager::AccessRights;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                self.user_manager.have_input_peer_user_for(
+                    self.user_manager.get_user(user_id),
+                    user_id,
+                    AccessRights::Read,
+                    self.auth_manager.is_bot(),
+                )
+            }
+            DialogType::Chat => self
+                .chat_manager
+                .have_input_peer_chat(dialog_id.get_chat_id(), AccessRights::Read),
+            DialogType::Channel => self.chat_manager.have_input_peer_channel_by_id(
+                self.auth_manager.is_bot(),
+                dialog_id.get_channel_id(),
+                AccessRights::Read,
+            ),
+            DialogType::SecretChat => {
+                allow_secret_chats
+                    && self.user_manager.have_input_encrypted_peer(
+                        dialog_id.get_secret_chat_id(),
+                        AccessRights::Read,
+                    )
+            }
+            DialogType::None => false,
         }
-        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
     }
 
     fn is_dialog_muted(&self, _dialog_id: DialogId) -> bool {
@@ -3416,8 +3443,9 @@ pub(crate) type BusinessNetHandle = NetKindHandle<crate::business_manager::Busin
 
 /// The cloned message-query dispatch surface the [`MessageQueryEnv`]
 /// senders use — the per-kind handle over the MessageQueryManager.cpp
-/// per-message handler kinds (the net-drain 28 plane); the answers drain
-/// through [`Td::dispatch_completed_message_query_net`].
+/// handler kinds (the net-drain 28 per-message plane + the net-drain 29
+/// search/history families); the answers drain through
+/// [`Td::dispatch_completed_message_query_net`].
 pub(crate) type MessageQueryNetHandle =
     NetKindHandle<crate::message_query_manager::MessageQueryNetKind>;
 
@@ -4424,7 +4452,7 @@ pub struct Td {
     /// [`Td::on_secure_net_answer`] drain).
     secure_net_completed: Arc<Mutex<Vec<(crate::secure_manager::SecureNetKind, NetQuery)>>>,
     /// The callback-parked message-query answers (the C++ ResultHandler
-    /// halves of the net-drain 28 per-message families — the
+    /// halves of the net-drain 28/29 families — the
     /// [`Td::on_message_query_net_answer`] drain).
     message_query_net_completed:
         Arc<Mutex<Vec<(crate::message_query_manager::MessageQueryNetKind, NetQuery)>>>,
@@ -4432,8 +4460,13 @@ pub struct Td {
     /// of the net-drain 30 families — the
     /// [`Td::on_web_app_net_answer`] drain).
     web_app_net_completed: Arc<Mutex<Vec<(crate::web_app_manager::WebAppNetKind, NetQuery)>>>,
-    /// The parked query state of the net-drain 28 families (the
-    /// handler vectors and promises the `Copy` kinds can't carry).
+    /// The parked query state of the net-drain 28/29 families (the
+    /// handler vectors, search offsets/filters and promises the `Copy`
+    /// kinds can't carry) — popped by
+    /// [`Td::on_message_query_net_answer`]; Td-held, not manager-held,
+    /// because the request arms and the affected-history trampolines run
+    /// the manager through the [`crate::td::message_query_env_split`]
+    /// borrow view.
     message_query_net_pending: crate::message_query_manager::PendingNetQueries,
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
@@ -7460,7 +7493,7 @@ impl Td {
         })
     }
 
-    /// The cloned message-query dispatch surface (the net-drain 28
+    /// The cloned message-query dispatch surface (the net-drain 28/29
     /// families' send legs — the env-held handle over
     /// [`MessageQueryEnv::net`]).
     pub(crate) fn message_query_net(&self) -> Option<MessageQueryNetHandle> {
@@ -15710,13 +15743,19 @@ impl Td {
     }
 
     /// Route one message-query net answer by kind — the ResultHandler
-    /// halves of the net-drain 28 per-message families
-    /// (MessageQueryManager.cpp:306-2290). The wire-error heads run here
+    /// halves of the net-drain 28/29 families (MessageQueryManager.cpp):
+    /// the per-message families (cpp:306-2290) and the search/history
+    /// families (cpp:521-889, 2046-2079). The wire-error heads run here
     /// (`on_get_dialog_error`); the parse failures settle through the
     /// manager error tails without the head (the landed-flip convention,
     /// §5); the M.10-blocked heads (`on_get_message_error`,
     /// `on_update_message_interaction_info`, the fact-check/updates
-    /// intakes) stay skipped with the C++ line refs.
+    /// intakes) stay skipped with the C++ line refs. The search walks
+    /// drive the receive head over the split-context alias pair (the
+    /// `run_on_get_dialogs` convention); the C++ handlers'
+    /// `get_channel_differences_if_needed` pre-walk collapses (the
+    /// M.10.19 gap machinery; the intakes run directly over the parsed
+    /// messages).
     fn on_message_query_net_answer(
         &mut self,
         kind: crate::message_query_manager::MessageQueryNetKind,
@@ -15748,6 +15787,29 @@ impl Td {
         use crate::message_query_manager::MessageViewers;
         // the pts hop and the counter intakes call the env trait methods
         use crate::message_query_manager::MessageQueryManagerEnv as _;
+        /// The `get_found_messages_object({})` empty answer of the
+        /// SEARCH_QUERY_EMPTY bands (cpp:620-622, 835-837).
+        fn empty_found_messages() -> td_api::FoundMessages {
+            td_api::FoundMessages {
+                total_count: 0,
+                messages: Vec::new(),
+                next_offset: String::new(),
+            }
+        }
+        /// The FLOOD_WAIT_x_OR_STARS_y rewrite of the public-post search
+        /// error tail (MessageQueryManager.cpp:766-777): the wait/stars
+        /// pair out of the error message, `StarManager::get_star_count`
+        /// over the stars amount.
+        fn flood_wait_or_stars(message: &str) -> Option<(i32, i64)> {
+            // the C++ `to_integer` reads the leading digits and answers 0
+            // on garbage (cpp:770-773) — the max(1, ·) pair absorbs it
+            let rest = message.strip_prefix("FLOOD_WAIT_")?;
+            let second = rest.find("_OR_STARS_")?;
+            let wait_time: i32 = rest[..second].parse().unwrap_or(0);
+            let stars_amount: i64 = rest[second + "_OR_STARS_".len()..].parse().unwrap_or(0);
+            let star_count = crate::star_manager::get_star_count(stars_amount, false).max(1);
+            Some((wait_time.max(1), star_count))
+        }
         match kind {
             // `GetExtendedMediaQuery` (MessageQueryManager.cpp:378-393) —
             // the `Updates` answer re-enters `on_get_updates` with the
@@ -16256,6 +16318,369 @@ impl Td {
                     Err(_) => promise.set_error(parse_error("messages.summarizeText")),
                 }
             }
+            // `SearchMessagesGlobalQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:593-624) — the walk into
+            // `on_get_messages_search_result` (cpp:3366-3401).
+            MessageQueryNetKind::SearchMessagesGlobal => {
+                let Some(mut pending) = self.message_query_net_pending.search_messages_global.pop()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    // the SEARCH_QUERY_EMPTY band answers the empty found
+                    // object (cpp:620-622)
+                    if status.message() == "SEARCH_QUERY_EMPTY" {
+                        return pending.promise.set_value(empty_found_messages());
+                    }
+                    return pending.promise.set_error(status);
+                }
+                let answer = match telegram_api::messages_Messages::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        // the fetch_result parse failure runs on_error
+                        // with the 500
+                        return pending
+                            .promise
+                            .set_error(parse_error("messages.searchGlobal"));
+                    }
+                };
+                let info = self.get_messages_info(answer, "SearchMessagesGlobalQuery");
+                self.run_on_get_messages_search_result(pending, info);
+            }
+            // `SearchSentMediaQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:640-664) — the walk into
+            // `on_get_outgoing_document_messages` (cpp:3416-3435).
+            MessageQueryNetKind::SearchSentMedia => {
+                let Some(mut promise) = self.message_query_net_pending.search_sent_media.pop()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let answer = match telegram_api::messages_Messages::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => return promise.set_error(parse_error("messages.searchSentMedia")),
+                };
+                let info = self.get_messages_info(answer, "SearchSentMediaQuery");
+                self.run_on_get_outgoing_document_messages(info, promise);
+            }
+            // `CheckSearchPostsFloodQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:683-694) — the SearchPostsFlood
+            // value object (the landed
+            // [`crate::message_query_manager::SearchPostsFlood`]).
+            MessageQueryNetKind::CheckSearchPostsFlood => {
+                let Some(mut promise) = self
+                    .message_query_net_pending
+                    .check_search_posts_flood
+                    .pop()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::SearchPostsFlood::parse(query.ok()) {
+                    Ok(flood) => {
+                        self.with_message_query_manager(|env, _| {
+                            let flood =
+                                crate::message_query_manager::SearchPostsFlood::from_wire(&flood);
+                            promise.set_value(flood.get_public_post_search_limits_object(env));
+                        });
+                    }
+                    Err(_) => promise.set_error(parse_error("channels.checkSearchPostsFlood")),
+                }
+            }
+            // `SearchPublicPostsQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:729-783) — the messagesSlice
+            // search-flood extraction (the null band is the 500), the
+            // walk into `on_get_public_post_search_result`
+            // (cpp:3462-3494) with the star re-add.
+            MessageQueryNetKind::SearchPublicPosts => {
+                let Some(mut pending) = self.message_query_net_pending.search_public_posts.pop()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    self.re_add_public_post_stars(pending.star_count);
+                    // the FLOOD_WAIT_OR_STARS rewrite answers the exceeded
+                    // limits object (cpp:767-777)
+                    if let Some((wait_time, star_count)) = flood_wait_or_stars(status.message()) {
+                        return pending.promise.set_value(td_api::FoundPublicPosts {
+                            messages: Vec::new(),
+                            next_offset: String::new(),
+                            search_limits: Some(td_api::PublicPostSearchLimits {
+                                daily_free_query_count: 0,
+                                remaining_free_query_count: 0,
+                                next_free_query_in: wait_time,
+                                star_count,
+                                is_current_query_free: true,
+                            }),
+                            are_limits_exceeded: true,
+                        });
+                    }
+                    if status.message() == "QUERY_EMPTY" {
+                        return pending.promise.set_value(td_api::FoundPublicPosts {
+                            messages: Vec::new(),
+                            next_offset: String::new(),
+                            search_limits: None,
+                            are_limits_exceeded: false,
+                        });
+                    }
+                    return pending.promise.set_error(status);
+                }
+                let mut answer = match telegram_api::messages_Messages::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        // the fetch_result parse failure runs on_error
+                        // with the 500 (the star re-add included)
+                        self.re_add_public_post_stars(pending.star_count);
+                        return pending
+                            .promise
+                            .set_error(parse_error("channels.searchPosts"));
+                    }
+                };
+                // the flood extraction (cpp:735-744): the flood moves out
+                // of the slice before the get_messages_info walk (so the
+                // walk sees no flood — the null band is the 500)
+                let flood = match &mut answer {
+                    telegram_api::messages_Messages::messages_messagesSlice(slice) => {
+                        slice.search_flood.take()
+                    }
+                    _ => None,
+                };
+                let Some(flood) = flood else {
+                    tdutils::log_error!("Receive {}", answer.to_debug_string());
+                    self.re_add_public_post_stars(pending.star_count);
+                    return pending
+                        .promise
+                        .set_error(Status::error(500, "Failed to receive search limits"));
+                };
+                tdutils::log_info!("Receive {}", flood.to_debug_string());
+                let info = self.get_messages_info(answer, "SearchPublicPostsQuery");
+                self.run_on_get_public_post_search_result(pending, flood, info);
+            }
+            // `SearchPostsQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:811-839) — the walk into
+            // `on_get_hashtag_search_result` (cpp:3522-3555).
+            MessageQueryNetKind::SearchPosts => {
+                let Some(mut pending) = self.message_query_net_pending.search_posts.pop() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if status.message() == "SEARCH_QUERY_EMPTY" {
+                        return pending.promise.set_value(empty_found_messages());
+                    }
+                    return pending.promise.set_error(status);
+                }
+                let answer = match telegram_api::messages_Messages::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        return pending
+                            .promise
+                            .set_error(parse_error("channels.searchPosts"));
+                    }
+                };
+                let info = self.get_messages_info(answer, "SearchPostsQuery");
+                self.run_on_get_hashtag_search_result(pending, info);
+            }
+            // `GetRecentLocationsQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:863-888) — the walk into
+            // `on_get_recent_locations` (cpp:3585-3609); the error tail
+            // runs the dialog-error head first.
+            MessageQueryNetKind::GetRecentLocations => {
+                let Some(mut pending) = self.message_query_net_pending.get_recent_locations.pop()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        pending.dialog_id,
+                        &status,
+                        "GetRecentLocationsQuery",
+                    );
+                    return pending.promise.set_error(status);
+                }
+                let answer = match telegram_api::messages_Messages::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        return pending
+                            .promise
+                            .set_error(parse_error("messages.getRecentLocations"));
+                    }
+                };
+                let info = self.get_messages_info(answer, "GetRecentLocationsQuery");
+                self.run_on_get_recent_locations(pending, info);
+            }
+            // `GetPersonalChannelHistoryQuery::on_result`/`on_error`
+            // (MessageQueryManager.cpp:2059-2078) — the guest-object walk.
+            MessageQueryNetKind::GetPersonalChannelHistory => {
+                let Some(mut promise) = self
+                    .message_query_net_pending
+                    .get_personal_channel_history
+                    .pop()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let answer = match telegram_api::messages_Messages::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        return promise
+                            .set_error(parse_error("messages.getPersonalChannelHistory"));
+                    }
+                };
+                let info = self.get_messages_info(answer, "GetPersonalChannelHistoryQuery");
+                self.run_get_personal_channel_history_result(info.messages, promise);
+            }
+            // The affected-history refills — the twelve families'
+            // `messages.affectedHistory`/
+            // `messages.affectedFoundMessages` answers feeding the landed
+            // loop (`MessageQueryManager::on_get_affected_history`,
+            // cpp:2463-2492); the record matches by the kind-FIFO pop.
+            MessageQueryNetKind::AffectedHistory(query_kind) => {
+                use crate::message_query_manager::AffectedHistoryQueryKind;
+                // the FIFO-per-kind pop (§5): the answer carries no
+                // dialog id, so the oldest parked record of the same
+                // family pairs with it — the single-flight shape of every
+                // caller
+                let position = self
+                    .message_query_net_pending
+                    .affected_history
+                    .iter()
+                    .position(|pending| pending.kind == query_kind);
+                let Some(mut pending) = position.map(|position| {
+                    self.message_query_net_pending
+                        .affected_history
+                        .remove(position)
+                }) else {
+                    tdutils::log_info!(
+                        "Receive a stray affected-history answer for {query_kind:?}"
+                    );
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    // the per-family on_error heads (the C++ first lines)
+                    match query_kind {
+                        AffectedHistoryQueryKind::DeleteDialogHistory { .. } => {
+                            crate::dialog_manager::on_get_dialog_error(
+                                &self.global,
+                                pending.dialog_id,
+                                &status,
+                                "DeleteHistoryQuery",
+                            );
+                        }
+                        AffectedHistoryQueryKind::DeleteDialogMessagesByDate { .. } => {
+                            crate::dialog_manager::on_get_dialog_error(
+                                &self.global,
+                                pending.dialog_id,
+                                &status,
+                                "DeleteMessagesByDateQuery",
+                            );
+                        }
+                        AffectedHistoryQueryKind::DeleteAllChannelMessagesFromSender {
+                            sender_dialog_id,
+                        } if sender_dialog_id.get_type()
+                            != crate::dialog_id::DialogType::Channel =>
+                        {
+                            let channel_id = pending.dialog_id.get_channel_id();
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                user_manager,
+                                chat_manager,
+                                ..
+                            } = self;
+                            let mut user_env = UserEnv {
+                                global,
+                                options: option_manager
+                                    .as_mut()
+                                    .expect("the answers drain post-init"),
+                                auth_is_bot: auth_manager.is_bot(),
+                            };
+                            chat_manager.on_get_channel_error(
+                                user_manager,
+                                &mut user_env,
+                                channel_id,
+                                &status,
+                                "DeleteParticipantHistoryQuery",
+                            );
+                        }
+                        // the forum-topic heads (DeleteTopicHistory /
+                        // ReadMentions / ReadReactions / ReadPollVotes /
+                        // UnpinAllMessages) ride the forum-topic slice
+                        // (net-drain 41); the rest have no head
+                        _ => {}
+                    }
+                    return pending.promise.set_error(status);
+                }
+                // the answer shape per family: the phone-call family
+                // answers affectedFoundMessages (the deleted-message ids
+                // ride an updateDeleteMessages pts update first,
+                // cpp:1581-1586); the rest answer affectedHistory
+                let affected_history = if matches!(
+                    query_kind,
+                    AffectedHistoryQueryKind::DeleteAllCallMessages { .. }
+                ) {
+                    match telegram_api::messages_AffectedFoundMessages::parse(query.ok()) {
+                        Ok(affected) => {
+                            if !affected.messages.is_empty() {
+                                // `process_pts_update(updateDeleteMessages)`
+                                // (cpp:1583-1585) — the ids ride the sink
+                                self.updates_manager.sink().process_pts_update(
+                                    crate::updates_manager::PendingUpdate::Wire(
+                                        telegram_api::Update::updateDeleteMessages(
+                                            telegram_api::updateDeleteMessages {
+                                                messages: affected.messages.clone(),
+                                                pts: 0,
+                                                pts_count: 0,
+                                            },
+                                        ),
+                                    ),
+                                );
+                            }
+                            crate::message_query_manager::AffectedHistory::from_affected_found_messages(&affected)
+                        }
+                        Err(_) => {
+                            return pending
+                                .promise
+                                .set_error(parse_error("messages.deletePhoneCallHistory"));
+                        }
+                    }
+                } else {
+                    match telegram_api::messages_AffectedHistory::parse(query.ok()) {
+                        Ok(affected) => {
+                            crate::message_query_manager::AffectedHistory::from_affected_history(
+                                &affected,
+                            )
+                        }
+                        Err(_) => {
+                            return pending
+                                .promise
+                                .set_error(parse_error("the affected-history answer"));
+                        }
+                    }
+                };
+                self.with_message_query_manager(|env, manager| {
+                    manager.on_get_affected_history(
+                        env,
+                        pending.dialog_id,
+                        pending.kind,
+                        pending.get_affected_messages,
+                        affected_history,
+                        pending.promise,
+                    );
+                });
+            }
         }
     }
 
@@ -16418,6 +16843,491 @@ impl Td {
                 });
             }
         }
+    }
+
+    /// Build the [`MessageQueryEnv`] view over the split Td borrows and
+    /// run the closure with it + the message-query manager (the
+    /// `with_secure_manager` shape — the net-answer drain's twin).
+    fn with_message_query_manager<R>(
+        &mut self,
+        run: impl FnOnce(
+            &mut MessageQueryEnv<'_>,
+            &mut crate::message_query_manager::MessageQueryManager,
+        ) -> R,
+    ) -> R {
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        run(&mut env, manager)
+    }
+
+    /// The public-post search's star re-add
+    /// (`add_pending_owned_star_count(star_count, …)`,
+    /// MessageQueryManager.cpp:3490/:752/:764) over the star env split.
+    fn re_add_public_post_stars(&mut self, star_count: i64) {
+        if star_count == 0 {
+            return;
+        }
+        let (mut star_manager, mut star_env) = crate::td::star_env_split(self);
+        star_manager.add_pending_owned_star_count(&mut star_env, star_count, false);
+    }
+
+    /// `get_messages_info` (MessagesInfo.cpp:20-82) — the shared
+    /// `messages_Messages` parse: the users/chats intakes run here (the
+    /// topics ride the forum-topic slice, net-drain 41), the counts and
+    /// the next-rate land in the walk record. The C++ callers'
+    /// `get_channel_differences_if_needed` pre-walk collapses (the
+    /// M.10.19 gap machinery is the messages plane's; the intakes run
+    /// directly over the parsed messages).
+    fn get_messages_info(
+        &mut self,
+        answer: telegram_api::messages_Messages,
+        source: &str,
+    ) -> MessagesInfoWalk {
+        let mut result = MessagesInfoWalk {
+            total_count: 0,
+            messages: Vec::new(),
+            next_rate: 0,
+        };
+        let (users, chats, topics) = match answer {
+            telegram_api::messages_Messages::messages_messages(messages) => {
+                result.total_count = messages.messages.len() as i32;
+                result.messages = messages.messages;
+                (messages.users, messages.chats, messages.topics)
+            }
+            telegram_api::messages_Messages::messages_messagesSlice(messages) => {
+                if messages.search_flood.is_some() {
+                    // the stray-flood LOG(ERROR) band (MessagesInfo.cpp:44-46):
+                    // the search call sites take the flood out of the
+                    // slice before this walk, so a flood still riding the
+                    // answer is the stray band
+                    tdutils::log_error!("Receive {}", messages.to_debug_string());
+                }
+                result.total_count = messages.count;
+                result.next_rate = messages.next_rate;
+                result.messages = messages.messages;
+                (messages.users, messages.chats, messages.topics)
+            }
+            telegram_api::messages_Messages::messages_channelMessages(messages) => {
+                // the C++ `is_channel_messages` flag feeds only the
+                // collapsed `get_channel_differences_if_needed` walk
+                result.total_count = messages.count;
+                result.messages = messages.messages;
+                (messages.users, messages.chats, messages.topics)
+            }
+            telegram_api::messages_Messages::messages_messagesNotModified(_) => {
+                tdutils::log_error!("Server returned messagesNotModified in response to {source}");
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        };
+        self.intake_users(users, source);
+        self.intake_chats(chats, source);
+        // `forum_topic_manager_->on_get_forum_topic_infos` — the
+        // forum-topic cache loads ride the forum-topic slice (net-drain 41)
+        if !topics.is_empty() {
+            tdutils::log_info!(
+                "Drop {} forum topics in the {source} answer — the forum-topic intake rides its slice",
+                topics.len()
+            );
+        }
+        result
+    }
+
+    /// The receive head of the search walks — the C++
+    /// `on_get_message(dialog_id, message, false, false, source)`
+    /// (MessagesManager.cpp:11921-12107): the port's `on_get_message`
+    /// collapses to the parse+create record (the M.10 container seam
+    /// returns the built message without the store insert), so the walks
+    /// drive the full head `on_get_message_full` over the alias quintet
+    /// (the `apply_new_message` convention) and collect the new full ids.
+    fn receive_search_message(
+        &mut self,
+        message: telegram_api::Message,
+        source: &'static str,
+    ) -> Option<(
+        crate::dialog_id::DialogId,
+        crate::messages_manager::MessageId,
+    )> {
+        // SAFETY: every alias below derives from `td_ptr` and the callee
+        // uses them strictly one at a time (the apply_new_message
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info =
+            crate::messages_manager::parse_telegram_api_message(ctx, message, false, false, source);
+        // `add_new_dialog` emits `updateNewChat` for the fresh user
+        // dialog (the apply_new_message convention)
+        if message_info.dialog_id.get_type() == crate::messages_manager::DialogType::User {
+            self.ensure_chat(message_info.dialog_id.get_user_id().get());
+        }
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        let full_id = crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            false,
+            source,
+        );
+        if !full_id.get_message_id().is_valid() {
+            return None;
+        }
+        Some((full_id.get_dialog_id(), full_id.get_message_id()))
+    }
+
+    /// `on_get_messages_search_result` (MessageQueryManager.cpp:3366-3401)
+    /// — the found-messages walk: the offset tracks the newest usable
+    /// message, the receive head stores the messages, the total clamps to
+    /// the valid count and the next offset rides the next-rate.
+    fn run_on_get_messages_search_result(
+        &mut self,
+        pending: crate::message_query_manager::SearchMessagesGlobalPending,
+        mut info: MessagesInfoWalk,
+    ) {
+        let crate::message_query_manager::SearchMessagesGlobalPending { mut promise } = pending;
+        if self.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        tdutils::log_info!("Receive {} found messages", info.messages.len());
+
+        let mut next_offset = crate::message_query_manager::MessageSearchOffset::default();
+        let mut full_ids: Vec<(
+            crate::dialog_id::DialogId,
+            crate::messages_manager::MessageId,
+        )> = Vec::new();
+        for message in std::mem::take(&mut info.messages) {
+            next_offset.update_from_message(&message);
+            if let Some(full_id) = self.receive_search_message(message, "search messages") {
+                full_ids.push(full_id);
+            } else {
+                info.total_count -= 1;
+            }
+        }
+        if info.total_count < full_ids.len() as i32 {
+            tdutils::log_error!(
+                "Receive {} valid messages out of {}",
+                full_ids.len(),
+                info.total_count
+            );
+            info.total_count = full_ids.len() as i32;
+        }
+        let mut next_offset_str = String::new();
+        if !full_ids.is_empty() {
+            if info.next_rate > 0 {
+                next_offset.date = info.next_rate;
+            }
+            next_offset_str = next_offset.to_offset_string();
+        }
+        let objects = self.build_message_objects(&full_ids, "on_get_messages_search_result");
+        promise.set_value(td_api::FoundMessages {
+            total_count: info.total_count,
+            messages: objects,
+            next_offset: next_offset_str,
+        });
+    }
+
+    /// `on_get_outgoing_document_messages`
+    /// (MessageQueryManager.cpp:3416-3435) — the same walk keyed by each
+    /// message's own dialog, then the document-only filter + the total
+    /// rewrite.
+    fn run_on_get_outgoing_document_messages(
+        &mut self,
+        info: MessagesInfoWalk,
+        mut promise: Promise<td_api::FoundMessages>,
+    ) {
+        if self.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        let mut full_ids: Vec<(
+            crate::dialog_id::DialogId,
+            crate::messages_manager::MessageId,
+        )> = Vec::new();
+        for message in info.messages {
+            if let Some(full_id) =
+                self.receive_search_message(message, "on_get_outgoing_document_messages")
+            {
+                full_ids.push(full_id);
+            }
+        }
+        let mut objects =
+            self.build_message_objects(&full_ids, "on_get_outgoing_document_messages");
+        // the document-only filter (cpp:3431-3432)
+        objects.retain(|object| {
+            matches!(
+                object.content,
+                Some(td_api::MessageContent::messageDocument(_))
+            )
+        });
+        let total_count = objects.len() as i32;
+        promise.set_value(td_api::FoundMessages {
+            total_count,
+            messages: objects,
+            next_offset: String::new(),
+        });
+    }
+
+    /// `on_get_public_post_search_result`
+    /// (MessageQueryManager.cpp:3462-3494) — the guest-free object walk
+    /// (`get_message_object` per stored message) + the flood limits and
+    /// the star re-add.
+    fn run_on_get_public_post_search_result(
+        &mut self,
+        pending: crate::message_query_manager::SearchPublicPostsPending,
+        flood: telegram_api::SearchPostsFlood,
+        mut info: MessagesInfoWalk,
+    ) {
+        let crate::message_query_manager::SearchPublicPostsPending {
+            star_count,
+            mut promise,
+        } = pending;
+        if self.global.close_flag() {
+            // the TRY_STATUS_PROMISE close band (cpp:3467) — no star
+            // re-add, like the C++
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        let posts_flood = crate::message_query_manager::SearchPostsFlood::from_wire(&flood);
+        let mut next_offset = crate::message_query_manager::MessageSearchOffset::default();
+        let mut full_ids: Vec<(
+            crate::dialog_id::DialogId,
+            crate::messages_manager::MessageId,
+        )> = Vec::new();
+        for message in std::mem::take(&mut info.messages) {
+            next_offset.update_from_message(&message);
+            if let Some(full_id) =
+                self.receive_search_message(message, "on_get_public_post_search_result")
+            {
+                full_ids.push(full_id);
+            }
+        }
+        let mut next_offset_str = String::new();
+        if !full_ids.is_empty() {
+            if info.next_rate > 0 {
+                next_offset.date = info.next_rate;
+            }
+            next_offset_str = next_offset.to_offset_string();
+        }
+        // `add_pending_owned_star_count(star_count, !posts_flood.is_free())`
+        // (cpp:3490) — the single re-add with the move flag
+        if star_count != 0 {
+            let move_to_owned = !posts_flood.is_free();
+            let (mut star_manager, mut star_env) = crate::td::star_env_split(self);
+            star_manager.add_pending_owned_star_count(&mut star_env, star_count, move_to_owned);
+        }
+        let objects = self.build_message_objects(&full_ids, "on_get_public_post_search_result");
+        let search_limits = self.with_message_query_manager(|env, _| {
+            posts_flood.get_public_post_search_limits_object(env)
+        });
+        promise.set_value(td_api::FoundPublicPosts {
+            messages: objects,
+            next_offset: next_offset_str,
+            search_limits: Some(search_limits),
+            are_limits_exceeded: false,
+        });
+    }
+
+    /// `on_get_hashtag_search_result` (MessageQueryManager.cpp:3522-3555)
+    /// — the found-messages walk of the hashtag form (the same shape as
+    /// the global search, the "search hashtag" source).
+    fn run_on_get_hashtag_search_result(
+        &mut self,
+        pending: crate::message_query_manager::SearchPostsPending,
+        mut info: MessagesInfoWalk,
+    ) {
+        let crate::message_query_manager::SearchPostsPending { mut promise } = pending;
+        if self.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        let mut next_offset = crate::message_query_manager::MessageSearchOffset::default();
+        let mut full_ids: Vec<(
+            crate::dialog_id::DialogId,
+            crate::messages_manager::MessageId,
+        )> = Vec::new();
+        for message in std::mem::take(&mut info.messages) {
+            next_offset.update_from_message(&message);
+            if let Some(full_id) = self.receive_search_message(message, "search hashtag") {
+                full_ids.push(full_id);
+            } else {
+                info.total_count -= 1;
+            }
+        }
+        if info.total_count < full_ids.len() as i32 {
+            tdutils::log_error!(
+                "Receive {} valid messages out of {}",
+                full_ids.len(),
+                info.total_count
+            );
+            info.total_count = full_ids.len() as i32;
+        }
+        let mut next_offset_str = String::new();
+        if !full_ids.is_empty() {
+            if info.next_rate > 0 {
+                next_offset.date = info.next_rate;
+            }
+            next_offset_str = next_offset.to_offset_string();
+        }
+        let objects = self.build_message_objects(&full_ids, "on_get_hashtag_search_result");
+        promise.set_value(td_api::FoundMessages {
+            total_count: info.total_count,
+            messages: objects,
+            next_offset: next_offset_str,
+        });
+    }
+
+    /// `on_get_recent_locations` (MessageQueryManager.cpp:3585-3609) — the
+    /// same-dialog walk into `get_messages_object(total, dialog, ids,
+    /// skip_not_found = true)`.
+    fn run_on_get_recent_locations(
+        &mut self,
+        pending: crate::message_query_manager::GetRecentLocationsPending,
+        mut info: MessagesInfoWalk,
+    ) {
+        let crate::message_query_manager::GetRecentLocationsPending {
+            dialog_id,
+            mut promise,
+        } = pending;
+        if self.global.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        tdutils::log_info!(
+            "Receive {} recent locations in {dialog_id:?}",
+            info.messages.len()
+        );
+        let mut message_ids: Vec<crate::messages_manager::MessageId> = Vec::new();
+        for message in std::mem::take(&mut info.messages) {
+            if let Some((_, message_id)) =
+                self.receive_search_message(message, "on_get_recent_locations")
+            {
+                message_ids.push(message_id);
+            } else {
+                info.total_count -= 1;
+            }
+        }
+        if info.total_count < message_ids.len() as i32 {
+            tdutils::log_error!(
+                "Receive {} valid messages out of {}",
+                message_ids.len(),
+                info.total_count
+            );
+            info.total_count = message_ids.len() as i32;
+        }
+        let objects = self.build_message_objects(
+            &message_ids
+                .into_iter()
+                .map(|message_id| (dialog_id, message_id))
+                .collect::<Vec<_>>(),
+            "on_get_recent_locations",
+        );
+        // `get_messages_object(total_count, dialog, ids, true)` — the
+        // skip-not-found form (cpp:3606-3608)
+        let mut objects: Vec<Option<td_api::Message>> = objects.into_iter().map(Some).collect();
+        let mut result = crate::messages_manager::get_messages_object(
+            info.total_count,
+            std::mem::take(&mut objects),
+            true,
+        );
+        // the live-location `remove_if` (cpp:3609-3617) — every non-
+        // `messageLiveLocation` content drops and the total decrements
+        // with it
+        let before = result.messages.len();
+        result.messages.retain(|m| {
+            matches!(
+                m.content.as_ref(),
+                Some(td_api::MessageContent::messageLiveLocation(_))
+            )
+        });
+        result.total_count -= (before - result.messages.len()) as i32;
+        promise.set_value(result);
+    }
+
+    /// `GetPersonalChannelHistoryQuery::on_result`
+    /// (MessageQueryManager.cpp:2059-2074) — the guest-object walk
+    /// (`get_guest_message_object` per message; the total rides zero,
+    /// the C++ default).
+    fn run_get_personal_channel_history_result(
+        &mut self,
+        messages: Vec<telegram_api::Message>,
+        mut promise: Promise<td_api::Messages>,
+    ) {
+        let mut result: Vec<td_api::Message> = Vec::new();
+        // SAFETY: as `run_on_get_messages_search_result` — the guest
+        // build reads the contexts one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+            unsafe { &mut *td_ptr };
+        for message in messages {
+            if let Some(message_object) =
+                crate::messages_manager::get_guest_message_object(manager, msgctx, message, false)
+            {
+                result.push(message_object);
+            }
+        }
+        promise.set_value(td_api::Messages {
+            total_count: 0,
+            messages: result,
+        });
+    }
+
+    /// `get_found_messages_object`'s per-id build
+    /// (MessagesManager.cpp:19050-19063) — the stored message of each
+    /// full id through `get_message_object`; the in-memory read is the
+    /// collapsed `get_message_force` (the db-load leg is the net-drain 24
+    /// seam).
+    fn build_message_objects(
+        &mut self,
+        full_ids: &[(
+            crate::dialog_id::DialogId,
+            crate::messages_manager::MessageId,
+        )],
+        source: &str,
+    ) -> Vec<td_api::Message> {
+        let mut objects = Vec::with_capacity(full_ids.len());
+        // SAFETY: the alias pair derives from `td_ptr`; the reads use the
+        // contexts strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+            unsafe { &mut *td_ptr };
+        let reactions_ctx: &dyn crate::messages_manager::DialogReactionsContext =
+            unsafe { &*td_ptr };
+        for &(dialog_id, message_id) in full_ids {
+            // hold the message node for the build — the C++ `Message *m`
+            // mutation (`is_update_sent`) rides the map round-trip, the
+            // port's ownership shape (the read_all_dialog_mentions
+            // convention)
+            let Some(mut m) = manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|dialog| dialog.messages.remove(&message_id))
+            else {
+                continue;
+            };
+            let object = crate::messages_manager::get_message_object(
+                manager,
+                reactions_ctx,
+                msgctx,
+                dialog_id,
+                &mut m,
+                source,
+            );
+            let prev = manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(message_id, m);
+            assert!(prev.is_none(), "message reappeared mid-build");
+            if let Some(object) = object {
+                objects.push(object);
+            }
+        }
+        objects
     }
 
     /// Route one payments net answer by kind — the ResultHandler halves
@@ -26875,10 +27785,10 @@ impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_
 /// (M.18) — the C++ manager reads the same surfaces off its `Td *td_`
 /// directly. The `send_update`s buffer into [`Td::message_query_updates`]
 /// and Td drains them; the per-message net query tails (net-drain 28)
-/// dispatch through the env net handle (a handle-less env parks the
-/// promise with the net-inert log) and the search/history tails +
-/// message-plane probes keep their default seam bodies (the honest error
-/// bands in
+/// and the search/history tails (net-drain 29) dispatch through the env
+/// net handle (a handle-less env parks the promise with the net-inert
+/// log) and the message-plane probes keep their default seam bodies (the
+/// honest error bands in
 /// [`crate::message_query_manager::MessageQueryManagerEnv`]).
 pub(crate) struct MessageQueryEnv<'a> {
     pub(crate) global: &'a mut Global,
@@ -26895,12 +27805,183 @@ pub(crate) struct MessageQueryEnv<'a> {
     /// `td_->file_manager_` — the `report_music_listen` file-view read
     /// (the shared registry behind the mutex, cloned per split).
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
-    /// The net-drain 28 dispatch surface (the per-message families' send
-    /// legs); `None` pre-init and in the net-inert tests.
+    /// The net-drain 28/29 dispatch surface (the per-message and
+    /// search/history families' send legs); `None` pre-init and in the
+    /// net-inert tests.
     pub(crate) net: Option<MessageQueryNetHandle>,
-    /// The net-drain 28 parked query state (the handler vectors and
-    /// promises the `Copy` kinds can't carry).
+    /// The net-drain 28/29 parked query state (the handler vectors,
+    /// search offsets/filters and promises the `Copy` kinds can't carry).
     pub(crate) pending: &'a mut crate::message_query_manager::PendingNetQueries,
+    /// `td_->community_manager_` — the search-global community filter's
+    /// `get_input_community` (MessageQueryManager.cpp:572-582).
+    pub(crate) community_manager: &'a mut CommunityManager,
+    /// `td_->star_manager_` — the public-post search's pending-owned-star
+    /// debit at the send (MessageQueryManager.cpp:719-721).
+    pub(crate) star_manager: &'a mut crate::star_manager::StarManager,
+    /// `td.star_updates` — the star plane's update sink (the
+    /// [`MqStarEnv`] adapter).
+    pub(crate) star_updates: &'a mut Vec<td_api::Update>,
+}
+
+impl MessageQueryEnv<'_> {
+    /// `td_->star_manager_->add_pending_owned_star_count` over the
+    /// [`MqStarEnv`] field split (the real debit; the trait default is
+    /// the net-inert log).
+    fn add_pending_owned_star_count(&mut self, star_count: i64, move_to_owned: bool) {
+        if star_count == 0 {
+            return;
+        }
+        let mut star_env = MqStarEnv {
+            global: self.global,
+            options: self.options.as_deref_mut(),
+            auth_is_authorized: self.auth_is_authorized,
+            auth_is_bot: self.auth_is_bot,
+            user_manager: self.user_manager,
+            chat_manager: self.chat_manager,
+            star_updates: self.star_updates,
+        };
+        self.star_manager
+            .add_pending_owned_star_count(&mut star_env, star_count, move_to_owned);
+    }
+
+    /// `DialogManager::get_input_peer` over the env field split (the free
+    /// fn needs `&mut Td`; the env-local mirror is the BotInfoEnv
+    /// convention).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        let MessageQueryEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            chat_manager,
+            ..
+        } = self;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let options = options.as_deref_mut()?;
+                let env = UserEnv {
+                    global,
+                    options,
+                    auth_is_bot: *auth_is_bot,
+                };
+                user_manager.get_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            DialogType::Chat => {
+                chat_manager.get_input_peer_chat(dialog_id.get_chat_id(), access_rights)
+            }
+            DialogType::Channel => {
+                let options = options.as_deref_mut()?;
+                let env = UserEnv {
+                    global,
+                    options,
+                    auth_is_bot: *auth_is_bot,
+                };
+                chat_manager.get_input_peer_channel(&env, dialog_id.get_channel_id(), access_rights)
+            }
+            DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+}
+
+/// The `MessagesInfo` of a `messages_Messages` answer walk
+/// (MessagesInfo.h) — the record the search intakes consume.
+struct MessagesInfoWalk {
+    total_count: i32,
+    messages: Vec<telegram_api::Message>,
+    next_rate: i32,
+}
+
+/// The star-manager slice of the [`MessageQueryEnv`] field split — the
+/// `add_pending_owned_star_count` debit of the public-post search send
+/// (MessageQueryManager.cpp:719-721); the star update sink keeps the
+/// `Td::star_updates` buffer (the `TdStarEnv` shape, narrowed to the
+/// fields the split owns).
+struct MqStarEnv<'a> {
+    global: &'a mut Global,
+    options: Option<&'a mut OptionManager>,
+    auth_is_authorized: bool,
+    auth_is_bot: bool,
+    user_manager: &'a mut UserManager,
+    chat_manager: &'a mut ChatManager,
+    star_updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::star_manager::StarManagerEnv for MqStarEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_status(&self) -> Status {
+        if self.global.close_flag() {
+            Status::error(500, "Request aborted")
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    fn my_user_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_bot_data(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<crate::user_manager::BotData> {
+        match self.user_manager.get_bot_data(user_id) {
+            Ok(bot_data) => tdutils::status::Result::Ok(bot_data),
+            Err(status) => tdutils::status::Result::from_status(status),
+        }
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return tdutils::status::Result::from_status(Status::error(500, "Client is closing"));
+        };
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id).into()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.star_updates.push(update);
+    }
 }
 
 impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_> {
@@ -27856,6 +28937,593 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
             }
             (None, _) => tdutils::log_info!("Send messages.summarizeText — [net-inert]"),
         }
+    }
+
+    // -- the access-gate mirrors of the net-drain 29 families (the
+    //    BotInfoEnv convention): the recent-locations/by-date send gates
+    //    read the dialog-plane state over the env field split
+
+    /// `DialogManager::have_dialog_force` over the env field split.
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self.have_user_force(dialog_id.get_user_id(), source),
+            DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
+        }
+    }
+
+    /// `DialogManager::check_dialog_access` — the env-local mirror of the
+    /// M.6.15a free fn (it takes `&mut Td`, which the field-split env
+    /// cannot reach): the same ladder over the two probes above.
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        use crate::dialog_id::DialogType;
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return Err(Status::error(400, "Invalid chat identifier specified"));
+            }
+            return Err(Status::error(400, "Chat not found"));
+        }
+        if !self.have_input_peer(dialog_id, allow_secret_chats, access_rights) {
+            if dialog_id.get_type() == DialogType::SecretChat && !allow_secret_chats {
+                return Err(Status::error(400, "Not supported in secret chats"));
+            }
+            if matches!(
+                access_rights,
+                crate::user_manager::AccessRights::Write | crate::user_manager::AccessRights::Edit
+            ) {
+                return Err(Status::error(400, "Have no write access to the chat"));
+            }
+            return Err(Status::error(400, "Can't access the chat"));
+        }
+        Ok(())
+    }
+
+    // -- the net-drain 29 send legs: the wire queries the C++ handlers
+    //    build at their send sites (MessageQueryManager.cpp:521-889,
+    //    2046-2079 and the affected-history closures at cpp:4334/4380/
+    //    4443/4536/4783/4832/4866/4876/4911/4962/4973/5150). The
+    //    handler-owned state parks in the Td queues at the send; the
+    //    answers drain through [`Td::on_message_query_net_answer`].
+
+    /// `SearchMessagesGlobalQuery::send` (MessageQueryManager.cpp:537-591)
+    /// — `messages.searchGlobal` with the folder/type/star windows over
+    /// the force-resolved offset peer; the invalid-community band files
+    /// the handler's own 400 through the completed queue (the full
+    /// on_error tail).
+    #[allow(clippy::too_many_arguments)]
+    fn send_search_messages_global_query(
+        &mut self,
+        folder_id: crate::messages_manager::FolderId,
+        ignore_folder_id: bool,
+        query: String,
+        offset_date: i32,
+        offset_dialog_id: crate::dialog_id::DialogId,
+        offset_message_id: crate::messages_manager::MessageId,
+        limit: i32,
+        filter: crate::messages_manager::MessageSearchFilter,
+        chat_type_filter: Option<td_api::SearchMessagesChatTypeFilter>,
+        min_date: i32,
+        max_date: i32,
+        promise: Promise<td_api::FoundMessages>,
+    ) {
+        use crate::message_query_manager::MessageQueryNetKind;
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send messages.searchGlobal for {query} — [net-inert]");
+            return;
+        };
+        self.pending
+            .search_messages_global
+            .push(crate::message_query_manager::SearchMessagesGlobalPending { promise });
+
+        // `DialogManager::get_input_peer_force(offset_dialog_id)`
+        // (cpp:550) — the zero-hash form, always present.
+        let offset_peer = crate::dialog_manager::get_input_peer_force(offset_dialog_id);
+
+        let mut flags = 0;
+        if !ignore_folder_id {
+            flags |= 1 << 0; // FOLDER_ID_MASK
+        }
+        let mut broadcasts_only = false;
+        let mut groups_only = false;
+        let mut users_only = false;
+        let mut community = None;
+        if let Some(chat_type_filter) = &chat_type_filter {
+            match chat_type_filter {
+                td_api::SearchMessagesChatTypeFilter::searchMessagesChatTypeFilterPrivate(_) => {
+                    users_only = true;
+                }
+                td_api::SearchMessagesChatTypeFilter::searchMessagesChatTypeFilterGroup(_) => {
+                    groups_only = true;
+                }
+                td_api::SearchMessagesChatTypeFilter::searchMessagesChatTypeFilterChannel(_) => {
+                    broadcasts_only = true;
+                }
+                td_api::SearchMessagesChatTypeFilter::searchMessagesChatTypeFilterCommunity(
+                    community_filter,
+                ) => {
+                    // `community_manager_->get_input_community(community_id)`
+                    // (cpp:572-582) — the null band is the handler's own
+                    // 400.
+                    let Some(input_community) = self.community_manager.get_input_community_impl(
+                        self.auth_is_bot,
+                        crate::community_id::CommunityId::new(community_filter.community_id),
+                    ) else {
+                        return net.complete_error(
+                            MessageQueryNetKind::SearchMessagesGlobal,
+                            400,
+                            "Invalid community specified",
+                        );
+                    };
+                    community = Some(input_community);
+                    flags |= 1 << 4; // COMMUNITY_MASK
+                }
+            }
+        }
+        if broadcasts_only {
+            flags |= 1 << 1;
+        }
+        if groups_only {
+            flags |= 1 << 2;
+        }
+        if users_only {
+            flags |= 1 << 3;
+        }
+        net.dispatch(
+            MessageQueryNetKind::SearchMessagesGlobal,
+            telegram_api::Function::messages_searchGlobal(telegram_api::messages_searchGlobal {
+                flags,
+                broadcasts_only,
+                groups_only,
+                users_only,
+                folder_id: if ignore_folder_id { 0 } else { folder_id.get() },
+                community,
+                q: query,
+                filter: Some(crate::messages_manager::get_input_messages_filter(filter)),
+                min_date,
+                max_date,
+                offset_rate: offset_date,
+                offset_peer: Some(Box::new(offset_peer)),
+                offset_id: offset_message_id.get_server_message_id().get(),
+                limit,
+            }),
+        );
+    }
+
+    /// `SearchSentMediaQuery::send` (MessageQueryManager.cpp:635-638) —
+    /// `messages.searchSentMedia` over the document filter.
+    fn send_search_sent_media_query(
+        &mut self,
+        query: String,
+        limit: i32,
+        promise: Promise<td_api::FoundMessages>,
+    ) {
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send messages.searchSentMedia for {query} — [net-inert]");
+            return;
+        };
+        self.pending.search_sent_media.push(promise);
+        net.dispatch(
+            crate::message_query_manager::MessageQueryNetKind::SearchSentMedia,
+            telegram_api::Function::messages_searchSentMedia(
+                telegram_api::messages_searchSentMedia {
+                    q: query,
+                    filter: Some(telegram_api::MessagesFilter::inputMessagesFilterDocument(
+                        telegram_api::inputMessagesFilterDocument,
+                    )),
+                    limit,
+                },
+            ),
+        );
+    }
+
+    /// `CheckSearchPostsFloodQuery::send`
+    /// (MessageQueryManager.cpp:675-680) — `channels.checkSearchPostsFlood`
+    /// with the QUERY flag set only for a non-empty query.
+    fn send_check_search_posts_flood_query(
+        &mut self,
+        query: String,
+        promise: Promise<td_api::PublicPostSearchLimits>,
+    ) {
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send channels.checkSearchPostsFlood — [net-inert]");
+            return;
+        };
+        self.pending.check_search_posts_flood.push(promise);
+        let flags = if query.is_empty() { 0 } else { 1 << 0 }; // QUERY_MASK
+        net.dispatch(
+            crate::message_query_manager::MessageQueryNetKind::CheckSearchPostsFlood,
+            telegram_api::Function::channels_checkSearchPostsFlood(
+                telegram_api::channels_checkSearchPostsFlood { flags, query },
+            ),
+        );
+    }
+
+    /// `SearchPublicPostsQuery::send` (MessageQueryManager.cpp:709-727) —
+    /// `channels.searchPosts`, the query form: the paid window arms the
+    /// pending-owned-star debit (`add_pending_owned_star_count(-star_count,
+    /// false)` over the star env) and the ALLOW_PAID_STARS flag.
+    fn send_search_public_posts_query(
+        &mut self,
+        query: String,
+        offset: crate::message_query_manager::MessageSearchOffset,
+        limit: i32,
+        star_count: i64,
+        promise: Promise<td_api::FoundPublicPosts>,
+    ) {
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send channels.searchPosts for {query} — [net-inert]");
+            return;
+        };
+        self.pending.search_public_posts.push(
+            crate::message_query_manager::SearchPublicPostsPending {
+                star_count,
+                promise,
+            },
+        );
+        if star_count > 0 {
+            // `add_pending_owned_star_count(-star_count, false)`
+            // (cpp:719-721) — the debit arms the paid window before the
+            // query goes out.
+            self.add_pending_owned_star_count(-star_count, false);
+        }
+        let mut flags = 1 << 1; // QUERY_MASK
+        if star_count > 0 {
+            flags |= 1 << 2; // ALLOW_PAID_STARS_MASK
+        }
+        let offset_peer = crate::dialog_manager::get_input_peer_force(offset.dialog_id);
+        net.dispatch(
+            crate::message_query_manager::MessageQueryNetKind::SearchPublicPosts,
+            telegram_api::Function::channels_searchPosts(telegram_api::channels_searchPosts {
+                flags,
+                hashtag: String::new(),
+                query,
+                offset_rate: offset.date,
+                offset_peer: Some(Box::new(offset_peer)),
+                offset_id: offset.message_id.get_server_message_id().get(),
+                limit,
+                allow_paid_stars: star_count,
+            }),
+        );
+    }
+
+    /// `SearchPostsQuery::send` (MessageQueryManager.cpp:797-808) —
+    /// `channels.searchPosts`, the hashtag form.
+    fn send_search_posts_query(
+        &mut self,
+        hashtag: String,
+        offset: crate::message_query_manager::MessageSearchOffset,
+        limit: i32,
+        promise: Promise<td_api::FoundMessages>,
+    ) {
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send channels.searchPosts for {hashtag} — [net-inert]");
+            return;
+        };
+        self.pending
+            .search_posts
+            .push(crate::message_query_manager::SearchPostsPending { promise });
+        let flags = 1 << 0; // HASHTAG_MASK
+        let offset_peer = crate::dialog_manager::get_input_peer_force(offset.dialog_id);
+        net.dispatch(
+            crate::message_query_manager::MessageQueryNetKind::SearchPosts,
+            telegram_api::Function::channels_searchPosts(telegram_api::channels_searchPosts {
+                flags,
+                hashtag,
+                query: String::new(),
+                offset_rate: offset.date,
+                offset_peer: Some(Box::new(offset_peer)),
+                offset_id: offset.message_id.get_server_message_id().get(),
+                limit,
+                allow_paid_stars: 0,
+            }),
+        );
+    }
+
+    /// `GetRecentLocationsQuery::send`
+    /// (MessageQueryManager.cpp:852-860) — `messages.getRecentLocations`
+    /// over the read-resolved peer; the access gate upstream makes the
+    /// miss the collapsed 400 band (the C++ CHECK band).
+    fn send_get_recent_locations_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        limit: i32,
+        promise: Promise<td_api::Messages>,
+    ) {
+        use crate::message_query_manager::MessageQueryNetKind;
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send messages.getRecentLocations for {dialog_id:?} — [net-inert]");
+            return;
+        };
+        self.pending
+            .get_recent_locations
+            .push(crate::message_query_manager::GetRecentLocationsPending { dialog_id, promise });
+        let Some(peer) = self.get_input_peer(dialog_id, crate::user_manager::AccessRights::Read)
+        else {
+            return net.complete_error(
+                MessageQueryNetKind::GetRecentLocations,
+                400,
+                "Chat is not accessible",
+            );
+        };
+        net.dispatch(
+            MessageQueryNetKind::GetRecentLocations,
+            telegram_api::Function::messages_getRecentLocations(
+                telegram_api::messages_getRecentLocations {
+                    peer: Some(Box::new(peer)),
+                    limit,
+                    hash: 0,
+                },
+            ),
+        );
+    }
+
+    /// `GetPersonalChannelHistoryQuery::send`
+    /// (MessageQueryManager.cpp:2054-2057) —
+    /// `messages.getPersonalChannelHistory` (the input user resolves
+    /// upstream, `get_input_user`).
+    fn send_get_personal_channel_history_query(
+        &mut self,
+        input_user: telegram_api::InputUser,
+        limit: i32,
+        promise: Promise<td_api::Messages>,
+    ) {
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send messages.getPersonalChannelHistory — [net-inert]");
+            return;
+        };
+        self.pending.get_personal_channel_history.push(promise);
+        net.dispatch(
+            crate::message_query_manager::MessageQueryNetKind::GetPersonalChannelHistory,
+            telegram_api::Function::messages_getPersonalChannelHistory(
+                telegram_api::messages_getPersonalChannelHistory {
+                    user_id: Some(input_user),
+                    limit,
+                    max_id: i32::MAX,
+                    min_id: 0,
+                    hash: 0,
+                },
+            ),
+        );
+    }
+
+    /// The affected-history refill (`run_affected_history_query_until_complete`'s
+    /// `query(dialog_id, query_promise)` closures at
+    /// MessageQueryManager.cpp:4334/4380/4443/4536/4783/4832/4866/4876/
+    /// 4911/4962/4973/5150) — one wire function per
+    /// [`crate::message_query_manager::AffectedHistoryQueryKind`]; the
+    /// loop continuation state parks in the kind-FIFO queue — the
+    /// collapsed-plane form of the C++ query promise that rides its own
+    /// handler; the send-site peer misses file the
+    /// handler's own band through the completed queue (the full on_error
+    /// tail).
+    fn send_affected_history_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        query: crate::message_query_manager::AffectedHistoryQueryKind,
+        get_affected_messages: bool,
+        promise: Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        use crate::message_query_manager::MessageQueryNetKind;
+        use crate::user_manager::AccessRights;
+        let kind = MessageQueryNetKind::AffectedHistory(query);
+        let Some(net) = self.net.clone() else {
+            tdutils::log_info!("Send the {query:?} affected-history query — [net-inert]");
+            return;
+        };
+        self.pending
+            .affected_history
+            .push(crate::message_query_manager::AffectedHistoryPending {
+                dialog_id,
+                kind: query,
+                get_affected_messages,
+                promise,
+            });
+
+        // The per-kind wire builds; the peer bands mirror the C++ handler
+        // send sites.
+        let function = match query {
+            // `DeletePhoneCallHistoryQuery::send` (cpp:1572-1574).
+            AffectedHistoryQueryKind::DeleteAllCallMessages { revoke } => {
+                telegram_api::Function::messages_deletePhoneCallHistory(
+                    telegram_api::messages_deletePhoneCallHistory {
+                        flags: i32::from(revoke),
+                        revoke,
+                    },
+                )
+            }
+            // `DeleteParticipantHistoryQuery::send` (cpp:1605-1618).
+            AffectedHistoryQueryKind::DeleteAllChannelMessagesFromSender { sender_dialog_id } => {
+                let channel_id = dialog_id.get_channel_id();
+                let input_channel = (|| {
+                    let env = UserEnv {
+                        global: self.global,
+                        options: self.options.as_deref_mut()?,
+                        auth_is_bot: self.auth_is_bot,
+                    };
+                    self.chat_manager.get_input_channel(&env, channel_id)
+                })();
+                let Some(input_channel) = input_channel else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                let Some(participant) = self.get_input_peer(sender_dialog_id, AccessRights::Know)
+                else {
+                    return net.complete_error(kind, 400, "Message sender is not accessible");
+                };
+                telegram_api::Function::channels_deleteParticipantHistory(
+                    telegram_api::channels_deleteParticipantHistory {
+                        channel: Some(input_channel),
+                        participant: Some(Box::new(participant)),
+                    },
+                )
+            }
+            // `DeleteHistoryQuery::send` (cpp:1646-1659).
+            AffectedHistoryQueryKind::DeleteDialogHistory {
+                max_message_id,
+                remove_from_dialog_list,
+                revoke,
+            } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                telegram_api::Function::messages_deleteHistory(
+                    telegram_api::messages_deleteHistory {
+                        flags: i32::from(revoke) << 1,
+                        just_clear: !remove_from_dialog_list,
+                        revoke,
+                        peer: Some(Box::new(peer)),
+                        max_id: max_message_id.get_server_message_id().get(),
+                        min_date: 0,
+                        max_date: 0,
+                    },
+                )
+            }
+            // `DeleteMessagesByDateQuery::send` (cpp:1727-1740).
+            AffectedHistoryQueryKind::DeleteDialogMessagesByDate {
+                min_date,
+                max_date,
+                revoke,
+            } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                telegram_api::Function::messages_deleteHistory(
+                    telegram_api::messages_deleteHistory {
+                        flags: (1 << 2) | (1 << 3) | (i32::from(revoke) << 1),
+                        just_clear: true,
+                        revoke,
+                        peer: Some(Box::new(peer)),
+                        max_id: 0,
+                        min_date,
+                        max_date,
+                    },
+                )
+            }
+            // `DeleteTopicHistoryQuery::send` (cpp:1938-1949).
+            AffectedHistoryQueryKind::DeleteTopicHistory { forum_topic_id } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Write) else {
+                    return net.complete_error(kind, 400, "Can't access the chat");
+                };
+                telegram_api::Function::messages_deleteTopicHistory(
+                    telegram_api::messages_deleteTopicHistory {
+                        peer: Some(Box::new(peer)),
+                        top_msg_id: forum_topic_id.get(),
+                    },
+                )
+            }
+            // `ReadMentionsQuery::send` (cpp:2094-2104) — the dialog and
+            // topic forms.
+            AffectedHistoryQueryKind::ReadAllDialogMentions => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                telegram_api::Function::messages_readMentions(telegram_api::messages_readMentions {
+                    flags: 0,
+                    peer: Some(Box::new(peer)),
+                    top_msg_id: 0,
+                })
+            }
+            AffectedHistoryQueryKind::ReadAllTopicMentions { forum_topic_id } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                telegram_api::Function::messages_readMentions(telegram_api::messages_readMentions {
+                    flags: 1 << 0, // TOP_MSG_ID_MASK
+                    peer: Some(Box::new(peer)),
+                    top_msg_id: forum_topic_id.get(),
+                })
+            }
+            // `ReadReactionsQuery::send` (cpp:2134-2152) — the saved-peer
+            // leg rides the SavedMessages plane (not carried by the kind).
+            AffectedHistoryQueryKind::ReadAllDialogReactions => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                telegram_api::Function::messages_readReactions(
+                    telegram_api::messages_readReactions {
+                        flags: 0,
+                        peer: Some(Box::new(peer)),
+                        top_msg_id: 0,
+                        saved_peer_id: None,
+                    },
+                )
+            }
+            AffectedHistoryQueryKind::ReadAllTopicReactions { forum_topic_id } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                telegram_api::Function::messages_readReactions(
+                    telegram_api::messages_readReactions {
+                        flags: 1 << 0, // TOP_MSG_ID_MASK
+                        peer: Some(Box::new(peer)),
+                        top_msg_id: forum_topic_id.get(),
+                        saved_peer_id: None,
+                    },
+                )
+            }
+            // `ReadPollVotesQuery::send` (cpp:2172-2192).
+            AffectedHistoryQueryKind::ReadAllDialogPollVotes { forum_topic_id } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Read) else {
+                    return net.complete_error(kind, 400, "Chat is not accessible");
+                };
+                let flags = if forum_topic_id.is_valid() { 1 << 0 } else { 0 };
+                telegram_api::Function::messages_readPollVotes(
+                    telegram_api::messages_readPollVotes {
+                        flags,
+                        peer: Some(Box::new(peer)),
+                        top_msg_id: forum_topic_id.get(),
+                    },
+                )
+            }
+            // `UnpinAllMessagesQuery::send` (cpp:2295-2321) — the "can't
+            // unpin" band logs the C++ INFO first.
+            AffectedHistoryQueryKind::UnpinAllDialogMessages => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Write) else {
+                    tdutils::log_info!("Can't unpin all messages in {dialog_id:?}");
+                    return net.complete_error(kind, 400, "Can't unpin all messages");
+                };
+                telegram_api::Function::messages_unpinAllMessages(
+                    telegram_api::messages_unpinAllMessages {
+                        flags: 0,
+                        peer: Some(Box::new(peer)),
+                        top_msg_id: 0,
+                        saved_peer_id: None,
+                    },
+                )
+            }
+            AffectedHistoryQueryKind::UnpinAllTopicMessages { forum_topic_id } => {
+                let Some(peer) = self.get_input_peer(dialog_id, AccessRights::Write) else {
+                    tdutils::log_info!("Can't unpin all messages in {dialog_id:?}");
+                    return net.complete_error(kind, 400, "Can't unpin all messages");
+                };
+                telegram_api::Function::messages_unpinAllMessages(
+                    telegram_api::messages_unpinAllMessages {
+                        flags: 1 << 0, // TOP_MSG_ID_MASK
+                        peer: Some(Box::new(peer)),
+                        top_msg_id: forum_topic_id.get(),
+                        saved_peer_id: None,
+                    },
+                )
+            }
+        };
+        net.dispatch(kind, function);
     }
 }
 
@@ -39085,9 +40753,12 @@ pub(crate) fn message_query_env_split(
         chat_manager,
         updates_manager,
         file_manager,
+        community_manager,
+        star_manager,
+        star_updates,
+        message_query_net_pending,
         message_query_manager,
         message_query_updates,
-        message_query_net_pending,
         can_ignore_background_updates,
         ..
     } = td;
@@ -39105,6 +40776,9 @@ pub(crate) fn message_query_env_split(
             file_manager: std::sync::Arc::clone(file_manager),
             net,
             pending: message_query_net_pending,
+            community_manager,
+            star_manager,
+            star_updates,
         },
         message_query_manager,
     )
@@ -40415,6 +42089,135 @@ impl crate::messages_manager::MmRequestContext for Td {
             ),
         );
         Ok(())
+    }
+
+    // -- the affected-history refills (the net-drain 29 wire tails;
+    // MessageQueryManager.cpp:4830-4978/:5144-5151) — the thin loop
+    // entries over the `MessageQueryEnv` split; the send arm builds the
+    // per-kind wire function and parks the loop continuation
+
+    /// `MessageQueryManager::unpin_all_dialog_messages_on_server`
+    /// (MessageQueryManager.cpp:5144-5151) —
+    /// `messages.unpinAllMessages`, `get_affected_messages = true`.
+    fn unpin_all_dialog_messages_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        manager.run_affected_history_query_until_complete(
+            &mut env,
+            dialog_id,
+            AffectedHistoryQueryKind::UnpinAllDialogMessages,
+            true,
+            promise,
+        );
+    }
+
+    /// `MessageQueryManager::unpin_all_topic_messages_on_server`
+    /// (MessageQueryManager.cpp:4972-4978) — the TOP_MSG_ID window form.
+    fn unpin_all_topic_messages_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        manager.run_affected_history_query_until_complete(
+            &mut env,
+            dialog_id,
+            AffectedHistoryQueryKind::UnpinAllTopicMessages { forum_topic_id },
+            true,
+            promise,
+        );
+    }
+
+    /// `MessageQueryManager::read_all_dialog_reactions_on_server`
+    /// (MessageQueryManager.cpp:4908-4915) — `messages.readReactions`,
+    /// `get_affected_messages = false`.
+    fn read_all_dialog_reactions_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        manager.run_affected_history_query_until_complete(
+            &mut env,
+            dialog_id,
+            AffectedHistoryQueryKind::ReadAllDialogReactions,
+            false,
+            promise,
+        );
+    }
+
+    /// `MessageQueryManager::read_all_topic_reactions_on_server`
+    /// (MessageQueryManager.cpp:4873-4881) — the topic form,
+    /// `get_affected_messages = true`.
+    fn read_all_topic_reactions_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        manager.run_affected_history_query_until_complete(
+            &mut env,
+            dialog_id,
+            AffectedHistoryQueryKind::ReadAllTopicReactions { forum_topic_id },
+            true,
+            promise,
+        );
+    }
+
+    /// `MessageQueryManager::read_all_dialog_mentions_on_server`
+    /// (MessageQueryManager.cpp:4860-4870) / `read_all_topic_mentions_on_server`
+    /// (cpp:4830-4836) — `messages.readMentions`; the topic form carries
+    /// `get_affected_messages = true`, the dialog form `false`.
+    fn read_all_mentions_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        let kind = if forum_topic_id.is_valid() {
+            AffectedHistoryQueryKind::ReadAllTopicMentions { forum_topic_id }
+        } else {
+            AffectedHistoryQueryKind::ReadAllDialogMentions
+        };
+        let get_affected_messages = forum_topic_id.is_valid();
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        manager.run_affected_history_query_until_complete(
+            &mut env,
+            dialog_id,
+            kind,
+            get_affected_messages,
+            promise,
+        );
+    }
+
+    /// `MessageQueryManager::read_all_dialog_poll_votes_on_server`
+    /// (MessageQueryManager.cpp:4957-4966) — `messages.readPollVotes`,
+    /// `get_affected_messages = false`.
+    fn read_all_dialog_poll_votes_on_server(
+        &mut self,
+        dialog_id: crate::messages_manager::DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        use crate::message_query_manager::AffectedHistoryQueryKind;
+        let (mut env, manager) = crate::td::message_query_env_split(self);
+        manager.run_affected_history_query_until_complete(
+            &mut env,
+            dialog_id,
+            AffectedHistoryQueryKind::ReadAllDialogPollVotes { forum_topic_id },
+            false,
+            promise,
+        );
     }
 
     fn get_chat_id_object(
@@ -46331,6 +48134,24 @@ mod tests {
 
     type GiveawayInfoSlot =
         std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::GiveawayInfo>>>>;
+
+    /// The `()`-promise recording pair (the record_giveaway_info shape).
+    /// The `()`-result recording slot (the GiveawayOptionsSlot shape).
+    type UnitResultSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    fn record_unit() -> (Promise<()>, UnitResultSlot) {
+        struct Rec(UnitResultSlot);
+        impl tdutils::promise::PromiseInterface<()> for Rec {
+            fn set_value(&mut self, value: ()) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: UnitResultSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
 
     fn record_giveaway_info() -> (Promise<td_api::GiveawayInfo>, GiveawayInfoSlot) {
         struct Rec(GiveawayInfoSlot);
@@ -66008,6 +67829,861 @@ kQIDAQAB\n\
             })
             .count();
         assert_eq!(stray_count, 0, "no stray queries");
+    }
+
+    #[test]
+    fn message_query_search_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(message_query_search_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 29 netted round-trips: the five search families,
+    /// the recent-locations family, the personal-channel guest walk and
+    /// the affected-history refills over the live td_api arms
+    /// (MessageQueryManager.cpp:521-889, 2046-2079 and the loop at
+    /// cpp:2447-2492).
+    fn message_query_search_families_ride_the_dispatcher_impl() {
+        /// A text wire message of the seeded user dialog (the flag bits:
+        /// `from_id:flags.8`, `media:flags.9` — the gated fields need
+        /// them on the wire).
+        fn text_wire_message(id: i32, date: i32, text: &str) -> telegram_api::Message {
+            telegram_api::Message::message(telegram_api::message {
+                id,
+                flags: 1 << 8, // FROM_ID
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 700000001,
+                })),
+                from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 700000001,
+                })),
+                date,
+                message: text.to_owned(),
+                ..telegram_api::message::default()
+            })
+        }
+        /// `messages.messagesSlice` with the seeded user + the messages.
+        fn slice_answer(
+            count: i32,
+            next_rate: i32,
+            messages: Vec<telegram_api::Message>,
+        ) -> Vec<u8> {
+            let slice = telegram_api::messages_Messages::messages_messagesSlice(
+                telegram_api::messages_messagesSlice {
+                    flags: if next_rate > 0 { 1 } else { 0 },
+                    inexact: false,
+                    count,
+                    next_rate,
+                    offset_id_offset: 0,
+                    search_flood: None,
+                    messages,
+                    topics: Vec::new(),
+                    chats: Vec::new(),
+                    users: vec![wire_user(700000001, "User")],
+                },
+            );
+            let mut out = Vec::new();
+            slice.store(&mut out);
+            out
+        }
+        /// `messages.affectedHistory` (the loop refill answer).
+        fn affected_history_answer(pts: i32, pts_count: i32, offset: i32) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_AffectedHistory {
+                pts,
+                pts_count,
+                offset,
+            }
+            .store_boxed(&mut out);
+            out
+        }
+        /// `messages.affectedFoundMessages` — the phone-call family's
+        /// answer form (the ids ride an updateDeleteMessages pts update).
+        fn affected_found_messages_answer(pts: i32, pts_count: i32, offset: i32) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_AffectedFoundMessages {
+                pts,
+                pts_count,
+                offset,
+                messages: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            out
+        }
+
+        /// The packed td_api message id of a server id (the MessageId
+        /// form the built objects carry).
+        fn packed_id(server_id: i32) -> i64 {
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(server_id),
+            )
+            .get()
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain29-mq-search");
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+        seed_my_user(&mut td); // my id 42
+        let user_chat = crate::messages_manager::DialogId::from_user_id(
+            crate::user_manager::UserId::new(700000001),
+        )
+        .get();
+        // the dialog record the read-all/unpin request arms' local halves
+        // read (the have_dialog_force probe over messages_manager)
+        {
+            let mut d = Box::new(crate::messages_manager::Dialog::default());
+            d.dialog_id = crate::messages_manager::DialogId::from_user_id(
+                crate::user_manager::UserId::new(700000001),
+            );
+            td.messages_manager.dialogs.insert(
+                crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+                    700000001,
+                )),
+                d,
+            );
+        }
+
+        // 1. searchMessages — the global search over the whole-chat-list
+        //    form (ignore_folder): the FOLDER_ID flag stays unset, the
+        //    empty offset rides the max date + the empty peer
+        td.request(
+            1,
+            Function::searchMessages(td_api::searchMessages {
+                chat_list: None,
+                query: "hello".to_owned(),
+                offset: String::new(),
+                limit: 10,
+                filter: None,
+                chat_type_filter: None,
+                min_date: 0,
+                max_date: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_searchGlobal::ID,
+        );
+        let body = telegram_api::messages_searchGlobal::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.q, "hello");
+        assert_eq!(
+            body.flags & 1,
+            0,
+            "the ignore-folder form leaves FOLDER_ID unset"
+        );
+        assert_eq!(body.folder_id, 0);
+        assert_eq!(body.limit, 10);
+        assert_eq!(body.offset_rate, i32::MAX, "the empty offset date");
+        assert_eq!(body.offset_id, 0);
+        net_complete(
+            sent,
+            slice_answer(
+                7,
+                1700000100,
+                vec![text_wire_message(100, 1700000000, "hello world")],
+            ),
+        );
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::foundMessages(found)) => {
+                assert_eq!(found.total_count, 7);
+                assert_eq!(found.messages.len(), 1);
+                assert_eq!(found.messages[0].id, packed_id(100));
+                // the next offset carries the answer message position
+                // (the date first: the offset string form)
+                assert!(
+                    found.next_offset.starts_with("1700000100,"),
+                    "{}",
+                    found.next_offset
+                );
+            }
+            other => panic!("expected foundMessages, got {other:?}"),
+        }
+
+        // 1b. the SEARCH_QUERY_EMPTY band answers the empty found object
+        td.request(
+            11,
+            Function::searchMessages(td_api::searchMessages {
+                chat_list: None,
+                query: "q".to_owned(),
+                offset: String::new(),
+                limit: 10,
+                filter: None,
+                chat_type_filter: None,
+                min_date: 0,
+                max_date: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_searchGlobal::ID,
+        );
+        net_fail(sent, 400, "SEARCH_QUERY_EMPTY");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 11).first() {
+            Some(Object::foundMessages(found)) => {
+                assert_eq!(found.total_count, 0);
+                assert!(found.messages.is_empty());
+                assert!(found.next_offset.is_empty());
+            }
+            other => panic!("expected the empty foundMessages, got {other:?}"),
+        }
+
+        // 2. searchOutgoingDocumentMessages — the document filter rides
+        //    the wire; the answer's non-document messages drop
+        td.request(
+            2,
+            Function::searchOutgoingDocumentMessages(td_api::searchOutgoingDocumentMessages {
+                query: "doc".to_owned(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_searchSentMedia::ID,
+        );
+        let body =
+            telegram_api::messages_searchSentMedia::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.q, "doc");
+        assert!(matches!(
+            body.filter,
+            Some(telegram_api::MessagesFilter::inputMessagesFilterDocument(_))
+        ));
+        net_complete(
+            sent,
+            slice_answer(
+                5,
+                0,
+                vec![
+                    text_wire_message(101, 1700000000, "photo"),
+                    telegram_api::Message::message(telegram_api::message {
+                        id: 102,
+                        flags: (1 << 8) | (1 << 9), // FROM_ID + MEDIA
+                        peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                            user_id: 700000001,
+                        })),
+                        from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                            user_id: 700000001,
+                        })),
+                        date: 1700000001,
+                        message: String::new(),
+                        media: Some(Box::new(telegram_api::MessageMedia::messageMediaDocument(
+                            telegram_api::messageMediaDocument {
+                                // `document:flags.0?Document` — the wire
+                                // form carries the bit
+                                flags: 1,
+                                document: Some(telegram_api::Document::document(
+                                    telegram_api::document {
+                                        id: 900,
+                                        access_hash: 1,
+                                        file_reference: b"ref".to_vec(),
+                                        date: 1700000001,
+                                        mime_type: "application/pdf".to_owned(),
+                                        size: 8,
+                                        dc_id: 1,
+                                        attributes: Vec::new(),
+                                        ..telegram_api::document::default()
+                                    },
+                                )),
+                                ..telegram_api::messageMediaDocument::default()
+                            },
+                        ))),
+                        ..telegram_api::message::default()
+                    }),
+                ],
+            ),
+        );
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::foundMessages(found)) => {
+                // the photo dropped, the total rewrote to the documents
+                assert_eq!(found.total_count, 1);
+                assert_eq!(found.messages.len(), 1);
+                assert_eq!(found.messages[0].id, packed_id(102));
+                assert!(matches!(
+                    found.messages[0].content,
+                    Some(td_api::MessageContent::messageDocument(_))
+                ));
+            }
+            other => panic!("expected the document-only foundMessages, got {other:?}"),
+        }
+
+        // 3. getPublicPostSearchLimits — the flood-check answers the
+        //    limits object
+        td.request(
+            3,
+            Function::getPublicPostSearchLimits(td_api::getPublicPostSearchLimits {
+                query: "news".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_checkSearchPostsFlood::ID,
+        );
+        let body = telegram_api::channels_checkSearchPostsFlood::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1, "the QUERY flag for a non-empty query");
+        assert_eq!(body.query, "news");
+        let flood = telegram_api::SearchPostsFlood {
+            flags: 1, // QUERY_IS_FREE
+            query_is_free: true,
+            total_daily: 10,
+            remains: 5,
+            wait_till: 0,
+            stars_amount: 0,
+        };
+        let mut answer = Vec::new();
+        flood.store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 3).first() {
+            Some(Object::publicPostSearchLimits(limits)) => {
+                assert_eq!(limits.daily_free_query_count, 10);
+                assert_eq!(limits.remaining_free_query_count, 5);
+                assert!(limits.is_current_query_free);
+            }
+            other => panic!("expected publicPostSearchLimits, got {other:?}"),
+        }
+
+        // 4. searchPosts — the public search with the paid window: the
+        //    debit arms the query, the flood rides the messagesSlice, the
+        //    answer re-adds the stars
+        td.request(
+            4,
+            Function::searchPublicPosts(td_api::searchPublicPosts {
+                query: "stars".to_owned(),
+                offset: String::new(),
+                limit: 10,
+                star_count: 100,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_searchPosts::ID,
+        );
+        let body = telegram_api::channels_searchPosts::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, (1 << 1) | (1 << 2), "QUERY + ALLOW_PAID_STARS");
+        assert_eq!(body.query, "stars");
+        assert_eq!(body.hashtag, "");
+        assert_eq!(body.allow_paid_stars, 100);
+        // the flood rides the slice (flags.3), the paid window is not
+        // free (the stars re-add takes the move form)
+        let answer = telegram_api::messages_Messages::messages_messagesSlice(
+            telegram_api::messages_messagesSlice {
+                flags: (1 << 3) | 1, // SEARCH_FLOOD + NEXT_RATE
+                inexact: false,
+                count: 3,
+                next_rate: 1700000500,
+                offset_id_offset: 0,
+                search_flood: Some(telegram_api::SearchPostsFlood {
+                    flags: 0,
+                    query_is_free: false,
+                    total_daily: 10,
+                    remains: 0,
+                    wait_till: 60,
+                    stars_amount: 50,
+                }),
+                messages: vec![text_wire_message(200, 1700000400, "paid post")],
+                topics: Vec::new(),
+                chats: Vec::new(),
+                users: vec![wire_user(700000001, "User")],
+            },
+        );
+        let mut out = Vec::new();
+        answer.store(&mut out);
+        net_complete(sent, out);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 4).first() {
+            Some(Object::foundPublicPosts(found)) => {
+                assert_eq!(found.messages.len(), 1);
+                assert_eq!(found.messages[0].id, packed_id(200));
+                assert!(!found.are_limits_exceeded);
+                let limits = found.search_limits.as_ref().expect("the flood limits");
+                assert!(!limits.is_current_query_free);
+                assert_eq!(limits.star_count, 50);
+                assert!(
+                    found.next_offset.starts_with("1700000500,"),
+                    "{}",
+                    found.next_offset
+                );
+            }
+            other => panic!("expected foundPublicPosts, got {other:?}"),
+        }
+
+        // 4b. the FLOOD_WAIT_OR_STARS error rewrite
+        td.request(
+            14,
+            Function::searchPublicPosts(td_api::searchPublicPosts {
+                query: "again".to_owned(),
+                offset: String::new(),
+                limit: 10,
+                star_count: 0,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_searchPosts::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_120_OR_STARS_5");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 14).first() {
+            Some(Object::foundPublicPosts(found)) => {
+                assert!(found.are_limits_exceeded);
+                let limits = found.search_limits.as_ref().expect("the rewrite limits");
+                assert_eq!(limits.next_free_query_in, 120);
+                assert_eq!(
+                    limits.star_count,
+                    crate::star_manager::get_star_count(5, false).max(1)
+                );
+                assert!(limits.is_current_query_free);
+            }
+            other => panic!("expected the exceeded foundPublicPosts, got {other:?}"),
+        }
+
+        // 5. searchPublicMessagesByTag — the hashtag form of
+        //    channels.searchPosts
+        td.request(
+            5,
+            Function::searchPublicMessagesByTag(td_api::searchPublicMessagesByTag {
+                tag: "#news".to_owned(),
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_searchPosts::ID,
+        );
+        let body = telegram_api::channels_searchPosts::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1, "HASHTAG only");
+        assert_eq!(body.hashtag, "#news");
+        assert_eq!(body.query, "");
+        net_complete(
+            sent,
+            slice_answer(2, 0, vec![text_wire_message(300, 1700000300, "tagged")]),
+        );
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 5).first() {
+            Some(Object::foundMessages(found)) => {
+                assert_eq!(found.total_count, 2);
+                assert_eq!(found.messages.len(), 1);
+                assert_eq!(found.messages[0].id, packed_id(300));
+                assert!(found.next_offset.starts_with("1700000300,"));
+            }
+            other => panic!("expected the hashtag foundMessages, got {other:?}"),
+        }
+
+        // 6. searchChatRecentLocationMessages — the Read peer of the
+        //    seeded user dialog rides the wire
+        td.request(
+            6,
+            Function::searchChatRecentLocationMessages(td_api::searchChatRecentLocationMessages {
+                chat_id: user_chat,
+                limit: 5,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getRecentLocations::ID,
+        );
+        let body =
+            telegram_api::messages_getRecentLocations::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.limit, 5);
+        match body.peer {
+            Some(boxed) => match *boxed {
+                telegram_api::InputPeer::inputPeerUser(peer) => {
+                    assert_eq!(peer.user_id, 700000001);
+                    // the answer walks re-intaked the user, so the hash
+                    // rides the wire_user fixture's 42 (the updated
+                    // record, not the seed's 5)
+                    assert_eq!(peer.access_hash, 42);
+                }
+                other => panic!("expected the user input peer, got {other:?}"),
+            },
+            None => panic!("expected the user input peer, got none"),
+        }
+        // a live location stays, a plain text message drops with the
+        // total decrement (the cpp:3609-3617 remove_if band)
+        let live_location_message = telegram_api::Message::message(telegram_api::message {
+            id: 401,
+            flags: (1 << 8) | (1 << 9), // FROM_ID + MEDIA
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 700000001,
+            })),
+            from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 700000001,
+            })),
+            date: 1700000201,
+            message: String::new(),
+            media: Some(Box::new(telegram_api::MessageMedia::messageMediaGeoLive(
+                telegram_api::messageMediaGeoLive {
+                    flags: 0,
+                    geo: Some(telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
+                        lat: 1.0,
+                        long: 2.0,
+                        ..telegram_api::geoPoint::default()
+                    })),
+                    heading: 0,
+                    period: 60,
+                    proximity_notification_radius: 0,
+                },
+            ))),
+            ..telegram_api::message::default()
+        });
+        net_complete(
+            sent,
+            slice_answer(
+                2,
+                0,
+                vec![
+                    text_wire_message(400, 1700000200, "location"),
+                    live_location_message,
+                ],
+            ),
+        );
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 6).first() {
+            Some(Object::messages(messages)) => {
+                // the text message dropped: 2 - 1
+                assert_eq!(messages.total_count, 1);
+                assert_eq!(messages.messages.len(), 1);
+                assert_eq!(messages.messages[0].id, packed_id(401));
+                assert!(matches!(
+                    messages.messages[0].content,
+                    Some(td_api::MessageContent::messageLiveLocation(_))
+                ));
+            }
+            other => panic!("expected messages, got {other:?}"),
+        }
+
+        // 7. deleteAllCallMessages — the affected-history loop over the
+        //    wire: a partial answer re-sends the query, the final answer
+        //    resolves the request
+        td.request(
+            7,
+            Function::deleteAllCallMessages(td_api::deleteAllCallMessages { revoke: true }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_deletePhoneCallHistory::ID,
+        );
+        let body = telegram_api::messages_deletePhoneCallHistory::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1);
+        assert!(body.revoke);
+        net_complete(sent, affected_found_messages_answer(10, 0, 1));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 7).is_empty(),
+            "the partial answer keeps the loop running"
+        );
+        let resent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_deletePhoneCallHistory::ID,
+        );
+        net_complete(resent, affected_found_messages_answer(11, 0, 0));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 7).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. deleteChatMessagesByDate — the by-date window rides the
+        //    deleteHistory flags; the error band fails the promise
+        //    (the dialog-error head logs)
+        td.request(
+            8,
+            Function::deleteChatMessagesByDate(td_api::deleteChatMessagesByDate {
+                chat_id: user_chat,
+                min_date: 1376438400,
+                max_date: 1400000000,
+                revoke: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_deleteHistory::ID,
+        );
+        let body =
+            telegram_api::messages_deleteHistory::parse(sent.query()).expect("the sent body");
+        // JUST_CLEAR rides bit 0 of the parsed word (the store ORs the
+        // bool in), so the by-date form reads 13 = JUST_CLEAR|MIN_DATE|MAX_DATE
+        assert_eq!(
+            body.flags,
+            (1 << 0) | (1 << 2) | (1 << 3),
+            "JUST_CLEAR + MIN_DATE + MAX_DATE"
+        );
+        assert!(body.just_clear);
+        assert!(!body.revoke);
+        assert_eq!(body.min_date, 1376438400);
+        assert_eq!(body.max_date, 1400000000);
+        net_complete(sent, affected_history_answer(20, 0, 0));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 8).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8b. the invalid-dialog band of check_dialog_access answers the
+        //     invalid-identifier 400 (DialogManager.cpp:1353-1358, no wire
+        //     query)
+        td.request(
+            18,
+            Function::deleteChatMessagesByDate(td_api::deleteChatMessagesByDate {
+                chat_id: 0,
+                min_date: 1376438400,
+                max_date: 1400000000,
+                revoke: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 18);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid chat identifier specified")
+        );
+
+        // 9. readAllChatMentions — the local half parks nothing new, the
+        //    refill rides messages.readMentions and the promise settles
+        //    at the final answer
+        td.request(
+            9,
+            Function::readAllChatMentions(td_api::readAllChatMentions { chat_id: user_chat }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_readMentions::ID,
+        );
+        let body = telegram_api::messages_readMentions::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 0);
+        assert_eq!(body.top_msg_id, 0);
+        net_complete(sent, affected_history_answer(30, 0, 0));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 9).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 10. unpinAllChatMessages + readAllChatReactions + the poll
+        //     votes — the remaining refill families over their own wire
+        //     functions
+        td.request(
+            10,
+            Function::unpinAllChatMessages(td_api::unpinAllChatMessages { chat_id: user_chat }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_unpinAllMessages::ID,
+        );
+        net_complete(sent, affected_history_answer(40, 0, 0));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 10).first(),
+            Some(Object::ok(_))
+        ));
+
+        td.request(
+            12,
+            Function::readAllChatReactions(td_api::readAllChatReactions { chat_id: user_chat }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_readReactions::ID,
+        );
+        net_complete(sent, affected_history_answer(50, 0, 0));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::ok(_))
+        ));
+
+        td.request(
+            13,
+            Function::readAllChatPollVotes(td_api::readAllChatPollVotes { chat_id: user_chat }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_readPollVotes::ID,
+        );
+        net_complete(sent, affected_history_answer(60, 0, 0));
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 11. the by-sender family — the request gate holds it (the
+        //     rights plane), so drive the loop manager-side over the
+        //     split: channels.deleteParticipantHistory rides the wire
+        //     with the channel + the sender peer
+        let channel_dialog = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(9999),
+        );
+        let (promise7, slot7) = record_unit();
+        {
+            let (mut env, manager) = crate::td::message_query_env_split(&mut td);
+            manager.run_affected_history_query_until_complete(
+                &mut env,
+                channel_dialog,
+                crate::message_query_manager::AffectedHistoryQueryKind::DeleteAllChannelMessagesFromSender {
+                    sender_dialog_id: crate::messages_manager::DialogId::from_user_id(
+                        crate::user_manager::UserId::new(700000001),
+                    ),
+                },
+                true,
+                promise7,
+            );
+        }
+        // the channel is not known — the send-site band files the
+        // handler's 400 through the completed queue
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        let outcome = slot7.lock().unwrap().take();
+        assert!(
+            matches!(&outcome, Some(tdutils::status::Result::Err(status)) if status.message() == "Chat is not accessible"),
+            "the unknown-channel band, got {outcome:?}"
+        );
+
+        // no stray queries beyond the family set
+        let stray_count = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .filter(|query| {
+                ![
+                    telegram_api::messages_searchGlobal::ID,
+                    telegram_api::messages_searchSentMedia::ID,
+                    telegram_api::channels_checkSearchPostsFlood::ID,
+                    telegram_api::channels_searchPosts::ID,
+                    telegram_api::messages_getRecentLocations::ID,
+                    telegram_api::messages_deletePhoneCallHistory::ID,
+                    telegram_api::messages_deleteHistory::ID,
+                    telegram_api::messages_readMentions::ID,
+                    telegram_api::messages_unpinAllMessages::ID,
+                    telegram_api::messages_readReactions::ID,
+                    telegram_api::messages_readPollVotes::ID,
+                ]
+                .contains(&query.tl_constructor())
+            })
+            .count();
+        assert_eq!(stray_count, 0, "no stray queries");
+    }
+
+    #[test]
+    fn personal_channel_history_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(personal_channel_history_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The bot-only guest walk of `getPersonalChatHistory`
+    /// (MessageQueryManager.cpp:2046-2079): the input user rides
+    /// `messages.getPersonalChannelHistory`, the answers build through
+    /// `get_guest_message_object` (no store reads).
+    fn personal_channel_history_rides_the_dispatcher_impl() {
+        /// The packed td_api message id of a server id (the guest build
+        /// answers `MessageId::get()`).
+        fn packed_id(server_id: i32) -> i64 {
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(server_id),
+            )
+            .get()
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain29-mq-personal-channel");
+        td.auth_manager.force_bot_for_test();
+        seed_dialog_user(&mut td); // user 700000001, access hash 5
+
+        td.request(
+            1,
+            Function::getPersonalChatHistory(td_api::getPersonalChatHistory {
+                user_id: 700000001,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPersonalChannelHistory::ID,
+        );
+        let body = telegram_api::messages_getPersonalChannelHistory::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.limit, 10);
+        assert_eq!(body.max_id, i32::MAX);
+        match body.user_id {
+            Some(telegram_api::InputUser::inputUser(user)) => {
+                assert_eq!(user.user_id, 700000001);
+                assert_eq!(user.access_hash, 5);
+            }
+            other => panic!("expected the input user, got {other:?}"),
+        }
+        let answer =
+            telegram_api::messages_Messages::messages_messages(telegram_api::messages_messages {
+                messages: vec![telegram_api::Message::message(telegram_api::message {
+                    id: 500,
+                    peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 700000001,
+                    })),
+                    date: 1700000600,
+                    message: "personal post".to_owned(),
+                    ..telegram_api::message::default()
+                })],
+                topics: Vec::new(),
+                chats: Vec::new(),
+                users: vec![wire_user(700000001, "User")],
+            });
+        let mut out = Vec::new();
+        answer.store(&mut out);
+        net_complete(sent, out);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::messages(messages)) => {
+                // the C++ guest build leaves the total at the default 0
+                assert_eq!(messages.total_count, 0);
+                assert_eq!(messages.messages.len(), 1);
+                // the guest build answers the packed full id
+                // (`m->message_id.get()`, MessageId.h SERVER_ID_SHIFT)
+                assert_eq!(messages.messages[0].id, packed_id(500));
+            }
+            other => panic!("expected the guest messages, got {other:?}"),
+        }
+
+        // the wire-error band passes through
+        td.request(
+            2,
+            Function::getPersonalChatHistory(td_api::getPersonalChatHistory {
+                user_id: 700000001,
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPersonalChannelHistory::ID,
+        );
+        net_fail(sent, 400, "USER_ID_INVALID");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "USER_ID_INVALID")
+        );
     }
 
     #[test]

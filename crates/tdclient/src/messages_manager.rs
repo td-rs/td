@@ -2317,6 +2317,80 @@ pub fn message_search_filter_index(filter: MessageSearchFilter) -> i32 {
     filter.as_i32() - 1
 }
 
+/// `get_input_messages_filter` (MessageSearchFilter.cpp:13-59) — the wire
+/// `MessagesFilter` of a search filter; the server-unreachable filters are
+/// the C++ `UNREACHABLE()` band (the request arms gate them earlier).
+pub fn get_input_messages_filter(filter: MessageSearchFilter) -> telegram_api::MessagesFilter {
+    use telegram_api::MessagesFilter;
+    match filter {
+        MessageSearchFilter::Empty => {
+            MessagesFilter::inputMessagesFilterEmpty(telegram_api::inputMessagesFilterEmpty)
+        }
+        MessageSearchFilter::Animation => {
+            MessagesFilter::inputMessagesFilterGif(telegram_api::inputMessagesFilterGif)
+        }
+        MessageSearchFilter::Audio => {
+            MessagesFilter::inputMessagesFilterMusic(telegram_api::inputMessagesFilterMusic)
+        }
+        MessageSearchFilter::Document => {
+            MessagesFilter::inputMessagesFilterDocument(telegram_api::inputMessagesFilterDocument)
+        }
+        MessageSearchFilter::Photo => {
+            MessagesFilter::inputMessagesFilterPhotos(telegram_api::inputMessagesFilterPhotos)
+        }
+        MessageSearchFilter::Video => {
+            MessagesFilter::inputMessagesFilterVideo(telegram_api::inputMessagesFilterVideo)
+        }
+        MessageSearchFilter::VoiceNote => {
+            MessagesFilter::inputMessagesFilterVoice(telegram_api::inputMessagesFilterVoice)
+        }
+        MessageSearchFilter::PhotoAndVideo => MessagesFilter::inputMessagesFilterPhotoVideo(
+            telegram_api::inputMessagesFilterPhotoVideo,
+        ),
+        MessageSearchFilter::Url => {
+            MessagesFilter::inputMessagesFilterUrl(telegram_api::inputMessagesFilterUrl)
+        }
+        MessageSearchFilter::ChatPhoto => MessagesFilter::inputMessagesFilterChatPhotos(
+            telegram_api::inputMessagesFilterChatPhotos,
+        ),
+        MessageSearchFilter::Call => MessagesFilter::inputMessagesFilterPhoneCalls(
+            telegram_api::inputMessagesFilterPhoneCalls {
+                flags: 0,
+                missed: false,
+            },
+        ),
+        MessageSearchFilter::MissedCall => MessagesFilter::inputMessagesFilterPhoneCalls(
+            telegram_api::inputMessagesFilterPhoneCalls {
+                flags: 1,
+                missed: true,
+            },
+        ),
+        MessageSearchFilter::VideoNote => MessagesFilter::inputMessagesFilterRoundVideo(
+            telegram_api::inputMessagesFilterRoundVideo,
+        ),
+        MessageSearchFilter::VoiceAndVideoNote => MessagesFilter::inputMessagesFilterRoundVoice(
+            telegram_api::inputMessagesFilterRoundVoice,
+        ),
+        MessageSearchFilter::Mention => MessagesFilter::inputMessagesFilterMyMentions(
+            telegram_api::inputMessagesFilterMyMentions,
+        ),
+        MessageSearchFilter::Pinned => {
+            MessagesFilter::inputMessagesFilterPinned(telegram_api::inputMessagesFilterPinned)
+        }
+        MessageSearchFilter::Poll => {
+            MessagesFilter::inputMessagesFilterPoll(telegram_api::inputMessagesFilterPoll)
+        }
+        // the server-unreachable filters (MessageSearchFilter.cpp:56-59) —
+        // the search arms gate them with "The filter is not supported"
+        MessageSearchFilter::UnreadMention
+        | MessageSearchFilter::FailedToSend
+        | MessageSearchFilter::UnreadReaction
+        | MessageSearchFilter::UnreadPollVote => {
+            unreachable!("the filter is not reachable on the wire plane")
+        }
+    }
+}
+
 /// `message_search_filter_index_mask` (MessageSearchFilter.h:52-57).
 pub fn message_search_filter_index_mask(filter: MessageSearchFilter) -> i32 {
     if filter == MessageSearchFilter::Empty {
@@ -14949,6 +15023,143 @@ pub fn get_message_object(
     })
 }
 
+/// `MessagesManager::get_guest_message_object` (MessagesManager.cpp:20655-20717)
+/// — the bot-only object build over a parsed wire message:
+/// `create_message` in the guest mode (no store insert), the dialog
+/// force-create, then the inline build (no sending state, no interaction
+/// counters — the guest reads no chat state beyond the sender planes).
+pub fn get_guest_message_object(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn MessageObjectContext,
+    message: telegram_api::Message,
+    is_business_message: bool,
+) -> Option<td_api::Message> {
+    assert!(ctx.is_bot());
+    let message_info = parse_telegram_api_message(
+        ctx,
+        message,
+        false,
+        is_business_message,
+        "get_guest_message_object",
+    );
+    let (dialog_id, dialog_message) =
+        create_message(ctx, manager, message_info, true, "get_guest_message_object");
+    let m = dialog_message?;
+    if is_business_message && dialog_id.get_type() != DialogType::User {
+        log_error!("Receive a business message in {dialog_id:?}");
+        return None;
+    }
+    ctx.force_create_dialog(dialog_id, "get_guest_message_object chat");
+
+    let sender = ctx.get_message_sender_object_const(
+        m.sender_user_id,
+        m.sender_dialog_id,
+        "get_guest_message_object",
+    );
+    let forward_info = m
+        .forward_info
+        .as_ref()
+        .and_then(|forward_info| forward_info.get_message_forward_info_object(ctx, false));
+    let import_info = m
+        .forward_info
+        .as_ref()
+        .and_then(|forward_info| forward_info.get_message_import_info_object());
+    // `!m->noforwards && !m->is_content_secret` (cpp:20686)
+    let can_be_saved = !m.noforwards && !m.is_content_secret;
+    let via_bot_user_id = ctx.content_context().get_user_id_object(
+        m.via_bot_user_id,
+        "get_guest_message_object via_bot_user_id",
+    );
+    let via_business_bot_user_id = ctx.content_context().get_user_id_object(
+        m.via_business_bot_user_id,
+        "get_guest_message_object via_business_bot_user_id",
+    );
+    let reply_to = if !m.replied_message_info.is_empty() {
+        if !m.replied_message_info.is_external()
+            && m.replied_message_info
+                .get_same_chat_reply_to_message_id(false)
+                == MessageId::default()
+        {
+            None
+        } else {
+            m.replied_message_info
+                .get_message_reply_to_message_object(ctx, dialog_id, m.message_id)
+        }
+    } else if m.reply_to_story_full_id.is_valid() {
+        Some(td_api::MessageReplyTo::messageReplyToStory(
+            td_api::messageReplyToStory {
+                story_poster_chat_id: ctx.content_context().get_chat_id_object(
+                    m.reply_to_story_full_id.get_dialog_id(),
+                    "get_guest_message_object messageReplyToStory",
+                ),
+                story_id: m.reply_to_story_full_id.get_story_id().get(),
+            },
+        ))
+    } else {
+        None
+    };
+    let reply_markup = m
+        .reply_markup
+        .as_deref()
+        .and_then(|reply_markup| get_message_reply_markup_object(ctx, reply_markup));
+    let content = get_message_message_content_object(manager, ctx, dialog_id, &m);
+    let self_destruct_type = m.ttl.get_message_self_destruct_type_object();
+    let restriction_info = crate::restriction_reason::get_restriction_info_object(
+        &m.restriction_reasons,
+        &ctx.get_restriction_options(),
+    );
+
+    Some(td_api::Message {
+        id: m.message_id.get(),
+        sender_id: sender,
+        receiver_id: None,
+        chat_id: ctx
+            .content_context()
+            .get_chat_id_object(dialog_id, "get_guest_message_object"),
+        sending_state: None,
+        scheduling_state: None,
+        is_outgoing: m.is_outgoing,
+        is_pinned: false,
+        is_from_offline: m.is_from_offline,
+        can_be_saved,
+        has_timestamped_media: false,
+        is_channel_post: m.is_channel_post,
+        is_paid_star_suggested_post: m.is_paid_suggested_post_stars,
+        is_paid_gram_suggested_post: m.is_paid_suggested_post_ton,
+        contains_unread_mention: false,
+        contains_unread_poll_votes: false,
+        date: m.date,
+        edit_date: get_message_shown_edit_date(&m),
+        forward_info,
+        import_info,
+        interaction_info: None,
+        unread_reactions: Vec::new(),
+        fact_check: None,
+        suggested_post_info: None,
+        reply_to,
+        topic_id: None,
+        self_destruct_type,
+        self_destruct_in: 0.0,
+        auto_delete_in: 0.0,
+        via_bot_user_id,
+        guest_bot_caller_id: get_message_guest_sender_object(ctx, &m),
+        sender_business_bot_user_id: via_business_bot_user_id,
+        sender_boost_count: m.sender_boost_count,
+        sender_tag: m.sender_rank.clone(),
+        paid_message_star_count: m.paid_message_star_count,
+        author_signature: m.author_signature.clone(),
+        media_album_id: m.media_album_id,
+        effect_id: m.effect_id.get(),
+        restriction_info,
+        summary_language_code: String::new(),
+        content: Some(content),
+        ephemeral_content: None,
+        reply_markup,
+        ephemeral_message_id: 0,
+        chat_instance: m.chat_instance,
+    })
+}
+
 /// `MessagesManager::get_messages_object(total_count, vector<Message *>,
 /// skip_not_found)` (MessagesManager.cpp:20852-20865).
 pub fn get_messages_object(
@@ -20408,10 +20619,23 @@ pub fn can_use_forum_topic_id(
     Result::Ok(())
 }
 
+/// The `read_all_dialog_mentions` tail decision — the local half's Ok
+/// shape: the request settles (`Done`, the secret-chat band) or rides the
+/// affected-history refill (`RunServer`, the net-drain 29 wire tail).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadAllMentionsTail {
+    RunServer,
+    Done,
+}
+
 /// `MessagesManager::read_all_dialog_mentions` (MessagesManager.cpp:9134-9188).
 /// The `check_dialog_access` opener is inlined per the M.10.6 convention:
 /// the in-memory registration here, the db-load leg and the
 /// `have_input_peer` rights half the [`ReadStateContext`] seam carries.
+/// The C++ promise rides the server refill at the fn's end; the port
+/// answers the decision (the arms settle the promise and run the
+/// [`crate::messages_manager::MmRequestContext::read_all_mentions_on_server`]
+/// tail).
 pub fn read_all_dialog_mentions(
     global: &crate::global::Global,
     manager: &mut MessagesManager,
@@ -20420,7 +20644,7 @@ pub fn read_all_dialog_mentions(
     time: &crate::user_manager::TimeCtx,
     dialog_id: DialogId,
     forum_topic_id: ForumTopicId,
-) -> Result<(), Status> {
+) -> Result<ReadAllMentionsTail, Status> {
     // `check_dialog_access(dialog_id, true, AccessRights::Read,
     // "read_all_dialog_mentions")` (DialogManager.cpp:1350-1375)
     if manager.get_dialog(dialog_id).is_none() {
@@ -20438,14 +20662,9 @@ pub fn read_all_dialog_mentions(
 
     if forum_topic_id.is_valid() {
         // `ForumTopicManager::on_topic_mention_count_changed(dialog_id,
-        // forum_topic_id, 0, false)` + `MessageQueryManager::
-        // read_all_topic_mentions_on_server` — [blocked: net], the
-        // MessageQueryManager owner
-        tracing::info!(
-            "read_all_topic_mentions_on_server seam: dialog {dialog_id:?} topic {}",
-            forum_topic_id.get()
-        );
-        return Result::Ok(());
+        // forum_topic_id, 0, false)` — the topic counter tick rides the
+        // forum-topic slice; the server refill runs the loop
+        return Result::Ok(ReadAllMentionsTail::RunServer);
     }
 
     let unread_mention_count = manager
@@ -20459,7 +20678,7 @@ pub fn read_all_dialog_mentions(
             unread_mention_count == 0,
             "a secret chat cannot have unread mentions"
         );
-        return Result::Ok(());
+        return Result::Ok(ReadAllMentionsTail::Done);
     }
 
     let (last_new_message_id, last_read_all_mentions_message_id) = {
@@ -20555,9 +20774,9 @@ pub fn read_all_dialog_mentions(
     );
 
     // `MessageQueryManager::read_all_dialog_mentions_on_server(dialog_id, 0,
-    // promise)` — [blocked: net]
-    tracing::info!("read_all_dialog_mentions_on_server seam: dialog {dialog_id:?}");
-    Result::Ok(())
+    // promise)` (cpp:9187) — the affected-history refill carries the
+    // promise; the arms run the tail over the decision
+    Result::Ok(ReadAllMentionsTail::RunServer)
 }
 
 /// `MessagesManager::read_all_local_dialog_poll_votes`
@@ -21540,8 +21759,9 @@ pub fn get_message_for_request(
 /// (MessagesManager.cpp:9301-9324) — the readAllChatPollVotes/
 /// readAllForumTopicPollVotes wrapper: the access gate, the topic gate,
 /// the local unread-vote clear, then the
-/// `read_all_dialog_poll_votes_on_server` net tail (the dispatcher answers
-/// nothing on `Ok` — the C++ ok waits for the server ack).
+/// `read_all_dialog_poll_votes_on_server` net tail — the request promise
+/// rides the affected-history refill (the C++ ok waits for the server
+/// ack); the arms run the tail over the Ok.
 pub fn read_all_dialog_poll_votes_request(
     ctx: &dyn MessageObjectContext,
     state: &mut dyn ReadStateContext,
@@ -21563,11 +21783,9 @@ pub fn read_all_dialog_poll_votes_request(
     }
     can_use_forum_topic_id(manager, dialog_id, forum_topic_id)?;
     read_all_local_dialog_poll_votes(ctx, manager, dialog_id, forum_topic_id);
-    // `read_all_dialog_poll_votes_on_server` — [blocked: net]
-    tracing::info!(
-        "read_all_dialog_poll_votes_on_server seam: dialog {dialog_id:?} topic {}",
-        forum_topic_id.get()
-    );
+    // `read_all_dialog_poll_votes_on_server` (cpp:9323) — the
+    // affected-history refill carries the promise; the arms run the tail
+    // over the Ok
     Result::Ok(())
 }
 
@@ -31536,7 +31754,8 @@ pub trait MmRequestContext:
         );
     }
     /// `message_query_manager_->unpin_all_dialog_messages_on_server` —
-    /// [blocked: net].
+    /// the affected-history refill over `messages.unpinAllMessages` (the
+    /// net-drain 29 wire tail; the default parks the promise offline).
     fn unpin_all_dialog_messages_on_server(
         &mut self,
         _dialog_id: DialogId,
@@ -31544,7 +31763,8 @@ pub trait MmRequestContext:
     ) {
     }
     /// `message_query_manager_->unpin_all_topic_messages_on_server` —
-    /// [blocked: net].
+    /// the topic form (the TOP_MSG_ID window); the default parks the
+    /// promise offline.
     fn unpin_all_topic_messages_on_server(
         &mut self,
         _dialog_id: DialogId,
@@ -31553,7 +31773,8 @@ pub trait MmRequestContext:
     ) {
     }
     /// `message_query_manager_->read_all_dialog_reactions_on_server` —
-    /// [blocked: net].
+    /// the affected-history refill over `messages.readReactions`; the
+    /// default parks the promise offline.
     fn read_all_dialog_reactions_on_server(
         &mut self,
         _dialog_id: DialogId,
@@ -31561,7 +31782,7 @@ pub trait MmRequestContext:
     ) {
     }
     /// `message_query_manager_->read_all_topic_reactions_on_server` —
-    /// [blocked: net].
+    /// the topic form; the default parks the promise offline.
     fn read_all_topic_reactions_on_server(
         &mut self,
         _dialog_id: DialogId,
@@ -31569,8 +31790,21 @@ pub trait MmRequestContext:
         _promise: tdutils::promise::Promise<()>,
     ) {
     }
+    /// `message_query_manager_->read_all_dialog_mentions_on_server` /
+    /// `read_all_topic_mentions_on_server` — the affected-history refill
+    /// over `messages.readMentions` (the topic form keyed by the
+    /// forum-topic id); the default parks the promise offline.
+    fn read_all_mentions_on_server(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: ForumTopicId,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+    }
     /// `message_query_manager_->read_all_dialog_poll_votes_on_server` —
-    /// [blocked: net].
+    /// the affected-history refill over `messages.readPollVotes` (the
+    /// request promise rides the loop — the C++ ok waits for the server
+    /// ack); the default parks the promise offline.
     fn read_all_dialog_poll_votes_on_server(
         &mut self,
         _dialog_id: DialogId,

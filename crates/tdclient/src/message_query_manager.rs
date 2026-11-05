@@ -10,11 +10,11 @@
 //!
 //! Heavily M.10-coupled surfaces (threads/forwards/statistics over
 //! MessagesManager) carry the `[blocked: M.10 integration]` seam tag; the
-//! per-message network query tails (net-drain 28) dispatch through the
-//! env net handle — the `MessageQueryNetKind` plane — while the
-//! search/history tails (net-drain 29) and the M.12/M.5-blocked loads
-//! carry `[blocked: net]` (the collapsed-actor convention: `Td` owns the
-//! struct, the [`MessageQueryManagerEnv`] trait carries the
+//! network query tails — the per-message families (net-drain 28) and the
+//! search/history families (net-drain 29) — dispatch through the env net
+//! handle — the `MessageQueryNetKind` plane — while the M.12/M.5-blocked
+//! loads carry `[blocked: net]` (the collapsed-actor convention: `Td`
+//! owns the struct, the [`MessageQueryManagerEnv`] trait carries the
 //! `G()`/option/cross-manager surfaces and the promise lands unanswered
 //! offline).
 
@@ -31,7 +31,6 @@ use tdutils::promise::Promise;
 /// `MessageQueryManager::MAX_SEARCH_MESSAGES` (MessageQueryManager.h:351) —
 /// the server-side search limit the request arms clamp to; its consumers
 /// (the search arms) land with the M.18.4 wiring.
-#[allow(dead_code)]
 pub(crate) const MAX_SEARCH_MESSAGES: i32 = 100;
 
 /// The `G()`/manager slice the collapsed MessageQueryManager reads through.
@@ -63,7 +62,7 @@ pub trait MessageQueryManagerEnv {
     /// the collapsed line answers the not-found band (the full access
     /// check is the M.6/M.10 integration).
     fn check_dialog_access(
-        &self,
+        &mut self,
         dialog_id: DialogId,
         _require_valid: bool,
         _access_rights: crate::user_manager::AccessRights,
@@ -142,10 +141,9 @@ pub trait MessageQueryManagerEnv {
         let _ = promise;
     }
 
-    // -- the query tails: the net-drain 28 per-message families dispatch
-    // -- through the env net handle (a handle-less env parks the promise
-    // -- with the net-inert log); the affected-history tail stays
-    // -- [blocked: net] until the net-drain 29 slice
+    // -- the query tails: the net-drain 28/29 families dispatch through
+    // -- the env net handle (a handle-less env parks the promise with
+    // -- the net-inert log)
     /// The affected-history refill (the Delete*/Read*/Unpin* queries).
     fn send_affected_history_query(
         &mut self,
@@ -314,11 +312,18 @@ pub trait MessageQueryManagerEnv {
     fn has_owned_star_count(&mut self, _star_count: i64) -> bool {
         true
     }
+    /// `td_->star_manager_->add_pending_owned_star_count` — the public-
+    /// post search's send-time debit / answer-time re-add
+    /// (MessageQueryManager.cpp:719-721, 3490 and the error tail
+    /// cpp:764); the default seam logs (the payments-plane posture).
+    fn add_pending_owned_star_count(&mut self, _star_count: i64, _move_to_owned: bool) {
+        tdutils::log_info!("StarManager::add_pending_owned_star_count — [net-inert]");
+    }
 
     // -- the query tails of the request slice: the per-message families
-    // -- (report/summarize/todo/ephemeral/bot-peer) dispatch through the
-    // -- env net handle (net-drain 28); the search/history tails stay
-    // -- [blocked: net] until the net-drain 29 slice
+    // -- (report/summarize/todo/ephemeral/bot-peer, net-drain 28) and the
+    // -- search/history families (net-drain 29) dispatch through the env
+    // -- net handle
     /// `SearchMessagesGlobalQuery::send`
     /// (MessageQueryManager.cpp:3182-3204 payload).
     #[allow(clippy::too_many_arguments)]
@@ -683,17 +688,21 @@ pub trait MessageQueryManagerEnv {
     }
 }
 
-/// The MessageQueryManager in-flight query kinds of the per-message
-/// families — the C++ ResultHandler classes of the net-drain 28 slice
-/// (MessageQueryManager.cpp): the kinds carry the `Copy` handler members
+/// The MessageQueryManager in-flight query kinds — the C++
+/// ResultHandler classes of the per-message families (the net-drain 28
+/// slice) and the search/history families (net-drain 29:
+/// MessageQueryManager.cpp:521-889, 2046-2079 and the affected-history
+/// closures at cpp:2447-2492): the kinds carry the `Copy` handler members
 /// the answer halves route by (the `dialog_id_`/`sender_dialog_id_`
 /// behind the `on_get_dialog_error` heads, the `message_id_` behind the
 /// M.10-blocked message-error head); the non-`Copy` handler state (the
-/// message-id vectors, the promises) parks in [`PendingNetQueries`] on
-/// the `Td` beside them (the §5 FIFO-per-kind convention — Payments.cpp
-/// is free functions over `Td`, so that slice set the shape; this
-/// manager's env is a field split, so the parks ride the env, not the
-/// manager).
+/// message-id vectors, the search offsets, the loop promises) parks in
+/// [`PendingNetQueries`] on the `Td` beside them (the §5 FIFO-per-kind
+/// convention — Payments.cpp is free functions over `Td`, so that slice
+/// set the shape; this manager's env is a field split, so the parks ride
+/// the env, not the manager; the affected-history answers pair by the
+/// kind-FIFO pop — the collapsed-plane form of the C++ promise that
+/// rides its own handler, exact under the single-flight caller shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MessageQueryNetKind {
     /// `GetExtendedMediaQuery` (MessageQueryManager.cpp:360-394) —
@@ -776,6 +785,33 @@ pub(crate) enum MessageQueryNetKind {
     /// `messages.summarizeText`; the ok half runs the formatted-text
     /// intake over the answer.
     SummarizeText,
+    /// `SearchMessagesGlobalQuery` (MessageQueryManager.cpp:521) —
+    /// `messages.searchGlobal` (the global search).
+    SearchMessagesGlobal,
+    /// `SearchSentMediaQuery` (MessageQueryManager.cpp:627) —
+    /// `messages.searchSentMedia` (the sent-media search).
+    SearchSentMedia,
+    /// `CheckSearchPostsFloodQuery` (MessageQueryManager.cpp:667) —
+    /// `channels.checkSearchPostsFlood`.
+    CheckSearchPostsFlood,
+    /// `SearchPublicPostsQuery` (MessageQueryManager.cpp:697) —
+    /// `channels.searchPosts`, the query form (the public-post search).
+    SearchPublicPosts,
+    /// `SearchPostsQuery` (MessageQueryManager.cpp:786) —
+    /// `channels.searchPosts`, the hashtag form (the tag search).
+    SearchPosts,
+    /// `GetRecentLocationsQuery` (MessageQueryManager.cpp:842) —
+    /// `messages.getRecentLocations`.
+    GetRecentLocations,
+    /// `GetPersonalChannelHistoryQuery` (MessageQueryManager.cpp:2046) —
+    /// `messages.getPersonalChannelHistory`.
+    GetPersonalChannelHistory,
+    /// The affected-history refill queries — one per
+    /// [`AffectedHistoryQueryKind`] family; every wire function answers
+    /// `messages.affectedHistory`/`messages.affectedFoundMessages`, which
+    /// feeds the landed
+    /// [`MessageQueryManager::on_get_affected_history`] loop.
+    AffectedHistory(AffectedHistoryQueryKind),
 }
 
 /// The answer-routing of the `read_message_contents_on_server` promise
@@ -796,10 +832,13 @@ pub enum ReadContentsIntake {
     ReadPollVotes,
 }
 
-/// The parked query state of the net-drain 28 families, one list per
+/// The parked query state of the net-drain 28/29 families, one list per
 /// answer kind (the C++ promises and handler vectors ride the
 /// ResultHandlers; the collapsed port parks them on the `Td` — the env
-/// field split carries them, the FIFO-per-kind convention, §5).
+/// field split carries them, the FIFO-per-kind convention, §5). The
+/// affected-history queue pairs by the kind-FIFO pop — the collapsed-
+/// plane form of the C++ loop promise that rides its own handler across
+/// the refill rounds (exact under the single-flight caller shape).
 #[derive(Default)]
 pub(crate) struct PendingNetQueries {
     /// `GetExtendedMediaQuery::dialog_id_`/`message_ids_`.
@@ -839,6 +878,70 @@ pub(crate) struct PendingNetQueries {
     pub(crate) to_do_toggles: Vec<Promise<()>>,
     /// `SummarizeTextQuery::promise_`.
     pub(crate) summarize_text: Vec<Promise<td_api::FormattedText>>,
+    /// `SearchMessagesGlobalQuery`'s members
+    /// (MessageQueryManager.cpp:521-530) + the promise.
+    pub(crate) search_messages_global: Vec<SearchMessagesGlobalPending>,
+    /// `SearchSentMediaQuery` — the promise only (cpp:627-631).
+    pub(crate) search_sent_media: Vec<Promise<td_api::FoundMessages>>,
+    /// `CheckSearchPostsFloodQuery` — the promise only (cpp:667-671).
+    pub(crate) check_search_posts_flood: Vec<Promise<td_api::PublicPostSearchLimits>>,
+    /// `SearchPublicPostsQuery`'s members (cpp:697-703) + the promise.
+    pub(crate) search_public_posts: Vec<SearchPublicPostsPending>,
+    /// `SearchPostsQuery`'s members (cpp:786-790) + the promise.
+    pub(crate) search_posts: Vec<SearchPostsPending>,
+    /// `GetRecentLocationsQuery`'s members (cpp:842-846) + the promise.
+    pub(crate) get_recent_locations: Vec<GetRecentLocationsPending>,
+    /// `GetPersonalChannelHistoryQuery` — the promise only (cpp:2046-2052).
+    pub(crate) get_personal_channel_history: Vec<Promise<td_api::Messages>>,
+    /// The affected-history refill records — the loop continuation state
+    /// (`on_get_affected_history` re-sends under the same key until the
+    /// final answer).
+    pub(crate) affected_history: Vec<AffectedHistoryPending>,
+}
+
+/// `SearchMessagesGlobalQuery` (MessageQueryManager.cpp:521-530) — the
+/// promise; the C++ handler also captures the query/offset/filter
+/// members `on_get_messages_search_result` (cpp:3366-3370) receives, but
+/// its body reads none of them (the answer carries the counts and the
+/// next rate), so the collapsed queue parks the promise only.
+pub(crate) struct SearchMessagesGlobalPending {
+    pub(crate) promise: Promise<td_api::FoundMessages>,
+}
+
+/// `SearchPublicPostsQuery` (MessageQueryManager.cpp:697-703) — the
+/// star window (the send debit / answer re-add pair) + the promise; the
+/// offset/limit members `on_get_public_post_search_result` receives
+/// (cpp:3462-3466) are unread in its body, like the C++.
+pub(crate) struct SearchPublicPostsPending {
+    pub(crate) star_count: i64,
+    pub(crate) promise: Promise<td_api::FoundPublicPosts>,
+}
+
+/// `SearchPostsQuery` (MessageQueryManager.cpp:786-790) — the promise;
+/// the hashtag/offset/limit members `on_get_hashtag_search_result`
+/// receives (cpp:3522-3525) are unread in its body, like the C++.
+pub(crate) struct SearchPostsPending {
+    pub(crate) promise: Promise<td_api::FoundMessages>,
+}
+
+/// `GetRecentLocationsQuery` (MessageQueryManager.cpp:842-846) — the
+/// dialog (the error head + the walk key) + the promise; the limit
+/// member `on_get_recent_locations` receives (cpp:3585-3587) is unread
+/// in its body, like the C++.
+pub(crate) struct GetRecentLocationsPending {
+    pub(crate) dialog_id: crate::dialog_id::DialogId,
+    pub(crate) promise: Promise<td_api::Messages>,
+}
+
+/// The affected-history refill record — the loop's `(dialog_id, query,
+/// get_affected_messages, promise)` tuple the answer routes by
+/// (`run_affected_history_query_until_complete`,
+/// MessageQueryManager.cpp:2447-2492).
+pub(crate) struct AffectedHistoryPending {
+    pub(crate) dialog_id: crate::dialog_id::DialogId,
+    pub(crate) kind: AffectedHistoryQueryKind,
+    pub(crate) get_affected_messages: bool,
+    pub(crate) promise: Promise<()>,
 }
 
 /// `MessageThreadInfo` (MessageThreadInfo.h) — the discussion-thread answer
@@ -1170,9 +1273,9 @@ fn get_message_date(message: &telegram_api::Message) -> i32 {
 /// search arms.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MessageSearchOffset {
-    date: i32,
-    message_id: MessageId,
-    dialog_id: DialogId,
+    pub(crate) date: i32,
+    pub(crate) message_id: MessageId,
+    pub(crate) dialog_id: DialogId,
 }
 
 impl MessageSearchOffset {
@@ -1790,7 +1893,7 @@ pub struct MessageReadMetric {
 }
 
 /// The affected-history query identity — which net request refills the
-/// loop ([blocked: net]; the C++ closures at
+/// loop (the C++ closures at
 /// MessageQueryManager.cpp:4334/4380/4443/4536/4783/4832/4866/4876/4911/4962/4973/5150).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AffectedHistoryQueryKind {
@@ -1811,22 +1914,22 @@ pub enum AffectedHistoryQueryKind {
         revoke: bool,
     },
     DeleteTopicHistory {
-        forum_topic_id: crate::files::ForumTopicId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
     },
     ReadAllDialogMentions,
     ReadAllTopicMentions {
-        forum_topic_id: crate::files::ForumTopicId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
     },
     ReadAllDialogReactions,
     ReadAllTopicReactions {
-        forum_topic_id: crate::files::ForumTopicId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
     },
     ReadAllDialogPollVotes {
-        forum_topic_id: crate::files::ForumTopicId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
     },
     UnpinAllDialogMessages,
     UnpinAllTopicMessages {
-        forum_topic_id: crate::files::ForumTopicId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
     },
 }
 
@@ -1870,9 +1973,8 @@ impl MessageQueryManager {
     }
 
     /// `run_affected_history_query_until_complete`
-    /// (MessageQueryManager.cpp:2447-2461). The query send is the
-    /// `[blocked: net]` tail — the promise lands in the query and stays
-    /// unanswered offline; the net step routes each
+    /// (MessageQueryManager.cpp:2447-2461). The query send rides the env
+    /// net handle (net-drain 29); the net step routes each
     /// `messages_affectedHistory` back into [`Self::on_get_affected_history`].
     pub fn run_affected_history_query_until_complete(
         &mut self,
@@ -2637,8 +2739,8 @@ impl std::fmt::Debug for MessageQueryManager {
 // ---------------------------------------------------------------------------
 // The M.mp request plane — `search_messages` and friends
 // (MessageQueryManager.cpp:3206-4298/4715-4835). The local validation and
-// decision tables are ported exactly; every `create_handler` query tail is
-// the `[blocked: net]` seam above and the promise lands unanswered offline.
+// decision tables are ported exactly; the `create_handler` query tails
+// dispatch through the env net handle (net-drain 29).
 // ---------------------------------------------------------------------------
 
 /// `get_message_search_filter` (MessageSearchFilter.cpp:59-103) — the
@@ -4439,7 +4541,7 @@ mod tests {
         }
 
         fn check_dialog_access(
-            &self,
+            &mut self,
             dialog_id: DialogId,
             _require_valid: bool,
             _access_rights: crate::user_manager::AccessRights,

@@ -6132,13 +6132,16 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         Function::readAllChatMentions(request) => {
-            // `Requests.cpp:3606-3611`.
+            // `Requests.cpp:3606-3611` — the local clear, then the
+            // affected-history refill over the net tail (the request
+            // promise rides the loop, the net-drain 29 shape).
             if !check_is_user(td, id) {
                 return;
             }
             let dialog_id = MmDialogId::new(request.chat_id);
             let mut manager = std::mem::take(&mut td.messages_manager);
             let time = crate::user_manager::TimeCtx::from_global(&td.global);
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             // SAFETY: the ctx/state pair aliases one Td and is used
             // strictly sequentially inside the callee.
             let td_ptr = std::ptr::from_mut(td);
@@ -6156,10 +6159,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 crate::messages_manager::ForumTopicId::default(),
             );
             td.messages_manager = manager;
-            match result {
-                Ok(()) => td.send_result(id, ok_object()),
-                Err(status) => td.send_error_impl(id, status.code(), status.message()),
-            }
+            run_read_mentions_tail(
+                td,
+                dialog_id,
+                crate::messages_manager::ForumTopicId::default(),
+                promise,
+                result,
+            );
         }
         Function::readAllForumTopicMentions(request) => {
             // `Requests.cpp:3614-3619`.
@@ -6170,8 +6176,11 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
             }
             let dialog_id = MmDialogId::new(request.chat_id);
+            let forum_topic_id =
+                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id);
             let mut manager = std::mem::take(&mut td.messages_manager);
             let time = crate::user_manager::TimeCtx::from_global(&td.global);
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             // SAFETY: as readAllChatMentions above.
             let td_ptr = std::ptr::from_mut(td);
             let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
@@ -6185,13 +6194,10 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 state,
                 &time,
                 dialog_id,
-                crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+                forum_topic_id,
             );
             td.messages_manager = manager;
-            match result {
-                Ok(()) => td.send_result(id, ok_object()),
-                Err(status) => td.send_error_impl(id, status.code(), status.message()),
-            }
+            run_read_mentions_tail(td, dialog_id, forum_topic_id, promise, result);
         }
         Function::readChatList(request) => {
             // `Requests.cpp:3621-3625`.
@@ -16060,11 +16066,13 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::readAllChatPollVotes(request) => {
             // Requests.cpp:4200-4204 → MessagesManager.cpp:9301-9324: the
-            // ok waits for the server ack, so the `Ok` arm answers nothing
+            // ok waits for the server ack — the promise rides the
+            // affected-history refill (the net-drain 29 shape)
             if !check_is_user(td, id) {
                 return;
             }
             let mut manager = std::mem::take(&mut td.messages_manager);
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let td_ptr = std::ptr::from_mut(td);
             let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
                 unsafe { &mut *td_ptr };
@@ -16078,8 +16086,20 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 crate::messages_manager::ForumTopicId::default(),
             );
             td.messages_manager = manager;
-            if let Err(status) = result {
-                td.send_error_impl(id, status.code(), status.message());
+            match result {
+                Ok(()) => {
+                    // SAFETY: the mm view aliases one Td, used strictly
+                    // sequentially.
+                    let td_ptr = std::ptr::from_mut(td);
+                    let mm: &mut dyn crate::messages_manager::MmRequestContext =
+                        unsafe { &mut *td_ptr };
+                    mm.read_all_dialog_poll_votes_on_server(
+                        MmDialogId::new(request.chat_id),
+                        crate::messages_manager::ForumTopicId::default(),
+                        promise,
+                    );
+                }
+                Err(status) => promise.set_error(status),
             }
         }
         Function::readAllForumTopicPollVotes(request) => {
@@ -16092,6 +16112,7 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Invalid forum topic identifier specified");
             }
             let mut manager = std::mem::take(&mut td.messages_manager);
+            let mut promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let td_ptr = std::ptr::from_mut(td);
             let ctx: &mut dyn crate::messages_manager::MessageObjectContext =
                 unsafe { &mut *td_ptr };
@@ -16105,8 +16126,20 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
             );
             td.messages_manager = manager;
-            if let Err(status) = result {
-                td.send_error_impl(id, status.code(), status.message());
+            match result {
+                Ok(()) => {
+                    // SAFETY: the mm view aliases one Td, used strictly
+                    // sequentially.
+                    let td_ptr = std::ptr::from_mut(td);
+                    let mm: &mut dyn crate::messages_manager::MmRequestContext =
+                        unsafe { &mut *td_ptr };
+                    mm.read_all_dialog_poll_votes_on_server(
+                        MmDialogId::new(request.chat_id),
+                        crate::messages_manager::ForumTopicId::from_raw(request.forum_topic_id),
+                        promise,
+                    );
+                }
+                Err(status) => promise.set_error(status),
             }
         }
         Function::loadQuickReplyShortcuts(_) => {
@@ -18782,6 +18815,33 @@ pub(crate) fn as_db_key(key: Vec<u8>) -> tddb::DbKey {
         tddb::DbKey::raw_key(b"cucumber".to_vec())
     } else {
         tddb::DbKey::raw_key(key)
+    }
+}
+
+/// The `read_all_dialog_mentions` tail — the local half's decision
+/// settles the request (the secret-chat band / the errors) or rides the
+/// affected-history refill over the `MmRequestContext` trampoline (the
+/// net-drain 29 wire tail, cpp:9187).
+fn run_read_mentions_tail(
+    td: &mut Td,
+    dialog_id: crate::messages_manager::DialogId,
+    forum_topic_id: crate::messages_manager::ForumTopicId,
+    mut promise: tdutils::promise::Promise<()>,
+    result: std::result::Result<
+        crate::messages_manager::ReadAllMentionsTail,
+        tdutils::status::Status,
+    >,
+) {
+    match result {
+        Ok(crate::messages_manager::ReadAllMentionsTail::Done) => promise.set_value(()),
+        Ok(crate::messages_manager::ReadAllMentionsTail::RunServer) => {
+            // SAFETY: the mm view aliases one Td, used strictly
+            // sequentially inside the trampoline.
+            let td_ptr = std::ptr::from_mut(td);
+            let mm: &mut dyn crate::messages_manager::MmRequestContext = unsafe { &mut *td_ptr };
+            mm.read_all_mentions_on_server(dialog_id, forum_topic_id, promise);
+        }
+        Err(status) => promise.set_error(status),
     }
 }
 

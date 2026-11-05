@@ -217,6 +217,9 @@ const CREATING_TD: &str =
 
 const QUIT_TAIL: &[&str] = &[
     "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
+    // the close announcement (Td.cpp:782, the dd06b16 close-path log
+    // family) — the CLI never leaves WaitParameters, so state 0
+    "[ 2][t 1][ts][Td.cpp:782][#1][!Td]\tClose Td in state 0",
     "[ 2][t 1][ts][cli.rs][!CliClient]\tupdateAuthorizationState {",
     "  authorization_state = authorizationStateClosed {",
     "  }",
