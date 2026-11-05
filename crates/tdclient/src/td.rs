@@ -21920,35 +21920,58 @@ impl Td {
             }
         }
 
+        // The per-handler `on_error` local-settle scope — the C++
+        // handlers collapse these error strings per class, not globally
+        // (GROUPCALL_NOT_MODIFIED: StartScheduledGroupCallQuery cpp:792,
+        // EditGroupCallTitleQuery cpp:984,
+        // ToggleGroupCallStartSubscriptionQuery cpp:1017,
+        // ToggleGroupCallSettingsQuery cpp:1063,
+        // ToggleGroupCallRecordQuery cpp:1474;
+        // PARTICIPANT_PRESENTATION_MISSING:
+        // LeaveGroupCallPresentationQuery cpp:951; the other
+        // Update-returning handlers error through).
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum TailSettle {
+            None,
+            NotModified,
+            PresentationMissing,
+        }
+
         // The Update-returning families share the `on_get_updates(ptr,
-        // promise)` tail; the GROUPCALL_NOT_MODIFIED / PARTICIPANT_*
-        // "not modified" bands settle locally (the C++ on_error ladders).
-        let run_updates_tail = |td: &mut Td, mut promise: Promise<()>, query: &NetQuery| {
-            if query.is_error() {
-                let status = query.error().clone();
-                if status.message() == "GROUPCALL_NOT_MODIFIED"
-                    || status.message() == "PARTICIPANT_PRESENTATION_MISSING"
-                {
-                    promise.set_value(());
-                } else {
-                    promise.set_error(status);
+        // promise)` tail; the scoped "not modified" bands settle
+        // locally per the C++ on_error ladders.
+        let run_updates_tail =
+            |td: &mut Td, mut promise: Promise<()>, query: &NetQuery, settle: TailSettle| {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    let settled = match settle {
+                        TailSettle::NotModified => status.message() == "GROUPCALL_NOT_MODIFIED",
+                        TailSettle::PresentationMissing => {
+                            status.message() == "PARTICIPANT_PRESENTATION_MISSING"
+                        }
+                        TailSettle::None => false,
+                    };
+                    if settled {
+                        promise.set_value(());
+                    } else {
+                        promise.set_error(status);
+                    }
+                    return;
                 }
-                return;
-            }
-            match telegram_api::Updates::parse(query.ok()) {
-                Ok(updates) => {
-                    td.um_send(UmMessage::OnGetUpdates {
-                        updates: Box::new(updates),
-                        promise,
-                    });
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => {
+                        td.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        });
+                    }
+                    Err(_) => {
+                        // the parse failure settles through the same tail
+                        let mut promise = promise;
+                        promise.set_error(parse_error("group call updates"));
+                    }
                 }
-                Err(_) => {
-                    // the parse failure settles through the same tail
-                    let mut promise = promise;
-                    promise.set_error(parse_error("group call updates"));
-                }
-            }
-        };
+            };
 
         match kind {
             // `GetGroupCallQuery` (cpp:450-478) — the reload: the
@@ -22104,7 +22127,7 @@ impl Td {
                 if let Some(promise) =
                     pop_head(&mut self.group_call_manager.pending.start_scheduled)
                 {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::NotModified);
                 }
             }
             // `ToggleGroupCallStartSubscriptionQuery` (cpp:992-1023).
@@ -22112,7 +22135,7 @@ impl Td {
                 if let Some(promise) =
                     pop_head(&mut self.group_call_manager.pending.toggle_start_subscription)
                 {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::NotModified);
                 }
             }
             // `EditGroupCallTitleQuery` (cpp:959-990) — the request
@@ -22120,7 +22143,7 @@ impl Td {
             // query-side default.
             K::EditTitle => {
                 if let Some(promise) = pop_head(&mut self.group_call_manager.pending.edit_title) {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::NotModified);
                 }
             }
             // `ToggleGroupCallSettingsQuery` (cpp:1025-1069).
@@ -22128,7 +22151,7 @@ impl Td {
                 if let Some(promise) =
                     pop_head(&mut self.group_call_manager.pending.toggle_settings)
                 {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::NotModified);
                 }
             }
             // `LeaveGroupCallPresentationQuery` (cpp:926-957) — the
@@ -22137,14 +22160,14 @@ impl Td {
                 if let Some(promise) =
                     pop_head(&mut self.group_call_manager.pending.leave_presentation)
                 {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::PresentationMissing);
                 }
             }
             // `ToggleGroupCallRecordQuery` (cpp:1442-1480).
             K::ToggleRecord => {
                 if let Some(promise) = pop_head(&mut self.group_call_manager.pending.toggle_record)
                 {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::NotModified);
                 }
             }
             // `ExportGroupCallInviteQuery` (cpp:1415-1440).
@@ -22165,14 +22188,14 @@ impl Td {
             // `InviteToGroupCallQuery` (cpp:1387-1413).
             K::Invite => {
                 if let Some(promise) = pop_head(&mut self.group_call_manager.pending.invite) {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::None);
                 }
             }
             // `DeclineConferenceCallInviteQuery` (cpp:1321-1347).
             K::DeclineInvite => {
                 if let Some(promise) = pop_head(&mut self.group_call_manager.pending.decline_invite)
                 {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::None);
                 }
             }
             // `SendGroupCallMessageQuery` (cpp:1071-1142) — the star
@@ -22235,7 +22258,7 @@ impl Td {
                         );
                         promise.set_error(status);
                     } else {
-                        run_updates_tail(self, promise, &query);
+                        run_updates_tail(self, promise, &query, TailSettle::None);
                     }
                 }
             }
@@ -22323,13 +22346,13 @@ impl Td {
             // `LeaveGroupCallQuery` (cpp:1572-1599).
             K::Leave => {
                 if let Some(promise) = pop_head(&mut self.group_call_manager.pending.leave) {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::None);
                 }
             }
             // `DiscardGroupCallQuery` (cpp:1601-1629).
             K::Discard => {
                 if let Some(promise) = pop_head(&mut self.group_call_manager.pending.discard) {
-                    run_updates_tail(self, promise, &query);
+                    run_updates_tail(self, promise, &query, TailSettle::None);
                 }
             }
         }
@@ -22371,6 +22394,7 @@ impl Td {
                 record.is_conference = w.conference;
                 record.stream_dc_id = w.stream_dc_id;
                 record.is_video_recorded = w.record_video_active;
+                record.is_rtmp_stream = w.rtmp_stream;
                 record.can_be_managed = w.creator;
                 record
             }
@@ -51032,6 +51056,195 @@ mod tests {
                 *slot.lock().unwrap(),
                 Some(tdutils::status::Result::Ok(()))
             ));
+        }
+
+        // GetStreamer (phone.getGroupCall limit 10) — the C++ band
+        // (cpp:2450-2479): only a joined live story scans for the
+        // streamer; the plain video chats, the rtmp streams and the
+        // not-joined live stories settle before the wire query. The
+        // answer side stays the signaling thin form — the C++
+        // participant scan (cpp:513-520) rides the parked participants
+        // plane.
+        fn wire_call(id: i64) -> telegram_api::GroupCall {
+            telegram_api::GroupCall::groupCall(telegram_api::groupCall {
+                flags: 0,
+                join_muted: false,
+                can_change_join_muted: false,
+                join_date_asc: false,
+                schedule_start_subscribed: false,
+                can_start_video: false,
+                record_video_active: false,
+                rtmp_stream: false,
+                listeners_hidden: false,
+                conference: false,
+                creator: false,
+                messages_enabled: false,
+                can_change_messages_enabled: false,
+                min: false,
+                id,
+                access_hash: 43,
+                participants_count: 0,
+                title: "band".to_owned(),
+                stream_dc_id: 0,
+                record_start_date: 0,
+                schedule_date: 0,
+                unmuted_video_count: 0,
+                unmuted_video_limit: 0,
+                version: 1,
+                invite_link: String::new(),
+                send_paid_messages_stars: 0,
+                default_send_as: None,
+            })
+        }
+        type StreamerSlot = std::sync::Arc<
+            std::sync::Mutex<Option<tdutils::status::Result<Option<td_api::GroupCallParticipant>>>>,
+        >;
+        let streamer_slot = || {
+            let slot: StreamerSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (slot, promise)
+        };
+
+        // the plain video chat settles empty with no wire query
+        {
+            register(&mut td, &mut env, false, 0);
+            let (slot, promise) = streamer_slot();
+            td.group_call_manager
+                .get_group_call_streamer(GroupCallId::new(11), promise);
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(None))
+            ));
+            assert!(rec.sent.lock().is_empty(), "the plain band must not send");
+        }
+
+        // the rtmp stream settles empty with no wire query
+        {
+            td.group_call_manager.on_get_group_call(
+                &mut env,
+                GroupCall {
+                    group_call_id: GroupCallId::new(11),
+                    input_group_call_id: 7100,
+                    input_group_call_access_hash: 43,
+                    chat_id: -1_000_000_000_777,
+                    is_active: true,
+                    is_joined: true,
+                    is_rtmp_stream: true,
+                    ..GroupCall::default()
+                },
+            );
+            let (slot, promise) = streamer_slot();
+            td.group_call_manager
+                .get_group_call_streamer(GroupCallId::new(11), promise);
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(None))
+            ));
+            assert!(rec.sent.lock().is_empty(), "the rtmp band must not send");
+        }
+
+        // the not-joined live story takes the C++ else arm's error
+        {
+            td.group_call_manager.on_get_group_call(
+                &mut env,
+                GroupCall {
+                    group_call_id: GroupCallId::new(11),
+                    input_group_call_id: 7100,
+                    input_group_call_access_hash: 43,
+                    chat_id: -1_000_000_000_777,
+                    is_active: true,
+                    is_joined: false,
+                    is_live_story: true,
+                    ..GroupCall::default()
+                },
+            );
+            let (slot, promise) = streamer_slot();
+            td.group_call_manager
+                .get_group_call_streamer(GroupCallId::new(11), promise);
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "GROUPCALL_JOIN_MISSING");
+                }
+                other => panic!("unexpected streamer result: {other:?}"),
+            }
+            assert!(rec.sent.lock().is_empty(), "the error band must not send");
+        }
+
+        // the joined live story dispatches; the success settles the
+        // thin None through the answer tail
+        {
+            register(&mut td, &mut env, true, 0);
+            let (slot, promise) = streamer_slot();
+            td.group_call_manager
+                .get_group_call_streamer(GroupCallId::new(11), promise);
+            let sent = take_sent_query(&rec, telegram_api::phone_getGroupCall::ID);
+            let wire = telegram_api::phone_getGroupCall::parse(sent.query()).unwrap();
+            assert_eq!(wire.limit, 10);
+            let mut answer = Vec::new();
+            telegram_api::phone_GroupCall {
+                call: Some(wire_call(7100)),
+                participants: vec![],
+                participants_next_offset: String::new(),
+                chats: vec![],
+                users: vec![],
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_group_call_net();
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(None))
+            ));
+        }
+
+        // the tail scope: GROUPCALL_NOT_MODIFIED collapses locally only
+        // on the five C++ handlers (cpp:792, 984, 1017, 1063, 1474) —
+        // ToggleRecord settles Ok; Leave errors through (cpp:1588-1590).
+        // (EditTitle / ToggleStartSubscription can't drive the tail —
+        // their promises settle at the request arm, cpp:5231 / 4387.)
+        {
+            register(&mut td, &mut env, false, 0);
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager.toggle_group_call_recording(
+                GroupCallId::new(11),
+                true,
+                String::new(),
+                false,
+                false,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::phone_toggleGroupCallRecord::ID);
+            net_fail(sent, 400, "GROUPCALL_NOT_MODIFIED");
+            td.dispatch_completed_group_call_net();
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+        {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager
+                .leave_group_call(GroupCallId::new(11), promise);
+            let sent = take_sent_query(&rec, telegram_api::phone_leaveGroupCall::ID);
+            net_fail(sent, 400, "GROUPCALL_NOT_MODIFIED");
+            td.dispatch_completed_group_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "GROUPCALL_NOT_MODIFIED");
+                }
+                other => panic!("unexpected leave result: {other:?}"),
+            }
         }
     }
 

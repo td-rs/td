@@ -13,7 +13,7 @@
 //! | arm | C++ tail | wire family |
 //! |---|---|---|
 //! | getGroupCall | `reload_group_call` (cpp:2807) | `GetGroupCall` — phone.getGroupCall (cpp:450) |
-//! | getLiveStoryStreamer | bands → `GetGroupCallStreamerQuery` (cpp:480) | `GetStreamer` — phone.getGroupCall limit 10 |
+//! | getLiveStoryStreamer | bands → `GetGroupCallStreamerQuery` (cpp:480); the answer's participant scan (cpp:513-520) rides the parked participants plane | `GetStreamer` — phone.getGroupCall limit 10 (the answer settles the signaling thin None) |
 //! | getVideoChatAvailableParticipants | `get_group_call_join_as` (cpp:2443) | `GetJoinAs` — phone.getGroupCallJoinAs (cpp:151) |
 //! | getLiveStoryAvailableMessageSenders | `get_group_call_send_as` → local `do_get_group_call_send_as` (cpp:2490-2582) | local — the cpp:2517 net leg is the update-driven reload |
 //! | setVideoChatDefaultParticipant | `set_group_call_default_join_as` (cpp:2586) | `SaveJoinAs` — phone.saveDefaultGroupCallJoinAs (cpp:242) |
@@ -31,7 +31,7 @@
 //! | getVideoChatInviteLink | bands → `ExportGroupCallInviteQuery` (cpp:1415) | `ExportInvite` — phone.exportGroupCallInvite |
 //! | inviteVideoChatParticipants / inviteGroupCallParticipant | `invite_group_call_participants` (cpp:3895) | `Invite` — phone.inviteToGroupCall (cpp:1387) |
 //! | declineGroupCallInvitation | `decline_group_call_invitation` (cpp:1316) | `DeclineInvite` — phone.declineConferenceCallInvite (cpp:1321) |
-//! | sendGroupCallMessage | bands → `SendGroupCallMessageQuery` (cpp:1071) | `SendMessage` — phone.sendGroupCallMessage |
+//! | sendGroupCallMessage | bands → the conference leg parks (tde2e, cpp:5963-5976) / `SendGroupCallMessageQuery` (cpp:1071) | `SendMessage` — phone.sendGroupCallMessage (the conference legs park in `plane_parks`) |
 //! | deleteGroupCallMessages | bands → the call-message store (media plane) | local — the cpp:1171 net leg rides the stored messages |
 //! | deleteGroupCallMessagesBySender | bands → `DeleteGroupCallParticipantMessagesQuery` (cpp:1201) | `DeleteSenderMessages` — phone.deleteGroupCallParticipantMessages |
 //! | loadGroupCallParticipants | bands → `GetGroupCallParticipantsQuery` (cpp:643) | `GetParticipants` — phone.getGroupParticipants |
@@ -50,6 +50,8 @@
 //! | joinGroupCall / joinVideoChat / joinLiveStory | the join flow (cpp:4434, 4530) | parked — the media plane |
 //! | startGroupCallScreenSharing | `JoinGroupCallPresentationQuery` (cpp:891) | parked — the media plane |
 //! | toggleGroupCallParticipantIsMuted / toggleGroupCallParticipantIsHandRaised / setGroupCallParticipantVolumeLevel | the participant plane (cpp:6779, 6886, 6986) | parked — the participants plane |
+//! | (behind the parked planes) GetGroupCallStreamQuery (cpp:109), CheckGroupCallQuery (cpp:1536), GetGroupCallParticipantsToCheckQuery (cpp:727), GetGroupCallParticipantQuery (cpp:530) | the stream-download / join-check / participants-check / single-participant reads — the join, media and participants planes | parked — media/join plane (#54) |
+//! | SendGroupCallEncryptedMessageQuery (cpp:1144) | the conference leg of sendGroupCallMessage (cpp:5963-5976) and the conference message-delete flow | parked — tde2e plane (the conference legs park in `plane_parks`) |
 
 use crate::dialog_id::DialogId;
 use crate::store_parse::{self, Parser};
@@ -89,9 +91,10 @@ impl GroupCallId {
 
 /// `td::GroupCall` — the call record (the participant/media halves stay
 /// on the deferred transport plane). The net-drain 36 slice adds the
-/// fields the router bands read (the C++ `GroupCall` state slice,
-/// GroupCall.h:39-419).
-#[derive(Clone, Debug, Default)]
+/// fields the router bands read (the C++ `GroupCall` state slice — the
+/// struct lives in GroupCallManager.cpp:1820-1880, there is no
+/// GroupCall.h).
+#[derive(Clone, Debug)]
 pub struct GroupCall {
     pub group_call_id: GroupCallId,
     /// The wire `InputGroupCallId` pair (the C++ `input_group_call_ids_`
@@ -110,6 +113,14 @@ pub struct GroupCall {
     pub is_live_story: bool,
     /// `group_call->can_be_managed` (GroupCall.h:115).
     pub can_be_managed: bool,
+    /// `group_call->is_rtmp_stream` (GroupCallManager.cpp:1827) — the
+    /// wire `groupCall.rtmp_stream` flag (the reload merge, cpp:7473).
+    pub is_rtmp_stream: bool,
+    /// `group_call->can_choose_message_sender` (GroupCallManager.cpp:1851)
+    /// — defaults true; the setter rides the GetGroupCallSendAsQuery
+    /// answer (cpp:224-232), whose wire leg the send-as recipe parks
+    /// (the chat-plane reads, §5).
+    pub can_choose_message_sender: bool,
     /// `group_call->scheduled_start_date` (GroupCall.h:82).
     pub scheduled_start_date: i32,
     /// `group_call->mute_new_participants` (GroupCall.h:104).
@@ -131,6 +142,39 @@ pub struct GroupCall {
     /// `group_call->message_sender_dialog_id` (GroupCall.h:96) — the
     /// live-story comment sender.
     pub message_sender_dialog_id: DialogId,
+}
+
+impl Default for GroupCall {
+    /// The C++ field defaults at the struct definition
+    /// (GroupCallManager.cpp:1820-1880) — notably
+    /// `can_choose_message_sender = true`.
+    fn default() -> GroupCall {
+        GroupCall {
+            group_call_id: GroupCallId::default(),
+            input_group_call_id: 0,
+            input_group_call_access_hash: 0,
+            chat_id: 0,
+            title: String::new(),
+            is_active: false,
+            is_joined: false,
+            is_my_video_enabled: false,
+            is_my_video_paused: false,
+            is_conference: false,
+            is_live_story: false,
+            can_be_managed: false,
+            is_rtmp_stream: false,
+            can_choose_message_sender: true,
+            scheduled_start_date: 0,
+            mute_new_participants: false,
+            are_messages_enabled: false,
+            paid_message_star_count: 0,
+            start_subscribed: false,
+            is_video_recorded: false,
+            stream_dc_id: 0,
+            audio_source: 0,
+            message_sender_dialog_id: DialogId::default(),
+        }
+    }
 }
 
 impl GroupCall {
@@ -287,6 +331,13 @@ pub(crate) struct PendingGroupCallQueries {
     pub(crate) leave: Vec<Promise<()>>,
     /// `DiscardGroupCallQuery::promise_`.
     pub(crate) discard: Vec<Promise<()>>,
+    /// The never-drained park lot (the nd35 SRP-lot shape, generalized
+    /// over the erased promise type): the promises the deferred planes
+    /// own — the media-plane join/payload flows (§5, ticket #54) and
+    /// the tde2e conference legs. Nothing pops them; they drop with the
+    /// manager, so the unfulfilled-drop error fires at teardown instead
+    /// of the promise leaking.
+    pub(crate) plane_parks: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 /// `td::GroupCallManager` (GroupCallManager.h) — signaling-only (D4).
@@ -441,8 +492,18 @@ impl GroupCallManager {
             promise.set_error(Status::error(400, "GROUPCALL_JOIN_MISSING"));
             return;
         }
-        if group_call.is_conference || group_call.is_live_story {
+        let dialog_id = DialogId::new(group_call.chat_id);
+        // the C++ band (cpp:2457): only a joined live story scans for
+        // the streamer; the plain video chats and the rtmp streams
+        // settle empty. The is_being_joined/need_rejoin after_join
+        // recursion is join-plane (media) — at this depth the
+        // not-joined band takes the C++ else arm's error.
+        if !group_call.is_live_story || !dialog_id.is_valid() || group_call.is_rtmp_stream {
             promise.set_value(None);
+            return;
+        }
+        if !group_call.is_joined {
+            promise.set_error(Status::error(400, "GROUPCALL_JOIN_MISSING"));
             return;
         }
         self.pending.streamer.push(promise);
@@ -488,15 +549,19 @@ impl GroupCallManager {
         );
     }
 
-    /// `get_group_call_send_as` (cpp:2490-2582) — the local sender-list
-    /// recipe (the cpp:2517 net leg is the update-driven reload). The
-    /// bands return the dialog ids in the C++ add order; the sender
-    /// objects build at the request arm over the full `Td` frame.
+    /// `get_group_call_send_as` → `do_get_group_call_send_as`
+    /// (cpp:2493-2582) — the local sender-list recipe. The cpp:2517
+    /// net leg (the channels_getSendAs send that feeds
+    /// `can_choose_message_sender` through the MultiPromiseActor
+    /// aggregation) parks with the chat-plane reads (§5) — the recipe
+    /// runs over the record's field. The bands return the dialog ids in
+    /// the C++ add order; the sender objects build at the request arm
+    /// over the full `Td` frame.
     pub(crate) fn group_call_send_as_dialog_ids(
         &self,
         group_call_id: GroupCallId,
         my_dialog_id: DialogId,
-        created_public_broadcasts: &[i64],
+        created_public_broadcasts: &[(i64, i64)],
     ) -> Result<Vec<DialogId>, Status> {
         let group_call = self
             .group_calls
@@ -521,8 +586,14 @@ impl GroupCallManager {
         if group_call.are_messages_enabled || group_call.can_be_managed {
             dialog_ids.push(my_dialog_id);
         }
-        if group_call.are_messages_enabled && group_call.can_be_managed {
-            for &channel_id in created_public_broadcasts {
+        if group_call.are_messages_enabled && group_call.can_choose_message_sender {
+            // the broadcasts sort by participant count, biggest first
+            // (the -score multimap, cpp:2571-2575); a stable sort keeps
+            // the ties in insertion order, the C++ multimap behavior.
+            // The count read rides the caller (the chat plane, §5).
+            let mut sorted: Vec<(i64, i64)> = created_public_broadcasts.to_vec();
+            sorted.sort_by_key(|broadcast| std::cmp::Reverse(broadcast.1));
+            for &(channel_id, _) in &sorted {
                 let channel_dialog_id =
                     DialogId::from_channel_id(crate::chat_manager::ChannelId::new(channel_id));
                 if channel_dialog_id != dialog_id {
@@ -1204,9 +1275,10 @@ impl GroupCallManager {
             ));
             return;
         }
-        // the conference leg rides the tde2e plane — the promise parks
-        // per the §5 fidelity notes.
-        std::mem::forget(promise);
+        // the conference leg rides the tde2e plane (the C++
+        // DeleteConferenceCallParticipantsQuery, cpp:1349-1386) — the
+        // promise parks per the §5 fidelity notes.
+        self.pending.plane_parks.push(Box::new(promise));
     }
 
     /// `decline_group_call_invitation` (cpp:1316-1323) — the invitation
@@ -1275,6 +1347,14 @@ impl GroupCallManager {
             }
             return;
         }
+        if group_call.is_conference {
+            // the C++ conference leg encrypts through tde2e and sends
+            // SendGroupCallEncryptedMessageQuery (cpp:5963-5976; the
+            // call_id twin band rides the tde2e plane too) — the
+            // promise parks per the §5 fidelity notes.
+            self.pending.plane_parks.push(Box::new(promise));
+            return;
+        }
         self.pending.send_message.push(promise);
         self.send_group_call_net_query(
             GroupCallNetKind::SendMessage {
@@ -1284,7 +1364,7 @@ impl GroupCallManager {
                 tdmtproto::telegram_api::phone_sendGroupCallMessage {
                     flags: if paid_message_star_count > 0 { 1 } else { 0 },
                     call: Some(group_call.input_group_call()),
-                    random_id: 0,
+                    random_id: tdutils::random::secure_int64(),
                     message: Some(tdmtproto::telegram_api::TextWithEntities {
                         text: String::new(),
                         entities: Vec::new(),
@@ -1630,7 +1710,7 @@ impl GroupCallManager {
     /// parks per the §5 fidelity notes.
     pub(crate) fn park_media_query<T: Send + 'static>(&mut self, what: &str, promise: Promise<T>) {
         tdutils::log_info!("Send {what} — [net-inert]");
-        std::mem::forget(promise);
+        self.pending.plane_parks.push(Box::new(promise));
     }
 
     /// `send_update_group_call` (cpp:2927-2952) — the port's thin form:
@@ -1643,19 +1723,16 @@ impl GroupCallManager {
         }));
     }
 
-    /// `get_current_state` (Requests.cpp:2253).
+    /// `get_current_state` (Requests.cpp:2253 → GroupCallManager.cpp:8298-8304)
+    /// — the C++ pushes only the message-limits update, which the
+    /// options plane owns (`manager_option_states`); nothing else rides
+    /// this walk.
     pub(crate) fn get_current_state(
         &mut self,
         env: &mut impl GroupCallEnv,
         updates: &mut Vec<td_api::Update>,
     ) {
-        for group_call in self.group_calls.values() {
-            let _ = group_call;
-            env.send_update(td_api::Update::updateGroupCall(td_api::updateGroupCall {
-                group_call: None,
-            }));
-        }
-        let _ = updates;
+        let _ = (env, updates);
     }
 }
 
@@ -2049,5 +2126,77 @@ mod tests {
         let mut manager = GroupCallManager::new();
         manager.park_media_query::<()>("phone.joinGroupCall", Promise::default());
         manager.park_media_query::<()>("phone.createGroupCall", Promise::default());
+    }
+
+    /// `do_get_group_call_send_as` (cpp:2533-2582) — the sender-list
+    /// recipe bands: the non-live-story empty settle, the
+    /// channel/my-dialog add order, the participant-count sort (the
+    /// stable ties, cpp:2571-2575) and the
+    /// `can_choose_message_sender` gate.
+    #[test]
+    fn send_as_recipe_bands() {
+        let mut env = TestEnv::default();
+        let my_dialog = crate::dialog_id::DialogId::new(777);
+        let channel_dialog = crate::dialog_id::DialogId::new(-1_000_000_000_001);
+        let broadcast = |id: i64| {
+            crate::dialog_id::DialogId::from_channel_id(crate::chat_manager::ChannelId::new(id))
+        };
+
+        // the non-live-story band settles empty (cpp:2502-2504)
+        let mut manager = GroupCallManager::new();
+        manager.on_get_group_call(&mut env, test_call(1));
+        let ids = manager
+            .group_call_send_as_dialog_ids(GroupCallId::new(1), my_dialog, &[])
+            .unwrap();
+        assert!(ids.is_empty());
+
+        // the joined live story: the managed channel sender, the
+        // my-dialog sender, then the broadcasts sorted by participant
+        // count, biggest first — the 9-count tie keeps insertion order
+        let mut call = test_call(1);
+        call.is_live_story = true;
+        call.can_be_managed = true;
+        call.are_messages_enabled = true;
+        call.can_choose_message_sender = true;
+        manager.on_get_group_call(&mut env, call);
+        let ids = manager
+            .group_call_send_as_dialog_ids(
+                GroupCallId::new(1),
+                my_dialog,
+                &[(505, 5), (507, 9), (506, 9)],
+            )
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                channel_dialog,
+                my_dialog,
+                broadcast(507),
+                broadcast(506),
+                broadcast(505),
+            ]
+        );
+
+        // `can_choose_message_sender = false` drops the broadcasts
+        let mut call = test_call(1);
+        call.is_live_story = true;
+        call.can_be_managed = true;
+        call.are_messages_enabled = true;
+        call.can_choose_message_sender = false;
+        manager.on_get_group_call(&mut env, call);
+        let ids = manager
+            .group_call_send_as_dialog_ids(GroupCallId::new(1), my_dialog, &[(505, 5)])
+            .unwrap();
+        assert_eq!(ids, vec![channel_dialog, my_dialog]);
+
+        // the not-joined band (cpp:2546-2549)
+        let mut call = test_call(1);
+        call.is_live_story = true;
+        call.is_joined = false;
+        manager.on_get_group_call(&mut env, call);
+        let err = manager
+            .group_call_send_as_dialog_ids(GroupCallId::new(1), my_dialog, &[])
+            .unwrap_err();
+        assert_eq!(err.message(), "GROUPCALL_JOIN_MISSING");
     }
 }

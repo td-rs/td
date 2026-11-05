@@ -11776,10 +11776,10 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
             }
             let mut promise = td
                 .deferred_promise::<td_api::ChatMessageSenders, _>(id, Object::chatMessageSenders);
-            // the created-public-broadcasts read (ChatManager.h:640)
-            // rides the chat plane (§5); the recipe runs over the
-            // empty list.
-            let created_public_broadcasts: Vec<i64> = Vec::new();
+            // the created-public-broadcasts read with the participant
+            // counts (ChatManager.h:640, cpp:2571-2575) rides the chat
+            // plane (§5); the recipe runs over the empty list.
+            let created_public_broadcasts: Vec<(i64, i64)> = Vec::new();
             match td.group_call_manager.group_call_send_as_dialog_ids(
                 GroupCallId::new(request.group_call_id),
                 my_dialog_id(td),
