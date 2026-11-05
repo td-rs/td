@@ -3411,12 +3411,14 @@ pub(crate) type PaymentsNetHandle = NetKindHandle<crate::payments::PaymentsNetKi
 /// [`Td::dispatch_completed_secure_net`].
 pub(crate) type SecureNetHandle = NetKindHandle<crate::secure_manager::SecureNetKind>;
 
-/// The cloned business dispatch surface (the §3.9 net-drain 26
-/// families — the manager-held `BusinessManager::net` handle; the
-/// queries ride the main DC or the business-connection invoke prefix
-/// over the connection DC); the answers drain through
-/// [`Td::dispatch_completed_business_net`].
 pub(crate) type BusinessNetHandle = NetKindHandle<crate::business_manager::BusinessNetKind>;
+
+/// The cloned message-query dispatch surface the [`MessageQueryEnv`]
+/// senders use — the per-kind handle over the MessageQueryManager.cpp
+/// per-message handler kinds (the net-drain 28 plane); the answers drain
+/// through [`Td::dispatch_completed_message_query_net`].
+pub(crate) type MessageQueryNetHandle =
+    NetKindHandle<crate::message_query_manager::MessageQueryNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -4412,6 +4414,14 @@ pub struct Td {
     /// of the net-drain 27 families — the
     /// [`Td::on_secure_net_answer`] drain).
     secure_net_completed: Arc<Mutex<Vec<(crate::secure_manager::SecureNetKind, NetQuery)>>>,
+    /// The callback-parked message-query answers (the C++ ResultHandler
+    /// halves of the net-drain 28 per-message families — the
+    /// [`Td::on_message_query_net_answer`] drain).
+    message_query_net_completed:
+        Arc<Mutex<Vec<(crate::message_query_manager::MessageQueryNetKind, NetQuery)>>>,
+    /// The parked query state of the net-drain 28 families (the
+    /// handler vectors and promises the `Copy` kinds can't carry).
+    message_query_net_pending: crate::message_query_manager::PendingNetQueries,
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
@@ -4898,6 +4908,8 @@ impl Td {
             pending_get_dialog_list_legs: std::collections::HashMap::new(),
             pending_get_pinned_dialogs_legs: std::collections::HashMap::new(),
             secure_net_completed: Arc::new(Mutex::new(Vec::new())),
+            message_query_net_completed: Arc::new(Mutex::new(Vec::new())),
+            message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
@@ -7184,6 +7196,7 @@ impl Td {
         self.dispatch_completed_payments_net();
         self.dispatch_completed_secure_net();
         self.dispatch_completed_business_net();
+        self.dispatch_completed_message_query_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -7428,6 +7441,17 @@ impl Td {
         Some(SecureNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.secure_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned message-query dispatch surface (the net-drain 28
+    /// families' send legs — the env-held handle over
+    /// [`MessageQueryEnv::net`]).
+    pub(crate) fn message_query_net(&self) -> Option<MessageQueryNetHandle> {
+        Some(MessageQueryNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.message_query_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -15456,6 +15480,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked message-query answers — the C++
+    /// ResultHandler halves of the net-drain 28 per-message families
+    /// (MessageQueryManager.cpp).
+    fn dispatch_completed_message_query_net(&mut self) {
+        let completed = std::mem::take(&mut *self.message_query_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_message_query_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -15634,6 +15669,556 @@ impl Td {
                 self.with_secure_manager(|_, manager| {
                     manager.on_get_passport_config_result(result)
                 });
+            }
+        }
+    }
+
+    /// Route one message-query net answer by kind — the ResultHandler
+    /// halves of the net-drain 28 per-message families
+    /// (MessageQueryManager.cpp:306-2290). The wire-error heads run here
+    /// (`on_get_dialog_error`); the parse failures settle through the
+    /// manager error tails without the head (the landed-flip convention,
+    /// §5); the M.10-blocked heads (`on_get_message_error`,
+    /// `on_update_message_interaction_info`, the fact-check/updates
+    /// intakes) stay skipped with the C++ line refs.
+    fn on_message_query_net_answer(
+        &mut self,
+        kind: crate::message_query_manager::MessageQueryNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        /// Pop the oldest parked entry — the §5 FIFO-per-kind convention.
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+        /// The Bool-answer unit band — the C++ `on_result`s that ignore
+        /// the payload (MessageQueryManager.cpp:1912-1918/1987-1993).
+        fn unit_bool_result(query: &NetQuery, what: &str) -> tdutils::status::Result<()> {
+            if query.is_error() {
+                return tdutils::status::Result::Err(query.error().clone());
+            }
+            match parse_wire_bool(query.ok()) {
+                Some(()) => tdutils::status::Result::Ok(()),
+                None => tdutils::status::Result::Err(parse_error(what)),
+            }
+        }
+        use crate::message_query_manager::MessageQueryNetKind;
+        use crate::message_query_manager::MessageViewers;
+        // the pts hop and the counter intakes call the env trait methods
+        use crate::message_query_manager::MessageQueryManagerEnv as _;
+        match kind {
+            // `GetExtendedMediaQuery` (MessageQueryManager.cpp:378-393) —
+            // the `Updates` answer re-enters `on_get_updates` with the
+            // empty promise, both halves finish the reload.
+            MessageQueryNetKind::GetExtendedMedia => {
+                let Some((dialog_id, message_ids)) =
+                    pop_head(&mut self.message_query_net_pending.extended_media)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetExtendedMediaQuery",
+                    );
+                } else if let Ok(updates) = telegram_api::Updates::parse(query.ok()) {
+                    self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise: Promise::default(),
+                    });
+                }
+                let (_env, mq_manager) = message_query_env_split(self);
+                mq_manager.finish_get_message_extended_media(dialog_id, &message_ids);
+            }
+            // `GetFactCheckQuery` (MessageQueryManager.cpp:415-430) — the
+            // error half runs the `on_get_dialog_error` head
+            // (cpp:426-428) before the fact-check reload intake
+            // (`is_error` covers the wire error and the parse failure —
+            // the C++ funnels both through `on_error`).
+            MessageQueryNetKind::GetFactCheck => {
+                let Some((dialog_id, message_ids)) =
+                    pop_head(&mut self.message_query_net_pending.fact_checks)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else if parse_wire_vector(query.ok(), telegram_api::FactCheck::read).is_some() {
+                    tdutils::status::Result::Ok(())
+                } else {
+                    tdutils::status::Result::Err(parse_error("messages.getFactCheck"))
+                };
+                if let tdutils::status::Result::Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetFactCheckQuery",
+                    );
+                }
+                let (mut env, mq_manager) = message_query_env_split(self);
+                mq_manager.on_reload_message_fact_checks(
+                    &mut env,
+                    dialog_id,
+                    &message_ids,
+                    result.is_error(),
+                );
+            }
+            // `GetMessagesViewsQuery` (MessageQueryManager.cpp:1147-1174)
+            // — the users/chats intakes, the count-mismatch 500 band and
+            // the per-message interaction-info intake (the last is
+            // [blocked: M.10 integration]); both halves finish.
+            MessageQueryNetKind::GetMessagesViews => {
+                let Some((dialog_id, message_ids)) =
+                    pop_head(&mut self.message_query_net_pending.views)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_MessageViews::parse(query.ok()) {
+                        Ok(views) if views.views.len() == message_ids.len() => {
+                            tdutils::status::Result::Ok(views)
+                        }
+                        // the cpp:1155-1157 count band settles through the
+                        // error half's finish
+                        Ok(_) => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Wrong number of message views returned",
+                        )),
+                        Err(_) => {
+                            tdutils::status::Result::Err(parse_error("messages.getMessagesViews"))
+                        }
+                    }
+                };
+                match result {
+                    tdutils::status::Result::Ok(mut views) => {
+                        self.intake_users(
+                            std::mem::take(&mut views.users),
+                            "GetMessagesViewsQuery",
+                        );
+                        self.intake_chats(
+                            std::mem::take(&mut views.chats),
+                            "GetMessagesViewsQuery",
+                        );
+                        // cpp:1160-1165 — `on_update_message_interaction_info`
+                        // per message is the [blocked: M.10 integration] half
+                        let (_env, mq_manager) = message_query_env_split(self);
+                        mq_manager.finish_get_message_views(dialog_id, &message_ids);
+                    }
+                    tdutils::status::Result::Err(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "GetMessagesViewsQuery",
+                        );
+                        let (_env, mq_manager) = message_query_env_split(self);
+                        mq_manager.finish_get_message_views(dialog_id, &message_ids);
+                    }
+                }
+            }
+            // `GetMessagesReactionsQuery`
+            // (MessageQueryManager.cpp:1195-1228) — the
+            // `updateMessageReactions` walk and the `on_get_updates`
+            // re-entry (the M.10 intakes) then the reload re-arm; both
+            // halves re-arm.
+            MessageQueryNetKind::GetMessagesReactions => {
+                let Some((dialog_id, message_ids)) =
+                    pop_head(&mut self.message_query_net_pending.reactions)
+                else {
+                    return;
+                };
+                let _ = message_ids;
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetMessagesReactionsQuery",
+                    );
+                } else if let Ok(updates) = telegram_api::Updates::parse(query.ok()) {
+                    // cpp:1203-1221 — the skipped-id walk and the updates
+                    // intake are the [blocked: M.10 integration] halves
+                    self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise: Promise::default(),
+                    });
+                }
+                let (mut env, mq_manager) = message_query_env_split(self);
+                mq_manager.try_reload_message_reactions(&mut env, dialog_id, true);
+            }
+            // `ReportReadMetricsQuery` (MessageQueryManager.cpp:1040-1048)
+            // — fire-and-forget (both C++ halves are empty).
+            MessageQueryNetKind::ReportReadMetrics => {}
+            // `GetMessageReadParticipantsQuery`
+            // (MessageQueryManager.cpp:1114-1126) — the read-dates answer
+            // builds the viewers and runs the intake; the error half's
+            // `on_get_message_error` head is [blocked: M.10 integration].
+            MessageQueryNetKind::GetMessageReadParticipants {
+                dialog_id,
+                message_id,
+            } => {
+                let _ = (dialog_id, message_id);
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.message_viewers)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match parse_wire_vector(query.ok(), telegram_api::ReadParticipantDate::read) {
+                    Some(read_dates) => {
+                        let viewers = MessageViewers::from_read_participant_dates(read_dates);
+                        let (mut env, mq_manager) = message_query_env_split(self);
+                        mq_manager.on_get_message_viewers(&mut env, viewers, false, promise);
+                    }
+                    None => promise.set_error(parse_error("messages.getMessageReadParticipants")),
+                }
+            }
+            // `GetEmojiGameInfoQuery` (MessageQueryManager.cpp:1400-1413).
+            MessageQueryNetKind::GetEmojiGameInfo => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.emoji_game_info)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::messages_EmojiGameInfo::parse(query.ok()) {
+                    Ok(game_info) => {
+                        let (mut env, mq_manager) = message_query_env_split(self);
+                        mq_manager.on_get_emoji_game_info(&mut env, &game_info, promise);
+                    }
+                    Err(_) => promise.set_error(parse_error("messages.getEmojiGameInfo")),
+                }
+            }
+            // `ReportMusicListenQuery` (MessageQueryManager.cpp:1014-1025)
+            // — the Bool answer is ignored.
+            MessageQueryNetKind::ReportMusicListen => {
+                let Some(mut promise) = pop_head(&mut self.message_query_net_pending.music_listen)
+                else {
+                    return;
+                };
+                match unit_bool_result(&query, "messages.reportMusicListen") {
+                    tdutils::status::Result::Ok(()) => promise.set_value(()),
+                    tdutils::status::Result::Err(status) => promise.set_error(status),
+                }
+            }
+            // `SendBotRequestedPeerQuery` (MessageQueryManager.cpp:344-357)
+            // — the `Updates` answer re-enters `on_get_updates` with the
+            // query-carried promise.
+            MessageQueryNetKind::SendBotRequestedPeer => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.bot_requested_peer)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
+                    Err(_) => promise.set_error(parse_error("messages.sendBotRequestedPeer")),
+                }
+            }
+            // `DeleteParticipantReactionsQuery`
+            // (MessageQueryManager.cpp:1987-2001) — the error head runs
+            // only off-channel senders.
+            MessageQueryNetKind::DeleteParticipantReactions {
+                dialog_id,
+                sender_dialog_id,
+            } => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.participant_reactions)
+                else {
+                    return;
+                };
+                let result = unit_bool_result(&query, "messages.deleteParticipantReactions");
+                // cpp:1996-2000 — the head runs only off-channel senders
+                let head_status = match &result {
+                    tdutils::status::Result::Err(status)
+                        if sender_dialog_id.get_type() != crate::dialog_id::DialogType::Channel =>
+                    {
+                        Some(status)
+                    }
+                    _ => None,
+                };
+                if let Some(status) = head_status {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "DeleteParticipantReactionsQuery",
+                    );
+                }
+                match result {
+                    tdutils::status::Result::Ok(()) => promise.set_value(()),
+                    tdutils::status::Result::Err(status) => promise.set_error(status),
+                }
+            }
+            // `DeleteParticipantReactionQuery`
+            // (MessageQueryManager.cpp:2026-2040) — the same head gate.
+            MessageQueryNetKind::DeleteParticipantReaction {
+                dialog_id,
+                sender_dialog_id,
+            } => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.participant_reaction)
+                else {
+                    return;
+                };
+                let result = unit_bool_result(&query, "messages.deleteParticipantReaction");
+                // cpp:2035-2039 — the same off-channel head gate
+                let head_status = match &result {
+                    tdutils::status::Result::Err(status)
+                        if sender_dialog_id.get_type() != crate::dialog_id::DialogType::Channel =>
+                    {
+                        Some(status)
+                    }
+                    _ => None,
+                };
+                if let Some(status) = head_status {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "DeleteParticipantReactionQuery",
+                    );
+                }
+                match result {
+                    tdutils::status::Result::Ok(()) => promise.set_value(()),
+                    tdutils::status::Result::Err(status) => {
+                        // cpp:2039-2041 — MESSAGE_NOT_MODIFIED answers ok
+                        if status.message() == "MESSAGE_NOT_MODIFIED" {
+                            promise.set_value(())
+                        } else {
+                            promise.set_error(status)
+                        }
+                    }
+                }
+            }
+            // `EditEphemeralMessageQuery` (MessageQueryManager.cpp:1493-1516)
+            // — the no-upload legs: the `Updates` answer re-enters
+            // `on_get_updates` with the query-carried promise.
+            MessageQueryNetKind::EditEphemeralMessage => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.ephemeral_edits)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
+                    Err(_) => promise.set_error(parse_error("ephemeral.editMessage")),
+                }
+            }
+            // `DeleteEphemeralMessageQuery`
+            // (MessageQueryManager.cpp:1912-1925) — the error head logs
+            // the dialog error before the promise error.
+            MessageQueryNetKind::DeleteEphemeralMessage { dialog_id } => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.ephemeral_deletes)
+                else {
+                    return;
+                };
+                let result = unit_bool_result(&query, "ephemeral.deleteMessage");
+                if let tdutils::status::Result::Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "DeleteEphemeralMessageQuery",
+                    );
+                }
+                match result {
+                    tdutils::status::Result::Ok(()) => promise.set_value(()),
+                    tdutils::status::Result::Err(status) => promise.set_error(status),
+                }
+            }
+            // `ReadMessagesContentsQuery`/`ReadChannelMessagesContentsQuery`
+            // (MessageQueryManager.cpp:2222-2288) — the plain form's pts
+            // hop precedes the promise closure; the channel form answers
+            // Bool; the closure routes into the reactions/poll-votes
+            // counter intakes.
+            MessageQueryNetKind::ReadMessageContents { intake } => {
+                use crate::message_query_manager::ReadContentsIntake;
+                // cpp:5050-5096 — the C++ promise closure rides the query;
+                // the collapsed port pops the first park of the answer's
+                // own intake (the pop pairs the counter walks; the
+                // same-intake residual is the §5 FIFO convention)
+                let index = self
+                    .message_query_net_pending
+                    .read_contents
+                    .iter()
+                    .position(|(_, _, parked_intake)| *parked_intake == intake);
+                let Some((dialog_id, message_ids, _)) = index
+                    .map(|index| self.message_query_net_pending.read_contents.remove(index))
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    // cpp:2282-2287 — the channel form's
+                    // `on_get_channel_error` head
+                    if dialog_id.get_type() == crate::dialog_id::DialogType::Channel {
+                        self.chat_channel_error_head(
+                            dialog_id.get_channel_id(),
+                            &status,
+                            "ReadChannelMessagesContentsQuery",
+                        );
+                    }
+                    tdutils::status::Result::Err(status)
+                } else if dialog_id.get_type() == crate::dialog_id::DialogType::Channel {
+                    // cpp:2266-2274 — the Bool answer (LOG_IF(ERROR,
+                    // !result) band on the false constructor)
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => tdutils::status::Result::Ok(()),
+                        Some(false) => {
+                            tdutils::log_error!("Read channel messages contents failed");
+                            tdutils::status::Result::Ok(())
+                        }
+                        None => tdutils::status::Result::Err(parse_error(
+                            "channels.readMessageContents",
+                        )),
+                    }
+                } else {
+                    match telegram_api::messages_AffectedMessages::parse(query.ok()) {
+                        Ok(affected) => {
+                            if affected.pts_count > 0 {
+                                // cpp:2231-2235 — the dummyUpdate pts hop
+                                let (mut env, _mq_manager) = message_query_env_split(self);
+                                env.add_pending_pts_update(
+                                    affected.pts,
+                                    affected.pts_count,
+                                    tdutils::time::now(),
+                                    Promise::default(),
+                                    "read messages content query",
+                                );
+                            }
+                            tdutils::status::Result::Ok(())
+                        }
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "messages.readMessageContents",
+                        )),
+                    }
+                };
+                match intake {
+                    ReadContentsIntake::Plain => {
+                        let _ = result;
+                    }
+                    ReadContentsIntake::ReadReactions => {
+                        let (mut env, mq_manager) = message_query_env_split(self);
+                        mq_manager.on_read_message_reactions(
+                            &mut env,
+                            dialog_id,
+                            message_ids,
+                            result.is_error(),
+                        );
+                    }
+                    ReadContentsIntake::ReadPollVotes => {
+                        let (mut env, mq_manager) = message_query_env_split(self);
+                        mq_manager.on_read_message_poll_votes(
+                            &mut env,
+                            dialog_id,
+                            message_ids,
+                            result.is_error(),
+                        );
+                    }
+                }
+            }
+            // `AppendToDoListQuery` (MessageQueryManager.cpp:1294-1308) —
+            // the `Updates` answer re-enters `on_get_updates`; the error
+            // half's `on_get_message_error` head is
+            // [blocked: M.10 integration].
+            MessageQueryNetKind::AppendToDoList => {
+                let Some(mut promise) = pop_head(&mut self.message_query_net_pending.to_do_appends)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
+                    Err(_) => promise.set_error(parse_error("messages.appendTodoList")),
+                }
+            }
+            // `ToggleToDoCompletedQuery`
+            // (MessageQueryManager.cpp:1331-1345) — the same shape.
+            MessageQueryNetKind::ToggleToDoCompleted => {
+                let Some(mut promise) = pop_head(&mut self.message_query_net_pending.to_do_toggles)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
+                    Err(_) => promise.set_error(parse_error("messages.toggleTodoCompleted")),
+                }
+            }
+            // `SummarizeTextQuery` (MessageQueryManager.cpp:1255-1270) —
+            // the `textWithEntities` answer runs the formatted-text
+            // intake and the object build over the user manager
+            // (cpp:1263-1265).
+            MessageQueryNetKind::SummarizeText => {
+                let Some(mut promise) =
+                    pop_head(&mut self.message_query_net_pending.summarize_text)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::TextWithEntities::parse(query.ok()) {
+                    Ok(text) => {
+                        let (mut env, _mq_manager) = message_query_env_split(self);
+                        let formatted_text = crate::message_entity::get_formatted_text(
+                            Some(&mut env),
+                            text.text,
+                            text.entities,
+                            true,
+                            true,
+                            "SummarizeTextQuery",
+                        );
+                        promise.set_value(crate::message_entity::get_formatted_text_object(
+                            Some(&mut env),
+                            &formatted_text,
+                            true,
+                            -1,
+                        ));
+                    }
+                    Err(_) => promise.set_error(parse_error("messages.summarizeText")),
+                }
             }
         }
     }
@@ -26092,8 +26677,11 @@ impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_
 /// The `G()`/manager slice the collapsed MessageQueryManager reads through
 /// (M.18) — the C++ manager reads the same surfaces off its `Td *td_`
 /// directly. The `send_update`s buffer into [`Td::message_query_updates`]
-/// and Td drains them; every net query tail and message-plane probe keeps
-/// its default seam body (the honest error bands in
+/// and Td drains them; the per-message net query tails (net-drain 28)
+/// dispatch through the env net handle (a handle-less env parks the
+/// promise with the net-inert log) and the search/history tails +
+/// message-plane probes keep their default seam bodies (the honest error
+/// bands in
 /// [`crate::message_query_manager::MessageQueryManagerEnv`]).
 pub(crate) struct MessageQueryEnv<'a> {
     pub(crate) global: &'a mut Global,
@@ -26105,10 +26693,17 @@ pub(crate) struct MessageQueryEnv<'a> {
     pub(crate) can_ignore_background_updates: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
     pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub(crate) updates_manager: &'a mut UpdatesManager<TdSink>,
     /// `td_->file_manager_` — the `report_music_listen` file-view read
     /// (the shared registry behind the mutex, cloned per split).
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    /// The net-drain 28 dispatch surface (the per-message families' send
+    /// legs); `None` pre-init and in the net-inert tests.
+    pub(crate) net: Option<MessageQueryNetHandle>,
+    /// The net-drain 28 parked query state (the handler vectors and
+    /// promises the `Copy` kinds can't carry).
+    pub(crate) pending: &'a mut crate::message_query_manager::PendingNetQueries,
 }
 
 impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_> {
@@ -26259,6 +26854,917 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
         Some(telegram_api::InputDocument::inputDocument(
             main_remote_location.as_input_document(),
         ))
+    }
+
+    /// `dialog_manager_->have_input_peer` — the real read (the
+    /// reactions-reload gate of the net-drain 28 slice; the field-split
+    /// twin of `crate::dialog_manager::have_input_peer`,
+    /// DialogManager.cpp:1377+).
+    fn have_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let Some(options) = self.options.as_deref_mut() else {
+                    return false;
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .have_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .have_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let Some(options) = self.options.as_deref_mut() else {
+                    return false;
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.have_input_peer_channel_id(
+                    &env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::SecretChat => {
+                // DialogManager.cpp:1494-1500 — the encrypted-peer read
+                // under the allow flag (the field-split twin of
+                // `dialog_manager::have_input_peer`)
+                allow_secret_chats
+                    && self.user_manager.have_input_encrypted_peer(
+                        dialog_id.get_secret_chat_id(),
+                        access_rights,
+                    )
+            }
+            crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    // -- the net-drain 28 send legs: the wire queries the C++ handlers
+    //    build at their send sites (MessageQueryManager.cpp:306-358,
+    //    360-430, 1002-1230, 1273-1347, 1388-1415, 1444-1568, 1888-2045,
+    //    2210-2289); the peers resolve here (the net-drain recipe) and the
+    //    null-peer bands settle through the completed queue (the inline
+    //    `on_error` calls of the C++ send sites) --
+
+    /// `GetExtendedMediaQuery::send` (MessageQueryManager.cpp:365-376).
+    fn send_get_extended_media_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_ids: Vec<crate::messages_manager::MessageId>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::GetExtendedMedia;
+        let server_ids = crate::messages_manager::MessageId::get_server_message_ids(&message_ids);
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getExtendedMedia(
+                        telegram_api::messages_getExtendedMedia {
+                            peer: Some(Box::new(peer)),
+                            id: server_ids,
+                        },
+                    ),
+                );
+                self.pending.extended_media.push((dialog_id, message_ids));
+            }
+            (Some(net), None) => {
+                // cpp:369-371 — the null peer runs the inline on_error band
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.extended_media.push((dialog_id, message_ids));
+            }
+            (None, _) => tdutils::log_info!("Send messages.getExtendedMedia — [net-inert]"),
+        }
+    }
+
+    /// `GetFactCheckQuery::send` (MessageQueryManager.cpp:405-413).
+    fn send_get_fact_check_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_ids: Vec<crate::messages_manager::MessageId>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::GetFactCheck;
+        let server_ids = crate::messages_manager::MessageId::get_server_message_ids(&message_ids);
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getFactCheck(
+                        telegram_api::messages_getFactCheck {
+                            peer: Some(Box::new(peer)),
+                            msg_id: server_ids,
+                        },
+                    ),
+                );
+                self.pending.fact_checks.push((dialog_id, message_ids));
+            }
+            (Some(net), None) => {
+                // cpp:407-409 — the null peer answers the promise 400
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.fact_checks.push((dialog_id, message_ids));
+            }
+            (None, _) => tdutils::log_info!("Send messages.getFactCheck — [net-inert]"),
+        }
+    }
+
+    /// `ReportReadMetricsQuery::send` (MessageQueryManager.cpp:1030-1038)
+    /// — the null peer returns silently (cpp:1032-1035).
+    fn send_report_read_metrics_query(
+        &mut self,
+        dialog_id: DialogId,
+        metrics: Vec<crate::message_query_manager::MessageReadMetric>,
+    ) {
+        let net = self.net.clone();
+        let Some(net) = net else {
+            return tdutils::log_info!("Send messages.reportReadMetrics — [net-inert]");
+        };
+        let Some(peer) = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read)
+        else {
+            return;
+        };
+        net.dispatch(
+            crate::message_query_manager::MessageQueryNetKind::ReportReadMetrics,
+            telegram_api::Function::messages_reportReadMetrics(
+                telegram_api::messages_reportReadMetrics {
+                    peer: Some(Box::new(peer)),
+                    metrics: metrics
+                        .into_iter()
+                        .map(|metric| telegram_api::InputMessageReadMetric {
+                            msg_id: metric.message_id.get_server_message_id().get(),
+                            view_id: metric.view_id,
+                            time_in_view_ms: metric.time_in_view_ms,
+                            active_time_in_view_ms: metric.active_time_in_view_ms,
+                            height_to_viewport_ratio_permille: metric
+                                .height_to_viewport_ratio_per_mille,
+                            seen_range_ratio_permille: metric.seen_range_ratio_per_mille,
+                        })
+                        .collect(),
+                },
+            ),
+        );
+    }
+
+    /// `GetMessageReadParticipantsQuery::send`
+    /// (MessageQueryManager.cpp:1105-1112) — the peer is CHECKed in the
+    /// C++ (the `can_get_message_viewers` gate ran first); the None band
+    /// settles through the completed queue.
+    fn send_get_message_read_participants_query(
+        &mut self,
+        message_full_id: MessageFullId,
+        promise: Promise<td_api::MessageViewers>,
+    ) {
+        let dialog_id = message_full_id.get_dialog_id();
+        let message_id = message_full_id.get_message_id();
+        let kind = crate::message_query_manager::MessageQueryNetKind::GetMessageReadParticipants {
+            dialog_id,
+            message_id,
+        };
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getMessageReadParticipants(
+                        telegram_api::messages_getMessageReadParticipants {
+                            peer: Some(Box::new(peer)),
+                            msg_id: message_id.get_server_message_id().get(),
+                        },
+                    ),
+                );
+                self.pending.message_viewers.push(promise);
+            }
+            (Some(net), None) => {
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.message_viewers.push(promise);
+            }
+            (None, _) => {
+                tdutils::log_info!("Send messages.getMessageReadParticipants — [net-inert]")
+            }
+        }
+    }
+
+    /// `GetMessagesViewsQuery::send`
+    /// (MessageQueryManager.cpp:1134-1145).
+    fn send_get_messages_views_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_ids: Vec<crate::messages_manager::MessageId>,
+        increment_view_counter: bool,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::GetMessagesViews;
+        let server_ids = crate::messages_manager::MessageId::get_server_message_ids(&message_ids);
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getMessagesViews(
+                        telegram_api::messages_getMessagesViews {
+                            peer: Some(Box::new(peer)),
+                            id: server_ids,
+                            increment: increment_view_counter,
+                        },
+                    ),
+                );
+                self.pending.views.push((dialog_id, message_ids));
+            }
+            (Some(net), None) => {
+                // cpp:1138-1141 — the null peer runs the inline on_error band
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.views.push((dialog_id, message_ids));
+            }
+            (None, _) => tdutils::log_info!("Send messages.getMessagesViews — [net-inert]"),
+        }
+    }
+
+    /// `GetMessagesReactionsQuery::send`
+    /// (MessageQueryManager.cpp:1182-1193) — the peer is CHECKed in the
+    /// C++ (`have_input_peer` gated the queue drain); the None band
+    /// settles through the completed queue.
+    fn send_get_messages_reactions_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_ids: Vec<crate::messages_manager::MessageId>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::GetMessagesReactions;
+        let server_ids = crate::messages_manager::MessageId::get_server_message_ids(&message_ids);
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getMessagesReactions(
+                        telegram_api::messages_getMessagesReactions {
+                            peer: Some(Box::new(peer)),
+                            id: server_ids,
+                        },
+                    ),
+                );
+                self.pending.reactions.push((dialog_id, message_ids));
+            }
+            (Some(net), None) => {
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.reactions.push((dialog_id, message_ids));
+            }
+            (None, _) => tdutils::log_info!("Send messages.getMessagesReactions — [net-inert]"),
+        }
+    }
+
+    /// `ReadMessagesContentsQuery::send`
+    /// (MessageQueryManager.cpp:2217-2220) /
+    /// `ReadChannelMessagesContentsQuery::send` (cpp:2256-2268) — the
+    /// dialog type picks the wire form; the intake tag rides the kind
+    /// (the C++ encodes it in the promise closure,
+    /// MessageQueryManager.cpp:5054-5059/5091-5096).
+    fn send_read_message_contents_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_ids: Vec<crate::messages_manager::MessageId>,
+        intake: crate::message_query_manager::ReadContentsIntake,
+    ) {
+        let kind =
+            crate::message_query_manager::MessageQueryNetKind::ReadMessageContents { intake };
+        let net = self.net.clone();
+        let Some(net) = net else {
+            return tdutils::log_info!("Send messages.readMessageContents — [net-inert]");
+        };
+        let server_ids = crate::messages_manager::MessageId::get_server_message_ids(&message_ids);
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User | crate::dialog_id::DialogType::Chat => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_readMessageContents(
+                        telegram_api::messages_readMessageContents { id: server_ids },
+                    ),
+                );
+                self.pending.read_contents.push((dialog_id, message_ids, intake));
+            }
+            crate::dialog_id::DialogType::Channel => {
+                let Some(input_channel) = self.env_input_channel(dialog_id.get_channel_id()) else {
+                    // cpp:2259-2263 — the null channel answers 400
+                    net.complete_error(kind, 400, "Can't access the chat");
+                    self.pending.read_contents.push((dialog_id, message_ids, intake));
+                    return;
+                };
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::channels_readMessageContents(
+                        telegram_api::channels_readMessageContents {
+                            channel: Some(input_channel),
+                            id: server_ids,
+                        },
+                    ),
+                );
+                self.pending.read_contents.push((dialog_id, message_ids, intake));
+            }
+            crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => {
+                // the secret-chat open-message leg is the tde2e plane; the
+                // collapsed port keeps the promise parked (the callers'
+                // pending counters stay, matching the never-settled C++
+                // promise)
+            }
+        }
+    }
+
+    /// `GetEmojiGameInfoQuery::send`
+    /// (MessageQueryManager.cpp:1396-1398).
+    fn send_get_emoji_game_info_query(&mut self, promise: Promise<td_api::StakeDiceState>) {
+        let net = self.net.clone();
+        match net {
+            Some(net) => {
+                net.dispatch(
+                    crate::message_query_manager::MessageQueryNetKind::GetEmojiGameInfo,
+                    telegram_api::Function::messages_getEmojiGameInfo(
+                        telegram_api::messages_getEmojiGameInfo,
+                    ),
+                );
+                self.pending.emoji_game_info.push(promise);
+            }
+            None => tdutils::log_info!("Send messages.getEmojiGameInfo — [net-inert]"),
+        }
+    }
+
+    /// `ReportMusicListenQuery::send`
+    /// (MessageQueryManager.cpp:1009-1012).
+    fn send_report_music_listen_query(
+        &mut self,
+        input_document: telegram_api::InputDocument,
+        duration: i32,
+        promise: Promise<()>,
+    ) {
+        let net = self.net.clone();
+        match net {
+            Some(net) => {
+                net.dispatch(
+                    crate::message_query_manager::MessageQueryNetKind::ReportMusicListen,
+                    telegram_api::Function::messages_reportMusicListen(
+                        telegram_api::messages_reportMusicListen {
+                            id: Some(input_document),
+                            listened_duration: duration,
+                        },
+                    ),
+                );
+                self.pending.music_listen.push(promise);
+            }
+            None => tdutils::log_info!("Send messages.reportMusicListen — [net-inert]"),
+        }
+    }
+
+    /// `SendBotRequestedPeerQuery::send`
+    /// (MessageQueryManager.cpp:313-342) — the MSG_ID/WEBAPP_REQ_ID flag
+    /// pair and the per-peer null bands (cpp:318-335).
+    fn send_send_bot_requested_peer_query(
+        &mut self,
+        message_full_id: MessageFullId,
+        bot_user_id: crate::user_manager::UserId,
+        request_id: String,
+        button_id: i32,
+        shared_dialog_ids: Vec<DialogId>,
+        promise: Promise<()>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::SendBotRequestedPeer;
+        let net = self.net.clone();
+        let Some(net) = net else {
+            return tdutils::log_info!("Send messages.sendBotRequestedPeer — [net-inert]");
+        };
+        const MSG_ID_MASK: i32 = 1; // flags.0
+        const WEBAPP_REQ_ID_MASK: i32 = 1 << 1; // flags.1
+        let dialog_id = message_full_id.get_dialog_id();
+        let (flags, input_peer) =
+            if bot_user_id == crate::user_manager::UserId::default() && request_id.is_empty() {
+                let Some(peer) =
+                    self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Write)
+                else {
+                    net.complete_error(kind, 400, "Can't access the chat");
+                    self.pending.bot_requested_peer.push(promise);
+                    return;
+                };
+                (MSG_ID_MASK, peer)
+            } else {
+                let Some(peer) = self.env_input_peer(
+                    DialogId::new(bot_user_id.get()),
+                    crate::user_manager::AccessRights::Write,
+                ) else {
+                    net.complete_error(kind, 400, "Can't access the chat");
+                    self.pending.bot_requested_peer.push(promise);
+                    return;
+                };
+                (WEBAPP_REQ_ID_MASK, peer)
+            };
+        let mut requested_peers = Vec::with_capacity(shared_dialog_ids.len());
+        for shared_dialog_id in shared_dialog_ids {
+            let Some(peer) =
+                self.env_input_peer(shared_dialog_id, crate::user_manager::AccessRights::Read)
+            else {
+                // cpp:330-334 — the chosen-chat null band
+                net.complete_error(kind, 400, "Can't access the chosen chat");
+                self.pending.bot_requested_peer.push(promise);
+                return;
+            };
+            requested_peers.push(Box::new(peer));
+        }
+        net.dispatch(
+            kind,
+            telegram_api::Function::messages_sendBotRequestedPeer(
+                telegram_api::messages_sendBotRequestedPeer {
+                    flags,
+                    peer: Some(Box::new(input_peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    webapp_req_id: request_id,
+                    button_id,
+                    requested_peers,
+                },
+            ),
+        );
+        self.pending.bot_requested_peer.push(promise);
+    }
+
+    /// `DeleteParticipantReactionsQuery::send`
+    /// (MessageQueryManager.cpp:1974-1985) — the peers are CHECKed in
+    /// the C++ (`have_input_peer` gated the request); the None bands
+    /// settle through the completed queue.
+    fn send_delete_participant_reactions_query(
+        &mut self,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+        promise: Promise<()>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::DeleteParticipantReactions {
+            dialog_id,
+            sender_dialog_id,
+        };
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Write);
+        let sender_peer =
+            self.env_input_peer(sender_dialog_id, crate::user_manager::AccessRights::Know);
+        match (net, peer, sender_peer) {
+            (Some(net), Some(peer), Some(sender_peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_deleteParticipantReactions(
+                        telegram_api::messages_deleteParticipantReactions {
+                            peer: Some(Box::new(peer)),
+                            participant: Some(Box::new(sender_peer)),
+                        },
+                    ),
+                );
+                self.pending.participant_reactions.push(promise);
+            }
+            (Some(net), ..) => {
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.participant_reactions.push(promise);
+            }
+            (None, ..) => {
+                tdutils::log_info!("Send messages.deleteParticipantReactions — [net-inert]")
+            }
+        }
+    }
+
+    /// `DeleteParticipantReactionQuery::send`
+    /// (MessageQueryManager.cpp:2013-2024) — the same CHECKed pair.
+    fn send_delete_participant_reaction_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+        sender_dialog_id: DialogId,
+        promise: Promise<()>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::DeleteParticipantReaction {
+            dialog_id,
+            sender_dialog_id,
+        };
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Write);
+        let sender_peer =
+            self.env_input_peer(sender_dialog_id, crate::user_manager::AccessRights::Know);
+        match (net, peer, sender_peer) {
+            (Some(net), Some(peer), Some(sender_peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_deleteParticipantReaction(
+                        telegram_api::messages_deleteParticipantReaction {
+                            peer: Some(Box::new(peer)),
+                            msg_id: message_id.get_server_message_id().get(),
+                            participant: Some(Box::new(sender_peer)),
+                        },
+                    ),
+                );
+                self.pending.participant_reaction.push(promise);
+            }
+            (Some(net), ..) => {
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.participant_reaction.push(promise);
+            }
+            (None, ..) => {
+                tdutils::log_info!("Send messages.deleteParticipantReaction — [net-inert]")
+            }
+        }
+    }
+
+    /// `EditEphemeralMessageQuery::send`
+    /// (MessageQueryManager.cpp:1452-1491) — the no-media legs (the media
+    /// legs wait at the M.12 upload seams); the flag set is the
+    /// PEER/MESSAGE/ENTITIES/REPLY_MARKUP quartet over the scheme bits
+    /// (MEDIA.3/RICH_MESSAGE.4 stay off).
+    fn send_edit_ephemeral_message_query(
+        &mut self,
+        dialog_id: DialogId,
+        receiver_user_id: crate::user_manager::UserId,
+        ephemeral_message_id: crate::messages_manager::EphemeralMessageId,
+        has_input_caption: bool,
+        input_caption: Option<crate::message_entity::FormattedText>,
+        _disable_web_page_preview: bool,
+        invert_media: bool,
+        reply_markup: Option<crate::reply_markup::ReplyMarkup>,
+        promise: Promise<()>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::EditEphemeralMessage;
+        let net = self.net.clone();
+        let Some(net) = net else {
+            return tdutils::log_info!("Send ephemeral.editMessage — [net-inert]");
+        };
+        const PEER_MASK: i32 = 1 << 7; // flags.7
+        const MESSAGE_MASK: i32 = 1; // flags.0
+        const ENTITIES_MASK: i32 = 1 << 1; // flags.1
+        const REPLY_MARKUP_MASK: i32 = 1 << 2; // flags.2
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Write);
+        let input_user = self.get_input_user(receiver_user_id);
+        let entities = input_caption.as_ref().map_or_else(Vec::new, |text| {
+            crate::message_entity::get_input_message_entities(
+                Some(&mut *self),
+                &text.entities,
+                "EditEphemeralMessageQuery",
+            )
+        });
+        let input_reply_markup = reply_markup
+            .and_then(|reply_markup| crate::reply_markup::get_input_reply_markup(&reply_markup));
+        let mut flags = PEER_MASK;
+        let mut message = String::new();
+        if has_input_caption
+            || input_caption
+                .as_ref()
+                .is_some_and(|text| !text.text.is_empty())
+        {
+            flags |= MESSAGE_MASK;
+            if let Some(text) = &input_caption {
+                message = text.text.clone();
+            }
+        }
+        if !entities.is_empty() {
+            flags |= ENTITIES_MASK;
+        }
+        if input_reply_markup.is_some() {
+            flags |= REPLY_MARKUP_MASK;
+        }
+        let peer_missing = peer.is_none();
+        match (peer, input_user) {
+            (Some(peer), Ok(input_user)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::ephemeral_editMessage(
+                        telegram_api::ephemeral_editMessage {
+                            flags,
+                            invert_media,
+                            welcome: false,
+                            peer: Some(Box::new(peer)),
+                            receiver_id: Some(input_user),
+                            id: ephemeral_message_id.get(),
+                            message,
+                            media: None,
+                            entities,
+                            reply_markup: input_reply_markup,
+                            rich_message: None,
+                        },
+                    ),
+                );
+                self.pending.ephemeral_edits.push(promise);
+            }
+            // cpp:1457-1464 — the inline on_error bands
+            _ => {
+                let what = if peer_missing {
+                    "Can't access the chat"
+                } else {
+                    "Can't access the user"
+                };
+                net.complete_error(kind, 400, what);
+                self.pending.ephemeral_edits.push(promise);
+            }
+        }
+    }
+
+    /// `DeleteEphemeralMessageQuery::send`
+    /// (MessageQueryManager.cpp:1896-1910) — the PEER flag form; the
+    /// receiver must be a user dialog (cpp:1900-1905).
+    fn send_delete_ephemeral_message_query(
+        &mut self,
+        dialog_id: DialogId,
+        receiver_dialog_id: DialogId,
+        ephemeral_message_id: crate::messages_manager::EphemeralMessageId,
+        promise: Promise<()>,
+    ) {
+        let kind =
+            crate::message_query_manager::MessageQueryNetKind::DeleteEphemeralMessage { dialog_id };
+        let net = self.net.clone();
+        let Some(net) = net else {
+            return tdutils::log_info!("Send ephemeral.deleteMessage — [net-inert]");
+        };
+        const PEER_MASK: i32 = 1; // flags.0
+        let receiver_is_user = receiver_dialog_id.get_type() == crate::dialog_id::DialogType::User;
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        let input_user = if receiver_is_user {
+            Some(self.get_input_user(receiver_dialog_id.get_user_id()))
+        } else {
+            None
+        };
+        match (peer, input_user) {
+            (Some(peer), Some(Ok(input_user))) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::ephemeral_deleteMessage(
+                        telegram_api::ephemeral_deleteMessage {
+                            flags: PEER_MASK,
+                            peer: Some(Box::new(peer)),
+                            receiver_id: Some(input_user),
+                            id: ephemeral_message_id.get(),
+                        },
+                    ),
+                );
+                self.pending.ephemeral_deletes.push(promise);
+            }
+            // cpp:1899-1906 — the receiver-type/user null bands
+            (peer, _) => {
+                let what = if peer.is_none() || !receiver_is_user {
+                    "Can't access the chat"
+                } else {
+                    "Can't access the user"
+                };
+                net.complete_error(kind, 400, what);
+                self.pending.ephemeral_deletes.push(promise);
+            }
+        }
+    }
+
+    /// `AppendToDoListQuery::send`
+    /// (MessageQueryManager.cpp:1282-1292) — the peer is CHECKed in the
+    /// C++ (the `can_add_message_tasks` gate ran first); the items
+    /// serialize through the to-do wire form
+    /// (`ToDoItem::get_input_todo_item`, ToDoItem.cpp:52-55).
+    fn send_append_to_do_list_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+        items: Vec<crate::message_content::ToDoItem>,
+        promise: Promise<()>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::AppendToDoList;
+        let list = items
+            .into_iter()
+            .map(|item| telegram_api::TodoItem {
+                id: item.id,
+                title: Some(crate::message_entity::get_input_text_with_entities(
+                    Some(&mut *self),
+                    &item.title,
+                    "get_input_todo_item",
+                )),
+            })
+            .collect::<Vec<_>>();
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_appendTodoList(
+                        telegram_api::messages_appendTodoList {
+                            peer: Some(Box::new(peer)),
+                            msg_id: message_id.get_server_message_id().get(),
+                            list,
+                        },
+                    ),
+                );
+                self.pending.to_do_appends.push(promise);
+            }
+            (Some(net), None) => {
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.to_do_appends.push(promise);
+            }
+            (None, _) => tdutils::log_info!("Send messages.appendTodoList — [net-inert]"),
+        }
+    }
+
+    /// `ToggleToDoCompletedQuery::send`
+    /// (MessageQueryManager.cpp:1320-1329).
+    fn send_toggle_to_do_completed_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+        done_task_ids: Vec<i32>,
+        not_done_task_ids: Vec<i32>,
+        promise: Promise<()>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::ToggleToDoCompleted;
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_toggleTodoCompleted(
+                        telegram_api::messages_toggleTodoCompleted {
+                            peer: Some(Box::new(peer)),
+                            msg_id: message_id.get_server_message_id().get(),
+                            completed: done_task_ids,
+                            incompleted: not_done_task_ids,
+                        },
+                    ),
+                );
+                self.pending.to_do_toggles.push(promise);
+            }
+            (Some(net), None) => {
+                net.complete_error(kind, 400, "Can't access the chat");
+                self.pending.to_do_toggles.push(promise);
+            }
+            (None, _) => tdutils::log_info!("Send messages.toggleTodoCompleted — [net-inert]"),
+        }
+    }
+
+    /// `SummarizeTextQuery::send` (MessageQueryManager.cpp:1239-1253) —
+    /// the TO_LANG/TONE flag pair (flags.0/flags.2); the null peer
+    /// answers the promise 400 (cpp:1247-1250).
+    fn send_summarize_text_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_id: crate::messages_manager::MessageId,
+        to_language_code: String,
+        tone: String,
+        promise: Promise<td_api::FormattedText>,
+    ) {
+        let kind = crate::message_query_manager::MessageQueryNetKind::SummarizeText;
+        const TO_LANG_MASK: i32 = 1; // flags.0
+        const TONE_MASK: i32 = 1 << 2; // flags.2
+        let mut flags = 0;
+        if !to_language_code.is_empty() {
+            flags |= TO_LANG_MASK;
+        }
+        if !tone.is_empty() {
+            flags |= TONE_MASK;
+        }
+        let net = self.net.clone();
+        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        match (net, peer) {
+            (Some(net), Some(peer)) => {
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_summarizeText(
+                        telegram_api::messages_summarizeText {
+                            flags,
+                            peer: Some(Box::new(peer)),
+                            id: message_id.get_server_message_id().get(),
+                            to_lang: to_language_code,
+                            tone,
+                        },
+                    ),
+                );
+                self.pending.summarize_text.push(promise);
+            }
+            (Some(net), None) => {
+                net.complete_error(kind, 400, "Chat is not accessible");
+                self.pending.summarize_text.push(promise);
+            }
+            (None, _) => tdutils::log_info!("Send messages.summarizeText — [net-inert]"),
+        }
+    }
+}
+
+impl MessageQueryEnv<'_> {
+    /// `DialogManager::get_input_peer` (DialogManager.cpp:1377-1395) —
+    /// the field-split twin of `crate::dialog_manager::get_input_peer`
+    /// (the net-drain 28 send legs resolve their peers at the dispatch
+    /// site).
+    fn env_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                let options = self.options.as_deref_mut()?;
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .get_input_peer_user(&env, user_id, access_rights)
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let channel_id = dialog_id.get_channel_id();
+                let options = self.options.as_deref_mut()?;
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager
+                    .get_input_peer_channel(&env, channel_id, access_rights)
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    /// `ChatManager::get_input_channel` (ChatManager.cpp) — the channel
+    /// read of the `channels.readMessageContents` send leg.
+    fn env_input_channel(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<telegram_api::InputChannel> {
+        let options = self.options.as_deref_mut()?;
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.get_input_channel(&env, channel_id)
+    }
+}
+
+impl crate::message_entity::UserManagerLike for MessageQueryEnv<'_> {
+    /// the formatted-text/to-do send legs over the env (the
+    /// `TdTranslationEnv` shape).
+    fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let mut env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let env = crate::user_manager::UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user_force(&env, user_id)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_bot_of(user_id)
     }
 }
 
@@ -37044,15 +38550,18 @@ pub(crate) fn message_query_env_split(
     MessageQueryEnv<'_>,
     &mut crate::message_query_manager::MessageQueryManager,
 ) {
+    let net = td.message_query_net();
     let crate::td::Td {
         global,
         option_manager,
         auth_manager,
         user_manager,
+        chat_manager,
         updates_manager,
         file_manager,
         message_query_manager,
         message_query_updates,
+        message_query_net_pending,
         can_ignore_background_updates,
         ..
     } = td;
@@ -37065,8 +38574,11 @@ pub(crate) fn message_query_env_split(
             can_ignore_background_updates: *can_ignore_background_updates,
             updates: message_query_updates,
             user_manager,
+            chat_manager,
             updates_manager,
             file_manager: std::sync::Arc::clone(file_manager),
+            net,
+            pending: message_query_net_pending,
         },
         message_query_manager,
     )
@@ -62350,6 +63862,992 @@ kQIDAQAB\n\
                     telegram_api::users_setSecureValueErrors::ID,
                     telegram_api::help_getPassportConfig::ID,
                     telegram_api::account_acceptAuthorization::ID,
+                ]
+                .contains(&query.tl_constructor())
+            })
+            .count();
+        assert_eq!(stray_count, 0, "no stray queries");
+    }
+
+    #[test]
+    fn message_query_per_message_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(message_query_per_message_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 28 netted round trips: every per-message family
+    /// dispatches through the real dispatcher, the wire bodies carry the
+    /// C++ payloads (MessageQueryManager.cpp:306-2290), and the answers
+    /// drain through `Td::on_message_query_net_answer` into the landed
+    /// intakes (the live td_api arms where their gates allow —
+    /// getStakeDiceState + deleteEphemeralMessage; the env-split seam
+    /// drives for the M.10/M.5-gated request arms, whose validation
+    /// bands stay covered by the manager tests).
+    fn message_query_per_message_families_ride_the_dispatcher_impl() {
+        use crate::message_query_manager::MessageReadMetric;
+        // the seam drives call the env send legs
+        use crate::message_query_manager::MessageQueryManagerEnv as _;
+
+        fn bool_true() -> Vec<u8> {
+            0x9972_75b5u32.to_le_bytes().to_vec()
+        }
+
+        fn updates_too_long() -> Vec<u8> {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updatesTooLong(telegram_api::updatesTooLong).store(&mut answer);
+            answer
+        }
+
+        /// `Vector<readParticipantDate>` with one viewer.
+        fn read_participant_dates() -> Vec<u8> {
+            let mut answer = Vec::new();
+            answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+            answer.extend_from_slice(&1i32.to_le_bytes());
+            telegram_api::ReadParticipantDate {
+                user_id: 7,
+                date: 500,
+            }
+            .store_boxed(&mut answer);
+            answer
+        }
+
+        /// The empty `Vector<factCheck>`.
+        fn empty_fact_checks() -> Vec<u8> {
+            let mut answer = Vec::new();
+            answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+            answer.extend_from_slice(&0i32.to_le_bytes());
+            answer
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain28-mq-per-message");
+        seed_dialog_user_id(&mut td, 7, 42); // the dialog peer
+        seed_dialog_user_id(&mut td, 8, 43); // the receiver/sender peer
+        let user_dialog = crate::dialog_id::DialogId::new(7);
+
+        // 1. getStakeDiceState (live arm) — the full round trip over the
+        //    dice-info answer (the params pair + the streak)
+        td.request(1, Function::getStakeDiceState(td_api::getStakeDiceState));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getEmojiGameInfo::ID,
+        );
+        let mut answer = Vec::new();
+        telegram_api::messages_EmojiGameInfo::messages_emojiGameDiceInfo(
+            telegram_api::messages_emojiGameDiceInfo {
+                flags: 0,
+                game_hash: "hash".to_owned(),
+                prev_stake: 100,
+                current_streak: 1,
+                params: vec![1, 2, 3, 4, 5, 6, 7],
+                plays_left: 0,
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::stakeDiceState(state)) => {
+                assert_eq!(state.state_hash, "hash");
+                assert_eq!(state.stake_gram_amount, 100);
+                assert_eq!(state.current_streak, 1);
+                assert_eq!(state.prize_per_mille, vec![1, 2, 3, 4, 5, 6]);
+                assert_eq!(state.streak_prize_per_mille, 7);
+            }
+            other => panic!("the stake dice state round trip: {other:?}"),
+        }
+
+        // 1b. the error band settles the parked promise
+        td.request(2, Function::getStakeDiceState(td_api::getStakeDiceState));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getEmojiGameInfo::ID,
+        );
+        net_fail(sent, 400, "EMOJI_GAME_UNAVAILABLE");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(error.code, 400);
+
+        // 2. getMessageViewers (the seam drive — the live arm gates on
+        //    the [blocked: M.10] can_get_message_viewers) — the
+        //    read-dates answer builds the viewers object
+        td.request_set.insert(3);
+        let promise = td.deferred_promise::<td_api::MessageViewers, _>(3, Object::messageViewers);
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_get_message_read_participants_query(
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(101),
+                    ),
+                ),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReadParticipants::ID,
+        );
+        let body = telegram_api::messages_getMessageReadParticipants::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.msg_id, 101);
+        assert!(
+            matches!(&body.peer, Some(peer) if matches!(&**peer,
+                telegram_api::InputPeer::inputPeerUser(peer) if peer.user_id == 7
+                    && peer.access_hash == 42)),
+            "the peer resolves at the send leg: {:?}",
+            body.peer
+        );
+        net_complete(sent, read_participant_dates());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 3).first() {
+            Some(Object::messageViewers(viewers)) => {
+                assert_eq!(viewers.viewers.len(), 1);
+                assert_eq!(viewers.viewers[0].user_id, 7);
+                assert_eq!(viewers.viewers[0].view_date, 500);
+            }
+            other => panic!("the viewers round trip: {other:?}"),
+        }
+
+        // 3. reportMusicListen (the seam drive) — the document + duration
+        //    payload; the Bool answer is ignored (cpp:1014-1020)
+        td.request_set.insert(4);
+        let promise = td.deferred_promise::<(), _>(4, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_report_music_listen_query(
+                telegram_api::InputDocument::inputDocument(telegram_api::inputDocument {
+                    id: 11,
+                    access_hash: 33,
+                    file_reference: b"ref".to_vec(),
+                }),
+                7,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportMusicListen::ID,
+        );
+        let body =
+            telegram_api::messages_reportMusicListen::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.listened_duration, 7);
+        assert!(
+            matches!(&body.id, Some(telegram_api::InputDocument::inputDocument(doc)) if doc.id == 11)
+        );
+        net_complete(sent, bool_true());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. summarizeText (the seam drive) — the TO_LANG/TONE flag pair
+        //    (flags.0/flags.2) and the formatted-text intake
+        td.request_set.insert(5);
+        let promise = td.deferred_promise::<td_api::FormattedText, _>(5, Object::formattedText);
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_summarize_text_query(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(102),
+                ),
+                "en".to_owned(),
+                "neutral".to_owned(),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_summarizeText::ID,
+        );
+        let body =
+            telegram_api::messages_summarizeText::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 | (1 << 2));
+        assert_eq!(body.to_lang, "en");
+        assert_eq!(body.tone, "neutral");
+        let mut answer = Vec::new();
+        telegram_api::TextWithEntities {
+            text: "Summary".to_owned(),
+            entities: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 5).first() {
+            Some(Object::formattedText(text)) => assert_eq!(text.text, "Summary"),
+            other => panic!("the summarize round trip: {other:?}"),
+        }
+
+        // 4b. the summarize error band
+        td.request_set.insert(6);
+        let promise = td.deferred_promise::<td_api::FormattedText, _>(6, Object::formattedText);
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_summarize_text_query(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(102),
+                ),
+                String::new(),
+                String::new(),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_summarizeText::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_summarizeText::parse(sent.query())
+                .expect("the sent body")
+                .flags,
+            0
+        );
+        net_fail(sent, 400, "MESSAGE_TOO_OLD");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 6).message, "MESSAGE_TOO_OLD");
+
+        // 5. appendTodoList (the seam drive) — the item list and the
+        //    Updates re-entry; the error band settles the promise
+        td.request_set.insert(7);
+        let promise = td.deferred_promise::<(), _>(7, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_append_to_do_list_query(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(103),
+                ),
+                vec![crate::message_content::ToDoItem {
+                    id: 1,
+                    title: crate::message_entity::FormattedText {
+                        text: "task".to_owned(),
+                        ..Default::default()
+                    },
+                }],
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_appendTodoList::ID,
+        );
+        let body =
+            telegram_api::messages_appendTodoList::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.list.len(), 1);
+        assert_eq!(body.list[0].id, 1);
+        net_complete(sent, updates_too_long());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+
+        // 5b. the append error band
+        td.request_set.insert(8);
+        let promise = td.deferred_promise::<(), _>(8, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_append_to_do_list_query(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(103),
+                ),
+                Vec::new(),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_appendTodoList::ID,
+        );
+        net_fail(sent, 400, "TODO_LIST_FULL");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 8).message, "TODO_LIST_FULL");
+
+        // 6. toggleTodoCompleted (the seam drive) — the completed/
+        //    incompleted pair
+        td.request_set.insert(9);
+        let promise = td.deferred_promise::<(), _>(9, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_toggle_to_do_completed_query(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(103),
+                ),
+                vec![1],
+                vec![2],
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_toggleTodoCompleted::ID,
+        );
+        let body =
+            telegram_api::messages_toggleTodoCompleted::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.completed, vec![1]);
+        assert_eq!(body.incompleted, vec![2]);
+        net_fail(sent, 400, "TODO_INVALID");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 9).message, "TODO_INVALID");
+
+        // 7. ephemeral.editMessage (the seam drive — the text leg) — the
+        //    PEER|MESSAGE flag pair (flags.7/flags.0) and the receiver
+        td.request_set.insert(10);
+        let promise = td.deferred_promise::<(), _>(10, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_edit_ephemeral_message_query(
+                user_dialog,
+                crate::user_manager::UserId::new(8),
+                crate::messages_manager::EphemeralMessageId::new(9),
+                true,
+                Some(crate::message_entity::FormattedText {
+                    text: "edited".to_owned(),
+                    ..Default::default()
+                }),
+                false,
+                false,
+                None,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_editMessage::ID,
+        );
+        let body = telegram_api::ephemeral_editMessage::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, (1 << 7) | 1);
+        assert_eq!(body.message, "edited");
+        assert!(
+            matches!(&body.receiver_id, Some(telegram_api::InputUser::inputUser(user)) if user.user_id == 8
+                && user.access_hash == 43)
+        );
+        net_complete(sent, updates_too_long());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+
+        // 7b. the edit error band
+        td.request_set.insert(11);
+        let promise = td.deferred_promise::<(), _>(11, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_edit_ephemeral_message_query(
+                user_dialog,
+                crate::user_manager::UserId::new(8),
+                crate::messages_manager::EphemeralMessageId::new(9),
+                false,
+                None,
+                false,
+                false,
+                None,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_editMessage::ID,
+        );
+        assert_eq!(
+            telegram_api::ephemeral_editMessage::parse(sent.query())
+                .expect("the sent body")
+                .flags,
+            1 << 7
+        );
+        net_fail(sent, 400, "EPHEMERAL_NOT_MODIFIED");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 11).message, "EPHEMERAL_NOT_MODIFIED");
+
+        // 8. messages.deleteParticipantReactions (the seam drive) — the
+        //    peer/participant pair
+        td.request_set.insert(12);
+        let promise = td.deferred_promise::<(), _>(12, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_delete_participant_reactions_query(
+                user_dialog,
+                crate::dialog_id::DialogId::new(8),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_deleteParticipantReactions::ID,
+        );
+        let body = telegram_api::messages_deleteParticipantReactions::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(&body.participant, Some(peer) if matches!(&**peer,
+                telegram_api::InputPeer::inputPeerUser(peer) if peer.user_id == 8)));
+        net_complete(sent, bool_true());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 12).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8b. the null-participant band settles through the queue
+        td.request_set.insert(13);
+        let promise = td.deferred_promise::<(), _>(13, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_delete_participant_reactions_query(
+                user_dialog,
+                crate::dialog_id::DialogId::new(999),
+                promise,
+            );
+        }
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_deleteParticipantReactions::ID,
+            "the null participant band dispatches nothing",
+        );
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 13);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't access the chat")
+        );
+
+        // 9. messages.deleteParticipantReaction — the msg_id band
+        td.request_set.insert(14);
+        let promise = td.deferred_promise::<(), _>(14, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_delete_participant_reaction_query(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(104),
+                ),
+                crate::dialog_id::DialogId::new(8),
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_deleteParticipantReaction::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_deleteParticipantReaction::parse(sent.query())
+                .expect("the sent body")
+                .msg_id,
+            104
+        );
+        net_fail(sent, 400, "REACTION_INVALID");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 14).message, "REACTION_INVALID");
+
+        // 10. messages.sendBotRequestedPeer (the seam drive) — the
+        //     MSG_ID flag branch and the requested-peer vector
+        td.request_set.insert(15);
+        let promise = td.deferred_promise::<(), _>(15, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_send_bot_requested_peer_query(
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(105),
+                    ),
+                ),
+                crate::user_manager::UserId::default(),
+                String::new(),
+                3,
+                vec![crate::dialog_id::DialogId::new(8)],
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendBotRequestedPeer::ID,
+        );
+        let body = telegram_api::messages_sendBotRequestedPeer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1); // MSG_ID
+        assert_eq!(body.msg_id, 105);
+        assert_eq!(body.button_id, 3);
+        assert_eq!(body.requested_peers.len(), 1);
+        net_complete(sent, updates_too_long());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+
+        // 10b. the chosen-chat null band (cpp:330-334)
+        td.request_set.insert(16);
+        let promise = td.deferred_promise::<(), _>(16, |_| ok_object());
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_send_bot_requested_peer_query(
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(105),
+                    ),
+                ),
+                crate::user_manager::UserId::default(),
+                String::new(),
+                3,
+                vec![crate::dialog_id::DialogId::new(999)],
+                promise,
+            );
+        }
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_sendBotRequestedPeer::ID,
+            "the chosen-chat null band dispatches nothing",
+        );
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 16);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't access the chosen chat")
+        );
+
+        // 11. messages.getExtendedMedia (the manager drive) — the id
+        //     vector and both finish halves
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.reload_message_extended_media(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(106),
+                )],
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getExtendedMedia::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_getExtendedMedia::parse(sent.query())
+                .expect("the sent body")
+                .id,
+            vec![106]
+        );
+        net_complete(sent, updates_too_long());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            td.message_query_net_pending.extended_media.is_empty(),
+            "the park drained"
+        );
+
+        // 12. messages.getFactCheck — the empty-vector answer erases the
+        //     reload set (a second reload re-sends)
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.reload_message_fact_checks(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(107),
+                )],
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getFactCheck::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_getFactCheck::parse(sent.query())
+                .expect("the sent body")
+                .msg_id,
+            vec![107]
+        );
+        net_complete(sent, empty_fact_checks());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.reload_message_fact_checks(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(107),
+                )],
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getFactCheck::ID,
+        );
+        net_complete(sent, empty_fact_checks());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            td.message_query_net_pending.fact_checks.is_empty(),
+            "the park drained"
+        );
+
+        // 13. messages.getMessagesReactions — the queue drain through the
+        //     real have_input_peer read and both re-arm halves
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.queue_message_reactions_reload(
+                &mut env,
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(108),
+                    ),
+                ),
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessagesReactions::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_getMessagesReactions::parse(sent.query())
+                .expect("the sent body")
+                .id,
+            vec![108]
+        );
+        net_fail(sent, 400, "REACTIONS_TOO_MANY");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            td.message_query_net_pending.reactions.is_empty(),
+            "the park drained"
+        );
+
+        // 14. messages.readMessageContents (the reactions rider) — the
+        //     counter walk settles through the intake
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.read_message_reactions_on_server(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(109),
+                )],
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_readMessageContents::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_readMessageContents::parse(sent.query())
+                .expect("the sent body")
+                .id,
+            vec![109]
+        );
+        assert!(td.message_query_manager.has_message_pending_read_reactions(
+            crate::dialog_id::MessageFullId::new(
+                user_dialog,
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(109),
+                )
+            )
+        ));
+        let mut answer = Vec::new();
+        telegram_api::messages_AffectedMessages {
+            pts: 100,
+            pts_count: 1,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            !td.message_query_manager.has_message_pending_read_reactions(
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(109),
+                    )
+                )
+            )
+        );
+
+        // 14b. the poll-votes rider over the error half
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.read_message_poll_votes_on_server(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(110),
+                )],
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_readMessageContents::ID,
+        );
+        assert_eq!(
+            telegram_api::messages_readMessageContents::parse(sent.query())
+                .expect("the sent body")
+                .id,
+            vec![110]
+        );
+        net_fail(sent, 500, "Internal");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            !td.message_query_manager
+                .has_message_pending_read_poll_votes(crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(110),
+                    )
+                ))
+        );
+
+        // 14c. two in-flight contents queries of different intakes,
+        //      answered in reverse order — the parks pair by intake (a
+        //      head-of-queue pop would walk the wrong counter map)
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.read_message_reactions_on_server(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(113),
+                )],
+            );
+        }
+        {
+            let (mut env, mq_manager) = message_query_env_split(&mut td);
+            mq_manager.read_message_poll_votes_on_server(
+                &mut env,
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(114),
+                )],
+            );
+        }
+        let mut contents_queries: Vec<NetQuery> = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .filter(
+                |query| query.tl_constructor() == telegram_api::messages_readMessageContents::ID,
+            )
+            .collect();
+        assert_eq!(contents_queries.len(), 2, "both contents queries in flight");
+        let sent_poll = contents_queries.remove(1); // the second send
+        let sent_reactions = contents_queries.remove(0);
+        assert_eq!(
+            telegram_api::messages_readMessageContents::parse(sent_reactions.query())
+                .expect("the sent body")
+                .id,
+            vec![113]
+        );
+        assert_eq!(
+            telegram_api::messages_readMessageContents::parse(sent_poll.query())
+                .expect("the sent body")
+                .id,
+            vec![114]
+        );
+        // the poll-votes answer (the second send) settles first
+        let mut poll_answer = Vec::new();
+        telegram_api::messages_AffectedMessages {
+            pts: 150,
+            pts_count: 1,
+        }
+        .store_boxed(&mut poll_answer);
+        net_complete(sent_poll, poll_answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            !td.message_query_manager
+                .has_message_pending_read_poll_votes(crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(114),
+                    )
+                )),
+            "the reverse-order poll-votes answer paired its own park"
+        );
+        assert!(
+            td.message_query_manager.has_message_pending_read_reactions(
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(113),
+                    )
+                )
+            ),
+            "the reactions park is still pending its own answer"
+        );
+        // the reactions answer settles the remaining park
+        let mut answer = Vec::new();
+        telegram_api::messages_AffectedMessages {
+            pts: 200,
+            pts_count: 1,
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent_reactions, answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            !td.message_query_manager.has_message_pending_read_reactions(
+                crate::dialog_id::MessageFullId::new(
+                    user_dialog,
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(113),
+                    )
+                )
+            )
+        );
+
+        // 15. messages.getMessagesViews (the seam drive) — the increment
+        //     flag, the count-mismatch 500 band and the finish halves
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_get_messages_views_query(
+                user_dialog,
+                vec![crate::messages_manager::MessageId::from_server_message_id(
+                    crate::dialog_id::ServerMessageId::new(111),
+                )],
+                true,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessagesViews::ID,
+        );
+        let body =
+            telegram_api::messages_getMessagesViews::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.id, vec![111]);
+        assert!(body.increment);
+        // the empty-views answer trips the count band (cpp:1155-1157);
+        // the finish still ran — the re-send proves it
+        let mut answer = Vec::new();
+        telegram_api::messages_MessageViews {
+            views: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(
+            td.message_query_net_pending.views.is_empty(),
+            "the park drained"
+        );
+
+        // 16. messages.reportReadMetrics — the metric fields; the null
+        //     peer returns silently (cpp:1032-1035)
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_report_read_metrics_query(
+                user_dialog,
+                vec![MessageReadMetric {
+                    message_id: crate::messages_manager::MessageId::from_server_message_id(
+                        crate::dialog_id::ServerMessageId::new(112),
+                    ),
+                    view_id: 77,
+                    time_in_view_ms: 1000,
+                    active_time_in_view_ms: 500,
+                    height_to_viewport_ratio_per_mille: 300,
+                    seen_range_ratio_per_mille: 200,
+                }],
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportReadMetrics::ID,
+        );
+        let body =
+            telegram_api::messages_reportReadMetrics::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.metrics.len(), 1);
+        assert_eq!(body.metrics[0].msg_id, 112);
+        assert_eq!(body.metrics[0].view_id, 77);
+        assert_eq!(body.metrics[0].time_in_view_ms, 1000);
+        net_complete(sent, bool_true());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        {
+            let (mut env, _mq_manager) = message_query_env_split(&mut td);
+            env.send_report_read_metrics_query(crate::dialog_id::DialogId::new(999), Vec::new());
+        }
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_reportReadMetrics::ID,
+            "the null-peer metrics band dispatches nothing",
+        );
+
+        // 17. deleteEphemeralMessage (the live bot arm) — the PEER flag
+        //     form and the receiver resolution
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            17,
+            Function::deleteEphemeralMessage(td_api::deleteEphemeralMessage {
+                chat_id: 7,
+                receiver_user_id: 8,
+                ephemeral_message_id: 5,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_deleteMessage::ID,
+        );
+        let body =
+            telegram_api::ephemeral_deleteMessage::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1);
+        assert_eq!(body.id, 5);
+        assert!(
+            matches!(&body.receiver_id, Some(telegram_api::InputUser::inputUser(user)) if user.user_id == 8)
+        );
+        net_complete(sent, bool_true());
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 17).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 17b. the error band runs the dialog-error head
+        td.request(
+            18,
+            Function::deleteEphemeralMessage(td_api::deleteEphemeralMessage {
+                chat_id: 7,
+                receiver_user_id: 8,
+                ephemeral_message_id: 6,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_deleteMessage::ID,
+        );
+        net_fail(sent, 400, "USER_NOT_PARTICIPANT");
+        td.dispatch_completed_message_query_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 18).message, "USER_NOT_PARTICIPANT");
+        assert!(
+            td.message_query_net_pending.ephemeral_deletes.is_empty(),
+            "the park drained"
+        );
+
+        // every family park drained; the updates engine refires are its
+        // own queries
+        let stray_count = rec
+            .sent
+            .lock()
+            .iter()
+            .filter(|query| {
+                ![
+                    telegram_api::updates_getDifference::ID,
+                    telegram_api::updates_getState::ID,
                 ]
                 .contains(&query.tl_constructor())
             })
