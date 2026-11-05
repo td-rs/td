@@ -36963,6 +36963,50 @@ pub fn get_giveaway_message_id(
 
     Result::Ok(found_id.get_server_message_id())
 }
+/// `MessagesManager::get_group_call_message_id` (MessagesManager.cpp:
+/// 36640-36657) — the invitation-message resolution for
+/// phone.declineConferenceCallInvite: the `get_message_force` probe +
+/// the ConferenceCall content/id bands in the C++ order.
+#[allow(clippy::too_many_arguments)]
+pub fn get_group_call_message_id(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    sendctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    message_full_id: MessageFullId,
+) -> Result<ServerMessageId, Status> {
+    let found = get_message_force_from_database(
+        global,
+        manager,
+        sendctx,
+        state,
+        reactions_ctx,
+        message_full_id.get_dialog_id(),
+        message_full_id.get_message_id(),
+        "get_group_call_message_id",
+    );
+    let Some(found) = found else {
+        return Result::Err(Status::error(400, "Message not found"));
+    };
+    let found_id = found.get_message_id();
+    let content_type = manager
+        .get_dialog(message_full_id.get_dialog_id())
+        .and_then(|d| get_message_in_dialog(d, found_id))
+        .and_then(|m| m.content.as_ref())
+        .map(|content| content.get_type());
+    if content_type != Some(MessageContentType::ConferenceCall) {
+        return Result::Err(Status::error(400, "Message has wrong type"));
+    }
+    if found_id.is_scheduled() {
+        return Result::Err(Status::error(400, "Wrong scheduled message identifier"));
+    }
+    if !found_id.is_server() {
+        return Result::Err(Status::error(400, "Wrong message identifier"));
+    }
+
+    Result::Ok(found_id.get_server_message_id())
+}
 
 #[cfg(test)]
 mod tests {

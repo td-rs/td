@@ -386,6 +386,26 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // the owned star/ton updates ride their inited flags)
             td.star_manager.get_current_state(&mut updates);
 
+            // GroupCallManager::get_current_state (Requests.cpp:2253 —
+            // after the star block; the net-drain 36 slice wires it in)
+            {
+                let crate::td::Td {
+                    group_call_manager,
+                    global,
+                    auth_manager,
+                    notification_updates,
+                    ..
+                } = td;
+                let mut env = crate::td::GroupCallTdEnv {
+                    global,
+                    auth_is_authorized: auth_manager.is_authorized(),
+                    auth_is_bot: auth_manager.is_bot(),
+                    updates: notification_updates,
+                    request_input_peer: None,
+                };
+                group_call_manager.get_current_state(&mut env, &mut updates);
+            }
+
             // MessageQueryManager::get_current_state
             // (Requests.cpp:2255 — after the star/group-call blocks; the
             // group-call manager in between is pending). The manager's
@@ -11433,15 +11453,30 @@ fn run_secret_chat_requests(td: &mut Td, id: u64, function: Function) {
 /// network tail is the [blocked: net] seam (D4 signaling-only).
 #[allow(clippy::too_many_lines)]
 fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
-    use crate::group_call_manager::GroupCallEnv;
+    use crate::group_call_manager::GroupCallId;
 
+    /// The M.51 GroupCallManager arm frame (see the frame note at the
+    /// forward site in [`run_request`]). The dialog-plane reads the C++
+    /// tails make over `td_` resolve here, over the full `Td` frame,
+    /// before the field split; the peer-bearing sends thread their
+    /// pre-resolved input peer through the env
+    /// (`GroupCallEnv::get_input_peer_read`).
+    #[allow(clippy::too_many_arguments)]
     fn group_call_arm(
         td: &mut Td,
+        peer_dialog_id: Option<crate::dialog_id::DialogId>,
         run: impl FnOnce(
             &mut crate::td::GroupCallTdEnv<'_>,
             &mut crate::group_call_manager::GroupCallManager,
         ),
     ) {
+        let request_input_peer = peer_dialog_id.and_then(|dialog_id| {
+            crate::dialog_manager::get_input_peer(
+                td,
+                dialog_id,
+                crate::user_manager::AccessRights::Read,
+            )
+        });
         let crate::td::Td {
             group_call_manager,
             global,
@@ -11454,8 +11489,63 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
             auth_is_authorized: auth_manager.is_authorized(),
             auth_is_bot: auth_manager.is_bot(),
             updates: notification_updates,
+            request_input_peer,
         };
         run(&mut env, group_call_manager);
+    }
+
+    /// `GroupCallManager::my_dialog_id` — the my-dialog read the
+    /// self-bands key on.
+    fn my_dialog_id(td: &Td) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(td.user_manager.get_my_id())
+    }
+
+    /// The sender-id probe + the as-dialog band ladder of
+    /// `set_group_call_default_join_as` (cpp:2586-2613) and
+    /// `set_group_call_default_send_as` (cpp:2615-2638): the dialog
+    /// reads run over the full `Td` frame.
+    fn resolve_default_participant(
+        td: &mut Td,
+        id: u64,
+        as_dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<crate::dialog_id::DialogId> {
+        use crate::dialog_id::DialogType;
+        match as_dialog_id.get_type() {
+            DialogType::User => {
+                if as_dialog_id != my_dialog_id(td) {
+                    td.send_error_impl(id, 400, "Can't join video chat as another user");
+                    return None;
+                }
+            }
+            DialogType::Chat | DialogType::Channel => {
+                if !crate::dialog_manager::have_dialog_force(
+                    td,
+                    as_dialog_id,
+                    "set_group_call_default_join_as 2",
+                ) {
+                    td.send_error_impl(id, 400, "Participant chat not found");
+                    return None;
+                }
+            }
+            DialogType::SecretChat => {
+                td.send_error_impl(id, 400, "Can't join video chat as a secret chat");
+                return None;
+            }
+            DialogType::None => {
+                td.send_error_impl(id, 400, "Invalid default participant identifier specified");
+                return None;
+            }
+        }
+        if !crate::dialog_manager::have_input_peer(
+            td,
+            as_dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+        ) {
+            td.send_error_impl(id, 400, "Can't access specified default participant chat");
+            return None;
+        }
+        Some(as_dialog_id)
     }
 
     macro_rules! ok_promise {
@@ -11465,37 +11555,76 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
     }
 
     match function {
-        // getVideoChatAvailableParticipants (Requests.cpp:5152-5157)
+        // getVideoChatAvailableParticipants (Requests.cpp:5152-5157 →
+        // GroupCallManager.cpp:2443-2449)
         Function::getVideoChatAvailableParticipants(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise =
                 td.deferred_promise::<td_api::MessageSenders, _>(id, Object::messageSenders);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_message_senders(
-                    &format!(
-                        "channels.getParticipants (join-as list) for {}",
-                        request.chat_id
-                    ),
-                    promise,
-                );
-                let _ = manager;
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            group_call_arm(td, Some(dialog_id), |env, manager| {
+                manager.get_group_call_join_as(env, dialog_id, promise);
             });
         }
 
-        // setVideoChatDefaultParticipant (Requests.cpp:5159-5165)
-        Function::setVideoChatDefaultParticipant(_request) => {
+        // setVideoChatDefaultParticipant (Requests.cpp:5159-5165 →
+        // GroupCallManager.cpp:2586-2613)
+        Function::setVideoChatDefaultParticipant(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "setVideoChatDefaultParticipant", promise);
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            // `TRY_STATUS_PROMISE(promise, can_join_video_chats(...))`
+            // (cpp:2445, 2339-2341)
+            if let Result::Err(status) = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                false,
+                crate::user_manager::AccessRights::Read,
+                "can_join_video_chats",
+            ) {
+                send_error_status(td, id, status);
+                return;
+            }
+            // `TRY_RESULT_PROMISE(promise, default_join_as_dialog_id,
+            // get_message_sender_dialog_id(...))` (Requests.cpp:5162-5163)
+            let default_join_as_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.default_participant_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let Some(as_dialog_id) = resolve_default_participant(td, id, default_join_as_dialog_id)
+            else {
+                return;
+            };
+            let Some(join_as_peer) = crate::dialog_manager::get_input_peer(
+                td,
+                as_dialog_id,
+                crate::user_manager::AccessRights::Read,
+            ) else {
+                td.send_error_impl(id, 400, "Can't access specified default participant chat");
+                return;
+            };
+            group_call_arm(td, Some(dialog_id), |env, manager| {
+                manager.set_group_call_default_join_as(env, dialog_id, join_as_peer, promise);
             });
         }
 
-        // createVideoChat (Requests.cpp:5167-5174)
+        // createVideoChat (Requests.cpp:5167-5174 → cpp:2658-2678) —
+        // the join-payload flow rides the media plane (ticket
+        // td-rs/td#54); the promise parks per the §5 fidelity notes.
         Function::createVideoChat(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -11504,40 +11633,33 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<td_api::GroupCallId, _>(id, Object::groupCallId);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!(
-                    "createVideoChat({}, {title}) — [blocked: net]",
-                    request.chat_id
-                );
-                let _ = (env, manager, promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query(&format!("createVideoChat({title})"), promise);
             });
         }
 
-        // createGroupCall (Requests.cpp:5176-5181)
-        Function::createGroupCall(request) => {
+        // createGroupCall (Requests.cpp:5176-5181 → cpp:2679-2713) —
+        // the media plane park.
+        Function::createGroupCall(_request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise =
                 td.deferred_promise::<td_api::GroupCallInfo, _>(id, Object::groupCallInfo);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("createGroupCall — [blocked: net]");
-                let _ = (env, manager, promise, request.join_parameters);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("createGroupCall", promise);
             });
         }
 
-        // getVideoChatRtmpUrl (Requests.cpp:5183-5187)
+        // getVideoChatRtmpUrl (Requests.cpp:5183-5187 → cpp:2781-2795)
         Function::getVideoChatRtmpUrl(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_rtmp_url(
-                    &format!("getVideoChatRtmpUrl for {}", request.chat_id),
-                    promise,
-                );
-                let _ = manager;
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            group_call_arm(td, Some(dialog_id), |env, manager| {
+                manager.get_video_chat_rtmp_stream_url(env, dialog_id, false, false, promise);
             });
         }
 
@@ -11547,12 +11669,9 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_rtmp_url(
-                    &format!("replaceVideoChatRtmpUrl for {}", request.chat_id),
-                    promise,
-                );
-                let _ = manager;
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            group_call_arm(td, Some(dialog_id), |env, manager| {
+                manager.get_video_chat_rtmp_stream_url(env, dialog_id, false, true, promise);
             });
         }
 
@@ -11562,12 +11681,9 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_rtmp_url(
-                    &format!("getLiveStoryRtmpUrl for {}", request.chat_id),
-                    promise,
-                );
-                let _ = manager;
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            group_call_arm(td, Some(dialog_id), |env, manager| {
+                manager.get_video_chat_rtmp_stream_url(env, dialog_id, true, false, promise);
             });
         }
 
@@ -11577,16 +11693,13 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_rtmp_url(
-                    &format!("replaceLiveStoryRtmpUrl for {}", request.chat_id),
-                    promise,
-                );
-                let _ = manager;
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            group_call_arm(td, Some(dialog_id), |env, manager| {
+                manager.get_video_chat_rtmp_stream_url(env, dialog_id, true, true, promise);
             });
         }
 
-        // getGroupCall (Requests.cpp:5205-5210)
+        // getGroupCall (Requests.cpp:5205-5210 → cpp:2807-2817)
         Function::getGroupCall(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -11598,90 +11711,160 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                     message: "Not Found".to_owned(),
                 }),
             });
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_group_call(
-                    &format!("getGroupCall({})", request.group_call_id),
+            group_call_arm(td, None, |_env, manager| {
+                manager.reload_group_call(GroupCallId::new(request.group_call_id), promise);
+            });
+        }
+
+        // startScheduledVideoChat (Requests.cpp:5212-5216 →
+        // cpp:4400-4432)
+        Function::startScheduledVideoChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, None, |_env, manager| {
+                manager
+                    .start_scheduled_group_call(GroupCallId::new(request.group_call_id), promise);
+            });
+        }
+
+        // toggleVideoChatEnabledStartNotification (Requests.cpp:5218-5222
+        // → cpp:4349-4398)
+        Function::toggleVideoChatEnabledStartNotification(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, None, |env, manager| {
+                manager.toggle_group_call_start_subscribed(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    request.enabled_start_notification,
                     promise,
                 );
-                let _ = manager;
             });
         }
 
-        // startScheduledVideoChat (Requests.cpp:5212-5216)
-        Function::startScheduledVideoChat(_request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "startScheduledVideoChat", promise);
-            });
-        }
-
-        // toggleVideoChatEnabledStartNotification (Requests.cpp:5218-5222)
-        Function::toggleVideoChatEnabledStartNotification(_request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleVideoChatEnabledStartNotification", promise);
-            });
-        }
-
-        // getLiveStoryStreamer (Requests.cpp:5224-5228)
+        // getLiveStoryStreamer (Requests.cpp:5224-5228 → cpp:2450-2479)
         Function::getLiveStoryStreamer(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<td_api::GroupCallParticipant, _>(
-                id,
-                Object::groupCallParticipant,
-            );
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("getLiveStoryStreamer — [blocked: net]");
-                let _ = (env, manager, promise, request.group_call_id);
+            let promise =
+                td.deferred_promise(
+                    id,
+                    |value: Option<td_api::GroupCallParticipant>| match value {
+                        Some(participant) => Object::groupCallParticipant(participant),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_owned(),
+                        }),
+                    },
+                );
+            group_call_arm(td, None, |_env, manager| {
+                manager.get_group_call_streamer(GroupCallId::new(request.group_call_id), promise);
             });
         }
 
-        // getLiveStoryAvailableMessageSenders (Requests.cpp:5230-5234)
+        // getLiveStoryAvailableMessageSenders (Requests.cpp:5230-5234 →
+        // cpp:2490-2582) — the local sender-list recipe; the sender
+        // objects build over the full `Td` frame.
         Function::getLiveStoryAvailableMessageSenders(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td
+            let mut promise = td
                 .deferred_promise::<td_api::ChatMessageSenders, _>(id, Object::chatMessageSenders);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("getLiveStoryAvailableMessageSenders — [blocked: net]");
-                let _ = (env, manager, promise, request.group_call_id);
-            });
+            // the created-public-broadcasts read with the participant
+            // counts (ChatManager.h:640, cpp:2571-2575) rides the chat
+            // plane (§5); the recipe runs over the empty list.
+            let created_public_broadcasts: Vec<(i64, i64)> = Vec::new();
+            match td.group_call_manager.group_call_send_as_dialog_ids(
+                GroupCallId::new(request.group_call_id),
+                my_dialog_id(td),
+                &created_public_broadcasts,
+            ) {
+                std::result::Result::Ok(dialog_ids) => {
+                    let senders = dialog_ids
+                        .iter()
+                        .map(|&dialog_id| td_api::ChatMessageSender {
+                            sender: Some(crate::dialog_manager::get_message_sender_object(
+                                td,
+                                dialog_id,
+                                "get_group_call_send_as",
+                            )),
+                            needs_premium: false,
+                        })
+                        .collect();
+                    promise.set_value(td_api::ChatMessageSenders { senders });
+                }
+                std::result::Result::Err(status) => {
+                    send_error_status(td, id, status);
+                }
+            }
         }
 
-        // setLiveStoryMessageSender (Requests.cpp:5236-5240)
-        Function::setLiveStoryMessageSender(_request) => {
+        // setLiveStoryMessageSender (Requests.cpp:5236-5240 →
+        // cpp:2615-2656)
+        Function::setLiveStoryMessageSender(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "setLiveStoryMessageSender", promise);
+            // `TRY_RESULT_PROMISE(promise, message_sender_dialog_id,
+            // get_message_sender_dialog_id(...))` (Requests.cpp:5238-5239)
+            let as_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.message_sender_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let Some(as_peer) = crate::dialog_manager::get_input_peer(
+                td,
+                as_dialog_id,
+                crate::user_manager::AccessRights::Read,
+            ) else {
+                td.send_error_impl(id, 400, "Can't access the chat");
+                return;
+            };
+            let is_another_user = as_dialog_id.get_type() == crate::dialog_id::DialogType::User
+                && as_dialog_id != my_dialog_id(td);
+            group_call_arm(td, None, |env, manager| {
+                manager.set_group_call_default_send_as(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    as_dialog_id,
+                    is_another_user,
+                    as_peer,
+                    promise,
+                );
             });
         }
 
-        // joinGroupCall (Requests.cpp:5242-5248)
-        Function::joinGroupCall(request) => {
+        // joinGroupCall (Requests.cpp:5242-5248 → cpp:4434) — the join
+        // flow rides the media plane (ticket td-rs/td#54).
+        Function::joinGroupCall(_request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise =
                 td.deferred_promise::<td_api::GroupCallInfo, _>(id, Object::groupCallInfo);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("joinGroupCall — [blocked: net]");
-                let _ = (env, manager, promise, request.input_group_call);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("joinGroupCall", promise);
             });
         }
 
-        // joinVideoChat (Requests.cpp:5250-5255)
+        // joinVideoChat (Requests.cpp:5250-5255 → cpp:4530) — the
+        // media plane park.
         Function::joinVideoChat(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -11690,25 +11873,24 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_text(&format!("joinVideoChat({invite_hash})"), promise);
-                let _ = manager;
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query(&format!("joinVideoChat({invite_hash})"), promise);
             });
         }
 
-        // joinLiveStory (Requests.cpp:5257-5261)
+        // joinLiveStory (Requests.cpp:5257-5261) — the media plane park.
         Function::joinLiveStory(_request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_text("joinLiveStory", promise);
-                let _ = manager;
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("joinLiveStory", promise);
             });
         }
 
-        // startGroupCallScreenSharing (Requests.cpp:5263-5269)
+        // startGroupCallScreenSharing (Requests.cpp:5263-5269 →
+        // cpp:891) — the media plane park.
         Function::startGroupCallScreenSharing(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -11717,175 +11899,292 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             };
             let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_text(
-                    &format!("startGroupCallScreenSharing({payload})"),
+            group_call_arm(td, None, |_env, manager| {
+                manager
+                    .park_media_query(&format!("startGroupCallScreenSharing({payload})"), promise);
+            });
+        }
+
+        // toggleGroupCallScreenSharingIsPaused (Requests.cpp:5271-5275
+        // → cpp:3960-4018) — the local pending-flag settle.
+        Function::toggleGroupCallScreenSharingIsPaused(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, None, |_env, manager| {
+                manager.toggle_group_call_is_my_presentation_paused(
+                    GroupCallId::new(request.group_call_id),
+                    request.is_paused,
                     promise,
                 );
-                let _ = manager;
             });
         }
 
-        // toggleGroupCallScreenSharingIsPaused (Requests.cpp:5271-5275)
-        Function::toggleGroupCallScreenSharingIsPaused(_request) => {
+        // endGroupCallScreenSharing (Requests.cpp:5277-5281 →
+        // cpp:3925-3959)
+        Function::endGroupCallScreenSharing(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleGroupCallScreenSharingIsPaused", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.end_group_call_screen_sharing(
+                    GroupCallId::new(request.group_call_id),
+                    promise,
+                );
             });
         }
 
-        // endGroupCallScreenSharing (Requests.cpp:5277-5281)
-        Function::endGroupCallScreenSharing(_request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "endGroupCallScreenSharing", promise);
-            });
-        }
-
-        // setVideoChatTitle (Requests.cpp:5283-5288)
+        // setVideoChatTitle (Requests.cpp:5283-5288 → cpp:5193-5236)
         Function::setVideoChatTitle(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(_title) = clean_or_utf8_error(td, id, &request.title) else {
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
                 return;
             };
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "setVideoChatTitle", promise);
+            group_call_arm(td, None, |env, manager| {
+                manager.set_group_call_title(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    title,
+                    promise,
+                );
             });
         }
 
-        // toggleVideoChatMuteNewParticipants (Requests.cpp:5290-5294)
-        Function::toggleVideoChatMuteNewParticipants(_request) => {
+        // toggleVideoChatMuteNewParticipants (Requests.cpp:5290-5294 →
+        // cpp:4095-4132)
+        Function::toggleVideoChatMuteNewParticipants(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleVideoChatMuteNewParticipants", promise);
+            group_call_arm(td, None, |env, manager| {
+                manager.toggle_group_call_mute_new_participants(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    request.mute_new_participants,
+                    promise,
+                );
             });
         }
 
-        // toggleGroupCallAreMessagesAllowed (Requests.cpp:5296-5300)
-        Function::toggleGroupCallAreMessagesAllowed(_request) => {
+        // toggleGroupCallAreMessagesAllowed (Requests.cpp:5296-5300 →
+        // cpp:4180-4216)
+        Function::toggleGroupCallAreMessagesAllowed(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleGroupCallAreMessagesAllowed", promise);
+            group_call_arm(td, None, |env, manager| {
+                manager.toggle_group_call_are_messages_enabled(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    request.are_messages_allowed,
+                    promise,
+                );
             });
         }
 
-        // setGroupCallPaidMessageStarCount (Requests.cpp:5302-5307)
-        Function::setGroupCallPaidMessageStarCount(_request) => {
+        // setGroupCallPaidMessageStarCount (Requests.cpp:5302-5307 →
+        // cpp:4266-4303)
+        Function::setGroupCallPaidMessageStarCount(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "setGroupCallPaidMessageStarCount", promise);
+            group_call_arm(td, None, |env, manager| {
+                manager.set_group_call_paid_message_star_count(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    request.paid_message_star_count,
+                    promise,
+                );
             });
         }
 
-        // sendGroupCallMessage (Requests.cpp:5309-5314)
-        Function::sendGroupCallMessage(_request) => {
+        // sendGroupCallMessage (Requests.cpp:5309-5314 → cpp:5884-5979)
+        // — the text parse rides the formatted-text integration for the
+        // call-message plane (§5); the wire text stays empty.
+        Function::sendGroupCallMessage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_text) = clean_or_utf8_error(
+                td,
+                id,
+                request
+                    .text
+                    .as_ref()
+                    .map(|text| text.text.as_str())
+                    .unwrap_or(""),
+            ) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            let group_call_id = GroupCallId::new(request.group_call_id);
+            let is_my_dialog = td
+                .group_call_manager
+                .get_group_call(group_call_id)
+                .map(|call| crate::dialog_id::DialogId::new(call.chat_id) == my_dialog_id(td))
+                .unwrap_or(false);
+            let has_owned_star_count = td
+                .star_manager
+                .has_owned_star_count(request.paid_message_star_count);
+            group_call_arm(td, None, |_env, manager| {
+                manager.send_group_call_message(
+                    group_call_id,
+                    request.paid_message_star_count,
+                    false,
+                    is_my_dialog,
+                    has_owned_star_count,
+                    promise,
+                );
+            });
+        }
+
+        // addPendingLiveStoryReaction (Requests.cpp:5316-5320 →
+        // cpp:5980-6045) — the pending bookkeeping settles locally.
+        Function::addPendingLiveStoryReaction(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "sendGroupCallMessage", promise);
+            let group_call_id = GroupCallId::new(request.group_call_id);
+            let is_my_dialog = td
+                .group_call_manager
+                .get_group_call(group_call_id)
+                .map(|call| crate::dialog_id::DialogId::new(call.chat_id) == my_dialog_id(td))
+                .unwrap_or(false);
+            let has_owned_star_count = td.star_manager.has_owned_star_count(request.star_count);
+            group_call_arm(td, None, |_env, manager| {
+                manager.send_group_call_reaction(
+                    group_call_id,
+                    request.star_count,
+                    is_my_dialog,
+                    has_owned_star_count,
+                    promise,
+                );
             });
         }
 
-        // addPendingLiveStoryReaction (Requests.cpp:5316-5320)
-        Function::addPendingLiveStoryReaction(_request) => {
+        // commitPendingLiveStoryReactions (Requests.cpp:5322-5326 →
+        // cpp:6046-6108) — the aggregated send rides the pending-reaction
+        // store (media plane, §5); the bands settle locally.
+        Function::commitPendingLiveStoryReactions(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "addPendingLiveStoryReaction", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.commit_pending_group_call_reactions(
+                    GroupCallId::new(request.group_call_id),
+                    promise,
+                );
             });
         }
 
-        // commitPendingLiveStoryReactions (Requests.cpp:5322-5326)
-        Function::commitPendingLiveStoryReactions(_request) => {
+        // removePendingLiveStoryReactions (Requests.cpp:5328-5332 →
+        // cpp:6109-6142)
+        Function::removePendingLiveStoryReactions(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "commitPendingLiveStoryReactions", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.remove_pending_group_call_reactions(
+                    GroupCallId::new(request.group_call_id),
+                    promise,
+                );
             });
         }
 
-        // removePendingLiveStoryReactions (Requests.cpp:5328-5332)
-        Function::removePendingLiveStoryReactions(_request) => {
+        // deleteGroupCallMessages (Requests.cpp:5334-5338 →
+        // cpp:4703-4760) — the stored-message delete rides the media
+        // plane (§5); the bands settle locally.
+        Function::deleteGroupCallMessages(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "removePendingLiveStoryReactions", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager
+                    .delete_group_call_messages(GroupCallId::new(request.group_call_id), promise);
             });
         }
 
-        // deleteGroupCallMessages (Requests.cpp:5334-5338)
-        Function::deleteGroupCallMessages(_request) => {
+        // deleteGroupCallMessagesBySender (Requests.cpp:5340-5344 →
+        // cpp:4761-4800)
+        Function::deleteGroupCallMessagesBySender(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "deleteGroupCallMessages", promise);
+            // `TRY_RESULT_PROMISE(promise, sender_dialog_id,
+            // get_message_sender_dialog_id(...))` (Requests.cpp:5342-5343)
+            let sender_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.sender_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            group_call_arm(td, Some(sender_dialog_id), |env, manager| {
+                manager.delete_group_call_messages_by_sender(
+                    env,
+                    GroupCallId::new(request.group_call_id),
+                    sender_dialog_id,
+                    request.report_spam,
+                    promise,
+                );
             });
         }
 
-        // deleteGroupCallMessagesBySender (Requests.cpp:5340-5344)
-        Function::deleteGroupCallMessagesBySender(_request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "deleteGroupCallMessagesBySender", promise);
-            });
-        }
-
-        // getLiveStoryTopDonors (Requests.cpp:5346-5350)
+        // getLiveStoryTopDonors (Requests.cpp:5346-5350 →
+        // cpp:4530-4575)
         Function::getLiveStoryTopDonors(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise =
                 td.deferred_promise::<td_api::LiveStoryDonors, _>(id, Object::liveStoryDonors);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("getLiveStoryTopDonors — [blocked: net]");
-                let _ = (env, manager, promise, request.group_call_id);
+            group_call_arm(td, None, |_env, manager| {
+                manager.get_group_call_stars_from_server(
+                    GroupCallId::new(request.group_call_id),
+                    promise,
+                );
             });
         }
 
-        // revokeGroupCallInviteLink (Requests.cpp:5352-5356)
-        Function::revokeGroupCallInviteLink(_request) => {
+        // revokeGroupCallInviteLink (Requests.cpp:5352-5356 →
+        // cpp:1180-1199)
+        Function::revokeGroupCallInviteLink(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "revokeGroupCallInviteLink", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.revoke_group_call_invite_link(
+                    GroupCallId::new(request.group_call_id),
+                    promise,
+                );
             });
         }
 
-        // inviteGroupCallParticipant (Requests.cpp:5358-5362)
+        // inviteGroupCallParticipant (Requests.cpp:5358-5362 →
+        // cpp:3796-3876) — the conference-plane bands; the
+        // InviteConferenceCallParticipant answer's success leg rides the
+        // messages plane (`wait_message_add`, §5) — the dispatch parks.
         Function::inviteGroupCallParticipant(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -11894,138 +12193,277 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                 .deferred_promise::<td_api::InviteGroupCallParticipantResult, _>(id, |value| {
                     invite_result_to_object(value)
                 });
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("inviteGroupCallParticipant — [blocked: net]");
-                let _ = (env, manager, promise, request.group_call_id);
+            let group_call_id = GroupCallId::new(request.group_call_id);
+            let input_user = {
+                let user_manager = std::mem::take(&mut td.user_manager);
+                let is_bot = td.auth_manager.is_bot();
+                let Some(options) = td.option_manager.as_mut() else {
+                    td.user_manager = user_manager;
+                    td.send_error_impl(id, 400, "Option manager is not initialized");
+                    return;
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: &mut td.global,
+                    options,
+                    auth_is_bot: is_bot,
+                };
+                let input_user = user_manager
+                    .get_input_user(&env, crate::user_manager::UserId::new(request.user_id));
+                td.user_manager = user_manager;
+                match input_user {
+                    Ok(input_user) => input_user,
+                    Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            group_call_arm(td, None, |_env, manager| {
+                manager.invite_group_call_participant(
+                    group_call_id,
+                    input_user,
+                    request.is_video,
+                    promise,
+                );
             });
         }
 
-        // declineGroupCallInvitation (Requests.cpp:5364-5368)
-        Function::declineGroupCallInvitation(_request) => {
+        // declineGroupCallInvitation (Requests.cpp:5364-5368 →
+        // cpp:1316-1323) — the invitation message id resolves through
+        // the M.10.19 get_message_force seam.
+        Function::declineGroupCallInvitation(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "declineGroupCallInvitation", promise);
+            let message_full_id = crate::messages_manager::MessageFullId::new(
+                crate::messages_manager::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
+            );
+            let server_message_id = {
+                // the context-alias split of the messages plane
+                // (the get_giveaway_message_id seam shape)
+                let td_ptr = std::ptr::from_mut(td);
+                let manager: &mut crate::messages_manager::MessagesManager =
+                    unsafe { &mut (*td_ptr).messages_manager };
+                let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+                let sendctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+                let state: &mut dyn crate::messages_manager::ReadStateContext =
+                    unsafe { crate::td::split_context_alias(td_ptr) };
+                let reactions_ctx: &dyn crate::messages_manager::DialogReactionsContext =
+                    unsafe { &*td_ptr };
+                match crate::messages_manager::get_group_call_message_id(
+                    global,
+                    manager,
+                    sendctx,
+                    state,
+                    reactions_ctx,
+                    message_full_id,
+                ) {
+                    std::result::Result::Ok(server_message_id) => server_message_id.get(),
+                    std::result::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            group_call_arm(td, None, |_env, manager| {
+                manager.decline_group_call_invitation(server_message_id, promise);
             });
         }
 
-        // banGroupCallParticipants (Requests.cpp:5370-5374)
-        Function::banGroupCallParticipants(_request) => {
+        // banGroupCallParticipants (Requests.cpp:5370-5374 →
+        // cpp:3878-3894) — the self/conference bands; the conference
+        // net leg rides the tde2e plane.
+        Function::banGroupCallParticipants(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "banGroupCallParticipants", promise);
+            let my_user_id = td.user_manager.get_my_id().get();
+            group_call_arm(td, None, |_env, manager| {
+                manager.delete_group_call_participants(
+                    GroupCallId::new(request.group_call_id),
+                    &request.user_ids,
+                    my_user_id,
+                    promise,
+                );
             });
         }
 
-        // inviteVideoChatParticipants (Requests.cpp:5376-5380)
-        Function::inviteVideoChatParticipants(_request) => {
+        // inviteVideoChatParticipants (Requests.cpp:5376-5380 →
+        // cpp:3895-3924) — the self removal + the input users resolve
+        // over the full `Td` frame.
+        Function::inviteVideoChatParticipants(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "inviteVideoChatParticipants", promise);
+            let my_user_id = td.user_manager.get_my_id();
+            let user_ids: Vec<_> = request
+                .user_ids
+                .iter()
+                .copied()
+                .filter(|&user_id| user_id != my_user_id.get())
+                .map(crate::user_manager::UserId::new)
+                .collect();
+            let input_users = {
+                let user_manager = std::mem::take(&mut td.user_manager);
+                let is_bot = td.auth_manager.is_bot();
+                let Some(options) = td.option_manager.as_mut() else {
+                    td.user_manager = user_manager;
+                    td.send_error_impl(id, 400, "Option manager is not initialized");
+                    return;
+                };
+                let env = crate::user_manager::UserEnv {
+                    global: &mut td.global,
+                    options,
+                    auth_is_bot: is_bot,
+                };
+                let input_users = user_manager.get_input_users(&env, &user_ids);
+                td.user_manager = user_manager;
+                match input_users {
+                    Ok(input_users) => input_users,
+                    Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            group_call_arm(td, None, |_env, manager| {
+                manager.invite_group_call_participants(
+                    GroupCallId::new(request.group_call_id),
+                    input_users,
+                    promise,
+                );
             });
         }
 
-        // getVideoChatInviteLink (Requests.cpp:5382-5386)
+        // getVideoChatInviteLink (Requests.cpp:5382-5386 →
+        // cpp:4218-4250)
         Function::getVideoChatInviteLink(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<td_api::HttpUrl, _>(id, Object::httpUrl);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("getVideoChatInviteLink — [blocked: net]");
-                let _ = (env, manager, promise, request.group_call_id);
+            let promise = td
+                .deferred_promise::<String, _>(id, |url| Object::httpUrl(td_api::HttpUrl { url }));
+            group_call_arm(td, None, |_env, manager| {
+                manager.get_group_call_invite_link(
+                    GroupCallId::new(request.group_call_id),
+                    request.can_self_unmute,
+                    promise,
+                );
             });
         }
 
-        // startGroupCallRecording (Requests.cpp:5388-5393)
+        // startGroupCallRecording (Requests.cpp:5388-5393 →
+        // cpp:4298-4348)
         Function::startGroupCallRecording(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(_title) = clean_or_utf8_error(td, id, &request.title) else {
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
                 return;
             };
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "startGroupCallRecording", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.toggle_group_call_recording(
+                    GroupCallId::new(request.group_call_id),
+                    true,
+                    title,
+                    request.record_video,
+                    request.use_portrait_orientation,
+                    promise,
+                );
             });
         }
 
         // endGroupCallRecording (Requests.cpp:5395-5399)
-        Function::endGroupCallRecording(_request) => {
+        Function::endGroupCallRecording(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "endGroupCallRecording", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.toggle_group_call_recording(
+                    GroupCallId::new(request.group_call_id),
+                    false,
+                    String::new(),
+                    false,
+                    false,
+                    promise,
+                );
             });
         }
 
-        // toggleGroupCallIsMyVideoPaused (Requests.cpp:5401-5405)
-        Function::toggleGroupCallIsMyVideoPaused(_request) => {
+        // toggleGroupCallIsMyVideoPaused (Requests.cpp:5401-5405 →
+        // cpp:4020-4076) — the local settle.
+        Function::toggleGroupCallIsMyVideoPaused(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleGroupCallIsMyVideoPaused", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.toggle_group_call_is_my_video_paused(
+                    GroupCallId::new(request.group_call_id),
+                    request.is_my_video_paused,
+                    promise,
+                );
             });
         }
 
-        // toggleGroupCallIsMyVideoEnabled (Requests.cpp:5407-5411)
-        Function::toggleGroupCallIsMyVideoEnabled(_request) => {
+        // toggleGroupCallIsMyVideoEnabled (Requests.cpp:5407-5411 →
+        // cpp:4077-4094) — the local settle.
+        Function::toggleGroupCallIsMyVideoEnabled(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleGroupCallIsMyVideoEnabled", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.toggle_group_call_is_my_video_enabled(
+                    GroupCallId::new(request.group_call_id),
+                    request.is_my_video_enabled,
+                    promise,
+                );
             });
         }
 
-        // toggleGroupCallParticipantIsMuted (Requests.cpp:5413-5417)
-        Function::toggleGroupCallParticipantIsMuted(_request) => {
+        // toggleGroupCallParticipantIsMuted / IsHandRaised /
+        // setGroupCallParticipantVolumeLevel (Requests.cpp:5413-5429 →
+        // cpp:6779-7085) — the participant plane (ticket td-rs/td#54).
+        Function::toggleGroupCallParticipantIsMuted(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleGroupCallParticipantIsMuted", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("phone.editGroupCallParticipant (is_muted)", promise);
+                let _ = request;
             });
         }
 
-        // toggleGroupCallParticipantIsHandRaised (Requests.cpp:5419-5423)
-        Function::toggleGroupCallParticipantIsHandRaised(_request) => {
+        Function::toggleGroupCallParticipantIsHandRaised(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "toggleGroupCallParticipantIsHandRaised", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager
+                    .park_media_query("phone.editGroupCallParticipant (is_hand_raised)", promise);
+                let _ = request;
             });
         }
 
-        // setGroupCallParticipantVolumeLevel (Requests.cpp:5425-5429)
-        Function::setGroupCallParticipantVolumeLevel(_request) => {
+        Function::setGroupCallParticipantVolumeLevel(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "setGroupCallParticipantVolumeLevel", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("phone.editGroupCallParticipant (volume_level)", promise);
+                let _ = request;
             });
         }
 
-        // setGroupCallParticipantIsSpeaking (Requests.cpp:5431-5435)
+        // setGroupCallParticipantIsSpeaking (Requests.cpp:5431-5435) —
+        // the speaking-action plane rides the media transport.
         Function::setGroupCallParticipantIsSpeaking(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -12039,35 +12477,37 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
                         Object::messageSenderChat(chat)
                     }
                 });
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("setGroupCallParticipantIsSpeaking — [blocked: net]");
-                let _ = (env, manager, promise, request.group_call_id);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("setGroupCallParticipantIsSpeaking", promise);
+                let _ = request;
             });
         }
 
-        // leaveGroupCall (Requests.cpp:5437-5441)
-        Function::leaveGroupCall(_request) => {
+        // leaveGroupCall (Requests.cpp:5437-5441 → cpp:5090-5127)
+        Function::leaveGroupCall(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "leaveGroupCall", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.leave_group_call(GroupCallId::new(request.group_call_id), promise);
             });
         }
 
-        // endGroupCall (Requests.cpp:5443-5447)
-        Function::endGroupCall(_request) => {
+        // endGroupCall (Requests.cpp:5443-5447 → cpp:7255-7259)
+        Function::endGroupCall(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "endGroupCall", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.discard_group_call(GroupCallId::new(request.group_call_id), promise);
             });
         }
 
-        // getGroupCallParticipants (Requests.cpp:5449-5453)
+        // getGroupCallParticipants (Requests.cpp:5485-5490 →
+        // cpp:4964-4976) — the participant-object build rides the
+        // participants plane (§5); the promise parks.
         Function::getGroupCallParticipants(_request) => {
             if !check_is_user(td, id) {
                 return;
@@ -12075,73 +12515,74 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise::<td_api::GroupCallParticipants, _>(id, |value| {
                 Object::groupCallParticipants(value)
             });
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_group_call_participants(
-                    "getGroupCallParticipants",
-                    promise,
-                );
-                let _ = manager;
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("phone.getGroupParticipants", promise);
             });
         }
 
-        // loadGroupCallParticipants (Requests.cpp:5455-5459)
-        Function::loadGroupCallParticipants(_request) => {
+        // loadGroupCallParticipants (Requests.cpp:5492-5496 →
+        // cpp:5060-5088)
+        Function::loadGroupCallParticipants(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = ok_promise!(td);
-            group_call_arm(td, |env, manager| {
-                manager.run_query(env, "loadGroupCallParticipants", promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.load_group_call_participants(
+                    GroupCallId::new(request.group_call_id),
+                    request.limit,
+                    promise,
+                );
             });
         }
 
-        // getGroupCallStreams (Requests.cpp:5461-5465)
-        Function::getGroupCallStreams(_request) => {
+        // getGroupCallStreams (Requests.cpp:5498-5502 →
+        // cpp:4246-4293)
+        Function::getGroupCallStreams(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::GroupCallStreams, _>(id, |value| {
                 Object::groupCallStreams(value)
             });
-            group_call_arm(td, |env, manager| {
-                env.send_group_call_query_group_call_streams("getGroupCallStreams", promise);
-                let _ = manager;
+            group_call_arm(td, None, |_env, manager| {
+                manager.get_group_call_streams(GroupCallId::new(request.group_call_id), promise);
             });
         }
 
-        // getGroupCallStreamSegment (Requests.cpp:5467-5471)
+        // getGroupCallStreamSegment (Requests.cpp:5504-5508) — the
+        // stream-segment transport rides the media plane.
         Function::getGroupCallStreamSegment(_request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::Data, _>(id, Object::data);
-            group_call_arm(td, |env, manager| {
-                tdutils::log_info!("getGroupCallStreamSegment — [blocked: net]");
-                let _ = (env, manager, promise);
+            group_call_arm(td, None, |_env, manager| {
+                manager.park_media_query("getGroupCallStreamSegment", promise);
             });
         }
 
-        // encryptGroupCallData (Requests.cpp:5473-5477) — [blocked: tde2e]
+        // encryptGroupCallData (Requests.cpp:5510-5514) — [blocked: tde2e]
         Function::encryptGroupCallData(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::Data, _>(id, Object::data);
-            group_call_arm(td, |env, manager| {
+            group_call_arm(td, None, |_env, manager| {
                 tdutils::log_info!("encryptGroupCallData — [blocked: tde2e]");
-                let _ = (env, manager, promise, request.group_call_id);
+                let _ = (manager, promise, request.group_call_id);
             });
         }
 
-        // decryptGroupCallData (Requests.cpp:5479-5483) — [blocked: tde2e]
+        // decryptGroupCallData (Requests.cpp:5516-5520) — [blocked: tde2e]
         Function::decryptGroupCallData(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<td_api::Data, _>(id, Object::data);
-            group_call_arm(td, |env, manager| {
+            group_call_arm(td, None, |_env, manager| {
                 tdutils::log_info!("decryptGroupCallData — [blocked: tde2e]");
-                let _ = (env, manager, promise, request.group_call_id);
+                let _ = (manager, promise, request.group_call_id);
             });
         }
 
