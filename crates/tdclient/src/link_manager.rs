@@ -877,41 +877,19 @@ pub trait LinkEnv {
         false
     }
 
-    /// `GetDeepLinkInfoQuery` (cpp:1607-1643) — `[blocked: net]`; the
-    /// promise drops with the query and stays unanswered offline.
-    fn send_get_deep_link_info_query(
+    /// `DialogManager::get_input_peer(dialog_id, Read)` — the send-leg
+    /// peer resolution of `RequestUrlAuthQuery::send` (cpp:1660-1665).
+    /// The narrow env views can't reach the dialog plane, so the default
+    /// answers `None` (the C++ `CHECK(input_peer != nullptr)` is fatal;
+    /// the port downgrades it to a non-fatal log-and-drop); the
+    /// button-URL path the peer form rides stays `[blocked: M.10
+    /// integration]` ahead of it, so the live flow never reaches this
+    /// seam before that lands.
+    fn get_input_peer_read(
         &mut self,
-        _link: String,
-        _promise: tdutils::promise::Promise<Option<td_api::DeepLinkInfo>>,
-    ) {
-    }
-
-    /// `RequestUrlAuthQuery` (cpp:1646-1719) — `[blocked: net]`; the
-    /// promise drops with the query and stays unanswered offline.
-    fn send_request_url_auth_query(
-        &mut self,
-        _url: String,
-        _promise: tdutils::promise::Promise<td_api::LoginUrlInfo>,
-    ) {
-    }
-
-    /// `GetRecentMeUrlsQuery` (cpp:1508-1604) — `[blocked: net]`.
-    fn send_get_recent_me_urls_query(
-        &mut self,
-        _referrer: String,
-        _promise: tdutils::promise::Promise<Option<td_api::TMeUrls>>,
-    ) {
-    }
-
-    /// `RequestUrlOauthQuery` (cpp:1722-1780, `messages.requestUrlAuth`
-    /// with the in-app origin) — `[blocked: net]`; the promise drops with
-    /// the query and stays unanswered offline.
-    fn send_request_url_oauth_query(
-        &mut self,
-        _url: String,
-        _in_app_origin: String,
-        _promise: tdutils::promise::Promise<td_api::OauthLinkInfo>,
-    ) {
+        _dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        None
     }
 
     /// `CheckUrlAuthMatchCodeQuery` (cpp:1782-1808,
@@ -6793,14 +6771,60 @@ pub fn get_message_link_info(
     })
 }
 
+/// The LinkManager in-flight query kinds — the C++ ResultHandler classes
+/// of the net-drain 32 families (LinkManager.cpp:1508-1780). The handler
+/// state the answers read (`url_`/`dialog_id_`/the promise) rides the
+/// [`PendingLinkQueries`] lots instead — the kinds stay `Copy`.
+#[derive(Clone, Copy)]
+pub(crate) enum LinkNetKind {
+    /// `GetRecentMeUrlsQuery` (cpp:1508) — `help.getRecentMeUrls`.
+    RecentMeUrls,
+    /// `GetDeepLinkInfoQuery` (cpp:1607) — `help.getDeepLinkInfo`, the
+    /// unauth wire form.
+    DeepLinkInfo,
+    /// `RequestUrlAuthQuery` (cpp:1646) — `messages.requestUrlAuth` in
+    /// the peer/button or the bare-url flag form.
+    RequestUrlAuth,
+    /// `RequestUrlOauthQuery` (cpp:1722) — the oauth form with the
+    /// in-app origin.
+    RequestUrlOauth,
+}
+
+/// The parked query promises — the ResultHandler members the `Copy`
+/// [`LinkNetKind`]s can't carry (`RequestUrlAuthQuery`'s `url_`/
+/// `dialog_id_`, `RequestUrlOauthQuery`'s `url_`, and every `promise_`).
+/// FIFO-paired per family (§5).
+#[derive(Default)]
+pub(crate) struct PendingLinkQueries {
+    /// `GetRecentMeUrlsQuery::promise_`.
+    pub(crate) recent_me_urls: Vec<tdutils::promise::Promise<Option<td_api::TMeUrls>>>,
+    /// `GetDeepLinkInfoQuery::promise_` (the null answer rides `None`).
+    pub(crate) deep_link_info: Vec<tdutils::promise::Promise<Option<td_api::DeepLinkInfo>>>,
+    /// `RequestUrlAuthQuery`'s `url_`/`dialog_id_`/`promise_`.
+    pub(crate) url_auth: Vec<(
+        String,
+        Option<crate::dialog_id::DialogId>,
+        tdutils::promise::Promise<td_api::LoginUrlInfo>,
+    )>,
+    /// `RequestUrlOauthQuery`'s `url_`/`promise_`.
+    pub(crate) url_oauth: Vec<(String, tdutils::promise::Promise<td_api::OauthLinkInfo>)>,
+}
+
 /// The autologin-token state (LinkManager.h:227-231).
-#[derive(Debug)]
+#[derive(Default)]
 pub(crate) struct LinkManager {
     autologin_token: String,
     autologin_domains: Vec<String>,
     autologin_update_time: f64,
     url_auth_domains: Vec<String>,
     whitelisted_domains: Vec<String>,
+    /// The parked query promises of the net-drain 32 families.
+    pub(crate) pending: PendingLinkQueries,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in
+    /// the net-inert tests; set at the manager install, §0's shared-env
+    /// shape).
+    pub(crate) net: Option<crate::td::LinkNetHandle>,
 }
 
 impl LinkManager {
@@ -6810,11 +6834,8 @@ impl LinkManager {
     /// [`LinkManager::start_up`].
     pub(crate) fn new() -> Self {
         Self {
-            autologin_token: String::new(),
-            autologin_domains: Vec::new(),
-            url_auth_domains: Vec::new(),
-            whitelisted_domains: Vec::new(),
             autologin_update_time: tdutils::time::now() - 365.0 * 86400.0,
+            ..Self::default()
         }
     }
 
@@ -6850,26 +6871,61 @@ impl LinkManager {
         }
     }
 
-    /// `LinkManager::get_recent_me_urls` (cpp:4021-4023) —
-    /// `GetRecentMeUrlsQuery` (`help.getRecentMeUrls`) is `[blocked: net]`;
-    /// the promise drops with the query and stays unanswered offline.
+    /// The `td_->create_handler<…>()->send(...)` collapse — the wire
+    /// query construction lives at the manager send sites; `None` keeps
+    /// the net-inert posture (the tests drive the answer halves).
+    fn send_link_net_query(
+        &self,
+        kind: LinkNetKind,
+        function: tdmtproto::telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
+    /// The `create_unauth` form — `GetDeepLinkInfoQuery::send`
+    /// (cpp:1618-1620) serializes without an auth context.
+    fn send_link_net_query_unauth(
+        &self,
+        kind: LinkNetKind,
+        function: tdmtproto::telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch_unauth(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
+    /// `LinkManager::get_recent_me_urls` (cpp:4021-4023) — the
+    /// `GetRecentMeUrlsQuery::send` half (`help.getRecentMeUrls`); the
+    /// promise parks in the family lot and the answer leg runs the
+    /// users/chats intakes + the recentMeUrl ladder (cpp:1533-1601).
     pub(crate) fn get_recent_me_urls(
         &mut self,
-        env: &mut impl LinkEnv,
         referrer: String,
         promise: tdutils::promise::Promise<Option<td_api::TMeUrls>>,
     ) {
-        env.send_get_recent_me_urls_query(referrer, promise);
+        self.pending.recent_me_urls.push(promise);
+        self.send_link_net_query(
+            LinkNetKind::RecentMeUrls,
+            tdmtproto::telegram_api::Function::help_getRecentMeUrls(
+                tdmtproto::telegram_api::help_getRecentMeUrls { referer: referrer },
+            ),
+            "help.getRecentMeUrls",
+        );
     }
 
     /// `LinkManager::get_deep_link_info` (cpp:4025-4039): the local half
     /// strips the `tg:` scheme (case-sensitive `begins_with`) and truncates
     /// the host at the first `/`, `?` or `#`, then the
-    /// `GetDeepLinkInfoQuery` (`help.getDeepLinkInfo`, unauth) is
-    /// `[blocked: net]`.
+    /// `GetDeepLinkInfoQuery::send` half (`help.getDeepLinkInfo`, the
+    /// unauth wire form) parks the promise in the family lot.
     pub(crate) fn get_deep_link_info(
         &mut self,
-        env: &mut impl LinkEnv,
         link: &str,
         promise: tdutils::promise::Promise<Option<td_api::DeepLinkInfo>>,
     ) {
@@ -6885,17 +6941,85 @@ impl LinkManager {
             pos += 1;
         }
         let link = &link[..pos];
-        env.send_get_deep_link_info_query(link.to_owned(), promise);
+        self.pending.deep_link_info.push(promise);
+        self.send_link_net_query_unauth(
+            LinkNetKind::DeepLinkInfo,
+            tdmtproto::telegram_api::Function::help_getDeepLinkInfo(
+                tdmtproto::telegram_api::help_getDeepLinkInfo {
+                    path: link.to_owned(),
+                },
+            ),
+            "help.getDeepLinkInfo",
+        );
+    }
+
+    /// `RequestUrlAuthQuery::send` (cpp:1652-1670) — the peer/button form
+    /// when the message dialog is valid (the read input peer resolves at
+    /// the send leg; the C++ `CHECK(input_peer != nullptr)` is fatal and
+    /// the port downgrades it to a non-fatal log-and-drop), the bare-url
+    /// form otherwise. The `url_`/`dialog_id_`/promise trio parks in the
+    /// family lot for the answer legs (cpp:1672-1719).
+    fn send_request_url_auth_query(
+        &mut self,
+        env: &mut impl LinkEnv,
+        url: String,
+        message_full_id: MessageFullId,
+        button_id: i32,
+        promise: tdutils::promise::Promise<td_api::LoginUrlInfo>,
+    ) {
+        // messages_requestUrlAuth flag bits (telegram_api.tl:2699).
+        const PEER_MASK: i32 = 1 << 1;
+        const URL_MASK: i32 = 1 << 2;
+        let dialog_id = message_full_id.get_dialog_id();
+        let (flags, peer, msg_id, wire_button_id, error_dialog_id) = if dialog_id.is_valid() {
+            let Some(peer) = env.get_input_peer_read(dialog_id) else {
+                // the C++ CHECK(input_peer != nullptr) is fatal; the
+                // port downgrades it to log-and-drop — the query never
+                // sends and the promise stays unanswered
+                tdutils::log_error!("RequestUrlAuthQuery — no input peer for {dialog_id:?}");
+                return;
+            };
+            (
+                PEER_MASK,
+                Some(Box::new(peer)),
+                message_full_id
+                    .get_message_id()
+                    .get_server_message_id()
+                    .get(),
+                button_id,
+                Some(dialog_id),
+            )
+        } else {
+            (URL_MASK, None, 0, 0, None)
+        };
+        self.pending
+            .url_auth
+            .push((url.clone(), error_dialog_id, promise));
+        self.send_link_net_query(
+            LinkNetKind::RequestUrlAuth,
+            tdmtproto::telegram_api::Function::messages_requestUrlAuth(
+                tdmtproto::telegram_api::messages_requestUrlAuth {
+                    flags,
+                    peer,
+                    msg_id,
+                    button_id: wire_button_id,
+                    url,
+                    in_app_origin: String::new(),
+                },
+            ),
+            "messages.requestUrlAuth",
+        );
     }
 
     /// `LinkManager::get_external_link_info` (cpp:4041-4129): the local
     /// machine — the tonsite/`.ton` proxy rewrite, the whitelisted
     /// skip-confirmation mark, the autologin-token append and the
     /// freshness-gated config reload. The `RequestUrlAuthQuery` tail
-    /// (cpp:4086) and the `ConfigManager::reload_config` closure
-    /// (cpp:4092-4100) are `[blocked: net]` env seams; the reload seam's
-    /// offline default reports the config as not reloaded, so the promise
-    /// answers the default open result exactly like the C++ error path.
+    /// (cpp:4086) rides the net plane (the URL-flag form); the
+    /// `ConfigManager::reload_config` closure (cpp:4092-4100) stays the
+    /// `[blocked: net]` env seam, and its offline default reports the
+    /// config as not reloaded, so the promise answers the default open
+    /// result exactly like the C++ error path.
     pub(crate) fn get_external_link_info(
         &mut self,
         env: &mut impl LinkEnv,
@@ -6962,7 +7086,7 @@ impl LinkManager {
 
         if !self.autologin_domains.contains(&url.host) {
             if self.url_auth_domains.contains(&url.host) {
-                env.send_request_url_auth_query(link, promise);
+                self.send_request_url_auth_query(env, link, MessageFullId::default(), 0, promise);
                 return;
             }
             promise.set_value(default_result(rewritten_default_url, skip_confirmation));
@@ -7017,8 +7141,8 @@ impl LinkManager {
     /// `LinkManager::get_login_url_info` (cpp:4131-4136): the message's
     /// login-button URL resolves through the message plane (the
     /// [`LinkEnv::get_login_button_url`] `[blocked: M.10 integration]`
-    /// seam), then the `RequestUrlAuthQuery` tail (cpp:1646) is
-    /// `[blocked: net]`.
+    /// seam), then the `RequestUrlAuthQuery::send` peer form
+    /// (cpp:1646-1670) rides the net plane.
     pub(crate) fn get_login_url_info(
         &mut self,
         env: &mut impl LinkEnv,
@@ -7027,7 +7151,13 @@ impl LinkManager {
         mut promise: tdutils::promise::Promise<td_api::LoginUrlInfo>,
     ) {
         match env.get_login_button_url(message_full_id, button_id) {
-            tdutils::status::Result::Ok(url) => env.send_request_url_auth_query(url, promise),
+            tdutils::status::Result::Ok(url) => self.send_request_url_auth_query(
+                env,
+                url,
+                message_full_id,
+                button_id as i32,
+                promise,
+            ),
             tdutils::status::Result::Err(status) => promise.set_error(status),
         }
     }
@@ -7130,7 +7260,9 @@ impl LinkManager {
 
     /// `LinkManager::get_oauth_link_info` (cpp:4164-4177): the local half
     /// parses the link and demands `internalLinkTypeOauth`, then the
-    /// `RequestUrlOauthQuery` (cpp:1722) is `[blocked: net]`.
+    /// `RequestUrlOauthQuery::send` half (cpp:1722-1736) — the bare-url
+    /// flag form with the in-app origin riding its own mask — parks the
+    /// url/promise pair for the answer leg (cpp:1738-1780).
     pub(crate) fn get_oauth_link_info(
         &mut self,
         env: &mut impl LinkEnv,
@@ -7145,7 +7277,28 @@ impl LinkManager {
         let td_api::InternalLinkType::internalLinkTypeOauth(oauth) = object else {
             return promise.set_error(Status::error(400, "Invalid OAuth URL specified"));
         };
-        env.send_request_url_oauth_query(oauth.url, in_app_origin, promise);
+        // messages_requestUrlAuth flag bits (telegram_api.tl:2699).
+        const URL_MASK: i32 = 1 << 2;
+        const IN_APP_ORIGIN_MASK: i32 = 1 << 3;
+        let mut flags = URL_MASK;
+        if !in_app_origin.is_empty() {
+            flags |= IN_APP_ORIGIN_MASK;
+        }
+        self.pending.url_oauth.push((oauth.url.clone(), promise));
+        self.send_link_net_query(
+            LinkNetKind::RequestUrlOauth,
+            tdmtproto::telegram_api::Function::messages_requestUrlAuth(
+                tdmtproto::telegram_api::messages_requestUrlAuth {
+                    flags,
+                    peer: None,
+                    msg_id: 0,
+                    button_id: 0,
+                    url: oauth.url,
+                    in_app_origin,
+                },
+            ),
+            "messages.requestUrlAuth",
+        );
     }
 
     /// `LinkManager::update_autologin_token` (cpp:4000-4003).
@@ -7303,5 +7456,51 @@ mod tests {
         assert_eq!(get_link_user_id("tg://user"), UserId::new(0));
         assert_eq!(get_link_user_id("tg://user?other=1"), UserId::new(0));
         assert_eq!(get_link_user_id("https://t.me/user?id=1"), UserId::new(0));
+    }
+
+    /// The net-drain 32 net-inert posture (§0): with no dispatch surface
+    /// the promises park in their family lots and nothing dispatches —
+    /// the offline behavior is byte-identical to the pre-drain parking
+    /// (the requests stay unanswered).
+    #[test]
+    fn net_queries_park_inert() {
+        let mut manager = LinkManager::new();
+        assert!(manager.net.is_none(), "no dispatch surface");
+        manager.get_recent_me_urls("ref".to_owned(), Default::default());
+        assert_eq!(manager.pending.recent_me_urls.len(), 1);
+        manager.get_deep_link_info("tg://join?invite=x", Default::default());
+        assert_eq!(manager.pending.deep_link_info.len(), 1);
+        assert!(manager.pending.url_auth.is_empty() && manager.pending.url_oauth.is_empty());
+    }
+
+    /// The `RequestUrlAuthQuery::send` peer band (cpp:1662): a message
+    /// dialog whose read input peer can't resolve never parks the
+    /// promise and never sends — the C++ `CHECK(input_peer != nullptr)`
+    /// is fatal there; the port downgrades it to log-and-drop.
+    #[test]
+    fn request_url_auth_drops_on_unresolvable_peer() {
+        use crate::messages_manager::{MessageId, ServerMessageId};
+        struct ResolvedButtonEnv;
+        impl LinkEnv for ResolvedButtonEnv {
+            fn get_login_button_url(
+                &mut self,
+                _message_full_id: MessageFullId,
+                _button_id: i64,
+            ) -> tdutils::status::Result<String> {
+                tdutils::status::Result::Ok("https://btn.example/auth".to_owned())
+            }
+            // get_input_peer_read keeps the default `None`
+        }
+        let mut manager = LinkManager::new();
+        manager.get_login_url_info(
+            &mut ResolvedButtonEnv,
+            MessageFullId::new(
+                crate::dialog_id::DialogId::from_user_id(UserId::new(900)),
+                MessageId::from_server_message_id(ServerMessageId::new(123)),
+            ),
+            7,
+            Default::default(),
+        );
+        assert!(manager.pending.url_auth.is_empty(), "the CHECK band");
     }
 }

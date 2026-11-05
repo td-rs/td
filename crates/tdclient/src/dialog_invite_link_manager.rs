@@ -561,6 +561,23 @@ impl DialogInviteLinkManager {
         ));
     }
 
+    /// `get_chat_invite_link_info_object(const string &)`
+    /// (DialogInviteLinkManager.cpp:787-790) — the string-keyed
+    /// map-lookup overload `GetRecentMeUrlsQuery`'s chatInvite arm reads
+    /// (LinkManager.cpp:1564-1571) right after the
+    /// `on_get_dialog_invite_link_info` intake; that intake rides the
+    /// un-landed checkDialogInviteLink net family, so until it lands the
+    /// lookup misses and the caller drops the URL exactly like the C++
+    /// null-info band.
+    pub fn get_chat_invite_link_info_object_by_url(
+        &self,
+        env: &mut impl DialogInviteLinkManagerEnv,
+        invite_link: &str,
+    ) -> Option<td_api::ChatInviteLinkInfo> {
+        let info = self.invite_link_infos.get(invite_link)?;
+        Some(self.get_chat_invite_link_info_object(env, info))
+    }
+
     /// `get_chat_invite_link_info_object` (DialogInviteLinkManager.cpp:775-875).
     pub fn get_chat_invite_link_info_object(
         &self,
