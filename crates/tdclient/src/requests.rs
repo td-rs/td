@@ -5569,20 +5569,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::changeWebBrowserSettings(request) => {
             // `Requests.cpp:3154-3160` — CHECK_IS_USER + the
-            // UpdateWebBrowserSettingsQuery ([blocked: net]); the promise
-            // parks until the query answer arrives.
+            // UpdateWebBrowserSettingsQuery::send (the net-drain 34 wire
+            // family); the promise parks in the manager's FIFO lot and
+            // the answer drains through `Td::on_web_browser_net_answer`.
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = WebBrowserEnv {
-                global: &mut td.global,
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.web_browser_updates,
-            };
             td.web_browser_manager.update_web_browser_settings(
-                &mut env,
                 request.open_external_browser,
                 request.display_close_button,
                 promise,

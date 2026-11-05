@@ -1,11 +1,15 @@
 //! `WebBrowserManager` (td/telegram/WebBrowserManager.{h,cpp}) — the M.31
 //! Wave-3 slice: the in-app web browser settings, the domain exceptions
-//! and the `getLinkWebBrowserType` classification. The four server queries
-//! are `[blocked: net]` seams (the result handlers are real and unit-tested
-//! against constructed answers); the settings ride the binlog pmc under the
-//! `web_browser_settings` key. The C++ `Td::ResultHandler` query classes
-//! collapse into the [`WebBrowserManagerEnv`] query seams, the
-//! `account_WebBrowserSettings` wire union splits by constructor id in
+//! and the `getLinkWebBrowserType` classification. The Get/Update settings
+//! queries ride the net plane (the net-drain 34 families — the
+//! `WebBrowserNetKind` dispatch over the manager-held
+//! `crate::td::WebBrowserNetHandle`); the toggle/delete-exceptions
+//! queries are the remaining `[blocked: net]` seams (the result handlers
+//! are real and unit-tested against constructed answers). The settings
+//! ride the binlog pmc under the `web_browser_settings` key. The C++
+//! `Td::ResultHandler` query classes collapse into the
+//! `WebBrowserNetKind` dispatch, the `account_WebBrowserSettings` wire
+//! union splits by constructor id in
 //! [`decode_web_browser_settings_answer`] (the `config_result` precedent).
 
 use crate::store_parse::{self, Parser};
@@ -17,7 +21,9 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 /// The `G()`/`td_` surface of the manager. The cross-manager arms are the
-/// `[blocked: net]` query seams; the `send_update` outbox is drained by
+/// `[blocked: net]` toggle/delete-exceptions query seams (the net-drain 34
+/// Get/Update settings families dispatch through the manager-held net
+/// handle instead); the `send_update` outbox is drained by
 /// `crate::td::Td::flush_user_updates`.
 pub trait WebBrowserManagerEnv {
     /// `td_->auth_manager_->is_authorized()`.
@@ -34,25 +40,6 @@ pub trait WebBrowserManagerEnv {
 
     /// `send_closure(G()->td(), &Td::send_update, ...)`.
     fn send_update(&mut self, update: td_api::Update);
-
-    /// `GetWebBrowserSettingsQuery::send` (cpp:34-36) — `[blocked: net]`;
-    /// the answer arrives through
-    /// [`WebBrowserManager::on_get_web_browser_settings`].
-    fn send_get_web_browser_settings_query(&mut self, hash: i64) {
-        tdutils::log_info!("Send GetWebBrowserSettings(hash = {hash}) — [blocked: net]");
-    }
-
-    /// `UpdateWebBrowserSettingsQuery::send` (cpp:61-64) — `[blocked: net]`.
-    fn send_update_web_browser_settings_query(
-        &mut self,
-        open_external_browser: bool,
-        display_close_button: bool,
-    ) {
-        tdutils::log_info!(
-            "Send UpdateWebBrowserSettings(open_external_browser = {open_external_browser}, \
-             display_close_button = {display_close_button}) — [blocked: net]"
-        );
-    }
 
     /// `ToggleWebBrowserSettingsExceptionQuery::send` (cpp:87-94) —
     /// `[blocked: net]`; the C++ `on_result` routes the answer into
@@ -105,17 +92,60 @@ pub fn decode_web_browser_settings_answer(
     }
 }
 
+/// The Web-Browser-plane in-flight query kinds — the C++ `Td::ResultHandler`
+/// classes of the net-drain 34 families (WebBrowserManager.cpp:25-83). The
+/// completions park by kind behind the manager-held net handle
+/// (`crate::td::WebBrowserNetHandle`); `Td::on_web_browser_net_answer`
+/// routes them. Both families answer `account.WebBrowserSettings` and feed
+/// the shared [`WebBrowserManager::on_get_web_browser_settings`] intake
+/// (the C++ query promises route there through the `PromiseCreator::lambda`
+/// hops, cpp:188-193/233-240) — the Get family's lambda promise is empty
+/// (`Promise<Unit>()`), the Update family's carries the request promise and
+/// parks in the manager's FIFO lot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebBrowserNetKind {
+    /// `GetWebBrowserSettingsQuery` (cpp:25-49) —
+    /// `account.getWebBrowserSettings(hash)`.
+    GetWebBrowserSettings,
+    /// `UpdateWebBrowserSettingsQuery` (cpp:51-83) —
+    /// `account.updateWebBrowserSettings(flags = 0, ...)`; the request
+    /// promise parks in the manager's `pending_update_promises` FIFO lot.
+    UpdateWebBrowserSettings,
+}
+
 /// The C++ `WebBrowserManager` actor; the Rust manager is a plain struct
 /// held by `Td` (the actor envelope collapses, the M.13 convention).
 #[derive(Default)]
 pub struct WebBrowserManager {
     /// `settings_` (WebBrowserManager.h:53).
     settings: WebBrowserSettings,
-    /// The `()`-typed promises parked at their `[blocked: net]` query
-    /// sends — the C++ promise rides the query actor until the answer,
-    /// the Rust collapse parks it here until the net query actors land
-    /// (the UserManager `net_blocked_promises` convention).
+    /// The `()`-typed promises parked at their `[blocked: net]`
+    /// toggle/delete-exceptions query sends — the C++ promise rides the
+    /// query actor until the answer, the Rust collapse parks it here until
+    /// those net query actors land (the UserManager `net_blocked_promises`
+    /// convention).
     net_blocked_promises: Vec<Promise<()>>,
+    /// The Update-family request promises — the C++ promise rides the
+    /// query's `PromiseCreator::lambda` into
+    /// [`WebBrowserManager::on_get_web_browser_settings`] (cpp:233-240);
+    /// FIFO-paired per family (§5 — the net completes same-family queries
+    /// in dispatch order, so the head pairs).
+    pending_update_promises: Vec<Promise<()>>,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in the
+    /// net-inert tests; set at the manager install, §0's shared-env shape).
+    pub(crate) net: Option<crate::td::WebBrowserNetHandle>,
+}
+
+/// Pop the oldest parked entry — the §5 FIFO-per-family convention (the
+/// C++ promise rides its own ResultHandler; the net completes the
+/// same-family queries in dispatch order, so the head pairs).
+fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
 }
 
 impl WebBrowserManager {
@@ -124,6 +154,30 @@ impl WebBrowserManager {
         WebBrowserManager {
             settings: WebBrowserSettings::default(),
             net_blocked_promises: Vec::new(),
+            pending_update_promises: Vec::new(),
+            net: None,
+        }
+    }
+
+    /// The Update-family promise pop for the
+    /// `Td::on_web_browser_net_answer` drain — the FIFO head the answer
+    /// pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_update_promise(&mut self) -> Option<Promise<()>> {
+        pop_head(&mut self.pending_update_promises)
+    }
+
+    /// The `td_->create_handler<…>()->send(...)` collapse — the wire
+    /// query construction lives at the manager send sites; `None` keeps
+    /// the net-inert posture (the tests drive the answer halves).
+    fn send_web_browser_net_query(
+        &self,
+        kind: WebBrowserNetKind,
+        function: tdmtproto::telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
         }
     }
 
@@ -154,7 +208,7 @@ impl WebBrowserManager {
         self.send_update_web_browser_settings(env);
 
         if self.settings.get_hash() == 0 {
-            self.reload_web_browser_settings(env);
+            self.reload_web_browser_settings();
         }
     }
 
@@ -185,16 +239,26 @@ impl WebBrowserManager {
             return;
         }
         self.send_update_web_browser_settings(env);
-        self.reload_web_browser_settings(env);
+        self.reload_web_browser_settings();
     }
 
     /// `reload_web_browser_settings` (cpp:187-194) — the
-    /// `GetWebBrowserSettingsQuery` is `[blocked: net]`; the answer handler
-    /// is [`WebBrowserManager::on_get_web_browser_settings`]. The C++ also
-    /// reloads from `UpdatesManager::after_get_difference` (cpp:2466), a
-    /// seam for the M.7 integration.
-    pub fn reload_web_browser_settings(&mut self, env: &mut impl WebBrowserManagerEnv) {
-        env.send_get_web_browser_settings_query(self.settings.get_hash());
+    /// `GetWebBrowserSettingsQuery::send` half rides the net plane; the
+    /// answer leg is [`WebBrowserManager::on_get_web_browser_settings`]
+    /// through `Td::on_web_browser_net_answer` (the C++ request lambda's
+    /// promise is empty, cpp:188-193). The C++ also reloads from
+    /// `UpdatesManager::after_get_difference` (cpp:2466), a seam for the
+    /// M.7 integration.
+    pub fn reload_web_browser_settings(&mut self) {
+        self.send_web_browser_net_query(
+            WebBrowserNetKind::GetWebBrowserSettings,
+            tdmtproto::telegram_api::Function::account_getWebBrowserSettings(
+                tdmtproto::telegram_api::account_getWebBrowserSettings {
+                    hash: self.settings.get_hash(),
+                },
+            ),
+            "account.getWebBrowserSettings",
+        );
     }
 
     /// `on_get_web_browser_settings` (cpp:196-214) — the shared result
@@ -247,17 +311,29 @@ impl WebBrowserManager {
     }
 
     /// `update_web_browser_settings` (cpp:232-242) — the
-    /// `UpdateWebBrowserSettingsQuery` is `[blocked: net]`; the promise
-    /// parks until the query answer arrives.
+    /// `UpdateWebBrowserSettingsQuery::send` half rides the net plane
+    /// (cpp:70-73); the request promise parks in the family FIFO lot and
+    /// the answer leg runs [`WebBrowserManager::on_get_web_browser_settings`]
+    /// through `Td::on_web_browser_net_answer` (the C++
+    /// `PromiseCreator::lambda` hop, cpp:233-240).
     pub fn update_web_browser_settings(
         &mut self,
-        env: &mut impl WebBrowserManagerEnv,
         open_external_browser: bool,
         display_close_button: bool,
         promise: Promise<()>,
     ) {
-        env.send_update_web_browser_settings_query(open_external_browser, display_close_button);
-        self.net_blocked_promises.push(promise);
+        self.pending_update_promises.push(promise);
+        self.send_web_browser_net_query(
+            WebBrowserNetKind::UpdateWebBrowserSettings,
+            tdmtproto::telegram_api::Function::account_updateWebBrowserSettings(
+                tdmtproto::telegram_api::account_updateWebBrowserSettings {
+                    flags: 0,
+                    open_external_browser,
+                    display_close_button,
+                },
+            ),
+            "account.updateWebBrowserSettings",
+        );
     }
 
     /// `add_web_browser_settings_exception` (cpp:244-248).
@@ -388,20 +464,6 @@ mod tests {
             self.updates.push(update);
         }
 
-        fn send_get_web_browser_settings_query(&mut self, hash: i64) {
-            self.query_log.push(format!("get {hash}"));
-        }
-
-        fn send_update_web_browser_settings_query(
-            &mut self,
-            open_external_browser: bool,
-            display_close_button: bool,
-        ) {
-            self.query_log.push(format!(
-                "update {open_external_browser} {display_close_button}"
-            ));
-        }
-
         fn send_toggle_web_browser_settings_exception_query(
             &mut self,
             is_deletion: bool,
@@ -458,6 +520,8 @@ mod tests {
         let manager = WebBrowserManager {
             settings: settings.clone(),
             net_blocked_promises: Vec::new(),
+            pending_update_promises: Vec::new(),
+            net: None,
         };
         (manager, settings)
     }
@@ -495,7 +559,9 @@ mod tests {
         let mut manager = WebBrowserManager::new();
         manager.load_web_browser_settings(&mut env);
         assert_eq!(env.updates.len(), 1);
-        assert_eq!(env.query_log, vec!["get 0".to_string()]);
+        // the hash-0 reload dispatches through the net handle — `None`
+        // here keeps the net-inert posture; the send leg rides the
+        // td.rs dispatcher round-trip
     }
 
     #[test]
@@ -507,7 +573,6 @@ mod tests {
         manager.load_web_browser_settings(&mut env);
         assert_eq!(manager.settings, WebBrowserSettings::default());
         assert_eq!(env.updates.len(), 1);
-        assert_eq!(env.query_log, vec!["get 0".to_string()]);
     }
 
     #[test]
@@ -600,23 +665,47 @@ mod tests {
     }
 
     #[test]
-    fn setters_park_the_promise_and_send_the_query() {
+    fn the_exception_setters_park_and_the_update_parks_fifo() {
         let mut env = TestEnv::new(true, false);
         let mut manager = WebBrowserManager::new();
+        // the Update family parks in its own FIFO lot and dispatches
+        // through the net handle (`None` here — the send leg rides the
+        // td.rs dispatcher round-trip)
         let (promise, _) = recording_promise();
-        manager.update_web_browser_settings(&mut env, true, false, promise);
+        manager.update_web_browser_settings(true, false, promise);
         let (promise, _) = recording_promise();
         manager.add_web_browser_settings_exception(&mut env, true, "https://a.com", promise);
         let (promise, _) = recording_promise();
         manager.remove_web_browser_settings_exception(&mut env, "https://a.com", promise);
         let (promise, _) = recording_promise();
         manager.remove_all_web_browser_settings_exceptions(&mut env, promise);
-        assert_eq!(manager.net_blocked_promises.len(), 4);
-        assert_eq!(env.query_log.len(), 4);
-        assert!(env.query_log[0].starts_with("update"));
-        assert!(env.query_log[1].starts_with("toggle false"));
-        assert!(env.query_log[2].starts_with("toggle true"));
-        assert_eq!(env.query_log[3], "delete all");
+        assert_eq!(manager.pending_update_promises.len(), 1);
+        assert_eq!(manager.net_blocked_promises.len(), 3);
+        assert_eq!(env.query_log.len(), 3);
+        assert!(env.query_log[0].starts_with("toggle false"));
+        assert!(env.query_log[1].starts_with("toggle true"));
+        assert_eq!(env.query_log[2], "delete all");
+    }
+
+    #[test]
+    fn update_promises_pair_fifo() {
+        let mut manager = WebBrowserManager::new();
+        let (promise_a, recorded_a) = recording_promise();
+        let (promise_b, recorded_b) = recording_promise();
+        manager.update_web_browser_settings(true, false, promise_a);
+        manager.update_web_browser_settings(false, true, promise_b);
+        manager
+            .pop_update_promise()
+            .expect("the first parked promise")
+            .set_value(());
+        assert!(recorded_a.0.lock().unwrap().is_some());
+        assert!(recorded_b.0.lock().unwrap().is_none());
+        manager
+            .pop_update_promise()
+            .expect("the second parked promise")
+            .set_value(());
+        assert!(recorded_b.0.lock().unwrap().is_some());
+        assert!(manager.pop_update_promise().is_none());
     }
 
     #[test]
