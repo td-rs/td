@@ -2846,8 +2846,13 @@ pub(crate) enum UpdatesNetKind {
     GetDifference,
     GetUpdatesState,
     ConfirmPtsQts,
-    /// the pts-short-gap repair (`GetPtsUpdateQuery`).
-    GetPtsUpdate,
+    /// the pts-short-gap repair (`GetPtsUpdateQuery`) — the C++ promise
+    /// lambda captures `pts` (the repair target, `get_pts() + 1`) and
+    /// rides it back into `on_get_pts_update` (cpp:360-365); the wire
+    /// query itself sends `pts - 1` (cpp:367).
+    GetPtsUpdate {
+        pts: i32,
+    },
     /// `PingServerQuery` — the C++ class sends `updates.getState` and
     /// feeds `on_server_pong` (UpdatesManager.cpp:152-166, 1927-1937).
     Ping,
@@ -6203,7 +6208,10 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
     }
 
     /// The `GetPtsUpdateQuery::send` (UpdatesManager.cpp:252-258) — the
-    /// pts-short-gap repair query.
+    /// pts-short-gap repair query. `pts` is the promise lambda's captured
+    /// value (`get_pts() + 1`, cpp:360-365); the wire query sends
+    /// `pts - 1` (cpp:367) and the answer re-enters
+    /// [`UpdatesManager::on_get_pts_update`] with the capture.
     fn send_get_pts_update(&mut self, pts: i32) {
         // the same flags.1|flags.2 pair as the ConfirmPtsQts send.
         const PTS_LIMIT_MASK: i32 = 1 << 1;
@@ -6211,11 +6219,11 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
         let flags = PTS_LIMIT_MASK | QTS_LIMIT_MASK;
         match &self.net {
             Some(net) => net.dispatch(
-                UpdatesNetKind::GetPtsUpdate,
+                UpdatesNetKind::GetPtsUpdate { pts },
                 telegram_api::Function::updates_getDifference(
                     telegram_api::updates_getDifference {
                         flags,
-                        pts,
+                        pts: pts - 1,
                         pts_limit: 1,
                         pts_total_limit: 0,
                         date: i32::MAX,
@@ -9395,12 +9403,28 @@ impl Td {
         // parse stays in this frame (the promise continuation's), the
         // intake hops into the manager's context.
         match kind {
-            UpdatesNetKind::GetDifference | UpdatesNetKind::GetPtsUpdate => {
+            UpdatesNetKind::GetDifference => {
                 if query.is_error() {
                     let status = query.error().clone();
                     self.um_send(UmMessage::OnFailedGetDifference { error: status });
                 } else if let Ok(difference) = telegram_api::updates_Difference::parse(query.ok()) {
                     self.um_send(UmMessage::OnGetDifference { difference });
+                } else {
+                    tdutils::log_error!("Failed to parse the getDifference answer");
+                }
+            }
+            UpdatesNetKind::GetPtsUpdate { pts } => {
+                // the C++ promise lambda (cpp:360-365): Ok re-enters
+                // on_get_pts_update with the captured pts; Err is dropped
+                // silently — the failed short-gap repair falls back to the
+                // gap-timeout ladder (no on_failed_get_difference hop).
+                if query.is_error() {
+                    tdutils::log_debug!(
+                        "GetPtsUpdate for pts {pts} failed: {} — the gap ladder retries",
+                        query.error().message()
+                    );
+                } else if let Ok(difference) = telegram_api::updates_Difference::parse(query.ok()) {
+                    self.um_send(UmMessage::OnGetPtsUpdate { pts, difference });
                 } else {
                     tdutils::log_error!("Failed to parse the getDifference answer");
                 }
@@ -9422,6 +9446,7 @@ impl Td {
                     // table logs at debug.
                     tdutils::log_debug!("Failed to confirm PTS/QTS: {}", query.error().message());
                 }
+                // the C++ on_result discards the answer — no Ok intake.
             }
             UpdatesNetKind::Ping => {
                 let state = if query.is_error() {
@@ -29197,9 +29222,15 @@ pub(crate) enum UmMessage {
         message_full_id: crate::messages_manager::MessageFullId,
         promise: Promise<()>,
     },
-    /// `on_get_difference` / the shared `GetPtsUpdate` parse arm
-    /// (cpp:522, :364).
+    /// `on_get_difference` (cpp:522).
     OnGetDifference {
+        difference: telegram_api::updates_Difference,
+    },
+    /// `on_get_pts_update(pts, difference)` (cpp:364, :2189) — the
+    /// pts-short-gap repair intake; the pts is the promise lambda's
+    /// capture (`get_pts() + 1` at the send leg).
+    OnGetPtsUpdate {
+        pts: i32,
         difference: telegram_api::updates_Difference,
     },
     /// `on_failed_get_difference` (cpp:524).
@@ -29322,6 +29353,9 @@ impl UmMessage {
             }
             UmMessage::OnGetDifference { difference } => {
                 td.with_updates_env(|um, env| um.on_get_difference(env, difference));
+            }
+            UmMessage::OnGetPtsUpdate { pts, difference } => {
+                td.with_updates_env(|um, env| um.on_get_pts_update(env, pts, difference));
             }
             UmMessage::OnFailedGetDifference { error } => {
                 td.with_updates_env(|um, env| um.on_failed_get_difference(env, error));
@@ -50004,6 +50038,337 @@ mod tests {
         net_fail(queries.remove(0), 404, "TIMEOUT");
         td.dispatch_completed_updates_net();
         assert!(td.updates_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn get_pts_update_repair_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_pts_update_repair_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_pts_update_repair_rides_the_dispatcher_impl() {
+        use crate::updates_manager::UpdatesManagerEnv;
+
+        let (mut td, rec) = netted_td("netfix-gpu-repair");
+
+        // Seed the pts baseline (pts = 2) through the init chain; the
+        // state intake clears the running flag and fires the
+        // after-difference marks load — drop it (no getDifference is
+        // dispatched here; the repair query below is the test's own).
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(sent.into_iter().next().unwrap(), state_answer(2, 0, 0));
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert!(sent.is_empty(), "clean slate");
+
+        // Queue a pending pts-4 update while the engine sits at pts 2 —
+        // the pts-short-gap shape (the missing pts-3 step).
+        {
+            let mut env = mk_env!(td);
+            let receive_time = env.now();
+            td.updates_manager.add_pending_pts_update(
+                &mut env,
+                update_new_message(5, 4, 1).into(),
+                4,
+                1,
+                receive_time,
+                Promise::default(),
+                "test",
+            );
+        }
+
+        // The send leg: the captured pts (3) rides the env; the wire
+        // derives `pts - 1` (cpp:367).
+        {
+            let mut env = mk_env!(td);
+            env.send_get_pts_update(3);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert_eq!(sent.len(), 1, "one getDifference dispatch");
+        let function = match telegram_api::Function::parse(sent[0].query()) {
+            Ok(telegram_api::Function::updates_getDifference(d)) => d,
+            _ => panic!("a getDifference payload"),
+        };
+        assert_eq!(function.pts, 2, "the wire carries the capture minus one");
+        assert_eq!(function.flags, 6, "PTS_LIMIT_MASK | QTS_LIMIT_MASK");
+        assert_eq!(function.pts_limit, 1);
+        assert_eq!(function.pts_total_limit, 0);
+        assert_eq!(function.date, i32::MAX);
+        assert_eq!(function.qts, 0);
+        assert_eq!(function.qts_limit, 0);
+
+        // The answer routes through UmMessage::OnGetPtsUpdate with the
+        // captured pts; the repair applies pts 3 and unblocks the queued
+        // pts-4 update (cpp:2189).
+        let mut answer = Vec::new();
+        telegram_api::updates_Difference::updates_differenceSlice(
+            telegram_api::updates_differenceSlice {
+                new_messages: vec![],
+                new_encrypted_messages: vec![],
+                other_updates: vec![update_new_message(9, 3, 1)],
+                chats: vec![],
+                users: vec![],
+                intermediate_state: Some(telegram_api::updates_State {
+                    pts: 0,
+                    qts: 0,
+                    date: 0,
+                    seq: 0,
+                    unread_count: 0,
+                }),
+            },
+        )
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_updates_net();
+
+        // The repair moved the engine: the next getDifference resumes
+        // from pts 4.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert_eq!(sent.len(), 1, "re-armed after the repair");
+        let function = match telegram_api::Function::parse(sent[0].query()) {
+            Ok(telegram_api::Function::updates_getDifference(d)) => d,
+            _ => panic!("a getDifference payload"),
+        };
+        assert_eq!(function.pts, 4, "the repair unblocked the queued update");
+    }
+
+    #[test]
+    fn get_pts_update_failure_stays_silent() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(get_pts_update_failure_stays_silent_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn get_pts_update_failure_stays_silent_impl() {
+        let (mut td, rec) = netted_td("netfix-gpu-fail");
+
+        // Seed the pts baseline (pts = 2) as in the repair test.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(sent.into_iter().next().unwrap(), state_answer(2, 0, 0));
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert!(sent.is_empty(), "clean slate");
+
+        // The repair query fails — the C++ promise lambda has no else
+        // (cpp:360-365): no on_failed_get_difference hop, no retry
+        // schedule; the gap ladder (the pts-gap timeout) retries.
+        {
+            let mut env = mk_env!(td);
+            env.send_get_pts_update(3);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 500, "boom");
+        td.dispatch_completed_updates_net();
+        assert!(td.updates_net_completed.lock().is_empty(), "drained");
+
+        // No state corruption, no immediate refire: the engine resumes
+        // from the untouched pts 2.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert_eq!(sent.len(), 1, "one manual re-send, no error refire");
+        let function = match telegram_api::Function::parse(sent[0].query()) {
+            Ok(telegram_api::Function::updates_getDifference(d)) => d,
+            _ => panic!("a getDifference payload"),
+        };
+        assert_eq!(function.pts, 2, "the failed repair left the pts alone");
+    }
+
+    #[test]
+    fn stale_pong_refires_get_difference() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(stale_pong_refires_get_difference_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn stale_pong_refires_get_difference_impl() {
+        let (mut td, rec) = netted_td("netfix-pong");
+
+        // Seed the pts baseline (pts = 1) as in the repair test.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(sent.into_iter().next().unwrap(), state_answer(1, 0, 0));
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert!(sent.is_empty(), "clean slate");
+
+        // The stale pong (pts 5 > 1) refires getDifference (cpp:1939).
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.ping_server(&mut env);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "one getState ping");
+        assert_eq!(sent[0].tl_constructor(), telegram_api::updates_getState::ID);
+        net_complete(sent.into_iter().next().unwrap(), state_answer(5, 100, 0));
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent.len(),
+            1,
+            "the stale pong refired getDifference through the manager hop"
+        );
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getDifference::ID
+        );
+
+        // Complete the refired difference (the running flag clears).
+        let mut empty_bytes = Vec::new();
+        telegram_api::updates_differenceEmpty { date: 100, seq: 7 }.store_boxed(&mut empty_bytes);
+        net_complete(sent.into_iter().next().unwrap(), empty_bytes);
+        td.dispatch_completed_updates_net();
+
+        // The fresh pong (equal pts, equal seq) does not refire.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.ping_server(&mut env);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert_eq!(sent.len(), 1, "one getState ping");
+        net_complete(sent.into_iter().next().unwrap(), state_answer(1, 100, 0));
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert!(
+            sent.is_empty(),
+            "the fresh pong left the engine alone (got {:?})",
+            sent.iter().map(|q| q.tl_constructor()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn confirm_pts_qts_ok_answer_is_discarded() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(confirm_pts_qts_ok_answer_is_discarded_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn confirm_pts_qts_ok_answer_is_discarded_impl() {
+        let (mut td, rec) = netted_td("netfix-confirm");
+
+        // Seed the pts baseline (pts = 2) as in the repair test.
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(sent.into_iter().next().unwrap(), state_answer(2, 0, 0));
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert!(sent.is_empty(), "clean slate");
+
+        // Set a known date with one manual difference round (an empty
+        // difference sticks the date 100).
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "one manual getDifference");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getDifference::ID
+        );
+        let mut empty_bytes = Vec::new();
+        telegram_api::updates_differenceEmpty { date: 100, seq: 7 }.store_boxed(&mut empty_bytes);
+        net_complete(sent.into_iter().next().unwrap(), empty_bytes);
+        td.dispatch_completed_updates_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert!(sent.is_empty(), "clean slate after the date-setting round");
+
+        // The confirmation answer is discarded (cpp:232-236 — on_result
+        // fetches and drops): a differenceEmpty carrying date 555 must
+        // NOT reach on_get_difference (the date would stick).
+        {
+            let mut env = mk_env!(td);
+            env.send_confirm_pts_qts(2, 1);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::updates_getDifference::ID
+        );
+        let mut empty_bytes = Vec::new();
+        telegram_api::updates_differenceEmpty { date: 555, seq: 0 }.store_boxed(&mut empty_bytes);
+        net_complete(sent.into_iter().next().unwrap(), empty_bytes);
+        td.dispatch_completed_updates_net();
+        assert!(td.updates_net_completed.lock().is_empty(), "drained");
+
+        {
+            let mut env = mk_env!(td);
+            td.updates_manager.get_difference(&mut env, "test");
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let sent = without_unread_marks_queries(sent);
+        assert_eq!(sent.len(), 1);
+        let function = match telegram_api::Function::parse(sent[0].query()) {
+            Ok(telegram_api::Function::updates_getDifference(d)) => d,
+            _ => panic!("a getDifference payload"),
+        };
+        assert_eq!(function.pts, 2, "the discarded answer moved no state");
+        assert_eq!(function.date, 100, "the date 555 answer never landed");
+    }
+
+    /// The `new_message_update` shape of the updates_manager inline
+    /// tests, local to the netted harness.
+    fn update_new_message(id: i32, pts: i32, pts_count: i32) -> telegram_api::Update {
+        telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+            message: Some(telegram_api::Message::message(telegram_api::message {
+                id,
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 100,
+                })),
+                ..telegram_api::message::default()
+            })),
+            pts,
+            pts_count,
+        })
     }
 
     // ---- the ton-wallet net slice: the query families ride the
