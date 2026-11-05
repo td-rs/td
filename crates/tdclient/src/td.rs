@@ -108,6 +108,7 @@ use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, U
 use crate::user_manager::SecretChatId;
 use crate::user_manager::{AccessRights, UserEnv, UserId, UserManager};
 use crate::web_browser_manager::WebBrowserManager;
+use crate::web_browser_manager::WebBrowserNetKind;
 
 use crate::call_manager::CallManager;
 use crate::dh_cache::DhConfig;
@@ -3472,6 +3473,14 @@ pub(crate) type MessageQueryNetHandle =
 /// the shared [`BotEnv`] view resolves the peers at the send leg.
 pub(crate) type WebAppNetHandle = NetKindHandle<crate::web_app_manager::WebAppNetKind>;
 
+/// The cloned Web-Browser dispatch surface — the per-kind handle over the
+/// WebBrowserManager.cpp ResultHandler kinds (the net-drain 34 plane: the
+/// Get/Update settings families); the answers drain through
+/// [`Td::dispatch_completed_web_browser_net`]. Manager-held (the
+/// [`crate::web_browser_manager::WebBrowserManager::net`] field): the
+/// send legs run inside the manager, the env carries nothing wire-facing.
+pub(crate) type WebBrowserNetHandle = NetKindHandle<crate::web_browser_manager::WebBrowserNetKind>;
+
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
 /// completes into `on_dialog_gift_transferred` with the empty to-dialog
@@ -5842,6 +5851,11 @@ pub struct Td {
     /// of the net-drain 30 families — the
     /// [`Td::on_web_app_net_answer`] drain).
     web_app_net_completed: Arc<Mutex<Vec<(crate::web_app_manager::WebAppNetKind, NetQuery)>>>,
+    /// The callback-parked Web-Browser answers (the C++ ResultHandler
+    /// halves of the net-drain 34 families — the
+    /// [`Td::on_web_browser_net_answer`] drain).
+    web_browser_net_completed:
+        Arc<Mutex<Vec<(crate::web_browser_manager::WebBrowserNetKind, NetQuery)>>>,
     /// The parked query state of the net-drain 28/29 families (the
     /// handler vectors, search offsets/filters and promises the `Copy`
     /// kinds can't carry) — popped by
@@ -6339,6 +6353,7 @@ impl Td {
             secure_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_query_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_app_net_completed: Arc::new(Mutex::new(Vec::new())),
+            web_browser_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
@@ -6823,6 +6838,7 @@ impl Td {
         self.story_manager.net = self.story_net();
         self.star_gift_manager.net = self.star_gift_net();
         self.business_manager.net = self.business_net();
+        self.web_browser_manager.net = self.web_browser_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -8638,6 +8654,7 @@ impl Td {
         self.dispatch_completed_business_net();
         self.dispatch_completed_message_query_net();
         self.dispatch_completed_web_app_net();
+        self.dispatch_completed_web_browser_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -8915,6 +8932,17 @@ impl Td {
         Some(WebAppNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.web_app_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned Web-Browser dispatch surface (the net-drain 34
+    /// families' send legs — the manager-held handle the settings
+    /// reload/update sends ride).
+    pub(crate) fn web_browser_net(&self) -> Option<WebBrowserNetHandle> {
+        Some(WebBrowserNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.web_browser_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -16975,6 +17003,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked Web-Browser answers — the C++
+    /// ResultHandler halves of the net-drain 34 families
+    /// (WebBrowserManager.cpp:25-83).
+    fn dispatch_completed_web_browser_net(&mut self) {
+        let completed = std::mem::take(&mut *self.web_browser_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_web_browser_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -18258,6 +18297,43 @@ impl Td {
                 });
             }
         }
+    }
+
+    /// Route one Web-Browser net answer by kind — the ResultHandler
+    /// halves of the net-drain 34 families (WebBrowserManager.cpp:25-83):
+    /// both wire answers are the `account.WebBrowserSettings` union and
+    /// feed the shared `on_get_web_browser_settings` intake (the C++
+    /// query promises route there through the `PromiseCreator::lambda`
+    /// hops, cpp:188-193/233-240). The Get family's lambda promise is
+    /// empty (`Promise<Unit>()`, the default no-op); the Update family's
+    /// pops the FIFO head the send parked.
+    fn on_web_browser_net_answer(
+        &mut self,
+        kind: crate::web_browser_manager::WebBrowserNetKind,
+        query: NetQuery,
+    ) {
+        let result = if query.is_error() {
+            Err(query.error().clone())
+        } else {
+            crate::web_browser_manager::decode_web_browser_settings_answer(query.ok())
+        };
+        // the Update family's promise pop borrows the manager, disjoint
+        // from the env fields — the env builds once for both arms
+        let promise = match kind {
+            WebBrowserNetKind::GetWebBrowserSettings => Promise::default(),
+            WebBrowserNetKind::UpdateWebBrowserSettings => self
+                .web_browser_manager
+                .pop_update_promise()
+                .unwrap_or_default(),
+        };
+        let mut env = WebBrowserEnv {
+            global: &mut self.global,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.web_browser_updates,
+        };
+        self.web_browser_manager
+            .on_get_web_browser_settings(&mut env, result, promise);
     }
 
     /// Build the [`MessageQueryEnv`] view over the split Td borrows and
@@ -47923,6 +47999,7 @@ mod tests {
         td.story_manager.net = td.story_net();
         td.star_gift_manager.net = td.star_gift_net();
         td.business_manager.net = td.business_net();
+        td.web_browser_manager.net = td.web_browser_net();
         {
             let net = td.link_net();
             if let Some(link_manager) = td.link_manager.as_mut() {
@@ -69483,6 +69560,173 @@ kQIDAQAB\n\
         // the drain ran clean — nothing parked, no strays
         assert!(td.web_app_net_completed.lock().is_empty(), "drained");
         assert!(!td.web_app_manager.has_pending_queries());
+    }
+
+    #[test]
+    fn web_browser_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(web_browser_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn web_browser_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// The settings snapshot through the public `get_current_state`
+        /// surface (the manager's `settings_` is private).
+        fn current_settings(td: &mut Td) -> td_api::WebBrowserSettings {
+            let mut updates = Vec::new();
+            let env = crate::td::WebBrowserEnv {
+                global: &mut td.global,
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.web_browser_updates,
+            };
+            td.web_browser_manager.get_current_state(&env, &mut updates);
+            assert_eq!(updates.len(), 1, "one updateWebBrowserSettings");
+            match updates.pop().unwrap() {
+                td_api::Update::updateWebBrowserSettings(update) => {
+                    update.settings.expect("the settings object")
+                }
+                other => panic!("expected updateWebBrowserSettings, got {other:?}"),
+            }
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain34-web-browser");
+
+        // 1. changeWebBrowserSettings — the Update family rides the wire;
+        //    the settings answer applies, saves and answers the request
+        td.request(
+            1,
+            Function::changeWebBrowserSettings(td_api::changeWebBrowserSettings {
+                open_external_browser: true,
+                display_close_button: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateWebBrowserSettings::ID,
+        );
+        let body = telegram_api::account_updateWebBrowserSettings::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.open_external_browser && !body.display_close_button);
+        net_complete(
+            sent,
+            wire!(telegram_api::account_webBrowserSettings {
+                flags: 0,
+                open_external_browser: true,
+                display_close_button: false,
+                external_exceptions: Vec::new(),
+                inapp_exceptions: Vec::new(),
+                hash: 7,
+            }),
+        );
+        td.dispatch_completed_web_browser_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+        let settings = current_settings(&mut td);
+        assert!(settings.open_external_browser);
+        assert!(!settings.display_close_button);
+        assert!(
+            !td.global
+                .binlog_pmc()
+                .get_raw(b"web_browser_settings")
+                .is_empty(),
+            "the applied settings are saved"
+        );
+
+        // 2. the notModified band — the promise answers ok, nothing saves
+        let saved = td.global.binlog_pmc().get_raw(b"web_browser_settings");
+        td.request(
+            2,
+            Function::changeWebBrowserSettings(td_api::changeWebBrowserSettings {
+                open_external_browser: false,
+                display_close_button: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateWebBrowserSettings::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::account_webBrowserSettingsNotModified),
+        );
+        td.dispatch_completed_web_browser_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+        assert_eq!(
+            td.global.binlog_pmc().get_raw(b"web_browser_settings"),
+            saved,
+            "notModified answers nothing to save"
+        );
+
+        // 3. the wire-error band — the promise error passes through
+        td.request(
+            3,
+            Function::changeWebBrowserSettings(td_api::changeWebBrowserSettings {
+                open_external_browser: true,
+                display_close_button: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateWebBrowserSettings::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_web_browser_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 4. the Get family — the auth-success reload rides the wire with
+        //    the current hash; the answer applies, saves and outboxes the
+        //    update
+        td.on_web_browser_authorization_success();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getWebBrowserSettings::ID,
+        );
+        let body = telegram_api::account_getWebBrowserSettings::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.hash, 7);
+        net_complete(
+            sent,
+            wire!(telegram_api::account_webBrowserSettings {
+                flags: 0,
+                open_external_browser: false,
+                display_close_button: true,
+                external_exceptions: Vec::new(),
+                inapp_exceptions: Vec::new(),
+                hash: 9,
+            }),
+        );
+        td.dispatch_completed_web_browser_net();
+        let settings = current_settings(&mut td);
+        assert!(!settings.open_external_browser);
+        assert!(settings.display_close_button);
+        assert!(
+            !td.web_browser_updates.is_empty(),
+            "the changed settings outbox the td_api update"
+        );
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(td.web_browser_net_completed.lock().is_empty(), "drained");
+        assert!(td.web_browser_manager.pop_update_promise().is_none());
     }
 
     #[test]
