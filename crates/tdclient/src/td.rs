@@ -3178,8 +3178,7 @@ pub(crate) enum AccountNetKind {
 type AccountNetHandle = NetKindHandle<AccountNetKind>;
 
 /// The StarManager in-flight query kinds — the C++ ResultHandler classes
-/// of StarManager.cpp:49-1400 (the options/subscriptions/revenue
-/// families; the transactions pair lands with its own slice).
+/// of StarManager.cpp:49-1400.
 #[derive(Clone, Copy)]
 pub(crate) enum StarNetKind {
     /// `GetStarsTopupOptionsQuery` (cpp:49).
@@ -3188,6 +3187,18 @@ pub(crate) enum StarNetKind {
     GiftOptions,
     /// `GetStarsGiveawayOptionsQuery` (cpp:122).
     GiveawayOptions,
+    /// `GetStarsTransactionsQuery` (cpp:161) — the list form
+    /// (payments.getStarsTransactions) and the by-id reload form
+    /// (payments.getStarsTransactionsByID, cpp:200) share the handler
+    /// and the answer ladder; the kind keys the error ladder's
+    /// `on_get_dialog_error`, the own-dialog balance update and the
+    /// file-source id on the request dialog.
+    Transactions {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `GetTonTransactionsQuery` (cpp:817) — the TON leg of
+    /// payments.getStarsTransactions (the `ton` flag form).
+    TonTransactions,
     /// `GetStarsSubscriptionsQuery` (cpp:1011) — the users/chats intakes
     /// and the owned-balance update ride the answer.
     Subscriptions,
@@ -3750,6 +3761,1369 @@ fn star_subscription_object(
         pricing: subscription.pricing.get_star_subscription_pricing_object(),
         r#type: Some(type_),
     }
+}
+
+/// The `TransactionDirection` bits (StarManager.cpp:181-195) — incoming
+/// sets inbound, outgoing sets outbound, none sets neither.
+fn star_transaction_direction_bits(
+    direction: Option<&td_api::TransactionDirection>,
+) -> (bool, bool) {
+    match direction {
+        Some(td_api::TransactionDirection::transactionDirectionIncoming(_)) => (true, false),
+        Some(td_api::TransactionDirection::transactionDirectionOutgoing(_)) => (false, true),
+        None => (false, false),
+    }
+}
+
+/// The `revenueWithdrawalState` closure half
+/// (StarManager.cpp:345-363/:885-903) — the succeeded/pending/failed
+/// state over the transaction's withdrawal fields, consuming them.
+fn star_transaction_withdrawal_state(
+    transaction: &mut telegram_api::StarsTransaction,
+) -> Option<td_api::RevenueWithdrawalState> {
+    if transaction.transaction_date > 0 {
+        let state = td_api::RevenueWithdrawalState::revenueWithdrawalStateSucceeded(
+            td_api::revenueWithdrawalStateSucceeded {
+                date: transaction.transaction_date,
+                url: std::mem::take(&mut transaction.transaction_url),
+            },
+        );
+        transaction.transaction_date = 0;
+        return Some(state);
+    }
+    if transaction.pending {
+        transaction.pending = false;
+        return Some(
+            td_api::RevenueWithdrawalState::revenueWithdrawalStatePending(
+                td_api::revenueWithdrawalStatePending {},
+            ),
+        );
+    }
+    if transaction.failed {
+        transaction.failed = false;
+        return Some(
+            td_api::RevenueWithdrawalState::revenueWithdrawalStateFailed(
+                td_api::revenueWithdrawalStateFailed {},
+            ),
+        );
+    }
+    None
+}
+
+/// The `get_message_id_object` closure half
+/// (StarManager.cpp:304-312) — the server-message id with the invalid
+/// band (an id outside the server range logs and zeroes).
+fn star_transaction_message_id(transaction: &mut telegram_api::StarsTransaction) -> i64 {
+    let raw = transaction.msg_id;
+    transaction.msg_id = 0;
+    let message_id = crate::messages_manager::MessageId::from_server_message_id(
+        crate::messages_manager::ServerMessageId::new(raw),
+    );
+    if raw != 0 && !message_id.is_valid() {
+        tdutils::log_error!("Receive an invalid message id {raw} in a Star transaction");
+        return 0;
+    }
+    message_id.get()
+}
+
+/// The `get_paid_media_object` closure half
+/// (StarManager.cpp:292-303) — the extended media converts, the file
+/// ids collect, the td_api objects build; the wire list is consumed.
+#[allow(clippy::vec_box)] // the generated telegram_api vector fields box their elements
+fn star_transaction_paid_media(
+    td: &mut Td,
+    extended_media: &mut Vec<Box<telegram_api::MessageMedia>>,
+    owner_dialog_id: crate::dialog_id::DialogId,
+    file_ids: &mut Vec<crate::files::FileId>,
+) -> Vec<td_api::PaidMedia> {
+    use crate::message_content::MessageContentContext as _;
+    let media = std::mem::take(extended_media);
+    let mut objects = Vec::with_capacity(media.len());
+    for m in media {
+        let extended = crate::message_content::MessageExtendedMedia::init_from_media(
+            td,
+            Some(*m),
+            owner_dialog_id,
+        );
+        // `MessageExtendedMedia::append_file_ids`
+        // (MessageExtendedMedia.cpp:265-277)
+        if extended.video_file_id.is_valid() {
+            file_ids.push(extended.video_file_id);
+        }
+        crate::photo::photo_append_file_ids(&extended.photo, file_ids);
+        objects.push(td.get_paid_media_object(&extended));
+    }
+    objects
+}
+
+/// The `StarGift(td, gift, true)` intake the transaction ladders share
+/// (StarManager.cpp:480-486/:677-683 and the TON twin cpp:931-937) —
+/// the wire gift converts and the accepted ones enter the gift
+/// manager; `require_unique` is the TON ladder's extra unique check
+/// before the intake (cpp:934).
+fn intake_star_gift(
+    td: &mut Td,
+    wire_gift: telegram_api::StarGift,
+    require_unique: bool,
+) -> Option<crate::star_gift_manager::StarGift> {
+    td.with_star_gift_manager(|env, manager| {
+        let gift = crate::star_gift_manager::StarGift::from_telegram(env, wire_gift, true);
+        if gift.is_valid() && (!require_unique || gift.is_unique()) {
+            manager.on_get_star_gift(env, &gift, true);
+            Some(gift)
+        } else {
+            None
+        }
+    })
+}
+
+/// `StarGift::get_gift_object(td_)` over the split env (the default
+/// background).
+fn star_gift_object(td: &mut Td, gift: &crate::star_gift_manager::StarGift) -> td_api::Gift {
+    td.with_star_gift_manager(|env, _| gift.get_gift_object(env, None))
+}
+
+/// `StarGift::get_upgraded_gift_object(td_)` over the split env.
+fn upgraded_star_gift_object(
+    td: &mut Td,
+    gift: &crate::star_gift_manager::StarGift,
+) -> td_api::UpgradedGift {
+    td.with_star_gift_manager(|env, _| gift.get_upgraded_gift_object(env))
+}
+
+/// `StarManager::get_star_transaction_file_source_id`
+/// (StarManager.cpp:1784-1797) — the interned
+/// `FileSource::StarTransaction` (the C++ per-manager dedup maps
+/// collapse onto the interner's by-value dedup).
+fn star_transaction_file_source_id(
+    td: &mut Td,
+    dialog_id: crate::dialog_id::DialogId,
+    transaction_id: &str,
+    is_refund: bool,
+) -> crate::files::FileSourceId {
+    if !dialog_id.is_valid() || transaction_id.is_empty() {
+        return crate::files::FileSourceId::default();
+    }
+    td.file_reference_manager
+        .intern(crate::files::FileSource::StarTransaction {
+            dialog_id,
+            transaction_id: transaction_id.to_owned(),
+            is_refund,
+        })
+}
+
+/// The `GetStarsTransactionsQuery::on_result` per-transaction ladder
+/// (StarManager.cpp:239-801) — one wire transaction into its td_api
+/// object over the request dialog's partner bands; `None` is the C++
+/// `continue` (the invalid-amount skip) while the in-ladder null types
+/// fall to the unsupported fallback. The type ladder is a closure so
+/// the inner `return`s keep the C++ lambda semantics (a type, not a
+/// finished transaction); the tail — the fallback, the leftover-field
+/// audit and the file-source registration — runs for every type.
+#[allow(clippy::too_many_lines)]
+fn convert_star_transaction(
+    td: &mut Td,
+    request_dialog_id: crate::dialog_id::DialogId,
+    for_bot: bool,
+    for_user: bool,
+    for_channel: bool,
+    for_supergroup: bool,
+    mut transaction: telegram_api::StarsTransaction,
+) -> Option<td_api::StarTransaction> {
+    use crate::dialog_id::DialogType;
+    use crate::message_content::MessageContentContext as _;
+
+    // cpp:240-242 — the amount band
+    if !matches!(
+        transaction.amount,
+        Some(telegram_api::StarsAmount::starsAmount(_))
+    ) {
+        tdutils::log_error!("Receive a Star transaction with an invalid amount");
+        return None;
+    }
+
+    let mut file_ids: Vec<crate::files::FileId> = Vec::new();
+    let mut product_info: Option<td_api::ProductInfo> = None;
+    let mut bot_payload = String::new();
+    let mut affiliate: Option<td_api::AffiliateInfo> = None;
+    let mut commission_per_mille: i32 = 0;
+
+    // cpp:249-255 — the product info over the web-document photo (the
+    // photo leg rides the parked `get_web_document_photo` seam)
+    if !transaction.title.is_empty()
+        || !transaction.description.is_empty()
+        || transaction.photo.is_some()
+    {
+        let photo = td.get_web_document_photo(transaction.photo.take(), DialogId::default());
+        crate::photo::photo_append_file_ids(&photo, &mut file_ids);
+        product_info = Some(crate::payments::get_product_info_object(
+            &mut PaymentsTdEnv { td },
+            &transaction.title,
+            &transaction.description,
+            &photo,
+        ));
+        transaction.title.clear();
+        transaction.description.clear();
+    }
+
+    // cpp:256-263 — the bot payload bands
+    if !transaction.bot_payload.is_empty() {
+        if td.auth_manager.is_bot() {
+            bot_payload = String::from_utf8_lossy(&transaction.bot_payload).into_owned();
+            transaction.bot_payload.clear();
+        } else if !for_bot {
+            tdutils::log_error!("Receive Star transaction with bot payload");
+        }
+    }
+
+    // cpp:264-291 — the affiliate (starref) bands
+    if transaction.starref_peer.is_some() {
+        let referrer_dialog_id = transaction
+            .starref_peer
+            .as_ref()
+            .map_or_else(DialogId::default, DialogId::from_peer);
+        if transaction.starref_commission_permille > 0
+            && transaction.starref_commission_permille < 1000
+            && referrer_dialog_id.is_valid()
+        {
+            crate::dialog_manager::force_create_dialog(td, referrer_dialog_id, "affiliateInfo");
+            if !matches!(
+                transaction.starref_amount,
+                Some(telegram_api::StarsAmount::starsAmount(_))
+            ) {
+                tdutils::log_error!("Receive an invalid starref amount");
+            } else {
+                let referrer_star_amount = crate::message_content::StarAmount::from_wire(
+                    transaction.starref_amount.as_ref(),
+                    true,
+                );
+                affiliate = Some(td_api::AffiliateInfo {
+                    commission_per_mille: transaction.starref_commission_permille,
+                    affiliate_chat_id: crate::dialog_manager::get_chat_id_object(
+                        referrer_dialog_id,
+                        "affiliateInfo",
+                    ),
+                    star_amount: Some(referrer_star_amount.get_star_amount_object()),
+                });
+                transaction.starref_commission_permille = 0;
+            }
+            transaction.starref_peer = None;
+        } else {
+            tdutils::log_error!("Receive an invalid affiliate info");
+        }
+    } else if transaction.starref_commission_permille != 0 {
+        if transaction.starref_commission_permille > 0
+            && transaction.starref_commission_permille < 1000
+        {
+            commission_per_mille = transaction.starref_commission_permille;
+        } else {
+            tdutils::log_error!("Receive an invalid commission");
+        }
+        transaction.starref_commission_permille = 0;
+    }
+
+    let transaction_amount =
+        crate::message_content::StarAmount::from_wire(transaction.amount.as_ref(), true);
+    let is_refund = transaction.refund;
+    // a purchase records as an expense whose sign agrees with the
+    // refund flag (cpp:316)
+    let is_purchase = transaction_amount.is_positive() == is_refund;
+    let for_chat = !for_user && !for_bot;
+
+    // cpp:317-776 — the partner ladder
+    let type_: Option<td_api::StarTransactionType> = (|| {
+        match transaction.peer.as_ref() {
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerUnsupported(_)) => {
+                Some(td_api::StarTransactionType::starTransactionTypeUnsupported(
+                    td_api::starTransactionTypeUnsupported {},
+                ))
+            }
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerPremiumBot(_)) => for_user
+                .then_some(
+                    td_api::StarTransactionType::starTransactionTypePremiumBotDeposit(
+                        td_api::starTransactionTypePremiumBotDeposit {},
+                    ),
+                ),
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerAppStore(_)) => for_user
+                .then_some(
+                    td_api::StarTransactionType::starTransactionTypeAppStoreDeposit(
+                        td_api::starTransactionTypeAppStoreDeposit {},
+                    ),
+                ),
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerPlayMarket(_)) => for_user
+                .then_some(
+                    td_api::StarTransactionType::starTransactionTypeGooglePlayDeposit(
+                        td_api::starTransactionTypeGooglePlayDeposit {},
+                    ),
+                ),
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerFragment(_)) => {
+                // cpp:336-374
+                if transaction.gift {
+                    if for_user {
+                        transaction.gift = false;
+                        return Some(td_api::StarTransactionType::starTransactionTypeUserDeposit(
+                            td_api::starTransactionTypeUserDeposit {
+                                user_id: 0,
+                                sticker: td.get_premium_gift_sticker_object(
+                                    0,
+                                    transaction_amount.star_count,
+                                ),
+                            },
+                        ));
+                    }
+                    return None;
+                }
+                let state = star_transaction_withdrawal_state(&mut transaction);
+                if state.is_some() || is_refund {
+                    // (the C++ band set makes this disjunction always
+                    // true — kept faithful to cpp:365)
+                    if for_user || for_bot || for_chat {
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypeFragmentWithdrawal(
+                                td_api::starTransactionTypeFragmentWithdrawal {
+                                    withdrawal_state: state,
+                                },
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                if for_user || for_bot {
+                    return Some(
+                        td_api::StarTransactionType::starTransactionTypeFragmentDeposit(
+                            td_api::starTransactionTypeFragmentDeposit {},
+                        ),
+                    );
+                }
+                None
+            }
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeer(peer)) => {
+                // cpp:375-757
+                let dialog_id = peer
+                    .peer
+                    .as_ref()
+                    .map_or_else(DialogId::default, DialogId::from_peer);
+                if !dialog_id.is_valid() {
+                    return None;
+                }
+                if commission_per_mille != 0 {
+                    // cpp:381-390
+                    crate::dialog_manager::force_create_dialog(
+                        td,
+                        dialog_id,
+                        "starsTransactionPeer",
+                    );
+                    let chat_id = crate::dialog_manager::get_chat_id_object(
+                        dialog_id,
+                        "starTransactionTypeAffiliateProgramCommission",
+                    );
+                    let commission = commission_per_mille;
+                    commission_per_mille = 0;
+                    return Some(
+                        td_api::StarTransactionType::starTransactionTypeAffiliateProgramCommission(
+                            td_api::starTransactionTypeAffiliateProgramCommission {
+                                chat_id,
+                                commission_per_mille: commission,
+                            },
+                        ),
+                    );
+                }
+                if transaction.paid_messages != 0 {
+                    // cpp:391-453
+                    let paid_messages = transaction.paid_messages;
+                    if is_purchase {
+                        if for_user {
+                            let is_suggested_post = product_info
+                                .as_ref()
+                                .is_some_and(|info| info.title == "Suggested Post");
+                            product_info = None;
+                            transaction.paid_messages = 0;
+                            crate::dialog_manager::force_create_dialog(
+                                td,
+                                dialog_id,
+                                "starsTransactionPeer",
+                            );
+                            let chat_id = crate::dialog_manager::get_chat_id_object(
+                                dialog_id,
+                                "starTransactionTypePaidMessageSend",
+                            );
+                            if transaction.phonegroup_message {
+                                transaction.phonegroup_message = false;
+                                if paid_messages != 1 {
+                                    tdutils::log_error!(
+                                        "Receive {paid_messages} paid group call messages"
+                                    );
+                                }
+                                if transaction.reaction {
+                                    transaction.reaction = false;
+                                    return Some(
+                                        td_api::StarTransactionType::starTransactionTypePaidGroupCallReactionSend(
+                                            td_api::starTransactionTypePaidGroupCallReactionSend {
+                                                chat_id,
+                                            },
+                                        ),
+                                    );
+                                }
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypePaidGroupCallMessageSend(
+                                        td_api::starTransactionTypePaidGroupCallMessageSend {
+                                            chat_id,
+                                        },
+                                    ),
+                                );
+                            }
+                            if is_suggested_post
+                                && crate::dialog_manager::is_broadcast_channel(td, dialog_id)
+                            {
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeSuggestedPostPaymentSend(
+                                        td_api::starTransactionTypeSuggestedPostPaymentSend {
+                                            chat_id,
+                                        },
+                                    ),
+                                );
+                            }
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypePaidMessageSend(
+                                    td_api::starTransactionTypePaidMessageSend {
+                                        chat_id,
+                                        message_count: paid_messages,
+                                    },
+                                ),
+                            );
+                        }
+                        return None;
+                    }
+                    if (for_user || for_supergroup || for_channel) && affiliate.is_some() {
+                        product_info = None;
+                        transaction.paid_messages = 0;
+                        let sender_id = crate::dialog_manager::get_message_sender_object(
+                            td,
+                            dialog_id,
+                            "starTransactionTypePaidMessage",
+                        );
+                        let affiliate_info = affiliate.take().unwrap();
+                        let commission = affiliate_info.commission_per_mille;
+                        let commission_star_amount = affiliate_info.star_amount;
+                        if transaction.phonegroup_message && !for_supergroup {
+                            transaction.phonegroup_message = false;
+                            if paid_messages != 1 {
+                                tdutils::log_error!(
+                                    "Receive {paid_messages} received paid group call messages"
+                                );
+                            }
+                            if transaction.reaction {
+                                transaction.reaction = false;
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypePaidGroupCallReactionReceive(
+                                        td_api::starTransactionTypePaidGroupCallReactionReceive {
+                                            sender_id: Some(sender_id),
+                                            commission_per_mille: commission,
+                                            commission_star_amount,
+                                        },
+                                    ),
+                                );
+                            }
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypePaidGroupCallMessageReceive(
+                                    td_api::starTransactionTypePaidGroupCallMessageReceive {
+                                        sender_id: Some(sender_id),
+                                        commission_per_mille: commission,
+                                        commission_star_amount,
+                                    },
+                                ),
+                            );
+                        }
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypePaidMessageReceive(
+                                td_api::starTransactionTypePaidMessageReceive {
+                                    sender_id: Some(sender_id),
+                                    message_count: paid_messages,
+                                    commission_per_mille: commission,
+                                    commission_star_amount,
+                                },
+                            ),
+                        );
+                    }
+                    if for_channel && dialog_id.get_type() == DialogType::User {
+                        product_info = None;
+                        transaction.paid_messages = 0;
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypeSuggestedPostPaymentReceive(
+                                td_api::starTransactionTypeSuggestedPostPaymentReceive {
+                                    user_id: td.get_user_id_object(
+                                        dialog_id.get_user_id(),
+                                        "starTransactionTypeSuggestedPostPaymentReceive",
+                                    ),
+                                },
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                if transaction.posts_search {
+                    // cpp:454-461
+                    if for_user && is_purchase {
+                        transaction.posts_search = false;
+                        product_info = None;
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypePublicPostSearch(
+                                td_api::starTransactionTypePublicPostSearch {},
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                if dialog_id.get_type() == DialogType::User {
+                    // cpp:462-672 — the user partner
+                    let user_id = dialog_id.get_user_id();
+                    let user_id_object = td.get_user_id_object(user_id, "starsTransactionPeer");
+                    if transaction.business_transfer {
+                        transaction.business_transfer = false;
+                        if is_purchase {
+                            if for_user {
+                                product_info = None;
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeBusinessBotTransferSend(
+                                        td_api::starTransactionTypeBusinessBotTransferSend {
+                                            user_id: user_id_object,
+                                        },
+                                    ),
+                                );
+                            }
+                        } else if for_bot {
+                            product_info = None;
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeBusinessBotTransferReceive(
+                                    td_api::starTransactionTypeBusinessBotTransferReceive {
+                                        user_id: user_id_object,
+                                    },
+                                ),
+                            );
+                        }
+                        return None;
+                    }
+                    if transaction.stargift.is_some() {
+                        let gift =
+                            intake_star_gift(td, transaction.stargift.take().unwrap(), false)?;
+                        if is_purchase {
+                            if gift.is_unique() {
+                                if transaction.stargift_resale {
+                                    if for_user {
+                                        transaction.stargift_resale = false;
+                                        return Some(
+                                            td_api::StarTransactionType::starTransactionTypeUpgradedGiftPurchase(
+                                                td_api::starTransactionTypeUpgradedGiftPurchase {
+                                                    user_id: user_id_object,
+                                                    gift: Some(upgraded_star_gift_object(
+                                                        td, &gift,
+                                                    )),
+                                                },
+                                            ),
+                                        );
+                                    }
+                                } else if transaction.stargift_upgrade {
+                                    if for_user {
+                                        transaction.stargift_upgrade = false;
+                                        transaction.msg_id = 0; // ignore
+                                        product_info = None;
+                                        return Some(
+                                            td_api::StarTransactionType::starTransactionTypeGiftUpgrade(
+                                                td_api::starTransactionTypeGiftUpgrade {
+                                                    user_id: user_id_object,
+                                                    gift: Some(upgraded_star_gift_object(
+                                                        td, &gift,
+                                                    )),
+                                                },
+                                            ),
+                                        );
+                                    }
+                                } else if transaction.stargift_drop_original_details {
+                                    if for_user {
+                                        product_info = None;
+                                        transaction.stargift_drop_original_details = false;
+                                        return Some(
+                                            td_api::StarTransactionType::starTransactionTypeGiftOriginalDetailsDrop(
+                                                td_api::starTransactionTypeGiftOriginalDetailsDrop {
+                                                    owner_id: Some(
+                                                        crate::dialog_manager::get_message_sender_object(
+                                                            td,
+                                                            dialog_id,
+                                                            "starTransactionTypeGiftOriginalDetailsDrop",
+                                                        ),
+                                                    ),
+                                                    gift: Some(upgraded_star_gift_object(
+                                                        td, &gift,
+                                                    )),
+                                                },
+                                            ),
+                                        );
+                                    }
+                                } else if transaction.offer {
+                                    if for_user {
+                                        transaction.offer = false;
+                                        return Some(
+                                            td_api::StarTransactionType::starTransactionTypeGiftPurchaseOffer(
+                                                td_api::starTransactionTypeGiftPurchaseOffer {
+                                                    gift: Some(upgraded_star_gift_object(
+                                                        td, &gift,
+                                                    )),
+                                                },
+                                            ),
+                                        );
+                                    }
+                                } else if for_user {
+                                    return Some(
+                                        td_api::StarTransactionType::starTransactionTypeGiftTransfer(
+                                            td_api::starTransactionTypeGiftTransfer {
+                                                owner_id: Some(
+                                                    crate::dialog_manager::get_message_sender_object(
+                                                        td,
+                                                        dialog_id,
+                                                        "starTransactionTypeGiftTransfer",
+                                                    ),
+                                                ),
+                                                gift: Some(upgraded_star_gift_object(td, &gift)),
+                                            },
+                                        ),
+                                    );
+                                }
+                            } else {
+                                if transaction.stargift_prepaid_upgrade {
+                                    if for_user {
+                                        transaction.stargift_prepaid_upgrade = false;
+                                        product_info = None;
+                                        return Some(
+                                            td_api::StarTransactionType::starTransactionTypeGiftUpgradePurchase(
+                                                td_api::starTransactionTypeGiftUpgradePurchase {
+                                                    owner_id: Some(
+                                                        td_api::MessageSender::messageSenderUser(
+                                                            td_api::messageSenderUser {
+                                                                user_id: user_id_object,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    gift: Some(star_gift_object(td, &gift)),
+                                                },
+                                            ),
+                                        );
+                                    }
+                                } else if transaction.stargift_auction_bid {
+                                    if for_user {
+                                        transaction.stargift_auction_bid = false;
+                                        product_info = None;
+                                        return Some(
+                                            td_api::StarTransactionType::starTransactionTypeGiftAuctionBid(
+                                                td_api::starTransactionTypeGiftAuctionBid {
+                                                    owner_id: Some(
+                                                        td_api::MessageSender::messageSenderUser(
+                                                            td_api::messageSenderUser {
+                                                                user_id: user_id_object,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    gift: Some(star_gift_object(td, &gift)),
+                                                },
+                                            ),
+                                        );
+                                    }
+                                } else if for_user || for_bot {
+                                    product_info = None;
+                                    return Some(
+                                        td_api::StarTransactionType::starTransactionTypeGiftPurchase(
+                                            td_api::starTransactionTypeGiftPurchase {
+                                                owner_id: Some(
+                                                    crate::dialog_manager::get_message_sender_object(
+                                                        td,
+                                                        dialog_id,
+                                                        "starTransactionTypeGiftPurchase",
+                                                    ),
+                                                ),
+                                                gift: Some(star_gift_object(td, &gift)),
+                                            },
+                                        ),
+                                    );
+                                }
+                            }
+                        } else if gift.is_unique() {
+                            if transaction.stargift_resale || transaction.offer {
+                                if for_user && affiliate.is_some() {
+                                    // the cpp:551-555 scope exit nulls
+                                    // the affiliate — move it out (the
+                                    // leftover-field audit sees it
+                                    // consumed)
+                                    let affiliate_info = affiliate.take().unwrap();
+                                    let commission = affiliate_info.commission_per_mille;
+                                    let commission_star_amount = affiliate_info.star_amount;
+                                    let via_offer = transaction.offer;
+                                    transaction.stargift_resale = false;
+                                    transaction.offer = false;
+                                    return Some(
+                                        td_api::StarTransactionType::starTransactionTypeUpgradedGiftSale(
+                                            td_api::starTransactionTypeUpgradedGiftSale {
+                                                user_id: user_id_object,
+                                                gift: Some(upgraded_star_gift_object(td, &gift)),
+                                                commission_per_mille: commission,
+                                                commission_star_amount,
+                                                via_offer,
+                                            },
+                                        ),
+                                    );
+                                }
+                            } else {
+                                tdutils::log_error!("Receive sale of an upgraded gift");
+                            }
+                        } else if for_user || for_channel {
+                            product_info = None;
+                            return Some(td_api::StarTransactionType::starTransactionTypeGiftSale(
+                                td_api::starTransactionTypeGiftSale {
+                                    user_id: user_id_object,
+                                    gift: Some(star_gift_object(td, &gift)),
+                                },
+                            ));
+                        }
+                        return None;
+                    }
+                    if transaction.subscription_period > 0 {
+                        // cpp:573-596 (the cpp:608-617 twin is dead —
+                        // this block always returns)
+                        let subscription_period = transaction.subscription_period;
+                        transaction.subscription_period = 0;
+                        if is_purchase {
+                            if for_user {
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeBotSubscriptionPurchase(
+                                        td_api::starTransactionTypeBotSubscriptionPurchase {
+                                            user_id: user_id_object,
+                                            subscription_period,
+                                            product_info: product_info.take(),
+                                        },
+                                    ),
+                                );
+                            }
+                        } else if for_channel {
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeChannelSubscriptionSale(
+                                    td_api::starTransactionTypeChannelSubscriptionSale {
+                                        user_id: user_id_object,
+                                        subscription_period,
+                                    },
+                                ),
+                            );
+                        } else if for_bot {
+                            // the cpp:587-589 bot-payload clear
+                            bot_payload.clear();
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeBotSubscriptionSale(
+                                    td_api::starTransactionTypeBotSubscriptionSale {
+                                        user_id: user_id_object,
+                                        subscription_period,
+                                        product_info: product_info.take(),
+                                        invoice_payload: std::mem::take(&mut bot_payload)
+                                            .into_bytes(),
+                                        affiliate: affiliate.take(),
+                                    },
+                                ),
+                            );
+                        }
+                        return None;
+                    }
+                    if transaction.gift {
+                        if for_user {
+                            transaction.gift = false;
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeUserDeposit(
+                                    td_api::starTransactionTypeUserDeposit {
+                                        user_id: if user_id
+                                            == crate::user_manager::UserManager::get_service_notifications_user_id()
+                                        {
+                                            0
+                                        } else {
+                                            user_id_object
+                                        },
+                                        sticker: td.get_premium_gift_sticker_object(
+                                            0,
+                                            transaction_amount.star_count,
+                                        ),
+                                    },
+                                ),
+                            );
+                        }
+                        return None;
+                    }
+                    if transaction.reaction {
+                        if for_channel {
+                            transaction.reaction = false;
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeChannelPaidReactionReceive(
+                                    td_api::starTransactionTypeChannelPaidReactionReceive {
+                                        user_id: user_id_object,
+                                        message_id: star_transaction_message_id(
+                                            &mut transaction,
+                                        ),
+                                    },
+                                ),
+                            );
+                        }
+                        return None;
+                    }
+                    // the cpp:626-628 scope exit clears the bot payload
+                    // on every exit from here on
+                    if transaction.premium_gift_months > 0 && is_purchase {
+                        let premium_gift_months = transaction.premium_gift_months;
+                        transaction.premium_gift_months = 0;
+                        product_info = None;
+                        if for_user || for_bot {
+                            bot_payload.clear();
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypePremiumPurchase(
+                                    td_api::starTransactionTypePremiumPurchase {
+                                        user_id: user_id_object,
+                                        month_count: premium_gift_months,
+                                        sticker: td.get_premium_gift_sticker_object(
+                                            premium_gift_months,
+                                            0,
+                                        ),
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                    if product_info.is_some() {
+                        if is_purchase {
+                            if for_user {
+                                bot_payload.clear();
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeBotInvoicePurchase(
+                                        td_api::starTransactionTypeBotInvoicePurchase {
+                                            user_id: user_id_object,
+                                            product_info: product_info.take(),
+                                        },
+                                    ),
+                                );
+                            }
+                        } else if for_bot {
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeBotInvoiceSale(
+                                    td_api::starTransactionTypeBotInvoiceSale {
+                                        user_id: user_id_object,
+                                        product_info: product_info.take(),
+                                        invoice_payload: std::mem::take(&mut bot_payload)
+                                            .into_bytes(),
+                                        affiliate: affiliate.take(),
+                                    },
+                                ),
+                            );
+                        }
+                        bot_payload.clear();
+                        return None;
+                    }
+                    if !transaction.extended_media.is_empty() || is_refund || for_bot {
+                        // TODO (cpp:654)
+                        if is_purchase {
+                            if for_user {
+                                bot_payload.clear();
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeBotPaidMediaPurchase(
+                                        td_api::starTransactionTypeBotPaidMediaPurchase {
+                                            user_id: user_id_object,
+                                            media: star_transaction_paid_media(
+                                                td,
+                                                &mut transaction.extended_media,
+                                                dialog_id,
+                                                &mut file_ids,
+                                            ),
+                                        },
+                                    ),
+                                );
+                            }
+                        } else if for_bot {
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeBotPaidMediaSale(
+                                    td_api::starTransactionTypeBotPaidMediaSale {
+                                        user_id: user_id_object,
+                                        media: star_transaction_paid_media(
+                                            td,
+                                            &mut transaction.extended_media,
+                                            request_dialog_id,
+                                            &mut file_ids,
+                                        ),
+                                        payload: std::mem::take(&mut bot_payload),
+                                        affiliate: affiliate.take(),
+                                    },
+                                ),
+                            );
+                        } else if for_channel {
+                            bot_payload.clear();
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeChannelPaidMediaSale(
+                                    td_api::starTransactionTypeChannelPaidMediaSale {
+                                        user_id: user_id_object,
+                                        message_id: star_transaction_message_id(
+                                            &mut transaction,
+                                        ),
+                                        // the paid media converts over the
+                                        // request dialog (cpp:666)
+                                        media: star_transaction_paid_media(
+                                            td,
+                                            &mut transaction.extended_media,
+                                            request_dialog_id,
+                                            &mut file_ids,
+                                        ),
+                                    },
+                                ),
+                            );
+                        }
+                        bot_payload.clear();
+                        return None;
+                    }
+                    bot_payload.clear();
+                    return None;
+                }
+
+                // cpp:674-756 — the partner isn't a user now
+                crate::dialog_manager::force_create_dialog(td, dialog_id, "starsTransactionPeer");
+                let chat_id =
+                    crate::dialog_manager::get_chat_id_object(dialog_id, "starsTransactionPeer");
+                if transaction.stargift.is_some() {
+                    let gift = intake_star_gift(td, transaction.stargift.take().unwrap(), false)?;
+                    if is_purchase {
+                        if gift.is_unique() {
+                            if transaction.stargift_drop_original_details {
+                                if for_user {
+                                    product_info = None;
+                                    transaction.stargift_drop_original_details = false;
+                                    return Some(
+                                        td_api::StarTransactionType::starTransactionTypeGiftOriginalDetailsDrop(
+                                            td_api::starTransactionTypeGiftOriginalDetailsDrop {
+                                                owner_id: Some(
+                                                    crate::dialog_manager::get_message_sender_object(
+                                                        td,
+                                                        dialog_id,
+                                                        "starTransactionTypeGiftOriginalDetailsDrop",
+                                                    ),
+                                                ),
+                                                gift: Some(upgraded_star_gift_object(td, &gift)),
+                                            },
+                                        ),
+                                    );
+                                }
+                            } else if !transaction.stargift_upgrade
+                                && !transaction.stargift_resale
+                                && for_user
+                            {
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeGiftTransfer(
+                                        td_api::starTransactionTypeGiftTransfer {
+                                            owner_id: Some(
+                                                crate::dialog_manager::get_message_sender_object(
+                                                    td,
+                                                    dialog_id,
+                                                    "starTransactionTypeGiftTransfer",
+                                                ),
+                                            ),
+                                            gift: Some(upgraded_star_gift_object(td, &gift)),
+                                        },
+                                    ),
+                                );
+                            }
+                        } else if transaction.stargift_prepaid_upgrade {
+                            if for_user {
+                                transaction.stargift_prepaid_upgrade = false;
+                                product_info = None;
+                                return Some(
+                                    td_api::StarTransactionType::starTransactionTypeGiftUpgradePurchase(
+                                        td_api::starTransactionTypeGiftUpgradePurchase {
+                                            owner_id: Some(
+                                                crate::dialog_manager::get_message_sender_object(
+                                                    td,
+                                                    dialog_id,
+                                                    "starTransactionTypeGiftUpgradePurchase",
+                                                ),
+                                            ),
+                                            gift: Some(star_gift_object(td, &gift)),
+                                        },
+                                    ),
+                                );
+                            }
+                        } else if for_user || for_bot {
+                            product_info = None;
+                            return Some(
+                                td_api::StarTransactionType::starTransactionTypeGiftPurchase(
+                                    td_api::starTransactionTypeGiftPurchase {
+                                        owner_id: Some(
+                                            crate::dialog_manager::get_message_sender_object(
+                                                td,
+                                                dialog_id,
+                                                "starTransactionTypeGiftPurchase",
+                                            ),
+                                        ),
+                                        gift: Some(star_gift_object(td, &gift)),
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                    return None;
+                }
+                if transaction.giveaway_post_id > 0 {
+                    if for_user && dialog_id.get_type() == DialogType::Channel {
+                        let giveaway_post_id = transaction.giveaway_post_id;
+                        transaction.giveaway_post_id = 0;
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypeGiveawayDeposit(
+                                td_api::starTransactionTypeGiveawayDeposit {
+                                    chat_id,
+                                    giveaway_message_id:
+                                        crate::messages_manager::MessageId::from_server_message_id(
+                                            crate::messages_manager::ServerMessageId::new(
+                                                giveaway_post_id,
+                                            ),
+                                        )
+                                        .get(),
+                                },
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                if transaction.subscription_period > 0 {
+                    if crate::dialog_manager::is_broadcast_channel(td, dialog_id) && for_user {
+                        let subscription_period = transaction.subscription_period;
+                        transaction.subscription_period = 0;
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypeChannelSubscriptionPurchase(
+                                td_api::starTransactionTypeChannelSubscriptionPurchase {
+                                    chat_id,
+                                    subscription_period,
+                                },
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                if transaction.reaction {
+                    if crate::dialog_manager::is_broadcast_channel(td, dialog_id) && for_user {
+                        transaction.reaction = false;
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypeChannelPaidReactionSend(
+                                td_api::starTransactionTypeChannelPaidReactionSend {
+                                    chat_id,
+                                    message_id: star_transaction_message_id(&mut transaction),
+                                },
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                if !transaction.extended_media.is_empty() || is_refund {
+                    // TODO (cpp:749)
+                    if crate::dialog_manager::is_broadcast_channel(td, dialog_id) && for_user {
+                        return Some(
+                            td_api::StarTransactionType::starTransactionTypeChannelPaidMediaPurchase(
+                                td_api::starTransactionTypeChannelPaidMediaPurchase {
+                                    chat_id,
+                                    message_id: star_transaction_message_id(&mut transaction),
+                                    media: star_transaction_paid_media(
+                                        td,
+                                        &mut transaction.extended_media,
+                                        dialog_id,
+                                        &mut file_ids,
+                                    ),
+                                },
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                None
+            }
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerAds(_)) => {
+                // cpp:758-762
+                (for_bot || for_channel).then_some(
+                    td_api::StarTransactionType::starTransactionTypeTelegramAdsWithdrawal(
+                        td_api::starTransactionTypeTelegramAdsWithdrawal {},
+                    ),
+                )
+            }
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerAPI(_)) => {
+                // cpp:763-771
+                if for_bot {
+                    let floodskip_number = transaction.floodskip_number;
+                    transaction.floodskip_number = 0;
+                    Some(
+                        td_api::StarTransactionType::starTransactionTypeTelegramApiUsage(
+                            td_api::starTransactionTypeTelegramApiUsage {
+                                request_count: floodskip_number,
+                            },
+                        ),
+                    )
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    })();
+
+    // cpp:777-782 — the unsupported fallback (the pre-December-2025
+    // offer band stays quiet)
+    let type_ = type_.unwrap_or_else(|| {
+        if !(transaction.offer && transaction.date < 1765550000 && !is_purchase) {
+            tdutils::log_error!("Receive unsupported Star transaction in {request_dialog_id:?}");
+        }
+        td_api::StarTransactionType::starTransactionTypeUnsupported(
+            td_api::starTransactionTypeUnsupported {},
+        )
+    });
+
+    // cpp:786-792 — the leftover-field audit over the consumed copy
+    if !matches!(
+        &type_,
+        td_api::StarTransactionType::starTransactionTypeUnsupported(_)
+    ) {
+        let name = crate::star_manager::get_unused_star_transaction_field(
+            &transaction,
+            product_info.as_ref(),
+            &bot_payload,
+            affiliate.as_ref(),
+            commission_per_mille,
+        );
+        if !name.is_empty() {
+            tdutils::log_error!("Receive {name} with a Star transaction");
+        }
+    }
+
+    // cpp:793-799 — the file-source registration
+    if !file_ids.is_empty() {
+        let source_id =
+            star_transaction_file_source_id(td, request_dialog_id, &transaction.id, is_refund);
+        for file_id in file_ids {
+            td.file_reference_manager
+                .add_file_source(file_id, source_id);
+        }
+    }
+
+    Some(td_api::StarTransaction {
+        id: transaction.id,
+        star_amount: Some(transaction_amount.get_star_amount_object()),
+        is_refund,
+        date: transaction.date,
+        r#type: Some(type_),
+    })
+}
+
+/// The `GetTonTransactionsQuery::on_result` per-transaction ladder
+/// (StarManager.cpp:865-997) — the TON twin over the `starsTonAmount`
+/// bands.
+#[allow(clippy::too_many_lines)]
+fn convert_ton_transaction(
+    td: &mut Td,
+    mut transaction: telegram_api::StarsTransaction,
+) -> Option<td_api::TonTransaction> {
+    use crate::dialog_id::DialogType;
+    use crate::message_content::MessageContentContext as _;
+
+    // cpp:866-869 — the amount band
+    if !matches!(
+        transaction.amount,
+        Some(telegram_api::StarsAmount::starsTonAmount(_))
+    ) {
+        tdutils::log_error!("Receive a TON transaction with an invalid amount");
+        return None;
+    }
+
+    let transaction_amount =
+        crate::message_content::TonAmount::from_wire(transaction.amount.as_ref(), true);
+    let is_refund = transaction.refund;
+    let is_purchase = transaction_amount.is_positive() == is_refund;
+
+    // cpp:874-984 — the partner ladder
+    let type_: Option<td_api::TonTransactionType> = (|| {
+        match transaction.peer.as_ref() {
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerUnsupported(_)) => {
+                Some(td_api::TonTransactionType::tonTransactionTypeUnsupported(
+                    td_api::tonTransactionTypeUnsupported {},
+                ))
+            }
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerPremiumBot(_))
+            | Some(telegram_api::StarsTransactionPeer::starsTransactionPeerAppStore(_))
+            | Some(telegram_api::StarsTransactionPeer::starsTransactionPeerPlayMarket(_))
+            | Some(telegram_api::StarsTransactionPeer::starsTransactionPeerAds(_))
+            | Some(telegram_api::StarsTransactionPeer::starsTransactionPeerAPI(_)) => None,
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeerFragment(_)) => {
+                // cpp:884-913
+                let state = star_transaction_withdrawal_state(&mut transaction);
+                if state.is_some() || is_refund {
+                    return Some(
+                        td_api::TonTransactionType::tonTransactionTypeFragmentWithdrawal(
+                            td_api::tonTransactionTypeFragmentWithdrawal {
+                                withdrawal_state: state,
+                            },
+                        ),
+                    );
+                }
+                let is_gift = transaction.gift;
+                transaction.gift = false;
+                Some(
+                    td_api::TonTransactionType::tonTransactionTypeFragmentDeposit(
+                        td_api::tonTransactionTypeFragmentDeposit {
+                            is_gift,
+                            sticker: td.get_ton_gift_sticker_object(transaction_amount.ton_amount),
+                        },
+                    ),
+                )
+            }
+            Some(telegram_api::StarsTransactionPeer::starsTransactionPeer(peer)) => {
+                // cpp:914-979
+                let dialog_id = peer
+                    .peer
+                    .as_ref()
+                    .map_or_else(DialogId::default, DialogId::from_peer);
+                if !dialog_id.is_valid() {
+                    return None;
+                }
+                if transaction.paid_messages != 0
+                    && is_purchase
+                    && transaction.title == "Suggested Post"
+                    && crate::dialog_manager::is_broadcast_channel(td, dialog_id)
+                {
+                    transaction.paid_messages = 0;
+                    transaction.title.clear();
+                    crate::dialog_manager::force_create_dialog(
+                        td,
+                        dialog_id,
+                        "starsTransactionPeer",
+                    );
+                    return Some(
+                        td_api::TonTransactionType::tonTransactionTypeSuggestedPostPayment(
+                            td_api::tonTransactionTypeSuggestedPostPayment {
+                                chat_id: crate::dialog_manager::get_chat_id_object(
+                                    dialog_id,
+                                    "tonTransactionTypeSuggestedPostPayment",
+                                ),
+                            },
+                        ),
+                    );
+                }
+                if transaction.stargift.is_some() && dialog_id.get_type() == DialogType::User {
+                    let gift = intake_star_gift(td, transaction.stargift.take().unwrap(), true)?;
+                    if transaction.stargift_resale || transaction.offer {
+                        transaction.stargift_resale = false;
+                        let user_id_object =
+                            td.get_user_id_object(dialog_id.get_user_id(), "starsTransactionPeer");
+                        if is_purchase {
+                            if transaction.offer {
+                                transaction.offer = false;
+                                return Some(
+                                    td_api::TonTransactionType::tonTransactionTypeGiftPurchaseOffer(
+                                        td_api::tonTransactionTypeGiftPurchaseOffer {
+                                            gift: Some(upgraded_star_gift_object(td, &gift)),
+                                        },
+                                    ),
+                                );
+                            }
+                            return Some(
+                                td_api::TonTransactionType::tonTransactionTypeUpgradedGiftPurchase(
+                                    td_api::tonTransactionTypeUpgradedGiftPurchase {
+                                        user_id: user_id_object,
+                                        gift: Some(upgraded_star_gift_object(td, &gift)),
+                                    },
+                                ),
+                            );
+                        }
+                        if transaction.starref_commission_permille > 0
+                            && transaction.starref_commission_permille < 1000
+                            && matches!(
+                                transaction.starref_amount,
+                                Some(telegram_api::StarsAmount::starsTonAmount(_))
+                            )
+                        {
+                            // the cpp:953-958 scope exit clears the
+                            // starref fields and the offer flag
+                            let commission_per_mille = transaction.starref_commission_permille;
+                            let commission_gram_amount =
+                                crate::message_content::TonAmount::from_wire(
+                                    transaction.starref_amount.as_ref(),
+                                    true,
+                                )
+                                .ton_amount;
+                            let via_offer = transaction.offer;
+                            transaction.starref_peer = None; // ignore
+                            transaction.starref_commission_permille = 0;
+                            transaction.starref_amount = None;
+                            transaction.offer = false;
+                            return Some(
+                                td_api::TonTransactionType::tonTransactionTypeUpgradedGiftSale(
+                                    td_api::tonTransactionTypeUpgradedGiftSale {
+                                        user_id: user_id_object,
+                                        gift: Some(upgraded_star_gift_object(td, &gift)),
+                                        commission_per_mille,
+                                        commission_gram_amount,
+                                        via_offer,
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                    return None;
+                }
+                let stake_dice_user_id = if td.global.is_test_dc() {
+                    5001167034
+                } else {
+                    8353936423
+                };
+                if dialog_id
+                    == DialogId::from_user_id(crate::user_manager::UserId::new(stake_dice_user_id))
+                {
+                    // cpp:970-977
+                    transaction.title.clear();
+                    if is_purchase {
+                        return Some(
+                            td_api::TonTransactionType::tonTransactionTypeStakeDiceStake(
+                                td_api::tonTransactionTypeStakeDiceStake {},
+                            ),
+                        );
+                    }
+                    return Some(
+                        td_api::TonTransactionType::tonTransactionTypeStakeDicePayout(
+                            td_api::tonTransactionTypeStakeDicePayout {},
+                        ),
+                    );
+                }
+                None
+            }
+            None => None,
+        }
+    })();
+
+    // cpp:985-988
+    let type_ = type_.unwrap_or_else(|| {
+        tdutils::log_error!("Receive unsupported TON transaction");
+        td_api::TonTransactionType::tonTransactionTypeUnsupported(
+            td_api::tonTransactionTypeUnsupported {},
+        )
+    });
+
+    // cpp:991-996 — the leftover-field audit (no converted halves)
+    if !matches!(
+        &type_,
+        td_api::TonTransactionType::tonTransactionTypeUnsupported(_)
+    ) {
+        let name =
+            crate::star_manager::get_unused_star_transaction_field(&transaction, None, "", None, 0);
+        if !name.is_empty() {
+            tdutils::log_error!("Receive {name} with a TON transaction");
+        }
+    }
+
+    Some(td_api::TonTransaction {
+        id: transaction.id,
+        gram_amount: transaction_amount.ton_amount,
+        is_refund,
+        date: transaction.date,
+        r#type: Some(type_),
+    })
 }
 
 /// `Vector<onrampProviderInfo>` — the `payments_getOnrampProviders`
@@ -19266,6 +20640,170 @@ impl Td {
                             promise.set_error(parse_error("payments_getStarsGiveawayOptions"));
                         }
                     }
+                }
+            }
+            // `GetStarsTransactionsQuery` (cpp:161-815) — the list and
+            // by-id forms over the shared `payments_StarsStatus`
+            // answer: the users/chats intakes, the partner ladder over
+            // the request dialog's bands, the own-dialog balance
+            // update and the per-transaction file-source registration.
+            StarNetKind::Transactions { dialog_id } => {
+                let promise = self.star_manager.take_pending(|p| &mut p.star_transactions);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetStarsTransactionsQuery",
+                    );
+                    if let Some(mut promise) = promise {
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let Ok(result) = telegram_api::payments_StarsStatus::parse(query.ok()) else {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(parse_error("payments_getStarsTransactions"));
+                    }
+                    return;
+                };
+                {
+                    let mut env = UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("star answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    };
+                    self.user_manager.on_get_users(
+                        &mut env,
+                        result.users.clone(),
+                        "GetStarsTransactionsQuery",
+                    );
+                }
+                self.intake_chats(result.chats.clone(), "GetStarsTransactionsQuery");
+                if !matches!(
+                    result.balance,
+                    Some(telegram_api::StarsAmount::starsAmount(_))
+                ) {
+                    tdutils::log_error!("Receive an invalid starsStatus balance");
+                    if let Some(mut promise) = promise {
+                        promise.set_error(Status::error(500, "Receive invalid response"));
+                    }
+                    return;
+                }
+                // cpp:232-237 — the partner bands key on the request
+                // dialog
+                let for_bot = dialog_id.get_type() == crate::dialog_id::DialogType::User
+                    && crate::message_content::MessageContentContext::is_user_bot(
+                        self,
+                        dialog_id.get_user_id(),
+                    );
+                let for_user =
+                    dialog_id.get_type() == crate::dialog_id::DialogType::User && !for_bot;
+                let for_chat = !for_user && !for_bot;
+                let for_channel =
+                    for_chat && crate::dialog_manager::is_broadcast_channel(self, dialog_id);
+                let for_supergroup = for_chat && !for_channel;
+                let mut transactions = Vec::with_capacity(result.history.len());
+                for transaction in result.history {
+                    if let Some(transaction) = convert_star_transaction(
+                        self,
+                        dialog_id,
+                        for_bot,
+                        for_user,
+                        for_channel,
+                        for_supergroup,
+                        transaction,
+                    ) {
+                        transactions.push(transaction);
+                    }
+                }
+                let star_amount =
+                    crate::message_content::StarAmount::from_wire(result.balance.as_ref(), true);
+                // cpp:804-806 — the own dialog refreshes the owned
+                // balance
+                if dialog_id == crate::dialog_manager::get_my_dialog_id(self) {
+                    let mut manager = std::mem::take(&mut self.star_manager);
+                    let mut env = TdStarEnv { td: &mut *self };
+                    manager.on_update_owned_star_amount(&mut env, star_amount);
+                    self.star_manager = manager;
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(td_api::StarTransactions {
+                        star_amount: Some(star_amount.get_star_amount_object()),
+                        transactions,
+                        next_offset: result.next_offset,
+                    });
+                }
+            }
+            // `GetTonTransactionsQuery` (cpp:817-1008) — the TON twin:
+            // the `starsTonAmount` balance band, the TON partner ladder
+            // and the unconditional owned-ton update.
+            StarNetKind::TonTransactions => {
+                let promise = self.star_manager.take_pending(|p| &mut p.ton_transactions);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let Ok(result) = telegram_api::payments_StarsStatus::parse(query.ok()) else {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(parse_error("payments_getStarsTransactions"));
+                    }
+                    return;
+                };
+                {
+                    let mut env = UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("star answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    };
+                    self.user_manager.on_get_users(
+                        &mut env,
+                        result.users.clone(),
+                        "GetTonTransactionsQuery",
+                    );
+                }
+                self.intake_chats(result.chats.clone(), "GetTonTransactionsQuery");
+                if !matches!(
+                    result.balance,
+                    Some(telegram_api::StarsAmount::starsTonAmount(_))
+                ) {
+                    tdutils::log_error!("Receive an invalid starsStatus balance");
+                    if let Some(mut promise) = promise {
+                        promise.set_error(Status::error(500, "Receive invalid response"));
+                    }
+                    return;
+                }
+                let mut transactions = Vec::with_capacity(result.history.len());
+                for transaction in result.history {
+                    if let Some(transaction) = convert_ton_transaction(self, transaction) {
+                        transactions.push(transaction);
+                    }
+                }
+                // cpp:1000-1001 — the TON balance always refreshes the
+                // owned count
+                let ton_amount =
+                    crate::message_content::TonAmount::from_wire(result.balance.as_ref(), true);
+                {
+                    let mut manager = std::mem::take(&mut self.star_manager);
+                    let mut env = TdStarEnv { td: &mut *self };
+                    manager.on_update_owned_ton_amount(&mut env, ton_amount);
+                    self.star_manager = manager;
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(td_api::TonTransactions {
+                        gram_amount: ton_amount.ton_amount,
+                        transactions,
+                        next_offset: result.next_offset,
+                    });
                 }
             }
             // `GetStarsSubscriptionsQuery` (cpp:1011-1052) — the
@@ -42523,6 +44061,135 @@ impl crate::star_manager::StarManagerEnv for TdStarEnv<'_> {
         }
     }
 
+    /// `GetStarsTransactionsQuery::send` (cpp:170-198) — the
+    /// write-access input peer at the send leg; the no-peer band runs
+    /// the C++ `on_error` 400 through the completed queue (the promise
+    /// error + the dialog-error head), the direction bits ride the
+    /// auto-flags, and `ascending` is the bot band.
+    fn send_get_star_transactions_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        subscription_id: String,
+        offset: String,
+        limit: i32,
+        direction: Option<td_api::TransactionDirection>,
+    ) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsTransactions — [net-inert]");
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            net.complete_error(
+                StarNetKind::Transactions { dialog_id },
+                400,
+                "Have no access to the chat",
+            );
+            return;
+        };
+        let flags = ((!subscription_id.is_empty()) as i32) << 3;
+        let (inbound, outbound) = star_transaction_direction_bits(direction.as_ref());
+        net.dispatch(
+            StarNetKind::Transactions { dialog_id },
+            telegram_api::Function::payments_getStarsTransactions(
+                telegram_api::payments_getStarsTransactions {
+                    flags,
+                    inbound,
+                    outbound,
+                    ascending: self.td.auth_manager.is_bot(),
+                    ton: false,
+                    subscription_id,
+                    peer: Some(Box::new(peer)),
+                    offset,
+                    limit,
+                },
+            ),
+        );
+    }
+
+    /// `GetStarsTransactionsQuery::send` (cpp:200-211) — the by-id
+    /// reload form over payments.getStarsTransactionsByID.
+    fn send_get_star_transactions_by_id_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        transaction_id: String,
+        is_refund: bool,
+    ) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsTransactionsByID — [net-inert]");
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) else {
+            net.complete_error(
+                StarNetKind::Transactions { dialog_id },
+                400,
+                "Have no access to the chat",
+            );
+            return;
+        };
+        net.dispatch(
+            StarNetKind::Transactions { dialog_id },
+            telegram_api::Function::payments_getStarsTransactionsByID(
+                telegram_api::payments_getStarsTransactionsByID {
+                    flags: 0,
+                    ton: false,
+                    peer: Some(Box::new(peer)),
+                    id: vec![telegram_api::InputStarsTransaction {
+                        flags: 0,
+                        refund: is_refund,
+                        id: transaction_id,
+                    }],
+                },
+            ),
+        );
+    }
+
+    /// `GetTonTransactionsQuery::send` (cpp:825-845) — the own dialog's
+    /// input peer, the ton flag set (the C++ CHECK band — the self peer
+    /// is always resolvable).
+    fn send_get_ton_transactions_query(
+        &mut self,
+        offset: String,
+        limit: i32,
+        direction: Option<td_api::TransactionDirection>,
+    ) {
+        let Some(net) = self.td.star_net() else {
+            return tdutils::log_info!("Send payments.getStarsTransactions (TON) — [net-inert]");
+        };
+        let my_dialog_id =
+            crate::dialog_id::DialogId::from_user_id(self.td.user_manager.get_my_id());
+        // the C++ CHECK(input_peer != nullptr) band — the self peer is
+        // always resolvable
+        let peer = crate::dialog_manager::get_input_peer(
+            self.td,
+            my_dialog_id,
+            crate::user_manager::AccessRights::Write,
+        )
+        .expect("the self input peer resolves");
+        let (inbound, outbound) = star_transaction_direction_bits(direction.as_ref());
+        net.dispatch(
+            StarNetKind::TonTransactions,
+            telegram_api::Function::payments_getStarsTransactions(
+                telegram_api::payments_getStarsTransactions {
+                    flags: 0,
+                    inbound,
+                    outbound,
+                    ascending: false,
+                    ton: true,
+                    subscription_id: String::new(),
+                    peer: Some(Box::new(peer)),
+                    offset,
+                    limit,
+                },
+            ),
+        );
+    }
+
     /// `GetStarsSubscriptionsQuery::send` (cpp:1024-1027) — the
     /// positional shape of the pinned scheme (the flags word stays 0, so
     /// the second field never serializes).
@@ -47021,6 +48688,518 @@ mod tests {
         }
 
         assert!(td.star_net_completed.lock().is_empty(), "drained");
+    }
+
+    type StarTransactionsSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::StarTransactions>>>>;
+
+    fn record_star_transactions() -> (Promise<td_api::StarTransactions>, StarTransactionsSlot) {
+        struct Rec(StarTransactionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::StarTransactions> for Rec {
+            fn set_value(&mut self, value: td_api::StarTransactions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: StarTransactionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type TonTransactionsSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::TonTransactions>>>>;
+
+    fn record_ton_transactions() -> (Promise<td_api::TonTransactions>, TonTransactionsSlot) {
+        struct Rec(TonTransactionsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::TonTransactions> for Rec {
+            fn set_value(&mut self, value: td_api::TonTransactions) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: TonTransactionsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    #[test]
+    fn star_transactions_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(star_transactions_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn star_transactions_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-star-tx");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        let my_dialog_id = crate::dialog_id::DialogId::from_user_id(td.user_manager.get_my_id());
+
+        // 1. getStarTransactions over the own dialog — the
+        //    subscription-id + inbound flags ride the wire, the partner
+        //    ladder converts and the own-dialog balance update fires.
+        let (promise, slot) = record_star_transactions();
+        with_star_manager(&mut td, |manager, env| {
+            manager.get_star_transactions(
+                env,
+                my_dialog_id,
+                "sub".to_owned(),
+                String::new(),
+                10,
+                Some(td_api::TransactionDirection::transactionDirectionIncoming(
+                    td_api::transactionDirectionIncoming {},
+                )),
+                promise,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getStarsTransactions::ID
+        );
+        let wire = telegram_api::payments_getStarsTransactions::parse(sent[0].query()).unwrap();
+        assert!(wire.flags & 1 << 3 != 0, "the subscription-id flag");
+        assert!(wire.inbound && !wire.outbound);
+        assert!(!wire.ascending, "a user client sends descending");
+        assert!(!wire.ton);
+        assert_eq!(wire.subscription_id, "sub");
+        assert_eq!(wire.limit, 10);
+
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsStatus {
+            flags: (1 << 0) | (1 << 3), // next_offset + history
+            balance: Some(telegram_api::StarsAmount::starsAmount(
+                telegram_api::starsAmount {
+                    amount: 42,
+                    nanos: 0,
+                },
+            )),
+            subscriptions: vec![],
+            subscriptions_next_offset: String::new(),
+            subscriptions_missing_balance: 0,
+            history: vec![
+                // a premium-bot deposit over the user band
+                telegram_api::StarsTransaction {
+                    flags: 0,
+                    refund: false,
+                    pending: false,
+                    failed: false,
+                    gift: false,
+                    reaction: false,
+                    stargift_upgrade: false,
+                    business_transfer: false,
+                    stargift_resale: false,
+                    posts_search: false,
+                    stargift_prepaid_upgrade: false,
+                    stargift_drop_original_details: false,
+                    phonegroup_message: false,
+                    stargift_auction_bid: false,
+                    offer: false,
+                    id: "tx1".to_owned(),
+                    amount: Some(telegram_api::StarsAmount::starsAmount(
+                        telegram_api::starsAmount {
+                            amount: 75,
+                            nanos: 0,
+                        },
+                    )),
+                    date: 100,
+                    peer: Some(
+                        telegram_api::StarsTransactionPeer::starsTransactionPeerPremiumBot(
+                            telegram_api::starsTransactionPeerPremiumBot,
+                        ),
+                    ),
+                    title: String::new(),
+                    description: String::new(),
+                    photo: None,
+                    transaction_date: 0,
+                    transaction_url: String::new(),
+                    bot_payload: vec![],
+                    msg_id: 0,
+                    extended_media: vec![],
+                    subscription_period: 0,
+                    giveaway_post_id: 0,
+                    stargift: None,
+                    floodskip_number: 0,
+                    starref_commission_permille: 0,
+                    starref_peer: None,
+                    starref_amount: None,
+                    paid_messages: 0,
+                    premium_gift_months: 0,
+                    ads_proceeds_from_date: 0,
+                    ads_proceeds_to_date: 0,
+                },
+                // a succeeded Fragment withdrawal
+                {
+                    let mut transaction = star_test_transaction(
+                        "tx2",
+                        Some(telegram_api::StarsAmount::starsAmount(
+                            telegram_api::starsAmount {
+                                amount: -10,
+                                nanos: 0,
+                            },
+                        )),
+                        telegram_api::StarsTransactionPeer::starsTransactionPeerFragment(
+                            telegram_api::starsTransactionPeerFragment,
+                        ),
+                    );
+                    transaction.flags |= 1 << 5; // transaction_date + transaction_url
+                    transaction.transaction_date = 200;
+                    transaction.transaction_url = "https://fragment.example".to_owned();
+                    transaction
+                },
+                // a bot-subscription purchase (a refunded expense
+                // records as a purchase, cpp:316) over a user peer
+                {
+                    let mut transaction = star_test_transaction(
+                        "tx3",
+                        Some(telegram_api::StarsAmount::starsAmount(
+                            telegram_api::starsAmount {
+                                amount: 100,
+                                nanos: 0,
+                            },
+                        )),
+                        telegram_api::StarsTransactionPeer::starsTransactionPeer(
+                            telegram_api::starsTransactionPeer {
+                                peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                                    user_id: 500,
+                                })),
+                            },
+                        ),
+                    );
+                    transaction.refund = true;
+                    transaction.flags |= (1 << 0) | (1 << 12); // title + subscription_period
+                    transaction.title = "Bot Subscription".to_owned();
+                    transaction.subscription_period = 30;
+                    transaction
+                },
+                // an invalid amount skips the transaction (cpp:240-242)
+                star_test_transaction(
+                    "tx4",
+                    Some(telegram_api::StarsAmount::starsTonAmount(
+                        telegram_api::starsTonAmount { amount: 5 },
+                    )),
+                    telegram_api::StarsTransactionPeer::starsTransactionPeerPremiumBot(
+                        telegram_api::starsTransactionPeerPremiumBot,
+                    ),
+                ),
+                // a bare user peer falls to the unsupported fallback
+                // (cpp:777-782)
+                star_test_transaction(
+                    "tx5",
+                    Some(telegram_api::StarsAmount::starsAmount(
+                        telegram_api::starsAmount {
+                            amount: 1,
+                            nanos: 0,
+                        },
+                    )),
+                    telegram_api::StarsTransactionPeer::starsTransactionPeer(
+                        telegram_api::starsTransactionPeer {
+                            peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                                user_id: 501,
+                            })),
+                        },
+                    ),
+                ),
+            ],
+            next_offset: "off2".to_owned(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_star_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(transactions)) => {
+                assert_eq!(transactions.star_amount.as_ref().unwrap().star_count, 42);
+                assert_eq!(transactions.next_offset, "off2");
+                assert_eq!(transactions.transactions.len(), 4, "the invalid one skips");
+                match &transactions.transactions[0].r#type {
+                    Some(td_api::StarTransactionType::starTransactionTypePremiumBotDeposit(_)) => {}
+                    other => panic!("unexpected tx1 type: {other:?}"),
+                }
+                match &transactions.transactions[1].r#type {
+                    Some(td_api::StarTransactionType::starTransactionTypeFragmentWithdrawal(
+                        withdrawal,
+                    )) => match &withdrawal.withdrawal_state {
+                        Some(td_api::RevenueWithdrawalState::revenueWithdrawalStateSucceeded(
+                            succeeded,
+                        )) => {
+                            assert_eq!(succeeded.date, 200);
+                            assert_eq!(succeeded.url, "https://fragment.example");
+                        }
+                        other => panic!("unexpected withdrawal state: {other:?}"),
+                    },
+                    other => panic!("unexpected tx2 type: {other:?}"),
+                }
+                match &transactions.transactions[2].r#type {
+                    Some(
+                        td_api::StarTransactionType::starTransactionTypeBotSubscriptionPurchase(
+                            subscription,
+                        ),
+                    ) => {
+                        assert_eq!(subscription.user_id, 500);
+                        assert_eq!(subscription.subscription_period, 30);
+                        assert_eq!(
+                            subscription.product_info.as_ref().unwrap().title,
+                            "Bot Subscription"
+                        );
+                    }
+                    other => panic!("unexpected tx3 type: {other:?}"),
+                }
+                assert!(transactions.transactions[2].is_refund);
+                assert!(matches!(
+                    &transactions.transactions[3].r#type,
+                    Some(td_api::StarTransactionType::starTransactionTypeUnsupported(
+                        _
+                    ))
+                ));
+            }
+            other => panic!("unexpected transactions result: {other:?}"),
+        }
+        // the own-dialog balance update went out (cpp:804-806)
+        assert!(
+            td.star_updates
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateOwnedStarCount(_)))
+        );
+
+        // 2. the by-id reload — payments.getStarsTransactionsByID with
+        //    the refund bit; the Unit promise rides the answer.
+        let (promise, slot) = record_ton_unit();
+        with_star_manager(&mut td, |manager, env| {
+            manager.reload_star_transaction(env, my_dialog_id, "tx1".to_owned(), true, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getStarsTransactionsByID::ID
+        );
+        let wire = telegram_api::payments_getStarsTransactionsByID::parse(sent[0].query()).unwrap();
+        assert!(!wire.ton);
+        assert_eq!(wire.id.len(), 1);
+        assert_eq!(wire.id[0].id, "tx1");
+        assert!(wire.id[0].refund);
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsStatus {
+            flags: 0,
+            balance: Some(telegram_api::StarsAmount::starsAmount(
+                telegram_api::starsAmount {
+                    amount: 42,
+                    nanos: 0,
+                },
+            )),
+            subscriptions: vec![],
+            subscriptions_next_offset: String::new(),
+            subscriptions_missing_balance: 0,
+            history: vec![],
+            next_offset: String::new(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_star_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the send-leg no-peer band — an unknown channel resolves no
+        //    write peer; the C++ on_error 400 answers the promise
+        //    (StarManager.cpp:174-176).
+        let unknown_channel = crate::dialog_id::DialogId::new(-1_000_000_999_999);
+        let (promise, slot) = record_star_transactions();
+        with_star_manager(&mut td, |manager, env| {
+            manager.get_star_transactions(
+                env,
+                unknown_channel,
+                String::new(),
+                String::new(),
+                10,
+                None,
+                promise,
+            );
+        });
+        td.dispatch_completed_star_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "Have no access to the chat");
+            }
+            other => panic!("unexpected no-peer result: {other:?}"),
+        }
+
+        // 4. getTonTransactions — the ton flag over the self peer, the
+        //    TON ladder and the unconditional owned-ton update.
+        let (promise, slot) = record_ton_transactions();
+        with_star_manager(&mut td, |manager, env| {
+            manager.get_ton_transactions(env, String::new(), 5, None, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::payments_getStarsTransactions::ID
+        );
+        let wire = telegram_api::payments_getStarsTransactions::parse(sent[0].query()).unwrap();
+        assert!(wire.ton);
+        assert!(!wire.ascending);
+        assert!(!wire.inbound && !wire.outbound);
+        assert_eq!(wire.limit, 5);
+
+        let mut answer = Vec::new();
+        telegram_api::payments_StarsStatus {
+            flags: 1 << 3, // history
+            balance: Some(telegram_api::StarsAmount::starsTonAmount(
+                telegram_api::starsTonAmount {
+                    amount: 90_000_000_000,
+                },
+            )),
+            subscriptions: vec![],
+            subscriptions_next_offset: String::new(),
+            subscriptions_missing_balance: 0,
+            history: vec![
+                // a gifted Fragment deposit (no withdrawal state)
+                {
+                    let mut transaction = star_test_transaction(
+                        "ton1",
+                        Some(telegram_api::StarsAmount::starsTonAmount(
+                            telegram_api::starsTonAmount { amount: 100 },
+                        )),
+                        telegram_api::StarsTransactionPeer::starsTransactionPeerFragment(
+                            telegram_api::starsTransactionPeerFragment,
+                        ),
+                    );
+                    transaction.gift = true;
+                    transaction
+                },
+                // a stake-dice stake (the prod-DC id, an expense)
+                star_test_transaction(
+                    "ton2",
+                    Some(telegram_api::StarsAmount::starsTonAmount(
+                        telegram_api::starsTonAmount { amount: -500 },
+                    )),
+                    telegram_api::StarsTransactionPeer::starsTransactionPeer(
+                        telegram_api::starsTransactionPeer {
+                            peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                                user_id: 8353936423,
+                            })),
+                        },
+                    ),
+                ),
+                // an invalid amount skips (the stars band)
+                star_test_transaction(
+                    "ton3",
+                    Some(telegram_api::StarsAmount::starsAmount(
+                        telegram_api::starsAmount {
+                            amount: 5,
+                            nanos: 0,
+                        },
+                    )),
+                    telegram_api::StarsTransactionPeer::starsTransactionPeerFragment(
+                        telegram_api::starsTransactionPeerFragment,
+                    ),
+                ),
+            ],
+            next_offset: String::new(),
+            chats: vec![],
+            users: vec![],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_star_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(transactions)) => {
+                assert_eq!(transactions.gram_amount, 90_000_000_000);
+                assert_eq!(transactions.transactions.len(), 2);
+                match &transactions.transactions[0].r#type {
+                    Some(td_api::TonTransactionType::tonTransactionTypeFragmentDeposit(
+                        deposit,
+                    )) => {
+                        assert!(deposit.is_gift);
+                        assert!(deposit.sticker.is_none(), "the ton-gift sticker seam parks");
+                    }
+                    other => panic!("unexpected ton1 type: {other:?}"),
+                }
+                assert!(matches!(
+                    &transactions.transactions[1].r#type,
+                    Some(td_api::TonTransactionType::tonTransactionTypeStakeDiceStake(_))
+                ));
+            }
+            other => panic!("unexpected ton transactions result: {other:?}"),
+        }
+        // the TON balance always refreshes the owned count (cpp:1001)
+        assert!(
+            td.star_updates
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateOwnedGramCount(_)))
+        );
+
+        assert!(td.star_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// The netted-test wire transaction with the shared defaults.
+    fn star_test_transaction(
+        id: &str,
+        amount: Option<telegram_api::StarsAmount>,
+        peer: telegram_api::StarsTransactionPeer,
+    ) -> telegram_api::StarsTransaction {
+        telegram_api::StarsTransaction {
+            flags: 0,
+            refund: false,
+            pending: false,
+            failed: false,
+            gift: false,
+            reaction: false,
+            stargift_upgrade: false,
+            business_transfer: false,
+            stargift_resale: false,
+            posts_search: false,
+            stargift_prepaid_upgrade: false,
+            stargift_drop_original_details: false,
+            phonegroup_message: false,
+            stargift_auction_bid: false,
+            offer: false,
+            id: id.to_owned(),
+            amount,
+            date: 100,
+            peer: Some(peer),
+            title: String::new(),
+            description: String::new(),
+            photo: None,
+            transaction_date: 0,
+            transaction_url: String::new(),
+            bot_payload: vec![],
+            msg_id: 0,
+            extended_media: vec![],
+            subscription_period: 0,
+            giveaway_post_id: 0,
+            stargift: None,
+            floodskip_number: 0,
+            starref_commission_permille: 0,
+            starref_peer: None,
+            starref_amount: None,
+            paid_messages: 0,
+            premium_gift_months: 0,
+            ads_proceeds_from_date: 0,
+            ads_proceeds_to_date: 0,
+        }
     }
 
     // ---- the support net slice: the help.* queries ride the dispatcher

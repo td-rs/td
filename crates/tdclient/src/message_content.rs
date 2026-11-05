@@ -14553,7 +14553,7 @@ impl MessageExtendedMedia {
     /// (MessageExtendedMedia.cpp:66-127) — the photo and video arms; the
     /// `get_live_photo_video_file_id` and `on_get_document` reads ride
     /// the seam.
-    fn init_from_media(
+    pub(crate) fn init_from_media(
         td: &mut dyn MessageContentContext,
         media: Option<telegram_api::MessageMedia>,
         owner_dialog_id: DialogId,

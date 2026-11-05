@@ -34,11 +34,13 @@
 //!   halves of StarManager.cpp:49-1400): the topup/gift/giveaway option
 //!   families, subscriptions (the `StarSubscription` conversion + the
 //!   owned-balance update), the subscription change/cancel/fulfill and
-//!   refund families, the revenue stats/withdrawal-url/ads-url set and
-//!   the paid-message revenue. The `GetStarsTransactionsQuery`/
-//!   `GetTonTransactionsQuery` pair keeps its `[blocked: net]` seam —
-//!   its answer conversion (the transaction partners/sources plane)
-//!   lands with its own slice.
+//!   refund families, the revenue stats/withdrawal-url/ads-url set, the
+//!   paid-message revenue and the transactions pair (the
+//!   `GetStarsTransactionsQuery` list/by-id forms + the
+//!   `GetTonTransactionsQuery` TON leg — the transaction partner ladder
+//!   with its users/chats intakes, the owned-balance updates and the
+//!   file-source registration live in the `Td::on_star_net_answer`
+//!   arms).
 //!
 //! Recorded divergences:
 //! - `on_update_stars_revenue_status` (StarManager.cpp:1761-1782) and the
@@ -46,18 +48,18 @@
 //!   converters ride the updates integration (the update arrives through
 //!   the net step; the StatisticsManager chat-revenue twin is the landed
 //!   shape to follow).
-//! - `get_star_transaction_file_source_id` (StarManager.cpp:1784-1797)
-//!   and `get_unused_star_transaction_field` (StarManager.cpp:1844-…)
-//!   serve the transactions answer halves and the file-reference plane;
-//!   they land with the net step that feeds them.
+//! - The C++ per-manager `star_transaction_file_source_ids_` dedup maps
+//!   (StarManager.cpp:1784-1797) collapse onto the
+//!   `FileReferenceManager` source interning (an equal source keeps its
+//!   id — the same dedup the C++ cache provides); the answer arms intern
+//!   `FileSource::StarTransaction` directly.
 //! - `reload_star_transaction`/`reload_owned_star_count` /
-//!   `reload_owned_ton_count` (StarManager.cpp:1739-1758) are the
-//!   MessagesManager/updates integration entry points; the validation
-//!   half (`can_manage_stars`) is real here and the query half rides the
-//!   same net seams.
+//!   `reload_owned_ton_count` (StarManager.cpp:1739-1758) are landed
+//!   here over the same seams; their C++ callers (UpdatesManager,
+//!   StarGiftManager, FileReferenceManager) ride their own planes.
 //! - The `G()->close_status()` guards of the query tails run here
-//!   against the env while the promise parks; when the net step lands
-//!   they re-run at the real send sites.
+//!   against the env while the promise parks; the real send sites run
+//!   past them on the Td side.
 
 use crate::dialog_id::{DialogId, DialogType};
 use crate::message_content::{StarAmount, TonAmount};
@@ -201,13 +203,15 @@ pub trait StarManagerEnv {
     }
 
     // ----------------------------------------------------------------
-    // The [blocked: net] query seams — each logs the query like the
-    // collapsed managers do; the answer halves land with the net step.
+    // The net query senders — the C++ ResultHandler send legs
+    // (StarManager.cpp:49-1400). The default arms are the net-inert
+    // logs (the net-inert tests and the pre-init windows); the answers
+    // drain through `Td::on_star_net_answer`.
     // ----------------------------------------------------------------
 
     /// `GetStarsTopupOptionsQuery::send` (payments.getStarsTopupOptions).
     fn send_get_star_payment_options_query(&mut self) {
-        tdutils::log_info!("Send payments.getStarsTopupOptions — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsTopupOptions — [net-inert]");
     }
 
     /// `GetStarsGiftOptionsQuery::send` (payments.getStarsGiftOptions).
@@ -215,13 +219,13 @@ pub trait StarManagerEnv {
         &mut self,
         _input_user: Option<telegram_api::InputUser>,
     ) {
-        tdutils::log_info!("Send payments.getStarsGiftOptions — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsGiftOptions — [net-inert]");
     }
 
     /// `GetStarsGiveawayOptionsQuery::send`
     /// (payments.getStarsGiveawayOptions).
     fn send_get_star_giveaway_payment_options_query(&mut self) {
-        tdutils::log_info!("Send payments.getStarsGiveawayOptions — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsGiveawayOptions — [net-inert]");
     }
 
     /// `GetStarsTransactionsQuery::send` (payments.getStarsTransactions).
@@ -233,7 +237,18 @@ pub trait StarManagerEnv {
         _limit: i32,
         _direction: Option<td_api::TransactionDirection>,
     ) {
-        tdutils::log_info!("Send payments.getStarsTransactions — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsTransactions — [net-inert]");
+    }
+
+    /// `GetStarsTransactionsQuery::send` (the by-id reload form —
+    /// payments.getStarsTransactionsByID, StarManager.cpp:200-211).
+    fn send_get_star_transactions_by_id_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _transaction_id: String,
+        _is_refund: bool,
+    ) {
+        tdutils::log_info!("Send payments.getStarsTransactionsByID — [net-inert]");
     }
 
     /// `GetTonTransactionsQuery::send`
@@ -244,13 +259,13 @@ pub trait StarManagerEnv {
         _limit: i32,
         _direction: Option<td_api::TransactionDirection>,
     ) {
-        tdutils::log_info!("Send payments.getStarsTransactions (TON) — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsTransactions (TON) — [net-inert]");
     }
 
     /// `GetStarsSubscriptionsQuery::send`
     /// (payments.getStarsSubscriptions).
     fn send_get_star_subscriptions_query(&mut self, _only_expiring: bool, _offset: String) {
-        tdutils::log_info!("Send payments.getStarsSubscriptions — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsSubscriptions — [net-inert]");
     }
 
     /// `ChangeStarsSubscriptionQuery::send`
@@ -260,7 +275,7 @@ pub trait StarManagerEnv {
         _subscription_id: String,
         _is_canceled: bool,
     ) {
-        tdutils::log_info!("Send payments.changeStarsSubscription — [blocked: net]");
+        tdutils::log_info!("Send payments.changeStarsSubscription — [net-inert]");
     }
 
     /// `BotCancelStarsSubscriptionQuery::send`
@@ -271,13 +286,13 @@ pub trait StarManagerEnv {
         _telegram_payment_charge_id: String,
         _is_canceled: bool,
     ) {
-        tdutils::log_info!("Send payments.botCancelStarsSubscription — [blocked: net]");
+        tdutils::log_info!("Send payments.botCancelStarsSubscription — [net-inert]");
     }
 
     /// `FulfillStarsSubscriptionQuery::send`
     /// (payments.fulfillStarsSubscription).
     fn send_fulfill_star_subscription_query(&mut self, _subscription_id: String) {
-        tdutils::log_info!("Send payments.fulfillStarsSubscription — [blocked: net]");
+        tdutils::log_info!("Send payments.fulfillStarsSubscription — [net-inert]");
     }
 
     /// `RefundStarsChargeQuery::send` (payments.refundStarsCharge).
@@ -286,12 +301,12 @@ pub trait StarManagerEnv {
         _input_user: telegram_api::InputUser,
         _telegram_payment_charge_id: String,
     ) {
-        tdutils::log_info!("Send payments.refundStarsCharge — [blocked: net]");
+        tdutils::log_info!("Send payments.refundStarsCharge — [net-inert]");
     }
 
     /// `GetStarsRevenueStatsQuery::send` (payments.getStarsRevenueStats).
     fn send_get_star_revenue_stats_query(&mut self, _dialog_id: DialogId, _is_dark: bool) {
-        tdutils::log_info!("Send payments.getStarsRevenueStats — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsRevenueStats — [net-inert]");
     }
 
     /// `GetStarsRevenueWithdrawalUrlQuery::send`
@@ -303,24 +318,24 @@ pub trait StarManagerEnv {
         _amount: i64,
         _input_check_password: telegram_api::InputCheckPasswordSRP,
     ) {
-        tdutils::log_info!("Send payments.getStarsRevenueWithdrawalUrl — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsRevenueWithdrawalUrl — [net-inert]");
     }
 
     /// `GetStarsRevenueAdsAccountUrlQuery::send`
     /// (payments.getStarsRevenueAdsAccountUrl).
     fn send_get_stars_revenue_ads_account_url_query(&mut self, _dialog_id: DialogId) {
-        tdutils::log_info!("Send payments.getStarsRevenueAdsAccountUrl — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsRevenueAdsAccountUrl — [net-inert]");
     }
 
     /// `GetGramRevenueStatsQuery::send`
     /// (payments.getStarsRevenueStats, the TON leg).
     fn send_get_gram_revenue_stats_query(&mut self, _is_dark: bool) {
-        tdutils::log_info!("Send payments.getStarsRevenueStats (TON) — [blocked: net]");
+        tdutils::log_info!("Send payments.getStarsRevenueStats (TON) — [net-inert]");
     }
 
     /// `GetPaidMessageRevenueQuery::send` (the paid-message revenue leg).
     fn send_get_paid_message_revenue_query(&mut self, _input_user: telegram_api::InputUser) {
-        tdutils::log_info!("Send payments.getPaidMessageRevenue — [blocked: net]");
+        tdutils::log_info!("Send payments.getPaidMessageRevenue — [net-inert]");
     }
 }
 
@@ -1101,6 +1116,51 @@ impl StarManager {
         }
     }
 
+    /// `reload_star_transaction` (StarManager.cpp:1739-1751) — the
+    /// by-id form of the transactions query (the file-reference
+    /// reload entry point); the caller's `Unit` promise rides the
+    /// `StarTransactions` answer through the wrapper.
+    pub fn reload_star_transaction(
+        &mut self,
+        env: &mut impl StarManagerEnv,
+        dialog_id: DialogId,
+        transaction_id: String,
+        is_refund: bool,
+        mut promise: Promise<()>,
+    ) {
+        if let Result::Err(status) = self.can_manage_stars(env, dialog_id, true) {
+            promise.set_error(status);
+            return;
+        }
+        self.pending.star_transactions.push(Promise::from_interface(
+            ReloadStarTransactionPromise {
+                promise: Some(promise),
+            },
+        ));
+        env.send_get_star_transactions_by_id_query(dialog_id, transaction_id, is_refund);
+    }
+
+    /// `reload_owned_star_count` (StarManager.cpp:1753-1755) — the
+    /// one-entry own-dialog transactions query with the empty promise
+    /// (the C++ `Auto()`; the balance update rides the answer intake).
+    pub fn reload_owned_star_count(&mut self, env: &mut impl StarManagerEnv) {
+        let my_dialog_id = env.my_dialog_id();
+        self.do_get_star_transactions(
+            env,
+            my_dialog_id,
+            String::new(),
+            String::new(),
+            1,
+            None,
+            Promise::default(),
+        );
+    }
+
+    /// `reload_owned_ton_count` (StarManager.cpp:1757-1759).
+    pub fn reload_owned_ton_count(&mut self, env: &mut impl StarManagerEnv) {
+        self.do_get_ton_transactions(env, String::new(), 1, None, Promise::default());
+    }
+
     /// `StarManager::get_current_state` (StarManager.cpp:1948-1955).
     pub fn get_current_state(&self, updates: &mut Vec<td_api::Update>) {
         if self.is_owned_star_count_inited {
@@ -1110,6 +1170,142 @@ impl StarManager {
             updates.push(self.get_update_owned_gram_count_object());
         }
     }
+}
+
+/// The `reload_star_transaction` promise wrapper
+/// (StarManager.cpp:1742-1749) — the `Unit` promise behind the
+/// `StarTransactions` answer (an error forwards, an ok drops the value).
+struct ReloadStarTransactionPromise {
+    promise: Option<Promise<()>>,
+}
+
+impl tdutils::promise::PromiseInterface<td_api::StarTransactions> for ReloadStarTransactionPromise {
+    fn set_value(&mut self, _value: td_api::StarTransactions) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_value(());
+        }
+    }
+
+    fn set_error(&mut self, error: Status) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_error(error);
+        }
+    }
+}
+
+/// `StarManager::get_unused_star_transaction_field`
+/// (StarManager.cpp:1844-1945) — the leftover-field audit over a
+/// converted transaction; the caller passes its consumed copy (the
+/// conversion clears each field it consumes, like the C++ in-place
+/// mutation, so a leftover names itself).
+pub(crate) fn get_unused_star_transaction_field(
+    transaction: &telegram_api::StarsTransaction,
+    product_info: Option<&td_api::ProductInfo>,
+    bot_payload: &str,
+    affiliate: Option<&td_api::AffiliateInfo>,
+    commission_per_mille: i32,
+) -> &'static str {
+    if product_info.is_some() {
+        return "product info";
+    }
+    if !bot_payload.is_empty() {
+        return "bot payload";
+    }
+    if affiliate.is_some() {
+        return "affiliate";
+    }
+    if commission_per_mille != 0 {
+        return "commission";
+    }
+    if !transaction.title.is_empty() {
+        return "title";
+    }
+    if !transaction.description.is_empty() {
+        return "description";
+    }
+    if transaction.photo.is_some() {
+        return "photo";
+    }
+    if !transaction.bot_payload.is_empty() {
+        return "bot payload";
+    }
+    if transaction.transaction_date != 0
+        || !transaction.transaction_url.is_empty()
+        || transaction.pending
+        || transaction.failed
+    {
+        return "withdrawal state";
+    }
+    if transaction.msg_id != 0 {
+        return "message identifier";
+    }
+    if transaction.gift {
+        return "gift";
+    }
+    if transaction.subscription_period != 0 {
+        return "subscription period";
+    }
+    if transaction.reaction {
+        return "reaction";
+    }
+    if !transaction.extended_media.is_empty() {
+        return "paid media";
+    }
+    if transaction.giveaway_post_id != 0 {
+        return "giveaway message";
+    }
+    if transaction.stargift.is_some() {
+        return "gift";
+    }
+    if transaction.floodskip_number != 0 {
+        return "API payment";
+    }
+    if transaction.starref_peer.is_some() {
+        return "affiliate info";
+    }
+    if transaction.starref_amount.is_some() {
+        return "affiliate payment info";
+    }
+    if transaction.starref_commission_permille != 0 {
+        return "affiliate commission info";
+    }
+    if transaction.stargift_upgrade {
+        return "gift upgrade";
+    }
+    if transaction.paid_messages != 0 {
+        return "paid messages";
+    }
+    if transaction.premium_gift_months != 0 {
+        return "Telegram Premium purchase";
+    }
+    if transaction.business_transfer {
+        return "business bot transfer";
+    }
+    if transaction.stargift_resale {
+        return "gift resale";
+    }
+    if transaction.ads_proceeds_from_date != 0 || transaction.ads_proceeds_to_date != 0 {
+        return "ads proceeds";
+    }
+    if transaction.posts_search {
+        return "post search";
+    }
+    if transaction.stargift_prepaid_upgrade {
+        return "prepaid gift upgrade";
+    }
+    if transaction.stargift_drop_original_details {
+        return "gift original details drop";
+    }
+    if transaction.phonegroup_message {
+        return "live story message";
+    }
+    if transaction.stargift_auction_bid {
+        return "gift auction bid";
+    }
+    if transaction.offer {
+        return "gift purchase offer";
+    }
+    ""
 }
 
 #[cfg(test)]
@@ -1169,6 +1365,7 @@ mod tests {
         star_giveaway_payment_options_seam: usize,
         star_transactions_seam: usize,
         ton_transactions_seam: usize,
+        star_transactions_by_id_seam: usize,
         star_subscriptions_seam: usize,
         change_star_subscription_seam: usize,
         bot_cancel_star_subscription_seam: usize,
@@ -1319,6 +1516,15 @@ mod tests {
             _direction: Option<td_api::TransactionDirection>,
         ) {
             self.star_transactions_seam += 1;
+        }
+
+        fn send_get_star_transactions_by_id_query(
+            &mut self,
+            _dialog_id: DialogId,
+            _transaction_id: String,
+            _is_refund: bool,
+        ) {
+            self.star_transactions_by_id_seam += 1;
         }
 
         fn send_get_ton_transactions_query(
@@ -1810,5 +2016,114 @@ mod tests {
         manager.on_update_owned_ton_amount(&mut env, TonAmount { ton_amount: 3 });
         manager.get_current_state(&mut updates);
         assert_eq!(updates.len(), 3);
+    }
+
+    #[test]
+    fn reload_star_transaction_validates_then_rides_the_by_id_seam() {
+        let mut env = TestEnv::authorized();
+        let mut manager = StarManager::new();
+
+        // a chat dialog rejects before the seam (the allow_self flag of
+        // the reload covers users and channels, never chats — cpp:1548)
+        let (promise, recorded) = recording_promise();
+        manager.reload_star_transaction(&mut env, DialogId::new(-42), "tx".into(), false, promise);
+        assert_eq!(env.star_transactions_by_id_seam, 0);
+        assert!(matches!(&*recorded.lock().unwrap(), Some(Result::Err(_))));
+
+        // the own dialog rides the by-id seam; the Unit promise parks
+        // behind the StarTransactions wrapper
+        let (promise, recorded) = recording_promise();
+        manager.reload_star_transaction(&mut env, DialogId::new(7), "tx".into(), true, promise);
+        assert_eq!(env.star_transactions_by_id_seam, 1);
+        assert_eq!(manager.pending.star_transactions.len(), 1);
+
+        // the wrapper forwards the error half; the ok half drops the
+        // value (cpp:1742-1749)
+        let mut parked = manager.pending.star_transactions.remove(0);
+        parked.set_error(Status::error(400, "STARS_BALANCE_INVALID"));
+        drop(parked);
+        match &*recorded.lock().unwrap() {
+            Some(Result::Err(status)) => assert_eq!(status.code(), 400),
+            _ => panic!("expected the forwarded query error"),
+        }
+
+        let (promise, recorded) = recording_promise();
+        manager.reload_star_transaction(&mut env, DialogId::new(7), "tx".into(), false, promise);
+        let mut parked = manager.pending.star_transactions.remove(0);
+        parked.set_value(td_api::StarTransactions::default());
+        drop(parked);
+        assert!(matches!(&*recorded.lock().unwrap(), Some(Result::Ok(()))));
+    }
+
+    #[test]
+    fn reload_owned_counts_ride_the_list_seams_with_empty_promises() {
+        let mut env = TestEnv::authorized();
+        let mut manager = StarManager::new();
+
+        manager.reload_owned_star_count(&mut env);
+        assert_eq!(env.premium_gift_sticker_set_loads, 0); // the reload skips the load chain
+        assert_eq!(env.star_transactions_seam, 1);
+        assert_eq!(manager.pending.star_transactions.len(), 1);
+
+        manager.reload_owned_ton_count(&mut env);
+        assert_eq!(env.ton_transactions_seam, 1);
+        assert_eq!(manager.pending.ton_transactions.len(), 1);
+
+        // the empty promises swallow an answer without a panic
+        let mut parked = manager.pending.star_transactions.remove(0);
+        parked.set_value(td_api::StarTransactions::default());
+        let mut parked = manager.pending.ton_transactions.remove(0);
+        parked.set_value(td_api::TonTransactions::default());
+    }
+
+    #[test]
+    fn get_unused_star_transaction_field_audits_leftovers() {
+        let transaction = telegram_api::StarsTransaction::default();
+        assert_eq!(
+            get_unused_star_transaction_field(&transaction, None, "", None, 0),
+            ""
+        );
+
+        let mut transaction = telegram_api::StarsTransaction {
+            title: "Suggested Post".into(),
+            ..telegram_api::StarsTransaction::default()
+        };
+        assert_eq!(
+            get_unused_star_transaction_field(&transaction, None, "", None, 0),
+            "title"
+        );
+        transaction.title.clear();
+
+        // the converted halves shadow the wire ones (cpp:1848-1859)
+        assert_eq!(
+            get_unused_star_transaction_field(
+                &transaction,
+                Some(&td_api::ProductInfo::default()),
+                "",
+                None,
+                0
+            ),
+            "product info"
+        );
+        assert_eq!(
+            get_unused_star_transaction_field(&transaction, None, "payload", None, 0),
+            "bot payload"
+        );
+        let affiliate = td_api::AffiliateInfo::default();
+        assert_eq!(
+            get_unused_star_transaction_field(&transaction, None, "", Some(&affiliate), 0),
+            "affiliate"
+        );
+        assert_eq!(
+            get_unused_star_transaction_field(&transaction, None, "", None, 77),
+            "commission"
+        );
+
+        // the deep wire bands (cpp:1872-1944)
+        transaction.pending = true;
+        assert_eq!(
+            get_unused_star_transaction_field(&transaction, None, "", None, 0),
+            "withdrawal state"
+        );
     }
 }

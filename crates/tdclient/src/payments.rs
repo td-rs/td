@@ -1891,7 +1891,7 @@ impl GiveawayParameters {
 /// `get_product_info_object` (InputInvoice.cpp:400-408). The description
 /// entities are built manager-less (see the module divergences); the
 /// photo object rides the [`PaymentsEnv::photo_object`] seam.
-fn get_product_info_object(
+pub(crate) fn get_product_info_object(
     env: &mut impl PaymentsEnv,
     title: &str,
     description: &str,
