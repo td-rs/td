@@ -10,10 +10,13 @@
 //!
 //! Heavily M.10-coupled surfaces (threads/forwards/statistics over
 //! MessagesManager) carry the `[blocked: M.10 integration]` seam tag; the
-//! network query tails carry `[blocked: net]` — the collapsed-actor
-//! convention: `Td` owns the struct, the [`MessageQueryManagerEnv`] trait
-//! carries the `G()`/option/cross-manager surfaces and the promise lands
-//! unanswered offline.
+//! per-message network query tails (net-drain 28) dispatch through the
+//! env net handle — the `MessageQueryNetKind` plane — while the
+//! search/history tails (net-drain 29) and the M.12/M.5-blocked loads
+//! carry `[blocked: net]` (the collapsed-actor convention: `Td` owns the
+//! struct, the [`MessageQueryManagerEnv`] trait carries the
+//! `G()`/option/cross-manager surfaces and the promise lands unanswered
+//! offline).
 
 use crate::chat_manager::ChannelId;
 use crate::dialog_id::{DialogId, MessageFullId, ServerMessageId};
@@ -72,7 +75,7 @@ pub trait MessageQueryManagerEnv {
     /// `dialog_manager_->have_input_peer` — the M.6 stub answers false
     /// (the full InputPeer family is the dialog-plane integration).
     fn have_input_peer(
-        &self,
+        &mut self,
         _dialog_id: DialogId,
         _from_group_chat: bool,
         _access_rights: crate::user_manager::AccessRights,
@@ -139,8 +142,10 @@ pub trait MessageQueryManagerEnv {
         let _ = promise;
     }
 
-    // -- the `[blocked: net]` query tails; each one owns the promise,
-    // -- which keeps the C++ request unanswered offline
+    // -- the query tails: the net-drain 28 per-message families dispatch
+    // -- through the env net handle (a handle-less env parks the promise
+    // -- with the net-inert log); the affected-history tail stays
+    // -- [blocked: net] until the net-drain 29 slice
     /// The affected-history refill (the Delete*/Read*/Unpin* queries).
     fn send_affected_history_query(
         &mut self,
@@ -150,54 +155,91 @@ pub trait MessageQueryManagerEnv {
         _promise: Promise<()>,
     ) {
     }
-    /// `GetExtendedMediaQuery` (MessageQueryManager.cpp:360-394).
+    /// `GetExtendedMediaQuery` (MessageQueryManager.cpp:360-394) —
+    /// dispatches `messages.getExtendedMedia` (the default arm is the
+    /// net-inert log); the answer arrives through the `Td` net drain
+    /// into [`MessageQueryManager::finish_get_message_extended_media`].
     fn send_get_extended_media_query(
         &mut self,
         _dialog_id: DialogId,
         _message_ids: Vec<MessageId>,
     ) {
+        tdutils::log_info!("Send messages.getExtendedMedia — [net-inert]");
     }
-    /// `GetFactCheckQuery` (MessageQueryManager.cpp:396-430).
-    fn send_get_fact_check_query(&mut self, _dialog_id: DialogId, _message_ids: Vec<MessageId>) {}
-    /// `ReportReadMetricsQuery` (MessageQueryManager.cpp:1028-1049).
+    /// `GetFactCheckQuery` (MessageQueryManager.cpp:396-430) — dispatches
+    /// `messages.getFactCheck`; the answer arrives through the `Td` net
+    /// drain into
+    /// [`MessageQueryManager::on_reload_message_fact_checks`].
+    fn send_get_fact_check_query(&mut self, _dialog_id: DialogId, _message_ids: Vec<MessageId>) {
+        tdutils::log_info!("Send messages.getFactCheck — [net-inert]");
+    }
+    /// `ReportReadMetricsQuery` (MessageQueryManager.cpp:1028-1049) —
+    /// dispatches `messages.reportReadMetrics` (fire-and-forget; the
+    /// default arm is the net-inert log).
     fn send_report_read_metrics_query(
         &mut self,
         _dialog_id: DialogId,
         _metrics: Vec<MessageReadMetric>,
     ) {
+        tdutils::log_info!("Send messages.reportReadMetrics — [net-inert]");
     }
-    /// `GetMessageReadParticipantsQuery` (MessageQueryManager.cpp:1096-1127).
+    /// `GetMessageReadParticipantsQuery`
+    /// (MessageQueryManager.cpp:1096-1127) — dispatches
+    /// `messages.getMessageReadParticipants` (the default arm parks the
+    /// promise net-inert); the answer arrives through the `Td` net drain
+    /// into [`MessageQueryManager::on_get_message_viewers`].
     fn send_get_message_read_participants_query(
         &mut self,
         _message_full_id: MessageFullId,
         _promise: Promise<td_api::MessageViewers>,
     ) {
+        tdutils::log_info!("Send messages.getMessageReadParticipants — [net-inert]");
     }
-    /// `GetMessagesViewsQuery` (MessageQueryManager.cpp:1129-1175).
+    /// `GetMessagesViewsQuery` (MessageQueryManager.cpp:1129-1175) —
+    /// dispatches `messages.getMessagesViews`; the answer arrives
+    /// through the `Td` net drain into
+    /// [`MessageQueryManager::finish_get_message_views`].
     fn send_get_messages_views_query(
         &mut self,
         _dialog_id: DialogId,
         _message_ids: Vec<MessageId>,
         _increment_view_counter: bool,
     ) {
+        tdutils::log_info!("Send messages.getMessagesViews — [net-inert]");
     }
-    /// `GetMessagesReactionsQuery` (MessageQueryManager.cpp:1177-1229).
+    /// `GetMessagesReactionsQuery` (MessageQueryManager.cpp:1177-1229) —
+    /// dispatches `messages.getMessagesReactions`; the answer arrives
+    /// through the `Td` net drain into
+    /// [`MessageQueryManager::try_reload_message_reactions`].
     fn send_get_messages_reactions_query(
         &mut self,
         _dialog_id: DialogId,
         _message_ids: Vec<MessageId>,
     ) {
+        tdutils::log_info!("Send messages.getMessagesReactions — [net-inert]");
     }
     /// `ReadMessagesContentsQuery`/`ReadChannelMessagesContentsQuery`
-    /// (MessageQueryManager.cpp:2210-2289).
+    /// (MessageQueryManager.cpp:2210-2289) — dispatches
+    /// `messages.readMessageContents` (user/chat dialogs) or
+    /// `channels.readMessageContents` (channel dialogs); the intake tag
+    /// encodes the C++ promise closure (MessageQueryManager.cpp:5054-5059/
+    /// 5091-5096) and the answer settles its counter walk through the
+    /// `Td` net drain.
     fn send_read_message_contents_query(
         &mut self,
         _dialog_id: DialogId,
         _message_ids: Vec<MessageId>,
+        _intake: ReadContentsIntake,
     ) {
+        tdutils::log_info!("Send messages.readMessageContents — [net-inert]");
     }
-    /// `GetEmojiGameInfoQuery` (MessageQueryManager.cpp:1388-1414).
-    fn send_get_emoji_game_info_query(&mut self, _promise: Promise<td_api::StakeDiceState>) {}
+    /// `GetEmojiGameInfoQuery` (MessageQueryManager.cpp:1388-1414) —
+    /// dispatches `messages.getEmojiGameInfo` (the default arm parks the
+    /// promise net-inert); the answer arrives through the `Td` net drain
+    /// into [`MessageQueryManager::on_get_emoji_game_info`].
+    fn send_get_emoji_game_info_query(&mut self, _promise: Promise<td_api::StakeDiceState>) {
+        tdutils::log_info!("Send messages.getEmojiGameInfo — [net-inert]");
+    }
 
     // -- the request-slice seams (the M.mp manager methods) -----------------
     /// `messages_manager_->can_add_message_tasks` — the ToDoList-content
@@ -273,8 +315,10 @@ pub trait MessageQueryManagerEnv {
         true
     }
 
-    // -- the `[blocked: net]` query tails of the request slice; each one
-    // -- owns the promise, which keeps the C++ request unanswered offline
+    // -- the query tails of the request slice: the per-message families
+    // -- (report/summarize/todo/ephemeral/bot-peer) dispatch through the
+    // -- env net handle (net-drain 28); the search/history tails stay
+    // -- [blocked: net] until the net-drain 29 slice
     /// `SearchMessagesGlobalQuery::send`
     /// (MessageQueryManager.cpp:3182-3204 payload).
     #[allow(clippy::too_many_arguments)]
@@ -340,15 +384,21 @@ pub trait MessageQueryManagerEnv {
     ) {
     }
     /// `ReportMusicListenQuery::send`
-    /// (MessageQueryManager.cpp:3679 payload).
+    /// (MessageQueryManager.cpp:3679 payload) — dispatches
+    /// `messages.reportMusicListen` (the default arm parks the promise
+    /// net-inert).
     fn send_report_music_listen_query(
         &mut self,
         _input_document: telegram_api::InputDocument,
         _duration: i32,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send messages.reportMusicListen — [net-inert]");
     }
-    /// `SummarizeTextQuery::send` (MessageQueryManager.cpp:3953 payload).
+    /// `SummarizeTextQuery::send` (MessageQueryManager.cpp:3953 payload)
+    /// — dispatches `messages.summarizeText` (the default arm parks the
+    /// promise net-inert); the answer's formatted-text intake runs in
+    /// the `Td` net drain.
     fn send_summarize_text_query(
         &mut self,
         _dialog_id: DialogId,
@@ -357,9 +407,13 @@ pub trait MessageQueryManagerEnv {
         _tone: String,
         _promise: Promise<td_api::FormattedText>,
     ) {
+        tdutils::log_info!("Send messages.summarizeText — [net-inert]");
     }
     /// `AppendToDoListQuery::send`
-    /// (MessageQueryManager.cpp:3970 payload).
+    /// (MessageQueryManager.cpp:3970 payload) — dispatches
+    /// `messages.appendTodoList` (the default arm parks the promise
+    /// net-inert); the answer re-enters `on_get_updates` with the
+    /// query-carried promise.
     fn send_append_to_do_list_query(
         &mut self,
         _dialog_id: DialogId,
@@ -367,9 +421,13 @@ pub trait MessageQueryManagerEnv {
         _items: Vec<crate::message_content::ToDoItem>,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send messages.appendTodoList — [net-inert]");
     }
     /// `ToggleToDoCompletedQuery::send`
-    /// (MessageQueryManager.cpp:3982 payload).
+    /// (MessageQueryManager.cpp:3982 payload) — dispatches
+    /// `messages.toggleTodoCompleted` (the default arm parks the promise
+    /// net-inert); the answer re-enters `on_get_updates` with the
+    /// query-carried promise.
     fn send_toggle_to_do_completed_query(
         &mut self,
         _dialog_id: DialogId,
@@ -378,10 +436,14 @@ pub trait MessageQueryManagerEnv {
         _not_done_task_ids: Vec<i32>,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send messages.toggleTodoCompleted — [net-inert]");
     }
     /// `EditEphemeralMessageQuery::send`
     /// (MessageQueryManager.cpp:4106-4129 payload) — the text/caption and
-    /// the media-upload completion funnel into the same query.
+    /// the media-upload completion funnel into the same query; this seam
+    /// dispatches `ephemeral.editMessage` for the no-media legs (the
+    /// default arm parks the promise net-inert; the media legs wait at
+    /// the M.12 upload seams).
     #[allow(clippy::too_many_arguments)]
     fn send_edit_ephemeral_message_query(
         &mut self,
@@ -395,6 +457,7 @@ pub trait MessageQueryManagerEnv {
         _reply_markup: Option<crate::reply_markup::ReplyMarkup>,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send ephemeral.editMessage — [net-inert]");
     }
     /// the media-content leg of `edit_ephemeral_message` — the
     /// `create_upload_message_content_query` +
@@ -431,16 +494,21 @@ pub trait MessageQueryManagerEnv {
     ) {
     }
     /// `DeleteParticipantReactionsQuery::send`
-    /// (MessageQueryManager.cpp:4800 payload).
+    /// (MessageQueryManager.cpp:4800 payload) — dispatches
+    /// `messages.deleteParticipantReactions` (the default arm parks the
+    /// promise net-inert).
     fn send_delete_participant_reactions_query(
         &mut self,
         _dialog_id: DialogId,
         _sender_dialog_id: DialogId,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send messages.deleteParticipantReactions — [net-inert]");
     }
     /// `DeleteParticipantReactionQuery::send`
-    /// (MessageQueryManager.cpp:4817 payload).
+    /// (MessageQueryManager.cpp:4817 payload) — dispatches
+    /// `messages.deleteParticipantReaction` (the default arm parks the
+    /// promise net-inert).
     fn send_delete_participant_reaction_query(
         &mut self,
         _dialog_id: DialogId,
@@ -448,6 +516,7 @@ pub trait MessageQueryManagerEnv {
         _sender_dialog_id: DialogId,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send messages.deleteParticipantReaction — [net-inert]");
     }
     /// `GetPersonalChannelHistoryQuery::send`
     /// (MessageQueryManager.cpp:4830 payload).
@@ -459,7 +528,10 @@ pub trait MessageQueryManagerEnv {
     ) {
     }
     /// `SendBotRequestedPeerQuery::send`
-    /// (MessageQueryManager.cpp:3330 payload).
+    /// (MessageQueryManager.cpp:3330 payload) — dispatches
+    /// `messages.sendBotRequestedPeer` (the default arm parks the promise
+    /// net-inert); the answer re-enters `on_get_updates` with the
+    /// query-carried promise.
     #[allow(clippy::too_many_arguments)]
     fn send_send_bot_requested_peer_query(
         &mut self,
@@ -470,9 +542,12 @@ pub trait MessageQueryManagerEnv {
         _shared_dialog_ids: Vec<DialogId>,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send messages.sendBotRequestedPeer — [net-inert]");
     }
     /// `DeleteEphemeralMessageQuery::send`
-    /// (MessageQueryManager.cpp:4735 payload).
+    /// (MessageQueryManager.cpp:4735 payload) — dispatches
+    /// `ephemeral.deleteMessage` (the default arm parks the promise
+    /// net-inert).
     fn send_delete_ephemeral_message_query(
         &mut self,
         _dialog_id: DialogId,
@@ -480,6 +555,7 @@ pub trait MessageQueryManagerEnv {
         _ephemeral_message_id: EphemeralMessageId,
         _promise: Promise<()>,
     ) {
+        tdutils::log_info!("Send ephemeral.deleteMessage — [net-inert]");
     }
 
     // -- the parse pre-steps + remaining probes of the request slice -------
@@ -605,6 +681,164 @@ pub trait MessageQueryManagerEnv {
     fn is_channel_public(&self, _channel_id: ChannelId) -> bool {
         false
     }
+}
+
+/// The MessageQueryManager in-flight query kinds of the per-message
+/// families — the C++ ResultHandler classes of the net-drain 28 slice
+/// (MessageQueryManager.cpp): the kinds carry the `Copy` handler members
+/// the answer halves route by (the `dialog_id_`/`sender_dialog_id_`
+/// behind the `on_get_dialog_error` heads, the `message_id_` behind the
+/// M.10-blocked message-error head); the non-`Copy` handler state (the
+/// message-id vectors, the promises) parks in [`PendingNetQueries`] on
+/// the `Td` beside them (the §5 FIFO-per-kind convention — Payments.cpp
+/// is free functions over `Td`, so that slice set the shape; this
+/// manager's env is a field split, so the parks ride the env, not the
+/// manager).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageQueryNetKind {
+    /// `GetExtendedMediaQuery` (MessageQueryManager.cpp:360-394) —
+    /// `messages.getExtendedMedia`; the answer's `Updates` half re-enters
+    /// `on_get_updates` and both halves finish the reload.
+    GetExtendedMedia,
+    /// `GetFactCheckQuery` (MessageQueryManager.cpp:396-430) —
+    /// `messages.getFactCheck`; both halves run `on_reload_message_fact_checks`.
+    GetFactCheck,
+    /// `GetMessagesViewsQuery` (MessageQueryManager.cpp:1129-1176) —
+    /// `messages.getMessagesViews`; both halves finish the views reload
+    /// (the count-mismatch 500 band between them).
+    GetMessagesViews,
+    /// `GetMessagesReactionsQuery` (MessageQueryManager.cpp:1177-1230)
+    /// — `messages.getMessagesReactions`; both halves re-arm
+    /// `try_reload_message_reactions(dialog_id, true)`.
+    GetMessagesReactions,
+    /// `ReportReadMetricsQuery` (MessageQueryManager.cpp:1028-1050) —
+    /// `messages.reportReadMetrics`; fire-and-forget (both C++ halves are
+    /// empty).
+    ReportReadMetrics,
+    /// `GetMessageReadParticipantsQuery`
+    /// (MessageQueryManager.cpp:1096-1128) —
+    /// `messages.getMessageReadParticipants`; the kind carries the
+    /// handler's `dialog_id_`/`message_id_` (the M.10-blocked
+    /// `on_get_message_error` head of the error half).
+    GetMessageReadParticipants {
+        dialog_id: DialogId,
+        message_id: MessageId,
+    },
+    /// `GetEmojiGameInfoQuery` (MessageQueryManager.cpp:1388-1415) —
+    /// `messages.getEmojiGameInfo`; the ok half runs
+    /// `on_get_emoji_game_info`.
+    GetEmojiGameInfo,
+    /// `ReportMusicListenQuery` (MessageQueryManager.cpp:1002-1027) —
+    /// `messages.reportMusicListen`; the ok half ignores the Bool.
+    ReportMusicListen,
+    /// `SendBotRequestedPeerQuery` (MessageQueryManager.cpp:306-358) —
+    /// `messages.sendBotRequestedPeer`; the ok half re-enters
+    /// `on_get_updates` with the query-carried promise.
+    SendBotRequestedPeer,
+    /// `DeleteParticipantReactionsQuery`
+    /// (MessageQueryManager.cpp:1965-2003) —
+    /// `messages.deleteParticipantReactions`; the kind carries the
+    /// handler's `dialog_id_`/`sender_dialog_id_` (the error head's
+    /// channel-type gate).
+    DeleteParticipantReactions {
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+    },
+    /// `DeleteParticipantReactionQuery`
+    /// (MessageQueryManager.cpp:2004-2045) —
+    /// `messages.deleteParticipantReaction`; the same error-head pair.
+    DeleteParticipantReaction {
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+    },
+    /// `EditEphemeralMessageQuery` (MessageQueryManager.cpp:1444-1518) —
+    /// `ephemeral.editMessage` (the text/caption/no-content legs; the
+    /// media legs wait at the M.12 upload seams); the ok half re-enters
+    /// `on_get_updates` with the query-carried promise.
+    EditEphemeralMessage,
+    /// `DeleteEphemeralMessageQuery` (MessageQueryManager.cpp:1888-1926)
+    /// — `ephemeral.deleteMessage`; the kind carries the handler's
+    /// `dialog_id_` (the error head).
+    DeleteEphemeralMessage { dialog_id: DialogId },
+    /// `ReadMessagesContentsQuery` (MessageQueryManager.cpp:2210-2246) /
+    /// `ReadChannelMessagesContentsQuery` (cpp:2248-2289) — one kind over
+    /// the two wire forms (the dialog type picks at the send leg); the
+    /// kind carries the promise-closure routing the C++ lambda encodes.
+    ReadMessageContents { intake: ReadContentsIntake },
+    /// `AppendToDoListQuery` (MessageQueryManager.cpp:1273-1310) —
+    /// `messages.appendTodoList`; the ok half re-enters `on_get_updates`
+    /// with the query-carried promise.
+    AppendToDoList,
+    /// `ToggleToDoCompletedQuery` (MessageQueryManager.cpp:1311-1347) —
+    /// `messages.toggleTodoCompleted`; the same re-entry.
+    ToggleToDoCompleted,
+    /// `SummarizeTextQuery` (MessageQueryManager.cpp:1231-1272) —
+    /// `messages.summarizeText`; the ok half runs the formatted-text
+    /// intake over the answer.
+    SummarizeText,
+}
+
+/// The answer-routing of the `read_message_contents_on_server` promise
+/// chain (MessageQueryManager.cpp:5050-5060/5086-5096) — which pending
+/// counter intake an answer settles (`Plain` is the log-event tail of the
+/// C++ `read_message_contents_on_server` itself; its Rust port is the
+/// messages plane's `openMessageContent` family, so only the two
+/// counter riders dispatch here today).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadContentsIntake {
+    /// the plain log-event promise (no manager counter) — constructed by
+    /// the messages plane's `openMessageContent` family when it lands.
+    #[allow(dead_code)]
+    Plain,
+    /// `on_read_message_reactions` (the `pending_read_reactions_` walk).
+    ReadReactions,
+    /// `on_read_message_poll_votes` (the `pending_read_poll_votes_` walk).
+    ReadPollVotes,
+}
+
+/// The parked query state of the net-drain 28 families, one list per
+/// answer kind (the C++ promises and handler vectors ride the
+/// ResultHandlers; the collapsed port parks them on the `Td` — the env
+/// field split carries them, the FIFO-per-kind convention, §5).
+#[derive(Default)]
+pub(crate) struct PendingNetQueries {
+    /// `GetExtendedMediaQuery::dialog_id_`/`message_ids_`.
+    pub(crate) extended_media: Vec<(DialogId, Vec<MessageId>)>,
+    /// `GetFactCheckQuery::dialog_id_` + the promise closure's
+    /// `message_ids`.
+    pub(crate) fact_checks: Vec<(DialogId, Vec<MessageId>)>,
+    /// `GetMessagesViewsQuery::dialog_id_`/`message_ids_`.
+    pub(crate) views: Vec<(DialogId, Vec<MessageId>)>,
+    /// `GetMessagesReactionsQuery::dialog_id_`/`message_ids_`.
+    pub(crate) reactions: Vec<(DialogId, Vec<MessageId>)>,
+    /// the `read_message_contents_on_server` promise closure's
+    /// `dialog_id`/`message_ids` + the intake the closure routes into —
+    /// the answer pops the first park of its own intake (a cross-intake
+    /// FIFO pop would walk the wrong counter map; the same-intake
+    /// residual rides the §5 FIFO pairing convention).
+    pub(crate) read_contents: Vec<(DialogId, Vec<MessageId>, ReadContentsIntake)>,
+    /// `GetMessageReadParticipantsQuery::promise_`.
+    pub(crate) message_viewers: Vec<Promise<td_api::MessageViewers>>,
+    /// `GetEmojiGameInfoQuery::promise_`.
+    pub(crate) emoji_game_info: Vec<Promise<td_api::StakeDiceState>>,
+    /// `ReportMusicListenQuery::promise_`.
+    pub(crate) music_listen: Vec<Promise<()>>,
+    /// `SendBotRequestedPeerQuery::promise_`.
+    pub(crate) bot_requested_peer: Vec<Promise<()>>,
+    /// `DeleteParticipantReactionsQuery::promise_`.
+    pub(crate) participant_reactions: Vec<Promise<()>>,
+    /// `DeleteParticipantReactionQuery::promise_`.
+    pub(crate) participant_reaction: Vec<Promise<()>>,
+    /// `EditEphemeralMessageQuery::promise_` (the no-upload legs).
+    pub(crate) ephemeral_edits: Vec<Promise<()>>,
+    /// `DeleteEphemeralMessageQuery::promise_`.
+    pub(crate) ephemeral_deletes: Vec<Promise<()>>,
+    /// `AppendToDoListQuery::promise_`.
+    pub(crate) to_do_appends: Vec<Promise<()>>,
+    /// `ToggleToDoCompletedQuery::promise_`.
+    pub(crate) to_do_toggles: Vec<Promise<()>>,
+    /// `SummarizeTextQuery::promise_`.
+    pub(crate) summarize_text: Vec<Promise<td_api::FormattedText>>,
 }
 
 /// `MessageThreadInfo` (MessageThreadInfo.h) — the discussion-thread answer
@@ -834,7 +1068,10 @@ impl EmojiGameInfo {
     /// `get_stake_dice_state_object` (EmojiGameInfo.cpp:47-61) — the
     /// suggested stake amounts come from the
     /// `ton_stakedice_stake_suggested_amounts` option; the C++
-    /// `to_integer<int64>` CHECKs the parse, so does the port.
+    /// `full_split` of the unset (empty) option yields no tokens — the
+    /// empty-filter carries that (a plain `split` would trip the
+    /// `to_integer` CHECK) — and the parsed amounts CHECK the parse like
+    /// the port always did.
     pub fn get_stake_dice_state_object(
         &self,
         env: &impl MessageQueryManagerEnv,
@@ -846,6 +1083,7 @@ impl EmojiGameInfo {
         let suggested_amounts: Vec<i64> = env
             .get_option_string("ton_stakedice_stake_suggested_amounts", "")
             .split(',')
+            .filter(|str| !str.is_empty())
             .map(|str| {
                 str.parse::<i64>()
                     .expect("Failed to parse the suggested stake amount")
@@ -1747,7 +1985,8 @@ impl MessageQueryManager {
     }
 
     /// `reload_message_extended_media` (MessageQueryManager.cpp:3262-3271)
-    /// — the dedup half; the query send is `[blocked: net]`.
+    /// — the dedup half; the query send dispatches through the env net
+    /// handle.
     pub fn reload_message_extended_media(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -1781,7 +2020,8 @@ impl MessageQueryManager {
     }
 
     /// `reload_message_fact_checks` (MessageQueryManager.cpp:3279-3295) —
-    /// the dedup half; the query send is `[blocked: net]`.
+    /// the dedup half; the query send dispatches through the env net
+    /// handle.
     pub fn reload_message_fact_checks(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -1821,8 +2061,8 @@ impl MessageQueryManager {
     }
 
     /// `send_message_view_metrics` (MessageQueryManager.cpp:3652-3678) —
-    /// validation, the local accumulate and the 5.0s re-arm; the flush is
-    /// the `[blocked: net]` tail.
+    /// validation, the local accumulate and the 5.0s re-arm; the flush
+    /// dispatches `messages.reportReadMetrics` through the env net handle.
     #[allow(clippy::too_many_arguments)]
     pub fn send_message_view_metrics(
         &mut self,
@@ -1882,8 +2122,8 @@ impl MessageQueryManager {
 
     /// `send_message_view_metrics_timeout`
     /// (MessageQueryManager.cpp:3691-3723) — the fold: summed view times,
-    /// max ratios, one metric per message; the report send is
-    /// `[blocked: net]`.
+    /// max ratios, one metric per message; the report send dispatches
+    /// through the env net handle.
     fn send_message_view_metrics_timeout(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -1923,8 +2163,8 @@ impl MessageQueryManager {
 
     /// `get_message_viewers` (MessageQueryManager.cpp:3731-3746) — the
     /// access check rides the message plane (`can_get_message_viewers`,
-    /// [blocked: M.10 integration]) and the query send is
-    /// `[blocked: net]`; the port carries the promise shape.
+    /// [blocked: M.10 integration]) and the query send dispatches
+    /// through the env net handle; the port carries the promise shape.
     pub fn get_message_viewers(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -1966,7 +2206,8 @@ impl MessageQueryManager {
     }
 
     /// `view_messages` (MessageQueryManager.cpp:3784-3809) — the dedup
-    /// sets and the 100-id chunking; each chunk send is `[blocked: net]`.
+    /// sets and the 100-id chunking; each chunk send dispatches through
+    /// the env net handle.
     pub fn view_messages(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -2063,9 +2304,9 @@ impl MessageQueryManager {
     }
 
     /// `try_reload_message_reactions` (MessageQueryManager.cpp:3838-3892)
-    /// — the queue drain and the request flag; the query send is
-    /// `[blocked: net]`, the no-input-peer retry rides the 0.2s deadline
-    /// (the SleepActor stand-in).
+    /// — the queue drain and the request flag; the query send dispatches
+    /// through the env net handle, the no-input-peer retry rides the 0.2s
+    /// deadline (the SleepActor stand-in).
     pub fn try_reload_message_reactions(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -2167,7 +2408,7 @@ impl MessageQueryManager {
 
     /// `read_message_reactions_on_server`
     /// (MessageQueryManager.cpp:5050-5060) — the pending counter bump;
-    /// the contents read is the `[blocked: net]` tail.
+    /// the contents read dispatches through the env net handle.
     pub fn read_message_reactions_on_server(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -2180,7 +2421,11 @@ impl MessageQueryManager {
                 .entry(MessageFullId::new(dialog_id, *message_id))
                 .or_default() += 1;
         }
-        env.send_read_message_contents_query(dialog_id, message_ids);
+        env.send_read_message_contents_query(
+            dialog_id,
+            message_ids,
+            ReadContentsIntake::ReadReactions,
+        );
     }
 
     /// `on_read_message_reactions` (MessageQueryManager.cpp:5062-5080).
@@ -2213,7 +2458,8 @@ impl MessageQueryManager {
     }
 
     /// `read_message_poll_votes_on_server`
-    /// (MessageQueryManager.cpp:5086-5097).
+    /// (MessageQueryManager.cpp:5086-5097) — the same contents dispatch
+    /// over the poll-votes intake.
     pub fn read_message_poll_votes_on_server(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -2227,7 +2473,11 @@ impl MessageQueryManager {
                 .entry(MessageFullId::new(dialog_id, *message_id))
                 .or_default() += 1;
         }
-        env.send_read_message_contents_query(dialog_id, message_ids);
+        env.send_read_message_contents_query(
+            dialog_id,
+            message_ids,
+            ReadContentsIntake::ReadPollVotes,
+        );
     }
 
     /// `on_read_message_poll_votes` (MessageQueryManager.cpp:5099-5121).
@@ -2265,7 +2515,8 @@ impl MessageQueryManager {
     }
 
     /// `get_emoji_game_info` (MessageQueryManager.cpp:4059-4069) — the
-    /// fetch is `[blocked: net]`; the promise lands in the query.
+    /// fetch dispatches `messages.getEmojiGameInfo` through the env net
+    /// handle; the promise parks with the query.
     pub fn get_emoji_game_info(
         &mut self,
         env: &mut impl MessageQueryManagerEnv,
@@ -4202,7 +4453,7 @@ mod tests {
         }
 
         fn have_input_peer(
-            &self,
+            &mut self,
             _dialog_id: DialogId,
             _from_group_chat: bool,
             _access_rights: crate::user_manager::AccessRights,
@@ -4388,9 +4639,15 @@ mod tests {
             &mut self,
             _dialog_id: DialogId,
             _message_ids: Vec<MessageId>,
+            intake: ReadContentsIntake,
         ) {
+            let tag = match intake {
+                ReadContentsIntake::Plain => "plain",
+                ReadContentsIntake::ReadReactions => "reactions",
+                ReadContentsIntake::ReadPollVotes => "poll-votes",
+            };
             self.sent_queries
-                .push("ReadMessageContentsQuery".to_owned());
+                .push(format!("ReadMessageContentsQuery:{tag}"));
         }
 
         fn send_update(&mut self, update: td_api::Update) {
@@ -4629,7 +4886,9 @@ mod tests {
             vec![message_full_id.get_message_id()],
         );
         assert!(manager.has_message_pending_read_reactions(message_full_id));
-        assert!(env.recorded("ReadMessageContentsQuery").len() == 1);
+        // the reactions rider routes its answer into the reactions intake
+        // (the C++ promise closure, MessageQueryManager.cpp:5054-5059)
+        assert_eq!(env.recorded("ReadMessageContentsQuery:reactions").len(), 1);
 
         // the ok result clears the counter
         manager.on_read_message_reactions(
@@ -4671,13 +4930,15 @@ mod tests {
         );
         assert_eq!(env.recorded("GetMessagesReactionsQuery").len(), send_count);
 
-        // the poll-vote counters mirror the machinery
+        // the poll-vote counters mirror the machinery (the closure now
+        // routes the poll-votes intake, MessageQueryManager.cpp:5091-5096)
         manager.read_message_poll_votes_on_server(
             &mut env,
             user_dialog(777),
             vec![message_full_id.get_message_id()],
         );
         assert!(manager.has_message_pending_read_poll_votes(message_full_id));
+        assert_eq!(env.recorded("ReadMessageContentsQuery:poll-votes").len(), 1);
         manager.on_read_message_poll_votes(
             &mut env,
             user_dialog(777),
