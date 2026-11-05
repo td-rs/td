@@ -50570,6 +50570,471 @@ mod tests {
         matches.pop().unwrap()
     }
 
+    /// The net-drain 36 band sweep — the remaining dispatcher families
+    /// round-trip their wire answers (the band ladders live beside the
+    /// tails in `group_call_manager.rs`).
+    #[test]
+    fn group_call_band_families_round_trip() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(group_call_band_families_round_trip_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn group_call_band_families_round_trip_impl() {
+        use crate::group_call_manager::{GroupCall, GroupCallEnv, GroupCallId, GroupCallManager};
+
+        struct NettedGroupCallEnv {
+            updates: Vec<td_api::Update>,
+        }
+        impl GroupCallEnv for NettedGroupCallEnv {
+            fn is_authorized(&self) -> bool {
+                true
+            }
+            fn is_bot(&self) -> bool {
+                false
+            }
+            fn send_update(&mut self, update: td_api::Update) {
+                self.updates.push(update);
+            }
+            fn get_input_peer_read(
+                &mut self,
+                _dialog_id: DialogId,
+            ) -> Option<telegram_api::InputPeer> {
+                Some(telegram_api::InputPeer::inputPeerEmpty(
+                    telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+
+        let (mut td, rec) = netted_td("netfix-group-call-bands");
+        let mut env = NettedGroupCallEnv {
+            updates: Vec::new(),
+        };
+        td.group_call_manager.on_get_group_call(
+            &mut env,
+            GroupCall {
+                group_call_id: GroupCallId::new(11),
+                input_group_call_id: 7100,
+                input_group_call_access_hash: 43,
+                chat_id: -1_000_000_000_777,
+                title: "band".to_owned(),
+                is_active: true,
+                is_joined: true,
+                can_be_managed: true,
+                ..GroupCall::default()
+            },
+        );
+
+        macro_rules! drive_unit {
+            ($td:ident, $rec:ident, $env:ident, $call:expr, $constructor:expr, $answer:expr) => {{
+                let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let capture = std::sync::Arc::clone(&slot);
+                let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                    *capture.lock().unwrap() = Some(result);
+                });
+                ($call)(&mut $td.group_call_manager, &mut $env, promise);
+                let sent = take_sent_query(&$rec, $constructor);
+                net_complete(sent, $answer);
+                $td.dispatch_completed_group_call_net();
+                slot
+            }};
+        }
+
+        let updates_answer = || {
+            let mut answer = Vec::new();
+            answer.extend_from_slice(&telegram_api::updatesCombined::ID.to_le_bytes());
+            telegram_api::updatesCombined {
+                updates: vec![],
+                users: vec![],
+                chats: vec![],
+                date: 1700000000,
+                seq_start: 0,
+                seq: 0,
+            }
+            .store(&mut answer);
+            answer
+        };
+
+        // SaveJoinAs (phone.saveDefaultGroupCallJoinAs → Bool)
+        {
+            let slot = drive_unit!(
+                td,
+                rec,
+                env,
+                |manager: &mut GroupCallManager, env: &mut NettedGroupCallEnv, promise| {
+                    manager.set_group_call_default_join_as(
+                        env,
+                        DialogId::new(-1_000_000_000_777),
+                        telegram_api::InputPeer::inputPeerEmpty(telegram_api::inputPeerEmpty {}),
+                        promise,
+                    );
+                },
+                telegram_api::phone_saveDefaultGroupCallJoinAs::ID,
+                {
+                    // `boolTrue#997275b5` — the bootstrap Bool has no
+                    // generated struct (the parse_wire_bool note).
+                    (0x9972_75b5u32).to_le_bytes().to_vec()
+                }
+            );
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // Each drive registers its own record — the registry is
+        // stateful across the drives (the live-story band, the
+        // scheduled band and the equality settles read it).
+        let register = |td: &mut Td,
+                        env: &mut NettedGroupCallEnv,
+                        is_live_story: bool,
+                        scheduled_start_date: i32| {
+            td.group_call_manager.on_get_group_call(
+                env,
+                GroupCall {
+                    group_call_id: GroupCallId::new(11),
+                    input_group_call_id: 7100,
+                    input_group_call_access_hash: 43,
+                    chat_id: -1_000_000_000_777,
+                    is_active: true,
+                    is_joined: true,
+                    can_be_managed: true,
+                    is_live_story,
+                    scheduled_start_date,
+                    ..GroupCall::default()
+                },
+            );
+        };
+
+        // SaveSendAs (phone.saveDefaultSendAs → Bool) — the tail's
+        // live-story band needs a live-story record.
+        {
+            register(&mut td, &mut env, true, 0);
+            let slot = drive_unit!(
+                td,
+                rec,
+                env,
+                |manager: &mut GroupCallManager, env: &mut NettedGroupCallEnv, promise| {
+                    manager.set_group_call_default_send_as(
+                        env,
+                        GroupCallId::new(11),
+                        DialogId::new(-1_000_000_000_777),
+                        false,
+                        telegram_api::InputPeer::inputPeerEmpty(telegram_api::inputPeerEmpty {}),
+                        promise,
+                    );
+                },
+                telegram_api::phone_saveDefaultSendAs::ID,
+                {
+                    // `boolTrue#997275b5` — the bootstrap Bool has no
+                    // generated struct (the parse_wire_bool note).
+                    (0x9972_75b5u32).to_le_bytes().to_vec()
+                }
+            );
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // ToggleStartSubscription (→ Updates)
+        {
+            register(&mut td, &mut env, false, 1700000000);
+            let slot = drive_unit!(
+                td,
+                rec,
+                env,
+                |manager: &mut GroupCallManager, env: &mut NettedGroupCallEnv, promise| {
+                    manager.toggle_group_call_start_subscribed(
+                        env,
+                        GroupCallId::new(11),
+                        true,
+                        promise,
+                    );
+                },
+                telegram_api::phone_toggleGroupCallStartSubscription::ID,
+                updates_answer()
+            );
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // ToggleSettings (the revoke form → Updates)
+        {
+            let slot = drive_unit!(
+                td,
+                rec,
+                env,
+                |manager: &mut GroupCallManager, _env: &mut NettedGroupCallEnv, promise| {
+                    manager.revoke_group_call_invite_link(GroupCallId::new(11), promise);
+                },
+                telegram_api::phone_toggleGroupCallSettings::ID,
+                updates_answer()
+            );
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // LeavePresentation (→ Updates)
+        {
+            let slot = drive_unit!(
+                td,
+                rec,
+                env,
+                |manager: &mut GroupCallManager, _env: &mut NettedGroupCallEnv, promise| {
+                    manager.end_group_call_screen_sharing(GroupCallId::new(11), promise);
+                },
+                telegram_api::phone_leaveGroupCallPresentation::ID,
+                updates_answer()
+            );
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // ToggleRecord (→ Updates)
+        {
+            let slot = drive_unit!(
+                td,
+                rec,
+                env,
+                |manager: &mut GroupCallManager, _env: &mut NettedGroupCallEnv, promise| {
+                    manager.toggle_group_call_recording(
+                        GroupCallId::new(11),
+                        true,
+                        String::new(),
+                        false,
+                        false,
+                        promise,
+                    );
+                },
+                telegram_api::phone_toggleGroupCallRecord::ID,
+                updates_answer()
+            );
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // ExportInvite (phone.exportGroupCallInvite → the link)
+        {
+            let slot: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<String>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager
+                .get_group_call_invite_link(GroupCallId::new(11), true, promise);
+            let sent = take_sent_query(&rec, telegram_api::phone_exportGroupCallInvite::ID);
+            let mut answer = Vec::new();
+            telegram_api::phone_ExportedGroupCallInvite {
+                link: "https://t.me/c/1".to_owned(),
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_group_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(link)) => {
+                    assert_eq!(link, "https://t.me/c/1");
+                }
+                other => panic!("unexpected invite-link result: {other:?}"),
+            }
+        }
+
+        // GetJoinAs (phone.getGroupCallJoinAs → the peers list)
+        {
+            let slot: std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::MessageSenders>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager.get_group_call_join_as(
+                &mut env,
+                DialogId::new(-1_000_000_000_777),
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::phone_getGroupCallJoinAs::ID);
+            let mut answer = Vec::new();
+            telegram_api::phone_JoinAsPeers {
+                peers: vec![],
+                chats: vec![],
+                users: vec![],
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_group_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(senders)) => {
+                    assert_eq!(senders.total_count, 0);
+                }
+                other => panic!("unexpected join-as result: {other:?}"),
+            }
+        }
+
+        // GetStars (phone.getGroupCallStars → the donors total)
+        {
+            let slot: std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::LiveStoryDonors>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            register(&mut td, &mut env, true, 0);
+            td.group_call_manager
+                .get_group_call_stars_from_server(GroupCallId::new(11), promise);
+            let sent = take_sent_query(&rec, telegram_api::phone_getGroupCallStars::ID);
+            let mut answer = Vec::new();
+            telegram_api::phone_GroupCallStars {
+                total_stars: 5_000_000_000,
+                top_donors: vec![],
+                chats: vec![],
+                users: vec![],
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_group_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(donors)) => {
+                    // the wire total is already in stars; the answer
+                    // applies only the ±2^51 clamp (cpp:1799-1816)
+                    assert_eq!(donors.total_star_count, 5_000_000_000);
+                }
+                other => panic!("unexpected stars result: {other:?}"),
+            }
+        }
+
+        // Invite (phone.inviteToGroupCall → Updates) — the not-a-video-
+        // chat band needs the non-live-story record back.
+        {
+            register(&mut td, &mut env, false, 0);
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager.invite_group_call_participants(
+                GroupCallId::new(11),
+                vec![telegram_api::InputUser::inputUserSelf(
+                    telegram_api::inputUserSelf {},
+                )],
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::phone_inviteToGroupCall::ID);
+            net_complete(sent, updates_answer());
+            td.dispatch_completed_group_call_net();
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // SendMessage (phone.sendGroupCallMessage → the star ledger +
+        // the updates hop) and its revert band. The paid-message bands
+        // ride the live-story record.
+        {
+            register(&mut td, &mut env, true, 0);
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager.send_group_call_message(
+                GroupCallId::new(11),
+                5,
+                false,
+                false,
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::phone_sendGroupCallMessage::ID);
+            net_fail(sent, 400, "STARS_WITHDRAWAL_FAILED");
+            td.dispatch_completed_group_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "STARS_WITHDRAWAL_FAILED");
+                }
+                other => panic!("unexpected send-message result: {other:?}"),
+            }
+        }
+
+        // DeleteSenderMessages (phone.deleteGroupCallParticipantMessages
+        // → Updates)
+        {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            register(&mut td, &mut env, true, 0);
+            td.group_call_manager.delete_group_call_messages_by_sender(
+                &mut env,
+                GroupCallId::new(11),
+                DialogId::new(-1_000_000_000_777),
+                false,
+                promise,
+            );
+            let sent = take_sent_query(
+                &rec,
+                telegram_api::phone_deleteGroupCallParticipantMessages::ID,
+            );
+            net_complete(sent, updates_answer());
+            td.dispatch_completed_group_call_net();
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // Leave (phone.leaveGroupCall → Updates)
+        {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager
+                .leave_group_call(GroupCallId::new(11), promise);
+            let sent = take_sent_query(&rec, telegram_api::phone_leaveGroupCall::ID);
+            net_complete(sent, updates_answer());
+            td.dispatch_completed_group_call_net();
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // DeclineInvite (phone.declineConferenceCallInvite → Updates)
+        {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            td.group_call_manager
+                .decline_group_call_invitation(42, promise);
+            let sent = take_sent_query(&rec, telegram_api::phone_declineConferenceCallInvite::ID);
+            net_complete(sent, updates_answer());
+            td.dispatch_completed_group_call_net();
+            assert!(matches!(
+                *slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+    }
+
     fn group_call_families_ride_the_dispatcher_impl() {
         use crate::group_call_manager::{GroupCall, GroupCallEnv, GroupCallId, GroupCallManager};
 

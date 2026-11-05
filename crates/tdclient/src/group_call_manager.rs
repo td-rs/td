@@ -306,6 +306,21 @@ pub(crate) struct GroupCallManager {
 /// clean-up bound.
 const MAX_TITLE_LENGTH: usize = 128;
 
+/// The `ToggleGroupCallSettingsQuery` field pair — the four arms share
+/// the class; each arm sets one field (the C++ flag-mask set:
+/// JOIN_MUTED_MASK = 1, RESET_INVITE_HASH_MASK = 2,
+/// MESSAGES_ENABLED_MASK = 4, SEND_PAID_MESSAGES_STARS_MASK = 8).
+enum ToggleSettingsForm {
+    /// `toggle_group_call_mute_new_participants` (cpp:5617).
+    JoinMuted(bool),
+    /// `revoke_group_call_invite_link` (cpp:6429).
+    ResetInviteHash,
+    /// `toggle_group_call_are_messages_enabled` (cpp:5704).
+    MessagesEnabled(bool),
+    /// `set_group_call_paid_message_star_count` (cpp:5789).
+    PaidMessageStarCount(i64),
+}
+
 impl GroupCallManager {
     pub(crate) fn new() -> GroupCallManager {
         GroupCallManager::default()
@@ -316,7 +331,8 @@ impl GroupCallManager {
     }
 
     /// The registry intake (GroupCallManager::on_get_group_call) — the
-    /// `update_group_call` refire rides the updates plane (net-drain 37).
+    /// `update_group_call` refire rides the updates plane (net-drain
+    /// 37); unused until that refire lands, hence the allow.
     #[allow(dead_code)]
     pub(crate) fn on_get_group_call(&mut self, env: &mut impl GroupCallEnv, group_call: GroupCall) {
         let group_call_id = group_call.group_call_id;
@@ -741,7 +757,7 @@ impl GroupCallManager {
         );
     }
 
-    /// `toggle_group_call_mute_new_participants` (cpp:4095-4132) — the
+    /// `toggle_group_call_mute_new_participants` (cpp:5617-5655) — the
     /// shared ToggleGroupCallSettings leg (the can-manage band resolves
     /// at the request arm).
     pub(crate) fn toggle_group_call_mute_new_participants(
@@ -770,12 +786,15 @@ impl GroupCallManager {
         self.pending.toggle_settings.push(Promise::default());
         self.send_group_call_net_query(
             GroupCallNetKind::ToggleSettings,
-            Self::toggle_settings_function(&group_call, 0, Some(mute_new_participants), None, None),
+            Self::toggle_settings_function(
+                &group_call,
+                ToggleSettingsForm::JoinMuted(mute_new_participants),
+            ),
             "phone.toggleGroupCallSettings (join_muted)",
         );
     }
 
-    /// `toggle_group_call_are_messages_enabled` (cpp:4180-4216).
+    /// `toggle_group_call_are_messages_enabled` (cpp:5704-5741).
     pub(crate) fn toggle_group_call_are_messages_enabled(
         &mut self,
         env: &mut impl GroupCallEnv,
@@ -802,12 +821,15 @@ impl GroupCallManager {
         self.pending.toggle_settings.push(Promise::default());
         self.send_group_call_net_query(
             GroupCallNetKind::ToggleSettings,
-            Self::toggle_settings_function(&group_call, 2, None, Some(are_messages_enabled), None),
+            Self::toggle_settings_function(
+                &group_call,
+                ToggleSettingsForm::MessagesEnabled(are_messages_enabled),
+            ),
             "phone.toggleGroupCallSettings (messages_enabled)",
         );
     }
 
-    /// `set_group_call_paid_message_star_count` (cpp:4266-4303).
+    /// `set_group_call_paid_message_star_count` (cpp:5789-5826).
     pub(crate) fn set_group_call_paid_message_star_count(
         &mut self,
         env: &mut impl GroupCallEnv,
@@ -836,16 +858,13 @@ impl GroupCallManager {
             GroupCallNetKind::ToggleSettings,
             Self::toggle_settings_function(
                 &group_call,
-                3,
-                None,
-                None,
-                Some(paid_message_star_count),
+                ToggleSettingsForm::PaidMessageStarCount(paid_message_star_count),
             ),
             "phone.toggleGroupCallSettings (send_paid_messages_stars)",
         );
     }
 
-    /// `revoke_group_call_invite_link` (cpp:1180-1199) — the
+    /// `revoke_group_call_invite_link` (cpp:6429-6431) — the
     /// reset_invite_hash form of ToggleGroupCallSettingsQuery.
     pub(crate) fn revoke_group_call_invite_link(
         &mut self,
@@ -866,7 +885,7 @@ impl GroupCallManager {
         self.pending.toggle_settings.push(promise);
         self.send_group_call_net_query(
             GroupCallNetKind::ToggleSettings,
-            Self::toggle_settings_function(&group_call, 1, None, None, None),
+            Self::toggle_settings_function(&group_call, ToggleSettingsForm::ResetInviteHash),
             "phone.toggleGroupCallSettings (reset_invite_hash)",
         );
     }
@@ -875,32 +894,18 @@ impl GroupCallManager {
     /// (cpp:1029-1049): the flag masks + the field pair.
     fn toggle_settings_function(
         group_call: &GroupCall,
-        form: i32,
-        join_muted: Option<bool>,
-        messages_enabled: Option<bool>,
-        paid_message_star_count: Option<i64>,
+        form: ToggleSettingsForm,
     ) -> tdmtproto::telegram_api::Function {
-        // form: 0 = join_muted, 1 = reset_invite_hash,
-        // 2 = messages_enabled, 3 = send_paid_messages_stars — the C++
-        // flag-mask set (JOIN_MUTED_MASK = 1, RESET_INVITE_HASH_MASK = 2,
-        // MESSAGES_ENABLED_MASK = 4, SEND_PAID_MESSAGES_STARS_MASK = 8).
-        let mut flags = 0;
-        if form == 0 {
-            flags |= 1;
-        }
-        if form == 1 {
-            flags |= 2;
-        }
-        if form == 2 {
-            flags |= 4;
-        }
-        if form == 3 {
-            flags |= 8;
-        }
+        let (flags, join_muted, messages_enabled, paid_message_star_count) = match form {
+            ToggleSettingsForm::JoinMuted(value) => (1, Some(value), None, None),
+            ToggleSettingsForm::ResetInviteHash => (2, None, None, None),
+            ToggleSettingsForm::MessagesEnabled(value) => (4, None, Some(value), None),
+            ToggleSettingsForm::PaidMessageStarCount(value) => (8, None, None, Some(value)),
+        };
         tdmtproto::telegram_api::Function::phone_toggleGroupCallSettings(
             tdmtproto::telegram_api::phone_toggleGroupCallSettings {
                 flags,
-                reset_invite_hash: form == 1,
+                reset_invite_hash: matches!(form, ToggleSettingsForm::ResetInviteHash),
                 call: Some(group_call.input_group_call()),
                 join_muted: join_muted.unwrap_or(false),
                 messages_enabled: messages_enabled.unwrap_or(false),
@@ -1873,7 +1878,7 @@ mod tests {
         let _ = call;
     }
 
-    /// `toggle_group_call_mute_new_participants` (cpp:4095-4132) — the
+    /// `toggle_group_call_mute_new_participants` (cpp:5617-5655) — the
     /// equality settle + the update emission + the net-inert dispatch.
     #[test]
     fn toggle_mute_new_participants() {
@@ -1914,7 +1919,7 @@ mod tests {
         );
     }
 
-    /// `revoke_group_call_invite_link` (cpp:1180-1199) — the manage
+    /// `revoke_group_call_invite_link` (cpp:6429-6431) — the manage
     /// band and the net-inert dispatch.
     #[test]
     fn revoke_invite_link_bands() {
