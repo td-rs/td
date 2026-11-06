@@ -3627,6 +3627,14 @@ pub(crate) type DialogParticipantNetHandle =
 /// legs run inside the manager over the env's peer/permission reads.
 pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::ForumTopicNetKind>;
 
+/// The cloned attach-menu dispatch surface the
+/// [`crate::attach_menu_manager::AttachMenuManager`] holds — the
+/// net-drain 42 families' send legs (the reload/single-bot/toggle
+/// queries); the answers drain through [`Td::on_attach_menu_net_answer`].
+/// Manager-held (the forum-topic shape): the send legs run inside the
+/// manager over the env's input-user reads.
+pub(crate) type AttachMenuNetHandle = NetKindHandle<crate::attach_menu_manager::AttachMenuNetKind>;
+
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
 /// completes into `on_dialog_gift_transferred` with the empty to-dialog
@@ -6069,6 +6077,12 @@ pub struct Td {
     /// [`Td::on_forum_topic_net_answer`].
     forum_topic_net_completed:
         Arc<Mutex<Vec<(crate::forum_topic_manager::ForumTopicNetKind, NetQuery)>>>,
+    /// The attach-menu net completed queue (the `AttachMenuNetKind`
+    /// tags; the net-drain 42 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_attach_menu_net_answer`].
+    attach_menu_net_completed:
+        Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6579,6 +6593,7 @@ impl Td {
             web_browser_net_completed: Arc::new(Mutex::new(Vec::new())),
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
+            attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7068,6 +7083,7 @@ impl Td {
         self.web_browser_manager.net = self.web_browser_net();
         self.group_call_manager.net = self.group_call_net();
         self.forum_topic_manager.net = self.forum_topic_net();
+        self.attach_menu_manager.net = self.attach_menu_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -8889,6 +8905,7 @@ impl Td {
         self.dispatch_completed_web_browser_net();
         self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_forum_topic_net();
+        self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9233,6 +9250,18 @@ impl Td {
         Some(ForumTopicNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.forum_topic_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned attach-menu dispatch surface the
+    /// [`crate::attach_menu_manager::AttachMenuManager`] holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn attach_menu_net(&self) -> Option<AttachMenuNetHandle> {
+        Some(AttachMenuNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.attach_menu_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17425,6 +17454,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// The net-drain 42 attach-menu answers (the dispatcher callback
+    /// parks) — the reload/single-bot/toggle intakes route into the
+    /// manager's answer handlers over the split env.
+    fn dispatch_completed_attach_menu_net(&mut self) {
+        let completed = std::mem::take(&mut *self.attach_menu_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_attach_menu_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -19572,6 +19612,114 @@ impl Td {
             total_count: 0,
             messages: result,
         });
+    }
+
+    /// Route one attach-menu net answer by kind — the ResultHandler halves
+    /// of the net-drain 42 families (AttachMenuManager.cpp:35-120). The
+    /// intakes/conversions live in the manager's answer handlers; the
+    /// toggle's two tails (the success-chain into `reload_attach_menu_bots`,
+    /// the error's promise-less reload first) run here over the split env.
+    fn on_attach_menu_net_answer(
+        &mut self,
+        kind: crate::attach_menu_manager::AttachMenuNetKind,
+        query: NetQuery,
+    ) {
+        use crate::attach_menu_manager::{AttachMenuBotsAnswer, AttachMenuNetKind as K};
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+
+        match kind {
+            // `GetAttachMenuBotsQuery::on_result`/`on_error` (cpp:47-60):
+            // the Result/constructor split routes into
+            // `on_reload_attach_menu_bots` — the error band arms the short
+            // retry and settles the parked promises Unit (cpp:615-618),
+            // the answer runs the users intake + the cache/update/save
+            // walk (cpp:610-660).
+            K::GetAttachMenuBots => {
+                let (mut env, manager) = attach_menu_env_split(self);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    return manager.on_reload_attach_menu_bots(&mut env, Err(status));
+                }
+                let answer = match telegram_api::AttachMenuBots::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        return manager.on_reload_attach_menu_bots(
+                            &mut env,
+                            Err(parse_error("messages.getAttachMenuBots")),
+                        );
+                    }
+                };
+                tdutils::log_info!("Receive result for GetAttachMenuBotsQuery");
+                let answer = match answer {
+                    telegram_api::AttachMenuBots::attachMenuBotsNotModified(_) => {
+                        AttachMenuBotsAnswer::NotModified
+                    }
+                    telegram_api::AttachMenuBots::attachMenuBots(bots) => {
+                        AttachMenuBotsAnswer::Bots(bots)
+                    }
+                };
+                manager.on_reload_attach_menu_bots(&mut env, Ok(answer));
+            }
+            // `GetAttachMenuBotQuery::on_result`/`on_error` (cpp:75-88):
+            // the Result routes into `on_get_attach_menu_bot` with the
+            // kind-carried user id (the C++ lambda capture) and the
+            // FIFO-parked promise (§5) — the users intake, the wire
+            // conversion and the cache walk live in the manager.
+            K::GetAttachMenuBot { user_id } => {
+                let Some(promise) = pop_head(&mut self.attach_menu_manager.pending_bot_queries)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::AttachMenuBotsBot::parse(query.ok()) {
+                        Ok(bot) => Ok(bot),
+                        Err(_) => Err(parse_error("messages.getAttachMenuBot")),
+                    }
+                };
+                tdutils::log_info!("Receive result for GetAttachMenuBotQuery");
+                let (mut env, manager) = attach_menu_env_split(self);
+                manager.on_get_attach_menu_bot(&mut env, user_id, result, promise);
+            }
+            // `ToggleBotInAttachMenuQuery::on_result`/`on_error`
+            // (cpp:103-119): the fetch failure rides the C++ `on_error`
+            // (the promise-less reload + the promise error), the Bool
+            // answer logs the false band (cpp:105-107) and success-chains
+            // the promise into `reload_attach_menu_bots` (cpp:795-799).
+            K::ToggleBotInAttachMenu => {
+                let Some(mut promise) =
+                    pop_head(&mut self.attach_menu_manager.pending_toggle_promises)
+                else {
+                    return;
+                };
+                let (mut env, manager) = attach_menu_env_split(self);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    manager.reload_attach_menu_bots(&mut env, Promise::default());
+                    return promise.set_error(status);
+                }
+                let Some(result) = parse_wire_bool_value(query.ok()) else {
+                    let status = parse_error("messages.toggleBotInAttachMenu");
+                    manager.reload_attach_menu_bots(&mut env, Promise::default());
+                    return promise.set_error(status);
+                };
+                tdutils::log_info!("Receive result for ToggleBotInAttachMenuQuery");
+                if !result {
+                    tdutils::log_error!("Failed to add a bot to attachment menu");
+                }
+                manager.reload_attach_menu_bots(&mut env, promise);
+            }
+        }
     }
 
     /// `get_found_messages_object`'s per-id build
@@ -45397,6 +45545,41 @@ pub(crate) fn forum_topic_env_split(
     )
 }
 
+/// The [`AttachMenuEnv`] over the split `Td` borrows + the manager — the
+/// net-answer drain's view (the `forum_topic_env_split` convention; the
+/// request arms build the same env inline over the request borrows).
+pub(crate) fn attach_menu_env_split(
+    td: &mut Td,
+) -> (
+    AttachMenuEnv<'_>,
+    &mut crate::attach_menu_manager::AttachMenuManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        file_manager,
+        file_reference_manager,
+        attach_menu_manager,
+        attach_menu_updates,
+        ..
+    } = td;
+    (
+        AttachMenuEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+            file_reference_manager,
+            updates: attach_menu_updates,
+        },
+        attach_menu_manager,
+    )
+}
+
 /// The `G()`/manager slice of the collapsed StickersManager (the M.st
 /// request plane). The file reads go through the shared FileManager
 /// registry behind the mutex (the `MessageQueryEnv` convention).
@@ -51095,6 +51278,7 @@ mod tests {
         td.group_call_manager.net = td.group_call_net();
         td.statistics_manager.net = td.statistics_net();
         td.forum_topic_manager.net = td.forum_topic_net();
+        td.attach_menu_manager.net = td.attach_menu_net();
         (td, rec, callback)
     }
 
@@ -54103,6 +54287,382 @@ mod tests {
             dialog_id,
             crate::forum_topic::ForumTopicId::new(forum_topic_id),
         )
+    }
+
+    /// The net-drain 42 attach-menu round-trips — the three families'
+    /// send legs dispatch through the installed handle and the wire
+    /// answers settle the parked promises (the band ladders live in
+    /// `attach_menu_manager.rs`; these cover the dispatcher plumbing, the
+    /// toggle chains and the read conversions).
+    #[test]
+    fn attach_menu_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(attach_menu_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn attach_menu_families_ride_the_dispatcher_impl() {
+        use crate::user_manager::UserId;
+
+        let (mut td, rec) = netted_td("netfix-attach-menu");
+        // the addable attach-menu bot (the request legs resolve + gate on
+        // it; the answer's users intake re-lands the same record)
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = &mut td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager.as_mut().expect("option manager set"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.on_get_user(
+                &mut env,
+                telegram_api::User::user(telegram_api::user {
+                    flags: 1 | (1 << 1) | (1 << 3), // ACCESS_HASH | FIRST_NAME | USERNAME
+                    access_hash: 77,
+                    first_name: "Attach".to_owned(),
+                    username: "attach_bot".to_owned(),
+                    bot: true,
+                    bot_attach_menu: true,
+                    ..telegram_api::user::default()
+                }),
+                "test",
+            );
+        }
+
+        fn unit_slot() -> (tdutils::promise::Promise<()>, UnitSlot) {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+
+        /// A wire `attachMenuBot` with a valid default_static icon.
+        fn wire_bot(user_id: i64) -> telegram_api::AttachMenuBot {
+            telegram_api::AttachMenuBot {
+                flags: 0,
+                inactive: false,
+                has_settings: false,
+                request_write_access: true,
+                show_in_attach_menu: true,
+                show_in_side_menu: false,
+                side_menu_disclaimer_needed: false,
+                bot_id: user_id,
+                short_name: "attach_bot".to_owned(),
+                peer_types: vec![telegram_api::AttachMenuPeerType::attachMenuPeerTypePM(
+                    telegram_api::attachMenuPeerTypePM,
+                )],
+                icons: vec![telegram_api::AttachMenuBotIcon {
+                    flags: 0,
+                    name: "default_static".to_owned(),
+                    icon: Some(telegram_api::Document::document(telegram_api::document {
+                        flags: 0,
+                        id: 100,
+                        access_hash: 7,
+                        file_reference: b"ref".to_vec(),
+                        date: 0,
+                        mime_type: "image/png".to_owned(),
+                        size: 123,
+                        thumbs: Vec::new(),
+                        video_thumbs: Vec::new(),
+                        dc_id: 2,
+                        attributes: Vec::new(),
+                    })),
+                    colors: Vec::new(),
+                }],
+            }
+        }
+
+        /// The wire `user` record that lands the bot into the cache.
+        fn wire_bot_user(user_id: i64) -> telegram_api::User {
+            telegram_api::User::user(telegram_api::user {
+                flags: 1 | (1 << 1) | (1 << 3), // ACCESS_HASH | FIRST_NAME | USERNAME
+                id: user_id,
+                access_hash: 77,
+                first_name: "Attach".to_owned(),
+                username: "attach_bot".to_owned(),
+                bot: true,
+                bot_attach_menu: true,
+                ..telegram_api::user::default()
+            })
+        }
+
+        /// The bootstrap `Bool` answer — the generator emits no structs
+        /// for the type (the `parse_wire_bool` doc); the ids are the
+        /// wire constants (telegram_api.tl:11-12).
+        fn bool_answer(value: bool) -> Vec<u8> {
+            const BOOL_TRUE_ID: i32 = 0x9972_75b5u32 as i32;
+            const BOOL_FALSE_ID: i32 = 0xbc79_9737u32 as i32;
+            let mut out = Vec::new();
+            out.extend_from_slice(
+                &(if value { BOOL_TRUE_ID } else { BOOL_FALSE_ID }).to_le_bytes(),
+            );
+            out
+        }
+
+        // 1. getAttachMenuBots — the cold-hash send; the answer runs the
+        //    users intake + the cache/save/update walk and settles the
+        //    parked promise Unit.
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.reload_attach_menu_bots(&mut env, promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let body = telegram_api::messages_getAttachMenuBots::parse(sent.query())
+                .expect("the getAttachMenuBots body");
+            assert_eq!(body.hash, 0, "the cold hash");
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBots(telegram_api::attachMenuBots {
+                hash: 1234,
+                bots: vec![wire_bot(901)],
+                users: vec![wire_bot_user(901)],
+            })
+            .store(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+            assert_eq!(td.attach_menu_manager.cache_for_test(), (1234, 1));
+            assert!(
+                td.attach_menu_updates
+                    .iter()
+                    .any(|u| matches!(u, td_api::Update::updateAttachmentMenuBots(_)))
+            );
+        }
+
+        // 2. the reload error band — the C++ `set_promises` settles the
+        //    parked promise Unit (the toggle chain answers Ok) and the
+        //    short retry arms (cpp:615-618).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.reload_attach_menu_bots(&mut env, promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            net_fail(sent, 429, "FLOOD_WAIT_1");
+            td.dispatch_completed_attach_menu_net();
+            assert!(
+                matches!(
+                    &*slot.lock().unwrap(),
+                    Some(tdutils::status::Result::Ok(()))
+                ),
+                "the C++ set_promises settles the reload promise Ok"
+            );
+            let deadline = td
+                .attach_menu_manager
+                .next_deadline()
+                .expect("the short retry armed");
+            assert!(
+                deadline - tdutils::time::now() >= 59.0 && deadline - tdutils::time::now() <= 120.0
+            );
+        }
+
+        // 3. getAttachMenuBot — the input user resolves with the seeded
+        //    access hash; the answer converts and the added bot's cache
+        //    entry updates in place (no hash reset, no new broadcast).
+        {
+            type BotSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::AttachmentMenuBot>>>,
+            >;
+            struct Rec(BotSlot);
+            impl tdutils::promise::PromiseInterface<td_api::AttachmentMenuBot> for Rec {
+                fn set_value(&mut self, value: td_api::AttachmentMenuBot) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: BotSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.get_attach_menu_bot_request(&mut env, UserId::new(901), promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBot::ID);
+            let body = telegram_api::messages_getAttachMenuBot::parse(sent.query())
+                .expect("the getAttachMenuBot body");
+            match body.bot.as_ref() {
+                Some(telegram_api::InputUser::inputUser(u)) => {
+                    assert_eq!(u.user_id, 901);
+                    assert_eq!(u.access_hash, 77, "the seeded access hash");
+                }
+                other => panic!("the resolved input user: {other:?}"),
+            }
+            let updates_before = td.attach_menu_updates.len();
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBotsBot {
+                bot: Some(wire_bot(901)),
+                users: vec![wire_bot_user(901)],
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_attach_menu_net();
+            let object = match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Ok(bot)) => bot.clone(),
+                other => panic!("the single-bot answer: {other:?}"),
+            };
+            assert_eq!(object.bot_user_id, 901);
+            assert!(object.is_added && object.request_write_access);
+            assert!(object.default_icon.is_some(), "the registered icon file");
+            assert_eq!(object.name, "attach_bot");
+            assert_eq!(
+                td.attach_menu_manager.cache_for_test(),
+                (1234, 1),
+                "the same-content walk leaves the hash alone"
+            );
+            assert_eq!(
+                td.attach_menu_updates.len(),
+                updates_before,
+                "no new broadcast for the same-content walk"
+            );
+        }
+
+        // 4. the wrong-bot band — the answer carries a different bot id
+        //    (cpp:739-741, the C++ lambda capture checks it).
+        {
+            type BotSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::AttachmentMenuBot>>>,
+            >;
+            struct Rec(BotSlot);
+            impl tdutils::promise::PromiseInterface<td_api::AttachmentMenuBot> for Rec {
+                fn set_value(&mut self, _value: td_api::AttachmentMenuBot) {}
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: BotSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.get_attach_menu_bot_request(&mut env, UserId::new(901), promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBot::ID);
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBotsBot {
+                bot: Some(wire_bot(777)),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Err(error)) if error.code() == 500
+            ));
+        }
+
+        // 5. toggleBotInAttachMenu — the WRITE_ALLOWED/enabled wire form;
+        //    the boolTrue answer success-chains into the reload query and
+        //    the reload's NotModified settles the toggle promise.
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(901),
+                true,
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_toggleBotInAttachMenu::ID);
+            let body = telegram_api::messages_toggleBotInAttachMenu::parse(sent.query())
+                .expect("the toggle body");
+            assert!(body.write_allowed, "is_added && allow_write_access");
+            assert!(body.enabled);
+            net_complete(sent, bool_answer(true));
+            td.dispatch_completed_attach_menu_net();
+            // the success chain fired the reload query
+            let reload = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let body = telegram_api::messages_getAttachMenuBots::parse(reload.query())
+                .expect("the chained reload body");
+            assert_eq!(body.hash, 1234, "the current hash rides the chain");
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBotsNotModified(
+                telegram_api::attachMenuBotsNotModified,
+            )
+            .store(&mut answer);
+            net_complete(reload, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(
+                matches!(
+                    &*slot.lock().unwrap(),
+                    Some(tdutils::status::Result::Ok(()))
+                ),
+                "the chained reload settles the toggle promise"
+            );
+        }
+
+        // 6. the toggle boolFalse band — the C++ LOG(ERROR) + the Unit
+        //    answer still success-chains (cpp:103-114).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(901),
+                true,
+                false,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_toggleBotInAttachMenu::ID);
+            let body = telegram_api::messages_toggleBotInAttachMenu::parse(sent.query())
+                .expect("the toggle body");
+            assert!(!body.write_allowed, "allow_write_access = false");
+            assert!(body.enabled);
+            net_complete(sent, bool_answer(false));
+            td.dispatch_completed_attach_menu_net();
+            let reload = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBotsNotModified(
+                telegram_api::attachMenuBotsNotModified,
+            )
+            .store(&mut answer);
+            net_complete(reload, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // 7. the toggle error band — the C++ `on_error` fires the
+        //    promise-less reload first, then fails the toggle promise
+        //    (cpp:116-119).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(901),
+                true,
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_toggleBotInAttachMenu::ID);
+            net_fail(sent, 400, "BOT_INACTIVE");
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Err(error)) if error.code() == 400
+            ));
+            // the promise-less reload rode the same answer
+            let reload = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBotsNotModified(
+                telegram_api::attachMenuBotsNotModified,
+            )
+            .store(&mut answer);
+            net_complete(reload, answer);
+            td.dispatch_completed_attach_menu_net();
+        }
     }
 
     #[test]
