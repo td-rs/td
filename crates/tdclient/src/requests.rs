@@ -1533,9 +1533,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getAttachmentMenuBot(request) => {
             // `Requests.cpp:1101-1105` — the bot-data read answers the
-            // manager object; the reload query tail parks at the
-            // [blocked: net] seam. (The M.40 flip predated the arms — the
-            // dispatcher audit caught the gap.)
+            // manager object; the reload query tail rides the dispatcher
+            // (net-drain 42).
             if !check_is_user(td, id) {
                 return;
             }
@@ -1558,8 +1557,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::toggleBotIsAddedToAttachmentMenu(request) => {
-            // `Requests.cpp:1107-1113` — the ok answer parks behind the
-            // toggle query ([blocked: net]).
+            // `Requests.cpp:1107-1113` — the ok answer chains into the
+            // reload query (net-drain 42).
             if !check_is_user(td, id) {
                 return;
             }
