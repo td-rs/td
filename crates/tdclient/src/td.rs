@@ -3139,7 +3139,8 @@ type CommunityNetHandle = NetKindHandle<CommunityNetKind>;
 
 /// The AccountManager in-flight query kinds — the C++ ResultHandler
 /// classes of AccountManager.cpp:180-612 (the sessions/authorizations,
-/// web-authorization, contact-token and TTL families).
+/// web-authorization, contact-token and TTL families) plus the sibling
+/// terms-of-service pair (TermsOfServiceManager.cpp:23-92, net-drain 51).
 #[derive(Clone, Copy)]
 pub(crate) enum AccountNetKind {
     /// `SetAccountTtlQuery` (cpp:180) — the `!result` 500 band.
@@ -3177,6 +3178,15 @@ pub(crate) enum AccountNetKind {
     /// `ImportContactTokenQuery` (cpp:574) — the `on_get_user` intake
     /// answers with the stored user object.
     ImportContactToken,
+    /// `GetTermsOfServiceUpdateQuery` (TermsOfServiceManager.cpp:23-62)
+    /// — the auth-success poll; the answer routes
+    /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_get_terms_of_service`].
+    GetTermsOfServiceUpdate,
+    /// `AcceptTermsOfServiceQuery` (TermsOfServiceManager.cpp:64-92) —
+    /// the dataJSON accept; the Bool answer routes
+    /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_accept_terms_of_service`]
+    /// with the parked request promise.
+    AcceptTermsOfService,
 }
 
 /// The cloned account dispatch surface the [`AccountEnv`] senders use —
@@ -21685,6 +21695,87 @@ impl Td {
                     }
                 }
             }
+            // `GetTermsOfServiceUpdateQuery` (TermsOfServiceManager.cpp:
+            // 23-62) — the answer converts the Empty/Update halves
+            // into the (expires, TermsOfService) pair (cpp:36-57) and
+            // routes the poll intake `on_get_terms_of_service`
+            // (cpp:145-167); the error leg is the logged drop (the C++
+            // `Random::fast(10, 60)` reschedule rides the collapsed
+            // timer plane, cpp:59-61 → 151-153).
+            AccountNetKind::GetTermsOfServiceUpdate => {
+                let result: std::result::Result<
+                    (i32, crate::terms_of_service::TermsOfService),
+                    Status,
+                > = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::help_TermsOfServiceUpdate::parse(query.ok()) {
+                        Ok(
+                            telegram_api::help_TermsOfServiceUpdate::help_termsOfServiceUpdateEmpty(
+                                update,
+                            ),
+                        ) => Ok((
+                            update.expires,
+                            crate::terms_of_service::TermsOfService::default(),
+                        )),
+                        Ok(telegram_api::help_TermsOfServiceUpdate::help_termsOfServiceUpdate(
+                            update,
+                        )) => Ok((
+                            update.expires,
+                            crate::terms_of_service::TermsOfService::from_telegram(
+                                update.terms_of_service.as_ref(),
+                            ),
+                        )),
+                        Err(_) => Err(parse_error("help.getTermsOfServiceUpdate")),
+                    }
+                };
+                let mut env = AccountEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    user_manager: &mut self.user_manager,
+                    device_token_manager: &mut self.device_token_manager,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.account_updates,
+                    net: None,
+                };
+                self.terms_of_service_manager
+                    .on_get_terms_of_service(&mut env, result);
+            }
+            // `AcceptTermsOfServiceQuery` (TermsOfServiceManager.cpp:
+            // 64-92) — the Bool answer runs the accept intake with the
+            // parked request promise (the false band logs and still
+            // settles, cpp:80-87); the error leg forwards
+            // (cpp:89-91 → 176-178).
+            AccountNetKind::AcceptTermsOfService => {
+                let Some(mut promise) = self.terms_of_service_manager.take_accept_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Some(result) = parse_wire_bool_value(query.ok()) else {
+                    promise.set_error(parse_error("help.acceptTermsOfService"));
+                    return;
+                };
+                if !result {
+                    tdutils::log_error!("Failed to accept terms of service");
+                }
+                // The intake re-polls (the collapsed schedule(0)), so the
+                // env carries the live dispatch surface.
+                let net = self.account_net();
+                let mut env = AccountEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    user_manager: &mut self.user_manager,
+                    device_token_manager: &mut self.device_token_manager,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.account_updates,
+                    net,
+                };
+                self.terms_of_service_manager
+                    .on_accept_terms_of_service(&mut env, promise);
+            }
             // `SetAccountTtlQuery` (cpp:180-209) — the `!result` 500 band.
             AccountNetKind::SetAccountTtl => {
                 let promise = self
@@ -25843,6 +25934,7 @@ impl Td {
     /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
     /// auth-success moment shared with `init_notification_manager`.
     fn init_terms_of_service_manager(&mut self) {
+        let net = self.account_net();
         let mut env = AccountEnv {
             global: &mut self.global,
             options: self.option_manager.as_mut(),
@@ -25850,7 +25942,7 @@ impl Td {
             device_token_manager: &mut self.device_token_manager,
             auth_is_bot: self.auth_manager.is_bot(),
             updates: &mut self.account_updates,
-            net: None,
+            net,
         };
         self.terms_of_service_manager.init(&mut env);
     }
@@ -33879,8 +33971,8 @@ impl tdnet::net_query::DcInitSink for InertDcInit {
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
 /// the field-split borrows (the `NotificationEnv` convention); the net
 /// field carries the live dispatch surface for the query senders (`None`
-/// keeps the net-inert posture — the TOS/suggested-action arms never
-/// send).
+/// keeps the net-inert posture — the account and terms-of-service
+/// families dispatch, the suggested-action arms stay net-inert).
 pub(crate) struct AccountEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: Option<&'a mut OptionManager>,
@@ -34219,8 +34311,50 @@ impl AccountManagerEnv for AccountEnv<'_> {
 }
 
 impl crate::terms_of_service_manager::TermsOfServiceManagerEnv for AccountEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    /// `GetTermsOfServiceUpdateQuery::send`
+    /// (TermsOfServiceManager.cpp:31-34).
+    fn send_get_terms_of_service_update_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::GetTermsOfServiceUpdate,
+                telegram_api::Function::help_getTermsOfServiceUpdate(
+                    telegram_api::help_getTermsOfServiceUpdate,
+                ),
+            ),
+            None => tdutils::log_info!("Send help.getTermsOfServiceUpdate — [net-inert]"),
+        }
+    }
+
+    /// `AcceptTermsOfServiceQuery::send` (TermsOfServiceManager.cpp:71-74)
+    /// — the dataJSON id form.
+    fn send_accept_terms_of_service_query(&mut self, terms_of_service_id: &str) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::AcceptTermsOfService,
+                telegram_api::Function::help_acceptTermsOfService(
+                    telegram_api::help_acceptTermsOfService {
+                        id: Some(telegram_api::DataJSON {
+                            data: terms_of_service_id.to_owned(),
+                        }),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send help.acceptTermsOfService for {terms_of_service_id} — [net-inert]"
+            ),
+        }
     }
 }
 
@@ -53372,6 +53506,276 @@ mod tests {
                 assert_eq!(website.bot_user_id, 7);
             }
             other => panic!("unexpected websites result: {other:?}"),
+        }
+
+        assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the net-drain 51 terms-of-service slice: the poll + accept
+    // families ride the account dispatch plane (the
+    // TermsOfServiceManager.cpp handler halves). ----
+
+    /// The net-drain 51 terms-of-service round-trips — the §3.9
+    /// families ride the dispatcher through the [`AccountEnv`] send
+    /// arms (GetTermsOfServiceUpdateQuery/AcceptTermsOfServiceQuery,
+    /// TermsOfServiceManager.cpp:23-92): the auth-success poll with the
+    /// full terms object in the update, the accept through the live
+    /// td_api arm with the schedule(0) re-poll, and the
+    /// false-Bool/error/parse bands.
+    #[test]
+    fn terms_of_service_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(terms_of_service_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn terms_of_service_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-terms");
+
+        // The env exactly as the production call sites build it —
+        // expanded at the call site so the field borrows stay disjoint.
+        macro_rules! terms_env {
+            () => {{
+                let net = td.account_net();
+                AccountEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    user_manager: &mut td.user_manager,
+                    device_token_manager: &mut td.device_token_manager,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.account_updates,
+                    net,
+                }
+            }};
+        }
+
+        fn terms_answer(expires: i32, id: &str, text: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_termsOfServiceUpdate {
+                expires,
+                terms_of_service: Some(telegram_api::help_TermsOfService {
+                    // bit 1 — min_age_confirm rides the wire
+                    flags: 1 << 1,
+                    popup: true,
+                    id: Some(telegram_api::DataJSON {
+                        data: id.to_owned(),
+                    }),
+                    text: text.to_owned(),
+                    entities: Vec::new(),
+                    min_age_confirm: 16,
+                }),
+            }
+            .store_boxed(&mut out);
+            out
+        }
+
+        fn empty_terms_answer(expires: i32) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_termsOfServiceUpdateEmpty { expires }.store_boxed(&mut out);
+            out
+        }
+
+        fn count_terms_updates(td: &Td) -> usize {
+            td.account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateTermsOfService(_)))
+                .count()
+        }
+
+        fn account_terms_update(td: &Td) -> Option<&td_api::updateTermsOfService> {
+            td.account_updates.iter().find_map(|update| match update {
+                td_api::Update::updateTermsOfService(update) => Some(update),
+                _ => None,
+            })
+        }
+
+        // 1. The auth-success poll — help.getTermsOfServiceUpdate
+        //    dispatches once (the is_inited_ gate, cpp:105-115); the
+        //    answer converts the Empty/Update halves (cpp:36-57) and
+        //    routes on_get_terms_of_service (cpp:145-167) — the update
+        //    carries the full terms object (cpp:136-143).
+        {
+            let mut env = terms_env!();
+            td.terms_of_service_manager.init(&mut env);
+            let mut env = terms_env!();
+            td.terms_of_service_manager.init(&mut env);
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].tl_constructor(),
+                telegram_api::help_getTermsOfServiceUpdate::ID
+            );
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                terms_answer(1_700_003_600, "tos-1", "Please accept"),
+            );
+            td.dispatch_completed_account_net();
+            let update = account_terms_update(&td).expect("the terms update emits");
+            assert_eq!(update.terms_of_service_id, "tos-1");
+            let terms = update.terms_of_service.as_ref().unwrap();
+            assert_eq!(terms.min_user_age, 16);
+            assert!(terms.show_popup);
+            assert_eq!(terms.text.as_ref().unwrap().text, "Please accept");
+        }
+
+        // 2. acceptTermsOfService through the live td_api arm — the
+        //    dataJSON wire form (cpp:71-74); boolTrue settles ok
+        //    (cpp:76-87), the pending clears with no update on the
+        //    accept itself (cpp:184-188), and the schedule(0) re-poll
+        //    dispatches again (the collapsed timer) — the empty-update
+        //    re-poll answer keeps the pending clear.
+        {
+            let updates_before = count_terms_updates(&td);
+            td.request(
+                201,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].tl_constructor(),
+                telegram_api::help_acceptTermsOfService::ID
+            );
+            let wire = telegram_api::help_acceptTermsOfService::parse(sent[0].query()).unwrap();
+            assert_eq!(wire.id.unwrap().data, "tos-1");
+            net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 201)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the accept settles ok"
+            );
+            assert_eq!(
+                count_terms_updates(&td),
+                updates_before,
+                "the accept itself emits no update"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].tl_constructor(),
+                telegram_api::help_getTermsOfServiceUpdate::ID
+            );
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                empty_terms_answer(1_700_003_600),
+            );
+            td.dispatch_completed_account_net();
+            assert_eq!(
+                count_terms_updates(&td),
+                updates_before,
+                "the empty re-poll answer emits nothing"
+            );
+        }
+
+        // 3. The false-Bool band — the LOG(ERROR) leg still settles ok
+        //    (cpp:80-87); the re-poll's terms answer re-emits the update
+        //    even though the id is unchanged (cpp:157-161 — the
+        //    reference sends on every non-empty poll, no id compare).
+        {
+            td.request(
+                202,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_complete(sent.into_iter().next().unwrap(), bool_answer(false));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 202)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the false Bool still settles ok"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                terms_answer(1_700_003_600, "tos-1", "Please accept"),
+            );
+            td.dispatch_completed_account_net();
+            assert_eq!(
+                count_terms_updates(&td),
+                2,
+                "the re-poll answer re-emits the update"
+            );
+        }
+
+        // 4. The error forward (cpp:89-91 → 176-178) and the
+        //    parse-failure 500 band.
+        {
+            td.request(
+                203,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_fail(
+                sent.into_iter().next().unwrap(),
+                400,
+                "TERMS_OF_SERVICE_INVALID",
+            );
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 203);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "TERMS_OF_SERVICE_INVALID");
+
+            td.request(
+                204,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                vec![0x00, 0x00, 0x00, 0x00],
+            );
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 204);
+            assert_eq!(error.code, 500);
+            assert_eq!(
+                error.message,
+                "Failed to parse the help.acceptTermsOfService answer"
+            );
+        }
+
+        // 5. The poll error band — the failed answer routes the error
+        //    half of on_get_terms_of_service (logged + dropped; the C++
+        //    reschedules at Random::fast(10, 60), the collapsed timer
+        //    plane; cpp:59-61 → 151-153).
+        {
+            let updates_before = count_terms_updates(&td);
+            td.request(
+                205,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+            td.dispatch_completed_account_net();
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            net_fail(sent.into_iter().next().unwrap(), 500, "FLOOD_WAIT");
+            td.dispatch_completed_account_net();
+            assert_eq!(
+                count_terms_updates(&td),
+                updates_before,
+                "the failed poll emits nothing"
+            );
         }
 
         assert!(td.account_net_completed.lock().is_empty(), "drained");

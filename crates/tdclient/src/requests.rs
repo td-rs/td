@@ -6923,6 +6923,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6930,7 +6931,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
             td.terms_of_service_manager.accept_terms_of_service(
                 &mut env,
