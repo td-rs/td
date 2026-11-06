@@ -2886,7 +2886,7 @@ impl<K: NetAnswerKind> NetKindHandle<K> {
     }
 
     /// The per-DC form — `create(function, {}, dc_id)`.
-    fn dispatch_dc(&self, kind: K, function: telegram_api::Function, dc_id: DcId) {
+    pub(crate) fn dispatch_dc(&self, kind: K, function: telegram_api::Function, dc_id: DcId) {
         self.dispatch_query(kind, function, dc_id, AuthFlag::On);
     }
 
@@ -3247,6 +3247,10 @@ pub(crate) type LinkNetHandle = NetKindHandle<crate::link_manager::LinkNetKind>;
 /// The cloned background dispatch surface the `BackgroundEnv` senders
 /// use — the answers drain through [`Td::on_background_net_answer`].
 type BackgroundNetHandle = NetKindHandle<crate::background_manager::BackgroundNetKind>;
+
+/// The cloned statistics dispatch surface the `StatisticsManager`
+/// senders hold — the answers drain through [`Td::on_statistics_net_answer`].
+type StatisticsNetHandle = NetKindHandle<crate::statistics_manager::StatisticsNetKind>;
 
 /// The parked ResultHandler members of the in-flight background net
 /// queries (BackgroundManager.cpp:46-304) — the promise/state the C++
@@ -5606,17 +5610,12 @@ pub struct Td {
     /// The statistics plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) statistics_updates: Vec<td_api::Update>,
-    /// The parked `getChatStatistics` requests riding the DC chain —
-    /// the collapsed `dc_id_promise` lambda tail
-    /// (StatisticsManager.cpp:746-758): a sync-resolved dc parks here
-    /// at the query seam; the refire path parks while the full query
-    /// is in flight and [`Td::finish_pending_channel_statistics_dc_id`]
-    /// settles it (the stats query seam lands with net-drain 38).
-    pub(crate) statistics_dc_parked: Vec<(
-        crate::chat_manager::DialogId,
-        bool,
-        Promise<td_api::ChatStatistics>,
-    )>,
+    /// The callback-parked statistics completions — the
+    /// `StatisticsNetKind` answers the driver threads file under their
+    /// kind (the nudge drains them through
+    /// [`Td::on_statistics_net_answer`]).
+    pub(crate) statistics_net_completed:
+        Arc<Mutex<Vec<(crate::statistics_manager::StatisticsNetKind, NetQuery)>>>,
     /// `Td::community_manager_` (the C++ init_managers block).
     pub(crate) community_manager: CommunityManager,
     /// The community plane's `send_update` outbox; drained by
@@ -6403,7 +6402,7 @@ impl Td {
             premium_manager: PremiumManager::new(),
             statistics_manager: StatisticsManager::new(),
             statistics_updates: Vec::new(),
-            statistics_dc_parked: Vec::new(),
+            statistics_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             ton_wallet_manager: crate::ton_wallet::TonWalletManager::new(),
@@ -7003,6 +7002,7 @@ impl Td {
         self.story_manager.net = self.story_net();
         self.star_gift_manager.net = self.star_gift_net();
         self.business_manager.net = self.business_net();
+        self.statistics_manager.net = self.statistics_net();
         self.web_browser_manager.net = self.web_browser_net();
         self.group_call_manager.net = self.group_call_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
@@ -8802,6 +8802,7 @@ impl Td {
         self.dispatch_completed_link_net();
         self.dispatch_completed_background_net();
         self.dispatch_completed_group_call_net();
+        self.dispatch_completed_statistics_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
         self.dispatch_completed_promo_net();
@@ -8986,6 +8987,17 @@ impl Td {
         Some(PrivacyNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.privacy_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned statistics dispatch surface the `StatisticsManager`
+    /// holds — `None` keeps the net-inert posture (the pre-init
+    /// windows and the net-inert tests).
+    fn statistics_net(&self) -> Option<StatisticsNetHandle> {
+        Some(StatisticsNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.statistics_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10419,6 +10431,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.group_call_net_completed.lock());
         for (kind, query) in completed {
             self.on_group_call_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked statistics answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 38
+    /// families (StatisticsManager.cpp:180-737).
+    fn dispatch_completed_statistics_net(&mut self) {
+        let completed = std::mem::take(&mut *self.statistics_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_statistics_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -15998,10 +16021,10 @@ impl Td {
     /// The `get_channel_statistics_dc_id` continuation drain (the
     /// collapsed query_promise lambda of cpp:3866-3876):
     /// `get_channel_statistics_dc_id_impl` re-reads the fresh full and
-    /// answers the parked dc promise; the parked `getChatStatistics`
-    /// request (the dc_id_promise lambda tail,
-    /// StatisticsManager.cpp:746-758) follows it — the error fails the
-    /// request, the dc parks it at the stats query seam (net-drain 38).
+    /// answers the parked dc promise; the parked statistics requests
+    /// (the dc_id_promise lambda tails, StatisticsManager.cpp:746-758,
+    /// 828-840, 858-870, 920-936, 955-979) follow it — the error fails
+    /// the request, the dc runs its send leg.
     fn finish_pending_channel_statistics_dc_id(
         &mut self,
         answered_channel_id: crate::chat_manager::ChannelId,
@@ -16016,61 +16039,70 @@ impl Td {
         }
         // the fresh full answers every continuation of the channel at
         // once (the C++ runs one impl per combiner query; the joined
-        // waiters share it — the only caller always passes
-        // for_full_statistics = true)
-        let for_full_statistics = continuations[0].1;
-        let (recorded, slot) = recorded_dc_id_promise();
-        self.with_chat_intake(|chat_manager, _user_manager, env| {
-            chat_manager.get_channel_statistics_dc_id_impl(
-                env,
-                answered_channel_id,
-                for_full_statistics,
-                recorded,
-            );
-        });
-        let result =
-            slot.lock().unwrap().take().unwrap_or_else(|| {
+        // waiters share it) — the impl runs per DISTINCT
+        // for_full_statistics flag (the only result-difference: the
+        // flag adds the can_view_statistics gate)
+        let mut results: Vec<(bool, tdutils::status::Result<crate::chat_manager::DcId>)> =
+            Vec::new();
+        let mut wire_results: Vec<(bool, tdutils::status::Result<DcId>)> = Vec::new();
+        for (_, for_full_statistics, _) in &continuations {
+            if results
+                .iter()
+                .any(|(flag, _)| *flag == *for_full_statistics)
+            {
+                continue;
+            }
+            let (recorded, slot) = recorded_dc_id_promise();
+            self.with_chat_intake(|chat_manager, _user_manager, env| {
+                chat_manager.get_channel_statistics_dc_id_impl(
+                    env,
+                    answered_channel_id,
+                    *for_full_statistics,
+                    recorded,
+                );
+            });
+            let result = slot.lock().unwrap().take().unwrap_or_else(|| {
                 tdutils::status::Result::Err(Status::error(500, "Request aborted"))
             });
-        for (_, _, mut dc_promise) in continuations {
-            dc_promise.set_result(result.clone());
+            // the promises settle with the chat-plane dc; the manager
+            // legs run with the wire-dispatch dc (the exact-dc
+            // conversion)
+            let wire_dc = match &result {
+                tdutils::status::Result::Ok(dc_id) => {
+                    tdutils::status::Result::Ok(if dc_id.is_external() {
+                        DcId::external(dc_id.get_value())
+                    } else {
+                        DcId::internal(dc_id.get_value())
+                    })
+                }
+                tdutils::status::Result::Err(status) => {
+                    tdutils::status::Result::Err(status.clone())
+                }
+            };
+            wire_results.push((*for_full_statistics, wire_dc));
+            results.push((*for_full_statistics, result));
+        }
+        for (_, flag, mut dc_promise) in continuations {
+            let result = results
+                .iter()
+                .find(|(result_flag, _)| *result_flag == flag)
+                .map(|(_, result)| result.clone());
+            if let Some(result) = result {
+                dc_promise.set_result(result);
+            }
         }
         // the parked stats requests pair by the dialog (the dc_id_promise
-        // lambda tail, StatisticsManager.cpp:746-758) and drain per
-        // continuation — the combiner's same-channel join included
-        let dialog_id = crate::chat_manager::DialogId::from_channel_id(answered_channel_id);
-        let parked = (0..self.statistics_dc_parked.len())
-            .filter(|&index| self.statistics_dc_parked[index].0 == dialog_id)
-            .collect::<Vec<_>>();
-        match result {
-            tdutils::status::Result::Ok(dc_id) => {
-                // `send_get_channel_stats_query` (cpp:753-764) — the query
-                // seam parks the promises (net-drain 38 consumes them
-                // when the stats queries land); the seam log rides the
-                // env once
-                if let Some((dialog_id, is_dark)) = parked.first().and_then(|&index| {
-                    self.statistics_dc_parked
-                        .get(index)
-                        .map(|(d, i, _)| (*d, *i))
-                }) {
-                    let mut env = StatisticsEnv {
-                        global: &mut self.global,
-                        updates: &mut self.statistics_updates,
-                    };
-                    let _ = dc_id;
-                    env.send_get_channel_stats_query(
-                        crate::dialog_id::DialogId::new(dialog_id.get()),
-                        is_dark,
-                    );
-                }
-            }
-            tdutils::status::Result::Err(status) => {
-                for index in parked.iter().rev() {
-                    let (_, _, mut promise) = self.statistics_dc_parked.remove(*index);
-                    promise.set_error(status.clone());
-                }
-            }
+        // lambda tails) and drain per continuation — the combiner's
+        // same-channel join included
+        let dialog_id = crate::dialog_id::DialogId::new(
+            crate::chat_manager::DialogId::from_channel_id(answered_channel_id).get(),
+        );
+        let mut manager = std::mem::take(&mut self.statistics_manager);
+        {
+            let mut env = StatisticsEnv { td: self };
+            manager.run_parked_dc_requests(&mut env, dialog_id, &wire_results);
         }
+        self.statistics_manager = manager;
     }
 
     /// Run one ChatManager intake under the taken-out managers (the
@@ -34776,19 +34808,229 @@ impl crate::ton_wallet::TonWalletManagerEnv for TonWalletEnv<'_> {
     }
 }
 
-/// The statistics-plane env over the `Td` fields.
+/// The statistics-plane env over the whole `Td` — the request arms take
+/// the manager out of `Td` and hand the remainder to the env (the
+/// `privacy_env_split` convention), so the send legs resolve the dc,
+/// the peers and the channels through the real managers and the answer
+/// intakes run over the real registries.
 pub(crate) struct StatisticsEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out for the statistics manager — the
+/// manager out, the env over the `Td` remainder (the
+/// `privacy_env_split` convention).
+pub(crate) fn statistics_env_split(td: &mut Td) -> (StatisticsManager, StatisticsEnv<'_>) {
+    let manager = std::mem::take(&mut td.statistics_manager);
+    (manager, StatisticsEnv { td })
 }
 
 impl StatisticsManagerEnv for StatisticsEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.statistics_updates.push(update);
+    }
+
+    fn statistics_dc_id(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        for_full_statistics: bool,
+    ) -> tdutils::status::Result<crate::statistics_manager::StatisticsDc> {
+        let (dc_promise, slot) = recorded_dc_id_promise();
+        let chat_dialog_id = crate::chat_manager::DialogId::new(dialog_id.get());
+        self.td.with_chat_intake(|chat_manager, user_manager, env| {
+            chat_manager.get_channel_statistics_dc_id(
+                user_manager,
+                env,
+                chat_dialog_id,
+                for_full_statistics,
+                dc_promise,
+            );
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(dc_id)) => {
+                // the chat-plane dc converts to the wire dispatch dc
+                // (the chain only resolves exact dcs)
+                let dc_id = if dc_id.is_external() {
+                    DcId::external(dc_id.get_value())
+                } else {
+                    DcId::internal(dc_id.get_value())
+                };
+                tdutils::status::Result::Ok(crate::statistics_manager::StatisticsDc::Resolved(
+                    dc_id,
+                ))
+            }
+            Some(tdutils::status::Result::Err(status)) => tdutils::status::Result::Err(status),
+            // the refire — the full query is out with the continuation
+            // parked; the answer leg settles the chain
+            None => tdutils::status::Result::Ok(crate::statistics_manager::StatisticsDc::Refired),
+        }
+    }
+
+    fn is_megagroup_channel(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.td
+            .chat_manager
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_megagroup)
+    }
+
+    fn get_input_channel(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<telegram_api::InputChannel> {
+        let user_manager = std::mem::take(&mut self.td.user_manager);
+        let result = if let Some(options) = self.td.option_manager.as_mut() {
+            let env = crate::user_manager::UserEnv {
+                global: &mut self.td.global,
+                options,
+                auth_is_bot: self.td.auth_manager.is_bot(),
+            };
+            self.td.chat_manager.get_input_channel(&env, channel_id)
+        } else {
+            None
+        };
+        self.td.user_manager = user_manager;
+        result
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+        source: &'static str,
+    ) -> tdutils::status::Result<()> {
+        crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            allow_secret_chats,
+            access_rights,
+            source,
+        )
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &'static str,
+    ) -> bool {
+        crate::messages_manager::have_message_force_full(
+            &self.td.messages_manager,
+            message_full_id,
+            source,
+        )
+    }
+
+    fn can_get_message_statistics(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+    ) -> bool {
+        let ctx: &dyn crate::messages_manager::SendMessageContext = self.td;
+        crate::messages_manager::can_get_message_statistics_full(
+            &self.td.messages_manager,
+            ctx,
+            message_full_id,
+        )
+    }
+
+    fn have_story_force(&mut self, story_full_id: crate::story_ids::StoryFullId) -> bool {
+        self.td
+            .with_story_manager(|env, manager| manager.have_story_force(env, story_full_id))
+    }
+
+    fn can_get_story_statistics(&mut self, story_full_id: crate::story_ids::StoryFullId) -> bool {
+        self.td
+            .with_story_manager(|env, manager| manager.can_get_story_statistics(env, story_full_id))
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_manager::get_my_dialog_id(self.td)
+    }
+
+    fn on_get_channel_error(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        status: &Status,
+        source: &'static str,
+    ) {
+        self.td.with_chat_intake(|chat_manager, user_manager, env| {
+            chat_manager.on_get_channel_error(user_manager, env, channel_id, status, source);
+        });
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &'static str,
+    ) {
+        let _ =
+            crate::dialog_manager::on_get_dialog_error(&self.td.global, dialog_id, status, source);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &'static str) {
+        let mut user_manager = std::mem::take(&mut self.td.user_manager);
+        if let Some(options) = self.td.option_manager.as_mut() {
+            let mut env = crate::user_manager::UserEnv {
+                global: &mut self.td.global,
+                options,
+                auth_is_bot: self.td.auth_manager.is_bot(),
+            };
+            user_manager.on_get_users(&mut env, users, source);
+        }
+        self.td.user_manager = user_manager;
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
+        self.td.with_chat_intake(|chat_manager, user_manager, env| {
+            chat_manager.on_get_chats(user_manager, env, chats, source);
+        });
+    }
+
+    fn get_user_id_object(&mut self, user_id: i64, source: &'static str) -> i64 {
+        let mut user_manager = std::mem::take(&mut self.td.user_manager);
+        let result = if let Some(options) = self.td.option_manager.as_mut() {
+            let mut env = crate::user_manager::UserEnv {
+                global: &mut self.td.global,
+                options,
+                auth_is_bot: self.td.auth_manager.is_bot(),
+            };
+            user_manager.get_user_id_object(
+                &mut env,
+                crate::user_manager::UserId::new(user_id),
+                source,
+            )
+        } else {
+            0
+        };
+        self.td.user_manager = user_manager;
+        result
+    }
+
+    fn get_public_forward_message(
+        &mut self,
+        message: telegram_api::Message,
+    ) -> Option<td_api::Message> {
+        self.td.get_public_forward_message_object(message)
+    }
+
+    fn get_public_forward_story(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        story: Box<telegram_api::StoryItem>,
+    ) -> Option<td_api::Story> {
+        self.td.get_public_forward_story_object(dialog_id, story)
     }
 }
 
@@ -34818,54 +35060,486 @@ fn recorded_dc_id_promise() -> (Promise<crate::chat_manager::DcId>, DcIdSlot) {
 }
 
 impl Td {
-    /// `StatisticsManager::get_channel_statistics` (StatisticsManager.cpp:746-758)
-    /// — the collapsed manager flow at the Td level: the dc_id chain
-    /// over the real [`ChatManager::get_channel_statistics_dc_id`]. A
-    /// synchronously-resolved dc parks the request at the stats query
-    /// seam; a missing/unexact dc refires the full query with the
-    /// continuation parked ([`Td::finish_pending_channel_statistics_dc_id`]
-    /// drains it); the error tail fails the request.
-    pub(crate) fn get_channel_statistics_dc_chain(
+    /// Run one statistics flow under the taken-out manager (the
+    /// net-answer convention — the manager comes out for the env borrow
+    /// and goes back).
+    fn with_statistics_manager<R>(
         &mut self,
-        dialog_id: crate::chat_manager::DialogId,
-        is_dark: bool,
-        mut promise: Promise<td_api::ChatStatistics>,
+        run: impl FnOnce(&mut StatisticsEnv<'_>, &mut StatisticsManager) -> R,
+    ) -> R {
+        let mut manager = std::mem::take(&mut self.statistics_manager);
+        let result = {
+            let mut env = StatisticsEnv { td: self };
+            run(&mut env, &mut manager)
+        };
+        self.statistics_manager = manager;
+        result
+    }
+
+    /// Route one statistics net answer by kind into the manager
+    /// intakes — the C++ ResultHandler halves
+    /// (StatisticsManager.cpp:180-737) over the parked
+    /// [`crate::statistics_manager::PendingStatisticsQueries`] lots
+    /// (FIFO, §5).
+    fn on_statistics_net_answer(
+        &mut self,
+        kind: crate::statistics_manager::StatisticsNetKind,
+        query: NetQuery,
     ) {
-        let (dc_promise, slot) = recorded_dc_id_promise();
-        self.with_chat_intake(|chat_manager, user_manager, env| {
-            chat_manager.get_channel_statistics_dc_id(
-                user_manager,
-                env,
-                dialog_id,
-                true,
-                dc_promise,
-            );
-        });
-        match slot.lock().unwrap().take() {
-            Some(tdutils::status::Result::Ok(dc_id)) => {
-                // send_get_channel_stats_query (cpp:753-764) — the query
-                // seam parks the promise (net-drain 38); the seam log
-                // rides the env
-                let _ = dc_id;
-                let mut env = StatisticsEnv {
-                    global: &mut self.global,
-                    updates: &mut self.statistics_updates,
-                };
-                env.send_get_channel_stats_query(
-                    crate::dialog_id::DialogId::new(dialog_id.get()),
-                    is_dark,
-                );
-                self.statistics_dc_parked
-                    .push((dialog_id, is_dark, promise));
-            }
-            Some(tdutils::status::Result::Err(status)) => promise.set_error(status),
-            None => {
-                // the refire — the full query is out with the
-                // continuation parked; the answer leg settles the chain
-                self.statistics_dc_parked
-                    .push((dialog_id, is_dark, promise));
-            }
+        use crate::statistics_manager::{
+            PendingStatisticsQueries, StatisticsNetKind, convert_broadcast_stats,
+            convert_megagroup_stats, convert_message_stats, convert_story_stats,
+            convert_ton_revenue_stats, convert_ton_revenue_transactions,
+        };
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
         }
+        self.with_statistics_manager(|env, manager| match kind {
+            // `GetBroadcastStatsQuery`/`GetMegagroupStatsQuery`
+            // `on_result`/`on_error` (cpp:233-261, 199-211) — the
+            // branch flag rides the lot entry; the broadcast answer's
+            // recent-interactions walk rides the recorded leg
+            StatisticsNetKind::ChannelStats => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((channel_id, is_megagroup, mut promise)) =
+                        PendingStatisticsQueries::take_pending_head(
+                            &mut manager.pending.channel_stats,
+                        )
+                    {
+                        let source = if is_megagroup {
+                            "GetMegagroupStatsQuery"
+                        } else {
+                            "GetBroadcastStatsQuery"
+                        };
+                        env.on_get_channel_error(channel_id, &status, source);
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let Some((channel_id, is_megagroup, mut promise)) =
+                    PendingStatisticsQueries::take_pending_head(&mut manager.pending.channel_stats)
+                else {
+                    return;
+                };
+                let result = if is_megagroup {
+                    telegram_api::stats_MegagroupStats::parse(query.ok()).map(|stats| {
+                        convert_megagroup_stats(env, stats)
+                    })
+                } else {
+                    telegram_api::stats_BroadcastStats::parse(query.ok()).map(|stats| {
+                        // the recent-interactions walk
+                        // (cpp:239-254) — the recorded
+                        // interaction-info leg
+                        let result = convert_broadcast_stats(stats);
+                        if let td_api::ChatStatistics::chatStatisticsChannel(channel) = &result {
+                            for info in &channel.recent_interactions {
+                                if let Some(td_api::ChatStatisticsObjectType::
+                                    chatStatisticsObjectTypeMessage(message)) =
+                                    info.object_type.as_ref()
+                                {
+                                    let channel_dialog_id = crate::chat_manager::DialogId::from_channel_id(channel_id);
+                                    env.on_update_message_interaction_info(
+                                        crate::dialog_id::DialogId::new(channel_dialog_id.get()),
+                                        message.message_id,
+                                        info.view_count,
+                                        info.forward_count,
+                                    );
+                                }
+                            }
+                        }
+                        result
+                    })
+                };
+                match result {
+                    Ok(statistics) => promise.set_value(statistics),
+                    Err(_) => {
+                        // the fetch failure band — the C++ fetch_result
+                        // failure routes on_error (the landed-flip
+                        // convention, §5)
+                        let status = if is_megagroup {
+                            parse_error("stats.getMegagroupStats")
+                        } else {
+                            parse_error("stats.getBroadcastStats")
+                        };
+                        let source = if is_megagroup {
+                            "GetMegagroupStatsQuery"
+                        } else {
+                            "GetBroadcastStatsQuery"
+                        };
+                        env.on_get_channel_error(channel_id, &status, source);
+                        promise.set_error(status);
+                    }
+                }
+            }
+            // `GetMessageStatsQuery::on_result`/`on_error` (cpp:539-551)
+            StatisticsNetKind::MessageStats => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((channel_id, mut promise)) =
+                        PendingStatisticsQueries::take_pending_head(&mut manager.pending.message_stats)
+                    {
+                        env.on_get_channel_error(channel_id, &status, "GetMessageStatsQuery");
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let result = telegram_api::stats_MessageStats::parse(query.ok())
+                    .map(convert_message_stats);
+                if let Some((channel_id, mut promise)) =
+                    PendingStatisticsQueries::take_pending_head(&mut manager.pending.message_stats)
+                {
+                    match result {
+                        Ok(statistics) => promise.set_value(statistics),
+                        Err(_) => {
+                            let status = parse_error("stats.getMessageStats");
+                            env.on_get_channel_error(channel_id, &status, "GetMessageStatsQuery");
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `GetStoryStatsQuery::on_result`/`on_error` (cpp:581-593)
+            StatisticsNetKind::StoryStats => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((channel_id, mut promise)) =
+                        PendingStatisticsQueries::take_pending_head(&mut manager.pending.story_stats)
+                    {
+                        env.on_get_channel_error(channel_id, &status, "GetStoryStatsQuery");
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let result =
+                    telegram_api::stats_StoryStats::parse(query.ok()).map(convert_story_stats);
+                if let Some((channel_id, mut promise)) =
+                    PendingStatisticsQueries::take_pending_head(&mut manager.pending.story_stats)
+                {
+                    match result {
+                        Ok(statistics) => promise.set_value(statistics),
+                        Err(_) => {
+                            let status = parse_error("stats.getStoryStats");
+                            env.on_get_channel_error(channel_id, &status, "GetStoryStatsQuery");
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `GetPollStatsQuery::on_result`/`on_error` (cpp:615-629)
+            StatisticsNetKind::PollStats => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((dialog_id, mut promise)) =
+                        PendingStatisticsQueries::take_pending_head(&mut manager.pending.poll_stats)
+                    {
+                        env.on_get_dialog_error(dialog_id, &status, "GetPollStatsQuery");
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let result = telegram_api::stats_PollStats::parse(query.ok()).map(|stats| {
+                    td_api::PollVoteStatistics {
+                        vote_graph: crate::statistics_manager::convert_stats_graph_opt(
+                            &stats.votes_graph,
+                        ),
+                    }
+                });
+                if let Some((dialog_id, mut promise)) =
+                    PendingStatisticsQueries::take_pending_head(&mut manager.pending.poll_stats)
+                {
+                    match result {
+                        Ok(statistics) => promise.set_value(statistics),
+                        Err(_) => {
+                            let status = parse_error("stats.getPollStats");
+                            env.on_get_dialog_error(dialog_id, &status, "GetPollStatsQuery");
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `GetDialogRevenueStatsQuery::on_result`/`on_error`
+            // (cpp:309-329)
+            StatisticsNetKind::RevenueStats => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((dialog_id, mut promise)) = PendingStatisticsQueries::take_pending_head(
+                        &mut manager.pending.revenue_stats,
+                    ) {
+                        env.on_get_dialog_error(dialog_id, &status, "GetDialogRevenueStatsQuery");
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let result = telegram_api::payments_StarsRevenueStats::parse(query.ok())
+                    .map(convert_ton_revenue_stats);
+                if let Some((dialog_id, mut promise)) =
+                    PendingStatisticsQueries::take_pending_head(&mut manager.pending.revenue_stats)
+                {
+                    match result {
+                        Ok(statistics) => promise.set_value(statistics),
+                        Err(_) => {
+                            let status = parse_error("payments.getStarsRevenueStats");
+                            env.on_get_dialog_error(
+                                dialog_id,
+                                &status,
+                                "GetDialogRevenueStatsQuery",
+                            );
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `GetTonRevenueWithdrawalUrlQuery::on_result`/`on_error`
+            // (cpp:352-364)
+            StatisticsNetKind::RevenueWithdrawalUrl => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((dialog_id, mut promise)) =
+                        PendingStatisticsQueries::take_pending_head(
+                            &mut manager.pending.revenue_withdrawal_urls,
+                        )
+                    {
+                        env.on_get_dialog_error(
+                            dialog_id,
+                            &status,
+                            "GetTonRevenueWithdrawalUrlQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let result = telegram_api::payments_StarsRevenueWithdrawalUrl::parse(query.ok())
+                    .map(|result| result.url);
+                if let Some((dialog_id, mut promise)) =
+                    PendingStatisticsQueries::take_pending_head(
+                        &mut manager.pending.revenue_withdrawal_urls,
+                    )
+                {
+                    match result {
+                        Ok(url) => promise.set_value(url),
+                        Err(_) => {
+                            let status = parse_error("payments.getStarsRevenueWithdrawalUrl");
+                            env.on_get_dialog_error(
+                                dialog_id,
+                                &status,
+                                "GetTonRevenueWithdrawalUrlQuery",
+                            );
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            // `GetTonRevenueTransactionsQuery::on_result`/`on_error`
+            // (cpp:386-506) — the users/chats intakes, the balance band
+            // and the history walk
+            StatisticsNetKind::RevenueTransactions => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if let Some((dialog_id, mut promise)) =
+                        PendingStatisticsQueries::take_pending_head(
+                            &mut manager.pending.revenue_transactions,
+                        )
+                    {
+                        env.on_get_dialog_error(
+                            dialog_id,
+                            &status,
+                            "GetTonRevenueTransactionsQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                    return;
+                }
+                let parsed = telegram_api::payments_StarsStatus::parse(query.ok());
+                let Some((dialog_id, mut promise)) = PendingStatisticsQueries::take_pending_head(
+                    &mut manager.pending.revenue_transactions,
+                ) else {
+                    return;
+                };
+                let Ok(result) = parsed else {
+                    let status = parse_error("payments.getStarsTransactions");
+                    env.on_get_dialog_error(dialog_id, &status, "GetTonRevenueTransactionsQuery");
+                    promise.set_error(status);
+                    return;
+                };
+                // the users/chats intakes (cpp:395-396)
+                env.on_get_users(result.users.clone(), "GetTonRevenueTransactionsQuery");
+                env.on_get_chats(result.chats.clone(), "GetTonRevenueTransactionsQuery");
+                // the balance band (cpp:398-401) — the on_error tail
+                // runs inline (the router IS the answer half)
+                if !matches!(
+                    result.balance,
+                    Some(telegram_api::StarsAmount::starsTonAmount(_))
+                ) {
+                    tdutils::log_error!("Receive {result:?}");
+                    let status = Status::error(500, "Receive invalid response");
+                    env.on_get_dialog_error(dialog_id, &status, "GetTonRevenueTransactionsQuery");
+                    promise.set_error(status);
+                    return;
+                }
+                promise.set_value(convert_ton_revenue_transactions(env, result));
+            }
+            // `GetMessagePublicForwardsQuery::on_result`/`on_error`
+            // (cpp:684-697) — the channel-difference walk is the
+            // recorded collapse (the updates engine); the conversion
+            // runs directly
+            StatisticsNetKind::MessagePublicForwards => {
+                on_public_forwards_answer(
+                    env,
+                    manager,
+                    query,
+                    false,
+                    "stats.getMessagePublicForwards",
+                    "GetMessagePublicForwardsQuery",
+                );
+            }
+            // `GetStoryPublicForwardsQuery::on_result`/`on_error`
+            // (cpp:723-736)
+            StatisticsNetKind::StoryPublicForwards => {
+                on_public_forwards_answer(
+                    env,
+                    manager,
+                    query,
+                    true,
+                    "stats.getStoryPublicForwards",
+                    "GetStoryPublicForwardsQuery",
+                );
+            }
+            // `LoadAsyncGraphQuery::on_result`/`on_error` (cpp:649-661) —
+            // the plain graph conversion; the error half has no
+            // dialog-error tail
+            StatisticsNetKind::LoadAsyncGraph => {
+                if query.is_error() {
+                    if let Some(mut promise) =
+                        PendingStatisticsQueries::take_pending_head(&mut manager.pending.load_async_graph)
+                    {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let result = telegram_api::StatsGraph::parse(query.ok())
+                    .map(|graph| crate::statistics_manager::convert_stats_graph(&graph));
+                if let Some(mut promise) =
+                    PendingStatisticsQueries::take_pending_head(&mut manager.pending.load_async_graph)
+                {
+                    match result {
+                        Ok(graph) => promise.set_value(graph),
+                        Err(_) => promise.set_error(parse_error("stats.loadAsyncGraph")),
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// The shared public-forwards answer half — the users/chats
+/// intakes (`get_channel_differences_if_needed`, cpp:1052-1053), then
+/// the `on_get_public_forwards` conversion (cpp:999-1047).
+fn on_public_forwards_answer(
+    env: &mut StatisticsEnv<'_>,
+    manager: &mut StatisticsManager,
+    query: NetQuery,
+    is_story: bool,
+    wire_name: &str,
+    source: &'static str,
+) {
+    let popped = if query.is_error() {
+        let popped = if is_story {
+            crate::statistics_manager::PendingStatisticsQueries::take_pending_head(
+                &mut manager.pending.story_public_forwards,
+            )
+        } else {
+            crate::statistics_manager::PendingStatisticsQueries::take_pending_head(
+                &mut manager.pending.message_public_forwards,
+            )
+        };
+        if let Some((dialog_id, mut promise)) = popped {
+            let status = query.error().clone();
+            env.on_get_dialog_error(dialog_id, &status, source);
+            promise.set_error(status);
+        }
+        return;
+    } else if is_story {
+        crate::statistics_manager::PendingStatisticsQueries::take_pending_head(
+            &mut manager.pending.story_public_forwards,
+        )
+    } else {
+        crate::statistics_manager::PendingStatisticsQueries::take_pending_head(
+            &mut manager.pending.message_public_forwards,
+        )
+    };
+    let Some((dialog_id, mut promise)) = popped else {
+        return;
+    };
+    let Ok(forwards) = telegram_api::stats_PublicForwards::parse(query.ok()) else {
+        let status = Status::error(500, &format!("Failed to parse the {wire_name} answer"));
+        env.on_get_dialog_error(dialog_id, &status, source);
+        promise.set_error(status);
+        return;
+    };
+    // the intakes + the recorded difference-walk collapse, then the
+    // conversion (cpp:1052-1075 → 999-1047)
+    env.on_get_users(forwards.users.clone(), "stats_publicForwards");
+    env.on_get_chats(forwards.chats.clone(), "stats_publicForwards");
+    manager.on_get_public_forwards(env, forwards, promise);
+}
+
+impl Td {
+    /// The `on_get_public_forwards` message leg (StatisticsManager.cpp:
+    /// 1012-1017): the receive head over the alias quintet + the object
+    /// build (the read_all_dialog_mentions map round-trip shape).
+    pub(crate) fn get_public_forward_message_object(
+        &mut self,
+        message: telegram_api::Message,
+    ) -> Option<td_api::Message> {
+        let (dialog_id, message_id) =
+            self.receive_search_message(message, "on_get_public_forwards")?;
+        // SAFETY: every alias below derives from `td_ptr` and the callee
+        // uses them strictly one at a time (the apply_new_message
+        // contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let msgctx: &mut dyn crate::messages_manager::MessageObjectContext =
+            unsafe { &mut *td_ptr };
+        let reactions_ctx: &dyn crate::messages_manager::DialogReactionsContext =
+            unsafe { &*td_ptr };
+        let mut m = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|dialog| dialog.messages.remove(&message_id))?;
+        let object = crate::messages_manager::get_message_object(
+            manager,
+            reactions_ctx,
+            msgctx,
+            dialog_id,
+            &mut m,
+            "on_get_public_forwards",
+        );
+        let prev = manager
+            .get_dialog_mut(dialog_id)
+            .expect("dialog")
+            .messages
+            .insert(message_id, m);
+        assert!(prev.is_none(), "message reappeared mid-build");
+        object
+    }
+
+    /// The `on_get_public_forwards` story leg (StatisticsManager.cpp:
+    /// 1026-1030): the story intake + the `have_story`/object build.
+    pub(crate) fn get_public_forward_story_object(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        story: Box<telegram_api::StoryItem>,
+    ) -> Option<td_api::Story> {
+        self.with_story_manager(|env, manager| {
+            let story_id = manager.on_get_story(env, dialog_id, Some(*story));
+            let story_full_id = crate::story_ids::StoryFullId::new(dialog_id, story_id);
+            if story_id.is_valid() && manager.have_story(story_full_id) {
+                manager.get_story_object(env, story_full_id)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -40691,6 +41365,13 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
         self.chat_manager
             .get_channel_type_by_id(crate::chat_manager::ChannelId::new(channel_id))
             == crate::chat_manager::ChannelType::Megagroup
+    }
+
+    fn can_get_channel_story_statistics(&self, channel_id: i64) -> bool {
+        self.chat_manager.can_get_channel_story_statistics(
+            self.auth_is_bot,
+            crate::chat_manager::ChannelId::new(channel_id),
+        )
     }
 
     fn get_input_file_id(
@@ -49802,6 +50483,7 @@ mod tests {
             }
         }
         td.group_call_manager.net = td.group_call_net();
+        td.statistics_manager.net = td.statistics_net();
         (td, rec, callback)
     }
 
@@ -66312,11 +66994,12 @@ mod tests {
             telegram_api::channels_getFullChannel::ID,
         );
         assert!(responses_of(&callback, 1).is_empty(), "the request parks");
-        assert_eq!(td.statistics_dc_parked.len(), 1);
+        assert_eq!(td.statistics_manager.dc_parked.len(), 1);
 
         // 2. the refire answer — the full applies with the exact dc, the
-        //    impl resolves it, the request stays parked at the seam
-        //    (cpp:3866-3876 + 753-764)
+        //    impl resolves it, the continuation runs the send leg over
+        //    the net plane (cpp:3866-3876 + 753-764): the parked lot
+        //    drains into `stats.getBroadcastStats`
         let channel_full = telegram_api::ChatFull::channelFull(telegram_api::channelFull {
             flags: 1 << 12, // stats_dc present
             can_view_stats: true,
@@ -66331,8 +67014,18 @@ mod tests {
         );
         td.dispatch_completed_chat_net();
         td.flush_deferred_results();
-        assert_eq!(td.statistics_dc_parked.len(), 1, "still parked at the seam");
-        assert!(responses_of(&callback, 1).is_empty(), "no response yet");
+        assert!(
+            td.statistics_manager.dc_parked.is_empty(),
+            "the refire send leg ran"
+        );
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stats_getBroadcastStats::ID,
+        );
+        assert!(
+            responses_of(&callback, 1).is_empty(),
+            "the request waits on the stats answer"
+        );
         let stats_dc = with_chat_managers(&mut td, |chat_manager, _user_manager, _env| {
             chat_manager
                 .get_channel_full_const(crate::chat_manager::ChannelId::new(804))
@@ -66340,8 +67033,8 @@ mod tests {
         });
         assert_eq!(stats_dc.map(|dc| dc.get_value()), Some(2));
 
-        // 3. the sync band — an exact cached dc parks directly at the
-        //    seam with no query out
+        // 3. the sync band — an exact cached dc skips the chain and the
+        //    send leg fires directly (no new full query)
         td.request(
             2,
             Function::getChatStatistics(td_api::getChatStatistics {
@@ -66349,8 +67042,14 @@ mod tests {
                 is_dark: true,
             }),
         );
-        assert!(rec.sent.lock().is_empty(), "the cached dc needs no query");
-        assert_eq!(td.statistics_dc_parked.len(), 2);
+        assert!(
+            td.statistics_manager.dc_parked.is_empty(),
+            "the cached dc sends directly"
+        );
+        take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stats_getBroadcastStats::ID,
+        );
 
         // 4. the error band — the refire fails, the impl answers the
         //    "Chat full info not found" 400 to the request
@@ -66429,17 +67128,751 @@ mod tests {
             .filter(|query| query.tl_constructor() == telegram_api::channels_getFullChannel::ID)
             .collect::<Vec<_>>();
         assert_eq!(stats_refires.len(), 2, "both 805 refires went out");
-        let parked_before = td.statistics_dc_parked.len();
+        let parked_before = td.statistics_manager.dc_parked.len();
         net_fail(stats_refires.remove(0), 400, "CHANNEL_PRIVATE");
         td.dispatch_completed_chat_net();
         td.flush_deferred_results();
         // the failed refire fails BOTH 805 requests (the same-channel
         // drain); the parked 804 seam entries stay untouched
-        assert!(td.statistics_dc_parked.len() < parked_before);
+        assert!(td.statistics_manager.dc_parked.len() < parked_before);
         assert_eq!(error_of(&callback, 5).code, 400);
         assert_eq!(error_of(&callback, 6).code, 400);
 
         assert!(td.chat_net_completed.lock().is_empty(), "drained");
+    }
+
+    fn broadcast_stats_answer() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::stats_BroadcastStats {
+            period: Some(telegram_api::StatsDateRangeDays {
+                min_date: 100,
+                max_date: 200,
+            }),
+            followers: Some(telegram_api::StatsAbsValueAndPrev {
+                current: 60.0,
+                previous: 40.0,
+            }),
+            views_per_post: None,
+            shares_per_post: None,
+            reactions_per_post: None,
+            views_per_story: None,
+            shares_per_story: None,
+            reactions_per_story: None,
+            enabled_notifications: Some(telegram_api::StatsPercentValue {
+                part: 25.0,
+                total: 100.0,
+            }),
+            growth_graph: None,
+            followers_graph: None,
+            mute_graph: None,
+            top_hours_graph: None,
+            interactions_graph: None,
+            iv_interactions_graph: None,
+            views_by_source_graph: None,
+            new_followers_by_source_graph: None,
+            languages_graph: None,
+            reactions_by_emotion_graph: None,
+            story_interactions_graph: None,
+            story_reactions_by_emotion_graph: None,
+            recent_posts_interactions: vec![
+                telegram_api::PostInteractionCounters::postInteractionCountersMessage(
+                    telegram_api::postInteractionCountersMessage {
+                        msg_id: 7,
+                        views: 10,
+                        forwards: 3,
+                        reactions: 2,
+                    },
+                ),
+            ],
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn megagroup_stats_answer() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::stats_MegagroupStats {
+            period: Some(telegram_api::StatsDateRangeDays {
+                min_date: 1,
+                max_date: 2,
+            }),
+            members: Some(telegram_api::StatsAbsValueAndPrev {
+                current: 10.0,
+                previous: 5.0,
+            }),
+            messages: None,
+            viewers: None,
+            posters: None,
+            growth_graph: None,
+            members_graph: None,
+            new_members_by_source_graph: None,
+            languages_graph: None,
+            messages_graph: None,
+            actions_graph: None,
+            top_hours_graph: None,
+            weekdays_graph: None,
+            top_posters: vec![telegram_api::StatsGroupTopPoster {
+                user_id: 901,
+                messages: 5,
+                avg_chars: 10,
+            }],
+            top_admins: vec![telegram_api::StatsGroupTopAdmin {
+                user_id: 902,
+                deleted: 1,
+                kicked: 2,
+                banned: 3,
+            }],
+            top_inviters: vec![telegram_api::StatsGroupTopInviter {
+                user_id: 904,
+                invitations: 7,
+            }],
+            users: vec![],
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn ton_revenue_stats_answer() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::payments_StarsRevenueStats {
+            flags: 0,
+            top_hours_graph: None,
+            revenue_graph: None,
+            status: Some(telegram_api::StarsRevenueStatus {
+                flags: 0,
+                withdrawal_enabled: true,
+                current_balance: Some(telegram_api::StarsAmount::starsTonAmount(
+                    telegram_api::starsTonAmount { amount: 100 },
+                )),
+                available_balance: Some(telegram_api::StarsAmount::starsAmount(
+                    telegram_api::starsAmount {
+                        amount: 50,
+                        nanos: 0,
+                    },
+                )),
+                overall_revenue: Some(telegram_api::StarsAmount::starsTonAmount(
+                    telegram_api::starsTonAmount { amount: 200 },
+                )),
+                next_withdrawal_at: 0,
+            }),
+            usd_rate: 2.0,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn ton_transactions_answer() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::payments_StarsStatus {
+            flags: 0,
+            balance: Some(telegram_api::StarsAmount::starsTonAmount(
+                telegram_api::starsTonAmount { amount: 500 },
+            )),
+            subscriptions: Vec::new(),
+            subscriptions_next_offset: String::new(),
+            subscriptions_missing_balance: 0,
+            history: vec![telegram_api::StarsTransaction {
+                amount: Some(telegram_api::StarsAmount::starsTonAmount(
+                    telegram_api::starsTonAmount { amount: 100 },
+                )),
+                date: 7,
+                peer: Some(
+                    telegram_api::StarsTransactionPeer::starsTransactionPeerFragment(
+                        telegram_api::starsTransactionPeerFragment {},
+                    ),
+                ),
+                ..telegram_api::StarsTransaction::default()
+            }],
+            next_offset: String::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    /// The net-drain 38 round trip — the nine statistics families ride
+    /// their send legs and the wire answers settle through
+    /// `Td::on_statistics_net_answer` (StatisticsManager.cpp:180-737):
+    /// the broadcast/megagroup branch pair + the ton revenue pair round
+    /// trip happy answers, the message/story/poll/forwards families
+    /// round trip their C++ gates, and the channel answer drains the
+    /// error band.
+    #[test]
+    fn statistics_families_round_trip_through_the_router() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(statistics_families_round_trip_through_the_router_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn statistics_families_round_trip_through_the_router_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("nd38-statistics-round-trip");
+        seed_dialog_channel(&mut td, 901, true, false);
+        seed_dialog_channel(&mut td, 902, true, true);
+        let chat_id_901 = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(901),
+        )
+        .get();
+        let chat_id_902 = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(902),
+        )
+        .get();
+        let full_for = |id: i64| {
+            messages_chat_full_answer(
+                telegram_api::ChatFull::channelFull(telegram_api::channelFull {
+                    flags: 1 << 12, // stats_dc present
+                    can_view_stats: true,
+                    id,
+                    about: "about".to_owned(),
+                    stats_dc: 2,
+                    ..telegram_api::channelFull::default()
+                }),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+
+        // 1. the broadcast branch — the refire chain lands, the send leg
+        //    fires, the happy answer settles the request
+        //    (cpp:746-768 + 233-261)
+        td.request(
+            1,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: chat_id_901,
+                is_dark: false,
+            }),
+        );
+        net_complete(
+            take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::channels_getFullChannel::ID,
+            ),
+            full_for(901),
+        );
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        net_complete(
+            take_sent_query(&rec, telegram_api::stats_getBroadcastStats::ID),
+            broadcast_stats_answer(),
+        );
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1)[0],
+            Object::chatStatisticsChannel(_)
+        ));
+
+        // 2. the megagroup branch — the cached dc sends directly, the
+        //    wire fn flips and the supergroup form settles
+        //    (cpp:180-212)
+        td.request(
+            2,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: chat_id_902,
+                is_dark: false,
+            }),
+        );
+        net_complete(
+            take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::channels_getFullChannel::ID,
+            ),
+            full_for(902),
+        );
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        net_complete(
+            take_sent_query(&rec, telegram_api::stats_getMegagroupStats::ID),
+            megagroup_stats_answer(),
+        );
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2)[0],
+            Object::chatStatisticsSupergroup(_)
+        ));
+
+        // 3. the ton revenue pair — the main-dc families need no chain
+        //    (cpp:770-775 + 290-330, 820-826 + 367-507)
+        td.request(
+            3,
+            Function::getChatRevenueStatistics(td_api::getChatRevenueStatistics {
+                chat_id: chat_id_901,
+                is_dark: false,
+            }),
+        );
+        net_complete(
+            take_sent_query(&rec, telegram_api::payments_getStarsRevenueStats::ID),
+            ton_revenue_stats_answer(),
+        );
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3)[0],
+            Object::chatRevenueStatistics(_)
+        ));
+        td.request(
+            4,
+            Function::getChatRevenueTransactions(td_api::getChatRevenueTransactions {
+                chat_id: chat_id_901,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        net_complete(
+            take_sent_query(&rec, telegram_api::payments_getStarsTransactions::ID),
+            ton_transactions_answer(),
+        );
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4)[0],
+            Object::chatRevenueTransactions(_)
+        ));
+
+        // 4. the message-family gates — the unregistered ids answer the
+        //    C++ 400s with no query out (cpp:528-531, 608-609)
+        td.request(
+            5,
+            Function::getMessageStatistics(td_api::getMessageStatistics {
+                chat_id: chat_id_901,
+                message_id: 20,
+                is_dark: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 5).code, 400);
+        assert!(rec.sent.lock().is_empty(), "the gate stops the query");
+        td.request(
+            6,
+            Function::getStoryStatistics(td_api::getStoryStatistics {
+                chat_id: chat_id_901,
+                story_id: 5,
+                is_dark: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 6).code, 400);
+        td.request(
+            7,
+            Function::getPollVoteStatistics(td_api::getPollVoteStatistics {
+                chat_id: chat_id_901,
+                message_id: 20,
+                is_dark: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 7).code, 400);
+        assert!(rec.sent.lock().is_empty(), "no query on the gates");
+
+        // 5. the forwards limit band — the pre-chain server clamp gate
+        //    (cpp:924-926, 959-961)
+        td.request(
+            8,
+            Function::getMessagePublicForwards(td_api::getMessagePublicForwards {
+                chat_id: chat_id_901,
+                message_id: 20,
+                offset: String::new(),
+                limit: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        assert_eq!(
+            error_of(&callback, 8).message,
+            "Parameter limit must be positive"
+        );
+        td.request(
+            9,
+            Function::getStoryPublicForwards(td_api::getStoryPublicForwards {
+                story_poster_chat_id: chat_id_901,
+                story_id: 5,
+                offset: String::new(),
+                limit: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        assert_eq!(
+            error_of(&callback, 9).message,
+            "Parameter limit must be positive"
+        );
+
+        // 6. the withdrawal-url password band — the empty password
+        //    answers the C++ 400 before any SRP or wire (cpp:797-799)
+        td.request(
+            10,
+            Function::getChatRevenueWithdrawalUrl(td_api::getChatRevenueWithdrawalUrl {
+                chat_id: chat_id_901,
+                password: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 10).message, "PASSWORD_HASH_INVALID");
+        assert!(rec.sent.lock().is_empty(), "no query on the band");
+
+        // 7. the channel error band — the net failure drains the lot
+        //    head through on_get_channel_error and the promise
+        //    (cpp:233-243)
+        seed_dialog_channel(&mut td, 903, true, false);
+        let chat_id_903 = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(903),
+        )
+        .get();
+        td.request(
+            11,
+            Function::getChatStatistics(td_api::getChatStatistics {
+                chat_id: chat_id_903,
+                is_dark: false,
+            }),
+        );
+        net_complete(
+            take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::channels_getFullChannel::ID,
+            ),
+            full_for(903),
+        );
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        net_fail(
+            take_sent_query(&rec, telegram_api::stats_getBroadcastStats::ID),
+            400,
+            "CHANNEL_PRIVATE",
+        );
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+    }
+
+    /// Seed one channel-post message row the statistics gates read — a
+    /// server id with a nonzero view count (the `can_get_message_statistics`
+    /// record fields, MessagesManager.cpp:8327-8340).
+    fn seed_channel_stats_message(td: &mut Td, chat_id: i64, server_message_id: i32) {
+        let dialog_id = crate::messages_manager::DialogId::new(chat_id);
+        let message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(server_message_id),
+        );
+        let mut manager = std::mem::take(&mut td.messages_manager);
+        let dialog = manager.dialogs.entry(dialog_id).or_insert_with(|| {
+            Box::new(crate::messages_manager::Dialog {
+                dialog_id,
+                is_update_new_chat_sent: true,
+                ..crate::messages_manager::Dialog::default()
+            })
+        });
+        dialog.last_new_message_id = message_id;
+        let message = crate::messages_manager::Message {
+            message_id,
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            view_count: 5,
+            random_id: 1,
+            ..crate::messages_manager::Message::default()
+        };
+        dialog.messages.insert(message_id, Box::new(message));
+        td.messages_manager = manager;
+    }
+
+    /// The net-drain 38 netted round-trips, part two — the message/story
+    /// stats families, the getStatisticalGraph rider, the public-forwards
+    /// conversion walk, the withdrawal-url placeholder collapse and the
+    /// transactions balance band over the live td_api arms
+    /// (StatisticsManager.cpp:828-886, 900-918, 999-1047, 793-810,
+    /// 386-401).
+    #[test]
+    fn statistics_message_story_graph_families_round_trip() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(statistics_message_story_graph_families_round_trip_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn statistics_message_story_graph_families_round_trip_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("nd38-statistics-message-story");
+        seed_dialog_channel(&mut td, 904, true, false);
+        seed_dialog_channel(&mut td, 905, true, false);
+        let chat_id_904 = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(904),
+        )
+        .get();
+        let chat_id_905 = crate::chat_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(905),
+        )
+        .get();
+        let full_for = |id: i64| {
+            messages_chat_full_answer(
+                telegram_api::ChatFull::channelFull(telegram_api::channelFull {
+                    flags: 1 << 12, // stats_dc present
+                    can_view_stats: true,
+                    id,
+                    about: "about".to_owned(),
+                    stats_dc: 2,
+                    ..telegram_api::channelFull::default()
+                }),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let answer_refire = |td: &mut Td, rec: &std::sync::Arc<RecNetSession>, id: i64| {
+            net_complete(
+                take_sent(
+                    std::mem::take(&mut *rec.sent.lock()),
+                    telegram_api::channels_getFullChannel::ID,
+                ),
+                full_for(id),
+            );
+            td.dispatch_completed_chat_net();
+            td.flush_deferred_results();
+        };
+        let message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(7),
+        )
+        .get();
+        seed_channel_stats_message(&mut td, chat_id_904, 7);
+
+        // 1. the message-stats happy path — the gates pass on the seeded
+        //    record, the chain refires, the wire query + the answer settle
+        //    the messageStatistics form (cpp:828-856 + 539-551)
+        td.request(
+            1,
+            Function::getMessageStatistics(td_api::getMessageStatistics {
+                chat_id: chat_id_904,
+                message_id,
+                is_dark: false,
+            }),
+        );
+        answer_refire(&mut td, &rec, 904);
+        net_complete(
+            take_sent_query(&rec, telegram_api::stats_getMessageStats::ID),
+            {
+                let mut out = Vec::new();
+                telegram_api::stats_MessageStats {
+                    views_graph: Some(telegram_api::StatsGraph::statsGraph(
+                        telegram_api::statsGraph {
+                            flags: 0,
+                            json: Some(telegram_api::DataJSON {
+                                data: "{\"x\":1}".to_owned(),
+                            }),
+                            zoom_token: String::new(),
+                        },
+                    )),
+                    reactions_by_emotion_graph: None,
+                }
+                .store_boxed(&mut out);
+                out
+            },
+        );
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        match &responses_of(&callback, 1)[0] {
+            Object::messageStatistics(stats) => {
+                assert!(
+                    matches!(
+                        &stats.message_interaction_graph,
+                        Some(td_api::StatisticalGraph::statisticalGraphData(_))
+                    ),
+                    "the views graph lands"
+                );
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+
+        // 2. the story-stats happy path — the seeded photo story passes
+        //    the story gates over the cached dc (cpp:858-886 + 581-593)
+        td.with_story_manager(|env, manager| {
+            manager.on_get_story(
+                env,
+                crate::dialog_id::DialogId::new(chat_id_904),
+                Some(wire_photo_story(11, false, 8640100)),
+            );
+        });
+        td.request(
+            2,
+            Function::getStoryStatistics(td_api::getStoryStatistics {
+                chat_id: chat_id_904,
+                story_id: 11,
+                is_dark: false,
+            }),
+        );
+        {
+            let mut out = Vec::new();
+            telegram_api::stats_StoryStats::default().store_boxed(&mut out);
+            net_complete(
+                take_sent_query(&rec, telegram_api::stats_getStoryStats::ID),
+                out,
+            );
+        }
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            &responses_of(&callback, 2)[0],
+            Object::storyStatistics(_)
+        ));
+
+        // 3. the getStatisticalGraph rider — the token + x form over the
+        //    cached dc (cpp:900-918)
+        td.request(
+            3,
+            Function::getStatisticalGraph(td_api::getStatisticalGraph {
+                chat_id: chat_id_904,
+                token: "tok".to_owned(),
+                x: 5,
+            }),
+        );
+        {
+            let mut out = Vec::new();
+            telegram_api::StatsGraph::statsGraphAsync(telegram_api::statsGraphAsync {
+                token: "next".to_owned(),
+            })
+            .store(&mut out);
+            net_complete(
+                take_sent_query(&rec, telegram_api::stats_loadAsyncGraph::ID),
+                out,
+            );
+        }
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        match &responses_of(&callback, 3)[0] {
+            Object::statisticalGraphAsync(graph) => assert_eq!(graph.token, "next"),
+            other => panic!("unexpected graph: {other:?}"),
+        }
+
+        // 4. the message-forwards walk — one stored forward + one unknown
+        //    story forward: the stored message converts, the unknown story
+        //    decrements the total (cpp:920-953 + 999-1047)
+        seed_channel_stats_message(&mut td, chat_id_905, 8);
+        td.request(
+            4,
+            Function::getMessagePublicForwards(td_api::getMessagePublicForwards {
+                chat_id: chat_id_904,
+                message_id,
+                offset: String::new(),
+                limit: 50,
+            }),
+        );
+        {
+            let mut out = Vec::new();
+            telegram_api::stats_PublicForwards {
+                flags: 0,
+                count: 3,
+                forwards: vec![
+                    telegram_api::PublicForward::publicForwardMessage(
+                        telegram_api::publicForwardMessage {
+                            message: Some(telegram_api::Message::message(telegram_api::message {
+                                id: 8,
+                                flags: 1 << 9, // MEDIA
+                                peer_id: Some(telegram_api::Peer::peerChannel(
+                                    telegram_api::peerChannel { channel_id: 905 },
+                                )),
+                                date: 100,
+                                message: "fwd".to_owned(),
+                                ..telegram_api::message::default()
+                            })),
+                        },
+                    ),
+                    telegram_api::PublicForward::publicForwardStory(
+                        telegram_api::publicForwardStory {
+                            peer: Some(telegram_api::Peer::peerChannel(
+                                telegram_api::peerChannel { channel_id: 905 },
+                            )),
+                            story: Some(Box::new(wire_photo_story(777, false, 8640100))),
+                        },
+                    ),
+                ],
+                next_offset: String::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            net_complete(
+                take_sent_query(&rec, telegram_api::stats_getMessagePublicForwards::ID),
+                out,
+            );
+        }
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        match &responses_of(&callback, 4)[0] {
+            Object::publicForwards(forwards) => {
+                assert_eq!(forwards.total_count, 2, "the unknown story drops 3→2");
+                assert_eq!(forwards.forwards.len(), 1);
+            }
+            other => panic!("unexpected forwards: {other:?}"),
+        }
+
+        // 5. the withdrawal-url placeholder collapse — the SRP seam parks
+        //    ([blocked: PasswordManager]) and the wire query rides the
+        //    empty-SRP form (the StarManager collapse, cpp:793-810)
+        td.request(
+            5,
+            Function::getChatRevenueWithdrawalUrl(td_api::getChatRevenueWithdrawalUrl {
+                chat_id: chat_id_904,
+                password: "pw".to_owned(),
+            }),
+        );
+        {
+            let mut out = Vec::new();
+            telegram_api::payments_StarsRevenueWithdrawalUrl {
+                url: "https://ton".to_owned(),
+            }
+            .store_boxed(&mut out);
+            net_complete(
+                take_sent_query(
+                    &rec,
+                    telegram_api::payments_getStarsRevenueWithdrawalUrl::ID,
+                ),
+                out,
+            );
+        }
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        match &responses_of(&callback, 5)[0] {
+            Object::httpUrl(url) => assert_eq!(url.url, "https://ton"),
+            other => panic!("unexpected url: {other:?}"),
+        }
+
+        // 6. the transactions balance band — a non-TON balance answers
+        //    the C++ 500 (cpp:398-401)
+        td.request(
+            6,
+            Function::getChatRevenueTransactions(td_api::getChatRevenueTransactions {
+                chat_id: chat_id_904,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        {
+            let mut out = Vec::new();
+            telegram_api::payments_StarsStatus {
+                balance: Some(telegram_api::StarsAmount::starsAmount(
+                    telegram_api::starsAmount {
+                        amount: 1,
+                        nanos: 0,
+                    },
+                )),
+                ..telegram_api::payments_StarsStatus::default()
+            }
+            .store_boxed(&mut out);
+            net_complete(
+                take_sent_query(&rec, telegram_api::payments_getStarsTransactions::ID),
+                out,
+            );
+        }
+        td.dispatch_completed_statistics_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 6);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
     }
 
     /// The `td_api::Chats`-typed recorded promise (the created-public
