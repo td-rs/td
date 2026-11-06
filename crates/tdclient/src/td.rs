@@ -3327,6 +3327,14 @@ struct PendingBackgroundQueries {
 /// [`Td::on_group_call_net_answer`].
 pub(crate) type GroupCallNetHandle = NetKindHandle<crate::group_call_manager::GroupCallNetKind>;
 
+/// The cloned call dispatch surface the `CallManager` senders hold — the
+/// answers drain through [`Td::on_call_net_answer`].
+pub(crate) type CallNetHandle = NetKindHandle<crate::call_manager::CallNetKind>;
+
+/// The cloned poll dispatch surface the `PollManagerEnv` senders hold —
+/// the answers drain through [`Td::on_poll_net_answer`].
+pub(crate) type PollNetHandle = NetKindHandle<crate::poll_manager::PollNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -3614,6 +3622,17 @@ pub(crate) type WebAppNetHandle = NetKindHandle<crate::web_app_manager::WebAppNe
 /// [`crate::web_browser_manager::WebBrowserManager::net`] field): the
 /// send legs run inside the manager, the env carries nothing wire-facing.
 pub(crate) type WebBrowserNetHandle = NetKindHandle<crate::web_browser_manager::WebBrowserNetKind>;
+
+/// The cloned notification-settings dispatch surface — the per-kind
+/// handle over the NotificationSettingsManager.cpp ResultHandler kinds
+/// (the net-drain 40 plane: the five ungated scope/reaction/reset
+/// families); the answers drain through
+/// [`Td::dispatch_completed_notification_settings_net`]. Manager-held
+/// (the [`crate::notification_settings_manager::NotificationSettingsManager::net`]
+/// field): the send legs run inside the manager, the env carries nothing
+/// wire-facing.
+pub(crate) type NotificationSettingsNetHandle =
+    NetKindHandle<crate::notification_settings_manager::NotificationSettingsNetKind>;
 /// The cloned DialogParticipant dispatch surface the
 /// [`TdDialogParticipantEnv`] senders use — the per-kind handle over the
 /// DialogParticipantManager.cpp ResultHandler kinds (the net-drain 35
@@ -3630,6 +3649,14 @@ pub(crate) type DialogParticipantNetHandle =
 /// [`crate::group_call_manager::GroupCallManager::net`] shape): the send
 /// legs run inside the manager over the env's peer/permission reads.
 pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::ForumTopicNetKind>;
+
+/// The cloned attach-menu dispatch surface the
+/// [`crate::attach_menu_manager::AttachMenuManager`] holds — the
+/// net-drain 42 families' send legs (the reload/single-bot/toggle
+/// queries); the answers drain through [`Td::on_attach_menu_net_answer`].
+/// Manager-held (the forum-topic shape): the send legs run inside the
+/// manager over the env's input-user reads.
+pub(crate) type AttachMenuNetHandle = NetKindHandle<crate::attach_menu_manager::AttachMenuNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -3734,6 +3761,14 @@ enum PendingPrivacyQuery {
     GetGlobal {
         promise: Promise<crate::privacy_manager::GlobalPrivacySettings>,
     },
+    /// The set chain's get-leg capture (GlobalPrivacySettings.cpp:186-197)
+    /// — the set slice rides the pending entry the way the C++ lambda
+    /// captures it; the get answer applies the changes and dispatches
+    /// the `SetGlobalPrivacySettingsQuery` tail.
+    SetGlobalChain {
+        set_settings: crate::privacy_manager::GlobalPrivacySettings,
+        promise: Promise<()>,
+    },
     /// The `SetGlobalPrivacySettingsQuery` promise
     /// (GlobalPrivacySettings.cpp:49).
     SetGlobal { promise: Promise<()> },
@@ -3743,8 +3778,8 @@ impl PendingPrivacyQuery {
     fn is_set_privacy(&self) -> bool {
         matches!(self, Self::SetPrivacy { .. })
     }
-    fn is_get_global(&self) -> bool {
-        matches!(self, Self::GetGlobal { .. })
+    fn is_get_global_leg(&self) -> bool {
+        matches!(self, Self::GetGlobal { .. } | Self::SetGlobalChain { .. })
     }
     fn is_set_global(&self) -> bool {
         matches!(self, Self::SetGlobal { .. })
@@ -3825,6 +3860,16 @@ fn parse_wire_bool(data: &[u8]) -> Option<()> {
     } else {
         None
     }
+}
+
+/// The notification-settings bool-answer band — a query answers ok only
+/// when it carried no error and the body is `boolTrue`; the wire error
+/// and the false-as-result 400 band ("Receive false as result",
+/// NotificationSettingsManager.cpp:469-471/545-547) settle the same
+/// way. Only the UpdateScope and Reset families carry the 400 band —
+/// SetReactions settles on any ok answer (cpp:507-515).
+fn wire_bool_ok(query: &NetQuery) -> bool {
+    !query.is_error() && parse_wire_bool_value(query.ok()) == Some(true)
 }
 
 /// The value form of [`parse_wire_bool`] — `Some(true)`/`Some(false)`
@@ -5929,6 +5974,12 @@ pub struct Td {
     /// `Td::on_group_call_net_answer`).
     group_call_net_completed:
         Arc<Mutex<Vec<(crate::group_call_manager::GroupCallNetKind, NetQuery)>>>,
+    /// The call net completed queue (the `CallNetKind` answers park
+    /// here; the drain routes them through `Td::on_call_net_answer`).
+    call_net_completed: Arc<Mutex<Vec<(crate::call_manager::CallNetKind, NetQuery)>>>,
+    /// The poll net completed queue (the `PollNetKind` answers park
+    /// here; the drain routes them through `Td::on_poll_net_answer`).
+    poll_net_completed: Arc<Mutex<Vec<(crate::poll_manager::PollNetKind, NetQuery)>>>,
     /// The callback-parked Support query answers, parked by kind (the
     /// `Td::on_support_net_answer` drain).
     support_net_completed: Arc<Mutex<Vec<(SupportNetKind, NetQuery)>>>,
@@ -6059,6 +6110,17 @@ pub struct Td {
     /// [`Td::on_web_browser_net_answer`] drain).
     web_browser_net_completed:
         Arc<Mutex<Vec<(crate::web_browser_manager::WebBrowserNetKind, NetQuery)>>>,
+    /// The callback-parked notification-settings answers (the C++
+    /// ResultHandler halves of the net-drain 40 families — the
+    /// [`Td::on_notification_settings_net_answer`] drain).
+    notification_settings_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::notification_settings_manager::NotificationSettingsNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The callback-parked DialogParticipant answers (the C++ ResultHandler
     /// halves of the net-drain 35 member-query trio — the
     /// [`Td::on_dialog_participant_net_answer`] drain).
@@ -6076,6 +6138,12 @@ pub struct Td {
     /// [`Td::on_forum_topic_net_answer`].
     forum_topic_net_completed:
         Arc<Mutex<Vec<(crate::forum_topic_manager::ForumTopicNetKind, NetQuery)>>>,
+    /// The attach-menu net completed queue (the `AttachMenuNetKind`
+    /// tags; the net-drain 42 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_attach_menu_net_answer`].
+    attach_menu_net_completed:
+        Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6552,6 +6620,8 @@ impl Td {
             background_net_completed: Arc::new(Mutex::new(Vec::new())),
             pending_background_queries: PendingBackgroundQueries::default(),
             group_call_net_completed: Arc::new(Mutex::new(Vec::new())),
+            call_net_completed: Arc::new(Mutex::new(Vec::new())),
+            poll_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_info_promises: Vec::new(),
             support_name_promises: Vec::new(),
@@ -6585,8 +6655,10 @@ impl Td {
             message_query_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_app_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_browser_net_completed: Arc::new(Mutex::new(Vec::new())),
+            notification_settings_net_completed: Arc::new(Mutex::new(Vec::new())),
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
+            attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7074,8 +7146,11 @@ impl Td {
         self.business_manager.net = self.business_net();
         self.statistics_manager.net = self.statistics_net();
         self.web_browser_manager.net = self.web_browser_net();
+        self.notification_settings_manager.net = self.notification_settings_net();
         self.group_call_manager.net = self.group_call_net();
+        self.call_manager.net = self.call_net();
         self.forum_topic_manager.net = self.forum_topic_net();
+        self.attach_menu_manager.net = self.attach_menu_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -8873,6 +8948,8 @@ impl Td {
         self.dispatch_completed_link_net();
         self.dispatch_completed_background_net();
         self.dispatch_completed_group_call_net();
+        self.dispatch_completed_call_net();
+        self.dispatch_completed_poll_net();
         self.dispatch_completed_statistics_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
@@ -8896,8 +8973,10 @@ impl Td {
         self.dispatch_completed_message_query_net();
         self.dispatch_completed_web_app_net();
         self.dispatch_completed_web_browser_net();
+        self.dispatch_completed_notification_settings_net();
         self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_forum_topic_net();
+        self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -8999,6 +9078,28 @@ impl Td {
         Some(GroupCallNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.group_call_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned call dispatch surface the `CallManager` holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn call_net(&self) -> Option<CallNetHandle> {
+        Some(CallNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.call_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned poll dispatch surface the `PollManagerEnv` senders
+    /// hold — `None` keeps the net-inert posture (the pre-init windows
+    /// and the net-inert tests).
+    pub(crate) fn poll_net(&self) -> Option<PollNetHandle> {
+        Some(PollNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.poll_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -9232,6 +9333,17 @@ impl Td {
         })
     }
 
+    /// The cloned notification-settings dispatch surface (the net-drain
+    /// 40 families' send legs — the manager-held handle the five
+    /// scope/reaction/reset queries ride).
+    pub(crate) fn notification_settings_net(&self) -> Option<NotificationSettingsNetHandle> {
+        Some(NotificationSettingsNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.notification_settings_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned DialogParticipant dispatch surface (the net-drain 35
     /// member-query trio). Env-held like the secure plane: the split env
     /// view captures the handle at split time.
@@ -9251,6 +9363,18 @@ impl Td {
         Some(ForumTopicNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.forum_topic_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned attach-menu dispatch surface the
+    /// [`crate::attach_menu_manager::AttachMenuManager`] holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn attach_menu_net(&self) -> Option<AttachMenuNetHandle> {
+        Some(AttachMenuNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.attach_menu_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10518,6 +10642,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked call answers — the C++ ResultHandler
+    /// on_result/on_error halves of the net-drain 44 families
+    /// (CallManager.cpp:31-118).
+    fn dispatch_completed_call_net(&mut self) {
+        let completed = std::mem::take(&mut *self.call_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_call_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Drain the callback-parked group-call answers — the C++
     /// ResultHandler `on_result`/`on_error` halves
     /// (GroupCallManager.cpp:76-1630).
@@ -10525,6 +10660,16 @@ impl Td {
         let completed = std::mem::take(&mut *self.group_call_net_completed.lock());
         for (kind, query) in completed {
             self.on_group_call_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked poll answers — the C++ ResultHandler
+    /// `on_result`/`on_error` halves (PollManager.cpp:67-332).
+    fn dispatch_completed_poll_net(&mut self) {
+        let completed = std::mem::take(&mut *self.poll_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_poll_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -17471,6 +17616,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked notification-settings answers — the
+    /// C++ ResultHandler halves of the net-drain 40 families
+    /// (NotificationSettingsManager.cpp:341-560).
+    fn dispatch_completed_notification_settings_net(&mut self) {
+        let completed = std::mem::take(&mut *self.notification_settings_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_notification_settings_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Drain the callback-parked DialogParticipant answers — the C++
     /// ResultHandler halves of the net-drain 35 member-query trio
     /// (DialogParticipantManager.cpp:342-443, 904-946).
@@ -17489,6 +17645,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.forum_topic_net_completed.lock());
         for (kind, query) in completed {
             self.on_forum_topic_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// The net-drain 42 attach-menu answers (the dispatcher callback
+    /// parks) — the reload/single-bot/toggle intakes route into the
+    /// manager's answer handlers over the split env.
+    fn dispatch_completed_attach_menu_net(&mut self) {
+        let completed = std::mem::take(&mut *self.attach_menu_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_attach_menu_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -18837,6 +19004,199 @@ impl Td {
             .on_get_web_browser_settings(&mut env, result, promise);
     }
 
+    /// Route one notification-settings net answer by kind — the
+    /// ResultHandler halves of the net-drain 40 families
+    /// (NotificationSettingsManager.cpp:341-560):
+    ///
+    /// * GetScopeNotifySettings (cpp:341-371): the answer feeds the
+    ///   landed `on_update_scope_notify_settings` intake, then the parked
+    ///   query promise resolves with the now-synchronized state (the
+    ///   `GetScopeNotificationSettingsRequest` do_run re-run,
+    ///   Requests.cpp:1340-1364) — or the wire error forwards.
+    /// * GetReactionsNotifySettings (cpp:373-399): the answer feeds the
+    ///   landed `on_update_reaction_notification_settings` intake (the
+    ///   C++ promise is the empty `Promise<Unit>()` — nothing parks).
+    /// * UpdateScopeNotifySettings / SetReactionsNotifySettings /
+    ///   ResetNotifySettings (cpp:453-560): the `bool` answers settle
+    ///   their erase-log-event promises (the parked id lot erases the
+    ///   binlog mirror on settlement, success or error, unless closing —
+    ///   LogEventHelper.cpp:42-52); the error and the false-as-result 400
+    ///   bands re-send the matching Get repair query unless a bot
+    ///   (the Reset family has no repair, only the expected-error-gated
+    ///   log).
+    fn on_notification_settings_net_answer(
+        &mut self,
+        kind: crate::notification_settings_manager::NotificationSettingsNetKind,
+        query: NetQuery,
+    ) {
+        use crate::notification_settings_manager::NotificationSettingsNetKind;
+        match kind {
+            NotificationSettingsNetKind::GetScope { scope } => {
+                let promise = self
+                    .notification_settings_manager
+                    .take_scope_get_promise(scope);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let result =
+                    if let Ok(settings) = telegram_api::PeerNotifySettings::parse(query.ok()) {
+                        Ok(Some(settings))
+                    } else {
+                        Err(tdutils::status::Status::error(
+                            500,
+                            "Receive invalid peer notify settings",
+                        ))
+                    };
+                match result {
+                    Ok(settings) => {
+                        let unix_time = self.get_unix_time();
+                        {
+                            let mut env = NotificationEnv {
+                                global: &mut self.global,
+                                options: self.option_manager.as_mut(),
+                                auth_is_authorized: self.auth_manager.is_authorized(),
+                                auth_is_bot: self.auth_manager.is_bot(),
+                                updates: &mut self.notification_updates,
+                            };
+                            self.notification_settings_manager
+                                .on_update_scope_notify_settings(&mut env, scope, settings);
+                        }
+                        // the do_run re-run: the synchronized state answers
+                        if let Some(mut promise) = promise {
+                            let object = self
+                                .notification_settings_manager
+                                .scope_settings_object(scope, unix_time);
+                            promise.set_value(object);
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            NotificationSettingsNetKind::GetReactions => {
+                if query.is_error() {
+                    // the empty C++ promise drops the error silently
+                    // (Promise<Unit>::set_error on the null promise is a
+                    // no-op — nothing parks, nothing logs)
+                    return;
+                }
+                let Ok(settings) = telegram_api::ReactionsNotifySettings::parse(query.ok()) else {
+                    return;
+                };
+                let mut env = NotificationEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.notification_updates,
+                };
+                let reaction_settings =
+                    crate::notification_settings::ReactionNotificationSettings::from_telegram(
+                        Some(settings),
+                    );
+                self.notification_settings_manager
+                    .on_update_reaction_notification_settings(&mut env, reaction_settings);
+            }
+            NotificationSettingsNetKind::UpdateScope { scope } => {
+                let log_event_id = self
+                    .notification_settings_manager
+                    .take_update_scope_log_event();
+                self.settle_notification_settings_erase_promise(log_event_id);
+                if !wire_bool_ok(&query) {
+                    tdutils::log_info!("Receive error for set notification settings");
+                    self.repair_scope_notification_settings(scope);
+                }
+            }
+            NotificationSettingsNetKind::SetReactions => {
+                let log_event_id = self
+                    .notification_settings_manager
+                    .take_set_reaction_log_event();
+                self.settle_notification_settings_erase_promise(log_event_id);
+                // the ok band settles on any answer — the C++ on_result
+                // has no false-as-result check (cpp:507-515: it logs the
+                // result and sets the promise); only the wire error runs
+                // the repair tail (cpp:519-524)
+                if query.is_error() {
+                    tdutils::log_info!("Receive error for set reaction notification settings");
+                    if !self.auth_manager.is_bot() {
+                        let env = NotificationEnv {
+                            global: &mut self.global,
+                            options: self.option_manager.as_mut(),
+                            auth_is_authorized: self.auth_manager.is_authorized(),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                            updates: &mut self.notification_updates,
+                        };
+                        self.notification_settings_manager
+                            .send_get_reaction_notification_settings_query(&env);
+                    }
+                }
+            }
+            NotificationSettingsNetKind::Reset => {
+                let log_event_id = self.notification_settings_manager.take_reset_log_event();
+                self.settle_notification_settings_erase_promise(log_event_id);
+                if !wire_bool_ok(&query) {
+                    let status = if query.is_error() {
+                        query.error().clone()
+                    } else {
+                        tdutils::status::Status::error(400, "Receive false as result")
+                    };
+                    if !self.global.is_expected_error(&status) {
+                        tdutils::log_error!(
+                            "Receive error for reset notification settings: {status}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The erase-log-event promise half — `get_erase_log_event_promise`
+    /// (LogEventHelper.cpp:42-52): on settlement, success or error, the
+    /// binlog mirror erases unless the td is closing.
+    fn settle_notification_settings_erase_promise(&mut self, log_event_id: Option<u64>) {
+        let Some(log_event_id) = log_event_id else {
+            return;
+        };
+        if !self
+            .global
+            .shared_close_flag()
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.global.td_db().binlog().erase(log_event_id);
+        }
+    }
+
+    /// The Update-scope family's on_error repair tail
+    /// (NotificationSettingsManager.cpp:483-492): re-send the scope Get
+    /// query with the empty promise unless a bot.
+    fn repair_scope_notification_settings(
+        &mut self,
+        scope: crate::notification_settings::NotificationSettingsScope,
+    ) {
+        if self.auth_manager.is_bot() {
+            return;
+        }
+        let env = NotificationEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.notification_updates,
+        };
+        self.notification_settings_manager
+            .send_get_scope_notification_settings_query(
+                &env,
+                scope,
+                tdutils::promise::Promise::default(),
+            );
+    }
+
     /// Route one DialogParticipant net answer by kind — the ResultHandler
     /// halves of the net-drain 35 member-query trio: the wire answers
     /// parse here and the manager intakes run the landed tails (the parse
@@ -19640,6 +20000,114 @@ impl Td {
             total_count: 0,
             messages: result,
         });
+    }
+
+    /// Route one attach-menu net answer by kind — the ResultHandler halves
+    /// of the net-drain 42 families (AttachMenuManager.cpp:35-120). The
+    /// intakes/conversions live in the manager's answer handlers; the
+    /// toggle's two tails (the success-chain into `reload_attach_menu_bots`,
+    /// the error's promise-less reload first) run here over the split env.
+    fn on_attach_menu_net_answer(
+        &mut self,
+        kind: crate::attach_menu_manager::AttachMenuNetKind,
+        query: NetQuery,
+    ) {
+        use crate::attach_menu_manager::{AttachMenuBotsAnswer, AttachMenuNetKind as K};
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+
+        match kind {
+            // `GetAttachMenuBotsQuery::on_result`/`on_error` (cpp:47-60):
+            // the Result/constructor split routes into
+            // `on_reload_attach_menu_bots` — the error band arms the short
+            // retry and settles the parked promises Unit (cpp:615-618),
+            // the answer runs the users intake + the cache/update/save
+            // walk (cpp:610-660).
+            K::GetAttachMenuBots => {
+                let (mut env, manager) = attach_menu_env_split(self);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    return manager.on_reload_attach_menu_bots(&mut env, Err(status));
+                }
+                let answer = match telegram_api::AttachMenuBots::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        return manager.on_reload_attach_menu_bots(
+                            &mut env,
+                            Err(parse_error("messages.getAttachMenuBots")),
+                        );
+                    }
+                };
+                tdutils::log_info!("Receive result for GetAttachMenuBotsQuery");
+                let answer = match answer {
+                    telegram_api::AttachMenuBots::attachMenuBotsNotModified(_) => {
+                        AttachMenuBotsAnswer::NotModified
+                    }
+                    telegram_api::AttachMenuBots::attachMenuBots(bots) => {
+                        AttachMenuBotsAnswer::Bots(bots)
+                    }
+                };
+                manager.on_reload_attach_menu_bots(&mut env, Ok(answer));
+            }
+            // `GetAttachMenuBotQuery::on_result`/`on_error` (cpp:75-88):
+            // the Result routes into `on_get_attach_menu_bot` with the
+            // kind-carried user id (the C++ lambda capture) and the
+            // FIFO-parked promise (§5) — the users intake, the wire
+            // conversion and the cache walk live in the manager.
+            K::GetAttachMenuBot { user_id } => {
+                let Some(promise) = pop_head(&mut self.attach_menu_manager.pending_bot_queries)
+                else {
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::AttachMenuBotsBot::parse(query.ok()) {
+                        Ok(bot) => Ok(bot),
+                        Err(_) => Err(parse_error("messages.getAttachMenuBot")),
+                    }
+                };
+                tdutils::log_info!("Receive result for GetAttachMenuBotQuery");
+                let (mut env, manager) = attach_menu_env_split(self);
+                manager.on_get_attach_menu_bot(&mut env, user_id, result, promise);
+            }
+            // `ToggleBotInAttachMenuQuery::on_result`/`on_error`
+            // (cpp:103-119): the fetch failure rides the C++ `on_error`
+            // (the promise-less reload + the promise error), the Bool
+            // answer logs the false band (cpp:105-107) and success-chains
+            // the promise into `reload_attach_menu_bots` (cpp:795-799).
+            K::ToggleBotInAttachMenu => {
+                let Some(mut promise) =
+                    pop_head(&mut self.attach_menu_manager.pending_toggle_promises)
+                else {
+                    return;
+                };
+                let (mut env, manager) = attach_menu_env_split(self);
+                if query.is_error() {
+                    let status = query.error().clone();
+                    manager.reload_attach_menu_bots(&mut env, Promise::default());
+                    return promise.set_error(status);
+                }
+                let Some(result) = parse_wire_bool_value(query.ok()) else {
+                    let status = parse_error("messages.toggleBotInAttachMenu");
+                    manager.reload_attach_menu_bots(&mut env, Promise::default());
+                    return promise.set_error(status);
+                };
+                tdutils::log_info!("Receive result for ToggleBotInAttachMenuQuery");
+                if !result {
+                    tdutils::log_error!("Failed to add a bot to attachment menu");
+                }
+                manager.reload_attach_menu_bots(&mut env, promise);
+            }
+        }
     }
 
     /// `get_found_messages_object`'s per-id build
@@ -20572,30 +21040,76 @@ impl Td {
                 manager.on_set_user_privacy_settings(&mut env, setting, result, promise);
                 self.privacy_manager = manager;
             }
-            // `GetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:33-46).
+            // `GetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:33-46)
+            // — the fetch promise converts through the wire constructor;
+            // the set chain's captured slice applies onto the fetched
+            // settings and dispatches the `SetGlobalPrivacySettingsQuery`
+            // tail (GlobalPrivacySettings.cpp:186-197).
             PrivacyNetKind::GetGlobalPrivacySettings => {
                 let Some(pending) = take_privacy_pending(
                     &mut self.privacy_promises,
-                    PendingPrivacyQuery::is_get_global,
+                    PendingPrivacyQuery::is_get_global_leg,
                 ) else {
                     return;
                 };
-                let PendingPrivacyQuery::GetGlobal { mut promise } = pending else {
-                    unreachable!("the selector matches the variant");
+                // both get-leg promises convert the wire settings or
+                // forward the failure (the C++ ResultHandler paths)
+                let r_settings = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::GlobalPrivacySettings::parse(query.ok()) {
+                        Ok(settings) => tdutils::status::Result::Ok(
+                            crate::privacy_manager::GlobalPrivacySettings::from_wire(settings),
+                        ),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "account_getGlobalPrivacySettings",
+                        )),
+                    }
                 };
-                if query.is_error() {
-                    promise.set_error(query.error().clone());
-                    return;
-                }
-                match telegram_api::GlobalPrivacySettings::parse(query.ok()) {
-                    Ok(settings) => promise.set_value(
-                        crate::privacy_manager::GlobalPrivacySettings::from_wire(settings),
-                    ),
-                    Err(_) => promise.set_error(parse_error("account_getGlobalPrivacySettings")),
+                match pending {
+                    PendingPrivacyQuery::GetGlobal { mut promise } => match r_settings {
+                        tdutils::status::Result::Ok(settings) => promise.set_value(settings),
+                        tdutils::status::Result::Err(status) => promise.set_error(status),
+                    },
+                    PendingPrivacyQuery::SetGlobalChain {
+                        set_settings,
+                        mut promise,
+                    } => match r_settings {
+                        tdutils::status::Result::Ok(mut settings) => {
+                            // `G()->ignore_result_if_closing`
+                            // (Global.h:280-284) — a closing Td converts
+                            // the ok answer into the request-aborted error
+                            if self.global.close_flag() {
+                                promise.set_error(crate::config_result::request_aborted_error());
+                                return;
+                            }
+                            settings.apply_changes(&set_settings);
+                            // the caller promise parks for the SET answer
+                            self.privacy_promises
+                                .push(PendingPrivacyQuery::SetGlobal { promise });
+                            match self.privacy_net() {
+                                Some(net) => net.dispatch(
+                                    PrivacyNetKind::SetGlobalPrivacySettings,
+                                    telegram_api::Function::account_setGlobalPrivacySettings(
+                                        telegram_api::account_setGlobalPrivacySettings {
+                                            settings: Some(
+                                                settings.get_input_global_privacy_settings(),
+                                            ),
+                                        },
+                                    ),
+                                ),
+                                None => {
+                                    tdutils::log_info!("Set global privacy settings — [net-inert]")
+                                }
+                            }
+                        }
+                        tdutils::status::Result::Err(status) => promise.set_error(status),
+                    },
+                    _ => unreachable!("the selector matches the get leg"),
                 }
             }
             // `SetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:59-75)
-            // — the ok arm drops the echoed settings value.
+            // — the Bool answer drops (the C++ Unit band).
             PrivacyNetKind::SetGlobalPrivacySettings => {
                 let Some(pending) = take_privacy_pending(
                     &mut self.privacy_promises,
@@ -20608,8 +21122,8 @@ impl Td {
                 };
                 if query.is_error() {
                     promise.set_error(query.error().clone());
-                } else if telegram_api::GlobalPrivacySettings::parse(query.ok()).is_ok() {
-                    // the echoed settings value drops (the C++ Unit band)
+                } else if parse_wire_bool(query.ok()).is_some() {
+                    // the echoed Bool value drops (the C++ Unit band)
                     promise.set_value(());
                 } else {
                     promise.set_error(parse_error("account_setGlobalPrivacySettings"));
@@ -22470,6 +22984,134 @@ impl Td {
         )
     }
 
+    /// Route one PollManager net answer by kind — the ResultHandler
+    /// halves of the net-drain 39 families (PollManager.cpp:67-332): the
+    /// wire answers parse here, the manager intakes run through the
+    /// `poll_env_split` view (the kinds carry the C++ promise-lambda
+    /// identity; the intakes pair the lots by it), and the Updates
+    /// answers feed the engine through the `UmMessage` hops.
+    fn on_poll_net_answer(&mut self, kind: crate::poll_manager::PollNetKind, query: NetQuery) {
+        use crate::poll_manager::PollNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        // The Updates-typed parse shared by the Update-returning
+        // families (the fetch failure settles through the same error
+        // tails, the landed-flip convention).
+        fn parse_updates(bytes: &[u8], what: &str) -> Result<telegram_api::Updates, Status> {
+            match telegram_api::Updates::parse(bytes) {
+                Ok(updates) => Ok(updates),
+                Err(_) => Err(parse_error(what)),
+            }
+        }
+        let wire = || {
+            if query.is_error() {
+                Err(query.error().clone())
+            } else {
+                Ok(query.ok().to_vec())
+            }
+        };
+        match kind {
+            // `SendVoteQuery::on_result`/`on_error` (cpp:266-306) — the
+            // answer re-enters `on_set_poll_answer` with the captured
+            // generation; the Ok updates ride the engine tail that
+            // finishes the ladder with Unit().
+            K::SendVote { generation } => {
+                let wire = match wire() {
+                    Err(status) => Err(status),
+                    Ok(bytes) => parse_updates(&bytes, "messages.sendVote"),
+                };
+                let tail = {
+                    let (mut env, poll_manager) = poll_env_split(self);
+                    poll_manager.on_send_vote_answer(&mut env, generation, wire)
+                };
+                if let Some((updates, poll_id, generation)) = tail {
+                    self.um_send(UmMessage::OnGetUpdatesPollAnswer {
+                        updates: Box::new(updates),
+                        poll_id,
+                        generation,
+                    });
+                }
+            }
+            // `GetPollResultsQuery::on_result`/`on_error` (cpp:91-110) —
+            // the answer re-enters `on_get_poll_results`; the returned
+            // updates feed the engine with an empty promise (the C++
+            // `Promise<Unit>()`).
+            K::GetPollResults { generation } => {
+                let wire = match wire() {
+                    Err(status) => Err(status),
+                    Ok(bytes) => parse_updates(&bytes, "messages.getPollResults").map(Some),
+                };
+                let updates = {
+                    let (mut env, poll_manager) = poll_env_split(self);
+                    poll_manager.on_get_poll_results_answer(&mut env, generation, wire)
+                };
+                if let Some(updates) = updates {
+                    self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise: Promise::default(),
+                    });
+                }
+            }
+            // `GetPollVotersQuery::on_result`/`on_error` (cpp:134-162) —
+            // the votesList parses here and the whole cpp:1619-1710
+            // intake runs (the parked pending_queries settle there).
+            K::GetPollVoters { poll_id, option_id } => {
+                let wire = match wire() {
+                    Err(status) => Err(status),
+                    Ok(bytes) => match telegram_api::messages_VotesList::parse(&bytes) {
+                        Ok(vote_list) => Ok(vote_list),
+                        Err(_) => Err(parse_error("messages.getPollVotes")),
+                    },
+                };
+                let (mut env, poll_manager) = poll_env_split(self);
+                poll_manager.on_get_poll_voters_answer(&mut env, poll_id, option_id, wire);
+            }
+            // `StopPollQuery::on_result`/`on_error` (cpp:294-332) — the
+            // Ok updates ride the engine, then the C++ promise-lambda
+            // tail runs `on_stop_poll_finished` with the popped tuple;
+            // the error bands settle inside the intake.
+            K::StopPoll { poll_id } => {
+                let wire = match wire() {
+                    Err(status) => Err(status),
+                    Ok(bytes) => parse_updates(&bytes, "messages.editMessage"),
+                };
+                let tail = {
+                    let (mut env, poll_manager) = poll_env_split(self);
+                    poll_manager.on_stop_poll_answer(&mut env, poll_id, wire)
+                };
+                if let Some((updates, message_full_id, log_event_id, promise)) = tail {
+                    self.um_send(UmMessage::OnGetUpdatesStopPoll {
+                        updates: Box::new(updates),
+                        poll_id,
+                        message_full_id,
+                        log_event_id,
+                        promise,
+                    });
+                }
+            }
+            // `DeletePollAnswerQuery::on_result`/`on_error`
+            // (cpp:216-234) — the dialog error head, then the updates
+            // feed with the popped promise.
+            K::DeletePollAnswer => {
+                let wire = match wire() {
+                    Err(status) => Err(status),
+                    Ok(bytes) => parse_updates(&bytes, "messages.deletePollAnswer"),
+                };
+                let tail = {
+                    let (mut env, poll_manager) = poll_env_split(self);
+                    poll_manager.on_delete_poll_answer_answer(&mut env, wire)
+                };
+                if let Some((updates, promise)) = tail {
+                    self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    });
+                }
+            }
+        }
+    }
+
     /// Route one GroupCallManager net answer by kind — the ResultHandler
     /// halves of the net-drain 36 families (GroupCallManager.cpp:76-1630):
     /// the wire answers parse here, run the users/chats intakes and the
@@ -22988,6 +23630,113 @@ impl Td {
             .group_calls
             .insert(group_call_id, record);
         Some(object)
+    }
+
+    /// Route one CallManager net answer by kind — the ResultHandler
+    /// halves of the net-drain 44 families (CallManager.cpp:31-118): the
+    /// ok answers run the manager intakes (the actor rating/debug/log
+    /// tails, the Updates engine intake for the rating query) and settle
+    /// the parked family promises FIFO; the error tails forward.
+    fn on_call_net_answer(&mut self, kind: crate::call_manager::CallNetKind, query: NetQuery) {
+        use crate::call_manager::CallNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+        // The manager-env split for the intakes (the `CallEnv` field
+        // borrows stay disjoint from the manager borrow).
+        macro_rules! call_env {
+            () => {
+                CallEnv {
+                    user_env: UserEnv {
+                        global: &mut self.global,
+                        options: self
+                            .option_manager
+                            .as_mut()
+                            .expect("net answers run with the initialized option manager"),
+                        auth_is_bot: self.auth_manager.is_bot(),
+                    },
+                    user_manager: &mut self.user_manager,
+                    notification_manager: &mut self.notification_manager,
+                    updates: &mut self.call_updates,
+                    dh_config: &mut self.call_dh_config,
+                }
+            };
+        }
+        match kind {
+            // `SetCallRatingQuery` (cpp:31-62) — the ok answer runs the
+            // actor rating flag + the Updates engine intake with the
+            // request promise (cpp:52-60).
+            K::SetCallRating { call_id } => {
+                if let Some(mut promise) = pop_head(&mut self.call_manager.pending.set_call_rating)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                let mut env = call_env!();
+                                self.call_manager.on_set_call_rating(&mut env, call_id);
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => promise.set_error(parse_error("phone.setCallRating")),
+                        }
+                    }
+                }
+            }
+            // `SaveCallDebugQuery` (cpp:64-94) — the Bool result rides
+            // the actor debug-information intake, then the settle
+            // (cpp:87-93).
+            K::SaveCallDebug { call_id } => {
+                if let Some(mut promise) = pop_head(&mut self.call_manager.pending.save_call_debug)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_wire_bool_value(query.ok()) {
+                            Some(result) => {
+                                let mut env = call_env!();
+                                self.call_manager
+                                    .on_save_debug_information(&mut env, call_id, result);
+                                promise.set_value(());
+                            }
+                            None => promise.set_error(parse_error("phone.saveCallDebug")),
+                        }
+                    }
+                }
+            }
+            // `SaveCallLogQuery` (cpp:96-118) — both legs ride
+            // `on_save_log`'s semantics (cpp:460-478): the ok leg runs
+            // the actor tail and settles, the error leg is the
+            // set_error + the FileUploadId partial-location cleanup
+            // (inlined here — the cleanup itself rides the M.12 files
+            // surface, cpp:462/:471).
+            K::SaveCallLog { call_id } => {
+                if let Some(mut promise) = pop_head(&mut self.call_manager.pending.save_call_log) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_wire_bool(query.ok()) {
+                            Some(()) => {
+                                let mut env = call_env!();
+                                self.call_manager.on_save_log(&mut env, call_id);
+                                promise.set_value(());
+                            }
+                            None => promise.set_error(parse_error("phone.saveCallLog")),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Route one LinkManager net answer by kind — the ResultHandler
@@ -29781,6 +30530,28 @@ pub(crate) enum UmMessage {
         message_full_id: crate::messages_manager::MessageFullId,
         promise: Promise<()>,
     },
+    /// `on_get_updates` + the poll-vote chain tail — the C++
+    /// `PromiseCreator::lambda` chain of `PollManager::on_set_poll_answer`
+    /// (PollManager.cpp:1417-1422): the Updates run through the engine,
+    /// then the ladder finishes with `Unit()` (the lambda ignores the
+    /// engine result).
+    OnGetUpdatesPollAnswer {
+        updates: Box<telegram_api::Updates>,
+        poll_id: crate::poll_manager::PollId,
+        generation: u64,
+    },
+    /// `on_get_updates` + the stop-poll chain tail — the C++
+    /// `new_promise` lambda of `PollManager::do_stop_poll`
+    /// (PollManager.cpp:1778-1783): the Updates run through the engine,
+    /// then `on_stop_poll_finished` erases the log event, clears
+    /// `being_closed_polls` and completes the caller promise.
+    OnGetUpdatesStopPoll {
+        updates: Box<telegram_api::Updates>,
+        poll_id: crate::poll_manager::PollId,
+        message_full_id: crate::messages_manager::MessageFullId,
+        log_event_id: u64,
+        promise: Promise<()>,
+    },
     /// `on_get_difference` (cpp:522).
     OnGetDifference {
         difference: telegram_api::updates_Difference,
@@ -29843,6 +30614,40 @@ impl UmMessage {
                     .take()
                     .unwrap_or(tdutils::status::Result::Ok(()));
                 td.on_set_message_reactions_chain(message_full_id, result, promise);
+            }
+            UmMessage::OnGetUpdatesPollAnswer {
+                updates,
+                poll_id,
+                generation,
+            } => {
+                // the C++ lambda tail (PollManager.cpp:1417-1422) ignores
+                // the engine result — the ladder always finishes with
+                // Unit(), so the engine promise is a plain drop
+                let updates_promise = tdutils::promise::PromiseCreator::lambda_result(move |_| {});
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, updates_promise));
+                let (mut env, poll_manager) = poll_env_split(td);
+                poll_manager.on_set_poll_answer_finished(&mut env, poll_id, Ok(()), generation);
+            }
+            UmMessage::OnGetUpdatesStopPoll {
+                updates,
+                poll_id,
+                message_full_id,
+                log_event_id,
+                promise,
+            } => {
+                // the empty promise stands in for the C++ `Promise<Unit>`
+                // the engine completes — the lambda's only continuation
+                // is the on_stop_poll_finished tail below
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                let (mut env, poll_manager) = poll_env_split(td);
+                poll_manager.on_stop_poll_finished(
+                    &mut env,
+                    poll_id,
+                    message_full_id,
+                    log_event_id,
+                    Ok(()),
+                    promise,
+                );
             }
             UmMessage::OnGetUpdatesMigrateChat {
                 updates,
@@ -30255,6 +31060,7 @@ pub(crate) fn poll_env_split(
     crate::poll_manager::PollManagerEnvImpl<'_>,
     &mut crate::poll_manager::PollManager,
 ) {
+    let net = td.poll_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -30275,6 +31081,7 @@ pub(crate) fn poll_env_split(
             chat_manager,
             file_manager: std::sync::Arc::clone(file_manager),
             updates: poll_updates,
+            net,
         },
         poll_manager,
     )
@@ -30649,6 +31456,315 @@ impl crate::poll_manager::PollManagerEnv for crate::poll_manager::PollManagerEnv
             skip_trim,
             source,
         )
+    }
+
+    /// `SendVoteQuery::send` (PollManager.cpp:247-265) — the input peer
+    /// resolves at the send leg; the None-peer band is the C++ `return
+    /// on_error(Status::Error(400, "Can't access the chat"))`.
+    fn send_vote_query(
+        &mut self,
+        message_full_id: &crate::messages_manager::MessageFullId,
+        options: Vec<String>,
+        generation: u64,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = self.net.clone();
+        let Some(net) = net else {
+            tdutils::log_info!("Send messages.sendVote — [net-inert]");
+            return Ok(());
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) =
+            poll_env_get_input_peer(self, dialog_id, crate::user_manager::AccessRights::Read)
+        else {
+            return Err(tdutils::status::Status::error(400, "Can't access the chat"));
+        };
+        net.dispatch(
+            crate::poll_manager::PollNetKind::SendVote { generation },
+            tdmtproto::telegram_api::Function::messages_sendVote(
+                tdmtproto::telegram_api::messages_sendVote {
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    options: options.into_iter().map(String::into_bytes).collect(),
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// `GetPollResultsQuery::send` (PollManager.cpp:79-90) — `false` is
+    /// the None-peer `promise.set_value(nullptr)` band (the Ok(null)
+    /// answer drops through the intake without touching state).
+    fn send_get_poll_results_query(
+        &mut self,
+        message_full_id: &crate::messages_manager::MessageFullId,
+        poll_hash: i64,
+        generation: u64,
+    ) -> bool {
+        let net = self.net.clone();
+        let Some(net) = net else {
+            tdutils::log_info!("Send messages.getPollResults — [net-inert]");
+            return true;
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) =
+            poll_env_get_input_peer(self, dialog_id, crate::user_manager::AccessRights::Read)
+        else {
+            return false;
+        };
+        net.dispatch(
+            crate::poll_manager::PollNetKind::GetPollResults { generation },
+            tdmtproto::telegram_api::Function::messages_getPollResults(
+                tdmtproto::telegram_api::messages_getPollResults {
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    poll_hash,
+                },
+            ),
+        );
+        true
+    }
+
+    /// `GetPollVotersQuery::send` (PollManager.cpp:120-140) — the
+    /// `messages_getPollVotes::OPTION_MASK`/`OFFSET_MASK` bits (flags.0
+    /// = option, flags.1 = offset); the wire limit is `max(limit, 10)`
+    /// (the manager parks the un-maxed limit); the None-peer band is
+    /// the direct `promise.set_error(400, "Chat is not accessible")`.
+    fn send_get_poll_voters_query(
+        &mut self,
+        message_full_id: &crate::messages_manager::MessageFullId,
+        poll_id: crate::poll_manager::PollId,
+        option_id: i32,
+        option: Vec<u8>,
+        offset: &str,
+        limit: i32,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = self.net.clone();
+        let Some(net) = net else {
+            tdutils::log_info!("Send messages.getPollVotes — [net-inert]");
+            return Ok(());
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) =
+            poll_env_get_input_peer(self, dialog_id, crate::user_manager::AccessRights::Read)
+        else {
+            return Err(tdutils::status::Status::error(
+                400,
+                "Chat is not accessible",
+            ));
+        };
+        // CHECK(!option.empty()) (cpp:126)
+        debug_assert!(!option.is_empty());
+        let mut flags: i32 = 1;
+        if !offset.is_empty() {
+            flags |= 1 << 1;
+        }
+        net.dispatch(
+            crate::poll_manager::PollNetKind::GetPollVoters { poll_id, option_id },
+            tdmtproto::telegram_api::Function::messages_getPollVotes(
+                tdmtproto::telegram_api::messages_getPollVotes {
+                    flags,
+                    peer: Some(Box::new(peer)),
+                    id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    option,
+                    offset: offset.to_owned(),
+                    limit: std::cmp::max(limit, 10),
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// `StopPollQuery::send` (PollManager.cpp:287-322) — the input peer
+    /// (Edit rights) resolves at the send leg; the wire is
+    /// `messages.editMessage` over the closed-`inputMediaPoll` stub
+    /// (cpp:303-313) with the `MEDIA_MASK`/`REPLY_MARKUP_MASK` bits
+    /// (flags.14/flags.2).
+    fn send_stop_poll_query(
+        &mut self,
+        message_full_id: &crate::messages_manager::MessageFullId,
+        reply_markup: Option<&crate::reply_markup::ReplyMarkup>,
+        poll_id: crate::poll_manager::PollId,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = self.net.clone();
+        let Some(net) = net else {
+            tdutils::log_info!("Send messages.editMessage (stop poll) — [net-inert]");
+            return Ok(());
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) =
+            poll_env_get_input_peer(self, dialog_id, crate::user_manager::AccessRights::Edit)
+        else {
+            return Err(tdutils::status::Status::error(400, "Can't access the chat"));
+        };
+        let input_reply_markup = reply_markup.and_then(crate::reply_markup::get_input_reply_markup);
+        let mut flags: i32 = 1 << 14;
+        if input_reply_markup.is_some() {
+            flags |= 1 << 2;
+        }
+        // the closed-poll stub: `closed` + `creator` bits, the empty
+        // question and answers, no close period/date/countries
+        let poll = tdmtproto::telegram_api::Poll {
+            id: poll_id.get(),
+            flags: 0,
+            closed: true,
+            creator: true,
+            question: Some(tdmtproto::telegram_api::TextWithEntities {
+                text: String::new(),
+                entities: Vec::new(),
+            }),
+            ..tdmtproto::telegram_api::Poll::default()
+        };
+        let input_media = tdmtproto::telegram_api::InputMedia::inputMediaPoll(
+            tdmtproto::telegram_api::inputMediaPoll {
+                flags: 0,
+                poll: Some(Box::new(poll)),
+                ..tdmtproto::telegram_api::inputMediaPoll::default()
+            },
+        );
+        net.dispatch(
+            crate::poll_manager::PollNetKind::StopPoll { poll_id },
+            tdmtproto::telegram_api::Function::messages_editMessage(
+                tdmtproto::telegram_api::messages_editMessage {
+                    flags,
+                    no_webpage: false,
+                    invert_media: false,
+                    peer: Some(Box::new(peer)),
+                    id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    message: String::new(),
+                    media: Some(Box::new(input_media)),
+                    reply_markup: input_reply_markup,
+                    entities: Vec::new(),
+                    schedule_date: 0,
+                    schedule_repeat_period: 0,
+                    quick_reply_shortcut_id: 0,
+                    rich_message: None,
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// `DeletePollAnswerQuery::send` (PollManager.cpp:205-217) — the
+    /// None-peer band is the C++ `on_error(Status::Error(400, "Can't
+    /// access the chat"))`.
+    fn send_delete_poll_answer_query(
+        &mut self,
+        message_full_id: &crate::messages_manager::MessageFullId,
+        option_id: Vec<u8>,
+    ) -> Result<(), tdutils::status::Status> {
+        let net = self.net.clone();
+        let Some(net) = net else {
+            tdutils::log_info!("Send messages.deletePollAnswer — [net-inert]");
+            return Ok(());
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) =
+            poll_env_get_input_peer(self, dialog_id, crate::user_manager::AccessRights::Read)
+        else {
+            return Err(tdutils::status::Status::error(400, "Can't access the chat"));
+        };
+        net.dispatch(
+            crate::poll_manager::PollNetKind::DeletePollAnswer,
+            tdmtproto::telegram_api::Function::messages_deletePollAnswer(
+                tdmtproto::telegram_api::messages_deletePollAnswer {
+                    peer: Some(Box::new(peer)),
+                    msg_id: message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    option: option_id,
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: DialogId,
+        status: &tdutils::status::Status,
+        source: &str,
+    ) -> bool {
+        crate::dialog_manager::on_get_dialog_error(self.global, dialog_id, status, source)
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        let options = self.options.as_mut();
+        if let Some(options) = options {
+            let mut env = crate::user_manager::UserEnv {
+                global: self.global,
+                options,
+                auth_is_bot: self.auth_is_bot,
+            };
+            self.user_manager.on_get_users(&mut env, users, source);
+        }
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str) {
+        let options = self.options.as_mut();
+        if let Some(options) = options {
+            let mut env = crate::user_manager::UserEnv {
+                global: self.global,
+                options,
+                auth_is_bot: self.auth_is_bot,
+            };
+            self.chat_manager
+                .on_get_chats(self.user_manager, &mut env, chats, source);
+        }
+    }
+}
+
+/// `DialogManager::get_input_peer` (DialogManager.cpp:133-168) over the
+/// field-split poll env — the env holds every surface the resolution
+/// reads (the per-type helpers take the disjoint field borrows).
+fn poll_env_get_input_peer(
+    env: &mut crate::poll_manager::PollManagerEnvImpl<'_>,
+    dialog_id: DialogId,
+    access_rights: crate::user_manager::AccessRights,
+) -> Option<tdmtproto::telegram_api::InputPeer> {
+    use crate::dialog_id::DialogType;
+    match dialog_id.get_type() {
+        DialogType::User => {
+            let user_id = dialog_id.get_user_id();
+            let options = env.options.as_mut()?;
+            let user_env = crate::user_manager::UserEnv {
+                global: env.global,
+                options,
+                auth_is_bot: env.auth_is_bot,
+            };
+            env.user_manager
+                .get_input_peer_user(&user_env, user_id, access_rights)
+        }
+        DialogType::Chat => env
+            .chat_manager
+            .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+        DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let options = env.options.as_mut()?;
+            let user_env = crate::user_manager::UserEnv {
+                global: env.global,
+                options,
+                auth_is_bot: env.auth_is_bot,
+            };
+            env.chat_manager
+                .get_input_peer_channel(&user_env, channel_id, access_rights)
+        }
+        DialogType::SecretChat => None,
+        DialogType::None => Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+            tdmtproto::telegram_api::inputPeerEmpty {},
+        )),
     }
 }
 
@@ -37578,18 +38694,21 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
         settings: crate::privacy_manager::GlobalPrivacySettings,
         promise: Promise<()>,
     ) {
-        // `SetGlobalPrivacySettingsQuery::send`
-        // (GlobalPrivacySettings.cpp:59-62).
+        // The set chain's get leg (GlobalPrivacySettings.cpp:186-197) —
+        // the pending entry carries the set slice (the C++ lambda
+        // capture); the get answer applies the changes and dispatches
+        // the `SetGlobalPrivacySettingsQuery` tail.
         self.td
             .privacy_promises
-            .push(PendingPrivacyQuery::SetGlobal { promise });
+            .push(PendingPrivacyQuery::SetGlobalChain {
+                set_settings: settings,
+                promise,
+            });
         match self.td.privacy_net() {
             Some(net) => net.dispatch(
-                PrivacyNetKind::SetGlobalPrivacySettings,
-                telegram_api::Function::account_setGlobalPrivacySettings(
-                    telegram_api::account_setGlobalPrivacySettings {
-                        settings: Some(settings.get_input_global_privacy_settings()),
-                    },
+                PrivacyNetKind::GetGlobalPrivacySettings,
+                telegram_api::Function::account_getGlobalPrivacySettings(
+                    telegram_api::account_getGlobalPrivacySettings,
                 ),
             ),
             None => tdutils::log_info!("Set global privacy settings — [net-inert]"),
@@ -45541,6 +46660,41 @@ pub(crate) fn forum_topic_env_split(
     )
 }
 
+/// The [`AttachMenuEnv`] over the split `Td` borrows + the manager — the
+/// net-answer drain's view (the `forum_topic_env_split` convention; the
+/// request arms build the same env inline over the request borrows).
+pub(crate) fn attach_menu_env_split(
+    td: &mut Td,
+) -> (
+    AttachMenuEnv<'_>,
+    &mut crate::attach_menu_manager::AttachMenuManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        file_manager,
+        file_reference_manager,
+        attach_menu_manager,
+        attach_menu_updates,
+        ..
+    } = td;
+    (
+        AttachMenuEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+            file_reference_manager,
+            updates: attach_menu_updates,
+        },
+        attach_menu_manager,
+    )
+}
+
 /// The `G()`/manager slice of the collapsed StickersManager (the M.st
 /// request plane). The file reads go through the shared FileManager
 /// registry behind the mutex (the `MessageQueryEnv` convention).
@@ -51230,6 +52384,7 @@ mod tests {
         td.star_gift_manager.net = td.star_gift_net();
         td.business_manager.net = td.business_net();
         td.web_browser_manager.net = td.web_browser_net();
+        td.notification_settings_manager.net = td.notification_settings_net();
         {
             let net = td.link_net();
             if let Some(link_manager) = td.link_manager.as_mut() {
@@ -51237,8 +52392,10 @@ mod tests {
             }
         }
         td.group_call_manager.net = td.group_call_net();
+        td.call_manager.net = td.call_net();
         td.statistics_manager.net = td.statistics_net();
         td.forum_topic_manager.net = td.forum_topic_net();
+        td.attach_menu_manager.net = td.attach_menu_net();
         (td, rec, callback)
     }
 
@@ -52380,6 +53537,21 @@ mod tests {
             .unwrap();
     }
 
+    /// The net-drain 39 poll round-trips — the five wire families over
+    /// the dispatcher (the message-keyed entry points ride the M.10
+    /// seam, so the sends drive the manager tails directly — the
+    /// binlog-replay entry shape; the band tests live in
+    /// `poll_manager.rs`; these cover the dispatcher plumbing).
+    #[test]
+    fn poll_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(poll_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// Take the single query of the expected constructor from the
     /// recorder (the engine's own difference fetches share the stream).
     fn take_sent_query(rec: &std::sync::Arc<RecNetSession>, constructor: i32) -> NetQuery {
@@ -53327,6 +54499,311 @@ mod tests {
         }
     }
 
+    fn poll_families_ride_the_dispatcher_impl() {
+        use crate::dialog_id::{DialogId, MessageFullId};
+        use crate::messages_manager::MessageId;
+        use crate::poll_manager::{Poll, PollId, PollManagerEnv, PollOption};
+
+        /// A `Promise<T>` slot (the UnitSlot convention over any type).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+
+        /// An empty `Updates` container — the same walk-safe answer the
+        /// group-call round-trips use.
+        fn empty_updates() -> Vec<u8> {
+            let mut answer = Vec::new();
+            telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 1700000000,
+                seq_start: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            answer
+        }
+
+        let (mut td, rec) = netted_td("netfix-poll");
+        // the self user id without the user record (inputPeerSelf
+        // resolves at the send legs)
+        tdactor::ActorMessage::dispatch(SeedMyId(500), &mut td);
+        let my_id = td.user_manager.get_my_id();
+        let dialog_id = DialogId::from_user_id(my_id);
+        let message_full_id = MessageFullId::new(dialog_id, MessageId::new(1 << 20));
+        let poll_id = PollId::new(31);
+
+        // seed the poll record over the self dialog (inputPeerSelf
+        // resolves at the send legs) + register the server message (the
+        // GetPollResults timeout arm)
+        {
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.polls.insert(
+                poll_id,
+                Poll {
+                    options: vec![
+                        PollOption {
+                            voter_count: 1,
+                            data: "a".to_owned(),
+                            ..PollOption::default()
+                        },
+                        PollOption {
+                            voter_count: 0,
+                            data: "b".to_owned(),
+                            ..PollOption::default()
+                        },
+                    ],
+                    hash: 77,
+                    is_anonymous: false,
+                    allow_multiple_answers: true,
+                    ..Poll::default()
+                },
+            );
+            manager.register_poll(&mut env, poll_id, message_full_id);
+        }
+
+        // 1. getPollResults — the register-armed 0.0 timeout fires at the
+        //    tick, the send resolves inputPeerSelf, the Updates answer
+        //    feeds the engine with the empty promise.
+        {
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.tick_timeouts(&mut env);
+            let sent = take_sent_query(&rec, telegram_api::messages_getPollResults::ID);
+            let wire = telegram_api::messages_getPollResults::parse(sent.query()).unwrap();
+            assert!(
+                matches!(
+                    *wire.peer.unwrap(),
+                    telegram_api::InputPeer::inputPeerSelf(_)
+                ),
+                "the self dialog resolves inputPeerSelf"
+            );
+            assert_eq!(wire.msg_id, 1);
+            assert_eq!(wire.poll_hash, 77);
+
+            net_complete(sent, empty_updates());
+            td.dispatch_completed_poll_net();
+            // the lot drained and the family's own deadline is gone (the
+            // engine may refire its difference machinery — not ours to
+            // assert here)
+            assert!(td.poll_manager.pending_net.get_poll_results.is_empty());
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.tick_timeouts(&mut env);
+            assert!(!manager.update_poll_timeout.contains_key(&poll_id.get()));
+        }
+
+        // 2. sendVote — the replay entry (`do_set_poll_answer`) parks the
+        //    promise and dispatches; the Updates answer walks the engine
+        //    then finishes the ladder with Unit().
+        {
+            let (promise, slot) = record_slot::<()>();
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.do_set_poll_answer(
+                &mut env,
+                poll_id,
+                message_full_id,
+                vec!["a".to_owned()],
+                0,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_sendVote::ID);
+            let wire = telegram_api::messages_sendVote::parse(sent.query()).unwrap();
+            assert_eq!(wire.msg_id, 1);
+            assert_eq!(wire.options, vec![b"a".to_vec()]);
+
+            net_complete(sent, empty_updates());
+            td.dispatch_completed_poll_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(())) => {}
+                other => panic!("unexpected sendVote result: {other:?}"),
+            }
+            assert!(!td.poll_manager.pending_answers.contains_key(&poll_id));
+        }
+
+        // 2b. sendVote — the wire error band: the dialog-error head runs,
+        //    the ladder settles the parked promise with the error.
+        {
+            let (promise, slot) = record_slot::<()>();
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.do_set_poll_answer(
+                &mut env,
+                poll_id,
+                message_full_id,
+                vec!["b".to_owned()],
+                0,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_sendVote::ID);
+            net_fail(sent, 400, "VOTE_NOT_ALLOWED");
+            td.dispatch_completed_poll_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.code(), 400);
+                    assert_eq!(status.message(), "VOTE_NOT_ALLOWED");
+                }
+                other => panic!("unexpected sendVote error result: {other:?}"),
+            }
+        }
+
+        // 3. stopPoll — the replay entry (`do_stop_poll`) dispatches the
+        //    closed-poll editMessage; the Updates answer walks the
+        //    engine then runs on_stop_poll_finished (the promise + the
+        //    being_closed erase).
+        {
+            let (promise, slot) = record_slot::<()>();
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.do_stop_poll(&mut env, poll_id, message_full_id, None, 0, promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_editMessage::ID);
+            let wire = telegram_api::messages_editMessage::parse(sent.query()).unwrap();
+            // MEDIA_MASK without REPLY_MARKUP_MASK (the null markup)
+            assert_eq!(wire.flags & (1 << 14), 1 << 14);
+            assert_eq!(wire.flags & (1 << 2), 0);
+            assert_eq!(wire.id, 1);
+            let telegram_api::InputMedia::inputMediaPoll(input) = *wire.media.unwrap() else {
+                panic!("expected the inputMediaPoll close stub");
+            };
+            let poll = input.poll.unwrap();
+            assert_eq!(poll.id, 31);
+            assert!(poll.closed);
+            assert!(poll.creator);
+            assert!(!poll.multiple_choice);
+
+            assert!(td.poll_manager.being_closed_polls.contains(&poll_id));
+            net_complete(sent, empty_updates());
+            td.dispatch_completed_poll_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(())) => {}
+                other => panic!("unexpected stopPoll result: {other:?}"),
+            }
+            assert!(!td.poll_manager.being_closed_polls.contains(&poll_id));
+        }
+
+        // 3b. stopPoll — the MESSAGE_NOT_MODIFIED band settles Ok
+        //     (non-bot) through on_stop_poll_finished.
+        {
+            let (promise, slot) = record_slot::<()>();
+            let (mut env, manager) = poll_env_split(&mut td);
+            manager.do_stop_poll(&mut env, poll_id, message_full_id, None, 0, promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_editMessage::ID);
+            net_fail(sent, 400, "MESSAGE_NOT_MODIFIED");
+            td.dispatch_completed_poll_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(())) => {}
+                other => panic!("unexpected stopPoll not-modified result: {other:?}"),
+            }
+            assert!(!td.poll_manager.being_closed_polls.contains(&poll_id));
+        }
+
+        // 4. getPollVoters — the entry point rides the M.10 seam, so the
+        //    parked lot + promise drive the send arm; the votesList
+        //    answer runs the intake (the unknown self voter drops from
+        //    the object, the wire count carries).
+        {
+            let (promise, slot) = record_slot::<td_api::PollVoters>();
+            {
+                let (_, manager) = poll_env_split(&mut td);
+                manager
+                    .poll_voters
+                    .entry(poll_id)
+                    .or_default()
+                    .resize_with(2, Default::default);
+                manager.poll_voters.get_mut(&poll_id).unwrap()[0]
+                    .pending_queries
+                    .push(promise);
+                manager.pending_net.get_poll_voters.push((
+                    poll_id,
+                    0,
+                    String::new(),
+                    10,
+                    dialog_id,
+                ));
+            }
+            let (mut env, _) = poll_env_split(&mut td);
+            env.send_get_poll_voters_query(&message_full_id, poll_id, 0, b"a".to_vec(), "", 10)
+                .unwrap();
+            let sent = take_sent_query(&rec, telegram_api::messages_getPollVotes::ID);
+            let wire = telegram_api::messages_getPollVotes::parse(sent.query()).unwrap();
+            // OPTION_MASK without OFFSET_MASK; the wire limit is
+            // max(limit, 10)
+            assert_eq!(wire.flags, 1);
+            assert_eq!(wire.id, 1);
+            assert_eq!(wire.option, b"a".to_vec());
+            assert_eq!(wire.limit, 10);
+
+            let mut answer = Vec::new();
+            telegram_api::messages_VotesList {
+                flags: 0,
+                count: 1,
+                votes: vec![telegram_api::MessagePeerVote::messagePeerVoteInputOption(
+                    telegram_api::messagePeerVoteInputOption {
+                        peer: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                            user_id: my_id.get(),
+                        })),
+                        date: 1700000000,
+                    },
+                )],
+                chats: Vec::new(),
+                users: Vec::new(),
+                next_offset: String::new(),
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_poll_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(object)) => {
+                    assert_eq!(object.total_count, 1);
+                    // the not-yet-received self voter drops from the
+                    // object (the min-sender gate)
+                    assert!(object.voters.is_empty());
+                }
+                other => panic!("unexpected getPollVoters result: {other:?}"),
+            }
+            // the voter landed in the cache and the next page answers
+            // from it
+            assert_eq!(
+                td.poll_manager.poll_voters.get(&poll_id).unwrap()[0]
+                    .voters
+                    .len(),
+                1
+            );
+        }
+
+        // 5. deletePollAnswer — the entry point rides the M.10 seam, so
+        //    the parked promise drives the send arm; the Updates answer
+        //    walks the engine with the promise.
+        {
+            let (promise, slot) = record_slot::<()>();
+            {
+                let (_, manager) = poll_env_split(&mut td);
+                manager
+                    .pending_net
+                    .delete_poll_answer
+                    .push((dialog_id, promise));
+            }
+            let (mut env, _) = poll_env_split(&mut td);
+            env.send_delete_poll_answer_query(&message_full_id, b"b".to_vec())
+                .unwrap();
+            let sent = take_sent_query(&rec, telegram_api::messages_deletePollAnswer::ID);
+            let wire = telegram_api::messages_deletePollAnswer::parse(sent.query()).unwrap();
+            assert_eq!(wire.msg_id, 1);
+            assert_eq!(wire.option, b"b".to_vec());
+
+            net_complete(sent, empty_updates());
+            td.dispatch_completed_poll_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(())) => {}
+                other => panic!("unexpected deletePollAnswer result: {other:?}"),
+            }
+            assert!(td.poll_manager.pending_net.delete_poll_answer.is_empty());
+        }
+    }
+
     fn account_queries_ride_the_dispatcher_impl() {
         let (mut td, rec) = netted_td("netfix-account");
 
@@ -54247,6 +55724,382 @@ mod tests {
             dialog_id,
             crate::forum_topic::ForumTopicId::new(forum_topic_id),
         )
+    }
+
+    /// The net-drain 42 attach-menu round-trips — the three families'
+    /// send legs dispatch through the installed handle and the wire
+    /// answers settle the parked promises (the band ladders live in
+    /// `attach_menu_manager.rs`; these cover the dispatcher plumbing, the
+    /// toggle chains and the read conversions).
+    #[test]
+    fn attach_menu_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(attach_menu_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn attach_menu_families_ride_the_dispatcher_impl() {
+        use crate::user_manager::UserId;
+
+        let (mut td, rec) = netted_td("netfix-attach-menu");
+        // the addable attach-menu bot (the request legs resolve + gate on
+        // it; the answer's users intake re-lands the same record)
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = &mut td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager.as_mut().expect("option manager set"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.on_get_user(
+                &mut env,
+                telegram_api::User::user(telegram_api::user {
+                    flags: 1 | (1 << 1) | (1 << 3), // ACCESS_HASH | FIRST_NAME | USERNAME
+                    access_hash: 77,
+                    first_name: "Attach".to_owned(),
+                    username: "attach_bot".to_owned(),
+                    bot: true,
+                    bot_attach_menu: true,
+                    ..telegram_api::user::default()
+                }),
+                "test",
+            );
+        }
+
+        fn unit_slot() -> (tdutils::promise::Promise<()>, UnitSlot) {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+
+        /// A wire `attachMenuBot` with a valid default_static icon.
+        fn wire_bot(user_id: i64) -> telegram_api::AttachMenuBot {
+            telegram_api::AttachMenuBot {
+                flags: 0,
+                inactive: false,
+                has_settings: false,
+                request_write_access: true,
+                show_in_attach_menu: true,
+                show_in_side_menu: false,
+                side_menu_disclaimer_needed: false,
+                bot_id: user_id,
+                short_name: "attach_bot".to_owned(),
+                peer_types: vec![telegram_api::AttachMenuPeerType::attachMenuPeerTypePM(
+                    telegram_api::attachMenuPeerTypePM,
+                )],
+                icons: vec![telegram_api::AttachMenuBotIcon {
+                    flags: 0,
+                    name: "default_static".to_owned(),
+                    icon: Some(telegram_api::Document::document(telegram_api::document {
+                        flags: 0,
+                        id: 100,
+                        access_hash: 7,
+                        file_reference: b"ref".to_vec(),
+                        date: 0,
+                        mime_type: "image/png".to_owned(),
+                        size: 123,
+                        thumbs: Vec::new(),
+                        video_thumbs: Vec::new(),
+                        dc_id: 2,
+                        attributes: Vec::new(),
+                    })),
+                    colors: Vec::new(),
+                }],
+            }
+        }
+
+        /// The wire `user` record that lands the bot into the cache.
+        fn wire_bot_user(user_id: i64) -> telegram_api::User {
+            telegram_api::User::user(telegram_api::user {
+                flags: 1 | (1 << 1) | (1 << 3), // ACCESS_HASH | FIRST_NAME | USERNAME
+                id: user_id,
+                access_hash: 77,
+                first_name: "Attach".to_owned(),
+                username: "attach_bot".to_owned(),
+                bot: true,
+                bot_attach_menu: true,
+                ..telegram_api::user::default()
+            })
+        }
+
+        /// The bootstrap `Bool` answer — the generator emits no structs
+        /// for the type (the `parse_wire_bool` doc); the ids are the
+        /// wire constants (telegram_api.tl:11-12).
+        fn bool_answer(value: bool) -> Vec<u8> {
+            const BOOL_TRUE_ID: i32 = 0x9972_75b5u32 as i32;
+            const BOOL_FALSE_ID: i32 = 0xbc79_9737u32 as i32;
+            let mut out = Vec::new();
+            out.extend_from_slice(
+                &(if value { BOOL_TRUE_ID } else { BOOL_FALSE_ID }).to_le_bytes(),
+            );
+            out
+        }
+
+        // 1. getAttachMenuBots — the cold-hash send; the answer runs the
+        //    users intake + the cache/save/update walk and settles the
+        //    parked promise Unit.
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.reload_attach_menu_bots(&mut env, promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let body = telegram_api::messages_getAttachMenuBots::parse(sent.query())
+                .expect("the getAttachMenuBots body");
+            assert_eq!(body.hash, 0, "the cold hash");
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBots(telegram_api::attachMenuBots {
+                hash: 1234,
+                bots: vec![wire_bot(901)],
+                users: vec![wire_bot_user(901)],
+            })
+            .store(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+            assert_eq!(td.attach_menu_manager.cache_for_test(), (1234, 1));
+            assert!(
+                td.attach_menu_updates
+                    .iter()
+                    .any(|u| matches!(u, td_api::Update::updateAttachmentMenuBots(_)))
+            );
+        }
+
+        // 2. the reload error band — the C++ `set_promises` settles the
+        //    parked promise Unit (the toggle chain answers Ok) and the
+        //    short retry arms (cpp:615-618).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.reload_attach_menu_bots(&mut env, promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            net_fail(sent, 429, "FLOOD_WAIT_1");
+            td.dispatch_completed_attach_menu_net();
+            assert!(
+                matches!(
+                    &*slot.lock().unwrap(),
+                    Some(tdutils::status::Result::Ok(()))
+                ),
+                "the C++ set_promises settles the reload promise Ok"
+            );
+            let deadline = td
+                .attach_menu_manager
+                .next_deadline()
+                .expect("the short retry armed");
+            assert!(
+                deadline - tdutils::time::now() >= 59.0 && deadline - tdutils::time::now() <= 120.0
+            );
+        }
+
+        // 3. getAttachMenuBot — the input user resolves with the seeded
+        //    access hash; the answer converts and the added bot's cache
+        //    entry updates in place (no hash reset, no new broadcast).
+        {
+            type BotSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::AttachmentMenuBot>>>,
+            >;
+            struct Rec(BotSlot);
+            impl tdutils::promise::PromiseInterface<td_api::AttachmentMenuBot> for Rec {
+                fn set_value(&mut self, value: td_api::AttachmentMenuBot) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: BotSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.get_attach_menu_bot_request(&mut env, UserId::new(901), promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBot::ID);
+            let body = telegram_api::messages_getAttachMenuBot::parse(sent.query())
+                .expect("the getAttachMenuBot body");
+            match body.bot.as_ref() {
+                Some(telegram_api::InputUser::inputUser(u)) => {
+                    assert_eq!(u.user_id, 901);
+                    assert_eq!(u.access_hash, 77, "the seeded access hash");
+                }
+                other => panic!("the resolved input user: {other:?}"),
+            }
+            let updates_before = td.attach_menu_updates.len();
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBotsBot {
+                bot: Some(wire_bot(901)),
+                users: vec![wire_bot_user(901)],
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_attach_menu_net();
+            let object = match &*slot.lock().unwrap() {
+                Some(tdutils::status::Result::Ok(bot)) => bot.clone(),
+                other => panic!("the single-bot answer: {other:?}"),
+            };
+            assert_eq!(object.bot_user_id, 901);
+            assert!(object.is_added && object.request_write_access);
+            assert!(object.default_icon.is_some(), "the registered icon file");
+            assert_eq!(object.name, "attach_bot");
+            assert_eq!(
+                td.attach_menu_manager.cache_for_test(),
+                (1234, 1),
+                "the same-content walk leaves the hash alone"
+            );
+            assert_eq!(
+                td.attach_menu_updates.len(),
+                updates_before,
+                "no new broadcast for the same-content walk"
+            );
+        }
+
+        // 4. the wrong-bot band — the answer carries a different bot id
+        //    (cpp:739-741, the C++ lambda capture checks it).
+        {
+            type BotSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::AttachmentMenuBot>>>,
+            >;
+            struct Rec(BotSlot);
+            impl tdutils::promise::PromiseInterface<td_api::AttachmentMenuBot> for Rec {
+                fn set_value(&mut self, _value: td_api::AttachmentMenuBot) {}
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: BotSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.get_attach_menu_bot_request(&mut env, UserId::new(901), promise);
+            let sent = take_sent_query(&rec, telegram_api::messages_getAttachMenuBot::ID);
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBotsBot {
+                bot: Some(wire_bot(777)),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut answer);
+            net_complete(sent, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Err(error)) if error.code() == 500
+            ));
+        }
+
+        // 5. toggleBotInAttachMenu — the WRITE_ALLOWED/enabled wire form;
+        //    the boolTrue answer success-chains into the reload query and
+        //    the reload's NotModified settles the toggle promise.
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(901),
+                true,
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_toggleBotInAttachMenu::ID);
+            let body = telegram_api::messages_toggleBotInAttachMenu::parse(sent.query())
+                .expect("the toggle body");
+            assert!(body.write_allowed, "is_added && allow_write_access");
+            assert!(body.enabled);
+            net_complete(sent, bool_answer(true));
+            td.dispatch_completed_attach_menu_net();
+            // the success chain fired the reload query
+            let reload = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let body = telegram_api::messages_getAttachMenuBots::parse(reload.query())
+                .expect("the chained reload body");
+            assert_eq!(body.hash, 1234, "the current hash rides the chain");
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBotsNotModified(
+                telegram_api::attachMenuBotsNotModified,
+            )
+            .store(&mut answer);
+            net_complete(reload, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(
+                matches!(
+                    &*slot.lock().unwrap(),
+                    Some(tdutils::status::Result::Ok(()))
+                ),
+                "the chained reload settles the toggle promise"
+            );
+        }
+
+        // 6. the toggle boolFalse band — the C++ LOG(ERROR) + the Unit
+        //    answer still success-chains (cpp:103-114).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(901),
+                true,
+                false,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_toggleBotInAttachMenu::ID);
+            let body = telegram_api::messages_toggleBotInAttachMenu::parse(sent.query())
+                .expect("the toggle body");
+            assert!(!body.write_allowed, "allow_write_access = false");
+            assert!(body.enabled);
+            net_complete(sent, bool_answer(false));
+            td.dispatch_completed_attach_menu_net();
+            let reload = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBotsNotModified(
+                telegram_api::attachMenuBotsNotModified,
+            )
+            .store(&mut answer);
+            net_complete(reload, answer);
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // 7. the toggle error band — the C++ `on_error` fires the
+        //    promise-less reload first, then fails the toggle promise
+        //    (cpp:116-119).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::attach_menu_env_split(&mut td);
+            manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                UserId::new(901),
+                true,
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_toggleBotInAttachMenu::ID);
+            net_fail(sent, 400, "BOT_INACTIVE");
+            td.dispatch_completed_attach_menu_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Err(error)) if error.code() == 400
+            ));
+            // the promise-less reload rode the same answer
+            let reload = take_sent_query(&rec, telegram_api::messages_getAttachMenuBots::ID);
+            let mut answer = Vec::new();
+            telegram_api::AttachMenuBots::attachMenuBotsNotModified(
+                telegram_api::attachMenuBotsNotModified,
+            )
+            .store(&mut answer);
+            net_complete(reload, answer);
+            td.dispatch_completed_attach_menu_net();
+        }
     }
 
     #[test]
@@ -55666,6 +57519,195 @@ mod tests {
                 .info_rules_len_for_test(UserPrivacySettingType::UserStatus),
             1
         );
+
+        assert!(td.privacy_net_completed.lock().is_empty(), "drained");
+        assert!(td.privacy_promises.is_empty(), "all promises resolved");
+    }
+
+    // ---- the global-privacy net slice: the fetch family and the set
+    // chain ride the dispatcher (GlobalPrivacySettings.cpp:26-198). ----
+
+    type GlobalPrivacySlot = std::sync::Arc<
+        std::sync::Mutex<
+            Option<tdutils::status::Result<crate::privacy_manager::GlobalPrivacySettings>>,
+        >,
+    >;
+
+    fn record_global_privacy_settings() -> (
+        Promise<crate::privacy_manager::GlobalPrivacySettings>,
+        GlobalPrivacySlot,
+    ) {
+        struct Rec(GlobalPrivacySlot);
+        impl tdutils::promise::PromiseInterface<crate::privacy_manager::GlobalPrivacySettings> for Rec {
+            fn set_value(&mut self, value: crate::privacy_manager::GlobalPrivacySettings) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GlobalPrivacySlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    /// The wire `globalPrivacySettings` the fetch answers with — the
+    /// archive bit, the stars payload (bit 5) and the gifts-button bit.
+    fn wire_global_privacy_settings(hide_read_marks: bool, stars: i64) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::GlobalPrivacySettings {
+            flags: 1 | if stars > 0 { 1 << 5 } else { 0 } | 1 << 7,
+            archive_and_mute_new_noncontact_peers: true,
+            keep_archived_unmuted: false,
+            keep_archived_folders: false,
+            hide_read_marks,
+            new_noncontact_peers_require_premium: true,
+            display_gifts_button: true,
+            noncontact_peers_paid_stars: stars,
+            disallowed_gifts: None,
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn global_privacy_settings_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(global_privacy_settings_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn global_privacy_settings_ride_the_dispatcher_impl() {
+        use crate::privacy_manager::GlobalPrivacySettings;
+        let (mut td, rec) = netted_td("netfix-global-privacy");
+
+        // 1. the fetch family — the wire settings convert through
+        //    `from_wire` (the stars ride the get_star_count clamp).
+        let (promise, slot) = record_global_privacy_settings();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            GlobalPrivacySettings::get_global_privacy_settings(&mut env, promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getGlobalPrivacySettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_global_privacy_settings(false, 25),
+        );
+        td.dispatch_completed_privacy_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(settings)) => {
+                // the rewrap getters answer the family shapes
+                assert_eq!(
+                    settings.get_read_date_privacy_settings_object(),
+                    td_api::ReadDatePrivacySettings {
+                        show_read_date: true
+                    }
+                );
+                let new_chat = settings.get_new_chat_privacy_settings_object();
+                assert_eq!(new_chat.incoming_paid_message_star_count, 25);
+                assert!(!new_chat.allow_new_chats_from_unknown_users);
+                // the wire form keeps the archive and gifts-button bits
+                let input = settings.get_input_global_privacy_settings();
+                assert!(input.archive_and_mute_new_noncontact_peers);
+                assert!(input.display_gifts_button);
+                assert_eq!(input.noncontact_peers_paid_stars, 25);
+            }
+            other => panic!("unexpected global privacy settings result: {other:?}"),
+        }
+
+        // 2. the set chain — the NewChat slice starts at the get query,
+        //    applies onto the fetched settings and rides the set tail;
+        //    the Bool answer drops into Unit.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                GlobalPrivacySettings::from_new_chat_privacy_settings(Some(
+                    td_api::NewChatPrivacySettings {
+                        allow_new_chats_from_unknown_users: true,
+                        incoming_paid_message_star_count: 7,
+                    },
+                )),
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the chain starts at the get query");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getGlobalPrivacySettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_global_privacy_settings(false, 25),
+        );
+        td.dispatch_completed_privacy_net();
+
+        // the tail: the fetched settings with the NewChat slice merged
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_setGlobalPrivacySettings::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::account_setGlobalPrivacySettings(function) => {
+                let settings = function.settings.unwrap();
+                // the slice wins the NewChat fields, the wire keeps the rest
+                assert_eq!(settings.noncontact_peers_paid_stars, 7);
+                assert_eq!(settings.flags & (1 << 5), 1 << 5, "the stars mask bit");
+                assert!(!settings.new_noncontact_peers_require_premium);
+                assert!(settings.archive_and_mute_new_noncontact_peers);
+                assert!(settings.display_gifts_button);
+                assert!(!settings.hide_read_marks);
+            }
+            other => panic!("unexpected set function: {other:?}"),
+        }
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_privacy_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the error band — the get leg fails, the chain forwards the
+        //    error (the C++ lambda error path).
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                GlobalPrivacySettings::from_read_date_privacy_settings(Some(
+                    td_api::ReadDatePrivacySettings {
+                        show_read_date: false,
+                    },
+                )),
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(
+            sent.into_iter().next().unwrap(),
+            400,
+            "PHONE_NUMBER_INVALID",
+        );
+        td.dispatch_completed_privacy_net();
+        match unit_slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "PHONE_NUMBER_INVALID");
+            }
+            other => panic!("unexpected chain error result: {other:?}"),
+        }
 
         assert!(td.privacy_net_completed.lock().is_empty(), "drained");
         assert!(td.privacy_promises.is_empty(), "all promises resolved");
@@ -75915,6 +77957,433 @@ kQIDAQAB\n\
     }
 
     #[test]
+    fn notification_settings_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(notification_settings_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn notification_settings_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain40-notification-settings");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        let unix_time = td.get_unix_time();
+
+        // 1. the deferred Get — the unsynchronized scope parks the request
+        //    promise on the fetch query; the wire carries the scope's
+        //    InputNotifyPeer; the answer applies through the intake and
+        //    the request resolves with the synchronized state
+        td.request(
+            1,
+            Function::getScopeNotificationSettings(td_api::getScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopePrivateChats(
+                        td_api::notificationSettingsScopePrivateChats,
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getNotifySettings::ID,
+        );
+        let body =
+            telegram_api::account_getNotifySettings::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyUsers(_))
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::PeerNotifySettings {
+                // show_previews + mute_until flags (peerNotifySettings
+                // bits 0 and 2)
+                flags: (1 << 0) | (1 << 2),
+                show_previews: false,
+                silent: false,
+                mute_until: unix_time + 120,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::scopeNotificationSettings(settings)) => {
+                assert_eq!(settings.mute_for, 120);
+                assert!(!settings.show_preview);
+            }
+            other => panic!("the deferred scope settings answer: {other:?}"),
+        }
+
+        // 2. setScopeNotificationSettings — the local update answers ok at
+        //    once and the server mirror rides the wire over the group
+        //    InputNotifyPeer; boolTrue settles the erase-log-event promise
+        //    (the settlement bracket allocates exactly the erase rewrite)
+        td.request(
+            2,
+            Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopeGroupChats(
+                        td_api::notificationSettingsScopeGroupChats,
+                    ),
+                ),
+                notification_settings: Some(td_api::ScopeNotificationSettings {
+                    mute_for: 50,
+                    sound_id: -1,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    story_sound_id: -1,
+                    show_story_poster: true,
+                    disable_pinned_message_notifications: false,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateNotifySettings::ID,
+        );
+        let body =
+            telegram_api::account_updateNotifySettings::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyChats(_))
+        ));
+        let settings = body.settings.expect("the wire settings");
+        assert_eq!(settings.mute_until, unix_time + 50);
+        assert!(settings.show_previews);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        let probe_a = td.global.td_db().binlog().next_event_id();
+        td.dispatch_completed_notification_settings_net();
+        let probe_b = td.global.td_db().binlog().next_event_id();
+        // each probe self-allocates its id (fetch_add returns the old
+        // value), so one real allocation between them measures as 2
+        assert_eq!(
+            probe_b - probe_a,
+            2,
+            "the erase rewrite is the only allocation at settlement"
+        );
+
+        // 3. the false-as-result band — the 400 rewrite repairs through a
+        //    fresh scope Get (the erase still settles)
+        td.request(
+            3,
+            Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopeGroupChats(
+                        td_api::notificationSettingsScopeGroupChats,
+                    ),
+                ),
+                notification_settings: Some(td_api::ScopeNotificationSettings {
+                    mute_for: 0,
+                    sound_id: -1,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    story_sound_id: -1,
+                    show_story_poster: true,
+                    disable_pinned_message_notifications: false,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateNotifySettings::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+        let repair = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getNotifySettings::ID,
+        );
+        let body = telegram_api::account_getNotifySettings::parse(repair.query())
+            .expect("the repair body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyChats(_))
+        ));
+        // the repair fetch parks the empty promise — the answer just runs
+        // the intake (the unsynchronized band is a no-op re-sync)
+        net_complete(
+            repair,
+            wire!(telegram_api::PeerNotifySettings {
+                flags: (1 << 0) | (1 << 2),
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+
+        // 4. setReactionNotificationSettings — the changed settings ride
+        //    account.setReactionsNotifySettings; boolTrue settles the
+        //    erase promise; the error band repairs through the reaction Get
+        td.request(
+            4,
+            Function::setReactionNotificationSettings(td_api::setReactionNotificationSettings {
+                notification_settings: Some(td_api::ReactionNotificationSettings {
+                    message_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceAll(
+                            td_api::reactionNotificationSourceAll,
+                        ),
+                    ),
+                    story_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    poll_vote_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceContacts(
+                            td_api::reactionNotificationSourceContacts,
+                        ),
+                    ),
+                    sound_id: -1,
+                    show_preview: true,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setReactionsNotifySettings::ID,
+        );
+        let body = telegram_api::account_setReactionsNotifySettings::parse(sent.query())
+            .expect("the sent body");
+        let wire_settings = body.settings.expect("the wire settings");
+        assert_eq!(wire_settings.flags & 1, 1, "messages_notify_from set");
+        assert!(wire_settings.show_previews);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+
+        // 4b. the SetReactions boolFalse band — the C++ on_result has no
+        //     false-as-result check (cpp:507-515): the ok body settles the
+        //     erase promise and NO repair fetch goes out
+        td.request(
+            40,
+            Function::setReactionNotificationSettings(td_api::setReactionNotificationSettings {
+                notification_settings: Some(td_api::ReactionNotificationSettings {
+                    message_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceContacts(
+                            td_api::reactionNotificationSourceContacts,
+                        ),
+                    ),
+                    story_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceContacts(
+                            td_api::reactionNotificationSourceContacts,
+                        ),
+                    ),
+                    poll_vote_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceAll(
+                            td_api::reactionNotificationSourceAll,
+                        ),
+                    ),
+                    sound_id: -1,
+                    show_preview: true,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 40).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setReactionsNotifySettings::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+        assert_not_sent(
+            &rec,
+            telegram_api::account_getReactionsNotifySettings::ID,
+            "the boolFalse ok band must not repair",
+        );
+
+        // 5. the reset family — the local reset answers ok and the server
+        //    reset rides the wire; boolTrue settles the erase promise
+        td.request(
+            5,
+            Function::resetAllNotificationSettings(td_api::resetAllNotificationSettings),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_resetNotifySettings::ID,
+        );
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+
+        // 6. the error bands — the update FLOOD_WAIT repairs through the
+        //    scope Get, the reactions FLOOD_WAIT through the reaction Get
+        //    (whose answer runs the reaction intake and outboxes the
+        //    changed update)
+        td.request(
+            6,
+            Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopeChannelChats(
+                        td_api::notificationSettingsScopeChannelChats,
+                    ),
+                ),
+                notification_settings: Some(td_api::ScopeNotificationSettings {
+                    mute_for: 10,
+                    sound_id: -1,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    story_sound_id: -1,
+                    show_story_poster: true,
+                    disable_pinned_message_notifications: false,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateNotifySettings::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_notification_settings_net();
+        let repair = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getNotifySettings::ID,
+        );
+        drop(
+            telegram_api::account_getNotifySettings::parse(repair.query())
+                .expect("the channel repair body"),
+        );
+        net_complete(
+            repair,
+            wire!(telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+
+        // the reaction error repair — the answer runs the intake
+        td.request(
+            7,
+            Function::setReactionNotificationSettings(td_api::setReactionNotificationSettings {
+                notification_settings: Some(td_api::ReactionNotificationSettings {
+                    message_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    story_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    poll_vote_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    sound_id: -1,
+                    show_preview: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setReactionsNotifySettings::ID,
+        );
+        net_fail(sent, 500, "REACTION_INVALID");
+        td.dispatch_completed_notification_settings_net();
+        let repair = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getReactionsNotifySettings::ID,
+        );
+        let updates_before = td.notification_updates.len();
+        net_complete(
+            repair,
+            wire!(telegram_api::ReactionsNotifySettings {
+                flags: 0,
+                messages_notify_from: None,
+                stories_notify_from: None,
+                poll_votes_notify_from: None,
+                sound: None,
+                show_previews: true,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+        assert!(
+            td.notification_updates.len() > updates_before,
+            "the changed reaction settings outbox the td_api update"
+        );
+        // the reaction settings persisted (the rns pmc key)
+        assert!(!td.global.binlog_pmc().get_raw(b"rns").is_empty());
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(
+            td.notification_settings_net_completed.lock().is_empty(),
+            "drained"
+        );
+        assert!(
+            td.notification_settings_manager
+                .take_scope_get_promise(
+                    crate::notification_settings::NotificationSettingsScope::Private
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn background_net_families_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -83539,5 +86008,288 @@ kQIDAQAB\n\
         );
 
         assert!(td.business_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// The net-drain 44 call-manager round-trips — the §3.9 families
+    /// ride the dispatcher (the C++ ResultHandler halves,
+    /// CallManager.cpp:31-118); saveCallLog round-trips through the live
+    /// td_api arm with the answer injected (the M.12 upload parks the
+    /// send).
+    #[test]
+    fn call_manager_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(call_manager_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn call_manager_families_ride_the_dispatcher_impl() {
+        // The env exactly as the request arms build it — expanded at the
+        // call site so the field borrows stay disjoint.
+        macro_rules! call_env {
+            ($td:ident) => {{
+                CallEnv {
+                    user_env: UserEnv {
+                        global: &mut $td.global,
+                        options: $td.option_manager.as_mut().expect("option manager set"),
+                        auth_is_bot: $td.auth_manager.is_bot(),
+                    },
+                    user_manager: &mut $td.user_manager,
+                    notification_manager: &mut $td.notification_manager,
+                    updates: &mut $td.call_updates,
+                    dh_config: &mut $td.call_dh_config,
+                }
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-manager");
+
+        // A resolvable call: the requested update creates the actor and
+        // binds the server id (CallId 1 ← server 100/7).
+        {
+            let mut env = call_env!(td);
+            td.call_manager.update_call(
+                &mut env,
+                telegram_api::updatePhoneCall {
+                    phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                        telegram_api::phoneCallRequested {
+                            flags: 0,
+                            video: false,
+                            id: 100,
+                            access_hash: 7,
+                            date: 0,
+                            admin_id: 8,
+                            participant_id: 5,
+                            g_a_hash: vec![1],
+                            protocol: Some(telegram_api::PhoneCallProtocol {
+                                flags: 0,
+                                udp_p2p: true,
+                                udp_reflector: false,
+                                min_layer: 65,
+                                max_layer: 65,
+                                library_versions: Vec::new(),
+                            }),
+                        },
+                    )),
+                },
+            );
+        }
+        let input_call = || {
+            Some(td_api::InputCall::inputCallDiscarded(
+                td_api::inputCallDiscarded { call_id: 1 },
+            ))
+        };
+
+        // 1. sendCallRating — the problem tags ride the comment and the
+        //    resolved inputPhoneCall rides the wire query; the Updates
+        //    answer settles the promise (cpp:52-60).
+        {
+            let (promise, slot) = record_translation_unit();
+            {
+                let mut env = call_env!(td);
+                td.call_manager.rate_call(
+                    &mut env,
+                    &input_call(),
+                    4,
+                    "great".to_string(),
+                    vec![
+                        td_api::CallProblem::callProblemEcho(td_api::callProblemEcho),
+                        td_api::CallProblem::callProblemDropped(td_api::callProblemDropped),
+                    ],
+                    promise,
+                );
+            }
+            let sent = take_sent_query(&rec, telegram_api::phone_setCallRating::ID);
+            let body =
+                telegram_api::phone_setCallRating::parse(sent.query()).expect("the rating body");
+            assert_eq!(body.rating, 4);
+            assert_eq!(body.comment, "great #echo #dropped");
+            assert_eq!(body.flags & 1, 0, "user_initiative off");
+            let peer = body.peer.as_ref().expect("the inputPhoneCall");
+            assert_eq!((peer.id, peer.access_hash), (100, 7));
+            net_complete(sent, wire_empty_updates());
+            td.dispatch_completed_call_net();
+            assert!(matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // 2. The rating bands — the invalid rating errors before any
+        //    query (cpp:260-262); the top rating clears the comment
+        //    (cpp:286-288); the error answer forwards (cpp:63-65).
+        {
+            let (promise, slot) = record_translation_unit();
+            let mut env = call_env!(td);
+            td.call_manager.rate_call(
+                &mut env,
+                &input_call(),
+                0,
+                String::new(),
+                Vec::new(),
+                promise,
+            );
+            assert!(matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Err(ref status))
+                    if status.message() == "Invalid rating specified"
+            ));
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent.iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_setCallRating::ID),
+                "no rating query for the invalid rating"
+            );
+        }
+        {
+            let (promise, slot) = record_translation_unit();
+            {
+                let mut env = call_env!(td);
+                td.call_manager.rate_call(
+                    &mut env,
+                    &input_call(),
+                    5,
+                    "great".to_string(),
+                    Vec::new(),
+                    promise,
+                );
+            }
+            let sent = take_sent_query(&rec, telegram_api::phone_setCallRating::ID);
+            let body =
+                telegram_api::phone_setCallRating::parse(sent.query()).expect("the rating body");
+            assert_eq!(body.rating, 5);
+            assert_eq!(body.comment, "", "the top rating clears the comment");
+            net_fail(sent, 400, "PHONE_NOT_INVALID");
+            td.dispatch_completed_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "PHONE_NOT_INVALID");
+                }
+                other => panic!("the rating error tail forwards: {other:?}"),
+            }
+        }
+
+        // 3. sendCallDebugInformation — the dataJSON wire form; the Bool
+        //    answer (false included — cpp:87-93) runs the intake and
+        //    settles; the error answer forwards.
+        {
+            let (promise, slot) = record_translation_unit();
+            {
+                let mut env = call_env!(td);
+                td.call_manager.send_call_debug_information(
+                    &mut env,
+                    crate::call_id::InputCallId::Call(crate::call_id::CallId::new(1)),
+                    "{\"x\":1}".to_string(),
+                    promise,
+                );
+            }
+            let sent = take_sent_query(&rec, telegram_api::phone_saveCallDebug::ID);
+            let body = telegram_api::phone_saveCallDebug::parse(sent.query())
+                .expect("the saveCallDebug body");
+            let peer = body.peer.as_ref().expect("the inputPhoneCall");
+            assert_eq!((peer.id, peer.access_hash), (100, 7));
+            assert_eq!(body.debug.as_ref().expect("the dataJSON").data, "{\"x\":1}");
+            net_complete(sent, bool_answer(false));
+            td.dispatch_completed_call_net();
+            assert!(
+                matches!(
+                    slot.lock().unwrap().take(),
+                    Some(tdutils::status::Result::Ok(()))
+                ),
+                "the false Bool still settles (cpp:87-93)"
+            );
+
+            let (promise, slot) = record_translation_unit();
+            {
+                let mut env = call_env!(td);
+                td.call_manager.send_call_debug_information(
+                    &mut env,
+                    crate::call_id::InputCallId::Call(crate::call_id::CallId::new(1)),
+                    "{}".to_string(),
+                    promise,
+                );
+            }
+            let sent = take_sent_query(&rec, telegram_api::phone_saveCallDebug::ID);
+            net_fail(sent, 500, "Internal Server Error");
+            td.dispatch_completed_call_net();
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Err(status)) => {
+                    assert_eq!(status.message(), "Internal Server Error");
+                }
+                other => panic!("the debug error tail forwards: {other:?}"),
+            }
+        }
+
+        // 4. sendCallLog — the live td_api arm routes past the removed
+        //    interim-500 shadow into the manager (the M.12 upload parks;
+        //    the promise waits in the family queue), the injected answer
+        //    (the query the M.12 send dispatches) settles the deferred
+        //    response, and the empty-call band still errors.
+        {
+            let id = 77;
+            td.request(
+                id,
+                Function::sendCallLog(td_api::sendCallLog {
+                    call_id: input_call(),
+                    log_file: None,
+                }),
+            );
+            assert!(
+                callback
+                    .errors
+                    .lock()
+                    .iter()
+                    .all(|(error_id, _)| *error_id != id),
+                "the interim-500 shadow is gone"
+            );
+            assert_eq!(td.call_manager.pending.save_call_log.len(), 1);
+            let mut query = NetQuery::new(
+                0,
+                DcId::main(),
+                NetQueryType::Common,
+                AuthFlag::On,
+                GzipFlag::Off,
+                telegram_api::phone_saveCallLog::ID,
+                Vec::new(),
+                u32::MAX,
+                60,
+            );
+            query.set_ok(bool_answer(true));
+            td.call_net_completed.lock().push((
+                crate::call_manager::CallNetKind::SaveCallLog {
+                    call_id: crate::call_id::InputCallId::Call(crate::call_id::CallId::new(1)),
+                },
+                query,
+            ));
+            td.dispatch_completed_call_net();
+            td.flush_deferred_results();
+            assert!(
+                callback
+                    .responses
+                    .lock()
+                    .iter()
+                    .any(|(response_id, _)| *response_id == id),
+                "the injected answer settles the deferred response"
+            );
+
+            let id = 78;
+            td.request(
+                id,
+                Function::sendCallLog(td_api::sendCallLog {
+                    call_id: None,
+                    log_file: None,
+                }),
+            );
+            td.flush_deferred_results();
+            let error = callback
+                .errors
+                .lock()
+                .iter()
+                .find(|(error_id, _)| *error_id == id)
+                .map(|(_, error)| error.clone())
+                .expect("the empty-call band");
+            assert_eq!(error.message, "Input call must be non-empty");
+        }
     }
 }
