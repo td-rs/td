@@ -6,10 +6,30 @@
 //! (the M.13 convention): timeouts become deadline maps merged into the Td
 //! timeout slot, `send_closure(G()->td(), &Td::send_update, ...)`
 //! becomes `env.send_update`, and the pmc/binlog access runs through the
-//! env. The saved-ringtones family and every ResultHandler query are
-//! `[blocked: net/Files]` seams — their only live callers here are the
-//! request arms, which answer the seam error, and `init`, which logs the
-//! blocked fetch.
+//! env.
+//!
+//! The net families split at the net-drain 40 open (verified against the
+//! C++ ResultHandler table):
+//!
+//! * **Ungated — landed on the net plane** (the
+//!   `NotificationSettingsNetKind` dispatch): the five scope/reaction
+//!   settings queries — Get/UpdateScopeNotifySettings
+//!   (`account.{get,update}NotifySettings` over the scope InputNotifyPeer,
+//!   cpp:341-371/453-493), Get/SetReactionsNotifySettings
+//!   (`account.{get,set}ReactionsNotifySettings`, cpp:373-399/495-528) and
+//!   ResetNotifySettings (`account.resetNotifySettings`, cpp:530-560).
+//! * **Files-coupled — parked**: the ringtones family
+//!   (Upload/Save/GetSavedRingtones, cpp:54-186) — the upload leg builds
+//!   an `InputFile` through the file-manager upload machinery and cleans
+//!   partial remote locations, the save leg resolves the ringtone
+//!   `FileId`/file-reference through the documents plane, and the saved
+//!   list answer is `vector<Document>` parsed into notification sounds.
+//! * **Dialog-plane-coupled — parked** (the M.6/M.10 external plane, not
+//!   Files): Get/UpdateDialogNotifySettings and the two
+//!   NotifyExceptions queries (cpp:188-339/401-451) — the send legs build
+//!   their InputNotifyPeer from the dialog access checks
+//!   (`get_input_notify_peer(dialog_id, forum_topic_id)`) and the answers
+//!   route into the messages/forum-topic/updates intakes.
 
 use std::collections::BTreeMap;
 
@@ -17,13 +37,15 @@ use crate::notification_manager::NotificationManagerEnv;
 use crate::notification_settings::{
     NotificationSettingsScope, ReactionNotificationSettings, ScopeNotificationSettings,
     are_different_equivalent_notification_sounds, are_equivalent_notification_sounds,
-    dup_notification_sound, get_notification_settings_scope_object,
-    get_scope_notification_settings_from_td_api, get_scope_notification_settings_from_telegram,
-    get_scope_notification_settings_object, is_notification_sound_default,
+    dup_notification_sound, get_input_notify_peer_for_scope,
+    get_notification_settings_scope_object, get_scope_notification_settings_from_td_api,
+    get_scope_notification_settings_from_telegram, get_scope_notification_settings_object,
+    is_notification_sound_default,
 };
 use crate::store_parse::{Parser, store_i32, store_log_event_version};
 use crate::td_api;
 use tdmtproto::telegram_api;
+use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 /// `LogEvent::HandlerType::UpdateScopeNotificationSettingsOnServer`
@@ -103,13 +125,40 @@ pub trait NotificationSettingsManagerEnv: NotificationManagerEnv {
     fn reset_all_dialog_notification_settings(&mut self) {}
 }
 
-/// The `get_scope_notification_settings(scope, promise)` answer
-/// (NotificationSettingsManager.cpp:1533-1544): either the synchronized
-/// settings or a deferred fetch — the promise stays unanswered until the
-/// (net-blocked) query finishes, matching the C++ promise defer.
-pub enum ScopeSettingsAnswer<'a> {
-    Ready(&'a ScopeNotificationSettings),
-    Deferred,
+/// The notification-settings-plane in-flight query kinds — the C++
+/// `Td::ResultHandler` classes of the ungated net-drain 40 families
+/// (NotificationSettingsManager.cpp:341-560). The completions park by
+/// kind behind the manager-held net handle
+/// (`crate::td::NotificationSettingsNetHandle`);
+/// `Td::on_notification_settings_net_answer` routes them. The
+/// Files-coupled ringtones family and the dialog-coupled families stay
+/// parked on their planes (the module doc map).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationSettingsNetKind {
+    /// `GetScopeNotifySettingsQuery` (cpp:341-371) —
+    /// `account.getNotifySettings(get_input_notify_peer(scope))`; the
+    /// query promise parks in the manager's scope-get lot (the empty
+    /// default for the init/repair sends, the request promise for the
+    /// `getScopeNotificationSettings` request).
+    GetScope { scope: NotificationSettingsScope },
+    /// `GetReactionsNotifySettingsQuery` (cpp:373-399) —
+    /// `account.getReactionsNotifySettings()`; the promise is always the
+    /// empty `Promise<Unit>()` on this line (the init fetch and the
+    /// set-error repair tail).
+    GetReactions,
+    /// `UpdateScopeNotifySettingsQuery` (cpp:453-493) —
+    /// `account.updateNotifySettings(...)` over the current scope
+    /// settings; the query promise is the erase-log-event wrapper over
+    /// the saved log event (the parked id lot carries the erase half).
+    UpdateScope { scope: NotificationSettingsScope },
+    /// `SetReactionsNotifySettingsQuery` (cpp:495-528) —
+    /// `account.setReactionsNotifySettings(...)`; the erase-log-event
+    /// wrapper rides the parked id lot.
+    SetReactions,
+    /// `ResetNotifySettingsQuery` (cpp:530-560) —
+    /// `account.resetNotifySettings()`; the erase-log-event wrapper rides
+    /// the parked id lot.
+    Reset,
 }
 
 /// The manager state — the C++ member fields of
@@ -126,11 +175,81 @@ pub struct NotificationSettingsManager {
     /// `scope + 1`, the map is keyed by the plain scope value. Deadlines
     /// are monotonic (`now()`) seconds, the M.13 collapse convention.
     scope_unmute_timeout: BTreeMap<i32, f64>,
+    /// The Get-scope family's parked query promises — the C++ promise
+    /// rides its own query (the request promise from
+    /// `get_scope_notification_settings`, the empty `Promise<Unit>()`
+    /// from the init/repair sends); the answers pop the scope's FIFO
+    /// head (§5 — the net completes same-family queries in dispatch
+    /// order).
+    pending_scope_get: Vec<(
+        NotificationSettingsScope,
+        Promise<td_api::ScopeNotificationSettings>,
+    )>,
+    /// The Update-scope family's parked log-event ids — the
+    /// `get_erase_log_event_promise` halves (LogEventHelper.cpp:42-52):
+    /// the answers erase the binlog mirror on settlement, success or
+    /// error, unless the td is closing.
+    pending_update_scope: Vec<u64>,
+    /// The Set-reactions family's parked log-event ids.
+    pending_set_reaction: Vec<u64>,
+    /// The Reset family's parked log-event ids.
+    pending_reset: Vec<u64>,
+    /// The net dispatch surface — the `td_` back-pointer the C++ manager
+    /// uses for its query sends, narrowed to the net plane (`None` in the
+    /// net-inert tests; set at the manager install, §0's shared-env
+    /// shape).
+    pub(crate) net: Option<crate::td::NotificationSettingsNetHandle>,
 }
 
 impl NotificationSettingsManager {
     pub fn new() -> Self {
         NotificationSettingsManager::default()
+    }
+
+    /// The `td_->create_handler<…>()->send(...)` collapse — the wire
+    /// query construction lives at the manager send sites; `None` keeps
+    /// the net-inert posture (the tests drive the answer halves).
+    fn send_notification_settings_net_query(
+        &self,
+        kind: NotificationSettingsNetKind,
+        function: telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
+    /// The Get-family promise pop for the
+    /// `Td::on_notification_settings_net_answer` drain — the FIFO head
+    /// of the scope's lot (the C++ promise rides its own query; the net
+    /// completes the same-family queries in dispatch order).
+    pub(crate) fn take_scope_get_promise(
+        &mut self,
+        scope: NotificationSettingsScope,
+    ) -> Option<Promise<td_api::ScopeNotificationSettings>> {
+        let index = self
+            .pending_scope_get
+            .iter()
+            .position(|&(parked_scope, _)| parked_scope == scope)?;
+        Some(self.pending_scope_get.remove(index).1)
+    }
+
+    /// The Update-scope family's parked log-event id pop — the
+    /// erase-log-event promise half.
+    pub(crate) fn take_update_scope_log_event(&mut self) -> Option<u64> {
+        pop_head(&mut self.pending_update_scope)
+    }
+
+    /// The Set-reactions family's parked log-event id pop.
+    pub(crate) fn take_set_reaction_log_event(&mut self) -> Option<u64> {
+        pop_head(&mut self.pending_set_reaction)
+    }
+
+    /// The Reset family's parked log-event id pop.
+    pub(crate) fn take_reset_log_event(&mut self) -> Option<u64> {
+        pop_head(&mut self.pending_reset)
     }
 
     fn get_scope(&self, scope: NotificationSettingsScope) -> &ScopeNotificationSettings {
@@ -158,8 +277,8 @@ impl NotificationSettingsManager {
     }
 
     /// `init` (NotificationSettingsManager.cpp:627-670): the pmc loads,
-    /// the unmute schedules, the update pushes and the (net-blocked) scope
-    /// fetch queries.
+    /// the unmute schedules, the update pushes and the scope fetch
+    /// queries (the net plane; `None` keeps the net-inert posture).
     pub fn init(&mut self, env: &mut impl NotificationSettingsManagerEnv) {
         if self.is_inited {
             return;
@@ -203,7 +322,7 @@ impl NotificationSettingsManager {
                 }
             }
             if !self.get_scope(scope).is_synchronized {
-                self.send_get_scope_notification_settings_query(scope);
+                self.send_get_scope_notification_settings_query(env, scope, Promise::default());
             }
         }
 
@@ -224,7 +343,7 @@ impl NotificationSettingsManager {
                 }
             }
         } else {
-            self.send_get_reaction_notification_settings_query();
+            self.send_get_reaction_notification_settings_query(env);
         }
         env.send_update(self.get_update_reaction_notification_settings_object());
 
@@ -234,17 +353,59 @@ impl NotificationSettingsManager {
     }
 
     /// `send_get_scope_notification_settings_query`
-    /// (NotificationSettingsManager.cpp:1546-1554) — the ResultHandler is
-    /// a net query, `[blocked: net]`; the deferred promise convention is
-    /// at the request arm.
-    fn send_get_scope_notification_settings_query(&self, scope: NotificationSettingsScope) {
-        tdutils::log_info!("Get scope notification settings query for {scope:?} — [blocked: net]");
+    /// (NotificationSettingsManager.cpp:1546-1554): the bot gate errors
+    /// the promise (500, "Wrong getScopeNotificationSettings query"); the
+    /// query rides the net plane and the promise parks in the family lot —
+    /// the request promise from the request path, the empty default from
+    /// the init/repair sends (the C++ `Promise<Unit>()`).
+    pub(crate) fn send_get_scope_notification_settings_query(
+        &mut self,
+        env: &impl NotificationSettingsManagerEnv,
+        scope: NotificationSettingsScope,
+        mut promise: Promise<td_api::ScopeNotificationSettings>,
+    ) {
+        if env.auth_is_bot() {
+            tdutils::log_error!("Can't get notification settings for {scope:?}");
+            promise.set_error(Status::error(
+                500,
+                "Wrong getScopeNotificationSettings query",
+            ));
+            return;
+        }
+        self.pending_scope_get.push((scope, promise));
+        self.send_notification_settings_net_query(
+            NotificationSettingsNetKind::GetScope { scope },
+            telegram_api::Function::account_getNotifySettings(
+                telegram_api::account_getNotifySettings {
+                    peer: Some(get_input_notify_peer_for_scope(scope)),
+                },
+            ),
+            "account.getNotifySettings",
+        );
     }
 
     /// `send_get_reaction_notification_settings_query`
-    /// (NotificationSettingsManager.cpp:893-900) — `[blocked: net]`.
-    fn send_get_reaction_notification_settings_query(&self) {
-        tdutils::log_info!("Get reaction notification settings query — [blocked: net]");
+    /// (NotificationSettingsManager.cpp:893-900): the bot gate errors the
+    /// C++ promise — every live caller on this line passes the empty
+    /// `Promise<Unit>()` (the init fetch and the set-error repair tail),
+    /// so nothing parks; the answer runs the landed
+    /// [`NotificationSettingsManager::on_update_reaction_notification_settings`]
+    /// intake.
+    pub(crate) fn send_get_reaction_notification_settings_query(
+        &mut self,
+        env: &impl NotificationSettingsManagerEnv,
+    ) {
+        if env.auth_is_bot() {
+            tdutils::log_error!("Can't get reaction notification settings");
+            return;
+        }
+        self.send_notification_settings_net_query(
+            NotificationSettingsNetKind::GetReactions,
+            telegram_api::Function::account_getReactionsNotifySettings(
+                telegram_api::account_getReactionsNotifySettings,
+            ),
+            "account.getReactionsNotifySettings",
+        );
     }
 
     /// `get_scope_mute_until` (NotificationSettingsManager.cpp:689-691).
@@ -301,20 +462,38 @@ impl NotificationSettingsManager {
     }
 
     /// `get_scope_notification_settings(scope, promise)` — the request
-    /// path (cpp:1533-1544). The `Deferred` answer leaves the request
-    /// promise unanswered, exactly like the C++ deferred promise waiting
-    /// for the (here net-blocked) fetch.
+    /// path (cpp:1533-1544): an unsynchronized scope defers into the
+    /// fetch — the promise parks on the query (the C++ RequestActor
+    /// defer, Requests.cpp:1340-1364) and the answer drain resolves it
+    /// with the now-synchronized state (the do_run re-run); otherwise the
+    /// promise settles inline with the synchronized object (the C++
+    /// `promise.set_value(Unit())` + `do_send_result` collapse — the
+    /// promise is the answer path, both bands).
     pub fn get_scope_notification_settings_for_request(
-        &self,
+        &mut self,
         env: &impl NotificationSettingsManagerEnv,
         scope: NotificationSettingsScope,
-    ) -> ScopeSettingsAnswer<'_> {
-        let notification_settings = self.get_scope(scope);
-        if !notification_settings.is_synchronized && !env.auth_is_bot() {
-            self.send_get_scope_notification_settings_query(scope);
-            return ScopeSettingsAnswer::Deferred;
+        mut promise: Promise<td_api::ScopeNotificationSettings>,
+    ) {
+        if !self.get_scope(scope).is_synchronized && !env.auth_is_bot() {
+            self.send_get_scope_notification_settings_query(env, scope, promise);
+            return;
         }
-        ScopeSettingsAnswer::Ready(notification_settings)
+        let unix_time = env.unix_time();
+        let object = get_scope_notification_settings_object(self.get_scope(scope), unix_time);
+        promise.set_value(object);
+    }
+
+    /// The synchronized-state object builder for the Get-family answer
+    /// drain — the `GetScopeNotificationSettingsRequest::do_send_result`
+    /// half (Requests.cpp:1352-1361): after the query answer the scope is
+    /// synchronized and the object builds from the state.
+    pub(crate) fn scope_settings_object(
+        &self,
+        scope: NotificationSettingsScope,
+        unix_time: i32,
+    ) -> td_api::ScopeNotificationSettings {
+        get_scope_notification_settings_object(self.get_scope(scope), unix_time)
     }
 
     /// `get_update_scope_notification_settings_object` (cpp:770-776); the
@@ -602,7 +781,12 @@ impl NotificationSettingsManager {
     }
 
     /// `update_scope_notification_settings_on_server` (cpp:1617-1627) —
-    /// the log event is real, the query is `[blocked: net]`.
+    /// the log event is real and the query rides the net plane: the wire
+    /// body is the current scope settings
+    /// (`ScopeNotificationSettings::get_input_peer_notify_settings`), the
+    /// query promise is `get_erase_log_event_promise(log_event_id)` — the
+    /// parked id lot carries the erase half and the kind's scope the
+    /// on_error repair tail.
     fn update_scope_notification_settings_on_server(
         &mut self,
         env: &mut impl NotificationSettingsManagerEnv,
@@ -617,7 +801,19 @@ impl NotificationSettingsManager {
         }
 
         tdutils::log_info!(
-            "Update {scope:?} notification settings on server with log_event {log_event_id} — [blocked: net]"
+            "Update {scope:?} notification settings on server with log_event {log_event_id}"
+        );
+        self.pending_update_scope.push(log_event_id);
+        let settings = self.get_scope(scope).clone();
+        self.send_notification_settings_net_query(
+            NotificationSettingsNetKind::UpdateScope { scope },
+            telegram_api::Function::account_updateNotifySettings(
+                telegram_api::account_updateNotifySettings {
+                    peer: Some(get_input_notify_peer_for_scope(scope)),
+                    settings: Some(settings.get_input_peer_notify_settings()),
+                },
+            ),
+            "account.updateNotifySettings",
         );
     }
 
@@ -647,7 +843,9 @@ impl NotificationSettingsManager {
         Ok(())
     }
 
-    /// `update_reaction_notification_settings_on_server` (cpp:1673-1682).
+    /// `update_reaction_notification_settings_on_server` (cpp:1673-1682)
+    /// — the log event is real and the query rides the net plane; the
+    /// erase-log-event id parks in the family lot.
     fn update_reaction_notification_settings_on_server(
         &mut self,
         env: &mut impl NotificationSettingsManagerEnv,
@@ -662,7 +860,20 @@ impl NotificationSettingsManager {
         }
 
         tdutils::log_info!(
-            "Update reaction notification settings on server with log_event {log_event_id} — [blocked: net]"
+            "Update reaction notification settings on server with log_event {log_event_id}"
+        );
+        self.pending_set_reaction.push(log_event_id);
+        self.send_notification_settings_net_query(
+            NotificationSettingsNetKind::SetReactions,
+            telegram_api::Function::account_setReactionsNotifySettings(
+                telegram_api::account_setReactionsNotifySettings {
+                    settings: Some(
+                        self.reaction_notification_settings
+                            .get_input_reactions_notify_settings(),
+                    ),
+                },
+            ),
+            "account.setReactionsNotifySettings",
         );
     }
 
@@ -678,7 +889,9 @@ impl NotificationSettingsManager {
         self.reset_all_notification_settings_on_server(env, 0);
     }
 
-    /// `reset_all_notification_settings_on_server` (cpp:1721-1729).
+    /// `reset_all_notification_settings_on_server` (cpp:1721-1729) — the
+    /// log event is real and the query rides the net plane; the
+    /// erase-log-event id parks in the family lot.
     fn reset_all_notification_settings_on_server(
         &mut self,
         env: &mut impl NotificationSettingsManagerEnv,
@@ -688,13 +901,18 @@ impl NotificationSettingsManager {
             let mut data = Vec::new();
             store_log_event_version(&mut data);
             data.extend_from_slice(&0u32.to_le_bytes());
-            // the id rides the (blocked) ack promise, so it is not read
-            // again on this line
             log_event_id = env.binlog_add(RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER, &data);
         }
-        let _ = log_event_id;
 
-        tdutils::log_info!("Reset all notification settings — [blocked: net]");
+        tdutils::log_info!("Reset all notification settings");
+        self.pending_reset.push(log_event_id);
+        self.send_notification_settings_net_query(
+            NotificationSettingsNetKind::Reset,
+            telegram_api::Function::account_resetNotifySettings(
+                telegram_api::account_resetNotifySettings,
+            ),
+            "account.resetNotifySettings",
+        );
     }
 
     /// `on_binlog_events` (cpp:1731-1763) — the replay dispatch from the
@@ -794,6 +1012,17 @@ impl NotificationSettingsManager {
     }
 }
 
+/// Pop the oldest parked entry — the §5 FIFO-per-family convention (the
+/// C++ promise rides its own ResultHandler; the net completes the
+/// same-family queries in dispatch order, so the head pairs).
+fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +1030,7 @@ mod tests {
     use crate::notification_settings::{NotificationSound, ReactionNotificationsFrom};
     use crate::store_parse::store_flags;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     struct TestSettingsEnv {
         pmc: HashMap<Vec<u8>, Vec<u8>>,
@@ -937,12 +1167,23 @@ mod tests {
         manager.init(&mut env);
 
         assert!(!env.pmc.contains_key(&b"nsfac"[..]), "nsfac must be erased");
-        // no scope settings: all three unsynchronized -> no scope updates,
-        // the fetches are the blocked seams
+        // no scope settings: all three unsynchronized -> no scope updates;
+        // the three fetch queries park their empty promises (the net-inert
+        // posture logs the sends — the td.rs round-trip drives the wire)
         assert!(env.updates.iter().all(|update| matches!(
             update,
             td_api::Update::updateReactionNotificationSettings(_)
         )));
+        for scope in [
+            NotificationSettingsScope::Private,
+            NotificationSettingsScope::Group,
+            NotificationSettingsScope::Channel,
+        ] {
+            assert!(
+                manager.take_scope_get_promise(scope).is_some(),
+                "the {scope:?} fetch parked its promise"
+            );
+        }
         // the reaction update carries the defaults
         let td_api::Update::updateReactionNotificationSettings(payload) = &env.updates[0] else {
             panic!("expected the reaction settings update");
@@ -1316,5 +1557,166 @@ mod tests {
         let mut out = Vec::new();
         store_flags(&mut out, []);
         out.try_into().expect("4 bytes")
+    }
+
+    /// The scope-object promise slot — captures the settled result (the
+    /// deferred request promise shape).
+    type ScopeSlot = Arc<Mutex<Option<tdutils::status::Result<td_api::ScopeNotificationSettings>>>>;
+
+    fn scope_slot() -> (Promise<td_api::ScopeNotificationSettings>, ScopeSlot) {
+        let slot: ScopeSlot = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+            *capture.lock().unwrap() = Some(result);
+        });
+        (promise, slot)
+    }
+
+    #[test]
+    fn scope_get_request_defers_and_parks_the_promise() {
+        let mut env = TestSettingsEnv::new();
+        let mut manager = NotificationSettingsManager::new();
+        // unsynchronized scope — the request defers (cpp:1533-1544)
+        let (promise, slot) = scope_slot();
+        manager.get_scope_notification_settings_for_request(
+            &env,
+            NotificationSettingsScope::Private,
+            promise,
+        );
+        assert!(slot.lock().unwrap().is_none(), "the promise stays parked");
+        // the fetch parks the promise — the drain pops it FIFO per scope;
+        // the answer drain shape: the intake runs first, then the do_run
+        // re-run answers from the synchronized state
+        let mut popped = manager
+            .take_scope_get_promise(NotificationSettingsScope::Private)
+            .expect("the request promise parked");
+        let wire_unix_time = env.unix_time;
+        manager.on_update_scope_notify_settings(
+            &mut env,
+            NotificationSettingsScope::Private,
+            Some(telegram_api::PeerNotifySettings {
+                flags: (1 << 0) | (1 << 2),
+                show_previews: true,
+                silent: false,
+                mute_until: wire_unix_time + 30,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        let object =
+            manager.scope_settings_object(NotificationSettingsScope::Private, env.unix_time);
+        popped.set_value(object);
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(settings)) => {
+                assert_eq!(settings.mute_for, 30);
+            }
+            other => panic!("the settled scope object: {other:?}"),
+        }
+        // a second pop finds nothing — one query, one promise
+        assert!(
+            manager
+                .take_scope_get_promise(NotificationSettingsScope::Private)
+                .is_none()
+        );
+        // the now-synchronized scope settles the promise inline with the
+        // object (the C++ set_value(Unit) + do_send_result collapse)
+        let (promise, slot) = scope_slot();
+        manager.get_scope_notification_settings_for_request(
+            &env,
+            NotificationSettingsScope::Private,
+            promise,
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(settings)) => {
+                assert_eq!(settings.mute_for, 30);
+            }
+            other => panic!("the inline settle: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_get_bot_gate_errors_the_promise() {
+        let mut env = TestSettingsEnv::new();
+        env.is_bot = true;
+        let mut manager = NotificationSettingsManager::new();
+        let (promise, slot) = scope_slot();
+        // cpp:1546-1554 — the bot gate errors the request promise directly
+        manager.send_get_scope_notification_settings_query(
+            &env,
+            NotificationSettingsScope::Group,
+            promise,
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(status.message(), "Wrong getScopeNotificationSettings query");
+            }
+            other => panic!("the bot gate: {other:?}"),
+        }
+        assert!(
+            manager
+                .take_scope_get_promise(NotificationSettingsScope::Group)
+                .is_none(),
+            "the gated send parks nothing"
+        );
+    }
+
+    #[test]
+    fn on_server_families_park_their_log_event_ids() {
+        let mut env = TestSettingsEnv::new();
+        let mut manager = NotificationSettingsManager::new();
+        manager.init(&mut env);
+        let binlog_before = env.binlog.len();
+
+        // UpdateScope — the wire send is net-inert here; the log event id
+        // parks FIFO (the erase-log-event promise half)
+        manager.update_scope_notification_settings_on_server(
+            &mut env,
+            NotificationSettingsScope::Channel,
+            0,
+        );
+        assert_eq!(env.binlog.len(), binlog_before + 1);
+        assert_eq!(
+            manager.take_update_scope_log_event(),
+            Some(env.binlog[binlog_before].0)
+        );
+        assert!(manager.take_update_scope_log_event().is_none());
+
+        // SetReactions
+        manager.update_reaction_notification_settings_on_server(&mut env, 0);
+        assert_eq!(env.binlog.len(), binlog_before + 2);
+        assert_eq!(
+            manager.take_set_reaction_log_event(),
+            Some(env.binlog[binlog_before + 1].0)
+        );
+        assert!(manager.take_set_reaction_log_event().is_none());
+
+        // Reset
+        manager.reset_all_notification_settings_on_server(&mut env, 0);
+        assert_eq!(env.binlog.len(), binlog_before + 3);
+        assert_eq!(
+            manager.take_reset_log_event(),
+            Some(env.binlog[binlog_before + 2].0)
+        );
+        assert!(manager.take_reset_log_event().is_none());
+
+        // the replay form reuses the recorded id — no new binlog event
+        let replayed_id = env.binlog[binlog_before].0;
+        manager.update_scope_notification_settings_on_server(
+            &mut env,
+            NotificationSettingsScope::Channel,
+            replayed_id,
+        );
+        assert_eq!(
+            env.binlog.len(),
+            binlog_before + 3,
+            "the replayed id parks without a new log event"
+        );
     }
 }

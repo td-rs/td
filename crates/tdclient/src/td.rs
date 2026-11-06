@@ -3614,6 +3614,17 @@ pub(crate) type WebAppNetHandle = NetKindHandle<crate::web_app_manager::WebAppNe
 /// [`crate::web_browser_manager::WebBrowserManager::net`] field): the
 /// send legs run inside the manager, the env carries nothing wire-facing.
 pub(crate) type WebBrowserNetHandle = NetKindHandle<crate::web_browser_manager::WebBrowserNetKind>;
+
+/// The cloned notification-settings dispatch surface — the per-kind
+/// handle over the NotificationSettingsManager.cpp ResultHandler kinds
+/// (the net-drain 40 plane: the five ungated scope/reaction/reset
+/// families); the answers drain through
+/// [`Td::dispatch_completed_notification_settings_net`]. Manager-held
+/// (the [`crate::notification_settings_manager::NotificationSettingsManager::net`]
+/// field): the send legs run inside the manager, the env carries nothing
+/// wire-facing.
+pub(crate) type NotificationSettingsNetHandle =
+    NetKindHandle<crate::notification_settings_manager::NotificationSettingsNetKind>;
 /// The cloned DialogParticipant dispatch surface the
 /// [`TdDialogParticipantEnv`] senders use — the per-kind handle over the
 /// DialogParticipantManager.cpp ResultHandler kinds (the net-drain 35
@@ -3825,6 +3836,16 @@ fn parse_wire_bool(data: &[u8]) -> Option<()> {
     } else {
         None
     }
+}
+
+/// The notification-settings bool-answer band — a query answers ok only
+/// when it carried no error and the body is `boolTrue`; the wire error
+/// and the false-as-result 400 band ("Receive false as result",
+/// NotificationSettingsManager.cpp:469-471/545-547) settle the same
+/// way. Only the UpdateScope and Reset families carry the 400 band —
+/// SetReactions settles on any ok answer (cpp:507-515).
+fn wire_bool_ok(query: &NetQuery) -> bool {
+    !query.is_error() && parse_wire_bool_value(query.ok()) == Some(true)
 }
 
 /// The value form of [`parse_wire_bool`] — `Some(true)`/`Some(false)`
@@ -6059,6 +6080,17 @@ pub struct Td {
     /// [`Td::on_web_browser_net_answer`] drain).
     web_browser_net_completed:
         Arc<Mutex<Vec<(crate::web_browser_manager::WebBrowserNetKind, NetQuery)>>>,
+    /// The callback-parked notification-settings answers (the C++
+    /// ResultHandler halves of the net-drain 40 families — the
+    /// [`Td::on_notification_settings_net_answer`] drain).
+    notification_settings_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::notification_settings_manager::NotificationSettingsNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The callback-parked DialogParticipant answers (the C++ ResultHandler
     /// halves of the net-drain 35 member-query trio — the
     /// [`Td::on_dialog_participant_net_answer`] drain).
@@ -6585,6 +6617,7 @@ impl Td {
             message_query_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_app_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_browser_net_completed: Arc::new(Mutex::new(Vec::new())),
+            notification_settings_net_completed: Arc::new(Mutex::new(Vec::new())),
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
@@ -7074,6 +7107,7 @@ impl Td {
         self.business_manager.net = self.business_net();
         self.statistics_manager.net = self.statistics_net();
         self.web_browser_manager.net = self.web_browser_net();
+        self.notification_settings_manager.net = self.notification_settings_net();
         self.group_call_manager.net = self.group_call_net();
         self.forum_topic_manager.net = self.forum_topic_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
@@ -8896,6 +8930,7 @@ impl Td {
         self.dispatch_completed_message_query_net();
         self.dispatch_completed_web_app_net();
         self.dispatch_completed_web_browser_net();
+        self.dispatch_completed_notification_settings_net();
         self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_forum_topic_net();
         self.dispatch_completed_story_net();
@@ -9230,6 +9265,17 @@ impl Td {
         Some(WebBrowserNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.web_browser_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned notification-settings dispatch surface (the net-drain
+    /// 40 families' send legs — the manager-held handle the five
+    /// scope/reaction/reset queries ride).
+    pub(crate) fn notification_settings_net(&self) -> Option<NotificationSettingsNetHandle> {
+        Some(NotificationSettingsNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.notification_settings_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17433,6 +17479,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked notification-settings answers — the
+    /// C++ ResultHandler halves of the net-drain 40 families
+    /// (NotificationSettingsManager.cpp:341-560).
+    fn dispatch_completed_notification_settings_net(&mut self) {
+        let completed = std::mem::take(&mut *self.notification_settings_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_notification_settings_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Drain the callback-parked DialogParticipant answers — the C++
     /// ResultHandler halves of the net-drain 35 member-query trio
     /// (DialogParticipantManager.cpp:342-443, 904-946).
@@ -18797,6 +18854,199 @@ impl Td {
         };
         self.web_browser_manager
             .on_get_web_browser_settings(&mut env, result, promise);
+    }
+
+    /// Route one notification-settings net answer by kind — the
+    /// ResultHandler halves of the net-drain 40 families
+    /// (NotificationSettingsManager.cpp:341-560):
+    ///
+    /// * GetScopeNotifySettings (cpp:341-371): the answer feeds the
+    ///   landed `on_update_scope_notify_settings` intake, then the parked
+    ///   query promise resolves with the now-synchronized state (the
+    ///   `GetScopeNotificationSettingsRequest` do_run re-run,
+    ///   Requests.cpp:1340-1364) — or the wire error forwards.
+    /// * GetReactionsNotifySettings (cpp:373-399): the answer feeds the
+    ///   landed `on_update_reaction_notification_settings` intake (the
+    ///   C++ promise is the empty `Promise<Unit>()` — nothing parks).
+    /// * UpdateScopeNotifySettings / SetReactionsNotifySettings /
+    ///   ResetNotifySettings (cpp:453-560): the `bool` answers settle
+    ///   their erase-log-event promises (the parked id lot erases the
+    ///   binlog mirror on settlement, success or error, unless closing —
+    ///   LogEventHelper.cpp:42-52); the error and the false-as-result 400
+    ///   bands re-send the matching Get repair query unless a bot
+    ///   (the Reset family has no repair, only the expected-error-gated
+    ///   log).
+    fn on_notification_settings_net_answer(
+        &mut self,
+        kind: crate::notification_settings_manager::NotificationSettingsNetKind,
+        query: NetQuery,
+    ) {
+        use crate::notification_settings_manager::NotificationSettingsNetKind;
+        match kind {
+            NotificationSettingsNetKind::GetScope { scope } => {
+                let promise = self
+                    .notification_settings_manager
+                    .take_scope_get_promise(scope);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let result =
+                    if let Ok(settings) = telegram_api::PeerNotifySettings::parse(query.ok()) {
+                        Ok(Some(settings))
+                    } else {
+                        Err(tdutils::status::Status::error(
+                            500,
+                            "Receive invalid peer notify settings",
+                        ))
+                    };
+                match result {
+                    Ok(settings) => {
+                        let unix_time = self.get_unix_time();
+                        {
+                            let mut env = NotificationEnv {
+                                global: &mut self.global,
+                                options: self.option_manager.as_mut(),
+                                auth_is_authorized: self.auth_manager.is_authorized(),
+                                auth_is_bot: self.auth_manager.is_bot(),
+                                updates: &mut self.notification_updates,
+                            };
+                            self.notification_settings_manager
+                                .on_update_scope_notify_settings(&mut env, scope, settings);
+                        }
+                        // the do_run re-run: the synchronized state answers
+                        if let Some(mut promise) = promise {
+                            let object = self
+                                .notification_settings_manager
+                                .scope_settings_object(scope, unix_time);
+                            promise.set_value(object);
+                        }
+                    }
+                    Err(status) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(status);
+                        }
+                    }
+                }
+            }
+            NotificationSettingsNetKind::GetReactions => {
+                if query.is_error() {
+                    // the empty C++ promise drops the error silently
+                    // (Promise<Unit>::set_error on the null promise is a
+                    // no-op — nothing parks, nothing logs)
+                    return;
+                }
+                let Ok(settings) = telegram_api::ReactionsNotifySettings::parse(query.ok()) else {
+                    return;
+                };
+                let mut env = NotificationEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.notification_updates,
+                };
+                let reaction_settings =
+                    crate::notification_settings::ReactionNotificationSettings::from_telegram(
+                        Some(settings),
+                    );
+                self.notification_settings_manager
+                    .on_update_reaction_notification_settings(&mut env, reaction_settings);
+            }
+            NotificationSettingsNetKind::UpdateScope { scope } => {
+                let log_event_id = self
+                    .notification_settings_manager
+                    .take_update_scope_log_event();
+                self.settle_notification_settings_erase_promise(log_event_id);
+                if !wire_bool_ok(&query) {
+                    tdutils::log_info!("Receive error for set notification settings");
+                    self.repair_scope_notification_settings(scope);
+                }
+            }
+            NotificationSettingsNetKind::SetReactions => {
+                let log_event_id = self
+                    .notification_settings_manager
+                    .take_set_reaction_log_event();
+                self.settle_notification_settings_erase_promise(log_event_id);
+                // the ok band settles on any answer — the C++ on_result
+                // has no false-as-result check (cpp:507-515: it logs the
+                // result and sets the promise); only the wire error runs
+                // the repair tail (cpp:519-524)
+                if query.is_error() {
+                    tdutils::log_info!("Receive error for set reaction notification settings");
+                    if !self.auth_manager.is_bot() {
+                        let env = NotificationEnv {
+                            global: &mut self.global,
+                            options: self.option_manager.as_mut(),
+                            auth_is_authorized: self.auth_manager.is_authorized(),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                            updates: &mut self.notification_updates,
+                        };
+                        self.notification_settings_manager
+                            .send_get_reaction_notification_settings_query(&env);
+                    }
+                }
+            }
+            NotificationSettingsNetKind::Reset => {
+                let log_event_id = self.notification_settings_manager.take_reset_log_event();
+                self.settle_notification_settings_erase_promise(log_event_id);
+                if !wire_bool_ok(&query) {
+                    let status = if query.is_error() {
+                        query.error().clone()
+                    } else {
+                        tdutils::status::Status::error(400, "Receive false as result")
+                    };
+                    if !self.global.is_expected_error(&status) {
+                        tdutils::log_error!(
+                            "Receive error for reset notification settings: {status}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The erase-log-event promise half — `get_erase_log_event_promise`
+    /// (LogEventHelper.cpp:42-52): on settlement, success or error, the
+    /// binlog mirror erases unless the td is closing.
+    fn settle_notification_settings_erase_promise(&mut self, log_event_id: Option<u64>) {
+        let Some(log_event_id) = log_event_id else {
+            return;
+        };
+        if !self
+            .global
+            .shared_close_flag()
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.global.td_db().binlog().erase(log_event_id);
+        }
+    }
+
+    /// The Update-scope family's on_error repair tail
+    /// (NotificationSettingsManager.cpp:483-492): re-send the scope Get
+    /// query with the empty promise unless a bot.
+    fn repair_scope_notification_settings(
+        &mut self,
+        scope: crate::notification_settings::NotificationSettingsScope,
+    ) {
+        if self.auth_manager.is_bot() {
+            return;
+        }
+        let env = NotificationEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.notification_updates,
+        };
+        self.notification_settings_manager
+            .send_get_scope_notification_settings_query(
+                &env,
+                scope,
+                tdutils::promise::Promise::default(),
+            );
     }
 
     /// Route one DialogParticipant net answer by kind — the ResultHandler
@@ -51611,6 +51861,7 @@ mod tests {
         td.star_gift_manager.net = td.star_gift_net();
         td.business_manager.net = td.business_net();
         td.web_browser_manager.net = td.web_browser_net();
+        td.notification_settings_manager.net = td.notification_settings_net();
         {
             let net = td.link_net();
             if let Some(link_manager) = td.link_manager.as_mut() {
@@ -76365,6 +76616,433 @@ kQIDAQAB\n\
         // the drain ran clean — nothing parked, no strays
         assert!(td.web_browser_net_completed.lock().is_empty(), "drained");
         assert!(td.web_browser_manager.pop_update_promise().is_none());
+    }
+
+    #[test]
+    fn notification_settings_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(notification_settings_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn notification_settings_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain40-notification-settings");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        let unix_time = td.get_unix_time();
+
+        // 1. the deferred Get — the unsynchronized scope parks the request
+        //    promise on the fetch query; the wire carries the scope's
+        //    InputNotifyPeer; the answer applies through the intake and
+        //    the request resolves with the synchronized state
+        td.request(
+            1,
+            Function::getScopeNotificationSettings(td_api::getScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopePrivateChats(
+                        td_api::notificationSettingsScopePrivateChats,
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getNotifySettings::ID,
+        );
+        let body =
+            telegram_api::account_getNotifySettings::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyUsers(_))
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::PeerNotifySettings {
+                // show_previews + mute_until flags (peerNotifySettings
+                // bits 0 and 2)
+                flags: (1 << 0) | (1 << 2),
+                show_previews: false,
+                silent: false,
+                mute_until: unix_time + 120,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::scopeNotificationSettings(settings)) => {
+                assert_eq!(settings.mute_for, 120);
+                assert!(!settings.show_preview);
+            }
+            other => panic!("the deferred scope settings answer: {other:?}"),
+        }
+
+        // 2. setScopeNotificationSettings — the local update answers ok at
+        //    once and the server mirror rides the wire over the group
+        //    InputNotifyPeer; boolTrue settles the erase-log-event promise
+        //    (the settlement bracket allocates exactly the erase rewrite)
+        td.request(
+            2,
+            Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopeGroupChats(
+                        td_api::notificationSettingsScopeGroupChats,
+                    ),
+                ),
+                notification_settings: Some(td_api::ScopeNotificationSettings {
+                    mute_for: 50,
+                    sound_id: -1,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    story_sound_id: -1,
+                    show_story_poster: true,
+                    disable_pinned_message_notifications: false,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateNotifySettings::ID,
+        );
+        let body =
+            telegram_api::account_updateNotifySettings::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyChats(_))
+        ));
+        let settings = body.settings.expect("the wire settings");
+        assert_eq!(settings.mute_until, unix_time + 50);
+        assert!(settings.show_previews);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        let probe_a = td.global.td_db().binlog().next_event_id();
+        td.dispatch_completed_notification_settings_net();
+        let probe_b = td.global.td_db().binlog().next_event_id();
+        // each probe self-allocates its id (fetch_add returns the old
+        // value), so one real allocation between them measures as 2
+        assert_eq!(
+            probe_b - probe_a,
+            2,
+            "the erase rewrite is the only allocation at settlement"
+        );
+
+        // 3. the false-as-result band — the 400 rewrite repairs through a
+        //    fresh scope Get (the erase still settles)
+        td.request(
+            3,
+            Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopeGroupChats(
+                        td_api::notificationSettingsScopeGroupChats,
+                    ),
+                ),
+                notification_settings: Some(td_api::ScopeNotificationSettings {
+                    mute_for: 0,
+                    sound_id: -1,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    story_sound_id: -1,
+                    show_story_poster: true,
+                    disable_pinned_message_notifications: false,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateNotifySettings::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+        let repair = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getNotifySettings::ID,
+        );
+        let body = telegram_api::account_getNotifySettings::parse(repair.query())
+            .expect("the repair body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyChats(_))
+        ));
+        // the repair fetch parks the empty promise — the answer just runs
+        // the intake (the unsynchronized band is a no-op re-sync)
+        net_complete(
+            repair,
+            wire!(telegram_api::PeerNotifySettings {
+                flags: (1 << 0) | (1 << 2),
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+
+        // 4. setReactionNotificationSettings — the changed settings ride
+        //    account.setReactionsNotifySettings; boolTrue settles the
+        //    erase promise; the error band repairs through the reaction Get
+        td.request(
+            4,
+            Function::setReactionNotificationSettings(td_api::setReactionNotificationSettings {
+                notification_settings: Some(td_api::ReactionNotificationSettings {
+                    message_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceAll(
+                            td_api::reactionNotificationSourceAll,
+                        ),
+                    ),
+                    story_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    poll_vote_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceContacts(
+                            td_api::reactionNotificationSourceContacts,
+                        ),
+                    ),
+                    sound_id: -1,
+                    show_preview: true,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setReactionsNotifySettings::ID,
+        );
+        let body = telegram_api::account_setReactionsNotifySettings::parse(sent.query())
+            .expect("the sent body");
+        let wire_settings = body.settings.expect("the wire settings");
+        assert_eq!(wire_settings.flags & 1, 1, "messages_notify_from set");
+        assert!(wire_settings.show_previews);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+
+        // 4b. the SetReactions boolFalse band — the C++ on_result has no
+        //     false-as-result check (cpp:507-515): the ok body settles the
+        //     erase promise and NO repair fetch goes out
+        td.request(
+            40,
+            Function::setReactionNotificationSettings(td_api::setReactionNotificationSettings {
+                notification_settings: Some(td_api::ReactionNotificationSettings {
+                    message_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceContacts(
+                            td_api::reactionNotificationSourceContacts,
+                        ),
+                    ),
+                    story_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceContacts(
+                            td_api::reactionNotificationSourceContacts,
+                        ),
+                    ),
+                    poll_vote_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceAll(
+                            td_api::reactionNotificationSourceAll,
+                        ),
+                    ),
+                    sound_id: -1,
+                    show_preview: true,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 40).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setReactionsNotifySettings::ID,
+        );
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+        assert_not_sent(
+            &rec,
+            telegram_api::account_getReactionsNotifySettings::ID,
+            "the boolFalse ok band must not repair",
+        );
+
+        // 5. the reset family — the local reset answers ok and the server
+        //    reset rides the wire; boolTrue settles the erase promise
+        td.request(
+            5,
+            Function::resetAllNotificationSettings(td_api::resetAllNotificationSettings),
+        );
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_resetNotifySettings::ID,
+        );
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_notification_settings_net();
+
+        // 6. the error bands — the update FLOOD_WAIT repairs through the
+        //    scope Get, the reactions FLOOD_WAIT through the reaction Get
+        //    (whose answer runs the reaction intake and outboxes the
+        //    changed update)
+        td.request(
+            6,
+            Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                scope: Some(
+                    td_api::NotificationSettingsScope::notificationSettingsScopeChannelChats(
+                        td_api::notificationSettingsScopeChannelChats,
+                    ),
+                ),
+                notification_settings: Some(td_api::ScopeNotificationSettings {
+                    mute_for: 10,
+                    sound_id: -1,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    story_sound_id: -1,
+                    show_story_poster: true,
+                    disable_pinned_message_notifications: false,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_updateNotifySettings::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_notification_settings_net();
+        let repair = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getNotifySettings::ID,
+        );
+        drop(
+            telegram_api::account_getNotifySettings::parse(repair.query())
+                .expect("the channel repair body"),
+        );
+        net_complete(
+            repair,
+            wire!(telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+
+        // the reaction error repair — the answer runs the intake
+        td.request(
+            7,
+            Function::setReactionNotificationSettings(td_api::setReactionNotificationSettings {
+                notification_settings: Some(td_api::ReactionNotificationSettings {
+                    message_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    story_reaction_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    poll_vote_source: Some(
+                        td_api::ReactionNotificationSource::reactionNotificationSourceNone(
+                            td_api::reactionNotificationSourceNone,
+                        ),
+                    ),
+                    sound_id: -1,
+                    show_preview: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setReactionsNotifySettings::ID,
+        );
+        net_fail(sent, 500, "REACTION_INVALID");
+        td.dispatch_completed_notification_settings_net();
+        let repair = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getReactionsNotifySettings::ID,
+        );
+        let updates_before = td.notification_updates.len();
+        net_complete(
+            repair,
+            wire!(telegram_api::ReactionsNotifySettings {
+                flags: 0,
+                messages_notify_from: None,
+                stories_notify_from: None,
+                poll_votes_notify_from: None,
+                sound: None,
+                show_previews: true,
+            }),
+        );
+        td.dispatch_completed_notification_settings_net();
+        assert!(
+            td.notification_updates.len() > updates_before,
+            "the changed reaction settings outbox the td_api update"
+        );
+        // the reaction settings persisted (the rns pmc key)
+        assert!(!td.global.binlog_pmc().get_raw(b"rns").is_empty());
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(
+            td.notification_settings_net_completed.lock().is_empty(),
+            "drained"
+        );
+        assert!(
+            td.notification_settings_manager
+                .take_scope_get_promise(
+                    crate::notification_settings::NotificationSettingsScope::Private
+                )
+                .is_none()
+        );
     }
 
     #[test]
