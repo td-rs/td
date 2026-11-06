@@ -3,9 +3,12 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`TranscriptionManagerEnv`] trait carries the `G()`/auth/pmc/
-//! cross-manager surfaces, and every `create_handler<...>` network tail
-//! is an env seam marked `[blocked: net]` — the C++ promise parks
-//! unanswered offline, exactly like the collapsed-line convention.
+//! cross-manager surfaces, and the two `create_handler<...>` network
+//! tails (`TranscribeAudioQuery`/`RateTranscribedAudioQuery` —
+//! TranscriptionInfo.cpp:21-91) dispatch through the
+//! `TranscriptionNetKind` plane over the Td-held
+//! `crate::td::TranscriptionNetHandle` (the net-drain 47 families; the
+//! answers drain through `Td::on_transcription_net_answer`).
 //!
 //! Landed here: the trial-parameters state machine (moved in from
 //! `manager_option_states`, the M.3.9.2 stand-in — the pmc codec is the
@@ -27,12 +30,10 @@
 //!   [blocked: M.28]; the per-content `TranscriptionInfo` storage. The
 //!   type itself (state machine, builders, message-db store/parse) is
 //!   landed and unit-tested here.
-//! - `TranscribeAudioQuery` / `RateTranscribedAudioQuery` —
-//!   [blocked: net].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::dialog_id::{DialogType, MessageFullId};
+use crate::dialog_id::{DialogId, DialogType, MessageFullId};
 use crate::files::FileId;
 use crate::td_api;
 use tdmtproto::telegram_api;
@@ -63,6 +64,31 @@ pub struct FileInfo {
     pub file_id: FileId,
 }
 
+/// The transcription-plane in-flight query kinds — the C++
+/// `Td::ResultHandler` query classes the manager's two network tails
+/// create (`TranscriptionInfo.cpp:21-91`). The completions park by kind
+/// behind the Td-held `crate::td::TranscriptionNetHandle`;
+/// `Td::on_transcription_net_answer` routes them. Both kinds carry the
+/// query's `dialog_id_` for the `on_get_dialog_error` head the C++
+/// `on_error`s run (cpp:52/:88).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptionNetKind {
+    /// `TranscribeAudioQuery` (TranscriptionInfo.cpp:21-55) —
+    /// `messages.transcribeAudio`; the kind carries the `FileInfo` the
+    /// C++ handler closure captures over the actor hop (cpp:275-278),
+    /// so the answer re-enters `on_transcribed_audio` for the same
+    /// voice/video note.
+    TranscribeAudio {
+        dialog_id: DialogId,
+        file_info: FileInfo,
+    },
+    /// `RateTranscribedAudioQuery` (TranscriptionInfo.cpp:57-91) —
+    /// `messages.rateTranscribedAudio`; the request promise parks in the
+    /// manager's `pending_rate_promises` FIFO lot (the C++ promise rides
+    /// the query's `promise_` member; §5's FIFO-per-family shape).
+    RateTranscribedAudio { dialog_id: DialogId },
+}
+
 /// `TranscriptionInfo` (TranscriptionInfo.h:23-31) — the per-message-
 /// content speech-recognition state. The C++ type lives inside the
 /// VoiceNotes/VideoNotes managers' message content records; the storage
@@ -89,7 +115,7 @@ impl TranscriptionInfo {
     /// `TranscriptionInfo::recognize_speech` (TranscriptionInfo.cpp:93-107)
     /// — the promise parks until a final transcription; the return value
     /// is the C++ "a new query was sent" flag (the caller sends the
-    /// [blocked: net] query and refreshes the message content).
+    /// `TranscribeAudioQuery` and refreshes the message content).
     pub fn recognize_speech(&mut self, promise: Promise<()>) -> bool {
         if self.is_transcribed {
             let mut promise = promise;
@@ -166,7 +192,7 @@ impl TranscriptionInfo {
     /// The outcome of `TranscriptionInfo::rate_speech_recognition`
     /// (TranscriptionInfo.cpp:149-156) — `None` is the immediate ok (the
     /// untranscribed content answers the request without a query); `Some`
-    /// carries the [blocked: net] `RateTranscribedAudioQuery` arguments.
+    /// carries the `RateTranscribedAudioQuery` arguments.
     pub fn rate_speech_recognition(&self, promise: Promise<()>) -> Option<(i64, Promise<()>)> {
         if !self.is_transcribed {
             let mut promise = promise;
@@ -433,19 +459,21 @@ pub trait TranscriptionManagerEnv {
         f: F,
     ) -> Option<R>;
 
-    // -- the `[blocked: net]` query tails; each one drops the promise,
-    // -- which keeps the C++ request unanswered offline
+    // -- the net query tails (the net-drain 47 families — the wire
+    // -- construction lives at the Td env send legs)
     /// `TranscribeAudioQuery` (TranscriptionInfo.cpp:21-55) — the C++
-    /// query carries the `on_transcribed_audio` handler, not the parked
-    /// request promises.
-    fn send_transcribe_audio_query(&mut self, message_full_id: MessageFullId);
-    /// `RateTranscribedAudioQuery` (TranscriptionInfo.cpp:57-91).
+    /// query carries the `on_transcribed_audio` handler closure, not the
+    /// parked request promises; the closure's `FileInfo` capture rides
+    /// the kind so the answer re-enters the manager for the same note.
+    fn send_transcribe_audio_query(&mut self, message_full_id: MessageFullId, file_info: FileInfo);
+    /// `RateTranscribedAudioQuery::send` (TranscriptionInfo.cpp:65-74) —
+    /// the request promise has already parked in the family lot by the
+    /// caller (the C++ query carries it on `promise_`).
     fn send_rate_transcribed_audio_query(
         &mut self,
         message_full_id: MessageFullId,
         transcription_id: i64,
         is_good: bool,
-        promise: Promise<()>,
     );
 }
 
@@ -477,8 +505,8 @@ pub struct TranscriptionManager {
 
     /// `pending_audio_transcriptions_` — the handler map collapsed to
     /// the file info it closes over (the closure's only free variable;
-    /// the [blocked: net] updater routes back to
-    /// `on_transcribed_audio_update`).
+    /// the wire answer (`on_transcribed_audio`) and the updates intake
+    /// both route back to `on_transcribed_audio_update`).
     pending_audio_transcriptions: HashMap<i64, FileInfo>,
     /// The C++ `MultiTimeout pending_audio_transcription_timeout_` — the
     /// per-transcription-id deadlines.
@@ -490,6 +518,22 @@ pub struct TranscriptionManager {
     voice_messages: HashMap<FileId, BTreeSet<MessageFullId>>,
     /// `message_file_ids_`.
     message_file_ids: HashMap<MessageFullId, FileInfo>,
+    /// The rate-family request promises — the C++
+    /// `RateTranscribedAudioQuery` carries the promise on the query
+    /// (`promise_`, TranscriptionInfo.cpp:57-62); the collapse parks it
+    /// here and the answer pops the head (FIFO-paired per family, §5).
+    pending_rate_promises: Vec<Promise<()>>,
+}
+
+/// Pop the oldest parked entry — the §5 FIFO-per-family convention (the
+/// C++ promise rides its own ResultHandler; the net completes the
+/// same-family queries in dispatch order, so the head pairs).
+fn pop_head(queue: &mut Vec<Promise<()>>) -> Option<Promise<()>> {
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
 }
 
 impl TranscriptionManager {
@@ -623,6 +667,31 @@ impl TranscriptionManager {
             .get_update_speech_recognition_trial_object()
     }
 
+    /// Park one rate-family promise and send the wire query — the
+    /// `RateTranscribedAudioQuery` send wrapper
+    /// (TranscriptionInfo.cpp:65-74): the request promise rides the
+    /// query in the C++ (`promise_`), the collapse parks it in the family
+    /// lot before the env send; FIFO order pairs with the answer drain
+    /// (§5).
+    pub(crate) fn send_rate_transcribed_audio_query(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        message_full_id: MessageFullId,
+        transcription_id: i64,
+        is_good: bool,
+        promise: Promise<()>,
+    ) {
+        self.pending_rate_promises.push(promise);
+        env.send_rate_transcribed_audio_query(message_full_id, transcription_id, is_good);
+    }
+
+    /// The rate-family promise pop for the
+    /// `Td::on_transcription_net_answer` drain — the FIFO head the answer
+    /// pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_rate_promise(&mut self) -> Option<Promise<()>> {
+        pop_head(&mut self.pending_rate_promises)
+    }
+
     /// `TranscriptionManager::register_voice` (TranscriptionManager.cpp:
     /// 218-231) — the MessagesManager/VoiceNotes/VideoNotes callers land
     /// with M.10/M.28.
@@ -727,7 +796,7 @@ impl TranscriptionManager {
             })
             .unwrap_or(false);
         if should_send {
-            env.send_transcribe_audio_query(message_full_id);
+            env.send_transcribe_audio_query(message_full_id, file_info);
             self.on_transcription_updated(env, file_info.file_id);
         }
     }
@@ -929,14 +998,13 @@ impl TranscriptionManager {
             Some(None) => {
                 // the untranscribed content: the promise answered ok
             }
-            Some(Some((transcription_id, promise))) => {
-                env.send_rate_transcribed_audio_query(
-                    message_full_id,
-                    transcription_id,
-                    is_good,
-                    promise,
-                );
-            }
+            Some(Some((transcription_id, promise))) => self.send_rate_transcribed_audio_query(
+                env,
+                message_full_id,
+                transcription_id,
+                is_good,
+                promise,
+            ),
         }
     }
 
@@ -1191,7 +1259,8 @@ mod tests {
         messages: Vec<MessageFullId>,
         /// the VoiceNotes/VideoNotes info storage ([blocked: M.28] seam)
         infos: HashMap<i32, TranscriptionInfo>,
-        /// the recorded `[blocked: net]` queries
+        /// the recorded wire-query tags (the offline stand-in for the
+        /// net plane)
         queries: Vec<&'static str>,
         updates: Vec<td_api::Update>,
     }
@@ -1275,7 +1344,11 @@ mod tests {
             self.infos.get_mut(&file_info.file_id.get()).map(f)
         }
 
-        fn send_transcribe_audio_query(&mut self, _message_full_id: MessageFullId) {
+        fn send_transcribe_audio_query(
+            &mut self,
+            _message_full_id: MessageFullId,
+            _file_info: FileInfo,
+        ) {
             self.queries.push("transcribeAudio");
         }
 
@@ -1284,7 +1357,6 @@ mod tests {
             _message_full_id: MessageFullId,
             _transcription_id: i64,
             _is_good: bool,
-            _promise: Promise<()>,
         ) {
             self.queries.push("rateTranscribedAudio");
         }
@@ -1862,11 +1934,12 @@ mod tests {
         assert!(env.queries.is_empty());
 
         // The transcribed content sends the rate query with its id (the
-        // promise rides the [blocked: net] query).
+        // promise parks in the family lot until the answer).
         env.register_info(3, transcribed_info("done"));
         let (_, promise) = FlagPromise::<()>::create();
         manager.rate_speech_recognition(&mut env, full_id(1, 1 << 21), false, promise);
         assert_eq!(env.queries, vec!["rateTranscribedAudio"]);
+        assert!(manager.pop_rate_promise().is_some(), "the promise parked");
 
         // The [blocked: M.28] missing-info seam: no stored info, no crash,
         // no query.
@@ -1874,6 +1947,42 @@ mod tests {
         let (_, promise) = FlagPromise::<()>::create();
         manager.rate_speech_recognition(&mut env, full_id(1, 1 << 21), true, promise);
         assert_eq!(env.queries.len(), 1);
+    }
+
+    #[test]
+    fn test_rate_promise_lot_is_fifo() {
+        // `RateTranscribedAudioQuery` carries the request promise on the
+        // query (`promise_`, TranscriptionInfo.cpp:57-62); the send
+        // wrapper parks it in the manager's lot and the answer pops the
+        // head — two parks pair with two answers in order, and a bare
+        // answer (no park) settles nothing (§5's FIFO-per-family shape).
+        let mut manager = TranscriptionManager::default();
+        let mut env = TestTranscriptionEnv::new();
+        assert!(manager.pop_rate_promise().is_none());
+
+        let ((first_ok, first_error), promise) = FlagPromise::<()>::create();
+        manager.send_rate_transcribed_audio_query(&mut env, full_id(1, 1 << 21), 77, true, promise);
+        let ((second_ok, second_error), promise) = FlagPromise::<()>::create();
+        manager.send_rate_transcribed_audio_query(
+            &mut env,
+            full_id(1, 1 << 21),
+            78,
+            false,
+            promise,
+        );
+        assert_eq!(env.queries, vec!["rateTranscribedAudio"; 2]);
+
+        let mut head = manager.pop_rate_promise().expect("the first park");
+        head.set_value(());
+        assert!(first_ok.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!first_error.load(std::sync::atomic::Ordering::SeqCst));
+
+        let mut head = manager.pop_rate_promise().expect("the second park");
+        head.set_error(Status::error(400, "VOICE_MESSAGES_FORBIDDEN"));
+        assert!(!second_ok.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(second_error.load(std::sync::atomic::Ordering::SeqCst));
+
+        assert!(manager.pop_rate_promise().is_none(), "the lot drained");
     }
 
     #[test]

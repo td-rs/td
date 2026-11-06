@@ -369,15 +369,9 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // after the suggested-action block; the manager's own
             // authorized/non-bot gate applies)
             {
-                let env = NotificationEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    auth_is_authorized: td.auth_manager.is_authorized(),
-                    auth_is_bot: td.auth_manager.is_bot(),
-                    updates: &mut td.transcription_updates,
-                };
-                td.transcription_manager
-                    .get_current_state(&env, &mut updates);
+                let (manager, env) = crate::td::transcription_env_split(td);
+                manager.get_current_state(&env, &mut updates);
+                td.transcription_manager = manager;
             }
 
             // StarManager::get_current_state (Requests.cpp:2251 — after
@@ -12947,19 +12941,14 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
             // transcription manager. The message probe is the
             // [blocked: M.10] seam — it answers false while no message
             // plane exists, so the C++ "Message not found" band is the
-            // offline answer.
+            // offline answer; the `TranscribeAudioQuery` tail rides the
+            // `TranscriptionNetKind` plane once the probe resolves.
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let mut env = NotificationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.transcription_updates,
-            };
-            td.transcription_manager.recognize_speech(
+            let (mut manager, mut env) = crate::td::transcription_env_split(td);
+            manager.recognize_speech(
                 &mut env,
                 crate::dialog_id::MessageFullId::new(
                     crate::dialog_id::DialogId::new(request.chat_id),
@@ -12967,22 +12956,20 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 ),
                 promise,
             );
+            td.transcription_manager = manager;
         }
         Function::rateSpeechRecognition(request) => {
             // `Requests.cpp:2940-2946`: CHECK_IS_USER, then the
-            // transcription manager (the same [blocked: M.10] probe band).
+            // transcription manager (the same [blocked: M.10] probe band;
+            // the `RateTranscribedAudioQuery` tail rides the
+            // `TranscriptionNetKind` plane with the request promise parked
+            // in the manager's FIFO lot).
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let mut env = NotificationEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                updates: &mut td.transcription_updates,
-            };
-            td.transcription_manager.rate_speech_recognition(
+            let (mut manager, mut env) = crate::td::transcription_env_split(td);
+            manager.rate_speech_recognition(
                 &mut env,
                 crate::dialog_id::MessageFullId::new(
                     crate::dialog_id::DialogId::new(request.chat_id),
@@ -12991,6 +12978,7 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
                 request.is_good,
                 promise,
             );
+            td.transcription_manager = manager;
         }
         Function::translateText(request) => {
             // `Requests.cpp:2847-2853`: CHECK_IS_USER, clean the two
@@ -19597,7 +19585,8 @@ mod request_census_tests {
         // openSponsoredChat, importMessages and the report pair) + M.25's
         // two transcription dispatches (recognizeSpeech,
         // rateSpeechRecognition — the [blocked: M.10] probe seam answers
-        // the C++ not-found band) and seven translation dispatches
+        // the C++ not-found band; the query tails ride the net-drain 47
+        // `TranscriptionNetKind` plane) and seven translation dispatches
         // (translateText, composeTextWithAi, fixTextWithAi,
         // createRichMessageWithAi and the rich trio — the query tails
         // park at the [blocked: net]/[blocked: RichMessage] seams like
