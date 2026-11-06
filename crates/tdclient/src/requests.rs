@@ -40,11 +40,8 @@ use crate::dialog_participant_manager::DialogParticipantManagerEnv;
 use crate::message_id::{MessageFullId, MessageId};
 use crate::messages_manager::DialogId as MmDialogId;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
-use crate::notification_settings::{
-    ReactionNotificationSettings, get_notification_settings_scope,
-    get_scope_notification_settings_object,
-};
-use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::notification_settings::ReactionNotificationSettings;
+use crate::notification_settings::get_notification_settings_scope;
 use crate::star_gift_manager::{
     StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
 };
@@ -760,30 +757,20 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             };
             let scope = get_notification_settings_scope(&scope_object);
             // `GetScopeNotificationSettingsRequest` (Requests.cpp:1340-1364):
-            // the synchronized settings answer the object, an unsynchronized
-            // scope defers into the (net-blocked) fetch and answers nothing
-            let unix_time = td.get_unix_time();
-            let answer = {
-                let env = NotificationEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    auth_is_authorized: td.auth_manager.is_authorized(),
-                    auth_is_bot: td.auth_manager.is_bot(),
-                    updates: &mut td.notification_updates,
-                };
-                match td
-                    .notification_settings_manager
-                    .get_scope_notification_settings_for_request(&env, scope)
-                {
-                    ScopeSettingsAnswer::Ready(settings) => {
-                        Some(get_scope_notification_settings_object(settings, unix_time))
-                    }
-                    ScopeSettingsAnswer::Deferred => None,
-                }
+            // the promise is the answer path on both bands — it settles
+            // inline with the synchronized object, or parks on the fetch
+            // query (the RequestActor defer) and the answer drain resolves
+            // it with the now-synchronized state (the do_run re-run)
+            let promise = td.deferred_promise(id, Object::scopeNotificationSettings);
+            let env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
             };
-            if let Some(object) = answer {
-                td.send_result(id, Object::scopeNotificationSettings(object));
-            }
+            td.notification_settings_manager
+                .get_scope_notification_settings_for_request(&env, scope, promise);
         }
         Function::setScopeNotificationSettings(request) => {
             // `Requests.cpp:7968-7975`: CHECK_IS_USER + the null-scope gate;
