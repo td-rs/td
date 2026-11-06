@@ -7273,7 +7273,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
 /// The M.49 ForumTopicManager arm group of the request dispatcher — see
 /// the frame note at the forward site in [`run_request`]. Every arm routes
 /// into `td_->forum_topic_manager_->...` (Requests.cpp:4835-4904, 7963);
-/// the network tails are the [blocked: net] query seams.
+/// the net-drain 41 query families dispatch through the manager-held net
+/// handle (the delete tail rides the message-query affected-history
+/// plane).
 #[allow(clippy::too_many_lines)]
 fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
     fn forum_arm(
@@ -7286,14 +7288,18 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
         let crate::td::Td {
             forum_topic_manager,
             global,
+            option_manager,
             auth_manager,
+            user_manager,
             chat_manager,
             notification_updates,
             ..
         } = td;
         let mut env = crate::td::ForumTopicTdEnv {
             global,
+            options: option_manager.as_mut(),
             auth_is_bot: auth_manager.is_bot(),
+            user_manager,
             chat_manager,
             updates: notification_updates,
         };
@@ -7484,6 +7490,11 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
                     promise,
                 );
             });
+            // The `MessageQueryManager::delete_topic_history` tail — the
+            // manager parked the validated deletes; the runner routes
+            // them onto the affected-history plane (the C++
+            // delete-promise lambda chain, ForumTopicManager.cpp:1028-1037)
+            td.run_forum_topic_delete_tails();
         }
 
         // setForumTopicNotificationSettings (Requests.cpp:7963-7967) —

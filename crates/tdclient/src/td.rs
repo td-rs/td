@@ -3618,6 +3618,14 @@ pub(crate) type WebBrowserNetHandle = NetKindHandle<crate::web_browser_manager::
 /// secure plane: the split env view resolves the peers at the send leg.
 pub(crate) type DialogParticipantNetHandle =
     NetKindHandle<crate::dialog_participant_manager::DialogParticipantNetKind>;
+/// The cloned ForumTopic dispatch surface the
+/// [`crate::forum_topic_manager::ForumTopicManager`] holds — the
+/// per-kind handle over the ForumTopicManager.cpp ResultHandler kinds
+/// (the net-drain 41 plane: the seven topic families); the answers drain
+/// through [`Td::dispatch_completed_forum_topic_net`]. Manager-held (the
+/// [`crate::group_call_manager::GroupCallManager::net`] shape): the send
+/// legs run inside the manager over the env's peer/permission reads.
+pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::ForumTopicNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -3625,6 +3633,48 @@ pub(crate) type DialogParticipantNetHandle =
 /// (the queue decouples the promise interface from the manager borrow, the
 /// `FinishCreateCommunityChain` convention).
 type ConvertGiftQueue = Arc<Mutex<Vec<(crate::dialog_id::DialogId, Promise<()>)>>>;
+
+/// The `delete_forum_topic` continuation queue — the C++
+/// `PromiseCreator::lambda` (ForumTopicManager.cpp:1028-1037): the
+/// affected-history loop's completion parks the request promise for the
+/// `on_delete_forum_topic` hop (the same queue-decoupling convention);
+/// the error arm settles the promise directly, like the lambda's
+/// `result.is_error()` branch.
+type ForumTopicDeleteQueue = Arc<
+    Mutex<
+        Vec<(
+            crate::dialog_id::DialogId,
+            crate::forum_topic::ForumTopicId,
+            Promise<()>,
+        )>,
+    >,
+>;
+
+/// The `delete_forum_topic` promise chain (ForumTopicManager.cpp:1028-1037):
+/// the affected-history loop's ok completion queues the
+/// `on_delete_forum_topic` tail with the request promise.
+struct ForumTopicDeleteChain {
+    dialog_id: crate::dialog_id::DialogId,
+    forum_topic_id: crate::forum_topic::ForumTopicId,
+    promise: Option<Promise<()>>,
+    queue: ForumTopicDeleteQueue,
+}
+
+impl tdutils::promise::PromiseInterface<()> for ForumTopicDeleteChain {
+    fn set_value(&mut self, _value: ()) {
+        if let Some(promise) = self.promise.take() {
+            self.queue
+                .lock()
+                .push((self.dialog_id, self.forum_topic_id, promise));
+        }
+    }
+
+    fn set_error(&mut self, error: Status) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_error(error);
+        }
+    }
+}
 
 /// The ConvertStarGiftQuery promise chain — the ok half queues the
 /// transfer tail, the error half fails the promise (the C++ lambda).
@@ -6013,6 +6063,16 @@ pub struct Td {
             )>,
         >,
     >,
+    /// The forum-topic net completed queue (the `ForumTopicNetKind`
+    /// tags; the net-drain 41 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_forum_topic_net_answer`].
+    forum_topic_net_completed:
+        Arc<Mutex<Vec<(crate::forum_topic_manager::ForumTopicNetKind, NetQuery)>>>,
+    /// The `delete_forum_topic` continuation queue (the affected-history
+    /// completion parking lot, the `FinishCreateCommunityChain`
+    /// convention).
+    forum_topic_delete_completions: ForumTopicDeleteQueue,
     /// The parked query state of the net-drain 28/29 families (the
     /// handler vectors, search offsets/filters and promises the `Copy`
     /// kinds can't carry) — popped by
@@ -6518,6 +6578,8 @@ impl Td {
             web_app_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_browser_net_completed: Arc::new(Mutex::new(Vec::new())),
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
+            forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
+            forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
@@ -7005,6 +7067,7 @@ impl Td {
         self.statistics_manager.net = self.statistics_net();
         self.web_browser_manager.net = self.web_browser_net();
         self.group_call_manager.net = self.group_call_net();
+        self.forum_topic_manager.net = self.forum_topic_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -8825,6 +8888,7 @@ impl Td {
         self.dispatch_completed_web_app_net();
         self.dispatch_completed_web_browser_net();
         self.dispatch_completed_dialog_participant_net();
+        self.dispatch_completed_forum_topic_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9157,6 +9221,18 @@ impl Td {
         Some(DialogParticipantNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.dialog_participant_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned forum-topic dispatch surface the
+    /// [`crate::forum_topic_manager::ForumTopicManager`] holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn forum_topic_net(&self) -> Option<ForumTopicNetHandle> {
+        Some(ForumTopicNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.forum_topic_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17262,7 +17338,48 @@ impl Td {
         for (kind, query) in completed {
             self.on_message_query_net_answer(kind, query);
         }
+        // The `delete_forum_topic` completions — the affected-history
+        // loop's promise chains parked their tails here (the C++ lambda's
+        // `send_closure(forum_topic_manager, on_delete_forum_topic)` hop,
+        // ForumTopicManager.cpp:1034-1036).
+        let completions = std::mem::take(&mut *self.forum_topic_delete_completions.lock());
+        for (dialog_id, forum_topic_id, promise) in completions {
+            let (mut env, manager) = crate::td::forum_topic_env_split(self);
+            manager.on_delete_forum_topic(&mut env, dialog_id, forum_topic_id, promise);
+        }
         self.drain_sink();
+    }
+
+    /// Run the validated `delete_forum_topic` wire tails — the C++
+    /// `MessageQueryManager::delete_topic_history` (MessageQueryManager.cpp:4735-4743)
+    /// over the landed affected-history plane: the `check_dialog_access`
+    /// head rides the dialog-plane seam, the binlog log event the
+    /// database seam, and the loop's completion chains into
+    /// `on_delete_forum_topic` (the parked completions drain through
+    /// [`Self::dispatch_completed_message_query_net`]).
+    pub(crate) fn run_forum_topic_delete_tails(&mut self) {
+        let tails = std::mem::take(&mut self.forum_topic_manager.pending.delete_tails);
+        for (dialog_id, forum_topic_id, promise) in tails {
+            let chained = Promise::from_interface(ForumTopicDeleteChain {
+                dialog_id,
+                forum_topic_id,
+                promise: Some(promise),
+                queue: Arc::clone(&self.forum_topic_delete_completions),
+            });
+            self.with_message_query_manager(|env, manager| {
+                manager.run_affected_history_query_until_complete(
+                    env,
+                    dialog_id,
+                    crate::message_query_manager::AffectedHistoryQueryKind::DeleteTopicHistory {
+                        forum_topic_id: crate::messages_manager::ForumTopicId::from_raw(
+                            forum_topic_id.get(),
+                        ),
+                    },
+                    true,
+                    chained,
+                );
+            });
+        }
     }
 
     /// Drain the callback-parked Web-App answers — the C++ ResultHandler
@@ -17293,6 +17410,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.dialog_participant_net_completed.lock());
         for (kind, query) in completed {
             self.on_dialog_participant_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked ForumTopic answers — the C++
+    /// ResultHandler halves of the net-drain 41 topic families
+    /// (ForumTopicManager.cpp:45-437).
+    fn dispatch_completed_forum_topic_net(&mut self) {
+        let completed = std::mem::take(&mut *self.forum_topic_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_forum_topic_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -18082,7 +18210,11 @@ impl Td {
                             .set_error(parse_error("messages.searchGlobal"));
                     }
                 };
-                let info = self.get_messages_info(answer, "SearchMessagesGlobalQuery");
+                let info = self.get_messages_info(
+                    DialogId::default(),
+                    answer,
+                    "SearchMessagesGlobalQuery",
+                );
                 self.run_on_get_messages_search_result(pending, info);
             }
             // `SearchSentMediaQuery::on_result`/`on_error`
@@ -18100,7 +18232,8 @@ impl Td {
                     Ok(answer) => answer,
                     Err(_) => return promise.set_error(parse_error("messages.searchSentMedia")),
                 };
-                let info = self.get_messages_info(answer, "SearchSentMediaQuery");
+                let info =
+                    self.get_messages_info(DialogId::default(), answer, "SearchSentMediaQuery");
                 self.run_on_get_outgoing_document_messages(info, promise);
             }
             // `CheckSearchPostsFloodQuery::on_result`/`on_error`
@@ -18196,7 +18329,8 @@ impl Td {
                         .set_error(Status::error(500, "Failed to receive search limits"));
                 };
                 tdutils::log_info!("Receive {}", flood.to_debug_string());
-                let info = self.get_messages_info(answer, "SearchPublicPostsQuery");
+                let info =
+                    self.get_messages_info(DialogId::default(), answer, "SearchPublicPostsQuery");
                 self.run_on_get_public_post_search_result(pending, flood, info);
             }
             // `SearchPostsQuery::on_result`/`on_error`
@@ -18221,7 +18355,7 @@ impl Td {
                             .set_error(parse_error("channels.searchPosts"));
                     }
                 };
-                let info = self.get_messages_info(answer, "SearchPostsQuery");
+                let info = self.get_messages_info(DialogId::default(), answer, "SearchPostsQuery");
                 self.run_on_get_hashtag_search_result(pending, info);
             }
             // `GetRecentLocationsQuery::on_result`/`on_error`
@@ -18251,7 +18385,8 @@ impl Td {
                             .set_error(parse_error("messages.getRecentLocations"));
                     }
                 };
-                let info = self.get_messages_info(answer, "GetRecentLocationsQuery");
+                let info =
+                    self.get_messages_info(pending.dialog_id, answer, "GetRecentLocationsQuery");
                 self.run_on_get_recent_locations(pending, info);
             }
             // `GetPersonalChannelHistoryQuery::on_result`/`on_error`
@@ -18274,7 +18409,11 @@ impl Td {
                             .set_error(parse_error("messages.getPersonalChannelHistory"));
                     }
                 };
-                let info = self.get_messages_info(answer, "GetPersonalChannelHistoryQuery");
+                let info = self.get_messages_info(
+                    DialogId::default(),
+                    answer,
+                    "GetPersonalChannelHistoryQuery",
+                );
                 self.run_get_personal_channel_history_result(info.messages, promise);
             }
             // The affected-history refills — the twelve families'
@@ -18354,8 +18493,19 @@ impl Td {
                         }
                         // the forum-topic heads (DeleteTopicHistory /
                         // ReadMentions / ReadReactions / ReadPollVotes /
-                        // UnpinAllMessages) ride the forum-topic slice
-                        // (net-drain 41); the rest have no head
+                        // UnpinAllMessages) — the DeleteTopicHistory head
+                        // landed with net-drain 41; the rest ride their
+                        // slices (the C++ heads are the same
+                        // `on_get_forum_topic_error` = `on_get_dialog_error`
+                        // shape, MessageQueryManager.cpp:1960)
+                        AffectedHistoryQueryKind::DeleteTopicHistory { .. } => {
+                            crate::dialog_manager::on_get_dialog_error(
+                                &self.global,
+                                pending.dialog_id,
+                                &status,
+                                "DeleteTopicHistoryQuery",
+                            );
+                        }
                         _ => {}
                     }
                     return pending.promise.set_error(status);
@@ -18710,6 +18860,303 @@ impl Td {
         run(&mut env, manager)
     }
 
+    /// Route one ForumTopic net answer by kind — the ResultHandler
+    /// halves of the net-drain 41 families (ForumTopicManager.cpp:45-437):
+    /// the wire answers parse here, run the users/chats intakes and settle
+    /// the parked family promises (the parse failures settle through the
+    /// same error tails, the landed-flip convention, §5).
+    fn on_forum_topic_net_answer(
+        &mut self,
+        kind: crate::forum_topic_manager::ForumTopicNetKind,
+        query: NetQuery,
+    ) {
+        use crate::forum_topic_manager::ForumTopicNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        fn pop_head<T>(queue: &mut Vec<T>) -> Option<T> {
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        }
+
+        match kind {
+            // `CreateForumTopicQuery::on_result`/`on_error` (cpp:96-133):
+            // the service-message walk off the random id builds the info,
+            // the Updates run the engine and the lambda chain completes
+            // `on_forum_topic_created` with the request promise.
+            K::CreateForumTopic {
+                dialog_id,
+                creator_dialog_id,
+                random_id,
+            } => {
+                let Some(mut promise) =
+                    pop_head(&mut self.forum_topic_manager.pending.create_topic)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "CreateForumTopicQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                let updates = match telegram_api::Updates::parse(query.ok()) {
+                    Ok(updates) => updates,
+                    Err(_) => return promise.set_error(parse_error("messages.createForumTopic")),
+                };
+                tdutils::log_info!("Receive result for CreateForumTopicQuery");
+                // `UpdatesManager::get_message_by_random_id` + the
+                // messageService/messageActionTopicCreate bands (cpp:104-113)
+                let invalid_result = |promise: &mut Promise<Option<td_api::ForumTopicInfo>>| {
+                    tdutils::log_error!("Receive invalid result for CreateForumTopicQuery");
+                    promise.set_error(Status::error(400, "Invalid result received"));
+                };
+                let message = crate::updates_manager::get_message_by_random_id(
+                    &updates,
+                    crate::chat_manager::DialogId::new(dialog_id.get()),
+                    random_id,
+                );
+                let service = match message {
+                    Some(telegram_api::Message::messageService(service)) => service,
+                    Some(_) | None => {
+                        invalid_result(&mut promise);
+                        return;
+                    }
+                };
+                let action = match &service.action {
+                    Some(telegram_api::MessageAction::messageActionTopicCreate(action)) => action,
+                    Some(_) | None => {
+                        invalid_result(&mut promise);
+                        return;
+                    }
+                };
+                let mut forum_topic_id = crate::forum_topic::ForumTopicId::new(service.id);
+                // the C++ reply-header band (cpp:117-123): only the plain
+                // `messageReplyHeader` form with the forum flag and a
+                // positive top id overrides
+                if let Some(telegram_api::MessageReplyHeader::messageReplyHeader(reply)) =
+                    &service.reply_to
+                    && reply.forum_topic
+                    && reply.reply_to_top_id > 0
+                {
+                    forum_topic_id = crate::forum_topic::ForumTopicId::new(reply.reply_to_top_id);
+                }
+                let forum_topic_info = crate::forum_topic::ForumTopicInfo::new(
+                    dialog_id,
+                    forum_topic_id,
+                    action.title.clone(),
+                    crate::forum_topic::ForumTopicIcon::new(
+                        action.icon_color,
+                        action.icon_emoji_id,
+                    ),
+                    service.date,
+                    creator_dialog_id,
+                    true,
+                    false,
+                    false,
+                    action.title_missing,
+                );
+                // the `on_get_updates` + `PromiseCreator::lambda` chain
+                // (cpp:126-133) — the UmMessage tail runs the engine then
+                // `on_forum_topic_created`
+                self.um_send(UmMessage::OnGetUpdatesForumTopicCreated {
+                    updates: Box::new(updates),
+                    dialog_id,
+                    forum_topic_info,
+                    promise,
+                });
+            }
+            // `GetForumTopicQuery::on_result`/`on_error` (cpp:330-366) —
+            // the users/chats intakes, the single-topic band and the
+            // `on_get_forum_topic` walk (the C++
+            // `get_channel_difference_if_needed` pre-walk collapses with
+            // the `get_messages_info` convention — the M.10.19 gap
+            // machinery is the messages plane's; the answer's messages
+            // ride the messages plane).
+            K::GetForumTopic {
+                dialog_id,
+                forum_topic_id,
+            } => {
+                let Some(mut promise) = pop_head(&mut self.forum_topic_manager.pending.get_topic)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetForumTopicQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                let answer = match telegram_api::messages_ForumTopics::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => return promise.set_error(parse_error("messages.getForumTopicsByID")),
+                };
+                tdutils::log_info!("Receive result for GetForumTopicQuery");
+                self.intake_users(answer.users, "GetForumTopicQuery");
+                self.intake_chats(answer.chats, "GetForumTopicQuery");
+                if !answer.messages.is_empty() {
+                    tdutils::log_info!(
+                        "Drop {} messages in the GetForumTopicQuery answer — the messages intake rides the messages plane",
+                        answer.messages.len()
+                    );
+                }
+                if answer.topics.len() != 1 {
+                    return promise.set_value(None);
+                }
+                let topic = answer.topics.into_iter().next().expect("one topic");
+                let (mut env, manager) = crate::td::forum_topic_env_split(self);
+                manager.on_get_forum_topic(&mut env, dialog_id, forum_topic_id, topic, promise);
+            }
+            // `GetForumTopicsQuery::on_result`/`on_error` (cpp:420-436) —
+            // the users/chats intakes and the `on_get_forum_topics` walk.
+            K::GetForumTopics { dialog_id } => {
+                let Some(mut promise) = pop_head(&mut self.forum_topic_manager.pending.get_topics)
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "GetForumTopicsQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                let answer = match telegram_api::messages_ForumTopics::parse(query.ok()) {
+                    Ok(answer) => answer,
+                    Err(_) => return promise.set_error(parse_error("messages.getForumTopics")),
+                };
+                tdutils::log_info!("Receive result for GetForumTopicsQuery");
+                self.intake_users(answer.users, "GetForumTopicsQuery");
+                self.intake_chats(answer.chats, "GetForumTopicsQuery");
+                if !answer.messages.is_empty() {
+                    tdutils::log_info!(
+                        "Drop {} messages in the GetForumTopicsQuery answer — the messages intake rides the messages plane",
+                        answer.messages.len()
+                    );
+                }
+                // `ignore ptr->pts_` (cpp:431)
+                let order_by_creation_date = answer.order_by_create_date;
+                let total_count = answer.count;
+                let topics = answer.topics;
+                let (mut env, manager) = crate::td::forum_topic_env_split(self);
+                manager.on_get_forum_topics(
+                    &mut env,
+                    dialog_id,
+                    order_by_creation_date,
+                    total_count,
+                    topics,
+                    promise,
+                );
+            }
+            // `EditForumTopicQuery::on_result`/`on_error` (cpp:207-219) —
+            // the Updates walk the promise rides; the TOPIC_NOT_MODIFIED
+            // band settles ok for non-bots (all three send forms share
+            // the class and the tail).
+            K::EditForumTopic { dialog_id } => {
+                let Some(promise) = pop_head(&mut self.forum_topic_manager.pending.edit_topic)
+                else {
+                    return;
+                };
+                self.forum_topic_updates_tail(
+                    query,
+                    dialog_id,
+                    promise,
+                    "TOPIC_NOT_MODIFIED",
+                    "messages.editForumTopic",
+                    "EditForumTopicQuery",
+                );
+            }
+            // `UpdatePinnedForumTopicQuery::on_result`/`on_error`
+            // (cpp:247-259) — the PINNED_TOPIC_NOT_MODIFIED band.
+            K::UpdatePinnedForumTopic { dialog_id } => {
+                let Some(promise) = pop_head(&mut self.forum_topic_manager.pending.update_pinned)
+                else {
+                    return;
+                };
+                self.forum_topic_updates_tail(
+                    query,
+                    dialog_id,
+                    promise,
+                    "PINNED_TOPIC_NOT_MODIFIED",
+                    "messages.updatePinnedForumTopic",
+                    "UpdatePinnedForumTopicQuery",
+                );
+            }
+            // `ReorderPinnedForumTopicsQuery::on_result`/`on_error`
+            // (cpp:288-300) — the PINNED_TOPICS_NOT_MODIFIED band.
+            K::ReorderPinnedForumTopics { dialog_id } => {
+                let Some(promise) = pop_head(&mut self.forum_topic_manager.pending.reorder_pinned)
+                else {
+                    return;
+                };
+                self.forum_topic_updates_tail(
+                    query,
+                    dialog_id,
+                    promise,
+                    "PINNED_TOPICS_NOT_MODIFIED",
+                    "messages.reorderPinnedForumTopics",
+                    "ReorderPinnedForumTopicsQuery",
+                );
+            }
+        }
+    }
+
+    /// The shared `Updates` answer tail of the edit/pin/reorder families —
+    /// the promise rides the `on_get_updates` walk; the error tail runs
+    /// the per-family "not modified" value band (non-bots only) and the
+    /// dialog-error head (the `edit_updates_answer_tail` shape,
+    /// DialogManager.cpp:255-273).
+    fn forum_topic_updates_tail(
+        &mut self,
+        query: NetQuery,
+        dialog_id: crate::dialog_id::DialogId,
+        mut promise: Promise<()>,
+        not_modified_message: &str,
+        what: &str,
+        source: &str,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        if query.is_error() {
+            let status = query.error().clone();
+            let not_modified = status.message() == not_modified_message;
+            if not_modified && !self.auth_manager.is_bot() {
+                promise.set_value(());
+            } else {
+                crate::dialog_manager::on_get_dialog_error(
+                    &self.global,
+                    dialog_id,
+                    &status,
+                    source,
+                );
+                promise.set_error(status);
+            }
+        } else {
+            match telegram_api::Updates::parse(query.ok()) {
+                Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                    updates: Box::new(updates),
+                    promise,
+                }),
+                Err(_) => promise.set_error(parse_error(what)),
+            }
+        }
+    }
+
     /// The public-post search's star re-add
     /// (`add_pending_owned_star_count(star_count, …)`,
     /// MessageQueryManager.cpp:3490/:752/:764) over the star env split.
@@ -18730,6 +19177,7 @@ impl Td {
     /// directly over the parsed messages).
     fn get_messages_info(
         &mut self,
+        topics_dialog_id: crate::dialog_id::DialogId,
         answer: telegram_api::messages_Messages,
         source: &str,
     ) -> MessagesInfoWalk {
@@ -18771,13 +19219,13 @@ impl Td {
         };
         self.intake_users(users, source);
         self.intake_chats(chats, source);
-        // `forum_topic_manager_->on_get_forum_topic_infos` — the
-        // forum-topic cache loads ride the forum-topic slice (net-drain 41)
+        // `forum_topic_manager_->on_get_forum_topic_infos`
+        // (MessagesInfo.cpp:75) — the topics intake over the env split
+        // (the search callers pass the null dialog: each topic resolves
+        // its own off the wire peer)
         if !topics.is_empty() {
-            tdutils::log_info!(
-                "Drop {} forum topics in the {source} answer — the forum-topic intake rides its slice",
-                topics.len()
-            );
+            let (mut env, manager) = crate::td::forum_topic_env_split(self);
+            manager.on_get_forum_topic_infos(&mut env, topics_dialog_id, topics, source);
         }
         result
     }
@@ -29242,6 +29690,17 @@ pub(crate) enum UmMessage {
         updates: Box<telegram_api::Updates>,
         tail: crate::story_manager::StoryNetTail,
     },
+    /// `on_get_updates` + the create-topic tail — the C++
+    /// `PromiseCreator::lambda` chain of `CreateForumTopicQuery::on_result`
+    /// (ForumTopicManager.cpp:126-133): the Updates run through the
+    /// engine, then `on_forum_topic_created` completes the request
+    /// promise with the built info.
+    OnGetUpdatesForumTopicCreated {
+        updates: Box<telegram_api::Updates>,
+        dialog_id: crate::dialog_id::DialogId,
+        forum_topic_info: crate::forum_topic::ForumTopicInfo,
+        promise: Promise<Option<td_api::ForumTopicInfo>>,
+    },
     /// `on_get_updates` + the paid-reaction chain tail — the C++
     /// `PromiseCreator::lambda` chain of
     /// `MessagesManager::commit_paid_message_reactions`
@@ -29382,6 +29841,20 @@ impl UmMessage {
                         });
                     }
                 }
+            }
+            UmMessage::OnGetUpdatesForumTopicCreated {
+                updates,
+                dialog_id,
+                forum_topic_info,
+                promise,
+            } => {
+                // the empty promise stands in for the C++ `Promise<Unit>`
+                // the handler passes to `on_get_updates` — the lambda
+                // chain's only continuation is the tail below
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                td.drain_sink();
+                let (mut env, manager) = crate::td::forum_topic_env_split(td);
+                manager.on_forum_topic_created(&mut env, dialog_id, forum_topic_info, promise);
             }
             UmMessage::OnGetDifference { difference } => {
                 td.with_updates_env(|um, env| um.on_get_difference(env, difference));
@@ -42380,10 +42853,15 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
 /// defaults until their tracks land.
 pub(crate) struct ForumTopicTdEnv<'a> {
     pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering.
+    pub(crate) options: Option<&'a mut OptionManager>,
     pub(crate) auth_is_bot: bool,
-    /// The chat-manager half for the forum checks — kept for the C++
-    /// field parity; the is_forum read lands with the chat plane.
-    #[allow(dead_code)]
+    /// The user-manager half for the send-leg peer/my-id reads (the
+    /// `StoryEnv` split shape).
+    pub(crate) user_manager: &'a mut UserManager,
+    /// The chat-manager half for the forum checks and the permission
+    /// reads (the is_forum read lands with the chat plane).
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
 }
@@ -42397,8 +42875,107 @@ impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
         self.global.unix_time()
     }
 
+    fn get_channel_permissions_can_create_topics(&self, dialog_id: DialogId) -> bool {
+        self.chat_manager
+            .get_channel_status(dialog_id.get_channel_id())
+            .can_create_topics()
+    }
+
+    fn get_channel_permissions_can_edit_topics(&self, dialog_id: DialogId) -> bool {
+        self.chat_manager
+            .get_channel_status(dialog_id.get_channel_id())
+            .can_edit_topics()
+    }
+
+    fn get_channel_permissions_can_pin_topics(&self, dialog_id: DialogId) -> bool {
+        self.chat_manager
+            .get_channel_status(dialog_id.get_channel_id())
+            .can_pin_topics()
+    }
+
+    fn get_channel_permissions_can_delete_messages(&self, dialog_id: DialogId) -> bool {
+        self.chat_manager
+            .get_channel_status(dialog_id.get_channel_id())
+            .can_delete_messages()
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    fn get_my_dialog_id(&mut self) -> DialogId {
+        DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    // `td_->dialog_manager_->get_input_peer(dialog_id, rights)` — the
+    // `StoryEnv::story_input_peer` split (the per-type reads over the
+    // user/chat managers).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        write: bool,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        let access_rights = if write {
+            crate::user_manager::AccessRights::Write
+        } else {
+            crate::user_manager::AccessRights::Read
+        };
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let user_env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options: self
+                        .options
+                        .as_deref_mut()
+                        .expect("forum topic requests run with the initialized option manager"),
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &user_env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let user_env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options: self
+                        .options
+                        .as_deref_mut()
+                        .expect("forum topic requests run with the initialized option manager"),
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &user_env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+    }
+
+    // `ForumTopicManager::can_be_forum` (cpp:1276-1296) — the User arm
+    // reads the bot flags, the Channel arm the broadcast/monoforum
+    // records (the monoforum half rides the chat-plane stub).
+    fn can_be_forum(&self, dialog_id: DialogId) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                self.auth_is_bot || self.user_manager.is_user_bot_of(dialog_id.get_user_id())
+            }
+            crate::dialog_id::DialogType::Channel => !self
+                .chat_manager
+                .is_broadcast_channel(dialog_id.get_channel_id()),
+            _ => false,
+        }
     }
 }
 
@@ -44784,6 +45361,39 @@ pub(crate) fn dialog_participant_env_split(
             net,
         },
         dialog_participant_manager,
+    )
+}
+
+/// Build the [`ForumTopicTdEnv`] view over the split Td borrows and run
+/// the closure with it + the forum-topic manager (the
+/// `dialog_participant_env_split` shape — the net-answer drain's and the
+/// UmMessage tail's twin).
+pub(crate) fn forum_topic_env_split(
+    td: &mut Td,
+) -> (
+    ForumTopicTdEnv<'_>,
+    &mut crate::forum_topic_manager::ForumTopicManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        forum_topic_manager,
+        notification_updates,
+        ..
+    } = td;
+    (
+        ForumTopicTdEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            updates: notification_updates,
+        },
+        forum_topic_manager,
     )
 }
 
@@ -50484,6 +51094,7 @@ mod tests {
         }
         td.group_call_manager.net = td.group_call_net();
         td.statistics_manager.net = td.statistics_net();
+        td.forum_topic_manager.net = td.forum_topic_net();
         (td, rec, callback)
     }
 
@@ -52831,6 +53442,667 @@ mod tests {
         }
         let slot: UrlSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    /// The net-drain 41 forum-topic round-trips — the send families'
+    /// legs dispatch through the installed handle and the wire answers
+    /// settle the parked promises (the band ladders live in
+    /// `forum_topic_manager.rs`; these cover the dispatcher plumbing, the
+    /// updates-walk tails and the read conversions).
+    #[test]
+    fn forum_topic_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(forum_topic_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn forum_topic_families_ride_the_dispatcher_impl() {
+        use crate::forum_topic_manager::ForumTopicManager;
+
+        let (mut td, rec) = netted_td("netfix-forum-topics");
+        seed_my_user(&mut td); // my id 42 — the create-topic creator id
+        // the creator forum megagroup (the permission reads + the Write
+        // peer resolve off the record)
+        seed_dialog_channel_with_flags(&mut td, 703, true, true, true);
+        let dialog = crate::dialog_id::DialogId::new(-1_000_000_000_703);
+
+        fn unit_slot() -> (tdutils::promise::Promise<()>, UnitSlot) {
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+
+        /// The CreateForumTopicQuery answer — the service message found
+        /// by its random id (cpp:104-125).
+        fn create_topic_answer(random_id: i64, channel_id: i64, topic_id: i32) -> Vec<u8> {
+            let service = telegram_api::Message::messageService(telegram_api::messageService {
+                flags: 0,
+                out: true,
+                mentioned: false,
+                media_unread: false,
+                reactions_are_possible: false,
+                silent: false,
+                post: false,
+                legacy: false,
+                id: topic_id,
+                from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 42,
+                })),
+                peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    channel_id,
+                })),
+                saved_peer_id: None,
+                reply_to: None,
+                date: 1700000000,
+                action: Some(telegram_api::MessageAction::messageActionTopicCreate(
+                    telegram_api::messageActionTopicCreate {
+                        flags: 0,
+                        title_missing: true,
+                        title: "Hello".to_owned(),
+                        icon_color: 0x7E_39C2,
+                        icon_emoji_id: 0,
+                    },
+                )),
+                reactions: None,
+                ttl_period: 0,
+            });
+            let mut out = Vec::new();
+            out.extend_from_slice(&telegram_api::updatesCombined::ID.to_le_bytes());
+            telegram_api::updatesCombined {
+                updates: vec![
+                    telegram_api::Update::updateMessageID(telegram_api::updateMessageID {
+                        id: topic_id,
+                        random_id,
+                    }),
+                    telegram_api::Update::updateNewChannelMessage(
+                        telegram_api::updateNewChannelMessage {
+                            message: Some(service),
+                            pts: 0,
+                            pts_count: 0,
+                        },
+                    ),
+                ],
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 1700000000,
+                seq_start: 0,
+                seq: 0,
+            }
+            .store(&mut out);
+            out
+        }
+
+        fn updates_answer() -> Vec<u8> {
+            let mut answer = Vec::new();
+            answer.extend_from_slice(&telegram_api::updatesCombined::ID.to_le_bytes());
+            telegram_api::updatesCombined {
+                updates: vec![],
+                users: vec![],
+                chats: vec![],
+                date: 1700000000,
+                seq_start: 0,
+                seq: 0,
+            }
+            .store(&mut answer);
+            answer
+        }
+
+        // 1. createForumTopic — the flags/peer/random-id wire form; the
+        //    answer's service message builds the info and the updates
+        //    walk completes the request promise.
+        {
+            let (promise, slot) = {
+                type InfoSlot = std::sync::Arc<
+                    std::sync::Mutex<
+                        Option<tdutils::status::Result<Option<td_api::ForumTopicInfo>>>,
+                    >,
+                >;
+                struct Rec(InfoSlot);
+                impl tdutils::promise::PromiseInterface<Option<td_api::ForumTopicInfo>> for Rec {
+                    fn set_value(&mut self, value: Option<td_api::ForumTopicInfo>) {
+                        *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                    }
+                    fn set_error(&mut self, error: Status) {
+                        *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                    }
+                }
+                let slot: InfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                (
+                    tdutils::promise::Promise::from_interface(Rec(slot.clone())),
+                    slot,
+                )
+            };
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::create_forum_topic(
+                manager,
+                &mut env,
+                dialog,
+                "Hello",
+                true,
+                Some(td_api::ForumTopicIcon {
+                    color: 0x7E_39C2,
+                    custom_emoji_id: 0,
+                }),
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_createForumTopic::ID);
+            let body = telegram_api::messages_createForumTopic::parse(sent.query())
+                .expect("the create body");
+            assert_eq!(body.title, "Hello");
+            assert!(body.title_missing, "the TITLE_MISSING flag");
+            assert_eq!(body.flags & 1, 1, "the ICON_COLOR flag");
+            assert_ne!(body.random_id, 0, "the random id");
+            let peer_channel = match body.peer.as_deref() {
+                Some(telegram_api::InputPeer::inputPeerChannel(p)) => Some(p.channel_id),
+                _ => None,
+            };
+            assert_eq!(peer_channel, Some(703), "the Write peer");
+            net_complete(sent, create_topic_answer(body.random_id, 703, 7));
+            td.dispatch_completed_forum_topic_net();
+            let info = match slot.lock().unwrap().take().unwrap() {
+                tdutils::status::Result::Ok(Some(info)) => info,
+                other => panic!("the create answer: {other:?}"),
+            };
+            assert_eq!(info.forum_topic_id, 7);
+            assert_eq!(info.name, "Hello");
+            assert!(info.is_outgoing, "the create-topic info is outgoing");
+            assert!(info.is_name_implicit, "the TITLE_MISSING flag rides");
+            assert!(manager_has_topic(&td, dialog, 7), "the registry intake");
+        }
+
+        // 2. editForumTopic — the TITLE wire form; the Updates walk
+        //    settles the promise, the TOPIC_NOT_MODIFIED band settles ok.
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::edit_forum_topic(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(7),
+                "New",
+                false,
+                crate::emoji_status::CustomEmojiId::default(),
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_editForumTopic::ID);
+            let body =
+                telegram_api::messages_editForumTopic::parse(sent.query()).expect("the edit body");
+            assert_eq!(body.flags & 1, 1, "the TITLE flag");
+            assert_eq!(body.topic_id, 7);
+            net_complete(sent, updates_answer());
+            td.dispatch_completed_forum_topic_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+
+            // the not-modified band (cpp:213-215)
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::edit_forum_topic(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(7),
+                "Newer",
+                false,
+                crate::emoji_status::CustomEmojiId::default(),
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_editForumTopic::ID);
+            net_fail(sent, 400, "TOPIC_NOT_MODIFIED");
+            td.dispatch_completed_forum_topic_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // 3. toggleForumTopicIsClosed — the CLOSED wire form (cpp:169-186).
+        {
+            let (promise, _slot) = unit_slot();
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::toggle_forum_topic_is_closed(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(7),
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_editForumTopic::ID);
+            let body =
+                telegram_api::messages_editForumTopic::parse(sent.query()).expect("the body");
+            assert_eq!(body.flags, 1 << 2, "the CLOSED flag only");
+            assert!(body.closed);
+        }
+
+        // 4. toggleGeneralForumTopicIsHidden — the HIDDEN wire form over
+        //    the general topic id 1 (cpp:188-205).
+        {
+            let (promise, _slot) = unit_slot();
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::toggle_forum_topic_is_hidden(
+                manager, &mut env, dialog, true, promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_editForumTopic::ID);
+            let body =
+                telegram_api::messages_editForumTopic::parse(sent.query()).expect("the body");
+            assert_eq!(body.flags, 1 << 3, "the HIDDEN flag only");
+            assert_eq!(body.topic_id, 1, "the general topic id");
+            assert!(body.hidden);
+        }
+
+        // 5. toggleForumTopicIsPinned — messages.updatePinnedForumTopic;
+        //    the PINNED_TOPIC_NOT_MODIFIED band settles ok (cpp:251-253).
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::toggle_forum_topic_is_pinned(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(7),
+                true,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_updatePinnedForumTopic::ID);
+            let body = telegram_api::messages_updatePinnedForumTopic::parse(sent.query())
+                .expect("the pin body");
+            assert_eq!(body.topic_id, 7);
+            assert!(body.pinned);
+            net_fail(sent, 400, "PINNED_TOPIC_NOT_MODIFIED");
+            td.dispatch_completed_forum_topic_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+
+        // 6. setPinnedForumTopics — messages.reorderPinnedForumTopics
+        //    with the request order (cpp:283); the not-modified band.
+        {
+            let (promise, slot) = unit_slot();
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::set_pinned_forum_topics(
+                manager,
+                &mut env,
+                dialog,
+                vec![
+                    crate::forum_topic::ForumTopicId::new(7),
+                    crate::forum_topic::ForumTopicId::new(9),
+                ],
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_reorderPinnedForumTopics::ID);
+            let body = telegram_api::messages_reorderPinnedForumTopics::parse(sent.query())
+                .expect("the reorder body");
+            assert_eq!(body.order, vec![7, 9]);
+            assert!(body.force);
+            net_fail(sent, 400, "PINNED_TOPICS_NOT_MODIFIED");
+            td.dispatch_completed_forum_topic_net();
+            assert!(matches!(
+                &*slot.lock().unwrap(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+        }
+    }
+
+    /// The net-drain 41 read families — `getForumTopic` answers the
+    /// single-topic band and the null form, `getForumTopics` walks the
+    /// topics with the next-offset computation.
+    #[test]
+    fn forum_topic_reads_round_trip() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(forum_topic_reads_round_trip_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn forum_topic_reads_round_trip_impl() {
+        use crate::forum_topic_manager::ForumTopicManager;
+
+        let (mut td, rec) = netted_td("netfix-forum-topic-reads");
+        seed_dialog_channel_with_flags(&mut td, 704, true, true, true);
+        let dialog = crate::dialog_id::DialogId::new(-1_000_000_000_704);
+
+        /// A live wire forumTopic in the read answers.
+        fn wire_forum_topic(id: i32, date: i32, channel_id: i64) -> telegram_api::ForumTopic {
+            telegram_api::ForumTopic::forumTopic(telegram_api::forumTopic {
+                flags: 0,
+                my: true,
+                closed: false,
+                pinned: true,
+                short: false,
+                hidden: false,
+                title_missing: false,
+                id,
+                date,
+                peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    channel_id,
+                })),
+                title: format!("Topic {id}"),
+                icon_color: 0,
+                icon_emoji_id: 0,
+                top_message: 0,
+                read_inbox_max_id: 0,
+                read_outbox_max_id: 0,
+                unread_count: 0,
+                unread_mentions_count: 0,
+                unread_reactions_count: 0,
+                unread_poll_votes_count: 0,
+                from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 42,
+                })),
+                notify_settings: None,
+                draft: None,
+            })
+        }
+
+        fn forum_topics_answer(
+            topics: Vec<telegram_api::ForumTopic>,
+            count: i32,
+            order_by_create_date: bool,
+        ) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_ForumTopics {
+                flags: 0,
+                order_by_create_date,
+                count,
+                topics,
+                messages: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+                pts: 0,
+            }
+            .store_boxed(&mut out);
+            out
+        }
+
+        // 1. getForumTopic — messages.getForumTopicsByID; the
+        //    single-topic answer walks the intake and answers the object.
+        {
+            type TopicSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<Option<td_api::ForumTopic>>>>,
+            >;
+            struct Rec(TopicSlot);
+            impl tdutils::promise::PromiseInterface<Option<td_api::ForumTopic>> for Rec {
+                fn set_value(&mut self, value: Option<td_api::ForumTopic>) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: TopicSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::get_forum_topic(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(5),
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getForumTopicsByID::ID);
+            let body = telegram_api::messages_getForumTopicsByID::parse(sent.query())
+                .expect("the by-id body");
+            assert_eq!(body.topics, vec![5]);
+            net_complete(
+                sent,
+                forum_topics_answer(vec![wire_forum_topic(5, 1000, 704)], 1, false),
+            );
+            td.dispatch_completed_forum_topic_net();
+            let topic = match slot.lock().unwrap().take().unwrap() {
+                tdutils::status::Result::Ok(Some(topic)) => topic,
+                other => panic!("the by-id answer: {other:?}"),
+            };
+            let info = topic.info.expect("the topic info");
+            assert_eq!(info.forum_topic_id, 5);
+            assert_eq!(info.chat_id, dialog.get());
+            assert!(topic.is_pinned, "the wire pinned flag rides the object");
+            assert!(
+                td.forum_topic_manager
+                    .has_topic_for_test(dialog, crate::forum_topic::ForumTopicId::new(5)),
+                "the registry intake"
+            );
+        }
+
+        // 2. getForumTopic — the zero-topic null band (cpp:349-351).
+        {
+            type TopicSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<Option<td_api::ForumTopic>>>>,
+            >;
+            struct Rec(TopicSlot);
+            impl tdutils::promise::PromiseInterface<Option<td_api::ForumTopic>> for Rec {
+                fn set_value(&mut self, value: Option<td_api::ForumTopic>) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: TopicSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::get_forum_topic(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(6),
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getForumTopicsByID::ID);
+            net_complete(sent, forum_topics_answer(Vec::new(), 0, false));
+            td.dispatch_completed_forum_topic_net();
+            assert!(matches!(
+                slot.lock().unwrap().take().unwrap(),
+                tdutils::status::Result::Ok(None)
+            ));
+        }
+
+        // 3. getForumTopics — the Q flag, the walk and the next offsets.
+        {
+            type TopicsSlot = std::sync::Arc<
+                std::sync::Mutex<Option<tdutils::status::Result<td_api::ForumTopics>>>,
+            >;
+            struct Rec(TopicsSlot);
+            impl tdutils::promise::PromiseInterface<td_api::ForumTopics> for Rec {
+                fn set_value(&mut self, value: td_api::ForumTopics) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: TopicsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let promise = tdutils::promise::Promise::from_interface(Rec(slot.clone()));
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::get_forum_topics(
+                manager,
+                &mut env,
+                dialog,
+                "search".to_owned(),
+                0,
+                crate::message_id::MessageId::default(),
+                crate::forum_topic::ForumTopicId::default(),
+                10,
+                promise,
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getForumTopics::ID);
+            let body =
+                telegram_api::messages_getForumTopics::parse(sent.query()).expect("the list body");
+            assert_eq!(body.flags & 1, 1, "the Q flag");
+            assert_eq!(body.q, "search");
+            assert_eq!(body.limit, 10);
+            net_complete(
+                sent,
+                forum_topics_answer(
+                    vec![
+                        wire_forum_topic(5, 1000, 704),
+                        wire_forum_topic(6, 2000, 704),
+                    ],
+                    42,
+                    false,
+                ),
+            );
+            td.dispatch_completed_forum_topic_net();
+            let topics = match slot.lock().unwrap().take().unwrap() {
+                tdutils::status::Result::Ok(topics) => topics,
+                other => panic!("the list answer: {other:?}"),
+            };
+            assert_eq!(topics.total_count, 42);
+            assert_eq!(topics.topics.len(), 2);
+            assert_eq!(topics.next_offset_date, 2000, "the last creation date");
+            assert_eq!(topics.next_offset_message_id, 0);
+            assert_eq!(topics.next_offset_forum_topic_id, 6);
+        }
+    }
+
+    /// The delete family — the wire tail rides the message-query
+    /// affected-history plane: the partial answer refills the loop, the
+    /// final answer runs `on_delete_forum_topic` (the registry erase +
+    /// the deleted-id mark) and settles the request promise.
+    #[test]
+    fn delete_forum_topic_rides_the_affected_history_plane() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(delete_forum_topic_rides_the_affected_history_plane_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn delete_forum_topic_rides_the_affected_history_plane_impl() {
+        use crate::forum_topic_manager::ForumTopicManager;
+
+        let (mut td, rec) = netted_td("netfix-forum-topic-delete");
+        seed_dialog_channel_with_flags(&mut td, 705, true, true, true);
+        let dialog = crate::dialog_id::DialogId::new(-1_000_000_000_705);
+
+        // seed a live topic (the delete tail erases it)
+        {
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            manager.on_get_forum_topic_impl(
+                &mut env,
+                dialog,
+                telegram_api::ForumTopic::forumTopic(telegram_api::forumTopic {
+                    flags: 0,
+                    my: true,
+                    closed: false,
+                    pinned: false,
+                    short: false,
+                    hidden: false,
+                    title_missing: false,
+                    id: 8,
+                    date: 1000,
+                    peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 705,
+                    })),
+                    title: "Doomed".to_owned(),
+                    icon_color: 0,
+                    icon_emoji_id: 0,
+                    top_message: 0,
+                    read_inbox_max_id: 0,
+                    read_outbox_max_id: 0,
+                    unread_count: 0,
+                    unread_mentions_count: 0,
+                    unread_reactions_count: 0,
+                    unread_poll_votes_count: 0,
+                    from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 42,
+                    })),
+                    notify_settings: None,
+                    draft: None,
+                }),
+            );
+        }
+        assert!(
+            td.forum_topic_manager
+                .has_topic_for_test(dialog, crate::forum_topic::ForumTopicId::new(8))
+        );
+
+        let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+            *capture.lock().unwrap() = Some(result);
+        });
+        {
+            let (mut env, manager) = crate::td::forum_topic_env_split(&mut td);
+            ForumTopicManager::delete_forum_topic(
+                manager,
+                &mut env,
+                dialog,
+                crate::forum_topic::ForumTopicId::new(8),
+                promise,
+            );
+        }
+        td.run_forum_topic_delete_tails();
+        let sent = take_sent_query(&rec, telegram_api::messages_deleteTopicHistory::ID);
+        let body = telegram_api::messages_deleteTopicHistory::parse(sent.query())
+            .expect("the delete body");
+        assert_eq!(body.top_msg_id, 8);
+
+        // the partial answer (offset > 0) refills the loop
+        let mut partial = Vec::new();
+        telegram_api::messages_AffectedHistory {
+            pts: 10,
+            pts_count: 5,
+            offset: 100,
+        }
+        .store_boxed(&mut partial);
+        net_complete(sent, partial);
+        td.dispatch_completed_message_query_net();
+        let refill = take_sent_query(&rec, telegram_api::messages_deleteTopicHistory::ID);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the partial answer does not settle the promise"
+        );
+
+        // the final answer runs the delete tail and settles the promise
+        let mut final_answer = Vec::new();
+        telegram_api::messages_AffectedHistory {
+            pts: 20,
+            pts_count: 0,
+            offset: 0,
+        }
+        .store_boxed(&mut final_answer);
+        net_complete(refill, final_answer);
+        td.dispatch_completed_message_query_net();
+        assert!(matches!(
+            &*slot.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            !td.forum_topic_manager
+                .has_topic_for_test(dialog, crate::forum_topic::ForumTopicId::new(8)),
+            "the registry erase"
+        );
+        assert!(
+            td.forum_topic_manager
+                .is_deleted_for_test(dialog, crate::forum_topic::ForumTopicId::new(8)),
+            "the deleted-id mark"
+        );
+    }
+
+    fn manager_has_topic(
+        td: &Td,
+        dialog_id: crate::dialog_id::DialogId,
+        forum_topic_id: i32,
+    ) -> bool {
+        td.forum_topic_manager.has_topic_for_test(
+            dialog_id,
+            crate::forum_topic::ForumTopicId::new(forum_topic_id),
+        )
     }
 
     #[test]
