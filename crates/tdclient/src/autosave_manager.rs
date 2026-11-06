@@ -7,10 +7,13 @@
 //! with the C++ corrupt-load path's binlog-pmc erase kept as its own seam.
 //! The three `Td::ResultHandler` query classes (`GetAutoSaveSettingsQuery`,
 //! `SaveAutoSaveSettingsQuery`, `DeleteAutoSaveExceptionsQuery`) collapse
-//! into the [`AutosaveManagerEnv`] query seams — `[blocked: net]` with the
-//! promises parked until the net queries land (the M.31 convention); the
-//! answer handler [`AutosaveManager::on_get_auto_save_settings`] is real
-//! and unit-tested against constructed answers. The C++
+//! into the [`AutosaveManagerEnv`] query seams — the get/save pair rides
+//! the client-side dispatcher under the crate-local `AutosaveNetKind`
+//! (the answers drain through `Td::on_autosave_net_answer` into the real
+//! intakes), while the delete query stays parked at its `[blocked: net]`
+//! seam with the promise in the manager's `net_blocked_promises` queue.
+//! The [`AutosaveManager::on_get_auto_save_settings`] intake is real and
+//! unit-tested against constructed answers; the C++
 //! `UpdatesManager::before_get_difference` (cpp:4978) /
 //! `after_get_difference` (cpp:2413) reload hooks flip at the M.7
 //! integration through [`AutosaveManager::reload_autosave_settings`].
@@ -27,9 +30,27 @@ use tdutils::status::Status;
 /// `telegram_api::autoSaveSettings::VIDEO_MAX_SIZE_MASK` (flags.2?long).
 const VIDEO_MAX_SIZE_MASK: i32 = 1 << 2;
 
-/// The `G()`/`td_` surface of the manager. The net queries are the
-/// `[blocked: net]` query seams; the `send_update` outbox is drained by
-/// `crate::td::Td::flush_user_updates`.
+/// The autosave query kinds riding the dispatcher — the C++ ResultHandler
+/// classes of AutosaveManager.cpp:32-95.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutosaveNetKind {
+    /// `GetAutoSaveSettingsQuery` (cpp:32) — the reload query; the
+    /// answer chains into [`AutosaveManager::on_get_auto_save_settings`]
+    /// (the C++ promise lambda, cpp:346-350).
+    GetAutoSaveSettings,
+    /// `SaveAutoSaveSettingsQuery` (cpp:60) — the per-scope/exception
+    /// save; the ok value drops, the error band fails the parked promise
+    /// and reloads the settings (cpp:91-94).
+    SaveAutoSaveSettings,
+}
+
+/// `telegram_api::account_saveAutoSaveSettings::PEER_MASK` (flags.3?InputPeer)
+/// — the per-dialog save form.
+pub(crate) const SAVE_AUTO_SAVE_SETTINGS_PEER_MASK: i32 = 1 << 3;
+
+/// The `G()`/`td_` surface of the manager. The get/save queries ride the
+/// dispatcher at the `AutosaveEnv` arms; the `send_update` outbox is
+/// drained by `crate::td::Td::flush_user_updates`.
 pub trait AutosaveManagerEnv {
     /// `G()->close_flag()`.
     fn close_flag(&self) -> bool;
@@ -62,31 +83,42 @@ pub trait AutosaveManagerEnv {
     /// (AutosaveManager.cpp:403).
     fn force_create_dialog(&mut self, dialog_id: DialogId);
 
-    /// `GetAutoSaveSettingsQuery::send` (cpp:40-42) — `[blocked: net]`;
-    /// the answer arrives through
+    /// `td_->dialog_manager_->get_input_peer(dialog_id, access_rights)`
+    /// (DialogManager.cpp:1377-1395) — the save query's in-query peer
+    /// build (cpp:73-75); `None` models the unresolvable dialog the C++
+    /// `CHECK` guards (the collapse answers the sibling
+    /// `check_dialog_access` band instead).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer>;
+
+    /// `GetAutoSaveSettingsQuery::send` (cpp:40-42) — the dispatcher arm
+    /// lives at the `AutosaveEnv` impl; the answer arrives through
     /// [`AutosaveManager::on_get_auto_save_settings`].
     fn send_get_auto_save_settings_query(&mut self) {
-        tdutils::log_info!("Send GetAutoSaveSettings — [blocked: net]");
+        tdutils::log_info!("Send GetAutoSaveSettings — [net-inert]");
     }
 
-    /// `SaveAutoSaveSettingsQuery::send` (cpp:67-80) — `[blocked: net]`;
-    /// the C++ builds the input peer for the peer-only save inside the
-    /// query (with the non-null CHECK the set-time `check_dialog_access`
-    /// already guarantees) and the C++ `on_error` reloads the settings
-    /// (cpp:91-94) — both obligations ride the net-step integration.
+    /// `SaveAutoSaveSettingsQuery::send` (cpp:67-80) — the dispatcher arm
+    /// lives at the `AutosaveEnv` impl (which computes the
+    /// `PEER_MASK` flag from the peer form); the C++ `on_error` reloads
+    /// the settings (cpp:91-94) — the tail rides the answer drain.
     fn send_save_auto_save_settings_query(
         &mut self,
         users: bool,
         chats: bool,
         broadcasts: bool,
         dialog_id: DialogId,
+        peer: Option<telegram_api::InputPeer>,
         settings: &telegram_api::AutoSaveSettings,
     ) {
         tdutils::log_info!(
             "Send SaveAutoSaveSettings(users = {users}, chats = {chats}, \
-             broadcasts = {broadcasts}, dialog_id = {dialog_id:?}) — [blocked: net]"
+             broadcasts = {broadcasts}, dialog_id = {dialog_id:?}) — [net-inert]"
         );
-        let _ = settings;
+        let _ = (peer, settings);
     }
 
     /// `DeleteAutoSaveExceptionsQuery::send` (cpp:104-106) —
@@ -342,10 +374,13 @@ pub struct AutosaveManager {
     settings: AutosaveSettings,
     /// `load_settings_queries_` (AutosaveManager.h:114).
     load_settings_queries: Vec<Promise<td_api::AutosaveSettings>>,
-    /// The `()`-typed promises parked at their `[blocked: net]` query
-    /// sends — the save/delete queries own them in the C++ until the
-    /// answer (the M.31 `net_blocked_promises` convention); the C++
-    /// `on_error` reload obligation rides the net-step integration.
+    /// The save queries' parked promises — the C++ `SaveAutoSaveSettingsQuery`
+    /// owns its `Promise<Unit>` until the answer (cpp:63); the net drain
+    /// settles them FIFO through [`AutosaveManager::on_save_auto_save_settings`].
+    pub(crate) pending_save_promises: Vec<Promise<()>>,
+    /// The `()`-typed promise parked at the still-blocked delete query
+    /// (`DeleteAutoSaveExceptionsQuery` owns its promise in the C++ until
+    /// the answer; the net-step integration rides the delete landing).
     net_blocked_promises: Vec<Promise<()>>,
 }
 
@@ -488,7 +523,7 @@ impl AutosaveManager {
 
     /// `reload_autosave_settings` (cpp:337-352) — also the C++
     /// `UpdatesManager` before/after-get-difference hook (cpp:4978/2413);
-    /// the net query is the `[blocked: net]` seam.
+    /// the net query rides the dispatcher (the `AutosaveEnv` arm).
     pub fn reload_autosave_settings(&mut self, env: &mut impl AutosaveManagerEnv) {
         if env.close_flag() {
             return fail_promises(&mut self.load_settings_queries, &request_aborted_error());
@@ -705,6 +740,19 @@ impl AutosaveManager {
                 }
             }
         }
+        // the per-dialog form resolves the peer up front — the C++ builds
+        // it inside the query send (cpp:72-75) behind the pre-apply
+        // `check_dialog_access` guarantee; the collapse bands before the
+        // apply so a save that cannot reach the server never applies
+        // (the C++ non-null CHECK downgrade)
+        let peer = if !users && !chats && !broadcasts {
+            match env.get_input_peer(dialog_id, crate::user_manager::AccessRights::Read) {
+                Some(peer) => Some(peer),
+                None => return promise.set_error(Status::error(400, "Chat not found")),
+            }
+        } else {
+            None
+        };
         // `old_settings = &settings_.exceptions_[dialog_id]` (cpp:471) —
         // the not-yet-known exception reads as the defaults, the C++
         // operator[] entry creation
@@ -769,9 +817,32 @@ impl AutosaveManager {
             chats,
             broadcasts,
             dialog_id,
+            peer,
             &input_settings,
         );
-        self.net_blocked_promises.push(promise);
+        self.pending_save_promises.push(promise);
+    }
+
+    /// `SaveAutoSaveSettingsQuery::on_result`/`on_error` (cpp:82-94) — the
+    /// ok value drops; the error band fails the parked promise and reloads
+    /// the settings (the C++ `on_error` tail, `set_error` first). FIFO —
+    /// one promise per completed save query.
+    pub fn on_save_auto_save_settings(
+        &mut self,
+        env: &mut impl AutosaveManagerEnv,
+        result: Result<(), Status>,
+    ) {
+        if self.pending_save_promises.is_empty() {
+            return;
+        }
+        let mut promise = self.pending_save_promises.remove(0);
+        match result {
+            Ok(()) => promise.set_value(()),
+            Err(error) => {
+                promise.set_error(error);
+                self.reload_autosave_settings(env);
+            }
+        }
     }
 
     /// `clear_autosave_settings_exceptions` (cpp:498-509).
@@ -877,6 +948,9 @@ mod tests {
         sqlite_pmc: BTreeMap<Vec<u8>, Vec<u8>>,
         updates: Vec<td_api::Update>,
         query_log: Vec<String>,
+        /// the collapsed dialog cache: `false` models the unresolvable
+        /// peer the C++ `CHECK` guards
+        resolve_peers: bool,
     }
 
     impl TestEnv {
@@ -887,6 +961,7 @@ mod tests {
                 sqlite_pmc: BTreeMap::new(),
                 updates: Vec::new(),
                 query_log: Vec::new(),
+                resolve_peers: true,
             }
         }
 
@@ -934,6 +1009,17 @@ mod tests {
             self.query_log.push(format!("force create {dialog_id:?}"));
         }
 
+        fn get_input_peer(
+            &mut self,
+            dialog_id: DialogId,
+            _access_rights: crate::user_manager::AccessRights,
+        ) -> Option<telegram_api::InputPeer> {
+            if !self.resolve_peers || !dialog_id.is_valid() {
+                return None;
+            }
+            Some(crate::dialog_manager::get_input_peer_force(dialog_id))
+        }
+
         fn send_get_auto_save_settings_query(&mut self) {
             self.query_log.push("get".to_string());
         }
@@ -944,10 +1030,26 @@ mod tests {
             chats: bool,
             broadcasts: bool,
             dialog_id: DialogId,
+            peer: Option<telegram_api::InputPeer>,
             _settings: &telegram_api::AutoSaveSettings,
         ) {
-            self.query_log
-                .push(format!("save {users} {chats} {broadcasts} {dialog_id:?}"));
+            self.query_log.push(format!(
+                "save {} {} {} {:?} peer={} {}",
+                users,
+                chats,
+                broadcasts,
+                dialog_id,
+                peer.is_some(),
+                peer.map(|p| match p {
+                    telegram_api::InputPeer::inputPeerUser(u) => format!("user {}", u.user_id),
+                    telegram_api::InputPeer::inputPeerChat(c) => format!("chat {}", c.chat_id),
+                    telegram_api::InputPeer::inputPeerChannel(c) => {
+                        format!("channel {}", c.channel_id)
+                    }
+                    _ => "other".to_string(),
+                })
+                .unwrap_or_default(),
+            ));
         }
 
         fn send_delete_auto_save_exceptions_query(&mut self) {
@@ -956,17 +1058,19 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Recorded<T>(Arc<Mutex<Option<T>>>);
+    struct Recorded<T>(Arc<Mutex<Option<tdutils::status::Result<T>>>>);
     struct RecordingPromise<T: Send + 'static> {
         recorded: Recorded<T>,
     }
 
     impl<T: Send + 'static> PromiseInterface<T> for RecordingPromise<T> {
         fn set_value(&mut self, value: T) {
-            *self.recorded.0.lock().unwrap() = Some(value);
+            *self.recorded.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
         }
 
-        fn set_error(&mut self, _error: Status) {}
+        fn set_error(&mut self, error: Status) {
+            *self.recorded.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+        }
     }
 
     fn recording_promise<T: Send + 'static>() -> (Promise<T>, Recorded<T>) {
@@ -1139,7 +1243,7 @@ mod tests {
         // the next request answers immediately from memory
         let (promise, recorded) = recording_promise();
         manager.get_autosave_settings(&mut env, promise);
-        let value = recorded.0.lock().unwrap().take().unwrap();
+        let value = recorded.0.lock().unwrap().take().unwrap().ok().clone();
         assert!(value.exceptions.is_empty());
         assert!(value.private_chat_settings.unwrap().autosave_photos);
         assert_eq!(env.query_log.len(), 1, "no re-query");
@@ -1303,13 +1407,13 @@ mod tests {
         let (promise, _) = recording_promise::<()>();
         manager.set_autosave_settings(&mut env, None, None, promise);
         assert!(env.query_log.is_empty());
-        assert!(manager.net_blocked_promises.is_empty());
+        assert!(manager.pending_save_promises.is_empty());
 
         // the not-inited settings reject before everything else
         let (promise, _) = recording_promise::<()>();
         manager.set_autosave_settings(&mut env, Some(private_scope()), None, promise);
         assert!(env.query_log.is_empty());
-        assert!(manager.net_blocked_promises.is_empty());
+        assert!(manager.pending_save_promises.is_empty());
     }
 
     #[test]
@@ -1349,7 +1453,7 @@ mod tests {
         assert!(env.query_log[0].starts_with("save true false false"));
         assert_eq!(env.updates.len(), 1);
         assert_eq!(update_scope(&env.updates[0]), "private");
-        assert_eq!(manager.net_blocked_promises.len(), 1);
+        assert_eq!(manager.pending_save_promises.len(), 1);
         assert_eq!(
             manager.settings.user_settings.max_video_file_size(),
             20_000_000
@@ -1406,6 +1510,136 @@ mod tests {
         assert_eq!(update_scope(env.updates.last().unwrap()), "chat 300");
         assert!(update_settings(env.updates.last().unwrap()).is_none());
         assert_eq!(env.query_log.len(), queries_so_far + 1);
+    }
+
+    #[test]
+    fn save_answers_settle_and_reload_per_query() {
+        let mut env = TestEnv::new(true);
+        let mut manager = inited_manager(false, false, 10_000_000);
+
+        // the scope save parks at the query
+        let (promise, recorded) = recording_promise();
+        manager.set_autosave_settings(
+            &mut env,
+            Some(private_scope()),
+            Some(td_api::ScopeAutosaveSettings {
+                autosave_photos: true,
+                autosave_videos: true,
+                max_video_file_size: 20_000_000,
+            }),
+            promise,
+        );
+        assert_eq!(manager.pending_save_promises.len(), 1);
+
+        // the ok answer drops (Bool) and settles the promise
+        manager.on_save_auto_save_settings(&mut env, Ok(()));
+        assert!(manager.pending_save_promises.is_empty());
+        assert!(matches!(
+            recorded.0.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert_eq!(env.query_log.len(), 1, "no reload on ok");
+
+        // the error band fails the promise and reloads the settings
+        // (the C++ on_error tail, cpp:91-94)
+        let (promise, recorded) = recording_promise();
+        manager.set_autosave_settings(
+            &mut env,
+            Some(private_scope()),
+            Some(td_api::ScopeAutosaveSettings {
+                autosave_photos: false,
+                autosave_videos: false,
+                max_video_file_size: 30_000_000,
+            }),
+            promise,
+        );
+        manager.on_save_auto_save_settings(&mut env, Err(Status::error(429, "Too Many Requests")));
+        assert!(manager.pending_save_promises.is_empty());
+        assert!(matches!(
+            recorded.0.lock().unwrap().take(),
+            Some(tdutils::status::Result::Err(_))
+        ));
+        assert_eq!(env.query_log.last().unwrap(), "get", "the reload fires");
+        assert!(manager.settings.are_being_reloaded);
+
+        // an answer without a parked promise drops
+        manager.on_save_auto_save_settings(&mut env, Ok(()));
+        assert_eq!(env.query_log.last().unwrap(), "get");
+    }
+
+    #[test]
+    fn save_on_unresolvable_peer_bands_before_the_apply() {
+        let mut env = TestEnv::new(true);
+        env.resolve_peers = false;
+        let mut manager = inited_manager(false, false, 10_000_000);
+
+        // the per-dialog form bands before the apply — the C++ answers
+        // the same save through its pre-apply check_dialog_access (the
+        // in-query CHECK downgrade collapses to the same gate), so no
+        // state moves and no query goes out
+        let (promise, recorded) = recording_promise();
+        manager.set_autosave_settings(
+            &mut env,
+            Some(scope_chat(300)),
+            Some(td_api::ScopeAutosaveSettings {
+                autosave_photos: true,
+                autosave_videos: false,
+                max_video_file_size: 3_000_000,
+            }),
+            promise,
+        );
+        assert!(env.query_log.is_empty(), "no query goes out");
+        assert!(env.updates.is_empty(), "no update fires");
+        assert!(env.saved_settings().is_none(), "the pmc save stays off");
+        assert!(manager.pending_save_promises.is_empty());
+        assert!(manager.settings.exceptions.is_empty(), "nothing applies");
+        assert!(matches!(
+            recorded.0.lock().unwrap().take(),
+            Some(tdutils::status::Result::Err(error)) if error.code() == 400
+        ));
+
+        // the scope forms need no peer — they still send
+        let (promise, _) = recording_promise();
+        manager.set_autosave_settings(
+            &mut env,
+            Some(private_scope()),
+            Some(td_api::ScopeAutosaveSettings {
+                autosave_photos: true,
+                autosave_videos: false,
+                max_video_file_size: 20_000_000,
+            }),
+            promise,
+        );
+        assert!(env.query_log[0].starts_with("save true false false"));
+        assert_eq!(manager.pending_save_promises.len(), 1);
+    }
+
+    #[test]
+    fn save_passes_the_peer_form_for_exception_dialogs() {
+        let mut env = TestEnv::new(true);
+        let mut manager = inited_manager(false, false, 10_000_000);
+
+        // the per-dialog save resolves the peer at the manager send leg
+        // (the C++ in-query build, cpp:72-75) and the scope forms send
+        // peer-less
+        let (promise, _) = recording_promise();
+        manager.set_autosave_settings(
+            &mut env,
+            Some(scope_chat(1000)),
+            Some(td_api::ScopeAutosaveSettings {
+                autosave_photos: true,
+                autosave_videos: false,
+                max_video_file_size: 3_000_000,
+            }),
+            promise,
+        );
+        assert_eq!(env.query_log.len(), 1);
+        assert!(
+            env.query_log[0].contains("peer=true user 1000"),
+            "{}",
+            env.query_log[0]
+        );
+        assert_eq!(manager.pending_save_promises.len(), 1);
     }
 
     #[test]
