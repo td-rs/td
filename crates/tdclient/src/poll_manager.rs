@@ -13,11 +13,34 @@
 //! maps driven by [`PollManager::tick_timeouts`].
 //!
 //! The message-plane probes (`MessagesManager::get_message_poll_id`, the
-//! notify-on-update hops) are the `[blocked: M.10 integration]` env seams;
-//! the net query tails (`messages.sendVote`, `messages.getPollResults`,
+//! notify-on-update hops) are the `[blocked: M.10 integration]` env seams.
+//! The five wire tails (`messages.sendVote`, `messages.getPollResults`,
 //! `messages.getPollVotes`, `messages.editMessage` close,
-//! `messages.addPollAnswer`, `messages.deletePollAnswer`) are the
-//! `[blocked: net]` env seams.
+//! `messages.deletePollAnswer`) ride the `PollNetKind` plane
+//! (net-drain 39); `messages.addPollAnswer` stays the M.9/M.10
+//! media-upload plane (the `add_poll_option` upload half).
+//!
+//! # The net-drain 39 audit table
+//!
+//! | C++ handler (PollManager.cpp) | wire | kind | send leg | answer arm | bands kept |
+//! |---|---|---|---|---|---|
+//! | `SendVoteQuery` cpp:236-306 | `messages.sendVote` | `PollNetKind::SendVote` | the `send_vote_query` env arm at `do_set_poll_answer` cpp:1386 | `on_send_vote_answer` → `on_set_poll_answer` cpp:1390-1429 → `on_set_poll_answer_finished` cpp:1431-1469 | close_flag drop; the None-peer 400 routes the dialog-error head + the full ladder |
+//! | `GetPollResultsQuery` cpp:67-110 | `messages.getPollResults` | `PollNetKind::GetPollResults` | the `send_get_poll_results_query` env arm at `on_update_poll_timeout` cpp:1866 | `on_get_poll_results_answer` → `on_get_poll_results` cpp:1940-1975 | Ok(null) drop at the send leg; error reget ladder; stale-generation reget 0.0 |
+//! | `GetPollVotersQuery` cpp:109-162 | `messages.getPollVotes` | `PollNetKind::GetPollVoters` | the `send_get_poll_voters_query` env arm at `get_poll_voters` cpp:1614 | `on_get_poll_voters_answer` → `on_get_poll_voters` cpp:1619-1710 | anonymous band; offset mismatch; empty-promise lot; count-mismatch reget; MESSAGE_ID_INVALID carve-out |
+//! | `StopPollQuery` cpp:278-332 | `messages.editMessage` | `PollNetKind::StopPoll` | the `send_stop_poll_query` env arm at `do_stop_poll` cpp:1787 | `on_stop_poll_answer` → the engine tail → `on_stop_poll_finished` cpp:1790-1806 | `MESSAGE_NOT_MODIFIED` Ok band (non-bot); being_closed erase on every band |
+//! | `DeletePollAnswerQuery` cpp:199-234 | `messages.deletePollAnswer` | `PollNetKind::DeletePollAnswer` | the `send_delete_poll_answer_query` env arm at `delete_poll_option` cpp:1235 | `on_delete_poll_answer_answer` → the updates tail with the popped promise | dialog error head |
+//!
+//! Divergences: `NetQueryRef query_ref_` cancellation stays unmodeled —
+//! the kind-carried `generation` identity pairs a replaced query's late
+//! answer with its own lot entry, and the generation check inside
+//! `on_set_poll_answer` drops it before any state touch; the C++
+//! `server_poll_messages_.get_random()` spread pick collapses to an
+//! arbitrary element; `G()->ignore_result_if_closing` (Global.h:706-709,
+//! Ok → 500 "Request aborted" on close_flag) guards the
+//! voters/results answers; the [`PollManagerEnv`] send arms carry the
+//! query construction (the peers resolve at the send leg, the §0.2
+//! recipe) and their `Err`s are the C++ `return on_error(...)`
+//! send-leg bands.
 //!
 //! Deferred to the M.9/M.10 integration (the C++ bodies read the message
 //! content plane): the option/explanation `MessageContent` media values —
@@ -954,14 +977,24 @@ impl StopPollLogEvent {
 // The manager env (the `Td *td_` / `G()` slice of the collapsed manager)
 // ---------------------------------------------------------------------------
 
-/// The `Td *td_` surface the collapsed PollManager reads. The wire query
+/// The `Td *td_` surface the collapsed PollManager reads. The five wire
 /// tails (`SendVoteQuery`/`GetPollResultsQuery`/`GetPollVotersQuery`/
-/// `StopPollQuery`/`DeletePollAnswerQuery`) are **[blocked: net]**: the
-/// promises park in the pending maps unanswered, exactly like the C++
-/// request without a network. The `messages_manager_` lookups are
+/// `StopPollQuery`/`DeletePollAnswerQuery`) ride the net-drain 39 plane:
+/// the [`send_vote_query`]/[`send_get_poll_results_query`]/
+/// [`send_get_poll_voters_query`]/[`send_stop_poll_query`]/
+/// [`send_delete_poll_answer_query`] arms dispatch (the net-inert log
+/// in the `None` band parks the promises, exactly the C++ request
+/// without a network) and the answers re-enter through the
+/// `PollNetKind` router. The `messages_manager_` lookups are
 /// **[blocked: M.10 integration]** seams; the web-page registration rides
 /// the M.17 line (the `WebPageId` newtype lands there — the seam carries
 /// the raw id).
+///
+/// [`send_vote_query`]: PollManagerEnv::send_vote_query
+/// [`send_get_poll_results_query`]: PollManagerEnv::send_get_poll_results_query
+/// [`send_get_poll_voters_query`]: PollManagerEnv::send_get_poll_voters_query
+/// [`send_stop_poll_query`]: PollManagerEnv::send_stop_poll_query
+/// [`send_delete_poll_answer_query`]: PollManagerEnv::send_delete_poll_answer_query
 pub trait PollManagerEnv: PollStoreEnv {
     // -- G() --
     fn auth_is_bot(&self) -> bool;
@@ -1048,6 +1081,106 @@ pub trait PollManagerEnv: PollStoreEnv {
         skip_trim: bool,
         source: &str,
     ) -> FormattedText;
+
+    // -- the net-drain 39 plane (the five wire tails; the send arms
+    //    resolve the peers at the send leg, the §0.2 recipe) --
+
+    /// `SendVoteQuery::send` (PollManager.cpp:247-265) — the input peer
+    /// resolves at the send leg; `Err` is the None-peer 400 band (the
+    /// manager runs the handler's on_error head + the full answer ladder
+    /// with it); `Ok(())` covers the dispatched query and the net-inert
+    /// log alike (the promise parks in `pending_answers`, the C++
+    /// request without a network). The generation rides the wire kind
+    /// (the query identity, §5); the C++ `{{poll_id}, {dialog_id_}}`
+    /// invoke-after chains stay unmodeled (the collapsed dispatcher
+    /// carries no chains).
+    fn send_vote_query(
+        &mut self,
+        message_full_id: &MessageFullId,
+        options: Vec<String>,
+        generation: u64,
+    ) -> Result<(), tdutils::status::Status>;
+
+    /// `GetPollResultsQuery::send` (PollManager.cpp:79-90) — `false` is
+    /// the None-peer `promise.set_value(nullptr)` band (the Ok(null)
+    /// answer drops through the intake without touching state);
+    /// `true` covers the dispatched query and the net-inert log.
+    fn send_get_poll_results_query(
+        &mut self,
+        message_full_id: &MessageFullId,
+        poll_hash: i64,
+        generation: u64,
+    ) -> bool;
+
+    /// `GetPollVotersQuery::send` (PollManager.cpp:120-140) — the input
+    /// peer resolves at the send leg; `Err` is the None-peer 400 band
+    /// (the handler settles the promise directly — no dialog-error head
+    /// — and the manager routes it through the full answer intake). The
+    /// (poll_id, option_id) pair rides the wire kind (the query
+    /// identity, §5).
+    fn send_get_poll_voters_query(
+        &mut self,
+        message_full_id: &MessageFullId,
+        poll_id: PollId,
+        option_id: i32,
+        option: Vec<u8>,
+        offset: &str,
+        limit: i32,
+    ) -> Result<(), tdutils::status::Status>;
+
+    /// `StopPollQuery::send` (PollManager.cpp:287-322) — the input peer
+    /// (Edit rights) resolves at the send leg; `Err` is the None-peer
+    /// 400 band (the manager routes it through on_stop_poll_finished,
+    /// so the being_closed/binlog erase + the promise error all run).
+    fn send_stop_poll_query(
+        &mut self,
+        message_full_id: &MessageFullId,
+        reply_markup: Option<&crate::reply_markup::ReplyMarkup>,
+        poll_id: PollId,
+    ) -> Result<(), tdutils::status::Status>;
+
+    /// `DeletePollAnswerQuery::send` (PollManager.cpp:205-217) — the
+    /// input peer resolves at the send leg; `Err` is the None-peer 400
+    /// band (the manager runs the dialog-error head + the promise
+    /// error).
+    fn send_delete_poll_answer_query(
+        &mut self,
+        message_full_id: &MessageFullId,
+        option_id: Vec<u8>,
+    ) -> Result<(), tdutils::status::Status>;
+
+    /// `MessagesManager::on_get_message_error(dialog_id, message_id,
+    /// status, source)` — [blocked: M.10]; the default answers `false`
+    /// (the error not consumed → the caller logs).
+    fn on_get_message_error(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: crate::messages_manager::MessageId,
+        _status: &tdutils::status::Status,
+        _source: &str,
+    ) -> bool {
+        tdutils::log_info!("MessagesManager::on_get_message_error — [blocked: M.10 Messages]");
+        false
+    }
+
+    /// `DialogManager::on_get_dialog_error(dialog_id, status, source)`
+    /// — `true` when the error was consumed.
+    fn on_get_dialog_error(
+        &mut self,
+        _dialog_id: DialogId,
+        _status: &tdutils::status::Status,
+        _source: &str,
+    ) -> bool {
+        false
+    }
+
+    /// `UserManager::on_get_users(users, source)` — the GetPollVoters
+    /// answer feed (cpp:1659).
+    fn on_get_users(&mut self, _users: Vec<tdmtproto::telegram_api::User>, _source: &str) {}
+
+    /// `ChatManager::on_get_chats(chats, source)` — the GetPollVoters
+    /// answer feed (cpp:1660).
+    fn on_get_chats(&mut self, _chats: Vec<tdmtproto::telegram_api::Chat>, _source: &str) {}
 }
 
 /// The concrete env over the live `Td` fields — built by `poll_env_split`
@@ -1062,6 +1195,8 @@ pub(crate) struct PollManagerEnvImpl<'a> {
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The net-drain 39 dispatch surface (`None` in the net-inert tests).
+    pub(crate) net: Option<crate::td::PollNetHandle>,
 }
 
 /// `PollManager::PendingPollAnswer` (PollManager.h:312-319).
@@ -1071,8 +1206,9 @@ pub struct PendingPollAnswer {
     pub(crate) promises: Vec<Promise<()>>,
     pub(crate) generation: u64,
     pub(crate) log_event_id: u64,
-    /// `NetQueryRef query_ref_` — the collapsed line keeps only the
-    /// finished flag ([blocked: net] on the query itself).
+    /// `NetQueryRef query_ref_` — the in-flight cancel stays unmodeled;
+    /// the answer's `generation` check subsumes the stale query (the
+    /// finished flag is what the state machine reads).
     pub(crate) is_finished: bool,
 }
 
@@ -1083,6 +1219,65 @@ pub struct PollOptionVoters {
     pub(crate) next_offset: String,
     pub(crate) pending_queries: Vec<Promise<td_api::PollVoters>>,
     pub(crate) was_invalidated: bool,
+}
+
+/// The PollManager in-flight query kinds — the C++ ResultHandler classes
+/// of the net-drain 39 families (PollManager.cpp:67-332). The variants
+/// carry the identity the C++ promise lambdas capture ([`PollId`] pairs
+/// with a globally-unique `generation` where the C++ captures one), so an
+/// out-of-order answer pairs with its own query (§5 — the query-carried
+/// promise identity); the rest of the handler state rides the
+/// [`PendingPollNetQueries`] lots. The kinds stay `Copy`.
+#[derive(Clone, Copy)]
+pub(crate) enum PollNetKind {
+    /// `SendVoteQuery` (cpp:236) — `messages.sendVote`; the answer
+    /// re-enters `on_set_poll_answer` with the captured generation
+    /// (cpp:1381-1386). The generation is globally unique
+    /// (`++current_generation_`), so it identifies the query even when a
+    /// replaced vote's stale answer lands late.
+    SendVote { generation: u64 },
+    /// `GetPollResultsQuery` (cpp:67) — `messages.getPollResults`; the
+    /// answer re-enters `on_get_poll_results` with the captured
+    /// generation (cpp:1859-1866).
+    GetPollResults { generation: u64 },
+    /// `GetPollVotersQuery` (cpp:109) — `messages.getPollVotes`; the
+    /// (poll_id, option_id) pair is unique among the in-flight queries
+    /// (the pending_queries guard allows one per option).
+    GetPollVoters { poll_id: PollId, option_id: i32 },
+    /// `StopPollQuery` (cpp:278) — `messages.editMessage` with the
+    /// closed-`inputMediaPoll`; one in-flight query per poll (the
+    /// `being_closed_polls` guard).
+    StopPoll { poll_id: PollId },
+    /// `DeletePollAnswerQuery` (cpp:199) — `messages.deletePollAnswer`;
+    /// the C++ handler carries only the promise, so the lot is a plain
+    /// positional FIFO.
+    DeletePollAnswer,
+}
+
+/// The parked query state of the net-drain 39 families — the
+/// ResultHandler members the [`PollNetKind`] identities can't carry.
+/// Entries pair with the wire answers by the kind-carried identity (a
+/// positional FIFO for DeletePollAnswer, §5); the SendVote promise
+/// parks in `pending_answers` and the GetPollVoters promises park in
+/// `poll_voters[..].pending_queries` exactly like the C++.
+#[derive(Default)]
+pub(crate) struct PendingPollNetQueries {
+    /// `SendVoteQuery`'s `dialog_id_` keyed by its generation — (poll_id,
+    /// generation, dialog_id).
+    pub(crate) send_vote: Vec<(PollId, u64, DialogId)>,
+    /// `GetPollResultsQuery`'s `poll_id_`/`dialog_id_`/`message_id_`
+    /// keyed by its generation.
+    pub(crate) get_poll_results: Vec<(PollId, u64, DialogId, crate::messages_manager::MessageId)>,
+    /// `GetPollVotersQuery`'s lambda captures — (offset at send, the
+    /// un-maxed limit, dialog_id) keyed by (poll_id, option_id).
+    pub(crate) get_poll_voters: Vec<(PollId, i32, String, i32, DialogId)>,
+    /// `StopPollQuery` — (message_full_id, log_event_id, promise): the
+    /// C++ `new_promise` lambda tuple (PollManager.cpp:1779-1784), keyed
+    /// by the poll id.
+    pub(crate) stop_poll: Vec<(PollId, MessageFullId, u64, Promise<()>)>,
+    /// `DeletePollAnswerQuery::promise_` with the dialog id the error
+    /// head reads — positional FIFO.
+    pub(crate) delete_poll_answer: Vec<(DialogId, Promise<()>)>,
 }
 
 /// `PollManager` (PollManager.h:47) — the collapsed actor. The three
@@ -1098,13 +1293,15 @@ pub struct PollManager {
     pub(crate) reply_poll_counts: HashMap<PollId, i32>,
     pub(crate) pending_answers: HashMap<PollId, PendingPollAnswer>,
     pub(crate) poll_voters: HashMap<PollId, Vec<PollOptionVoters>>,
+    /// The parked query state of the net-drain 39 families.
+    pub(crate) pending_net: PendingPollNetQueries,
     pub(crate) loaded_from_database_polls: HashSet<PollId>,
     pub(crate) being_closed_polls: HashSet<PollId>,
     pub(crate) current_local_poll_id: i64,
     pub(crate) current_generation: u64,
     /// `update_poll_timeout_` — `add_timeout_in` keeps the earlier
     /// deadline, `set_timeout_in` replaces it (the MultiTimeout contract).
-    update_poll_timeout: HashMap<i64, f64>,
+    pub(crate) update_poll_timeout: HashMap<i64, f64>,
     close_poll_timeout: HashMap<i64, f64>,
     unload_poll_timeout: HashMap<i64, f64>,
     /// The learned MultiTimeout clock — the last `env.now()` an
@@ -1993,18 +2190,35 @@ impl PollManager {
     }
 
     /// `PollManager::delete_poll_option` (PollManager.cpp:1233-1236) —
-    /// the DeletePollAnswerQuery tail is [blocked: net].
+    /// the `DeletePollAnswerQuery` send: the C++ handler holds only the
+    /// promise, so the lot is a positional FIFO; the send-leg None-peer
+    /// band routes the handler's on_error head (dialog error + the
+    /// promise error).
     pub fn delete_poll_option(
         &mut self,
         env: &mut impl PollManagerEnv,
         message_full_id: MessageFullId,
-        _option_id: String,
+        option_id: String,
         mut promise: Promise<()>,
     ) {
+        // TRY_STATUS_PROMISE(promise, get_message_poll_id(…)) (cpp:1234)
         if let Err(status) = env.get_message_poll_id(&message_full_id, false) {
             promise.set_error(status);
+            return;
         }
-        // [blocked: net]: the DeletePollAnswerQuery tail.
+        let dialog_id = message_full_id.get_dialog_id();
+        self.pending_net
+            .delete_poll_answer
+            .push((dialog_id, promise));
+        if let Err(status) =
+            env.send_delete_poll_answer_query(&message_full_id, option_id.into_bytes())
+        {
+            // `DeletePollAnswerQuery::send`'s None-peer band (cpp:206-209)
+            // runs the on_error head with the parked promise
+            let (_, mut promise) = self.pending_net.delete_poll_answer.pop().unwrap();
+            env.on_get_dialog_error(dialog_id, &status, "DeletePollAnswerQuery");
+            promise.set_error(status);
+        }
     }
 
     /// `PollManager::set_poll_answer` (PollManager.cpp:1238-1287).
@@ -2094,7 +2308,7 @@ impl PollManager {
     }
 
     /// `PollManager::do_set_poll_answer` (PollManager.cpp:1310-1388).
-    fn do_set_poll_answer(
+    pub(crate) fn do_set_poll_answer(
         &mut self,
         env: &mut impl PollManagerEnv,
         poll_id: PollId,
@@ -2150,8 +2364,10 @@ impl PollManager {
         }
 
         // The in-flight query cancel + promise release of the C++ happens
-        // when a DIFFERENT answer replaces it; the [blocked: net] line
-        // never has a query in flight, so only the promises release.
+        // when a DIFFERENT answer replaces it; the wire answer of the
+        // replaced query rides a stale generation and returns before any
+        // state touch — the generation check subsumes the cancel. Only
+        // the promises release here.
         if had_promises {
             let promises =
                 std::mem::take(&mut self.pending_answers.get_mut(&poll_id).unwrap().promises);
@@ -2159,6 +2375,10 @@ impl PollManager {
                 old_promise.set_value(());
             }
         }
+
+        // the C++ `sent_options` copy (cpp:1360-1364) — the option data
+        // rides the wire before `options` moves into the pending record
+        let sent_options: Vec<String> = options.clone();
 
         self.current_generation += 1;
         let generation = self.current_generation;
@@ -2172,30 +2392,101 @@ impl PollManager {
 
         self.notify_on_poll_update(env, poll_id);
 
-        // [blocked: net]: the SendVoteQuery tail — the promise parks in
-        // pending_answers_, unanswered offline.
+        // `SendVoteQuery::send` (PollManager.cpp:247-265) — the lot parks
+        // the handler's `dialog_id_` keyed by the generation; the
+        // send-leg None-peer band runs the handler's on_error head
+        // (dialog error) and routes the error through the full answer
+        // ladder (`on_set_poll_answer` with the 400), exactly the C++
+        // `return on_error(Status)` tail. The promise stays in
+        // pending_answers either way.
+        let dialog_id = message_full_id.get_dialog_id();
+        self.pending_net
+            .send_vote
+            .push((poll_id, generation, dialog_id));
+        if let Err(status) = env.send_vote_query(&message_full_id, sent_options, generation) {
+            // no query was dispatched — the handler dies at the send leg
+            // (the C++ `return on_error(...)`); its lot entry goes with it
+            let index = self
+                .pending_net
+                .send_vote
+                .iter()
+                .position(|&(_, generation_, _)| generation_ == generation)
+                .unwrap();
+            self.pending_net.send_vote.remove(index);
+            tdutils::log_info!("Can't set poll answer, because have no read access to {dialog_id}");
+            env.on_get_dialog_error(dialog_id, &status, "SendVoteQuery");
+            self.on_set_poll_answer_wire(env, poll_id, generation, Err(status));
+        }
     }
 
-    /// `PollManager::on_set_poll_answer` (PollManager.cpp:1390-1429) — the
-    /// query-result half; offline it stays parked, but the binlog replay
-    /// reaches do_set_poll_answer directly.
-    /// The net-result intakes; wired by the M.10 message-plane union
-    /// ([blocked: M.10 integration]).
-    #[allow(dead_code)]
-    fn on_set_poll_answer_result(
+    /// The `SendVoteQuery` answer — the C++ handler's `on_result`/
+    /// `on_error` (PollManager.cpp:266-306): the lot pairs the answer
+    /// with its query by the kind-carried generation; the error band
+    /// runs the dialog-error head, then the promise tail re-enters
+    /// `on_set_poll_answer`. Returns the parsed updates + the
+    /// (poll_id, generation) pair for the router's engine feed (the
+    /// `Unit()` lambda tail finishes the ladder); `None` when the
+    /// ladder settled (or dropped) without one.
+    pub(crate) fn on_send_vote_answer(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        generation: u64,
+        wire: std::result::Result<tdmtproto::telegram_api::Updates, tdutils::status::Status>,
+    ) -> Option<(tdmtproto::telegram_api::Updates, PollId, u64)> {
+        let Some(index) = self
+            .pending_net
+            .send_vote
+            .iter()
+            .position(|&(_, generation_, _)| generation_ == generation)
+        else {
+            // an answer for a query this manager never sent (or already
+            // answered) — the C++ handler instance is gone either way
+            return None;
+        };
+        let (poll_id, _, dialog_id) = self.pending_net.send_vote.remove(index);
+        if let Err(status) = &wire {
+            // `SendVoteQuery::on_error` (cpp:299-304)
+            env.on_get_dialog_error(dialog_id, status, "SendVoteQuery");
+        }
+        self.on_set_poll_answer_wire(env, poll_id, generation, wire)
+            .map(|updates| (updates, poll_id, generation))
+    }
+
+    /// `PollManager::on_set_poll_answer` (PollManager.cpp:1390-1429) —
+    /// the query-result half: the close_flag drop, the pending-entry +
+    /// generation guards, the binlog erase + `is_finished` pre-section,
+    /// then either the updates feed (the router passes the parsed
+    /// answer; the `Unit()` lambda tail finishes the ladder) or the
+    /// direct error finish. Returns the parsed updates for the router's
+    /// engine feed; `None` when the ladder settled (or dropped) without
+    /// one. The binlog replay reaches `do_set_poll_answer` directly.
+    pub(crate) fn on_set_poll_answer_wire(
         &mut self,
         env: &mut impl PollManagerEnv,
         poll_id: PollId,
         generation: u64,
-    ) {
-        let Some(pending_answer) = self.pending_answers.get(&poll_id) else {
-            return;
-        };
-        debug_assert!(!pending_answer.promises.is_empty());
-        if pending_answer.generation != generation {
-            return;
+        wire: std::result::Result<tdmtproto::telegram_api::Updates, tdutils::status::Status>,
+    ) -> Option<tdmtproto::telegram_api::Updates> {
+        if env.close_flag() && wire.is_err() {
+            // the request will be re-sent after restart (cpp:1393-1395)
+            return None;
         }
-        let log_event_id = pending_answer.log_event_id;
+        // can happen if this is an answer with mismatched generation
+        // and server has ignored invoke-after (cpp:1396-1399)
+        self.pending_answers.get(&poll_id)?;
+        let pending_generation = self.pending_answers.get(&poll_id).unwrap().generation;
+        if pending_generation != generation {
+            return None;
+        }
+        debug_assert!(
+            !self
+                .pending_answers
+                .get(&poll_id)
+                .unwrap()
+                .promises
+                .is_empty()
+        );
+        let log_event_id = self.pending_answers.get(&poll_id).unwrap().log_event_id;
         if log_event_id != 0 {
             env.binlog_erase(log_event_id);
             self.pending_answers.get_mut(&poll_id).unwrap().log_event_id = 0;
@@ -2204,13 +2495,20 @@ impl PollManager {
         if self.polls.contains_key(&poll_id) {
             self.set_was_saved(poll_id, false);
         }
-        // The updates_manager on_get_updates fan-out is the net half.
-        self.on_set_poll_answer_finished(env, poll_id, Ok(()), generation);
+        match wire {
+            // the router feeds the engine and the `Unit()` lambda tail
+            // (cpp:1417-1422) finishes the ladder with Ok(())
+            Ok(updates) => Some(updates),
+            Err(status) => {
+                self.on_set_poll_answer_finished(env, poll_id, Err(status), generation);
+                None
+            }
+        }
     }
 
     /// `PollManager::on_set_poll_answer_finished`
     /// (PollManager.cpp:1431-1469).
-    fn on_set_poll_answer_finished(
+    pub(crate) fn on_set_poll_answer_finished(
         &mut self,
         env: &mut impl PollManagerEnv,
         poll_id: PollId,
@@ -2472,8 +2770,230 @@ impl PollManager {
             self.unload_poll_timeout.remove(&poll_id.get());
         }
 
-        // [blocked: net]: the GetPollVotersQuery tail — the promise parks
-        // in pending_queries, unanswered offline.
+        // `GetPollVotersQuery::send` (PollManager.cpp:1609-1617) — the
+        // lot parks the lambda captures ((poll_id, option_id) identity,
+        // the offset captured at send, the un-maxed limit, the handler's
+        // dialog_id_); the promise stays in pending_queries like the
+        // C++. The send-leg None-peer band settles the promise directly
+        // (no dialog-error head — cpp:122-125) by routing the 400
+        // through the full answer intake (the parked promises fail
+        // there).
+        let offset = self.poll_voters.get(&poll_id).unwrap()[option_id as usize]
+            .next_offset
+            .clone();
+        let dialog_id = message_full_id.get_dialog_id();
+        self.pending_net.get_poll_voters.push((
+            poll_id,
+            option_id,
+            offset.clone(),
+            limit,
+            dialog_id,
+        ));
+        let option = poll.options[option_id as usize]
+            .get_data()
+            .as_bytes()
+            .to_vec();
+        if let Err(status) = env.send_get_poll_voters_query(
+            &message_full_id,
+            poll_id,
+            option_id,
+            option,
+            &offset,
+            limit,
+        ) {
+            // no query was dispatched — the handler dies at the send leg
+            // (cpp:123-125)
+            tdutils::log_info!("Can't get poll, because have no read access to {dialog_id}");
+            let index = self
+                .pending_net
+                .get_poll_voters
+                .iter()
+                .position(|&(poll_id_, option_id_, ..)| {
+                    poll_id_ == poll_id && option_id_ == option_id
+                })
+                .unwrap();
+            self.pending_net.get_poll_voters.remove(index);
+            self.on_get_poll_voters_result(env, poll_id, option_id, offset, limit, Err(status));
+        }
+    }
+
+    /// The `GetPollVotersQuery` answer — the C++ handler's
+    /// `on_result`/`on_error` (PollManager.cpp:134-162): the lot pairs
+    /// the answer with its query by the (poll_id, option_id) identity;
+    /// the error band runs the dialog-error head with the
+    /// MESSAGE_ID_INVALID log carve-out, then the promise tail re-enters
+    /// the intake.
+    pub(crate) fn on_get_poll_voters_answer(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        poll_id: PollId,
+        option_id: i32,
+        wire: std::result::Result<
+            tdmtproto::telegram_api::messages_VotesList,
+            tdutils::status::Status,
+        >,
+    ) {
+        let Some(index) = self
+            .pending_net
+            .get_poll_voters
+            .iter()
+            .position(|&(poll_id_, option_id_, ..)| poll_id_ == poll_id && option_id_ == option_id)
+        else {
+            // an answer for a query this manager never sent (or already
+            // answered) — the C++ handler instance is gone either way
+            return;
+        };
+        let (_, _, offset, limit, dialog_id) = self.pending_net.get_poll_voters.remove(index);
+        if let Err(status) = &wire {
+            // `GetPollVotersQuery::on_error` (cpp:155-161)
+            if !env.on_get_dialog_error(dialog_id, status, "GetPollVotersQuery")
+                && status.message() != "MESSAGE_ID_INVALID"
+            {
+                tdutils::log_error!("Receive {status}, while trying to get voters of {poll_id}");
+            }
+        }
+        self.on_get_poll_voters_result(env, poll_id, option_id, offset, limit, wire);
+    }
+
+    /// `PollManager::on_get_poll_voters` (PollManager.cpp:1619-1710) —
+    /// the answer intake; the parked `pending_queries` promises settle
+    /// here (the None-peer band routes its 400 through the same
+    /// ladder).
+    pub(crate) fn on_get_poll_voters_result(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        poll_id: PollId,
+        option_id: i32,
+        offset: String,
+        limit: i32,
+        wire: std::result::Result<
+            tdmtproto::telegram_api::messages_VotesList,
+            tdutils::status::Status,
+        >,
+    ) {
+        // `G()->ignore_result_if_closing` (Global.h:706-709) — a closing
+        // Td converts an Ok answer into the 500 request-aborted error;
+        // errors pass through.
+        let wire = if env.close_flag() && wire.is_ok() {
+            Err(tdutils::status::Status::error(500, "Request aborted"))
+        } else {
+            wire
+        };
+        let Some(poll) = self.get_poll(poll_id).cloned() else {
+            // the C++ CHECK(poll != nullptr)
+            panic!("poll {poll_id} not found in on_get_poll_voters");
+        };
+        if option_id < 0 || option_id as usize >= poll.options.len() {
+            tdutils::log_error!(
+                "Can't process voters for option {option_id} in {poll_id}, because it has only {} options",
+                poll.options.len()
+            );
+            return;
+        }
+        let wire = if poll.is_anonymous {
+            // just in case (cpp:1634-1636)
+            Err(tdutils::status::Status::error(400, "Poll is anonymous"))
+        } else {
+            wire
+        };
+
+        {
+            let voters = self.get_poll_option_voters(&poll, poll_id, option_id);
+            if voters.next_offset != offset {
+                tdutils::log_error!(
+                    "Expected results for option {option_id} in {poll_id} with offset {}, but received with {offset}",
+                    voters.next_offset
+                );
+                return;
+            }
+        }
+        let promises = {
+            let voters = self.get_poll_option_voters(&poll, poll_id, option_id);
+            std::mem::take(&mut voters.pending_queries)
+        };
+        if promises.is_empty() {
+            tdutils::log_error!("Have no waiting promises for option {option_id} in {poll_id}");
+            return;
+        }
+        let vote_list = match wire {
+            Err(status) => {
+                for mut promise in promises {
+                    promise.set_error(tdutils::status::Status::error(
+                        status.code(),
+                        status.message(),
+                    ));
+                }
+                return;
+            }
+            Ok(vote_list) => vote_list,
+        };
+
+        env.on_get_users(vote_list.users, "on_get_poll_voters");
+        env.on_get_chats(vote_list.chats, "on_get_poll_voters");
+
+        {
+            let voters = self.get_poll_option_voters(&poll, poll_id, option_id);
+            voters.next_offset = vote_list.next_offset.clone();
+        }
+        if poll.options[option_id as usize].voter_count != vote_list.count {
+            self.current_generation += 1;
+            timeout_set(&mut self.update_poll_timeout, poll_id.get(), 0.0, env.now());
+        }
+
+        let option_data = poll.options[option_id as usize]
+            .get_data()
+            .as_bytes()
+            .to_vec();
+        let mut voter_ids: Vec<(DialogId, i32)> = Vec::new();
+        for peer_vote in vote_list.votes {
+            let (peer, date) = match peer_vote {
+                tdmtproto::telegram_api::MessagePeerVote::messagePeerVote(voter) => {
+                    if voter.option != option_data {
+                        continue;
+                    }
+                    (voter.peer, voter.date)
+                }
+                tdmtproto::telegram_api::MessagePeerVote::messagePeerVoteInputOption(voter) => {
+                    (voter.peer, voter.date)
+                }
+                tdmtproto::telegram_api::MessagePeerVote::messagePeerVoteMultiple(voter) => {
+                    if !voter.options.contains(&option_data) {
+                        continue;
+                    }
+                    (voter.peer, voter.date)
+                }
+            };
+            let dialog_id = peer.as_ref().map(DialogId::from_peer).unwrap_or_default();
+            if dialog_id.is_valid() {
+                voter_ids.push((dialog_id, date));
+            } else {
+                tdutils::log_error!("Receive {dialog_id} as voter in {poll_id}");
+            }
+        }
+        {
+            let voters = self.get_poll_option_voters(&poll, poll_id, option_id);
+            voters.voters.extend_from_slice(&voter_ids);
+        }
+        // the C++ truncation rides the object copy — the map keeps every
+        // voter, the object carries the first `limit` (cpp:1694-1697)
+        if voter_ids.len() as i32 > limit {
+            voter_ids.truncate(limit as usize);
+        }
+        let known_voter_count = self
+            .poll_voters
+            .get(&poll_id)
+            .map(|poll_voters| poll_voters[option_id as usize].voters.len() as i32)
+            .unwrap_or(0);
+        if vote_list.next_offset.is_empty() && known_voter_count != vote_list.count {
+            let voters = self.get_poll_option_voters(&poll, poll_id, option_id);
+            voters.was_invalidated = true;
+        }
+
+        let total = std::cmp::max(vote_list.count, known_voter_count);
+        for mut promise in promises {
+            let object = self.get_poll_voters_object(env, total, &voter_ids);
+            promise.set_value(object);
+        }
     }
 
     /// `PollManager::stop_poll` (PollManager.cpp:1717-1746).
@@ -2494,11 +3014,20 @@ impl PollManager {
                 "Poll has already been closed",
             ));
         }
-        // `get_inline_reply_markup` + `has_message_sender_user_id` — the
-        // force-reply fold rides the M.10 seam; the collapsed line keeps
-        // the raw markup out of the log event exactly when it is None.
-        let _ = env.has_message_sender_user_id(&message_full_id);
-        let new_reply_markup = reply_markup; // [blocked: M.10 integration] for the fold
+        // `get_inline_reply_markup(reply_markup, is_bot,
+        // has_message_sender_user_id(message_full_id))` (PollManager.cpp:
+        // 1723-1725; ReplyMarkup.cpp:434-445) — the inline-only fold; the
+        // switch-inline allowance keys on the message sender being a user.
+        let switch_inline_buttons_allowed = env.has_message_sender_user_id(&message_full_id);
+        let new_reply_markup = match crate::reply_markup::get_inline_reply_markup(
+            reply_markup,
+            env.auth_is_bot(),
+            switch_inline_buttons_allowed,
+            env.is_test_dc(),
+        ) {
+            Ok(markup) => markup,
+            Err(status) => return promise.set_error(status),
+        };
         if is_local_poll_id(poll_id) {
             self.stop_local_poll(env, poll_id);
             promise.set_value(());
@@ -2524,12 +3053,12 @@ impl PollManager {
     }
 
     /// `PollManager::do_stop_poll` (PollManager.cpp:1766-1788).
-    fn do_stop_poll(
+    pub(crate) fn do_stop_poll(
         &mut self,
         env: &mut impl PollManagerEnv,
         poll_id: PollId,
         message_full_id: MessageFullId,
-        reply_markup: Option<td_api::ReplyMarkup>,
+        reply_markup: Option<crate::reply_markup::ReplyMarkup>,
         log_event_id: u64,
         promise: Promise<()>,
     ) {
@@ -2553,19 +3082,109 @@ impl PollManager {
         let is_inserted = self.being_closed_polls.insert(poll_id);
         debug_assert!(is_inserted);
 
-        // [blocked: net]: the StopPollQuery tail. Offline the poll is
-        // already closed + saved locally; the log event is erased and the
-        // promise parked — the C++ request without a network.
-        let _ = log_event_id;
-        let _ = promise;
+        // `StopPollQuery::send` (PollManager.cpp:287-322) — the lot
+        // parks the C++ `new_promise` lambda tuple (message_full_id,
+        // log_event_id, promise) keyed by the poll id; the send-leg
+        // None-peer band routes the handler's on_error head + the
+        // error through `on_stop_poll_finished`, so the being_closed
+        // erase + the binlog erase run on every band.
+        let dialog_id = message_full_id.get_dialog_id();
+        self.pending_net
+            .stop_poll
+            .push((poll_id, message_full_id, log_event_id, promise));
+        if let Err(status) =
+            env.send_stop_poll_query(&message_full_id, reply_markup.as_ref(), poll_id)
+        {
+            let index = self
+                .pending_net
+                .stop_poll
+                .iter()
+                .position(|&(poll_id_, ..)| poll_id_ == poll_id)
+                .unwrap();
+            let (_, message_full_id, log_event_id, promise) =
+                self.pending_net.stop_poll.remove(index);
+            tdutils::log_info!("Can't close poll, because have no edit access to {dialog_id}");
+            env.on_get_dialog_error(dialog_id, &status, "StopPollQuery");
+            self.on_stop_poll_finished(
+                env,
+                poll_id,
+                message_full_id,
+                log_event_id,
+                Err(status),
+                promise,
+            );
+        }
     }
 
-    /// `PollManager::on_stop_poll_finished` (PollManager.cpp:1790-1806) —
-    /// the local halves of the query-result landing.
-    /// The net-result landing; wired by the M.10 message-plane union
-    /// ([blocked: M.10 integration]).
-    #[allow(dead_code)]
-    fn on_stop_poll_finished(
+    /// The `StopPollQuery` answer — the C++ handler's
+    /// `on_result`/`on_error` (PollManager.cpp:294-332): the lot pairs
+    /// the answer with its query by the poll id; the error band runs
+    /// the MESSAGE_NOT_MODIFIED Ok settle (non-bot) or the
+    /// dialog-error head + the error finish; the Ok updates feed the
+    /// engine with the popped lambda tuple (the router's
+    /// `OnGetUpdatesStopPoll` hop runs `on_stop_poll_finished` after
+    /// the engine).
+    pub(crate) fn on_stop_poll_answer(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        poll_id: PollId,
+        wire: std::result::Result<tdmtproto::telegram_api::Updates, tdutils::status::Status>,
+    ) -> Option<(
+        tdmtproto::telegram_api::Updates,
+        MessageFullId,
+        u64,
+        Promise<()>,
+    )> {
+        let Some(index) = self
+            .pending_net
+            .stop_poll
+            .iter()
+            .position(|&(poll_id_, ..)| poll_id_ == poll_id)
+        else {
+            // an answer for a query this manager never sent (or already
+            // answered) — the C++ handler instance is gone either way
+            return None;
+        };
+        let (_, message_full_id, log_event_id, promise) = self.pending_net.stop_poll.remove(index);
+        match wire {
+            Err(status) => {
+                // `StopPollQuery::on_error` (cpp:323-332)
+                if !env.auth_is_bot() && status.message() == "MESSAGE_NOT_MODIFIED" {
+                    self.on_stop_poll_finished(
+                        env,
+                        poll_id,
+                        message_full_id,
+                        log_event_id,
+                        Ok(()),
+                        promise,
+                    );
+                    return None;
+                }
+                env.on_get_dialog_error(message_full_id.get_dialog_id(), &status, "StopPollQuery");
+                self.on_stop_poll_finished(
+                    env,
+                    poll_id,
+                    message_full_id,
+                    log_event_id,
+                    Err(status),
+                    promise,
+                );
+                None
+            }
+            // the router feeds the engine, then the C++ promise-lambda
+            // tail runs `on_stop_poll_finished` with the engine's
+            // result (cpp:1778-1783)
+            Ok(updates) => Some((updates, message_full_id, log_event_id, promise)),
+        }
+    }
+
+    /// `PollManager::on_stop_poll_finished` (PollManager.cpp:1790-1806)
+    /// — the query-result landing: the being_closed erase, the binlog
+    /// erase, the bot re-register band and the promise settle (the
+    /// MESSAGE_NOT_MODIFIED band routes its Ok through here too — the
+    /// C++ promise-lambda always runs).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_stop_poll_finished(
         &mut self,
         env: &mut impl PollManagerEnv,
         poll_id: PollId,
@@ -2633,7 +3252,10 @@ impl PollManager {
     }
 
     /// `PollManager::on_update_poll_timeout` (PollManager.cpp:1840-1867) —
-    /// the local checks, then the GetPollResultsQuery tail [blocked: net].
+    /// the local checks, then the `GetPollResultsQuery` send: the
+    /// captured generation rides the kind, the promise is empty (the
+    /// C++ `Promise<Unit>()`; the answer re-enters
+    /// `on_get_poll_results` through the router).
     fn on_update_poll_timeout(&mut self, env: &mut impl PollManagerEnv, poll_id: PollId) {
         if env.close_flag() {
             return;
@@ -2641,12 +3263,161 @@ impl PollManager {
         debug_assert!(!env.auth_is_bot());
         debug_assert!(!is_local_poll_id(poll_id));
 
-        let Some(poll) = self.get_poll(poll_id) else {
+        let Some(poll) = self.get_poll(poll_id).cloned() else {
             return;
         };
-        // [blocked: net]: the query send; the closed-poll, pending-answers
-        // and server-poll guards ride it.
-        let _ = (poll.is_closed, poll.is_updated_after_close);
+        if poll.is_closed && poll.is_updated_after_close {
+            return;
+        }
+        if self.pending_answers.contains_key(&poll_id) {
+            tdutils::log_info!("Skip fetching results of {poll_id}, because it is being voted now");
+            return;
+        }
+        let Some(message_full_id) = self.server_poll_messages.get(&poll_id).and_then(|ids| {
+            // the C++ `get_random()` spread pick collapses to an
+            // arbitrary element
+            ids.iter().next().copied()
+        }) else {
+            return;
+        };
+        tdutils::log_info!("Fetching results of {poll_id} from {message_full_id:?}");
+        let generation = self.current_generation;
+
+        // `GetPollResultsQuery::send` (PollManager.cpp:79-90) — the lot
+        // parks the handler's `poll_id_`/`dialog_id_`/`message_id_`
+        // keyed by the generation; the send-leg None-peer band is
+        // `promise.set_value(nullptr)`: the Ok(null) answer drops
+        // through the intake without touching state, so no query parks
+        // at all.
+        let dialog_id = message_full_id.get_dialog_id();
+        let message_id = message_full_id.get_message_id();
+        let dispatched = env.send_get_poll_results_query(&message_full_id, poll.hash, generation);
+        if !dispatched {
+            tdutils::log_info!("Can't reget poll, because have no read access to {dialog_id}");
+            return;
+        }
+        self.pending_net
+            .get_poll_results
+            .push((poll_id, generation, dialog_id, message_id));
+    }
+
+    /// The `GetPollResultsQuery` answer — the C++ handler's
+    /// `on_result`/`on_error` (PollManager.cpp:91-110): the lot pairs
+    /// the answer with its query by the kind-carried generation; the
+    /// error band runs the messages-error head + the log, then the
+    /// promise tail re-enters the intake.
+    pub(crate) fn on_get_poll_results_answer(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        generation: u64,
+        wire: std::result::Result<
+            Option<tdmtproto::telegram_api::Updates>,
+            tdutils::status::Status,
+        >,
+    ) -> Option<tdmtproto::telegram_api::Updates> {
+        let Some(index) = self
+            .pending_net
+            .get_poll_results
+            .iter()
+            .position(|&(_, generation_, _, _)| generation_ == generation)
+        else {
+            // an answer for a query this manager never sent (or already
+            // answered) — the C++ handler instance is gone either way
+            return None;
+        };
+        let (poll_id, _, dialog_id, message_id) = self.pending_net.get_poll_results.remove(index);
+        if let Err(status) = &wire {
+            // `GetPollResultsQuery::on_error` (cpp:100-107)
+            if !env.on_get_message_error(dialog_id, message_id, status, "GetPollResultsQuery") {
+                tdutils::log_error!("Receive {status}, while trying to get results of {poll_id}");
+            }
+        }
+        self.on_get_poll_results_result(env, poll_id, generation, wire)
+    }
+
+    /// The `DeletePollAnswerQuery` answer — the C++ handler's
+    /// `on_result`/`on_error` (PollManager.cpp:216-234): the promise
+    /// pops FIFO (the C++ handler carries only the promise); the error
+    /// band runs the dialog-error head + the promise error, the Ok band
+    /// hands the promise to the updates tail.
+    pub(crate) fn on_delete_poll_answer_answer(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        wire: std::result::Result<tdmtproto::telegram_api::Updates, tdutils::status::Status>,
+    ) -> Option<(tdmtproto::telegram_api::Updates, Promise<()>)> {
+        let Some((dialog_id, mut promise)) = (!self.pending_net.delete_poll_answer.is_empty())
+            .then(|| self.pending_net.delete_poll_answer.remove(0))
+        else {
+            // an answer for a query this manager never sent (or already
+            // answered) — the C++ handler instance is gone either way
+            return None;
+        };
+        match wire {
+            Err(status) => {
+                // `DeletePollAnswerQuery::on_error` (cpp:228-233)
+                env.on_get_dialog_error(dialog_id, &status, "DeletePollAnswerQuery");
+                promise.set_error(status);
+                None
+            }
+            // `td_->updates_manager_->on_get_updates(result,
+            // std::move(promise_))` (cpp:222-226) — the router feeds the
+            // engine with the popped promise
+            Ok(updates) => Some((updates, promise)),
+        }
+    }
+
+    /// `PollManager::on_get_poll_results` (PollManager.cpp:1940-1975) —
+    /// the answer intake; returns the parsed updates for the router's
+    /// engine feed (the C++ passes an empty promise, `Promise<Unit>()`).
+    pub(crate) fn on_get_poll_results_result(
+        &mut self,
+        env: &mut impl PollManagerEnv,
+        poll_id: PollId,
+        generation: u64,
+        wire: std::result::Result<
+            Option<tdmtproto::telegram_api::Updates>,
+            tdutils::status::Status,
+        >,
+    ) -> Option<tdmtproto::telegram_api::Updates> {
+        // `G()->ignore_result_if_closing` (Global.h:706-709).
+        let wire = if env.close_flag() && wire.is_ok() {
+            Err(tdutils::status::Status::error(500, "Request aborted"))
+        } else {
+            wire
+        };
+        let poll = self.get_poll(poll_id).cloned()?;
+        match wire {
+            Err(_) => {
+                if !(env.close_flag()
+                    || env.auth_is_bot()
+                    || (poll.is_closed && poll.is_updated_after_close))
+                {
+                    let timeout = self.get_polling_timeout(env);
+                    tdutils::log_info!("Schedule updating of {poll_id} in {timeout}");
+                    timeout_add(
+                        &mut self.update_poll_timeout,
+                        poll_id.get(),
+                        timeout,
+                        env.now(),
+                    );
+                }
+                None
+            }
+            Ok(None) => None,
+            Ok(Some(updates)) => {
+                if generation != self.current_generation {
+                    tdutils::log_info!("Receive possibly outdated result of {poll_id}, reget it");
+                    if !(env.close_flag()
+                        || env.auth_is_bot()
+                        || (poll.is_closed && poll.is_updated_after_close))
+                    {
+                        timeout_set(&mut self.update_poll_timeout, poll_id.get(), 0.0, env.now());
+                    }
+                    return None;
+                }
+                Some(updates)
+            }
+        }
     }
 
     /// `PollManager::on_close_poll_timeout` (PollManager.cpp:1869-1894).
@@ -4185,5 +4956,1067 @@ mod tests {
             "Correct quiz option list must be non-empty"
         );
         let _: Result<(), Status> = check_quiz_correct_option_ids(&[0], 1, false);
+    }
+
+    // ---------------------------------------------------------------------------
+    // The net-drain 39 band tests (the five wire families)
+    // ---------------------------------------------------------------------------
+
+    /// The band-test env: the full [`PollManagerEnv`] surface over
+    /// recording fields (the callback-queries TestEnv convention). The
+    /// send arms record their parameters; `peer = None` answers the
+    /// send-leg None bands.
+    struct TestEnv {
+        store: TestStoreEnv,
+        bot: bool,
+        closing: bool,
+        use_message_database: bool,
+        /// `get_message_poll_id` answers `Ok(known_poll)` unless
+        /// `poll_not_found` flips.
+        known_poll: PollId,
+        poll_not_found: bool,
+        peer: Option<tdmtproto::telegram_api::InputPeer>,
+        queries: Vec<String>,
+        dialog_errors: Vec<(String, String)>,
+        message_errors: Vec<(String, String)>,
+        intake_users: usize,
+        intake_chats: usize,
+        binlog_adds: Vec<(i32, u64)>,
+        binlog_erases: Vec<u64>,
+    }
+
+    impl Default for TestEnv {
+        fn default() -> TestEnv {
+            TestEnv {
+                store: TestStoreEnv::default(),
+                bot: false,
+                closing: false,
+                use_message_database: false,
+                known_poll: PollId::new(31),
+                poll_not_found: false,
+                peer: Some(tdmtproto::telegram_api::InputPeer::inputPeerSelf(
+                    tdmtproto::telegram_api::inputPeerSelf {},
+                )),
+                queries: Vec::new(),
+                dialog_errors: Vec::new(),
+                message_errors: Vec::new(),
+                intake_users: 0,
+                intake_chats: 0,
+                binlog_adds: Vec::new(),
+                binlog_erases: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::photo::PhotoStoreEnv for TestEnv {
+        fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store.store_file_id(file_id, out);
+        }
+
+        fn parse_file_id(&mut self, parser: &mut Parser<'_>) -> Result<FileId, &'static str> {
+            self.store.parse_file_id(parser)
+        }
+    }
+
+    impl PollStoreEnv for TestEnv {
+        fn store_poll_media(&mut self, media_type: i32, out: &mut Vec<u8>) {
+            self.store.store_poll_media(media_type, out);
+        }
+
+        fn parse_poll_media(&mut self, parser: &mut Parser<'_>) -> Result<i32, &'static str> {
+            self.store.parse_poll_media(parser)
+        }
+    }
+
+    impl PollManagerEnv for TestEnv {
+        fn auth_is_bot(&self) -> bool {
+            self.bot
+        }
+
+        fn close_flag(&self) -> bool {
+            self.closing
+        }
+
+        fn use_message_database(&self) -> bool {
+            self.use_message_database
+        }
+
+        fn unix_time(&self) -> i32 {
+            1700000000
+        }
+
+        fn server_time(&self) -> f64 {
+            1700000000.0
+        }
+
+        fn now(&self) -> f64 {
+            1700000000.0
+        }
+
+        fn is_test_dc(&self) -> bool {
+            false
+        }
+
+        fn pmc_get_raw(&mut self, _key: &[u8]) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn pmc_set_raw(&mut self, _key: &[u8], _value: &[u8]) {}
+
+        fn binlog_add(&mut self, handler_type: i32, _data: &[u8]) -> u64 {
+            let id = self.binlog_adds.len() as u64 + 1;
+            self.binlog_adds.push((handler_type, id));
+            id
+        }
+
+        fn binlog_rewrite(&mut self, _log_event_id: u64, _handler_type: i32, _data: &[u8]) -> u64 {
+            0
+        }
+
+        fn binlog_erase(&mut self, log_event_id: u64) {
+            self.binlog_erases.push(log_event_id);
+        }
+
+        fn add_min_channel(&mut self, _channel_id: ChannelId, _min_channel: MinChannel) {}
+
+        fn get_min_channel(&self, _channel_id: ChannelId) -> Option<MinChannel> {
+            None
+        }
+
+        fn channel_is_member(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn channel_date(&self, _channel_id: ChannelId) -> i32 {
+            0
+        }
+
+        fn have_dialog_info(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn have_min_user(&self, _user_id: UserId) -> bool {
+            false
+        }
+
+        fn get_my_id(&self) -> UserId {
+            UserId::new(7)
+        }
+
+        fn get_my_dialog_id(&self) -> DialogId {
+            DialogId::from_user_id(UserId::new(7))
+        }
+
+        fn get_option_integer(&self, _name: &str, default_value: i64) -> i64 {
+            default_value
+        }
+
+        fn get_option_string(&self, _name: &str) -> String {
+            String::new()
+        }
+
+        fn get_message_poll_id(
+            &mut self,
+            _message_full_id: &MessageFullId,
+            _ignore_has_poll: bool,
+        ) -> Result<PollId, Status> {
+            if self.poll_not_found {
+                Err(Status::error(400, "Chat not found"))
+            } else {
+                Ok(self.known_poll)
+            }
+        }
+
+        fn has_message_sender_user_id(&mut self, _message_full_id: &MessageFullId) -> bool {
+            false
+        }
+
+        fn on_external_update_message_content(&mut self, _message_full_id: MessageFullId) {}
+
+        fn on_update_poll_has_unread_votes(
+            &mut self,
+            _message_full_id: MessageFullId,
+            _has_unread_votes: bool,
+        ) {
+        }
+
+        fn register_poll_web_pages(&mut self, _poll_id: PollId, _web_page_ids: Vec<i64>) {}
+
+        fn get_min_message_sender_object(
+            &mut self,
+            dialog_id: DialogId,
+        ) -> Option<td_api::MessageSender> {
+            Some(td_api::MessageSender::messageSenderUser(
+                td_api::messageSenderUser {
+                    user_id: dialog_id.get(),
+                },
+            ))
+        }
+
+        fn get_poll_media_object(&mut self, _media_type: Option<i32>) -> Option<td_api::PollMedia> {
+            None
+        }
+
+        fn send_update(&mut self, _update: td_api::Update) {}
+
+        fn get_formatted_text_with_users(
+            &mut self,
+            text: String,
+            _entities: Vec<tdmtproto::telegram_api::MessageEntity>,
+            _skip_media_timestamps: bool,
+            _skip_trim: bool,
+            _source: &str,
+        ) -> FormattedText {
+            FormattedText {
+                text,
+                entities: Vec::new(),
+            }
+        }
+
+        fn send_vote_query(
+            &mut self,
+            _message_full_id: &MessageFullId,
+            options: Vec<String>,
+            _generation: u64,
+        ) -> Result<(), Status> {
+            let Some(_) = self.peer.clone() else {
+                return Err(Status::error(400, "Can't access the chat"));
+            };
+            self.queries.push(format!("sendVote:{}", options.join(",")));
+            Ok(())
+        }
+
+        fn send_get_poll_results_query(
+            &mut self,
+            _message_full_id: &MessageFullId,
+            _poll_hash: i64,
+            _generation: u64,
+        ) -> bool {
+            if self.peer.is_none() {
+                return false;
+            }
+            self.queries.push("getPollResults".to_owned());
+            true
+        }
+
+        fn send_get_poll_voters_query(
+            &mut self,
+            _message_full_id: &MessageFullId,
+            _poll_id: PollId,
+            option_id: i32,
+            option: Vec<u8>,
+            offset: &str,
+            limit: i32,
+        ) -> Result<(), Status> {
+            if self.peer.is_none() {
+                return Err(Status::error(400, "Chat is not accessible"));
+            }
+            self.queries.push(format!(
+                "getPollVotes:{}:{}:{offset}:{limit}",
+                String::from_utf8_lossy(&option),
+                option_id
+            ));
+            Ok(())
+        }
+
+        fn send_stop_poll_query(
+            &mut self,
+            _message_full_id: &MessageFullId,
+            _reply_markup: Option<&crate::reply_markup::ReplyMarkup>,
+            _poll_id: PollId,
+        ) -> Result<(), Status> {
+            if self.peer.is_none() {
+                return Err(Status::error(400, "Can't access the chat"));
+            }
+            self.queries.push("stopPoll".to_owned());
+            Ok(())
+        }
+
+        fn send_delete_poll_answer_query(
+            &mut self,
+            _message_full_id: &MessageFullId,
+            option_id: Vec<u8>,
+        ) -> Result<(), Status> {
+            if self.peer.is_none() {
+                return Err(Status::error(400, "Can't access the chat"));
+            }
+            self.queries.push(format!(
+                "deletePollAnswer:{}",
+                String::from_utf8_lossy(&option_id)
+            ));
+            Ok(())
+        }
+
+        fn on_get_message_error(
+            &mut self,
+            _dialog_id: DialogId,
+            _message_id: MessageId,
+            status: &Status,
+            _source: &str,
+        ) -> bool {
+            self.message_errors.push((
+                "GetPollResultsQuery".to_owned(),
+                status.message().to_owned(),
+            ));
+            false
+        }
+
+        fn on_get_dialog_error(
+            &mut self,
+            _dialog_id: DialogId,
+            status: &Status,
+            source: &str,
+        ) -> bool {
+            self.dialog_errors
+                .push((source.to_owned(), status.message().to_owned()));
+            false
+        }
+
+        fn on_get_users(&mut self, _users: Vec<tdmtproto::telegram_api::User>, _source: &str) {
+            self.intake_users += 1;
+        }
+
+        fn on_get_chats(&mut self, _chats: Vec<tdmtproto::telegram_api::Chat>, _source: &str) {
+            self.intake_chats += 1;
+        }
+    }
+
+    // the test promise helpers (the M.45 RecordingPromise convention)
+
+    type Recorded<T> = std::sync::Arc<std::sync::Mutex<Vec<std::result::Result<T, String>>>>;
+
+    struct RecordingPromise<T: Send + 'static> {
+        outcomes: Recorded<T>,
+    }
+
+    impl<T: Send + 'static> tdutils::promise::PromiseInterface<T> for RecordingPromise<T> {
+        fn set_value(&mut self, value: T) {
+            self.outcomes.lock().unwrap().push(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            self.outcomes.lock().unwrap().push(Err(format!(
+                "{} {}",
+                error.code(),
+                error.message()
+            )));
+        }
+    }
+
+    fn recording_promise<T: Send + 'static>() -> (Promise<T>, Recorded<T>) {
+        let outcomes: Recorded<T> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Promise::from_interface(RecordingPromise {
+                outcomes: outcomes.clone(),
+            }),
+            outcomes,
+        )
+    }
+
+    fn band_updates() -> tdmtproto::telegram_api::Updates {
+        tdmtproto::telegram_api::Updates::updatesCombined(
+            tdmtproto::telegram_api::updatesCombined {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 1700000000,
+                seq_start: 0,
+                seq: 0,
+            },
+        )
+    }
+
+    fn seed_poll(bot: bool) -> Poll {
+        Poll {
+            options: vec![
+                PollOption {
+                    voter_count: 1,
+                    data: "a".to_owned(),
+                    ..PollOption::default()
+                },
+                PollOption {
+                    voter_count: 0,
+                    data: "b".to_owned(),
+                    ..PollOption::default()
+                },
+            ],
+            hash: 77,
+            is_anonymous: false,
+            allow_multiple_answers: true,
+            is_creator: !bot,
+            ..Poll::default()
+        }
+    }
+
+    fn band_message_full_id() -> MessageFullId {
+        MessageFullId::new(
+            DialogId::from_user_id(UserId::new(7)),
+            MessageId::new(1 << 20),
+        )
+    }
+
+    #[test]
+    fn set_poll_answer_parks_dispatches_and_settles_the_ladder() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+
+        // the vote parks the promise + dispatches the wire query
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.set_poll_answer(&mut env, band_message_full_id(), vec![0], promise);
+        assert_eq!(env.queries, vec!["sendVote:a".to_owned()]);
+        assert!(outcomes.lock().unwrap().is_empty());
+        assert!(manager.pending_answers.contains_key(&poll_id));
+        let generation = manager.pending_answers.get(&poll_id).unwrap().generation;
+
+        // the Ok answer re-enters the ladder: the bookkeeping runs, the
+        // updates hand back for the engine tail, then the finish settles
+        // the promise (the router order collapses here)
+        let (updates, tail_poll_id, tail_generation) = manager
+            .on_send_vote_answer(&mut env, generation, Ok(band_updates()))
+            .expect("the Ok updates hand back");
+        let _ = updates;
+        assert_eq!(tail_poll_id, poll_id);
+        assert_eq!(tail_generation, generation);
+        manager.on_set_poll_answer_finished(&mut env, poll_id, Ok(()), generation);
+        assert_eq!(*outcomes.lock().unwrap(), vec![Ok(())]);
+        assert!(!manager.pending_answers.contains_key(&poll_id));
+        assert!(manager.pending_net.send_vote.is_empty());
+    }
+
+    #[test]
+    fn set_poll_answer_send_leg_band_runs_the_error_head_and_ladder() {
+        let mut env = TestEnv {
+            peer: None,
+            ..TestEnv::default()
+        };
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.set_poll_answer(&mut env, band_message_full_id(), vec![0], promise);
+        // the None-peer band: the handler's on_error head runs, then the
+        // ladder settles the parked promise with the 400
+        assert_eq!(
+            env.dialog_errors,
+            vec![(
+                "SendVoteQuery".to_owned(),
+                "Can't access the chat".to_owned()
+            )]
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 Can't access the chat".to_owned())]
+        );
+        // no query was dispatched — the lot entry died with the handler
+        assert!(manager.pending_net.send_vote.is_empty());
+        // the second vote on the same poll re-enters do_set_poll_answer
+        // cleanly (the pending entry stays coherent)
+        let (promise2, outcomes2) = recording_promise::<()>();
+        manager.set_poll_answer(&mut env, band_message_full_id(), vec![1], promise2);
+        assert_eq!(outcomes2.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replaced_vote_releases_and_the_late_answer_pairs_by_generation() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+
+        let (promise1, outcomes1) = recording_promise::<()>();
+        manager.set_poll_answer(&mut env, band_message_full_id(), vec![0], promise1);
+        let generation1 = manager.pending_answers.get(&poll_id).unwrap().generation;
+
+        // a DIFFERENT answer replaces it: the old promises release Ok,
+        // the new generation parks
+        let (promise2, outcomes2) = recording_promise::<()>();
+        manager.set_poll_answer(&mut env, band_message_full_id(), vec![1], promise2);
+        assert_eq!(*outcomes1.lock().unwrap(), vec![Ok(())]);
+        let generation2 = manager.pending_answers.get(&poll_id).unwrap().generation;
+        assert_ne!(generation1, generation2);
+        assert_eq!(manager.pending_net.send_vote.len(), 2);
+
+        // the replaced query's late answer pairs with ITS lot entry and
+        // drops at the generation check (no state touch, no settle)
+        let tail = manager.on_send_vote_answer(&mut env, generation1, Ok(band_updates()));
+        assert!(tail.is_none());
+        assert_eq!(manager.pending_net.send_vote.len(), 1);
+        assert!(outcomes2.lock().unwrap().is_empty());
+        assert!(manager.pending_answers.contains_key(&poll_id));
+
+        // the current generation's answer settles
+        let (updates, _, generation) = manager
+            .on_send_vote_answer(&mut env, generation2, Ok(band_updates()))
+            .unwrap();
+        let _ = updates;
+        assert_eq!(generation, generation2);
+        manager.on_set_poll_answer_finished(&mut env, poll_id, Ok(()), generation);
+        assert_eq!(*outcomes2.lock().unwrap(), vec![Ok(())]);
+    }
+
+    #[test]
+    fn get_poll_voters_cache_bands_and_wire_send() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+
+        // a cached page answers from the map (offset < cur_offset)
+        manager
+            .poll_voters
+            .entry(poll_id)
+            .or_default()
+            .resize_with(2, Default::default);
+        let voter = DialogId::from_user_id(UserId::new(9));
+        manager.poll_voters.get_mut(&poll_id).unwrap()[0].voters =
+            vec![(voter, 5), (voter, 6), (voter, 7)];
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 1, 2, promise);
+        let outcomes = outcomes.lock().unwrap();
+        let object = outcomes[0].as_ref().expect("the cached page answers");
+        assert_eq!(object.total_count, 3);
+        assert_eq!(object.voters.len(), 2);
+        assert_eq!(object.voters[0].date, 6);
+        drop(outcomes);
+
+        // too big offset errors
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 4, 2, promise);
+        assert!(
+            matches!(&outcomes.lock().unwrap()[0], Err(message) if message == "400 Too big offset specified; voters can be received only consequently")
+        );
+
+        // the exhausted page (next_offset empty, cur_offset > 0) answers
+        // the empty object
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 3, 2, promise);
+        let outcomes = outcomes.lock().unwrap();
+        let object = outcomes[0].as_ref().expect("the exhausted page answers");
+        assert_eq!(object.total_count, 0);
+        assert!(object.voters.is_empty());
+        drop(outcomes);
+
+        // the voter_count == 0 option answers the empty object without a
+        // query
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 1, 0, 2, promise);
+        let outcomes = outcomes.lock().unwrap();
+        assert!(
+            outcomes[0]
+                .as_ref()
+                .expect("the empty option answers")
+                .voters
+                .is_empty()
+        );
+        drop(outcomes);
+        assert!(env.queries.is_empty());
+
+        // a fresh send parks the promise + fires the query (option 0 has
+        // voter_count 1 > 0)
+        manager.poll_voters.get_mut(&poll_id).unwrap().clear();
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 0, 2, promise);
+        assert_eq!(env.queries, vec!["getPollVotes:a:0::2".to_owned()]);
+        assert!(outcomes.lock().unwrap().is_empty());
+        assert_eq!(manager.pending_net.get_poll_voters.len(), 1);
+    }
+
+    #[test]
+    fn get_poll_voters_intake_bands() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+        manager
+            .poll_voters
+            .entry(poll_id)
+            .or_default()
+            .resize_with(2, Default::default);
+
+        // the send-leg 400 (no read access) settles the parked promises
+        // directly — no dialog-error head on this family
+        let mut no_peer_env = TestEnv {
+            peer: None,
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut no_peer_env, band_message_full_id(), 0, 0, 2, promise);
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 Chat is not accessible".to_owned())]
+        );
+        assert!(manager.pending_net.get_poll_voters.is_empty());
+
+        // the happy intake: the three vote variants filter by the option
+        // data, the users/chats intakes run, the count mismatch re-arms
+        // the update timeout (the seeded voter_count 1 != the wire
+        // count 3)
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 0, 2, promise);
+        let answer = tdmtproto::telegram_api::messages_VotesList {
+            flags: 0,
+            count: 3,
+            votes: vec![
+                // the wrong-option vote drops (messagePeerVote)
+                tdmtproto::telegram_api::MessagePeerVote::messagePeerVote(
+                    tdmtproto::telegram_api::messagePeerVote {
+                        peer: Some(tdmtproto::telegram_api::Peer::peerUser(
+                            tdmtproto::telegram_api::peerUser { user_id: 11 },
+                        )),
+                        option: b"b".to_vec(),
+                        date: 1,
+                    },
+                ),
+                // the right-option vote lands (messagePeerVote)
+                tdmtproto::telegram_api::MessagePeerVote::messagePeerVote(
+                    tdmtproto::telegram_api::messagePeerVote {
+                        peer: Some(tdmtproto::telegram_api::Peer::peerUser(
+                            tdmtproto::telegram_api::peerUser { user_id: 9 },
+                        )),
+                        option: b"a".to_vec(),
+                        date: 5,
+                    },
+                ),
+                // the multi-vote lands when the option rides its list
+                tdmtproto::telegram_api::MessagePeerVote::messagePeerVoteMultiple(
+                    tdmtproto::telegram_api::messagePeerVoteMultiple {
+                        peer: Some(tdmtproto::telegram_api::Peer::peerUser(
+                            tdmtproto::telegram_api::peerUser { user_id: 12 },
+                        )),
+                        options: vec![b"a".to_vec()],
+                        date: 7,
+                    },
+                ),
+            ],
+            chats: Vec::new(),
+            users: Vec::new(),
+            next_offset: "next".to_owned(),
+        };
+        manager.on_get_poll_voters_answer(&mut env, poll_id, 0, Ok(answer));
+        assert_eq!(env.intake_users, 1);
+        assert_eq!(env.intake_chats, 1);
+        let outcomes = outcomes.lock().unwrap();
+        let object = outcomes[0].as_ref().expect("the page answers");
+        // the wire count (3) vs the known voters (2) — max wins
+        assert_eq!(object.total_count, 3);
+        assert_eq!(object.voters.len(), 2);
+        drop(outcomes);
+        assert_eq!(
+            manager.poll_voters.get(&poll_id).unwrap()[0].next_offset,
+            "next"
+        );
+        // the voter count mismatch re-armed the update timeout at 0.0
+        assert!(manager.update_poll_timeout.contains_key(&poll_id.get()));
+        manager.update_poll_timeout.clear();
+
+        // the offset-mismatch drop: a fresh page request parks at the
+        // current offset (== cur_offset), then an intervening update
+        // resets the cached next_offset — the answer's captured offset
+        // mismatches and the intake drops it without touching the
+        // promises (cpp:1638-1647)
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 2, 2, promise);
+        assert!(outcomes.lock().unwrap().is_empty());
+        manager.poll_voters.get_mut(&poll_id).unwrap()[0].next_offset = String::new();
+        let stale = tdmtproto::telegram_api::messages_VotesList {
+            flags: 0,
+            count: 3,
+            votes: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+            next_offset: String::new(),
+        };
+        manager.on_get_poll_voters_answer(&mut env, poll_id, 0, Ok(stale));
+        assert!(outcomes.lock().unwrap().is_empty());
+
+        // the wire error band: the dialog-error head + the MESSAGE_ID_INVALID
+        // carve-out log, then the parked promises fail (the dropped
+        // mismatch promise is cleared — the C++ would have it fail on
+        // its own answer; here the fresh park drives the band)
+        manager.poll_voters.get_mut(&poll_id).unwrap()[0]
+            .pending_queries
+            .clear();
+        manager.poll_voters.get_mut(&poll_id).unwrap()[0].next_offset = "next".to_owned();
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 2, 2, promise);
+        assert!(outcomes.lock().unwrap().is_empty());
+        manager.on_get_poll_voters_answer(
+            &mut env,
+            poll_id,
+            0,
+            Err(Status::error(420, "SLOWMODE_WAIT")),
+        );
+        assert_eq!(
+            env.dialog_errors,
+            vec![("GetPollVotersQuery".to_owned(), "SLOWMODE_WAIT".to_owned())]
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("420 SLOWMODE_WAIT".to_owned())]
+        );
+    }
+
+    #[test]
+    fn get_poll_voters_entry_guards_and_anonymous_band() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        let mut poll = seed_poll(false);
+        poll.is_anonymous = true;
+        manager.polls.insert(poll_id, poll);
+        manager
+            .poll_voters
+            .entry(poll_id)
+            .or_default()
+            .resize_with(2, Default::default);
+
+        // the entry guard rejects the anonymous poll outright
+        // (cpp:1571-1573)
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.get_poll_voters(&mut env, band_message_full_id(), 0, 0, 2, promise);
+        assert!(
+            matches!(&outcomes.lock().unwrap()[0], Err(message) if message == "400 Poll results can't be received")
+        );
+
+        // the in-intake anonymous band (the "just in case" cpp:1634-1636)
+        // converts the Ok answer into the 400 — reachable when the poll
+        // turned anonymous after the send (the white-box park)
+        let (promise, outcomes) = recording_promise::<td_api::PollVoters>();
+        manager.poll_voters.get_mut(&poll_id).unwrap()[0]
+            .pending_queries
+            .push(promise);
+        manager.pending_net.get_poll_voters.push((
+            poll_id,
+            0,
+            String::new(),
+            2,
+            DialogId::from_user_id(UserId::new(7)),
+        ));
+        manager.on_get_poll_voters_answer(
+            &mut env,
+            poll_id,
+            0,
+            Ok(tdmtproto::telegram_api::messages_VotesList::default()),
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 Poll is anonymous".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stop_poll_fold_send_and_finish_bands() {
+        // the markup fold only runs for bots (get_inline_reply_markup
+        // drops the markup for users — ReplyMarkup.cpp:319-322)
+        let mut env = TestEnv {
+            bot: true,
+            ..TestEnv::default()
+        };
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(true));
+
+        // the non-inline markup fails the fold at the C++
+        // TRY_RESULT_PROMISE position (cpp:1723-1725)
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.stop_poll(
+            &mut env,
+            band_message_full_id(),
+            Some(td_api::ReplyMarkup::replyMarkupShowKeyboard(
+                td_api::replyMarkupShowKeyboard::default(),
+            )),
+            promise,
+        );
+        assert!(
+            matches!(&outcomes.lock().unwrap()[0], Err(message) if message == "400 Inline keyboard expected")
+        );
+        assert!(manager.pending_net.stop_poll.is_empty());
+
+        // the finish bands want the non-bot posture (the
+        // MESSAGE_NOT_MODIFIED Ok settle is the !is_bot band, cpp:324)
+        env.bot = false;
+
+        // the happy send parks the C++ lambda tuple and closes locally
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.stop_poll(&mut env, band_message_full_id(), None, promise);
+        assert_eq!(env.queries, vec!["stopPoll".to_owned()]);
+        assert!(manager.being_closed_polls.contains(&poll_id));
+        assert!(manager.get_poll(poll_id).unwrap().is_closed);
+        assert!(outcomes.lock().unwrap().is_empty());
+
+        // re-open the poll between the finish bands (the entry guard
+        // rejects a second stop of a closed poll)
+        let reopen = |manager: &mut PollManager| {
+            manager.get_poll_editable(poll_id).unwrap().is_closed = false;
+        };
+
+        // the MESSAGE_NOT_MODIFIED band settles Ok through the finish
+        // (the being_closed erase + the promise)
+        reopen(&mut manager);
+        manager.on_stop_poll_answer(
+            &mut env,
+            poll_id,
+            Err(Status::error(400, "MESSAGE_NOT_MODIFIED")),
+        );
+        assert_eq!(*outcomes.lock().unwrap(), vec![Ok(())]);
+        assert!(!manager.being_closed_polls.contains(&poll_id));
+
+        // the error band runs the dialog-error head + the error finish
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.stop_poll(&mut env, band_message_full_id(), None, promise);
+        manager.on_stop_poll_answer(
+            &mut env,
+            poll_id,
+            Err(Status::error(500, "CHAT_WRITE_FORBIDDEN")),
+        );
+        assert_eq!(
+            env.dialog_errors,
+            vec![(
+                "StopPollQuery".to_owned(),
+                "CHAT_WRITE_FORBIDDEN".to_owned()
+            )]
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("500 CHAT_WRITE_FORBIDDEN".to_owned())]
+        );
+
+        // the happy answer hands the updates + the tuple back for the
+        // engine tail; the finish then erases the log event and settles
+        env.use_message_database = true;
+        reopen(&mut manager);
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.stop_poll(&mut env, band_message_full_id(), None, promise);
+        let log_event_id = manager.pending_net.stop_poll[0].2;
+        assert_ne!(log_event_id, 0);
+        let (updates, tail_mfi, tail_log_event_id, tail_promise) = manager
+            .on_stop_poll_answer(&mut env, poll_id, Ok(band_updates()))
+            .expect("the Ok updates hand back");
+        let _ = updates;
+        assert_eq!(tail_mfi, band_message_full_id());
+        assert_eq!(tail_log_event_id, log_event_id);
+        manager.on_stop_poll_finished(
+            &mut env,
+            poll_id,
+            tail_mfi,
+            tail_log_event_id,
+            Ok(()),
+            tail_promise,
+        );
+        assert_eq!(*outcomes.lock().unwrap(), vec![Ok(())]);
+        assert!(env.binlog_erases.contains(&log_event_id));
+    }
+
+    #[test]
+    fn stop_poll_send_leg_band_routes_the_full_finish() {
+        let mut env = TestEnv {
+            peer: None,
+            ..TestEnv::default()
+        };
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.stop_poll(&mut env, band_message_full_id(), None, promise);
+        // the None-peer band runs the dialog-error head, then the finish
+        // (the being_closed erase + the promise error)
+        assert_eq!(
+            env.dialog_errors,
+            vec![(
+                "StopPollQuery".to_owned(),
+                "Can't access the chat".to_owned()
+            )]
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 Can't access the chat".to_owned())]
+        );
+        assert!(!manager.being_closed_polls.contains(&poll_id));
+        assert!(manager.pending_net.stop_poll.is_empty());
+    }
+
+    #[test]
+    fn on_update_poll_timeout_guards_and_results_ladder() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+
+        // no poll → no send
+        manager.on_update_poll_timeout(&mut env, poll_id);
+        assert!(env.queries.is_empty());
+
+        // closed + updated-after-close → no send
+        let mut closed = seed_poll(false);
+        closed.is_closed = true;
+        closed.is_updated_after_close = true;
+        manager.polls.insert(poll_id, closed);
+        manager.on_update_poll_timeout(&mut env, poll_id);
+        assert!(env.queries.is_empty());
+
+        // an open poll without server messages → no send
+        manager.polls.insert(poll_id, seed_poll(false));
+        manager.on_update_poll_timeout(&mut env, poll_id);
+        assert!(env.queries.is_empty());
+
+        // a pending vote skips the fetch (cpp:1853-1856)
+        manager
+            .server_poll_messages
+            .entry(poll_id)
+            .or_default()
+            .insert(band_message_full_id());
+        manager
+            .pending_answers
+            .insert(poll_id, crate::poll_manager::PendingPollAnswer::default());
+        manager.on_update_poll_timeout(&mut env, poll_id);
+        assert!(env.queries.is_empty());
+        manager.pending_answers.remove(&poll_id);
+
+        // the happy send parks the handler members keyed by the
+        // generation
+        manager.on_update_poll_timeout(&mut env, poll_id);
+        assert_eq!(env.queries, vec!["getPollResults".to_owned()]);
+        assert_eq!(manager.pending_net.get_poll_results.len(), 1);
+        let generation = manager.pending_net.get_poll_results[0].1;
+
+        // the error band runs the messages-error head, then re-arms the
+        // update timeout with the polling timeout
+        assert!(manager.update_poll_timeout.is_empty());
+        let updates = manager.on_get_poll_results_answer(
+            &mut env,
+            generation,
+            Err(Status::error(500, "TIMEOUT")),
+        );
+        assert!(updates.is_none());
+        assert_eq!(env.message_errors.len(), 1);
+        assert!(manager.update_poll_timeout.contains_key(&poll_id.get()));
+
+        // the stale-generation band hands nothing back and re-arms at 0.0
+        // (the re-parked lot entry pairs with the answer)
+        manager.update_poll_timeout.clear();
+        manager.current_generation += 1;
+        manager.pending_net.get_poll_results.push((
+            poll_id,
+            generation,
+            DialogId::from_user_id(UserId::new(7)),
+            MessageId::new(1 << 20),
+        ));
+        let updates =
+            manager.on_get_poll_results_answer(&mut env, generation, Ok(Some(band_updates())));
+        assert!(updates.is_none());
+        assert!(manager.update_poll_timeout.contains_key(&poll_id.get()));
+        manager.update_poll_timeout.clear();
+
+        // the current-generation answer hands the updates back
+        let generation = manager.current_generation;
+        manager.pending_net.get_poll_results.push((
+            poll_id,
+            generation,
+            DialogId::from_user_id(UserId::new(7)),
+            MessageId::new(1 << 20),
+        ));
+        let updates =
+            manager.on_get_poll_results_answer(&mut env, generation, Ok(Some(band_updates())));
+        assert!(updates.is_some());
+        assert!(manager.pending_net.get_poll_results.is_empty());
+    }
+
+    #[test]
+    fn on_update_poll_timeout_null_band_parks_nothing() {
+        let mut env = TestEnv {
+            peer: None,
+            ..TestEnv::default()
+        };
+        let mut manager = PollManager::new();
+        let poll_id = env.known_poll;
+        manager.polls.insert(poll_id, seed_poll(false));
+        manager
+            .server_poll_messages
+            .entry(poll_id)
+            .or_default()
+            .insert(band_message_full_id());
+
+        // the Ok(null) send band: no query, no lot entry, no state touch
+        manager.on_update_poll_timeout(&mut env, poll_id);
+        assert!(env.queries.is_empty());
+        assert!(manager.pending_net.get_poll_results.is_empty());
+    }
+
+    #[test]
+    fn delete_poll_option_seam_send_and_answer_bands() {
+        let mut env = TestEnv::default();
+        let mut manager = PollManager::new();
+
+        // the M.10 seam error settles the promise directly (the C++
+        // TRY_STATUS_PROMISE)
+        env.poll_not_found = true;
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.delete_poll_option(&mut env, band_message_full_id(), "a".to_owned(), promise);
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 Chat not found".to_owned())]
+        );
+        assert!(manager.pending_net.delete_poll_answer.is_empty());
+        env.poll_not_found = false;
+
+        // the send-leg band runs the dialog-error head + the promise error
+        env.peer = None;
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.delete_poll_option(&mut env, band_message_full_id(), "a".to_owned(), promise);
+        assert_eq!(
+            env.dialog_errors,
+            vec![(
+                "DeletePollAnswerQuery".to_owned(),
+                "Can't access the chat".to_owned()
+            )]
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 Can't access the chat".to_owned())]
+        );
+        env.peer = Some(tdmtproto::telegram_api::InputPeer::inputPeerSelf(
+            tdmtproto::telegram_api::inputPeerSelf {},
+        ));
+
+        // the happy send parks the promise FIFO
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.delete_poll_option(&mut env, band_message_full_id(), "a".to_owned(), promise);
+        assert_eq!(env.queries, vec!["deletePollAnswer:a".to_owned()]);
+        assert_eq!(manager.pending_net.delete_poll_answer.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty());
+
+        // the Ok answer hands the updates + the popped promise back (the
+        // router feeds the engine with them)
+        let (updates, tail_promise) = manager
+            .on_delete_poll_answer_answer(&mut env, Ok(band_updates()))
+            .expect("the Ok updates hand back");
+        let _ = updates;
+        drop(tail_promise);
+        assert!(manager.pending_net.delete_poll_answer.is_empty());
+
+        // the error band settles the popped promise with the head
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.delete_poll_option(&mut env, band_message_full_id(), "b".to_owned(), promise);
+        manager.on_delete_poll_answer_answer(&mut env, Err(Status::error(400, "OPTION_INVALID")));
+        assert_eq!(
+            env.dialog_errors,
+            vec![
+                (
+                    "DeletePollAnswerQuery".to_owned(),
+                    "Can't access the chat".to_owned()
+                ),
+                (
+                    "DeletePollAnswerQuery".to_owned(),
+                    "OPTION_INVALID".to_owned()
+                )
+            ]
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![Err("400 OPTION_INVALID".to_owned())]
+        );
     }
 }
