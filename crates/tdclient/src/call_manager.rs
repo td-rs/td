@@ -1,12 +1,16 @@
 //! `CallManager` (td/telegram/CallManager.{h,cpp}) — the M.32 Wave-3 call
 //! manager. The C++ actor model collapses to a plain struct (the M.13
-//! convention): `ActorOwn<CallActor>` becomes a map value, the
-//! `SafePromise` hops become direct calls, and the query handlers
-//! (SetCallRatingQuery/SaveCallDebugQuery/SaveCallLogQuery) are
-//! `[blocked: net]`/`[blocked: M.12]` seams. `rate_call`/`do_rate_call`/
-//! `on_set_call_rating` have NO td_api caller in this revision (rateCall
-//! was removed upstream) — recorded here, not ported; `send_call_log`'
-//! upload machinery queues on the M.12 FileManager upload surface.
+//! convention): `ActorOwn<CallActor>` becomes a map value and the
+//! `SafePromise` hops become direct calls. The net-drain 44 slice lands
+//! the `CallNetKind` plane over the manager-held net handle:
+//! `phone.setCallRating` (SetCallRatingQuery, cpp:31-62) and
+//! `phone.saveCallDebug` (SaveCallDebugQuery, cpp:64-94) ride the
+//! dispatcher — `sendCallRating` routes here through `rate_call`
+//! (Requests.cpp:5132-5138) and the answers drain through
+//! `Td::on_call_net_answer`; `phone.saveCallLog` is `[blocked:
+//! net/Files]` — the C++ send resolves the uploaded InputFile through
+//! the FileManager upload chain (CallManager.cpp:368-386), so the
+//! request parks at the upload seam with the answer intake landed.
 
 use crate::call_actor::{CallActor, CallActorEnv};
 use crate::call_id::{CallId, InputCallId};
@@ -33,38 +37,6 @@ pub trait CallManagerEnv: CallActorEnv + DhCacheEnv {
     ) -> Option<telegram_api::InputPhoneCall> {
         None
     }
-
-    /// `SaveCallDebugQuery` (CallManager.cpp:64-94) — `[blocked: net]`; the
-    /// answer handler is [`CallManager::on_save_debug_information`].
-    fn send_save_call_debug_query(&mut self, data: &str) {
-        tdutils::log_info!(
-            "Send phone.saveCallDebug for {} bytes — [blocked: net]",
-            data.len()
-        );
-    }
-
-    /// `SetCallRatingQuery` (CallManager.cpp:31-62) — `[blocked: net]`;
-    /// the C++ `on_result` routes `on_set_call_rating` + the updates
-    /// through `updates_manager_->on_get_updates`.
-    fn send_set_call_rating_query(&mut self, rating: i32, comment: &str) {
-        tdutils::log_info!(
-            "Send phone.setCallRating(rating = {rating}, comment = {comment}) — [blocked: net]"
-        );
-    }
-
-    /// `SaveCallLogQuery` (CallManager.cpp:96-118) — `[blocked: net]`
-    /// over the M.12 upload surface.
-    fn send_save_call_log_query(
-        &mut self,
-        input_call: &InputCallId,
-        log_file: &Option<td_api::InputFile>,
-    ) {
-        tdutils::log_info!(
-            "Send phone.saveCallLog(has_file = {}) — [blocked: net]",
-            log_file.is_some()
-        );
-        let _ = input_call;
-    }
 }
 
 /// `CallManager::CallInfo` (CallManager.h:60-63).
@@ -84,9 +56,48 @@ pub struct CallManager {
     call_info: std::collections::BTreeMap<i64, CallInfo>,
     /// `id_to_actor_` (CallManager.h:66) — the collapsed `ActorOwn` map.
     id_to_actor: std::collections::BTreeMap<CallId, CallActor>,
-    /// The `()`-typed promises parked at their `[blocked: net]` manager
-    /// query sends (the UserManager `net_blocked_promises` convention).
-    pub net_blocked_promises: Vec<Promise<()>>,
+    /// The manager-held dispatch surface (`UserManager::net` shape) —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) net: Option<crate::td::CallNetHandle>,
+    /// The parked query promises (the [`PendingCallQueries`] lots).
+    pub(crate) pending: PendingCallQueries,
+}
+
+/// The CallManager in-flight query kinds — the C++ ResultHandler classes
+/// of the net-drain 44 families (CallManager.cpp:31-118). The handler
+/// state the answers read (the call the answer routes into) rides the
+/// kinds — [`InputCallId`] is `Copy`.
+#[derive(Clone, Copy)]
+pub(crate) enum CallNetKind {
+    /// `SetCallRatingQuery` (cpp:31-62) — the ok answer routes
+    /// [`CallManager::on_set_call_rating`] + the Updates engine intake
+    /// with the request promise (cpp:52-60).
+    SetCallRating { call_id: InputCallId },
+    /// `SaveCallDebugQuery` (cpp:64-94) — the ok answer routes
+    /// [`CallManager::on_save_debug_information`] with the Bool result
+    /// and settles the request promise (cpp:87-93).
+    SaveCallDebug { call_id: InputCallId },
+    /// `SaveCallLogQuery` (cpp:96-118) — the send rides the M.12 upload
+    /// chain; the answer routes [`CallManager::on_save_log`]
+    /// (cpp:115-127). Un-gates with the M.12 Files plane (the send
+    /// dispatch arrives with the upload chain).
+    #[allow(dead_code)]
+    SaveCallLog { call_id: InputCallId },
+}
+
+/// The parked query promises — the ResultHandler members the `Copy`
+/// [`CallNetKind`]s can't carry. FIFO-paired per family (§5; the C++
+/// carries the promise on the query itself).
+#[derive(Default)]
+pub(crate) struct PendingCallQueries {
+    /// `SetCallRatingQuery::promise_` (cpp:33).
+    pub(crate) set_call_rating: Vec<Promise<()>>,
+    /// `SaveCallDebugQuery::promise_` (cpp:66).
+    pub(crate) save_call_debug: Vec<Promise<()>>,
+    /// `SaveCallLogQuery::promise_` (cpp:99) — the send parks over the
+    /// M.12 upload chain; the answer intake pops the lot.
+    pub(crate) save_call_log: Vec<Promise<()>>,
 }
 
 impl CallManager {
@@ -97,7 +108,23 @@ impl CallManager {
             next_call_id: 1,
             call_info: std::collections::BTreeMap::new(),
             id_to_actor: std::collections::BTreeMap::new(),
-            net_blocked_promises: Vec::new(),
+            net: None,
+            pending: PendingCallQueries::default(),
+        }
+    }
+
+    /// The `td_->create_handler<…>()->send(...)` collapse — the wire
+    /// query construction lives at the manager send sites; `None` keeps
+    /// the net-inert posture (the tests drive the answer halves).
+    fn send_call_net_query(
+        &self,
+        kind: CallNetKind,
+        function: tdmtproto::telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
         }
     }
 
@@ -274,7 +301,7 @@ impl CallManager {
     }
 
     /// `send_call_debug_information` (CallManager.cpp:337-350) — the
-    /// `SaveCallDebugQuery` tail is `[blocked: net]`; the promise parks.
+    /// resolved inputPhoneCall feeds the `SaveCallDebugQuery` send.
     pub fn send_call_debug_information(
         &mut self,
         env: &mut impl CallManagerEnv,
@@ -286,7 +313,7 @@ impl CallManager {
         if status.is_error() {
             return promise.set_error(status);
         }
-        let call_id = match call_id {
+        match call_id {
             InputCallId::Call(call_id) => {
                 let Some(actor) = self.id_to_actor.get(&call_id) else {
                     return promise.set_error(Status::error(400, "Call not found"));
@@ -296,27 +323,64 @@ impl CallManager {
                 let Some(input_phone_call) = recorded.lock().unwrap().take() else {
                     return promise.set_error(Status::error(400, "Call not found"));
                 };
-                let _ = input_phone_call;
-                InputCallId::Call(call_id)
+                self.do_send_call_debug_information(
+                    env,
+                    InputCallId::Call(call_id),
+                    input_phone_call,
+                    data,
+                    promise,
+                );
             }
             InputCallId::Message(message_full_id) => {
-                if env
-                    .get_input_phone_call_from_message(message_full_id)
-                    .is_none()
-                {
+                let Some(input_phone_call) = env.get_input_phone_call_from_message(message_full_id)
+                else {
                     return promise.set_error(Status::error(400, "Call not found"));
-                }
-                InputCallId::Message(message_full_id)
+                };
+                self.do_send_call_debug_information(
+                    env,
+                    InputCallId::Message(message_full_id),
+                    input_phone_call,
+                    data,
+                    promise,
+                );
             }
         };
-        self.do_send_call_debug_information(env, call_id, data, promise);
     }
 
-    /// `send_call_log` (CallManager.cpp:614-634) — the close gate and
-    /// the InputCallId resolution bands are real; the call-log file
-    /// intake (`FileManager::get_input_file_id(FileType::CallLog)` + the
-    /// encrypted-file band) rides the M.12 env surface and the
-    /// `SaveCallLogQuery` upload parks (the recorded upload queue).
+    /// `do_send_call_debug_information` (CallManager.cpp:352-357) — the
+    /// `phone.saveCallDebug` send; the promise rides the family queue.
+    fn do_send_call_debug_information(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        call_id: InputCallId,
+        input_phone_call: telegram_api::InputPhoneCall,
+        data: String,
+        promise: Promise<()>,
+    ) {
+        let status = env.close_status();
+        if status.is_error() {
+            let mut promise = promise;
+            return promise.set_error(status);
+        }
+        self.pending.save_call_debug.push(promise);
+        self.send_call_net_query(
+            CallNetKind::SaveCallDebug { call_id },
+            tdmtproto::telegram_api::Function::phone_saveCallDebug(
+                telegram_api::phone_saveCallDebug {
+                    peer: Some(input_phone_call),
+                    debug: Some(telegram_api::DataJSON { data }),
+                },
+            ),
+            "phone.saveCallDebug",
+        );
+    }
+
+    /// `send_call_log` (CallManager.cpp:368-386) — the close gate and
+    /// the InputCallId resolution bands are real; the file intake
+    /// (`FileManager::get_input_file_id(FileType::CallLog)` + the
+    /// encrypted-file band) and the upload chain ride the M.12 Files
+    /// surface — the request parks at the upload seam and the promise
+    /// waits in the family queue for the landed answer intake.
     pub fn send_call_log(
         &mut self,
         env: &mut impl CallManagerEnv,
@@ -328,16 +392,18 @@ impl CallManager {
         if status.is_error() {
             return promise.set_error(status);
         }
-        let call_id = match InputCallId::get_input_call_id(input_call) {
-            Ok(call_id) => call_id,
-            Err(status) => return promise.set_error(status),
-        };
-        env.send_save_call_log_query(&call_id, &log_file);
-        self.net_blocked_promises.push(promise);
+        if let Err(status) = InputCallId::get_input_call_id(input_call) {
+            return promise.set_error(status);
+        }
+        tdutils::log_info!(
+            "Send phone.saveCallLog(has_file = {}) — [blocked: net/Files] over the M.12 upload chain",
+            log_file.is_some()
+        );
+        self.pending.save_call_log.push(promise);
     }
 
-    /// `rate_call` (CallManager.cpp:256-273) — the `SetCallRatingQuery`
-    /// tail is `[blocked: net]`; the promise parks.
+    /// `rate_call` (CallManager.cpp:256-273) — the resolved inputPhoneCall
+    /// feeds the `SetCallRatingQuery` send.
     pub fn rate_call(
         &mut self,
         env: &mut impl CallManagerEnv,
@@ -360,18 +426,28 @@ impl CallManager {
         };
         let (inner, recorded) = record_phone_call_promise();
         self.fetch_input_phone_call(env, call_id, inner);
-        let Some(_input_phone_call) = recorded.lock().unwrap().take() else {
+        let Some(input_phone_call) = recorded.lock().unwrap().take() else {
             return promise.set_error(Status::error(400, "Call not found"));
         };
-        self.do_rate_call(env, call_id, rating, comment, &problems, promise);
+        self.do_rate_call(
+            env,
+            call_id,
+            input_phone_call,
+            rating,
+            comment,
+            &problems,
+            promise,
+        );
     }
 
-    /// `do_rate_call` (CallManager.cpp:275-326) — the tag-building is the
-    /// real port; the query send is the seam.
+    /// `do_rate_call` (CallManager.cpp:275-326) — the tag-building and the
+    /// `phone.setCallRating` send; the promise rides the family queue.
+    #[allow(clippy::too_many_arguments)]
     fn do_rate_call(
         &mut self,
         env: &mut impl CallManagerEnv,
-        _call_id: InputCallId,
+        call_id: InputCallId,
+        input_phone_call: telegram_api::InputPhoneCall,
         rating: i32,
         mut comment: String,
         problems: &[td_api::CallProblem],
@@ -407,20 +483,30 @@ impl CallManager {
                 comment.push_str(tag);
             }
         }
-        env.send_set_call_rating_query(rating, &comment);
-        self.net_blocked_promises.push(promise);
+        self.pending.set_call_rating.push(promise);
+        self.send_call_net_query(
+            CallNetKind::SetCallRating { call_id },
+            tdmtproto::telegram_api::Function::phone_setCallRating(
+                telegram_api::phone_setCallRating {
+                    flags: 0,
+                    user_initiative: false,
+                    peer: Some(input_phone_call),
+                    rating,
+                    comment,
+                },
+            ),
+            "phone.setCallRating",
+        );
     }
 
-    /// `do_send_call_debug_information` (CallManager.cpp:352-357).
-    fn do_send_call_debug_information(
-        &mut self,
-        env: &mut impl CallManagerEnv,
-        _call_id: InputCallId,
-        data: String,
-        promise: Promise<()>,
-    ) {
-        env.send_save_call_debug_query(&data);
-        self.net_blocked_promises.push(promise);
+    /// `on_set_call_rating` (CallManager.cpp:328-333) — the
+    /// `SetCallRatingQuery` ok-answer intake.
+    pub fn on_set_call_rating(&mut self, env: &mut impl CallManagerEnv, call_id: InputCallId) {
+        if let InputCallId::Call(call_id) = call_id
+            && let Some(actor) = self.id_to_actor.get_mut(&call_id)
+        {
+            actor.on_set_call_rating(env);
+        }
     }
 
     /// `on_save_debug_information` (CallManager.cpp:359-366).
@@ -434,6 +520,17 @@ impl CallManager {
             && let Some(actor) = self.id_to_actor.get_mut(&call_id)
         {
             actor.on_save_debug_information(env, result);
+        }
+    }
+
+    /// `on_save_log` (CallManager.cpp:460-478) — the ok leg's actor tail;
+    /// the FileUploadId partial-location cleanup and the promise settle
+    /// ride the Td answer router (cpp:462/:471/:477).
+    pub fn on_save_log(&mut self, env: &mut impl CallManagerEnv, call_id: InputCallId) {
+        if let InputCallId::Call(call_id) = call_id
+            && let Some(actor) = self.id_to_actor.get_mut(&call_id)
+        {
+            actor.on_save_log(env);
         }
     }
 
@@ -605,10 +702,6 @@ mod tests {
         fn close_status(&self) -> Status {
             Status::ok()
         }
-
-        fn send_save_call_debug_query(&mut self, _data: &str) {
-            self.queries.push("saveCallDebug".to_string());
-        }
     }
 
     struct Recorded<T>(std::sync::Arc<std::sync::Mutex<Option<std::result::Result<T, Status>>>>);
@@ -732,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_information_parks_after_the_input_check() {
+    fn debug_information_errors_on_the_unknown_call_band() {
         let mut env = TestEnv::new();
         let mut manager = CallManager::new();
         let (promise, recorded) = record::<()>();
@@ -743,9 +836,37 @@ mod tests {
             promise,
         );
         // the unknown call errors before any query
-        assert!(recorded.0.lock().unwrap().is_some());
-        assert!(env.queries.is_empty());
-        assert!(manager.net_blocked_promises.is_empty());
+        assert!(matches!(
+            recorded.0.lock().unwrap().take().unwrap(),
+            Result::Err(ref status) if status.message() == "Call not found"
+        ));
+        assert!(manager.pending.save_call_debug.is_empty());
+    }
+
+    #[test]
+    fn do_rate_call_parks_in_the_family_queue_when_net_inert() {
+        let mut env = TestEnv::new();
+        let mut manager = CallManager::new();
+        let (promise, recorded) = record::<()>();
+        manager.do_rate_call(
+            &mut env,
+            InputCallId::Call(CallId::new(1)),
+            telegram_api::InputPhoneCall {
+                id: 100,
+                access_hash: 7,
+            },
+            4,
+            "great".to_string(),
+            &[
+                td_api::CallProblem::callProblemEcho(td_api::callProblemEcho),
+                td_api::CallProblem::callProblemDropped(td_api::callProblemDropped),
+            ],
+            promise,
+        );
+        // net-inert: the promise waits in the family queue, nothing settles
+        assert!(recorded.0.lock().unwrap().is_none());
+        assert_eq!(manager.pending.set_call_rating.len(), 1);
+        assert!(manager.pending.save_call_debug.is_empty());
     }
 
     #[test]
@@ -772,6 +893,6 @@ mod tests {
             promise,
         );
         assert!(recorded.0.lock().unwrap().is_none());
-        assert_eq!(manager.net_blocked_promises.len(), 1);
+        assert_eq!(manager.pending.save_call_log.len(), 1);
     }
 }
