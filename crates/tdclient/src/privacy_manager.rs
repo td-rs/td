@@ -801,8 +801,9 @@ impl PrivacyManager {
 
     /// `PrivacyManager::get_privacy` (PrivacyManager.cpp:120-138) — the
     /// synchronized cache answers the builder; otherwise the promise
-    /// queues and the first request sends `account.getPrivacy` — the
-    /// `[blocked: net]` seam.
+    /// queues and the first request sends `account.getPrivacy` through
+    /// the dispatcher (the answer drains the queue via
+    /// `on_get_user_privacy_settings`).
     pub(crate) fn get_privacy(
         &mut self,
         env: &mut impl PrivacyManagerEnv,
@@ -826,7 +827,7 @@ impl PrivacyManager {
 
     /// `PrivacyManager::set_privacy` (PrivacyManager.cpp:140-155) — the
     /// rules intake is real; the first request sends `account.setPrivacy`
-    /// through the `[blocked: net]` seam (the
+    /// through the dispatcher (the
     /// `set_privacy_impl`/`on_set_user_privacy_settings` chain rides it),
     /// the dedup path parks the rules in `pending_rules`.
     pub(crate) fn set_privacy(
@@ -856,7 +857,6 @@ impl PrivacyManager {
     /// the `updateUserPrivacySettingRules` emission. Reached from the net
     /// seams' result handlers and `on_update_privacy` (the updates-plane
     /// arm), and from the tests.
-    #[allow(dead_code)] // the result-handler/updates-plane callers land with the M.7/M.net wiring
     fn do_update_privacy(
         &mut self,
         env: &mut impl PrivacyManagerEnv,
@@ -1099,9 +1099,10 @@ impl GlobalPrivacySettings {
         }
     }
 
-    /// `GlobalPrivacySettings::apply_changes` (GlobalPrivacySettings.cpp:115-137).
-    #[allow(dead_code)] // the get → apply_changes chain parks until the net result handlers land
-    fn apply_changes(&mut self, set_settings: &GlobalPrivacySettings) {
+    /// `GlobalPrivacySettings::apply_changes` (GlobalPrivacySettings.cpp:115-137)
+    /// — the chain's set leg applies the slice onto the fetched settings
+    /// (the dispatcher's GetGlobal answer arm).
+    pub(crate) fn apply_changes(&mut self, set_settings: &GlobalPrivacySettings) {
         debug_assert_eq!(self.set_type, SetType::None);
         match set_settings.set_type {
             SetType::Archive => {
@@ -1185,25 +1186,24 @@ impl GlobalPrivacySettings {
 
     /// `GlobalPrivacySettings::get_input_global_privacy_settings`
     /// (GlobalPrivacySettings.cpp:139-154) — the telegram form the
-    /// `SetGlobalPrivacySettingsQuery` sends (its sender rides the
-    /// `[blocked: net]` result handlers). The masks are the C++
+    /// `SetGlobalPrivacySettingsQuery` tail sends. The masks are the C++
     /// `NONCONTACT_PEERS_PAID_STARS_MASK`/`DISALLOWED_GIFTS_MASK` (bits
-    /// 6/7 of the `globalPrivacySettings` flags).
-    #[allow(dead_code)] // the SetGlobalPrivacySettingsQuery sender (the [blocked: net] tail)
+    /// 5/6 of the `globalPrivacySettings` flags — the generated header
+    /// pins them 32/64; bit 7 is `display_gifts_button`).
     pub(crate) fn get_input_global_privacy_settings(
         &self,
     ) -> tdmtproto::telegram_api::GlobalPrivacySettings {
         debug_assert_eq!(self.set_type, SetType::None);
         let mut flags = 0;
         if self.noncontact_peers_paid_star_count > 0 {
-            flags |= 1 << 6; // NONCONTACT_PEERS_PAID_STARS_MASK
+            flags |= 1 << 5; // NONCONTACT_PEERS_PAID_STARS_MASK
         }
         let gifts_settings = self
             .gift_settings
             .get_disallowed_gifts()
             .get_input_disallowed_gifts_settings();
         if gifts_settings.is_some() {
-            flags |= 1 << 7; // DISALLOWED_GIFTS_MASK
+            flags |= 1 << 6; // DISALLOWED_GIFTS_MASK
         }
         tdmtproto::telegram_api::GlobalPrivacySettings {
             flags,
@@ -1220,8 +1220,7 @@ impl GlobalPrivacySettings {
 
     /// `GlobalPrivacySettings::get_global_privacy_settings`
     /// (GlobalPrivacySettings.cpp:175-177) — the
-    /// `account.getGlobalPrivacySettings` query parks at the
-    /// `[blocked: net]` seam.
+    /// `account.getGlobalPrivacySettings` fetch rides the dispatcher.
     pub(crate) fn get_global_privacy_settings(
         env: &mut impl PrivacyManagerEnv,
         promise: Promise<GlobalPrivacySettings>,
@@ -1232,8 +1231,8 @@ impl GlobalPrivacySettings {
     /// `GlobalPrivacySettings::set_global_privacy_settings`
     /// (GlobalPrivacySettings.cpp:179-198) — the archive-flag hide is
     /// real; the get → `apply_changes` → `account.setGlobalPrivacySettings`
-    /// chain parks at the `[blocked: net]` seam with the caller promise
-    /// riding the dropped query (the C++ LambdaPromise convention).
+    /// chain rides the dispatcher with the caller promise (the C++
+    /// LambdaPromise convention — the set slice rides the pending lot).
     pub(crate) fn set_global_privacy_settings(
         env: &mut impl PrivacyManagerEnv,
         set_settings: GlobalPrivacySettings,
@@ -1268,21 +1267,17 @@ pub(crate) trait PrivacyManagerEnv {
 
     /// `Td::send_update(updateUserPrivacySettingRules)` — the collapsed
     /// update sink (the privacy plane's single update).
-    #[allow(dead_code)] // do_update_privacy's emission (the intake plane)
     fn send_update_privacy_rules(&mut self, update: td_api::updateUserPrivacySettingRules);
 
     /// `UserManager::on_update_online_status_privacy`.
-    #[allow(dead_code)] // do_update_privacy's fan-out (the intake plane)
     fn on_update_online_status_privacy(&mut self);
 
     /// `UserManager::on_update_phone_number_privacy`.
-    #[allow(dead_code)] // do_update_privacy's fan-out (the intake plane)
     fn on_update_phone_number_privacy(&mut self);
 
     /// `UserManager::reload_user(user_id, Promise<Unit>(), source)` —
     /// the unrestricted-user online-status refetch walk (the GetUserMerger
     /// park behind it).
-    #[allow(dead_code)] // do_update_privacy's fan-out (the intake plane)
     fn reload_user(&mut self, user_id: UserId, source: &str);
 
     /// `SuggestedActionManager::hide_suggested_action(SuggestedAction{
@@ -1290,15 +1285,15 @@ pub(crate) trait PrivacyManagerEnv {
     fn hide_archive_and_mute_suggested_action(&mut self);
 
     /// `GetPrivacyQuery::send` (PrivacyManager.cpp:33-35) — the
-    /// `account.getPrivacy` query; `[blocked: net]`, the queued caller
-    /// promises ride the [`PrivacyManager`] state until the net step's
+    /// `account.getPrivacy` query; the queued caller promises ride the
+    /// [`PrivacyManager`] state until the net step's
     /// `on_get_user_privacy_settings` drains them.
     fn get_privacy_via_net(&mut self, key: UserPrivacySettingType);
 
     /// `SetPrivacyQuery::send` (PrivacyManager.cpp:61-64) — the
-    /// `account.setPrivacy` query with the input rules; `[blocked: net]`,
-    /// the caller promise rides the seam (the C++ LambdaPromise drop)
-    /// until the net step's `on_set_user_privacy_settings` answers it.
+    /// `account.setPrivacy` query with the input rules; the caller
+    /// promise rides the seam (the C++ LambdaPromise drop) until the
+    /// net step's `on_set_user_privacy_settings` answers it.
     fn set_privacy_via_net(
         &mut self,
         key: UserPrivacySettingType,
@@ -1308,13 +1303,13 @@ pub(crate) trait PrivacyManagerEnv {
 
     /// `GetGlobalPrivacySettingsQuery::send`
     /// (GlobalPrivacySettings.cpp:33-35) — the
-    /// `account.getGlobalPrivacySettings` query; `[blocked: net]`.
+    /// `account.getGlobalPrivacySettings` fetch.
     fn get_global_privacy_via_net(&mut self, promise: Promise<GlobalPrivacySettings>);
 
-    /// `SetGlobalPrivacySettingsQuery::send`
-    /// (GlobalPrivacySettings.cpp:59-62) — the
-    /// `account.setGlobalPrivacySettings` tail of the get →
-    /// `apply_changes` → set chain; `[blocked: net]`.
+    /// The set chain's get leg (GlobalPrivacySettings.cpp:186-197) —
+    /// the pending lot carries the set slice; the get answer applies
+    /// the changes and dispatches the `SetGlobalPrivacySettingsQuery`
+    /// tail.
     fn set_global_privacy_via_net(&mut self, settings: GlobalPrivacySettings, promise: Promise<()>);
 
     /// `UserManager::on_get_users` — the wire rules intake leg
@@ -1929,8 +1924,9 @@ mod tests {
         assert!(!fetched.hide_read_marks);
 
         // the set flow: the archive hide is statically dead for the
-        // ReadDate/NewChat set types, and the whole chain parks at the
-        // seam with the caller promise
+        // ReadDate/NewChat set types; the chain start rides the env seam
+        // (the dispatcher applies the slice onto the fetched settings
+        // and sends the set tail)
         let mut env = TestPrivacyEnv::new();
         let promise = Promise::default();
         GlobalPrivacySettings::set_global_privacy_settings(&mut env, read_date, promise);

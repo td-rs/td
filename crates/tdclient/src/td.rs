@@ -3730,6 +3730,14 @@ enum PendingPrivacyQuery {
     GetGlobal {
         promise: Promise<crate::privacy_manager::GlobalPrivacySettings>,
     },
+    /// The set chain's get-leg capture (GlobalPrivacySettings.cpp:186-197)
+    /// — the set slice rides the pending entry the way the C++ lambda
+    /// captures it; the get answer applies the changes and dispatches
+    /// the `SetGlobalPrivacySettingsQuery` tail.
+    SetGlobalChain {
+        set_settings: crate::privacy_manager::GlobalPrivacySettings,
+        promise: Promise<()>,
+    },
     /// The `SetGlobalPrivacySettingsQuery` promise
     /// (GlobalPrivacySettings.cpp:49).
     SetGlobal { promise: Promise<()> },
@@ -3739,8 +3747,8 @@ impl PendingPrivacyQuery {
     fn is_set_privacy(&self) -> bool {
         matches!(self, Self::SetPrivacy { .. })
     }
-    fn is_get_global(&self) -> bool {
-        matches!(self, Self::GetGlobal { .. })
+    fn is_get_global_leg(&self) -> bool {
+        matches!(self, Self::GetGlobal { .. } | Self::SetGlobalChain { .. })
     }
     fn is_set_global(&self) -> bool {
         matches!(self, Self::SetGlobal { .. })
@@ -20504,30 +20512,76 @@ impl Td {
                 manager.on_set_user_privacy_settings(&mut env, setting, result, promise);
                 self.privacy_manager = manager;
             }
-            // `GetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:33-46).
+            // `GetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:33-46)
+            // — the fetch promise converts through the wire constructor;
+            // the set chain's captured slice applies onto the fetched
+            // settings and dispatches the `SetGlobalPrivacySettingsQuery`
+            // tail (GlobalPrivacySettings.cpp:186-197).
             PrivacyNetKind::GetGlobalPrivacySettings => {
                 let Some(pending) = take_privacy_pending(
                     &mut self.privacy_promises,
-                    PendingPrivacyQuery::is_get_global,
+                    PendingPrivacyQuery::is_get_global_leg,
                 ) else {
                     return;
                 };
-                let PendingPrivacyQuery::GetGlobal { mut promise } = pending else {
-                    unreachable!("the selector matches the variant");
+                // both get-leg promises convert the wire settings or
+                // forward the failure (the C++ ResultHandler paths)
+                let r_settings = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::GlobalPrivacySettings::parse(query.ok()) {
+                        Ok(settings) => tdutils::status::Result::Ok(
+                            crate::privacy_manager::GlobalPrivacySettings::from_wire(settings),
+                        ),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "account_getGlobalPrivacySettings",
+                        )),
+                    }
                 };
-                if query.is_error() {
-                    promise.set_error(query.error().clone());
-                    return;
-                }
-                match telegram_api::GlobalPrivacySettings::parse(query.ok()) {
-                    Ok(settings) => promise.set_value(
-                        crate::privacy_manager::GlobalPrivacySettings::from_wire(settings),
-                    ),
-                    Err(_) => promise.set_error(parse_error("account_getGlobalPrivacySettings")),
+                match pending {
+                    PendingPrivacyQuery::GetGlobal { mut promise } => match r_settings {
+                        tdutils::status::Result::Ok(settings) => promise.set_value(settings),
+                        tdutils::status::Result::Err(status) => promise.set_error(status),
+                    },
+                    PendingPrivacyQuery::SetGlobalChain {
+                        set_settings,
+                        mut promise,
+                    } => match r_settings {
+                        tdutils::status::Result::Ok(mut settings) => {
+                            // `G()->ignore_result_if_closing`
+                            // (Global.h:280-284) — a closing Td converts
+                            // the ok answer into the request-aborted error
+                            if self.global.close_flag() {
+                                promise.set_error(crate::config_result::request_aborted_error());
+                                return;
+                            }
+                            settings.apply_changes(&set_settings);
+                            // the caller promise parks for the SET answer
+                            self.privacy_promises
+                                .push(PendingPrivacyQuery::SetGlobal { promise });
+                            match self.privacy_net() {
+                                Some(net) => net.dispatch(
+                                    PrivacyNetKind::SetGlobalPrivacySettings,
+                                    telegram_api::Function::account_setGlobalPrivacySettings(
+                                        telegram_api::account_setGlobalPrivacySettings {
+                                            settings: Some(
+                                                settings.get_input_global_privacy_settings(),
+                                            ),
+                                        },
+                                    ),
+                                ),
+                                None => {
+                                    tdutils::log_info!("Set global privacy settings — [net-inert]")
+                                }
+                            }
+                        }
+                        tdutils::status::Result::Err(status) => promise.set_error(status),
+                    },
+                    _ => unreachable!("the selector matches the get leg"),
                 }
             }
             // `SetGlobalPrivacySettingsQuery` (GlobalPrivacySettings.cpp:59-75)
-            // — the ok arm drops the echoed settings value.
+            // — the Bool answer drops (the C++ Unit band).
             PrivacyNetKind::SetGlobalPrivacySettings => {
                 let Some(pending) = take_privacy_pending(
                     &mut self.privacy_promises,
@@ -20540,8 +20594,8 @@ impl Td {
                 };
                 if query.is_error() {
                     promise.set_error(query.error().clone());
-                } else if telegram_api::GlobalPrivacySettings::parse(query.ok()).is_ok() {
-                    // the echoed settings value drops (the C++ Unit band)
+                } else if parse_wire_bool(query.ok()).is_some() {
+                    // the echoed Bool value drops (the C++ Unit band)
                     promise.set_value(());
                 } else {
                     promise.set_error(parse_error("account_setGlobalPrivacySettings"));
@@ -37434,18 +37488,21 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
         settings: crate::privacy_manager::GlobalPrivacySettings,
         promise: Promise<()>,
     ) {
-        // `SetGlobalPrivacySettingsQuery::send`
-        // (GlobalPrivacySettings.cpp:59-62).
+        // The set chain's get leg (GlobalPrivacySettings.cpp:186-197) —
+        // the pending entry carries the set slice (the C++ lambda
+        // capture); the get answer applies the changes and dispatches
+        // the `SetGlobalPrivacySettingsQuery` tail.
         self.td
             .privacy_promises
-            .push(PendingPrivacyQuery::SetGlobal { promise });
+            .push(PendingPrivacyQuery::SetGlobalChain {
+                set_settings: settings,
+                promise,
+            });
         match self.td.privacy_net() {
             Some(net) => net.dispatch(
-                PrivacyNetKind::SetGlobalPrivacySettings,
-                telegram_api::Function::account_setGlobalPrivacySettings(
-                    telegram_api::account_setGlobalPrivacySettings {
-                        settings: Some(settings.get_input_global_privacy_settings()),
-                    },
+                PrivacyNetKind::GetGlobalPrivacySettings,
+                telegram_api::Function::account_getGlobalPrivacySettings(
+                    telegram_api::account_getGlobalPrivacySettings,
                 ),
             ),
             None => tdutils::log_info!("Set global privacy settings — [net-inert]"),
@@ -55522,6 +55579,195 @@ mod tests {
                 .info_rules_len_for_test(UserPrivacySettingType::UserStatus),
             1
         );
+
+        assert!(td.privacy_net_completed.lock().is_empty(), "drained");
+        assert!(td.privacy_promises.is_empty(), "all promises resolved");
+    }
+
+    // ---- the global-privacy net slice: the fetch family and the set
+    // chain ride the dispatcher (GlobalPrivacySettings.cpp:26-198). ----
+
+    type GlobalPrivacySlot = std::sync::Arc<
+        std::sync::Mutex<
+            Option<tdutils::status::Result<crate::privacy_manager::GlobalPrivacySettings>>,
+        >,
+    >;
+
+    fn record_global_privacy_settings() -> (
+        Promise<crate::privacy_manager::GlobalPrivacySettings>,
+        GlobalPrivacySlot,
+    ) {
+        struct Rec(GlobalPrivacySlot);
+        impl tdutils::promise::PromiseInterface<crate::privacy_manager::GlobalPrivacySettings> for Rec {
+            fn set_value(&mut self, value: crate::privacy_manager::GlobalPrivacySettings) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: GlobalPrivacySlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    /// The wire `globalPrivacySettings` the fetch answers with — the
+    /// archive bit, the stars payload (bit 5) and the gifts-button bit.
+    fn wire_global_privacy_settings(hide_read_marks: bool, stars: i64) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::GlobalPrivacySettings {
+            flags: 1 | if stars > 0 { 1 << 5 } else { 0 } | 1 << 7,
+            archive_and_mute_new_noncontact_peers: true,
+            keep_archived_unmuted: false,
+            keep_archived_folders: false,
+            hide_read_marks,
+            new_noncontact_peers_require_premium: true,
+            display_gifts_button: true,
+            noncontact_peers_paid_stars: stars,
+            disallowed_gifts: None,
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    #[test]
+    fn global_privacy_settings_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(global_privacy_settings_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn global_privacy_settings_ride_the_dispatcher_impl() {
+        use crate::privacy_manager::GlobalPrivacySettings;
+        let (mut td, rec) = netted_td("netfix-global-privacy");
+
+        // 1. the fetch family — the wire settings convert through
+        //    `from_wire` (the stars ride the get_star_count clamp).
+        let (promise, slot) = record_global_privacy_settings();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            GlobalPrivacySettings::get_global_privacy_settings(&mut env, promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getGlobalPrivacySettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_global_privacy_settings(false, 25),
+        );
+        td.dispatch_completed_privacy_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(settings)) => {
+                // the rewrap getters answer the family shapes
+                assert_eq!(
+                    settings.get_read_date_privacy_settings_object(),
+                    td_api::ReadDatePrivacySettings {
+                        show_read_date: true
+                    }
+                );
+                let new_chat = settings.get_new_chat_privacy_settings_object();
+                assert_eq!(new_chat.incoming_paid_message_star_count, 25);
+                assert!(!new_chat.allow_new_chats_from_unknown_users);
+                // the wire form keeps the archive and gifts-button bits
+                let input = settings.get_input_global_privacy_settings();
+                assert!(input.archive_and_mute_new_noncontact_peers);
+                assert!(input.display_gifts_button);
+                assert_eq!(input.noncontact_peers_paid_stars, 25);
+            }
+            other => panic!("unexpected global privacy settings result: {other:?}"),
+        }
+
+        // 2. the set chain — the NewChat slice starts at the get query,
+        //    applies onto the fetched settings and rides the set tail;
+        //    the Bool answer drops into Unit.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                GlobalPrivacySettings::from_new_chat_privacy_settings(Some(
+                    td_api::NewChatPrivacySettings {
+                        allow_new_chats_from_unknown_users: true,
+                        incoming_paid_message_star_count: 7,
+                    },
+                )),
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the chain starts at the get query");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getGlobalPrivacySettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_global_privacy_settings(false, 25),
+        );
+        td.dispatch_completed_privacy_net();
+
+        // the tail: the fetched settings with the NewChat slice merged
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_setGlobalPrivacySettings::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::account_setGlobalPrivacySettings(function) => {
+                let settings = function.settings.unwrap();
+                // the slice wins the NewChat fields, the wire keeps the rest
+                assert_eq!(settings.noncontact_peers_paid_stars, 7);
+                assert_eq!(settings.flags & (1 << 5), 1 << 5, "the stars mask bit");
+                assert!(!settings.new_noncontact_peers_require_premium);
+                assert!(settings.archive_and_mute_new_noncontact_peers);
+                assert!(settings.display_gifts_button);
+                assert!(!settings.hide_read_marks);
+            }
+            other => panic!("unexpected set function: {other:?}"),
+        }
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_privacy_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the error band — the get leg fails, the chain forwards the
+        //    error (the C++ lambda error path).
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let mut env = crate::td::PrivacyEnv { td: &mut td };
+            GlobalPrivacySettings::set_global_privacy_settings(
+                &mut env,
+                GlobalPrivacySettings::from_read_date_privacy_settings(Some(
+                    td_api::ReadDatePrivacySettings {
+                        show_read_date: false,
+                    },
+                )),
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(
+            sent.into_iter().next().unwrap(),
+            400,
+            "PHONE_NUMBER_INVALID",
+        );
+        td.dispatch_completed_privacy_net();
+        match unit_slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "PHONE_NUMBER_INVALID");
+            }
+            other => panic!("unexpected chain error result: {other:?}"),
+        }
 
         assert!(td.privacy_net_completed.lock().is_empty(), "drained");
         assert!(td.privacy_promises.is_empty(), "all promises resolved");
