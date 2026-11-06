@@ -6631,15 +6631,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-        Function::sendCallLog(_) => {
-            // `Requests.cpp:5148-5153` — the FileManager call-log upload
-            // surface (FileType::CallLog + upload callback) queues on the
-            // M.12 upload continuation; the interim 500 stays.
-            if !check_is_user(td, id) {
-                return;
-            }
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
-        }
 
         // --- account / sessions (Requests.cpp:2452-2478, 2515, …) ---
         Function::confirmQrCodeAuthentication(request) => {
