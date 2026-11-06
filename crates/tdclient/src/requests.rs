@@ -16993,7 +16993,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::getUserPrivacySettingRules(request) => {
             // Requests.cpp:2418-2422 — `PrivacyManager::get_privacy`; the
             // synchronized cache band answers the rules builder and the
-            // `account.getPrivacy` tail is the `[blocked: net]` seam.
+            // `account.getPrivacy` tail rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17014,7 +17014,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::setUserPrivacySettingRules(request) => {
             // Requests.cpp:2424-2428 — `PrivacyManager::set_privacy`; the
             // rules intake bands are real and the `account.setPrivacy`
-            // tail is the `[blocked: net]` seam.
+            // tail rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17073,8 +17073,8 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::getReadDatePrivacySettings(_) => {
             // Requests.cpp:5711-5723 — the query-promise lambda rewraps
             // the fetched `GlobalPrivacySettings` into the td_api object;
-            // the `account.getGlobalPrivacySettings` fetch is the
-            // `[blocked: net]` seam.
+            // the `account.getGlobalPrivacySettings` fetch rides the
+            // dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17110,7 +17110,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
             // = `settings == nullptr || !settings->show_read_date_`); the
             // archive hide is statically dead for this set type and the
             // get → `apply_changes` → `account.setGlobalPrivacySettings`
-            // chain parks at the `[blocked: net]` seam.
+            // chain rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17129,8 +17129,8 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::getNewChatPrivacySettings(_) => {
             // Requests.cpp:5732-5744 — the query-promise lambda rewrap of
             // `get_new_chat_privacy_settings_object`; the
-            // `account.getGlobalPrivacySettings` fetch is the
-            // `[blocked: net]` seam.
+            // `account.getGlobalPrivacySettings` fetch rides the
+            // dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17166,7 +17166,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
             // `[0, 1000000]` star-count clamp; the archive hide is
             // statically dead for this set type and the get →
             // `apply_changes` → `account.setGlobalPrivacySettings` chain
-            // parks at the `[blocked: net]` seam.
+            // rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
