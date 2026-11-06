@@ -10,10 +10,12 @@
 //! [`crate::files::FileManager::store_file`]/[`crate::files::FileManager::parse_file`]
 //! through the env, exactly like the photo stores. The three `Td::ResultHandler`
 //! query classes (`GetAttachMenuBotsQuery`, `GetAttachMenuBotQuery`,
-//! `ToggleBotInAttachMenuQuery`) collapse into the
-//! [`AttachMenuManagerEnv`] query seams — `[blocked: net]` with the
-//! promises parked (the M.31 convention); the two answer handlers are
-//! real and unit-tested. The C++ actor timeout (the 1–1.33h successful
+//! `ToggleBotInAttachMenuQuery` — AttachMenuManager.cpp:35-120) collapse
+//! onto the `AttachMenuNetKind` dispatcher tag (the net-drain 42
+//! plane): the queries ride the manager-held net handle and the answers
+//! drain through `Td::on_attach_menu_net_answer` into the real intake
+//! handlers; the reload/single-bot/toggle promises park in the family
+//! lots (the FIFO §5 pairing). The C++ actor timeout (the 1–1.33h successful
 //! reload / 1–2min error retry) rides the shared Td timeout slot through
 //! [`AttachMenuManager::tick_timeouts`]/[`AttachMenuManager::next_deadline`]
 //! (the M.13 convention).
@@ -25,11 +27,33 @@ use crate::user_manager::{BotData, UserId};
 use std::collections::HashMap;
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
+use tdutils::promise::PromiseInterface;
 use tdutils::status::Status;
 
-/// The `G()`/`td_` surface of the manager. The net queries are the
-/// `[blocked: net]` query seams; the `send_update` outbox is drained by
-/// `crate::td::Td::flush_user_updates`.
+/// The in-flight query kinds of the net-drain 42 attach-menu families —
+/// the C++ `Td::ResultHandler` classes (`GetAttachMenuBotsQuery`,
+/// `GetAttachMenuBotQuery`, `ToggleBotInAttachMenuQuery`,
+/// AttachMenuManager.cpp:35-120) collapsed onto one dispatcher tag; the
+/// answers drain through `Td::on_attach_menu_net_answer`. The expected
+/// bot id rides the single-bot kind (the C++ promise lambda captures
+/// `user_id`); the promises park in the manager's family lots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachMenuNetKind {
+    /// `GetAttachMenuBotsQuery` (cpp:35-61) — `messages.getAttachMenuBots`;
+    /// the promise lot is the shared `reload_attach_menu_bots_queries`.
+    GetAttachMenuBots,
+    /// `GetAttachMenuBotQuery` (cpp:63-89) — `messages.getAttachMenuBot`;
+    /// `user_id` is the C++ lambda capture the wrong-bot band checks.
+    GetAttachMenuBot { user_id: UserId },
+    /// `ToggleBotInAttachMenuQuery` (cpp:91-120) —
+    /// `messages.toggleBotInAttachMenu`; the answer success-chains into
+    /// `reload_attach_menu_bots` (cpp:795-799), the error reloads
+    /// promise-less first (cpp:116-119).
+    ToggleBotInAttachMenu,
+}
+
+/// The `G()`/`td_` surface of the manager; the `send_update` outbox is
+/// drained by `crate::td::Td::flush_user_updates`.
 pub trait AttachMenuManagerEnv {
     /// `G()->close_flag()`.
     fn close_flag(&self) -> bool;
@@ -98,37 +122,6 @@ pub trait AttachMenuManagerEnv {
 
     /// `parser.context()->td()...->file_manager_->parse_file(parser)`.
     fn parse_file_id(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
-
-    /// `GetAttachMenuBotsQuery::send` (cpp:43-45) — `[blocked: net]`; the
-    /// answer arrives through
-    /// [`AttachMenuManager::on_reload_attach_menu_bots`].
-    fn send_get_attach_menu_bots_query(&mut self, hash: i64) {
-        tdutils::log_info!("Send GetAttachMenuBots(hash = {hash}) — [blocked: net]");
-    }
-
-    /// `GetAttachMenuBotQuery::send` (cpp:71-73) — `[blocked: net]`; the
-    /// answer arrives through
-    /// [`AttachMenuManager::on_get_attach_menu_bot`].
-    fn send_get_attach_menu_bot_query(&mut self, input_user: &telegram_api::InputUser) {
-        tdutils::log_info!("Send GetAttachMenuBot — [blocked: net]");
-        let _ = input_user;
-    }
-
-    /// `ToggleBotInAttachMenuQuery::send` (cpp:98-101) — `[blocked: net]`;
-    /// the C++ success closure chains into `reload_attach_menu_bots` and
-    /// the C++ `on_error` reloads + fails the promise (cpp:116-119) — both
-    /// obligations ride the net-step integration.
-    fn send_toggle_bot_in_attach_menu_query(
-        &mut self,
-        input_user: &telegram_api::InputUser,
-        write_allowed: bool,
-        is_added: bool,
-    ) {
-        tdutils::log_info!(
-            "Send ToggleBotInAttachMenu(write_allowed = {write_allowed}, is_added = {is_added}) — [blocked: net]"
-        );
-        let _ = input_user;
-    }
 }
 
 /// `AttachMenuManager::is_active` (cpp:440-442).
@@ -136,10 +129,20 @@ fn is_active(env: &impl AttachMenuManagerEnv) -> bool {
     !env.close_flag() && env.is_authorized() && !env.is_bot()
 }
 
-/// `td::fail_promises` (Promise.h) — fail the queue with a cloned error.
-fn fail_promises<T: Send>(promises: &mut Vec<Promise<T>>, error: &Status) {
-    for mut promise in std::mem::take(promises) {
-        promise.set_error(error.clone());
+/// The C++ `reload_attach_menu_bot` wrapped promise (cpp:701-708): the
+/// single-bot object answer completes the caller's Unit promise (the
+/// object drops, the error rides).
+struct WrappedUnitPromise {
+    inner: Promise<()>,
+}
+
+impl PromiseInterface<td_api::AttachmentMenuBot> for WrappedUnitPromise {
+    fn set_value(&mut self, _value: td_api::AttachmentMenuBot) {
+        self.inner.set_value(());
+    }
+
+    fn set_error(&mut self, error: Status) {
+        self.inner.set_error(error);
     }
 }
 
@@ -566,15 +569,6 @@ fn icon_expects_colors(name: &str) -> bool {
     matches!(icon_slot(name), Some(IconSlot::AndroidIcon))
 }
 
-/// The parked `getAttachmentMenuBot` request — the C++ promise rides the
-/// query actor until the answer; the collapse parks it here until the net
-/// query actors land. Both fields read at the net-step integration.
-#[allow(dead_code)]
-struct PendingBotQuery {
-    user_id: UserId,
-    promise: Promise<td_api::AttachmentMenuBot>,
-}
-
 /// The C++ `AttachMenuManager` actor; the Rust manager is a plain struct
 /// held by `Td` (the actor envelope collapses, the M.13 convention).
 #[derive(Default)]
@@ -588,13 +582,22 @@ pub struct AttachMenuManager {
     /// `attach_menu_bot_file_source_ids_` — the interning cache; the
     /// source ids themselves live in the FileReferenceManager.
     attach_menu_bot_file_source_ids: HashMap<UserId, FileSourceId>,
-    /// `reload_attach_menu_bots_queries_`.
+    /// The manager-held dispatch surface of the net-drain 42 families —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests; the `ForumTopicManager::net` shape).
+    pub(crate) net: Option<crate::td::AttachMenuNetHandle>,
+    /// `reload_attach_menu_bots_queries_` — also the
+    /// `GetAttachMenuBotsQuery` promise lot (FIFO §5 pairing).
     reload_attach_menu_bots_queries: Vec<Promise<()>>,
-    /// The parked single-bot queries (the `[blocked: net]` convention).
-    pending_bot_queries: Vec<PendingBotQuery>,
-    /// The parked toggle promises (the same convention; the C++
-    /// success-chains them into `reload_attach_menu_bots`).
-    pending_toggle_promises: Vec<Promise<()>>,
+    /// `GetAttachMenuBotQuery::promise_` lot (the C++ promise rides the
+    /// query; the collapse parks it FIFO per kind, §5) — the wrapped-Unit
+    /// entries of `reload_attach_menu_bot` ride the same kind. The drain
+    /// pops it in `Td::on_attach_menu_net_answer`.
+    pub(crate) pending_bot_queries: Vec<Promise<td_api::AttachmentMenuBot>>,
+    /// `ToggleBotInAttachMenuQuery::promise_` lot; the answers
+    /// success-chain into `reload_attach_menu_bots` (cpp:795-799). The
+    /// drain pops it in `Td::on_attach_menu_net_answer`.
+    pub(crate) pending_toggle_promises: Vec<Promise<()>>,
     /// The C++ actor timeout deadline (`set_timeout_in(Random::fast(...))`,
     /// process-monotonic — the M.3.7.2 convention).
     next_reload_at: f64,
@@ -606,9 +609,34 @@ impl AttachMenuManager {
         AttachMenuManager::default()
     }
 
+    /// Test-only: the cache probes (the netted round-trips' intake
+    /// assertions) — the current hash + the cached bot count.
+    #[cfg(test)]
+    pub(crate) fn cache_for_test(&self) -> (i64, usize) {
+        (self.hash, self.attach_menu_bots.len())
+    }
+
     /// `get_attach_menu_bots_database_key` (cpp:845-847).
     fn get_attach_menu_bots_database_key() -> &'static str {
         "attach_bots"
+    }
+
+    /// The `td_->create_handler<…>()->send(...)` collapse of the three
+    /// query classes — the dispatcher tag rides the kind; the input users
+    /// resolve at the request legs (the C++ `TRY_RESULT_PROMISE` settle
+    /// fails the promise directly, no query). `None` on the handle keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests; the `send_forum_topic_net_query` shape).
+    fn send_attach_menu_net_query(
+        &mut self,
+        kind: AttachMenuNetKind,
+        what: &str,
+        build: impl FnOnce() -> telegram_api::Function,
+    ) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(kind, build()),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
     }
 
     /// `AttachMenuManager::init` (cpp:366-430) — also `start_up`
@@ -903,8 +931,9 @@ impl AttachMenuManager {
     }
 
     /// `reload_attach_menu_bots` (cpp:595-608) — also the C++
-    /// `UpdatesManager::before_get_difference` hook (cpp:4124); the query
-    /// is the `[blocked: net]` seam.
+    /// `UpdatesManager::before_get_difference` hook (cpp:4124); the
+    /// head-only send dispatches `messages.getAttachMenuBots` with the
+    /// current hash.
     pub fn reload_attach_menu_bots(
         &mut self,
         env: &mut impl AttachMenuManagerEnv,
@@ -916,7 +945,16 @@ impl AttachMenuManager {
 
         self.reload_attach_menu_bots_queries.push(promise);
         if self.reload_attach_menu_bots_queries.len() == 1 {
-            env.send_get_attach_menu_bots_query(self.hash);
+            let hash = self.hash;
+            self.send_attach_menu_net_query(
+                AttachMenuNetKind::GetAttachMenuBots,
+                "messages.getAttachMenuBots",
+                move || {
+                    telegram_api::Function::messages_getAttachMenuBots(
+                        telegram_api::messages_getAttachMenuBots { hash },
+                    )
+                },
+            );
         }
     }
 
@@ -933,10 +971,15 @@ impl AttachMenuManager {
             }
             return;
         }
-        if let Err(error) = result {
-            // `set_timeout_in(Random::fast(60, 120))` (cpp:616)
+        if let Err(_error) = result {
+            // `set_timeout_in(Random::fast(60, 120))` (cpp:615-618) — the
+            // retry rides the timeout; the C++ `set_promises` settles the
+            // parked promises Unit (the error itself drops), so the
+            // toggle chain re-entering here answers Ok like the C++.
             self.next_reload_at = tdutils::time::now() + f64::from(tdutils::random::fast(60, 120));
-            fail_promises(&mut self.reload_attach_menu_bots_queries, &error);
+            for mut promise in std::mem::take(&mut self.reload_attach_menu_bots_queries) {
+                promise.set_value(());
+            }
             return;
         }
 
@@ -1007,8 +1050,9 @@ impl AttachMenuManager {
     }
 
     /// `get_attach_menu_bot` (cpp:675-691) — the `getAttachmentMenuBot`
-    /// request flow; the query is the `[blocked: net]` seam and the
-    /// promise parks until the answer.
+    /// request flow; the input user resolves at the leg (the
+    /// `TRY_RESULT_PROMISE` settle) and `messages.getAttachMenuBot`
+    /// dispatches with the promise parked in the family lot.
     pub fn get_attach_menu_bot_request(
         &mut self,
         env: &mut impl AttachMenuManagerEnv,
@@ -1031,13 +1075,24 @@ impl AttachMenuManager {
             ));
         }
 
-        env.send_get_attach_menu_bot_query(&input_user);
-        self.pending_bot_queries
-            .push(PendingBotQuery { user_id, promise });
+        self.pending_bot_queries.push(promise);
+        self.send_attach_menu_net_query(
+            AttachMenuNetKind::GetAttachMenuBot { user_id },
+            "messages.getAttachMenuBot",
+            move || {
+                telegram_api::Function::messages_getAttachMenuBot(
+                    telegram_api::messages_getAttachMenuBot {
+                        bot: Some(input_user),
+                    },
+                )
+            },
+        );
     }
 
-    /// `reload_attach_menu_bot` (cpp:693-715) — no td_api arm reaches it
-    /// in this revision; kept for the net-step integration.
+    /// `reload_attach_menu_bot` (cpp:693-715) — the C++ caller is the
+    /// FileReferenceManager repair leg (FileReferenceManager.cpp:556, the
+    /// Files plane); the caller's Unit promise wraps the object answer
+    /// (the `WrappedUnitPromise` interface) and parks in the single-bot lot.
     #[allow(dead_code)]
     pub fn reload_attach_menu_bot(
         &mut self,
@@ -1054,14 +1109,21 @@ impl AttachMenuManager {
             Err(status) => return promise.set_error(status),
         };
 
-        env.send_get_attach_menu_bot_query(&input_user);
-        self.pending_bot_queries.push(PendingBotQuery {
-            user_id,
-            promise: Promise::default(),
-        });
-        // the C++ wraps the Unit promise around the object answer (the
-        // object drops); the park keeps the ordering
-        self.pending_toggle_promises.push(promise);
+        self.pending_bot_queries
+            .push(Promise::from_interface(WrappedUnitPromise {
+                inner: promise,
+            }));
+        self.send_attach_menu_net_query(
+            AttachMenuNetKind::GetAttachMenuBot { user_id },
+            "messages.getAttachMenuBot",
+            move || {
+                telegram_api::Function::messages_getAttachMenuBot(
+                    telegram_api::messages_getAttachMenuBot {
+                        bot: Some(input_user),
+                    },
+                )
+            },
+        );
     }
 
     /// `on_get_attach_menu_bot` (cpp:717-761) — the shared answer handler
@@ -1126,10 +1188,10 @@ impl AttachMenuManager {
     }
 
     /// `toggle_bot_is_added_to_attach_menu` (cpp:776-802) — the
-    /// `toggleBotIsAddedToAttachmentMenu` request flow; the C++
-    /// success-chains the promise into `reload_attach_menu_bots` and the
-    /// C++ `ToggleBotInAttachMenuQuery::on_error` reloads + fails — both
-    /// obligations ride the net-step integration.
+    /// `toggleBotIsAddedToAttachmentMenu` request flow; the answer
+    /// success-chains into `reload_attach_menu_bots` (cpp:795-799) and the
+    /// C++ `on_error` reloads promise-less + fails (cpp:116-119) — both
+    /// tails run in `Td::on_attach_menu_net_answer`.
     pub fn toggle_bot_is_added_to_attach_menu(
         &mut self,
         env: &mut impl AttachMenuManagerEnv,
@@ -1160,9 +1222,25 @@ impl AttachMenuManager {
             self.remove_bot_from_attach_menu(env, user_id);
         }
 
+        // `ToggleBotInAttachMenuQuery::send` (cpp:98-101) — the
+        // WRITE_ALLOWED flag carries `is_added && allow_write_access`,
+        // `enabled` carries `is_added`.
         let write_allowed = is_added && allow_write_access;
-        env.send_toggle_bot_in_attach_menu_query(&input_user, write_allowed, is_added);
         self.pending_toggle_promises.push(promise);
+        self.send_attach_menu_net_query(
+            AttachMenuNetKind::ToggleBotInAttachMenu,
+            "messages.toggleBotInAttachMenu",
+            move || {
+                telegram_api::Function::messages_toggleBotInAttachMenu(
+                    telegram_api::messages_toggleBotInAttachMenu {
+                        flags: 0,
+                        write_allowed,
+                        bot: Some(input_user),
+                        enabled: is_added,
+                    },
+                )
+            },
+        );
     }
 
     /// `get_attachment_menu_bot_object` (cpp:804-831) — invalid icon
@@ -1416,24 +1494,6 @@ mod tests {
         fn parse_file_id(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
             Ok(FileId::new(parser.i32_()?, 0))
         }
-
-        fn send_get_attach_menu_bots_query(&mut self, hash: i64) {
-            self.query_log.push(format!("get bots {hash}"));
-        }
-
-        fn send_get_attach_menu_bot_query(&mut self, _input_user: &telegram_api::InputUser) {
-            self.query_log.push("get bot".to_string());
-        }
-
-        fn send_toggle_bot_in_attach_menu_query(
-            &mut self,
-            _input_user: &telegram_api::InputUser,
-            write_allowed: bool,
-            is_added: bool,
-        ) {
-            self.query_log
-                .push(format!("toggle {write_allowed} {is_added}"));
-        }
     }
 
     #[derive(Default)]
@@ -1573,13 +1633,10 @@ mod tests {
             env.query_log.contains(&"pmc erase attach_bots".to_string()),
             "the no-chat-info-db erase"
         );
+        assert_eq!(env.query_log.len(), 1, "the pmc erase");
         assert_eq!(
-            env.query_log.len(),
-            2,
-            "the pmc erase + the init-tail reload"
-        );
-        assert!(
-            env.query_log.contains(&"get bots 0".to_string()),
+            manager.reload_attach_menu_bots_queries.len(),
+            1,
             "the init tail fires the reload query"
         );
         assert_eq!(env.updates.len(), 1, "the empty updateAttachmentMenuBots");
@@ -1620,12 +1677,12 @@ mod tests {
         let (promise, recorded) = recording_promise();
         manager.reload_attach_menu_bots(&mut env, promise);
         assert!(recorded.0.lock().unwrap().is_none(), "rides the query");
-        assert_eq!(env.query_log, vec!["get bots 0".to_string()]);
+        assert_eq!(manager.reload_attach_menu_bots_queries.len(), 1);
 
         // the second request queues behind the first
         let (promise, _) = recording_promise();
         manager.reload_attach_menu_bots(&mut env, promise);
-        assert_eq!(env.query_log.len(), 1);
+        assert_eq!(manager.reload_attach_menu_bots_queries.len(), 2);
 
         manager.on_reload_attach_menu_bots(&mut env, Ok(bots_answer(vec![wire_bot(300, "bot")])));
         assert!(manager.attach_menu_bots.len() == 1);
@@ -1646,13 +1703,19 @@ mod tests {
     }
 
     #[test]
-    fn reload_error_sets_the_short_retry() {
+    fn reload_error_sets_the_short_retry_and_settles_ok() {
         let mut env = TestEnv::new();
         let mut manager = AttachMenuManager::new();
-        let (promise, _) = recording_promise();
+        let (promise, recorded) = recording_promise();
         manager.reload_attach_menu_bots(&mut env, promise);
         manager.on_reload_attach_menu_bots(&mut env, Err(Status::error(429, "FLOOD")));
         assert!(manager.reload_attach_menu_bots_queries.is_empty());
+        // the C++ `set_promises` (cpp:617) settles Unit — the toggle
+        // chain re-entering here answers Ok despite the failed reload
+        assert!(
+            recorded.0.lock().unwrap().is_some(),
+            "the reload promise settles Ok"
+        );
         let deadline = manager.next_deadline().unwrap();
         assert!(
             deadline - tdutils::time::now() >= 59.0 && deadline - tdutils::time::now() <= 120.0,
@@ -1667,22 +1730,21 @@ mod tests {
         manager.next_reload_at = tdutils::time::now() - 1.0;
         manager.tick_timeouts(&mut env);
         assert_eq!(
-            env.query_log.last().unwrap(),
-            "get bots 0",
+            manager.reload_attach_menu_bots_queries.len(),
+            1,
             "the due timeout reloads"
         );
 
         // not yet due: no query
-        let queries = env.query_log.len();
         manager.next_reload_at = tdutils::time::now() + 3600.0;
         manager.tick_timeouts(&mut env);
-        assert_eq!(env.query_log.len(), queries);
+        assert_eq!(manager.reload_attach_menu_bots_queries.len(), 1);
 
         // inactive: no query
         env.is_authorized = false;
         manager.next_reload_at = tdutils::time::now() - 1.0;
         manager.tick_timeouts(&mut env);
-        assert_eq!(env.query_log.len(), queries);
+        assert_eq!(manager.reload_attach_menu_bots_queries.len(), 1);
     }
 
     #[test]
@@ -1697,7 +1759,6 @@ mod tests {
         env.bot_is_addable = true;
         let (promise, _) = recording_promise();
         manager.get_attach_menu_bot_request(&mut env, user_id(1), promise);
-        assert_eq!(env.query_log, vec!["get bot".to_string()]);
         assert_eq!(manager.pending_bot_queries.len(), 1);
     }
 
@@ -1777,16 +1838,13 @@ mod tests {
             updates_after_load + 1,
             "the removal broadcast"
         );
-        assert!(
-            env.query_log.iter().any(|q| q == "toggle false false"),
-            "write_allowed = is_added && allow_write_access"
-        );
         assert_eq!(manager.pending_toggle_promises.len(), 1);
 
-        // the add path checks the bot data and sends write_allowed
+        // the add path checks the bot data and sends write_allowed — the
+        // wire form rides the netted round-trip
         let (promise, _) = recording_promise();
         manager.toggle_bot_is_added_to_attach_menu(&mut env, user_id(300), true, true, promise);
-        assert!(env.query_log.iter().any(|q| q == "toggle true true"));
+        assert_eq!(manager.pending_toggle_promises.len(), 2);
 
         // the not-addable bot rejects
         env.bot_is_addable = false;
