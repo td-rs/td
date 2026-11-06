@@ -30,6 +30,12 @@ impl ForumTopicId {
         self.0 > 0
     }
 
+    /// `ForumTopicId::general` (ForumTopicId.h:38-40) — the general
+    /// topic's fixed id.
+    pub const fn general() -> ForumTopicId {
+        ForumTopicId(1)
+    }
+
     /// `ForumTopicId::get_forum_topic_ids` (ForumTopicId.h).
     pub fn get_forum_topic_ids(input_ids: &[i32]) -> Vec<ForumTopicId> {
         input_ids.iter().copied().map(ForumTopicId::new).collect()
@@ -250,28 +256,52 @@ pub struct ForumTopicInfo {
 }
 
 impl ForumTopicInfo {
-    /// `ForumTopicInfo(ForumTopic)` (ForumTopicInfo.cpp:13-40).
+    /// `ForumTopicInfo(ForumTopic)` (ForumTopicInfo.cpp:13-40) — the
+    /// dialog/creator ids resolve off the wire peers (with the
+    /// force-create rides the dialog-inventory plane), the validity and
+    /// the expected-dialog bands reset to the empty info like the C++.
     pub fn from_telegram(
         forum_topic: &telegram_api::ForumTopic,
         expected_dialog_id: DialogId,
     ) -> ForumTopicInfo {
         let telegram_api::ForumTopic::forumTopic(forum_topic) = forum_topic else {
+            tdutils::log_error!("Receive {}", forum_topic.to_debug_string());
             return ForumTopicInfo::default();
         };
         let mut result = ForumTopicInfo {
-            dialog_id: expected_dialog_id,
+            dialog_id: forum_topic
+                .peer
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or_default(),
             forum_topic_id: ForumTopicId::new(forum_topic.id),
             title: forum_topic.title.clone(),
             icon: ForumTopicIcon::new(forum_topic.icon_color, forum_topic.icon_emoji_id),
             creation_date: forum_topic.date,
+            creator_dialog_id: forum_topic
+                .from_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or_default(),
             is_outgoing: forum_topic.my,
             is_closed: forum_topic.closed,
             is_hidden: forum_topic.hidden,
-            is_title_missing: false,
-            ..ForumTopicInfo::default()
+            is_title_missing: forum_topic.title_missing,
         };
-        if let Some(from_id) = &forum_topic.from_id {
-            result.creator_dialog_id = DialogId::from_peer(from_id);
+        if result.creation_date <= 0
+            || !result.forum_topic_id.is_valid()
+            || !result.dialog_id.is_valid()
+            || !result.creator_dialog_id.is_valid()
+        {
+            tdutils::log_error!("Receive {}", forum_topic.to_debug_string());
+            result = ForumTopicInfo::default();
+        }
+        if expected_dialog_id != DialogId::default() && result.dialog_id != expected_dialog_id {
+            tdutils::log_error!(
+                "Receive forum topic in {:?} instead of {expected_dialog_id:?}",
+                result.dialog_id
+            );
+            result = ForumTopicInfo::default();
         }
         result
     }

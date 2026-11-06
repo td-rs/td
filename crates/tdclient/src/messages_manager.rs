@@ -23098,6 +23098,19 @@ pub(crate) fn have_message_force_full(
         .is_some_and(|d| have_message_force(d, message_full_id.get_message_id(), source))
 }
 
+/// `MessagesManager::can_get_message_statistics(MessageFullId)`
+/// (MessagesManager.cpp:8363-8366).
+pub(crate) fn can_get_message_statistics_full(
+    manager: &MessagesManager,
+    ctx: &dyn SendMessageContext,
+    message_full_id: MessageFullId,
+) -> bool {
+    manager
+        .get_dialog(message_full_id.get_dialog_id())
+        .and_then(|d| get_message(d, message_full_id.get_message_id()))
+        .is_some_and(|m| can_get_message_statistics(ctx, message_full_id.get_dialog_id(), m))
+}
+
 /// `MessagesManager::register_dialog_ephemeral_message` /
 /// `unregister_dialog_ephemeral_message` (MessagesManager.cpp:13806-13820).
 fn register_dialog_ephemeral_message(d: &mut Dialog, ephemeral_message_id: EphemeralMessageId) {
