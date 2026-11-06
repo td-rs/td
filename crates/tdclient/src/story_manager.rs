@@ -1254,6 +1254,14 @@ pub trait StoryManagerEnv {
     /// through the env.
     fn is_megagroup_channel(&self, channel_id: i64) -> bool;
 
+    /// `td_->chat_manager_->can_get_channel_story_statistics`
+    /// (ChatManager.cpp:3909-3921) — the story-statistics predicate
+    /// rides the channel record/full read through the env.
+    fn can_get_channel_story_statistics(&self, channel_id: i64) -> bool {
+        let _ = channel_id;
+        false
+    }
+
     /// `UserManager::on_update_user_max_read_story_id` —
     /// [blocked: M.x user stories]; the interim no-op logs.
     fn on_update_user_max_read_story_id(&mut self, user_id: UserId, max_read_story_id: StoryId) {
@@ -2751,6 +2759,26 @@ impl StoryManager {
     ) -> bool {
         self.get_story_force(env, story_full_id, "have_story_force")
             .is_some()
+    }
+
+    /// `StoryManager::can_get_story_statistics` (StoryManager.cpp:
+    /// 2498-2508) — the bot/live/server bands over the chat-manager
+    /// statistics predicate (the env seam rides the channel read).
+    pub fn can_get_story_statistics(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        story_full_id: StoryFullId,
+    ) -> bool {
+        let Some(story) = self.get_story_force(env, story_full_id, "can_get_story_statistics")
+        else {
+            return false;
+        };
+        if env.is_bot() || !story_full_id.get_story_id().is_server() || story.is_live {
+            return false;
+        }
+        let dialog_id = story_full_id.get_dialog_id();
+        dialog_id.get_type() == crate::dialog_id::DialogType::Channel
+            && env.can_get_channel_story_statistics(dialog_id.get_channel_id().get())
     }
 
     /// `get_story_force` (StoryManager.cpp:2387-2411).

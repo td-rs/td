@@ -12,11 +12,11 @@
 //!   the arms this engine needs today are the message-family stand-ins.
 //! - [`UpdatesManagerEnv`] — the `G()->` / `td_->` environment surface
 //!   (clock, options, binlog pmc, authorization) plus the GetDifference /
-//!   GetUpdatesState / ConfirmPtsQts / GetPtsUpdate senders, which stay
-//!   `[blocked: net]` until the net step (the deferred S76
-//!   bridge↔dispatcher reconciliation); the S74 harness drives the
-//!   response intakes (`on_get_difference`, `on_get_updates_state`)
-//!   directly.
+//!   GetUpdatesState / ConfirmPtsQts / GetPtsUpdate / PingServer senders,
+//!   which dispatch through the updates net plane over the real `Td`
+//!   (`TdUpdatesEnv`, the `e48734b` bridge); the S74 harness env records
+//!   the sends and drives the response intakes (`on_get_difference`,
+//!   `on_get_updates_state`) directly.
 //!
 //! Documented divergences (all synchronous-collapse, the M.3/M.4 pmc
 //! convention):
@@ -923,9 +923,10 @@ pub trait UpdatesSink {
 }
 
 /// The `G()->`/`td_->` environment the engine runs against: the clock,
-/// options, the binlog pmc, the authorization state, and the
-/// `[blocked: net]` query senders (the S74 harness drives the response
-/// intakes directly).
+/// options, the binlog pmc, the authorization state, and the five query
+/// senders (the `Td` env dispatches them through the updates net plane;
+/// the S74 harness env records the sends and drives the response intakes
+/// directly).
 pub trait UpdatesManagerEnv {
     /// `Time::now()` — the process-monotonic clock.
     fn now(&mut self) -> f64;
@@ -953,16 +954,20 @@ pub trait UpdatesManagerEnv {
     fn pmc_erase(&mut self, key: &str);
     /// `td_->user_manager_->get_my_id()` (0 while unknown).
     fn get_my_id(&mut self) -> i64;
-    /// The `GetDifferenceQuery` — `[blocked: net]`; records the request.
+    /// The `GetDifferenceQuery` (cpp:207-210) — the engine's main ladder.
     fn send_get_difference(&mut self, pts: i32, date: i32, qts: i32);
-    /// The `GetUpdatesStateQuery` — `[blocked: net]`.
+    /// The `GetUpdatesStateQuery` (cpp:136-138) — the init-state pts
+    /// fetch.
     fn send_get_updates_state(&mut self);
-    /// The `ConfirmPtsQtsQuery` — `[blocked: net]`.
+    /// The `ConfirmPtsQtsQuery` (cpp:219-229) — the answer is discarded.
     fn send_confirm_pts_qts(&mut self, pts: i32, qts: i32);
-    /// The `GetPtsUpdateQuery` (the pts-short-gap repair) —
-    /// `[blocked: net]`.
+    /// The `GetPtsUpdateQuery` (the pts-short-gap repair, cpp:252-258) —
+    /// `pts` is the promise lambda's captured repair target
+    /// (`get_pts() + 1`); the wire sends `pts - 1` and the answer
+    /// re-enters [`UpdatesManager::on_get_pts_update`] with the capture
+    /// (cpp:360-367).
     fn send_get_pts_update(&mut self, pts: i32);
-    /// The `PingServerQuery` — `[blocked: net]`; the response intake is
+    /// The `PingServerQuery` (cpp:158-161); the response intake is
     /// [`UpdatesManager::on_server_pong`].
     fn send_ping_server(&mut self);
     /// `td_->online_manager_->is_online()` (the data-reload precondition).
@@ -1533,8 +1538,8 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         now
     }
 
-    /// `UpdatesManager::confirm_pts_qts` (cpp:2270) — the query is the
-    /// `[blocked: net]` seam.
+    /// `UpdatesManager::confirm_pts_qts` (cpp:2270) — the query rides
+    /// the env's ConfirmPtsQts sender (the answer is discarded).
     fn confirm_pts_qts(&mut self, env: &mut impl UpdatesManagerEnv, qts: i32) {
         let mut pts = self.get_pts();
         if pts < 0 {
@@ -3477,9 +3482,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         self.try_reload_often_data(env);
     }
 
-    /// `UpdatesManager::on_get_difference` (cpp:2040) — all four variants.
-    /// The response intake is driven directly by the harness while the
-    /// GetDifference sender is `[blocked: net]`.
+    /// `UpdatesManager::on_get_difference` (cpp:2040) — all four variants
+    /// (the netted harness env drives it directly; the real `Td` router
+    /// feeds it through `UmMessage::OnGetDifference`).
     pub fn on_get_difference(
         &mut self,
         env: &mut impl UpdatesManagerEnv,
@@ -3950,9 +3955,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     }
 
     /// `UpdatesManager::check_pts_gap`/`repair_pts_gap` (cpp:341-377) —
-    /// the pts-short-gap single-update fetch; the GetPtsUpdateQuery is the
-    /// `[blocked: net]` seam and the response intake
-    /// (`on_get_pts_update(pts, difference)`) lands with M.7.6.
+    /// the pts-short-gap single-update fetch; the captured pts rides the
+    /// env's GetPtsUpdate sender back into
+    /// [`UpdatesManager::on_get_pts_update`] (cpp:360-367).
     fn check_pts_gap(&mut self, env: &mut impl UpdatesManagerEnv) {
         if env.close_flag() {
             return;
@@ -3980,7 +3985,10 @@ impl<S: UpdatesSink> UpdatesManager<S> {
 
         tdutils::log_debug!("Fetch update with PTS = {}", pts);
         self.pts_short_gap += 1;
-        env.send_get_pts_update(pts - 1);
+        // the seam carries the captured pts (`get_pts() + 1`); the env
+        // sender derives the wire's `pts - 1` and rides the capture back
+        // into the answer (cpp:360-367).
+        env.send_get_pts_update(pts);
     }
 
     /// `UpdatesManager::fill_pts_gap` (cpp:379).
@@ -6107,7 +6115,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     }
 
     /// `UpdatesManager::ping_server` (cpp:1926) — the pong drives the
-    /// state intake; the query send is the `[blocked: net]` env seam.
+    /// state intake; the query rides the env's PingServer sender.
     pub fn ping_server(&mut self, env: &mut impl UpdatesManagerEnv) {
         if self.is_ping_sent {
             return;
@@ -8751,6 +8759,31 @@ mod tests {
             manager.pending_pts_updates.is_empty(),
             "the whole queue drained"
         );
+    }
+
+    #[test]
+    fn check_pts_gap_sends_the_captured_pts() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(2);
+        let now = env.clock;
+        // A pending pts-4 update that needs pts 3 first — the gap arms
+        // the min-pts-gap timeout.
+        manager.add_pending_pts_update(
+            &mut env,
+            new_message_update(5, 4, 1).into(),
+            4,
+            1,
+            now,
+            Promise::default(),
+            "test",
+        );
+        // The C++ repair_pts_gap captures pts = get_pts() + 1 in the
+        // promise lambda and sends pts - 1 on the wire (cpp:360-367) —
+        // the env seam carries the CAPTURE.
+        env.clock += 0.1;
+        manager.tick_timeouts(&mut env);
+        assert_eq!(env.sent_pts_updates, [3], "the captured pts, not pts - 1");
     }
 
     // ==== M.7.8/M.7.9 — the container statics --------

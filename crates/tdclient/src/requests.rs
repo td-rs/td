@@ -58,7 +58,6 @@ use crate::td::CallEnv;
 use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
 use crate::td::ReactionEnv;
-use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::TdAnimationsEnv;
 use crate::td::TdLinkEnv;
@@ -1638,8 +1637,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             td.message_import_manager = message_import_manager;
         }
         Function::getStatisticalGraph(request) => {
-            // `Requests.cpp:1586-1593` — the token read answers the stored
-            // graphs; the query tail parks at the [blocked: net] seam.
+            // `Requests.cpp:8279-8285` → StatisticsManager.cpp:900-918 —
+            // the token + x form over the dc chain (the net-drain 38
+            // rider).
             if !check_is_user(td, id) {
                 return;
             }
@@ -1658,17 +1658,15 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                         Object::statisticalGraphError(graph)
                     }
                 });
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.load_statistics_graph(
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.load_statistics_graph(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &token,
                 request.x,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::isLoginEmailAddressRequired(_) => {
             // `Requests.cpp:1893-1898` — the ok answer parks behind the
@@ -7275,7 +7273,9 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
 /// The M.49 ForumTopicManager arm group of the request dispatcher — see
 /// the frame note at the forward site in [`run_request`]. Every arm routes
 /// into `td_->forum_topic_manager_->...` (Requests.cpp:4835-4904, 7963);
-/// the network tails are the [blocked: net] query seams.
+/// the net-drain 41 query families dispatch through the manager-held net
+/// handle (the delete tail rides the message-query affected-history
+/// plane).
 #[allow(clippy::too_many_lines)]
 fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
     fn forum_arm(
@@ -7288,14 +7288,18 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
         let crate::td::Td {
             forum_topic_manager,
             global,
+            option_manager,
             auth_manager,
+            user_manager,
             chat_manager,
             notification_updates,
             ..
         } = td;
         let mut env = crate::td::ForumTopicTdEnv {
             global,
+            options: option_manager.as_mut(),
             auth_is_bot: auth_manager.is_bot(),
+            user_manager,
             chat_manager,
             updates: notification_updates,
         };
@@ -7486,6 +7490,11 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
                     promise,
                 );
             });
+            // The `MessageQueryManager::delete_topic_history` tail — the
+            // manager parked the validated deletes; the runner routes
+            // them onto the affected-history plane (the C++
+            // delete-promise lambda chain, ForumTopicManager.cpp:1028-1037)
+            td.run_forum_topic_delete_tails();
         }
 
         // setForumTopicNotificationSettings (Requests.cpp:7963-7967) —
@@ -9915,14 +9924,16 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 }
             });
             // StatisticsManager::get_channel_statistics (cpp:746-758) —
-            // the dc_id chain over the real ChatManager flow (the §2
-            // flip: the DC refire rides the GetFullChannel family; the
-            // stats query seam itself parks until net-drain 38)
-            td.get_channel_statistics_dc_chain(
-                crate::chat_manager::DialogId::new(request.chat_id),
+            // the dc_id chain over the real ChatManager flow; the send
+            // leg dispatches the wire query (net-drain 38)
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_channel_statistics(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
                 request.is_dark,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getMessageStatistics(request) => {
             if !check_is_user(td, id) {
@@ -9931,16 +9942,19 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |s: td_api::MessageStatistics| {
                 Object::messageStatistics(s)
             });
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_channel_message_statistics(
+            // StatisticsManager::get_channel_message_statistics
+            // (cpp:828-840) — the dc chain + the gates + the wire query
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_channel_message_statistics(
                 &mut env,
-                crate::dialog_id::DialogId::new(request.chat_id),
+                MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    MessageId::new(request.message_id),
+                ),
                 request.is_dark,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getStoryStatistics(request) => {
             if !check_is_user(td, id) {
@@ -9948,16 +9962,19 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::StoryStatistics| Object::storyStatistics(s));
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_channel_story_statistics(
+            // StatisticsManager::get_channel_story_statistics
+            // (cpp:858-870) — the dc chain + the gates + the wire query
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_channel_story_statistics(
                 &mut env,
-                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::story_ids::StoryFullId::new(
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                ),
                 request.is_dark,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getChatRevenueStatistics(request) => {
             if !check_is_user(td, id) {
@@ -9966,16 +9983,16 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |s: td_api::ChatRevenueStatistics| {
                 Object::chatRevenueStatistics(s)
             });
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_dialog_revenue_statistics(
+            // StatisticsManager::get_dialog_revenue_statistics
+            // (cpp:770-775)
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_dialog_revenue_statistics(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.is_dark,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getChatRevenueWithdrawalUrl(request) => {
             if !check_is_user(td, id) {
@@ -9986,16 +10003,16 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_dialog_revenue_withdrawal_url(
+            // StatisticsManager::get_dialog_revenue_withdrawal_url
+            // (cpp:793-810) — the SRP seam + the wire query
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_dialog_revenue_withdrawal_url(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &password,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getChatRevenueTransactions(request) => {
             if !check_is_user(td, id) {
@@ -10007,17 +10024,17 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |s: td_api::ChatRevenueTransactions| {
                 Object::chatRevenueTransactions(s)
             });
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_dialog_revenue_transactions(
+            // StatisticsManager::get_dialog_revenue_transactions
+            // (cpp:820-826)
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_dialog_revenue_transactions(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &offset,
                 request.limit,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getMessagePublicForwards(request) => {
             if !check_is_user(td, id) {
@@ -10028,17 +10045,20 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |s: td_api::PublicForwards| Object::publicForwards(s));
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_message_public_forwards(
+            // StatisticsManager::get_message_public_forwards
+            // (cpp:920-936) — the limit band + the dc chain + the gates
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_message_public_forwards(
                 &mut env,
-                crate::dialog_id::DialogId::new(request.chat_id),
+                MessageFullId::new(
+                    MmDialogId::new(request.chat_id),
+                    MessageId::new(request.message_id),
+                ),
                 &offset,
                 request.limit,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::getStoryPublicForwards(request) => {
             if !check_is_user(td, id) {
@@ -10049,17 +10069,20 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |s: td_api::PublicForwards| Object::publicForwards(s));
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_story_public_forwards(
+            // StatisticsManager::get_story_public_forwards (cpp:955-978)
+            // — the User-dialog band + the dc chain + the gates
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_story_public_forwards(
                 &mut env,
-                crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                crate::story_ids::StoryFullId::new(
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                ),
                 &offset,
                 request.limit,
                 promise,
             );
+            td.statistics_manager = manager;
         }
 
         // Everything else waits for its manager step.
@@ -16748,16 +16771,16 @@ fn run_bot_and_web_app_requests(td: &mut Td, id: u64, function: Function) {
                 td.send_error_impl(id, status.code(), status.message());
                 return;
             }
-            let mut env = StatisticsEnv {
-                global: &mut td.global,
-                updates: &mut td.statistics_updates,
-            };
-            td.statistics_manager.get_poll_statistics(
+            // StatisticsManager::get_poll_statistics (cpp:888-898) — the
+            // send leg over the main dc
+            let (mut manager, mut env) = crate::td::statistics_env_split(&mut *td);
+            manager.get_poll_statistics(
                 &mut env,
                 MessageFullId::new(dialog_id, message_id),
                 request.is_dark,
                 promise,
             );
+            td.statistics_manager = manager;
         }
         Function::canPurchaseFromStore(request) => {
             // Requests.cpp:9202-9205 → Premium.cpp:1444-1446: the store
