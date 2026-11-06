@@ -3582,9 +3582,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // --- the poll set (M.19): Requests.cpp:8088-8131. The arms validate +
-        // route to the PollManager; the net query tails park the promises
-        // unanswered offline, exactly like the C++ request without a network
-        // (the message-poll lookups answer the M.10 seam's not-found band) ---
+        // route to the PollManager; the five wire tails ride the net-drain 39
+        // plane (the promises park only in the net-inert posture; the
+        // message-poll lookups answer the M.10 seam's not-found band) ---
         Function::addPollOption(request) => {
             // Requests.cpp:8088-8093
             if !check_is_user(td, id) {
