@@ -4,19 +4,15 @@
 //! request flips (Requests.cpp:8359-8374).
 //!
 //! Seams:
-//! - The `messages.getBotCallbackAnswer` and
-//!   `messages.setBotCallbackAnswer` network tails ride the
-//!   `CallbackNetKind` plane (net-drain 49): the manager-held
-//!   `CallbackNetHandle` dispatches the wire queries and the answers
-//!   drain through `Td::on_callback_net_answer` into
-//!   [`CallbackQueriesManager::on_get_bot_callback_answer`] and
+//! - The three `Td::ResultHandler` network tails
+//!   (`messages.getBotCallbackAnswer`, `messages.setBotCallbackAnswer`,
+//!   `ephemeral.getCallbackAnswer`) ride the `CallbackNetKind` plane
+//!   (net-drain 49): the manager-held `CallbackNetHandle` dispatches
+//!   the wire queries and the answers drain through
+//!   `Td::on_callback_net_answer` into
+//!   [`CallbackQueriesManager::on_get_bot_callback_answer`],
+//!   [`CallbackQueriesManager::on_get_ephemeral_callback_answer`] and
 //!   [`CallbackQueriesManager::on_set_bot_callback_answer`].
-//! - The `ephemeral.getCallbackAnswer` tail rides the
-//!   [`CallbackQueriesManagerEnv`] net seam — `[blocked: net]` with the
-//!   promise parked (the M.41 convention); the answer handler
-//!   ([`CallbackQueriesManager::on_get_ephemeral_callback_answer`]) is
-//!   real and unit-tested, including `BOT_RESPONSE_TIMEOUT` → 502
-//!   remap.
 //! - `td_->password_manager_->get_input_check_password_srp`
 //!   (CallbackQueriesManager.cpp:365-373) is the
 //!   [`CallbackQueriesManagerEnv::get_input_check_password_srp`] seam —
@@ -46,6 +42,9 @@ use tdutils::status::Status;
 /// carry the handler members the error heads read (the §5 identity — an
 /// out-of-order answer pairs with its own query), so the family lots
 /// park the promises alone.
+// the C++ ResultHandler class names carry the shared
+// CallbackAnswer postfix
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallbackNetKind {
     /// `GetBotCallbackAnswerQuery` (CallbackQueriesManager.cpp:31-100)
@@ -61,6 +60,11 @@ pub(crate) enum CallbackNetKind {
     /// `promise_` member (cpp:146-149), so the lot is a plain
     /// positional FIFO.
     SetBotCallbackAnswer,
+    /// `GetEphemeralCallbackAnswerQuery` (CallbackQueriesManager.cpp:
+    /// 102-142) — `ephemeral.getCallbackAnswer`; the kind carries the
+    /// handler's `dialog_id_` for the `on_get_dialog_error` head the
+    /// `on_error` tail runs (cpp:136).
+    GetEphemeralCallbackAnswer { dialog_id: DialogId },
 }
 
 /// The `messages.getBotCallbackAnswer` wire flags
@@ -73,6 +77,9 @@ const CALLBACK_PASSWORD_MASK: i32 = 1 << 2;
 /// carry the non-empty strings.
 const CALLBACK_MESSAGE_MASK: i32 = 1;
 const CALLBACK_URL_MASK: i32 = 1 << 2;
+/// The `ephemeral.getCallbackAnswer` wire flag
+/// (CallbackQueriesManager.cpp:117) — the data bytes ride bit 1.
+const EPHEMERAL_CALLBACK_DATA_MASK: i32 = 1 << 1;
 
 /// `InlineQueriesManager::get_inline_message_id`
 /// (InlineQueriesManager.cpp:534-542) — the base64url form of the bare
@@ -240,20 +247,6 @@ pub trait CallbackQueriesManagerEnv {
         dialog_id: DialogId,
         access_rights: AccessRights,
     ) -> Option<telegram_api::InputPeer>;
-
-    /// `GetEphemeralCallbackAnswerQuery::send`
-    /// (CallbackQueriesManager.cpp:111-122) — `[blocked: net]`; the
-    /// answer arrives through
-    /// [`CallbackQueriesManager::on_get_ephemeral_callback_answer`].
-    fn send_get_ephemeral_callback_answer_query(
-        &mut self,
-        dialog_id: DialogId,
-        ephemeral_message_id: i32,
-        data: Vec<u8>,
-    ) {
-        let _ = (dialog_id, ephemeral_message_id, data);
-        tdutils::log_info!("Send ephemeral.getCallbackAnswer — [blocked: net]");
-    }
 }
 
 /// A parked `messages.getBotCallbackAnswer` query — the request
@@ -264,9 +257,11 @@ struct PendingBotCallbackAnswerQuery {
     promise: Promise<td_api::CallbackQueryAnswer>,
 }
 
-/// A parked `ephemeral.getCallbackAnswer` query.
+/// A parked `ephemeral.getCallbackAnswer` query — the request promise
+/// (the C++ query carries it on the handler's `promise_` member,
+/// CallbackQueriesManager.cpp:105-109; the error head's dialog identity
+/// rides the kind).
 struct PendingEphemeralCallbackAnswerQuery {
-    dialog_id: DialogId,
     promise: Promise<td_api::CallbackQueryAnswer>,
 }
 
@@ -642,13 +637,13 @@ impl CallbackQueriesManager {
         if ephemeral_message_id > 0
             && let td_api::CallbackQueryPayload::callbackQueryPayloadData(data_payload) = &payload
         {
-            env.send_get_ephemeral_callback_answer_query(
+            self.send_get_ephemeral_callback_answer_query(
+                env,
                 dialog_id,
                 ephemeral_message_id,
                 data_payload.data.clone(),
+                promise,
             );
-            self.pending_ephemeral_callback_answer_queries
-                .push(PendingEphemeralCallbackAnswerQuery { dialog_id, promise });
             return;
         }
         if !message_id.is_server() {
@@ -795,6 +790,57 @@ impl CallbackQueriesManager {
         }
     }
 
+    /// The `td_->create_handler<GetEphemeralCallbackAnswerQuery>(promise)
+    /// ->send(...)` collapse (CallbackQueriesManager.cpp:111-122, the
+    /// routing at cpp:353-358): the request promise parks in the family
+    /// lot (the C++ carries it on the query's `promise_` member,
+    /// cpp:105-109; §5's FIFO shape — the kind carries the handler's
+    /// `dialog_id_` for the error head), then the read peer resolves and
+    /// the wire query dispatches — the data bytes ride the bit-1 mask
+    /// (cpp:117) and the id is the raw ephemeral message id (cpp:119).
+    /// The C++ `CHECK(input_peer != nullptr)` band (cpp:114-115) files
+    /// through the completed queue so the answer half runs the full
+    /// `on_error` tail (the message-query convention); `None` on the
+    /// handle keeps the net-inert posture. The C++
+    /// `need_resend_on_503_ = false` flag (cpp:120) rides the handle's
+    /// 24-hour budget like every landed per-kind send (documented
+    /// divergence).
+    pub(crate) fn send_get_ephemeral_callback_answer_query(
+        &mut self,
+        env: &mut impl CallbackQueriesManagerEnv,
+        dialog_id: DialogId,
+        ephemeral_message_id: i32,
+        data: Vec<u8>,
+        promise: Promise<td_api::CallbackQueryAnswer>,
+    ) {
+        self.pending_ephemeral_callback_answer_queries
+            .push(PendingEphemeralCallbackAnswerQuery { promise });
+        let kind = CallbackNetKind::GetEphemeralCallbackAnswer { dialog_id };
+        match (
+            self.net.clone(),
+            env.get_input_peer(dialog_id, AccessRights::Read),
+        ) {
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::ephemeral_getCallbackAnswer(
+                    telegram_api::ephemeral_getCallbackAnswer {
+                        flags: EPHEMERAL_CALLBACK_DATA_MASK,
+                        peer: Some(Box::new(peer)),
+                        id: ephemeral_message_id,
+                        data,
+                    },
+                ),
+            ),
+            (Some(net), None) => {
+                // the C++ CHECK(input_peer != nullptr) band (cpp:114-115)
+                net.complete_error(kind, 400, "Can't access the chat");
+            }
+            (None, _) => {
+                tdutils::log_info!("Send ephemeral.getCallbackAnswer — [net-inert]");
+            }
+        }
+    }
+
     /// `GetBotCallbackAnswerQuery::on_result` (on the parked query) +
     /// `on_error` (CallbackQueriesManager.cpp:79-99) — the caller passes
     /// the query answer or the fetch/network status; the
@@ -846,10 +892,12 @@ impl CallbackQueriesManager {
     }
 
     /// `GetEphemeralCallbackAnswerQuery::on_result`/`on_error`
-    /// (CallbackQueriesManager.cpp:124-142).
+    /// (CallbackQueriesManager.cpp:124-142) — the dialog identity rides
+    /// the wire kind (the C++ handler's `dialog_id_` member, cpp:103).
     pub fn on_get_ephemeral_callback_answer(
         &mut self,
         env: &mut impl CallbackQueriesManagerEnv,
+        dialog_id: DialogId,
         result: Result<telegram_api::messages_BotCallbackAnswer, Status>,
     ) {
         let Some(query) = self.pending_ephemeral_callback_answer_queries.pop() else {
@@ -857,7 +905,6 @@ impl CallbackQueriesManager {
             return;
         };
         let mut promise = query.promise;
-        let dialog_id = query.dialog_id;
         let answer = match result {
             Ok(answer) => answer,
             Err(mut status) => {
@@ -911,6 +958,16 @@ impl CallbackQueriesManager {
     #[cfg(test)]
     pub(crate) fn pop_set_bot_callback_answer_promise_for_test(&mut self) -> Option<Promise<()>> {
         self.pending_set_bot_callback_answer_queries
+            .pop()
+            .map(|query| query.promise)
+    }
+
+    /// Test-only: the parked ephemeral-family promise pop.
+    #[cfg(test)]
+    pub(crate) fn pop_ephemeral_callback_answer_promise_for_test(
+        &mut self,
+    ) -> Option<Promise<td_api::CallbackQueryAnswer>> {
+        self.pending_ephemeral_callback_answer_queries
             .pop()
             .map(|query| query.promise)
     }
@@ -1078,18 +1135,6 @@ mod tests {
             Some(telegram_api::InputPeer::inputPeerSelf(
                 telegram_api::inputPeerSelf {},
             ))
-        }
-
-        fn send_get_ephemeral_callback_answer_query(
-            &mut self,
-            dialog_id: DialogId,
-            ephemeral_message_id: i32,
-            _data: Vec<u8>,
-        ) {
-            self.queries.push(format!(
-                "getEphemeralCallbackAnswer:{}:{ephemeral_message_id}",
-                dialog_id.get()
-            ));
         }
     }
 
@@ -1532,7 +1577,8 @@ mod tests {
         };
         let mut manager = CallbackQueriesManager::new();
 
-        // an ephemeral message id routes to the ephemeral query
+        // an ephemeral message id routes to the ephemeral query — the
+        // promise parks in the ephemeral lot (the get lot stays empty)
         env.ephemeral_message_id = 9;
         let (promise, outcomes) = recording_promise();
         manager.send_callback_query(
@@ -1541,9 +1587,14 @@ mod tests {
             Some(payload_data()),
             promise,
         );
-        assert_eq!(env.queries, vec!["getEphemeralCallbackAnswer:-3:9"]);
+        assert!(manager.pending_bot_callback_answer_queries.is_empty());
+        assert!(!manager.pending_ephemeral_callback_answer_queries.is_empty());
         assert!(outcomes.lock().unwrap().is_empty());
-        manager.on_get_ephemeral_callback_answer(&mut env, Ok(sample_answer()));
+        manager.on_get_ephemeral_callback_answer(
+            &mut env,
+            crate::dialog_id::DialogId::new(-3),
+            Ok(sample_answer()),
+        );
         assert_eq!(outcomes.lock().unwrap().len(), 1);
 
         // the BOT_RESPONSE_TIMEOUT remap on the ephemeral answer
@@ -1556,6 +1607,7 @@ mod tests {
         );
         manager.on_get_ephemeral_callback_answer(
             &mut env,
+            crate::dialog_id::DialogId::new(-3),
             Err(Status::error(400, "BOT_RESPONSE_TIMEOUT")),
         );
         assert!(matches!(

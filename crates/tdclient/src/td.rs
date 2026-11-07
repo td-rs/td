@@ -19564,6 +19564,32 @@ impl Td {
                 manager.on_set_bot_callback_answer(result);
                 self.callback_queries_manager = manager;
             }
+            // `GetEphemeralCallbackAnswerQuery::on_result`/`on_error`
+            // (CallbackQueriesManager.cpp:124-142) — the answer converts
+            // through the manager intake (the landed on_get_dialog_error
+            // head + the BOT_RESPONSE_TIMEOUT remap).
+            K::GetEphemeralCallbackAnswer { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotCallbackAnswer::parse(query.ok()) {
+                        Ok(answer) => Ok(answer),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.botCallbackAnswer: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the ephemeral_getCallbackAnswer answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.callback_queries_manager);
+                {
+                    let mut env = crate::td::BotEnv { td: self };
+                    manager.on_get_ephemeral_callback_answer(&mut env, dialog_id, result);
+                }
+                self.callback_queries_manager = manager;
+            }
         }
     }
 
@@ -80661,7 +80687,153 @@ kQIDAQAB\n\
             (400, "QUERY_ID_INVALID")
         );
 
-        // 14. the net-inert posture — no handle, the promises park like
+        // 14. the ephemeral family (the seam drive — the routing lives
+        //     behind the [blocked: M.10] probe inside send_callback_query,
+        //     cpp:353-358; GetEphemeralCallbackAnswerQuery::send,
+        //     cpp:111-122): the DATA_MASK bit-1, the resolved read peer,
+        //     the raw ephemeral id and the payload bytes
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    9,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_getCallbackAnswer::ID,
+        );
+        let body =
+            telegram_api::ephemeral_getCallbackAnswer::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 1, "the ephemeral DATA_MASK is bit 1");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 9);
+        assert_eq!(body.data, b"ed".to_vec());
+
+        // the answer settles the parked promise with the same triple
+        // (cpp:124-133)
+        net_complete(sent, bot_callback_answer());
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(answer)) => {
+                assert_eq!(answer.text, "answer");
+                assert_eq!(answer.url, "https://t.me");
+            }
+            other => panic!("the ephemeral answer round trip: {other:?}"),
+        }
+
+        // 15. the ephemeral BOT_RESPONSE_TIMEOUT remap (cpp:137-139) —
+        //     the on_get_dialog_error head runs first (the landed one)
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    10,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_getCallbackAnswer::ID,
+        );
+        net_fail(sent, 400, "BOT_RESPONSE_TIMEOUT");
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (502, "The bot is not responding")
+                );
+            }
+            other => panic!("the ephemeral timeout remap, got {other:?}"),
+        }
+
+        // 16. the unresolvable-peer band — the C++ CHECK (cpp:114-115)
+        //     files through the completed queue so the on_error tail runs
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    unknown_dialog,
+                    11,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("the ephemeral access band, got {other:?}"),
+        }
+
+        // 17. the parse-failure 500 — the fetch_result band
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    12,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_getCallbackAnswer::ID,
+        );
+        net_complete(sent, vec![0xba, 0xad, 0xf0, 0x0d]);
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (
+                        500,
+                        "Failed to parse the ephemeral_getCallbackAnswer answer"
+                    )
+                );
+            }
+            other => panic!("the ephemeral parse band, got {other:?}"),
+        }
+
+        // 18. the net-inert posture — no handle, the promises park like
         //     the C++ handlers hold them
         td.callback_queries_manager.net = None;
         let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
@@ -80713,6 +80885,31 @@ kQIDAQAB\n\
                 .pop_set_bot_callback_answer_promise_for_test()
                 .is_some(),
             "the set promise parks like the C++ handler holds it"
+        );
+
+        // the ephemeral send parks the same way offline
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    13,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.callback_queries_manager
+                .pop_ephemeral_callback_answer_promise_for_test()
+                .is_some(),
+            "the ephemeral promise parks like the C++ handler holds it"
         );
 
         // the drains ran clean — nothing parked, no strays
