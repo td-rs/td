@@ -90,7 +90,7 @@ use crate::message_content::*;
 use crate::message_entity::FormattedText;
 use crate::messages_manager::{
     DialogId, EphemeralMessageFullId, FileUploadId, FolderId, MessageFullId,
-    QuickReplyMessageFullId, QuickReplyShortcutId, StoryFullId, StoryId,
+    QuickReplyMessageFullId, StoryFullId, StoryId,
 };
 use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
@@ -3660,6 +3660,13 @@ pub(crate) type DialogParticipantNetHandle =
 /// legs run inside the manager over the env's peer/permission reads.
 pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::ForumTopicNetKind>;
 
+/// The cloned web-pages dispatch surface the
+/// [`crate::web_pages_manager::WebPagesManager`] holds — the
+/// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
+/// reloads and the instant-view heads); the answers drain through
+/// [`Td::on_web_pages_net_answer`]. Manager-held (the forum-topic
+/// shape): the send legs run inside the manager over the env's reads.
+pub(crate) type WebPagesNetHandle = NetKindHandle<crate::web_pages_manager::WebPagesNetKind>;
 /// The cloned attach-menu dispatch surface the
 /// [`crate::attach_menu_manager::AttachMenuManager`] holds — the
 /// net-drain 42 families' send legs (the reload/single-bot/toggle
@@ -6148,6 +6155,11 @@ pub struct Td {
     /// [`Td::on_forum_topic_net_answer`].
     forum_topic_net_completed:
         Arc<Mutex<Vec<(crate::forum_topic_manager::ForumTopicNetKind, NetQuery)>>>,
+    /// The web-pages net completed queue (the `WebPagesNetKind` tags;
+    /// the net-drain 46 family) — the dispatcher callbacks park here,
+    /// the actor pump routes them through
+    /// [`Td::on_web_pages_net_answer`].
+    web_pages_net_completed: Arc<Mutex<Vec<(crate::web_pages_manager::WebPagesNetKind, NetQuery)>>>,
     /// The attach-menu net completed queue (the `AttachMenuNetKind`
     /// tags; the net-drain 42 families) — the dispatcher callbacks park
     /// here, the actor pump routes them through
@@ -6668,6 +6680,7 @@ impl Td {
             notification_settings_net_completed: Arc::new(Mutex::new(Vec::new())),
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
+            web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -7160,6 +7173,7 @@ impl Td {
         self.group_call_manager.net = self.group_call_net();
         self.call_manager.net = self.call_net();
         self.forum_topic_manager.net = self.forum_topic_net();
+        self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
@@ -8986,6 +9000,7 @@ impl Td {
         self.dispatch_completed_notification_settings_net();
         self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_forum_topic_net();
+        self.dispatch_completed_web_pages_net();
         self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9373,6 +9388,18 @@ impl Td {
         Some(ForumTopicNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.forum_topic_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned web-pages dispatch surface the
+    /// [`crate::web_pages_manager::WebPagesManager`] holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn web_pages_net(&self) -> Option<WebPagesNetHandle> {
+        Some(WebPagesNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.web_pages_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17659,6 +17686,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked WebPages answers — the C++
+    /// ResultHandler halves of the net-drain 46 family
+    /// (`GetWebPageQuery`, WebPagesManager.cpp:117-166).
+    fn dispatch_completed_web_pages_net(&mut self) {
+        let completed = std::mem::take(&mut *self.web_pages_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_web_pages_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// The net-drain 42 attach-menu answers (the dispatcher callback
     /// parks) — the reload/single-bot/toggle intakes route into the
     /// manager's answer handlers over the split env.
@@ -19549,6 +19587,106 @@ impl Td {
                     "messages.reorderPinnedForumTopics",
                     "ReorderPinnedForumTopicsQuery",
                 );
+            }
+        }
+    }
+
+    /// Route one web-pages net answer by kind — the ResultHandler halves
+    /// of the net-drain 46 family (`GetWebPageQuery`,
+    /// WebPagesManager.cpp:117-166). The page intake
+    /// (`on_get_web_page`) and the url registration
+    /// (`on_get_web_page_by_url`) live in the manager; the
+    /// `webPageNotModified` band (the view-count intake, cpp:147-156)
+    /// runs here; the invalid-id sends settle the parked
+    /// `WebPageIdTail` lot, the valid-id sends drain the instant-view
+    /// lots through `on_reload_web_page_instant_view` (cpp:1334-1339).
+    fn on_web_pages_net_answer(
+        &mut self,
+        kind: crate::web_pages_manager::WebPagesNetKind,
+        query: NetQuery,
+    ) {
+        use crate::web_pages_manager::WebPagesNetKind as K;
+
+        match kind {
+            K::GetWebPage { web_page_id } => {
+                // the handler's `url_` capture (cpp:131) re-parsed off
+                // the query payload — the answer pairs with its own
+                // request exactly (no FIFO url lot)
+                let url = match telegram_api::Function::parse(query.query()) {
+                    Ok(telegram_api::Function::messages_getWebPage(body)) => body.url,
+                    _ => String::new(),
+                };
+                let result: tdutils::status::Result<crate::webpage::WebPageId> = if query.is_error()
+                {
+                    // `GetWebPageQuery::on_error` (cpp:163-164)
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_WebPage::parse(query.ok()) {
+                        Ok(answer) => {
+                            tdutils::log_info!("Receive result for GetWebPageQuery");
+                            self.intake_users(answer.users, "GetWebPageQuery");
+                            self.intake_chats(answer.chats, "GetWebPageQuery");
+                            match answer.webpage.map(|page| *page) {
+                                // the `webPageNotModified` band
+                                // (cpp:147-156)
+                                Some(telegram_api::WebPage::webPageNotModified(page)) => {
+                                    if web_page_id.is_valid() {
+                                        let view_count = page.cached_page_views;
+                                        let (mut env, manager) = web_pages_env_split(self);
+                                        manager.on_get_web_page_instant_view_view_count(
+                                            &mut env,
+                                            web_page_id,
+                                            view_count,
+                                        );
+                                        tdutils::status::Result::Ok(web_page_id)
+                                    } else {
+                                        tdutils::log_error!(
+                                            "Receive webPageNotModified for {}",
+                                            url
+                                        );
+                                        tdutils::status::Result::Err(Status::error(
+                                            500,
+                                            "Receive webPageNotModified",
+                                        ))
+                                    }
+                                }
+                                // the page walk (cpp:158-160)
+                                Some(page) => {
+                                    let (mut env, manager) = web_pages_env_split(self);
+                                    let new_web_page_id = manager.on_get_web_page(
+                                        &mut env,
+                                        page,
+                                        crate::dialog_id::DialogId::default(),
+                                    );
+                                    manager.on_get_web_page_by_url(&url, new_web_page_id, false);
+                                    tdutils::status::Result::Ok(new_web_page_id)
+                                }
+                                None => tdutils::status::Result::Err(Status::error(
+                                    500,
+                                    "Failed to parse the messages.getWebPage answer",
+                                )),
+                            }
+                        }
+                        Err(_) => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getWebPage answer",
+                        )),
+                    }
+                };
+                let (mut env, manager) = web_pages_env_split(self);
+                if web_page_id.is_valid() {
+                    // the instant-view reload head: the answer drains the
+                    // server lot (the C++ query-promise lambda,
+                    // cpp:1334-1339)
+                    manager.on_reload_web_page_instant_view(&mut env, web_page_id, result);
+                } else {
+                    // the by-URL send: the promise tail settles (FIFO per
+                    // family, §5)
+                    if !manager.pending_web_page_queries.is_empty() {
+                        let tail = manager.pending_web_page_queries.remove(0);
+                        manager.settle_web_page_id(&mut env, tail, result);
+                    }
+                }
             }
         }
     }
@@ -45246,14 +45384,6 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
         // [blocked: M.10/net]
     }
 
-    fn reload_quick_reply_message(
-        &mut self,
-        _shortcut_id: QuickReplyShortcutId,
-        _message_id: crate::message_id::MessageId,
-    ) {
-        // [blocked: Wave 3]
-    }
-
     fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
         // [blocked: M.6]
     }
@@ -45333,25 +45463,6 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
         self.options
             .as_ref()
             .is_some_and(|options| options.get_option_boolean("is_premium", false))
-    }
-
-    fn send_get_web_page_preview_query(
-        &mut self,
-        _text: crate::message_entity::FormattedText,
-        _options: Box<crate::web_pages_manager::GetWebPagePreviewOptions>,
-        _promise: Promise<Option<td_api::LinkPreview>>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_web_page_query(
-        &mut self,
-        _web_page_id: crate::webpage::WebPageId,
-        _url: String,
-        _hash: i32,
-        _promise: Promise<crate::webpage::WebPageId>,
-    ) {
-        // [blocked: net]
     }
 }
 
@@ -52529,6 +52640,7 @@ mod tests {
         td.call_manager.net = td.call_net();
         td.statistics_manager.net = td.statistics_net();
         td.forum_topic_manager.net = td.forum_topic_net();
+        td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
         (td, rec, callback)
     }
@@ -55482,6 +55594,332 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// The net-drain 46 web-page round-trips — the GetWebPageQuery
+    /// family's send legs dispatch through the installed handle (the
+    /// by-URL reloads and the instant-view heads) and the wire answers
+    /// settle the parked promise tails (the band ladders live in
+    /// `web_pages_manager.rs`; these cover the dispatcher plumbing, the
+    /// ladder continuations and the null-object 404 rewrite).
+    #[test]
+    fn web_page_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(web_page_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn web_page_families_ride_the_dispatcher_impl() {
+        use crate::web_pages_manager::{WebPageIdTail, WebPageInstantView, WebPagesManager};
+        use crate::webpage::WebPageId;
+
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-web-pages");
+
+        /// A wire `webPage` answer body (no cached_page — the instant
+        /// view content plane rides the M.17 seam).
+        fn wire_page(id: i64, url: &str) -> telegram_api::WebPage {
+            telegram_api::WebPage::webPage(telegram_api::webPage {
+                id,
+                flags: 0,
+                url: url.to_owned(),
+                display_url: url.to_owned(),
+                hash: 0,
+                r#type: "article".to_owned(),
+                site_name: String::new(),
+                title: "Title".to_owned(),
+                description: String::new(),
+                photo: None,
+                embed_url: String::new(),
+                embed_type: String::new(),
+                embed_width: 0,
+                embed_height: 0,
+                duration: 0,
+                author: String::new(),
+                document: None,
+                cached_page: None,
+                attributes: Vec::new(),
+                has_large_media: false,
+                video_cover_photo: false,
+            })
+        }
+
+        /// The `messages.webPage` answer envelope.
+        fn web_page_answer(page: telegram_api::WebPage, users: Vec<telegram_api::User>) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&telegram_api::messages_WebPage::ID.to_le_bytes());
+            telegram_api::messages_WebPage {
+                webpage: Some(Box::new(page)),
+                chats: Vec::new(),
+                users,
+            }
+            .store(&mut out);
+            out
+        }
+
+        /// The `webPageNotModified` answer envelope.
+        fn not_modified_answer(cached_page_views: i32) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&telegram_api::messages_WebPage::ID.to_le_bytes());
+            telegram_api::messages_WebPage {
+                webpage: Some(Box::new(telegram_api::WebPage::webPageNotModified(
+                    telegram_api::webPageNotModified {
+                        flags: 1, // CACHED_PAGE_VIEWS
+                        cached_page_views,
+                    },
+                ))),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .store(&mut out);
+            out
+        }
+
+        /// Seed a cached page with a loaded instant view (the
+        /// instant-view reload head's precondition, cpp:1331-1332).
+        fn seed_page_with_instant_view(td: &mut Td, id: i64, url: &str, hash: i32, is_full: bool) {
+            let (mut env, manager) = crate::td::web_pages_env_split(td);
+            let web_page_id = WebPageId::new(id);
+            manager
+                .url_to_web_page_id
+                .insert(url.to_owned(), (web_page_id, false));
+            manager.web_pages.insert(
+                web_page_id,
+                crate::web_pages_manager::WebPage {
+                    url: url.to_owned(),
+                    display_url: url.to_owned(),
+                    type_: "article".to_owned(),
+                    title: "Title".to_owned(),
+                    ..crate::web_pages_manager::WebPage::default()
+                },
+            );
+            if let Some(page) = manager.web_pages.get_mut(&web_page_id) {
+                page.instant_view = WebPageInstantView {
+                    hash,
+                    is_full,
+                    is_loaded: true,
+                    is_empty: false,
+                    ..WebPageInstantView::default()
+                };
+            }
+            let _ = &mut env;
+        }
+
+        // 1. getWebPageInstantView over the live td_api arm — the cold
+        //    URL reload sends messages.getWebPage(url, 0); the full-page
+        //    answer lands the record + the url map, and the empty
+        //    instant view settles the actor tail through the null-object
+        //    rewrite (404 "Not Found", Td.cpp:1405-1409).
+        {
+            td.request(
+                1,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/page".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            let body = telegram_api::messages_getWebPage::parse(sent.query()).expect("the body");
+            assert_eq!(body.url, "https://example.com/page");
+            assert_eq!(body.hash, 0, "the cold by-URL hash");
+            net_complete(
+                sent,
+                web_page_answer(wire_page(5, "https://example.com/page"), Vec::new()),
+            );
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 1);
+            assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            // the landed record: the second, only-local request answers
+            // from the negative-cache ladder without any new query
+            td.request(
+                2,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/page".to_owned(),
+                    only_local: true,
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 2);
+            assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            assert!(
+                rec.sent.lock().is_empty(),
+                "the cached-url request dispatches nothing"
+            );
+        }
+
+        // 2. the wire error band — the by-URL send's error rides to the
+        //    request answer (the GetWebPageQuery::on_error half,
+        //    cpp:162-165).
+        {
+            td.request(
+                3,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/gone".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            net_fail(sent, 400, "WEBPAGE_NOT_EXIST");
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 3);
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (400, "WEBPAGE_NOT_EXIST")
+            );
+        }
+
+        // 3. the instant-view reload head — the cached page re-requests
+        //    with is_full ? hash : 0 (cpp:1329-1330); the
+        //    webPageNotModified answer runs the view-count intake
+        //    (cpp:141-146) and settles the parked actor tail with the
+        //    captured id, which builds the instant-view object.
+        {
+            seed_page_with_instant_view(&mut td, 7, "https://example.com/iv", 42, true);
+            td.request(
+                4,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/iv".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            let body = telegram_api::messages_getWebPage::parse(sent.query()).expect("the body");
+            assert_eq!(body.hash, 42, "the is_full hash re-request");
+            net_complete(sent, not_modified_answer(99));
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let responses = responses_of(&callback, 4);
+            assert_eq!(responses.len(), 1, "the not-modified settle");
+            let Object::webPageInstantView(object) = &responses[0] else {
+                panic!("the instant-view object answer: {:?}", responses[0]);
+            };
+            assert_eq!(object.view_count, 99, "the view-count intake");
+            // the view count persisted on the record
+            let (_, manager) = crate::td::web_pages_env_split(&mut td);
+            assert_eq!(
+                manager
+                    .web_pages
+                    .get(&WebPageId::new(7))
+                    .expect("the cached page")
+                    .instant_view
+                    .view_count,
+                99
+            );
+        }
+
+        // 4. the server-lot error band — the reload head's error fails
+        //    every parked tail of the lot (cpp:1439-1441).
+        {
+            seed_page_with_instant_view(&mut td, 8, "https://example.com/iv-err", 0, false);
+            td.request(
+                5,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/iv-err".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            let body = telegram_api::messages_getWebPage::parse(sent.query()).expect("the body");
+            assert_eq!(body.hash, 0, "the !is_full hash re-request");
+            net_fail(sent, 500, "Internal Server Error");
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 5);
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (500, "Internal Server Error")
+            );
+        }
+
+        // 5. the webPagePending band — the pending page arms the
+        //    timeout (the re-fetch keeps the URL) and the ladder
+        //    settles the empty-instant-view 404 (cpp:630-641).
+        {
+            td.request(
+                6,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/pending".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            net_complete(
+                sent,
+                web_page_answer(
+                    telegram_api::WebPage::webPagePending(telegram_api::webPagePending {
+                        flags: 1, // URL
+                        id: 9,
+                        date: 100,
+                        url: "https://example.com/pending".to_owned(),
+                    }),
+                    Vec::new(),
+                ),
+            );
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 6);
+            assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            assert!(
+                td.web_pages_timeouts.contains_key(&9),
+                "the pending-page timeout armed"
+            );
+            assert_eq!(
+                td.web_pages_manager
+                    .pending_web_page_urls
+                    .get(&WebPageId::new(9))
+                    .map(String::as_str),
+                Some("https://example.com/pending")
+            );
+        }
+
+        // 6. the loaded-instant-view only_local band — the cached answer
+        //    settles without any query (cpp:1297-1299).
+        {
+            td.request(
+                7,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/iv".to_owned(),
+                    only_local: true,
+                }),
+            );
+            td.flush_deferred_results();
+            let responses = responses_of(&callback, 7);
+            assert_eq!(responses.len(), 1, "the only-local settle");
+            assert!(
+                rec.sent.lock().is_empty(),
+                "the loaded-instant-view only-local request dispatches nothing"
+            );
+        }
+
+        // 7. the net-inert posture — the plain WebPageId tail parks in
+        //    the family lot when the handle is absent (the None arm
+        //    logs net-inert, §0.2).
+        {
+            td.web_pages_manager.net = None;
+            let slot: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<WebPageId>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            let (mut env, manager) = crate::td::web_pages_env_split(&mut td);
+            WebPagesManager::fetch_web_page_by_url(
+                manager,
+                &mut env,
+                "https://example.com/inert",
+                WebPageIdTail::Promise { promise },
+            );
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "the net-inert send parks the tail"
+            );
+            let (_, manager) = crate::td::web_pages_env_split(&mut td);
+            assert_eq!(manager.pending_web_page_queries.len(), 1);
+        }
     }
 
     fn forum_topic_families_ride_the_dispatcher_impl() {
