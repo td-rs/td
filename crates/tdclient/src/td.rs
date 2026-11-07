@@ -19543,6 +19543,27 @@ impl Td {
                 }
                 self.callback_queries_manager = manager;
             }
+            // `SetBotCallbackAnswerQuery::on_result`/`on_error`
+            // (CallbackQueriesManager.cpp:163-178) — both Bool bands
+            // answer ok (the `!result` LOG(INFO) rides the intake), the
+            // wire error forwards unchanged (no dialog-error head on
+            // this family).
+            K::SetBotCallbackAnswer => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(value) => Ok(value),
+                        None => Err(Status::error(
+                            500,
+                            "Failed to parse the messages_setBotCallbackAnswer answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.callback_queries_manager);
+                manager.on_set_bot_callback_answer(result);
+                self.callback_queries_manager = manager;
+            }
         }
     }
 
@@ -80523,8 +80544,125 @@ kQIDAQAB\n\
             other => panic!("the parse band, got {other:?}"),
         }
 
-        // 9. the net-inert posture — no handle, the promise parks like
-        //    the C++ handler holds it
+        // 9. the set family — the bot-only live arm (Requests.cpp:
+        //     8363-8369 + CallbackQueriesManager.cpp:184-188): the
+        //     non-bot band first (CHECK_IS_BOT)
+        td.request(
+            2,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 11,
+                text: "done".to_owned(),
+                show_alert: true,
+                url: "https://t.me".to_owned(),
+                cache_time: 7,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Only bots can use the method")
+        );
+
+        // 10. the bot-mode full round trip (cpp:151-161): the
+        //     MESSAGE_MASK/URL_MASK bits carry the non-empty strings,
+        //     the alert bit and the cache time ride the wire
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            3,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 11,
+                text: "done".to_owned(),
+                show_alert: true,
+                url: "https://t.me".to_owned(),
+                cache_time: 7,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_setBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(
+            body.flags,
+            1 | (1 << 1) | (1 << 2),
+            "MESSAGE_MASK | the alert bit | URL_MASK for the non-empty strings"
+        );
+        assert!(body.alert);
+        assert_eq!(body.query_id, 11);
+        assert_eq!(body.message, "done");
+        assert_eq!(body.url, "https://t.me");
+        assert_eq!(body.cache_time, 7);
+
+        // 11. the boolTrue answer settles the parked request promise ok
+        //     (cpp:163-174)
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_callback_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 12. the boolFalse band answers ok too — the C++ `!result`
+        //     LOG(INFO) (cpp:169-172); the empty strings keep both masks
+        //     off (cpp:152-158)
+        td.request(
+            4,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 12,
+                text: String::new(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_setBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 0, "no masks for the empty strings");
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_callback_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. the wire-error band forwards the same code/message
+        //     (cpp:176-178) — QUERY_ID_INVALID is the reference band
+        td.request(
+            5,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 13,
+                text: String::new(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotCallbackAnswer::ID,
+        );
+        net_fail(sent, 400, "QUERY_ID_INVALID");
+        td.dispatch_completed_callback_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "QUERY_ID_INVALID")
+        );
+
+        // 14. the net-inert posture — no handle, the promises park like
+        //     the C++ handlers hold them
         td.callback_queries_manager.net = None;
         let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
         {
@@ -80550,6 +80688,31 @@ kQIDAQAB\n\
                 .pop_bot_callback_answer_promise_for_test()
                 .is_some(),
             "the promise parks like the C++ handler holds it"
+        );
+
+        // the set arm parks the same way offline (the bot posture
+        // stands — the arm gate passed above)
+        td.request(
+            6,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 14,
+                text: String::new(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback, 6).is_none() && responses_of(&callback, 6).is_empty(),
+            "nothing settles offline"
+        );
+        assert!(
+            td.callback_queries_manager
+                .pop_set_bot_callback_answer_promise_for_test()
+                .is_some(),
+            "the set promise parks like the C++ handler holds it"
         );
 
         // the drains ran clean — nothing parked, no strays

@@ -4,18 +4,19 @@
 //! request flips (Requests.cpp:8359-8374).
 //!
 //! Seams:
-//! - The `messages.getBotCallbackAnswer` network tail rides the
+//! - The `messages.getBotCallbackAnswer` and
+//!   `messages.setBotCallbackAnswer` network tails ride the
 //!   `CallbackNetKind` plane (net-drain 49): the manager-held
-//!   `CallbackNetHandle` dispatches the wire query and the
-//!   answer drains through `Td::on_callback_net_answer`
-//!   into [`CallbackQueriesManager::on_get_bot_callback_answer`].
-//! - The `ephemeral.getCallbackAnswer` and `messages.setBotCallbackAnswer`
-//!   tails ride the [`CallbackQueriesManagerEnv`] net seams —
-//!   `[blocked: net]` with the promises parked (the M.41 convention);
-//!   the answer handlers
-//!   ([`CallbackQueriesManager::on_get_ephemeral_callback_answer`],
-//!   [`CallbackQueriesManager::on_set_bot_callback_answer`]) are real
-//!   and unit-tested, including `BOT_RESPONSE_TIMEOUT` → 502 remap.
+//!   `CallbackNetHandle` dispatches the wire queries and the answers
+//!   drain through `Td::on_callback_net_answer` into
+//!   [`CallbackQueriesManager::on_get_bot_callback_answer`] and
+//!   [`CallbackQueriesManager::on_set_bot_callback_answer`].
+//! - The `ephemeral.getCallbackAnswer` tail rides the
+//!   [`CallbackQueriesManagerEnv`] net seam — `[blocked: net]` with the
+//!   promise parked (the M.41 convention); the answer handler
+//!   ([`CallbackQueriesManager::on_get_ephemeral_callback_answer`]) is
+//!   real and unit-tested, including `BOT_RESPONSE_TIMEOUT` → 502
+//!   remap.
 //! - `td_->password_manager_->get_input_check_password_srp`
 //!   (CallbackQueriesManager.cpp:365-373) is the
 //!   [`CallbackQueriesManagerEnv::get_input_check_password_srp`] seam —
@@ -55,6 +56,11 @@ pub(crate) enum CallbackNetKind {
         dialog_id: DialogId,
         message_id: MessageId,
     },
+    /// `SetBotCallbackAnswerQuery` (CallbackQueriesManager.cpp:144-179)
+    /// — `messages.setBotCallbackAnswer`; the handler carries only the
+    /// `promise_` member (cpp:146-149), so the lot is a plain
+    /// positional FIFO.
+    SetBotCallbackAnswer,
 }
 
 /// The `messages.getBotCallbackAnswer` wire flags
@@ -62,6 +68,11 @@ pub(crate) enum CallbackNetKind {
 /// bytes, `PASSWORD_MASK` the SRP envelope.
 const CALLBACK_DATA_MASK: i32 = 1;
 const CALLBACK_PASSWORD_MASK: i32 = 1 << 2;
+/// The `messages.setBotCallbackAnswer` wire flags
+/// (CallbackQueriesManager.cpp:152-158) — `MESSAGE_MASK`/`URL_MASK`
+/// carry the non-empty strings.
+const CALLBACK_MESSAGE_MASK: i32 = 1;
+const CALLBACK_URL_MASK: i32 = 1 << 2;
 
 /// `InlineQueriesManager::get_inline_message_id`
 /// (InlineQueriesManager.cpp:534-542) — the base64url form of the bare
@@ -243,22 +254,6 @@ pub trait CallbackQueriesManagerEnv {
         let _ = (dialog_id, ephemeral_message_id, data);
         tdutils::log_info!("Send ephemeral.getCallbackAnswer — [blocked: net]");
     }
-
-    /// `SetBotCallbackAnswerQuery::send`
-    /// (CallbackQueriesManager.cpp:151-161) — `[blocked: net]`; the
-    /// answer arrives through
-    /// [`CallbackQueriesManager::on_set_bot_callback_answer`].
-    fn send_set_bot_callback_answer_query(
-        &mut self,
-        callback_query_id: i64,
-        text: &str,
-        url: &str,
-        show_alert: bool,
-        cache_time: i32,
-    ) {
-        let _ = (callback_query_id, text, url, show_alert, cache_time);
-        tdutils::log_info!("Send messages.setBotCallbackAnswer — [blocked: net]");
-    }
 }
 
 /// A parked `messages.getBotCallbackAnswer` query — the request
@@ -305,12 +300,15 @@ impl CallbackQueriesManager {
         CallbackQueriesManager::default()
     }
 
-    /// `answer_callback_query` (CallbackQueriesManager.cpp:184-188).
+    /// `answer_callback_query` (CallbackQueriesManager.cpp:184-188) —
+    /// the env stays in the port shape though the send reads no plane
+    /// through it (the manager-held handle replaces the C++
+    /// `td_->create_handler` leg).
     // the C++ argument list is the port shape (env + 6 params)
     #[allow(clippy::too_many_arguments)]
     pub fn answer_callback_query(
         &mut self,
-        env: &mut impl CallbackQueriesManagerEnv,
+        _env: &mut impl CallbackQueriesManagerEnv,
         callback_query_id: i64,
         text: &str,
         show_alert: bool,
@@ -318,15 +316,58 @@ impl CallbackQueriesManager {
         cache_time: i32,
         promise: Promise<()>,
     ) {
-        env.send_set_bot_callback_answer_query(
+        self.send_set_bot_callback_answer_query(
             callback_query_id,
             text,
             url,
             show_alert,
             cache_time,
+            promise,
         );
+    }
+
+    /// The `td_->create_handler<SetBotCallbackAnswerQuery>(promise)
+    /// ->send(...)` collapse (CallbackQueriesManager.cpp:151-161): the
+    /// request promise parks in the family lot (the C++ carries it on
+    /// the query's `promise_` member, cpp:146-149; §5's FIFO shape),
+    /// then the wire query dispatches — the `MESSAGE_MASK`/`URL_MASK`
+    /// bits carry the non-empty strings (cpp:152-158) and the alert
+    /// bit rides the bool field. `None` on the handle keeps the
+    /// net-inert posture.
+    #[allow(clippy::too_many_arguments)]
+    fn send_set_bot_callback_answer_query(
+        &mut self,
+        callback_query_id: i64,
+        text: &str,
+        url: &str,
+        show_alert: bool,
+        cache_time: i32,
+        promise: Promise<()>,
+    ) {
         self.pending_set_bot_callback_answer_queries
             .push(PendingSetBotCallbackAnswerQuery { promise });
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                CallbackNetKind::SetBotCallbackAnswer,
+                telegram_api::Function::messages_setBotCallbackAnswer(
+                    telegram_api::messages_setBotCallbackAnswer {
+                        flags: (if text.is_empty() {
+                            0
+                        } else {
+                            CALLBACK_MESSAGE_MASK
+                        }) | (if url.is_empty() { 0 } else { CALLBACK_URL_MASK }),
+                        alert: show_alert,
+                        query_id: callback_query_id,
+                        message: text.to_owned(),
+                        url: url.to_owned(),
+                        cache_time,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.setBotCallbackAnswer — [net-inert]");
+            }
+        }
     }
 
     /// `get_query_payload` (CallbackQueriesManager.cpp:190-207) —
@@ -864,6 +905,15 @@ impl CallbackQueriesManager {
             .pop()
             .map(|query| query.promise)
     }
+
+    /// Test-only: the parked set-family promise pop (the same
+    /// convention).
+    #[cfg(test)]
+    pub(crate) fn pop_set_bot_callback_answer_promise_for_test(&mut self) -> Option<Promise<()>> {
+        self.pending_set_bot_callback_answer_queries
+            .pop()
+            .map(|query| query.promise)
+    }
 }
 
 #[cfg(test)]
@@ -1039,19 +1089,6 @@ mod tests {
             self.queries.push(format!(
                 "getEphemeralCallbackAnswer:{}:{ephemeral_message_id}",
                 dialog_id.get()
-            ));
-        }
-
-        fn send_set_bot_callback_answer_query(
-            &mut self,
-            callback_query_id: i64,
-            text: &str,
-            url: &str,
-            show_alert: bool,
-            cache_time: i32,
-        ) {
-            self.queries.push(format!(
-                "setBotCallbackAnswer:{callback_query_id}:{text}:{url}:{show_alert}:{cache_time}"
             ));
         }
     }
@@ -1616,9 +1653,9 @@ mod tests {
 
         let (promise, outcomes) = recording_promise();
         manager.answer_callback_query(&mut env, 11, "done", true, "https://t.me", 7, promise);
-        assert_eq!(
-            env.queries,
-            vec!["setBotCallbackAnswer:11:done:https://t.me:true:7"]
+        assert!(
+            !manager.pending_set_bot_callback_answer_queries.is_empty(),
+            "the promise parks like the C++ handler holds it"
         );
         manager.on_set_bot_callback_answer(Ok(true));
         assert_eq!(*outcomes.lock().unwrap(), vec![Ok(())]);
