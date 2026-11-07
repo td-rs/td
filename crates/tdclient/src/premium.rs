@@ -333,7 +333,9 @@ pub trait PremiumEnv {
 
     /// `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
     /// — the premium-subscription assign legs (Premium.cpp:1461-1465);
-    /// the suggested-action plane parks at its own seam.
+    /// the td env routes the trio into the suggested-action manager's
+    /// live dismiss flow (net-drain 52) — this default stays for the
+    /// plane-less test envs.
     fn dismiss_suggested_action(
         &mut self,
         action_type: crate::suggested_action::SuggestedActionType,
