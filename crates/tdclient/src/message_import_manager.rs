@@ -50,12 +50,11 @@ pub trait MessageImportManagerEnv {
     /// caller (the C++ query carries it on `promise_`, cpp:33-36).
     fn send_check_history_import_query(&mut self, message_file_head: String);
 
-    /// `CheckHistoryImportPeerQuery` — [blocked: net].
-    fn send_check_history_import_peer_query(
-        &mut self,
-        dialog_id: DialogId,
-        promise: Promise<String>,
-    );
+    /// `CheckHistoryImportPeerQuery` (MessageImportManager.cpp:67-98) —
+    /// the request promise has already parked in the family lot by the
+    /// caller (the C++ query carries it on `promise_`, cpp:72-74); the
+    /// write peer resolves at this send leg (cpp:75-81).
+    fn send_check_history_import_peer_query(&mut self, dialog_id: DialogId);
 
     /// `InitHistoryImportQuery` → `upload_imported_messages` — the
     /// [blocked: net/Files] upload tail; the promise parks (the C++ send
@@ -83,6 +82,12 @@ pub(crate) enum MessageImportNetKind {
     /// manager's `check_history_import` FIFO lot (the C++ query carries
     /// it on `promise_`; §5's FIFO-per-family shape).
     CheckHistoryImport,
+    /// `CheckHistoryImportPeerQuery` (cpp:67-98) —
+    /// `messages.checkHistoryImportPeer`; the kind carries the
+    /// handler's `dialog_id_` for the `on_get_dialog_error` head the
+    /// C++ `on_error` runs (cpp:94), the request promise parks in the
+    /// `check_history_import_peer` FIFO lot.
+    CheckHistoryImportPeer { dialog_id: DialogId },
 }
 
 /// The parked head-query promises — the ResultHandler members the
@@ -92,6 +97,8 @@ pub(crate) enum MessageImportNetKind {
 pub(crate) struct PendingMessageImportQueries {
     /// `CheckHistoryImportQuery::promise_` (cpp:33).
     pub(crate) check_history_import: Vec<Promise<td_api::MessageFileType>>,
+    /// `CheckHistoryImportPeerQuery::promise_` (cpp:69).
+    pub(crate) check_history_import_peer: Vec<Promise<String>>,
 }
 
 /// `td::MessageImportManager` — stateless offline (every in-flight piece
@@ -167,8 +174,17 @@ impl MessageImportManager {
         Ok(())
     }
 
+    /// The check-history-import-promise pop for the
+    /// `Td::on_message_import_net_answer` drain — the FIFO head the
+    /// answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_check_history_import_peer_promise(&mut self) -> Option<Promise<String>> {
+        pop_head(&mut self.pending.check_history_import_peer)
+    }
+
     /// `MessageImportManager::get_message_import_confirmation_text`
-    /// (MessageImportManager.cpp:310-314).
+    /// (MessageImportManager.cpp:310-314) — the can_import_messages
+    /// bands first, then the promise parks in the family lot and the
+    /// env send leg resolves the write peer (cpp:75-81).
     pub fn get_message_import_confirmation_text(
         &mut self,
         env: &mut impl MessageImportManagerEnv,
@@ -178,7 +194,8 @@ impl MessageImportManager {
         if let Err(status) = self.can_import_messages(env, dialog_id) {
             return promise.set_error(status);
         }
-        env.send_check_history_import_peer_query(dialog_id, promise);
+        self.pending.check_history_import_peer.push(promise);
+        env.send_check_history_import_peer_query(dialog_id);
     }
 
     /// `MessageImportManager::import_messages`
@@ -236,6 +253,9 @@ mod tests {
         /// the recorded `messages.checkHistoryImport` sends (the head
         /// strings — the offline stand-in for the net plane)
         sent_import_heads: RefCell<Vec<String>>,
+        /// the recorded `messages.checkHistoryImportPeer` sends (the
+        /// dialog ids — the offline stand-in for the net plane)
+        sent_import_peer_dialogs: RefCell<Vec<DialogId>>,
     }
 
     impl MessageImportManagerEnv for TestEnv {
@@ -279,11 +299,8 @@ mod tests {
             self.sent_import_heads.borrow_mut().push(message_file_head);
         }
 
-        fn send_check_history_import_peer_query(
-            &mut self,
-            _dialog_id: DialogId,
-            _promise: Promise<String>,
-        ) {
+        fn send_check_history_import_peer_query(&mut self, dialog_id: DialogId) {
+            self.sent_import_peer_dialogs.borrow_mut().push(dialog_id);
         }
 
         fn start_history_import(
@@ -329,6 +346,7 @@ mod tests {
             checked_access: RefCell::new(Vec::new()),
             imported: RefCell::new(Vec::new()),
             sent_import_heads: RefCell::new(Vec::new()),
+            sent_import_peer_dialogs: RefCell::new(Vec::new()),
         }
     }
 
@@ -410,6 +428,69 @@ mod tests {
     }
 
     #[test]
+    fn check_history_import_peer_parks_after_the_access_bands() {
+        // `get_message_import_confirmation_text`
+        // (MessageImportManager.cpp:310-314) — the can_import_messages
+        // bands fail the promise before any query (cpp:312), then the
+        // promise parks in the family lot and the send leg carries the
+        // dialog (the write peer resolves there, cpp:75-81).
+        let mut env = empty_env();
+        env.contacts.insert(42);
+        let contact_dialog = DialogId::from_user_id(UserId::new(42));
+        let stranger_dialog = DialogId::from_user_id(UserId::new(43));
+        let mut manager = MessageImportManager::new();
+
+        // the access bands fail before the send (no seam call)
+        let (promise, slot) = outcome_promise::<String>();
+        manager.get_message_import_confirmation_text(&mut env, stranger_dialog, promise);
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Err(status))
+                if (status.code(), status.message()) == (400, "User must be a mutual contact")
+        ));
+        assert!(
+            env.sent_import_peer_dialogs.borrow().is_empty(),
+            "the failed band never sends"
+        );
+
+        // the accessible dialog parks the promise and sends the dialog
+        let (first, first_slot) = outcome_promise::<String>();
+        manager.get_message_import_confirmation_text(&mut env, contact_dialog, first);
+        let (second, second_slot) = outcome_promise::<String>();
+        manager.get_message_import_confirmation_text(&mut env, contact_dialog, second);
+        assert_eq!(
+            env.sent_import_peer_dialogs.borrow().clone(),
+            vec![contact_dialog, contact_dialog]
+        );
+        assert!(first_slot.lock().unwrap().is_none(), "the promises park");
+
+        // FIFO: the answers pair with the head
+        let mut head = manager
+            .pop_check_history_import_peer_promise()
+            .expect("the first park");
+        head.set_value("Import this chat?".to_owned());
+        assert!(matches!(
+            first_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(text)) if text == "Import this chat?"
+        ));
+        assert!(second_slot.lock().unwrap().is_none(), "FIFO: only the head");
+
+        let mut head = manager
+            .pop_check_history_import_peer_promise()
+            .expect("the second park");
+        head.set_error(Status::error(420, "FLOOD_WAIT_9"));
+        assert!(matches!(
+            second_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Err(status))
+                if (status.code(), status.message()) == (420, "FLOOD_WAIT_9")
+        ));
+        assert!(
+            manager.pop_check_history_import_peer_promise().is_none(),
+            "the lot drained"
+        );
+    }
+
+    #[test]
     fn user_must_be_a_mutual_contact() {
         let mut env = TestEnv {
             contacts: HashSet::new(),
@@ -419,6 +500,7 @@ mod tests {
             checked_access: RefCell::new(Vec::new()),
             imported: RefCell::new(Vec::new()),
             sent_import_heads: RefCell::new(Vec::new()),
+            sent_import_peer_dialogs: RefCell::new(Vec::new()),
         };
         let mut manager = MessageImportManager::new();
         let dialog_id = DialogId::from_user_id(UserId::new(42));
@@ -442,6 +524,7 @@ mod tests {
             checked_access: RefCell::new(Vec::new()),
             imported: RefCell::new(Vec::new()),
             sent_import_heads: RefCell::new(Vec::new()),
+            sent_import_peer_dialogs: RefCell::new(Vec::new()),
         };
         let mut manager = MessageImportManager::new();
         let dialog_id = DialogId::from_chat_id(crate::chat_manager::ChatId::new(5));
@@ -461,6 +544,7 @@ mod tests {
             checked_access: RefCell::new(Vec::new()),
             imported: RefCell::new(Vec::new()),
             sent_import_heads: RefCell::new(Vec::new()),
+            sent_import_peer_dialogs: RefCell::new(Vec::new()),
         };
         let mut manager = MessageImportManager::new();
         let dialog_id = DialogId::from_channel_id(ChannelId::new(10));
@@ -493,6 +577,7 @@ mod tests {
             checked_access: RefCell::new(Vec::new()),
             imported: RefCell::new(Vec::new()),
             sent_import_heads: RefCell::new(Vec::new()),
+            sent_import_peer_dialogs: RefCell::new(Vec::new()),
         };
         let mut manager = MessageImportManager::new();
         let dialog_id = DialogId::from_user_id(UserId::new(42));

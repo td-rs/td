@@ -24176,6 +24176,45 @@ impl Td {
                     )),
                 }
             }
+            // `CheckHistoryImportPeerQuery::on_result`/`on_error`
+            // (MessageImportManager.cpp:83-97) — the confirm_text answer
+            // settles the parked request; the error tail runs the
+            // on_get_dialog_error head (cpp:94) with the handler's
+            // `dialog_id_` before the promise error (cpp:95-96).
+            K::CheckHistoryImportPeer { dialog_id } => {
+                let Some(mut promise) = self
+                    .message_import_manager
+                    .pop_check_history_import_peer_promise()
+                else {
+                    tdutils::log_info!(
+                        "Receive an unexpected messages.checkHistoryImportPeer answer"
+                    );
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_CheckedHistoryImportPeer::parse(query.ok()) {
+                        Ok(parsed) => Ok(parsed.confirm_text),
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the messages_checkHistoryImportPeer answer",
+                        )),
+                    }
+                };
+                match result {
+                    Ok(confirm_text) => promise.set_value(confirm_text),
+                    Err(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "CheckHistoryImportPeerQuery",
+                        );
+                        promise.set_error(status);
+                    }
+                }
+            }
         }
     }
 
@@ -46755,12 +46794,33 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         );
     }
 
-    fn send_check_history_import_peer_query(
-        &mut self,
-        _dialog_id: crate::dialog_id::DialogId,
-        _promise: Promise<String>,
-    ) {
-        // [blocked: net]
+    fn send_check_history_import_peer_query(&mut self, dialog_id: crate::dialog_id::DialogId) {
+        // `CheckHistoryImportPeerQuery::send`
+        // (MessageImportManager.cpp:75-81) — the write peer resolves
+        // here; the C++ CHECK(input_peer != nullptr) downgrades to the
+        // sibling 400 access band (the autosave convention) so the
+        // answer half runs the full on_error tail.
+        use crate::message_import_manager::MessageImportNetKind;
+        let Some(net) = self.td.message_import_net() else {
+            tdutils::log_info!("Check history import peer — [net-inert]");
+            return;
+        };
+        let kind = MessageImportNetKind::CheckHistoryImportPeer { dialog_id };
+        match crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) {
+            Some(peer) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_checkHistoryImportPeer(
+                    telegram_api::messages_checkHistoryImportPeer {
+                        peer: Some(Box::new(peer)),
+                    },
+                ),
+            ),
+            None => net.complete_error(kind, 400, "Can't access the chat"),
+        }
     }
 
     fn start_history_import(
@@ -79545,6 +79605,202 @@ kQIDAQAB\n\
         assert!(
             td.message_import_manager
                 .pop_check_history_import_promise()
+                .is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.message_import_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// Seed one mutual-contact user (the `on_get_user` contact-intake
+    /// state) — `access_hash: None` leaves the registry without a peer
+    /// form (the min-user shape).
+    fn seed_import_contact(td: &mut Td, id: i64, access_hash: Option<i64>) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        user_manager.on_get_user(
+            &mut env,
+            telegram_api::User::user(telegram_api::user {
+                id,
+                flags: if access_hash.is_some() { 1 } else { 0 },
+                access_hash: access_hash.unwrap_or(0),
+                contact: true,
+                mutual_contact: true,
+                first_name: "Contact".to_owned(),
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+    }
+
+    #[test]
+    fn check_history_import_peer_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(check_history_import_peer_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn check_history_import_peer_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) =
+            netted_td_with_callback("netdrain58-check-history-import-peer");
+        seed_import_contact(&mut td, 700000002, Some(9));
+
+        // 1. the live td_api arm rides the wire after the
+        //    can_import_messages bands — the write peer resolves at the
+        //    send leg (CheckHistoryImportPeerQuery::send, cpp:75-81)
+        td.request(
+            1,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImportPeer::ID,
+        );
+        let body = telegram_api::messages_checkHistoryImportPeer::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerUser(peer))
+                if (peer.user_id, peer.access_hash) == (700000002, 9)
+        ));
+
+        // 2. the confirm_text answer settles the request as the text
+        //    object (cpp:83-91)
+        let mut answer = Vec::new();
+        telegram_api::messages_CheckedHistoryImportPeer {
+            confirm_text: "Import this chat?".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::text(text)) if text.text == "Import this chat?"
+        ));
+
+        // 3. the live-arm local bands keep the C++ order — the access
+        //    check before the query (can_import_messages, cpp:282-308)
+        td.request(
+            2,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 3,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_checkHistoryImportPeer::ID,
+            "the unaccessed dialog never reaches the wire",
+        );
+
+        // 4. the wire-error band forwards verbatim after the
+        //    on_get_dialog_error head (cpp:93-97)
+        td.request(
+            3,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImportPeer::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 5. the unresolvable-peer band — the C++ CHECK(input_peer !=
+        //    nullptr) downgrades to the sibling 400 access band (the
+        //    autosave convention) so the answer half runs the full
+        //    on_error tail
+        seed_import_contact(&mut td, 700000003, None);
+        td.request(
+            4,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000003,
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_checkHistoryImportPeer::ID,
+            "the unresolvable peer never reaches the wire",
+        );
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't access the chat")
+        );
+
+        // 6. the parse-failure band — the fetch_result failure routes
+        //    through on_error (the dialog head + the 500, cpp:44-46 →
+        //    :93-97)
+        td.request(
+            5,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImportPeer::ID,
+        );
+        net_complete(sent, bool_answer(true)); // the wrong constructor
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                500,
+                "Failed to parse the messages_checkHistoryImportPeer answer"
+            )
+        );
+
+        // 7. the net-inert posture — the send leg logs, the promise parks
+        //    unanswered (the C++ offline shape)
+        td.net_query_dispatcher = None;
+        td.request(
+            6,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            responses_of(&callback, 6).is_empty() && error_of_id(&callback, 6).is_none(),
+            "the request parks unanswered"
+        );
+        assert!(
+            td.message_import_manager
+                .pop_check_history_import_peer_promise()
                 .is_some(),
             "the promise parks like the C++ handler holds it"
         );
