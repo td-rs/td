@@ -3402,6 +3402,17 @@ pub(crate) type InlineMessageNetHandle =
 /// families ride the same env).
 pub(crate) type TopDialogNetHandle = NetKindHandle<crate::top_dialog_manager::TopDialogNetKind>;
 
+/// The env-carried channel-recommendation dispatch surface (the
+/// net-drain 61 plane): the per-kind handle over the
+/// ChannelRecommendationManager.cpp ResultHandler kind (the two
+/// GetChannelRecommendationsQuery forms — the recommended-channels
+/// reload and the per-channel similar-chats reload); the answers drain
+/// through [`Td::on_channel_recommendation_net_answer`]. Env-carried
+/// over the shared `TdTopDialogEnv` (the top-dialog families ride the
+/// same env).
+pub(crate) type ChannelRecommendationNetHandle =
+    NetKindHandle<crate::channel_recommendation_manager::ChannelRecommendationNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6307,6 +6318,18 @@ pub struct Td {
     /// [`Td::on_top_dialog_net_answer`].
     top_dialog_net_completed:
         Arc<Mutex<Vec<(crate::top_dialog_manager::TopDialogNetKind, NetQuery)>>>,
+    /// The channel-recommendation net completed queue (the
+    /// `ChannelRecommendationNetKind` tags; the net-drain 61 family)
+    /// — the dispatcher callbacks park here, the actor pump routes
+    /// them through [`Td::on_channel_recommendation_net_answer`].
+    channel_recommendation_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::channel_recommendation_manager::ChannelRecommendationNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The bot-recommendation net completed queue (the
     /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6845,6 +6868,7 @@ impl Td {
             inline_message_net_pending:
                 crate::inline_message_manager::PendingInlineMessageQueries::default(),
             top_dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
+            channel_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -9167,6 +9191,7 @@ impl Td {
         self.dispatch_completed_reaction_net();
         self.dispatch_completed_inline_message_net();
         self.dispatch_completed_top_dialog_net();
+        self.dispatch_completed_channel_recommendation_net();
         self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9657,6 +9682,18 @@ impl Td {
         Some(TopDialogNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.top_dialog_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned channel-recommendation dispatch surface the
+    /// [`TdTopDialogEnv`] carries (the net-drain 61 family's send
+    /// legs) — `None` keeps the net-inert posture (the pre-init
+    /// windows and the net-inert tests).
+    pub(crate) fn channel_recommendation_net(&self) -> Option<ChannelRecommendationNetHandle> {
+        Some(ChannelRecommendationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.channel_recommendation_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -18052,6 +18089,18 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the channel-recommendation-parked answers — the C++
+    /// `GetChannelRecommendationsQuery` `on_result`/`on_error` halves
+    /// of the net-drain 61 family (ChannelRecommendationManager.cpp:
+    /// 60-84).
+    fn dispatch_completed_channel_recommendation_net(&mut self) {
+        let completed = std::mem::take(&mut *self.channel_recommendation_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_channel_recommendation_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20356,6 +20405,60 @@ impl Td {
                     }
                 }
             }
+        }
+    }
+
+    /// Route one channel-recommendation net answer — the
+    /// `GetChannelRecommendationsQuery` ResultHandler halves of the
+    /// net-drain 61 family (ChannelRecommendationManager.cpp:60-84):
+    /// the answer parses to the `(total_count, chats)` pair and runs
+    /// the landed reload intakes through the promise-lambda hop (the
+    /// recommended-channels walk at cpp:250-287 / the per-channel walk
+    /// at cpp:495-522); the error runs the `on_get_channel_error`
+    /// head first (cpp:75-79).
+    fn on_channel_recommendation_net_answer(
+        &mut self,
+        kind: crate::channel_recommendation_manager::ChannelRecommendationNetKind,
+        query: NetQuery,
+    ) {
+        let crate::channel_recommendation_manager::ChannelRecommendationNetKind::
+            GetChannelRecommendations { channel_id } = kind;
+        let result = if query.is_error() {
+            Err(query.error().clone())
+        } else {
+            match telegram_api::messages_Chats::parse(query.ok()) {
+                // `messages_chats::on_result` (cpp:63-68)
+                Ok(telegram_api::messages_Chats::messages_chats(chats)) => {
+                    Ok((chats.chats.len() as i32, chats.chats))
+                }
+                // `messages_chatsSlice::on_result` (cpp:69-73)
+                Ok(telegram_api::messages_Chats::messages_chatsSlice(chats)) => {
+                    Ok((chats.count, chats.chats))
+                }
+                _ => {
+                    // the C++ `UNREACHABLE` collapses onto the 500
+                    // convention (§5)
+                    tdutils::log_error!("Can't parse messages.Chats");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the channels_getChannelRecommendations answer",
+                    ))
+                }
+            }
+        };
+        let (mut env, recommendation_manager) = recommendation_env_split(self);
+        if let Err(status) = &result
+            && channel_id.is_valid()
+        {
+            // `on_error` (cpp:75-79) — the channel-error head runs
+            // before the promise fires
+            crate::channel_recommendation_manager::ChannelRecommendationManagerEnv::
+                on_get_channel_error(&mut env, channel_id, status, "GetChannelRecommendationsQuery");
+        }
+        if channel_id.is_valid() {
+            recommendation_manager.on_get_channel_recommendations(&mut env, channel_id, result);
+        } else {
+            recommendation_manager.on_get_recommended_channels(&mut env, result);
         }
     }
 
@@ -48111,6 +48214,7 @@ pub(crate) fn top_dialog_env_split(
     &mut crate::top_dialog_manager::TopDialogManager,
 ) {
     let net = td.top_dialog_net();
+    let recommendation_net = td.channel_recommendation_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -48129,6 +48233,7 @@ pub(crate) fn top_dialog_env_split(
             user_manager,
             chat_manager,
             net,
+            recommendation_net,
         },
         top_dialog_manager,
     )
@@ -48141,6 +48246,7 @@ pub(crate) fn recommendation_env_split(
     &mut crate::channel_recommendation_manager::ChannelRecommendationManager,
 ) {
     let net = td.top_dialog_net();
+    let recommendation_net = td.channel_recommendation_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -48159,6 +48265,7 @@ pub(crate) fn recommendation_env_split(
             user_manager,
             chat_manager,
             net,
+            recommendation_net,
         },
         channel_recommendation_manager,
     )
@@ -48178,6 +48285,9 @@ pub(crate) struct TdTopDialogEnv<'a> {
     /// The net-drain 61 top-dialog dispatch surface (the query send
     /// legs); `None` keeps the net-inert posture.
     pub(crate) net: Option<TopDialogNetHandle>,
+    /// The net-drain 61 channel-recommendation dispatch surface (the
+    /// query send legs); `None` keeps the net-inert posture.
+    pub(crate) recommendation_net: Option<ChannelRecommendationNetHandle>,
 }
 
 impl TdTopDialogEnv<'_> {
@@ -48590,8 +48700,97 @@ impl crate::channel_recommendation_manager::ChannelRecommendationManagerEnv for 
         self.global.td_db().common_kv().erase(key);
     }
 
-    fn reload_recommended_channels(&mut self, _channel_id: crate::chat_manager::ChannelId) {
-        // [blocked: net]
+    fn get_channel_ids(
+        &mut self,
+        chats: Vec<telegram_api::Chat>,
+        source: &str,
+    ) -> Vec<crate::chat_manager::ChannelId> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return Vec::new();
+        };
+        let mut env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .get_channel_ids(self.user_manager, &mut env, chats, source)
+    }
+
+    fn on_get_channel_error(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        let Some(options) = self.options.as_deref_mut() else {
+            return false;
+        };
+        let mut env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.on_get_channel_error(
+            self.user_manager,
+            &mut env,
+            channel_id,
+            status,
+            source,
+        )
+    }
+
+    fn get_input_channel_object(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<telegram_api::InputChannel> {
+        let options = self.options.as_deref_mut()?;
+        let env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.get_input_channel(&env, channel_id)
+    }
+
+    /// `GetChannelRecommendationsQuery::send`
+    /// (ChannelRecommendationManager.cpp:47-58) — the net-drain 61
+    /// send leg over the env-carried handle; the C++ `CHECK` band
+    /// (a valid channel id whose input form misses — unreachable
+    /// behind the `get_channel_recommendations` pre-gate) downgrades
+    /// to the complete_error file-through so the `on_error` head
+    /// runs.
+    fn reload_recommended_channels(&mut self, channel_id: crate::chat_manager::ChannelId) {
+        use crate::channel_recommendation_manager::ChannelRecommendationNetKind;
+        let kind = ChannelRecommendationNetKind::GetChannelRecommendations { channel_id };
+        match self.recommendation_net.clone() {
+            Some(net) => {
+                let input_channel = self.get_input_channel_object(channel_id);
+                if channel_id.is_valid() && input_channel.is_none() {
+                    // the C++ `CHECK(!channel_id.is_valid() ||
+                    // input_channel != nullptr)` band
+                    return net.complete_error(kind, 400, "Can't access the chat");
+                }
+                let flags = if input_channel.is_some() {
+                    // `CHANNEL_MASK` (the generated layer-230 bit 0)
+                    1
+                } else {
+                    0
+                };
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::channels_getChannelRecommendations(
+                        telegram_api::channels_getChannelRecommendations {
+                            flags,
+                            channel: input_channel,
+                        },
+                    ),
+                );
+            }
+            None => {
+                tdutils::log_info!("Send channels.getChannelRecommendations — [net-inert]");
+            }
+        }
     }
 
     fn save_app_log(&mut self, _ref_channel_id: i64, _open_channel_id: i64, _promise: Promise<()>) {
@@ -84034,6 +84233,252 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.top_dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn channel_recommendation_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_recommendation_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the two
+    /// GetChannelRecommendationsQuery forms (ChannelRecommendationManager.cpp:
+    /// 31-84) dispatch through the real dispatcher and the answers drain
+    /// through `Td::on_channel_recommendation_net_answer` into the
+    /// ported reload intakes — the recommended-channels form through
+    /// the live getRecommendedChats arm, the per-channel form through
+    /// the live getChatSimilarChats arm.
+    fn channel_recommendation_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-channel-recommendations");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        // a broadcast channel the user created — registered, member (the
+        // creator), so the recommendation walk drops it like the C++
+        // is_suitable_recommended_channel band (cpp:133-143)
+        seed_channel_with_usernames(&mut td, 703, &[]);
+        let channel_chat_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+
+        // 1. the recommended-channels form — the live getRecommendedChats
+        //    arm parks the promise and fires the bare query (flags 0,
+        //    no channel, cpp:52-58)
+        td.request(
+            1,
+            Function::getRecommendedChats(td_api::getRecommendedChats),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        let body = telegram_api::channels_getChannelRecommendations::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 0, "the bare form carries no channel");
+        assert!(body.channel.is_none());
+
+        // the messages.chats answer walks the intake (cpp:256-299): the
+        // member channel is unsuitable, the count decrements, the
+        // promise resolves with the empty Chats object
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_chats {
+                chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                    broadcast: true,
+                    id: 703,
+                    access_hash: 777,
+                    title: "rec".to_owned(),
+                    ..telegram_api::channel::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::chats(chats) = responses.first().expect("the response") else {
+            panic!("the recommended-chats response");
+        };
+        assert_eq!(chats.total_count, 0, "the unsuitable walk decrements");
+        assert!(chats.chat_ids.is_empty());
+
+        // 2. the cache path — a second request answers locally, no wire
+        //    query (the 24h reload deadline, cpp:160-181)
+        td.request(
+            2,
+            Function::getRecommendedChats(td_api::getRecommendedChats),
+        );
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 2);
+        let td_api::Object::chats(chats) = responses.first().expect("the cached response") else {
+            panic!("the cached response");
+        };
+        assert_eq!(chats.total_count, 0);
+        assert!(
+            !rec.sent.lock().iter().any(|query| query.tl_constructor()
+                == telegram_api::channels_getChannelRecommendations::ID),
+            "the cache answers without a wire query"
+        );
+
+        // 3. the per-channel form — the live getChatSimilarChats arm
+        //    (the seeded channel carries the arm's gates): the
+        //    CHANNEL_MASK form with the inputChannel body (cpp:52-58)
+        td.request(
+            3,
+            Function::getChatSimilarChats(td_api::getChatSimilarChats {
+                chat_id: channel_chat_id,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        let body = telegram_api::channels_getChannelRecommendations::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1, "CHANNEL_MASK");
+        assert!(matches!(
+            body.channel,
+            Some(telegram_api::InputChannel::inputChannel(_))
+        ));
+
+        // the chatsSlice answer (cpp:61-73) — the count rides the slice,
+        // the member channel drops, the record caches with the 24h
+        // deadline (cpp:491-522)
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_chatsSlice {
+                count: 2,
+                chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                    broadcast: true,
+                    id: 703,
+                    access_hash: 777,
+                    title: "rec".to_owned(),
+                    ..telegram_api::channel::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        let td_api::Object::chats(chats) = responses.first().expect("the similar response") else {
+            panic!("the similar-chats response");
+        };
+        assert_eq!(chats.total_count, 1, "2 - the dropped member channel");
+        assert!(chats.chat_ids.is_empty());
+        let channel_id = crate::chat_manager::ChannelId::new(703);
+        let record = td
+            .channel_recommendation_manager
+            .channel_recommended_dialogs
+            .get(&channel_id)
+            .expect("the cached record");
+        assert_eq!(record.total_count, 1);
+        assert!(record.next_reload_time > tdutils::time::now());
+
+        // 4. the count form — the live getChatSimilarChatCount arm with
+        //    return_local settles -1 from the reload head (cpp:476-487);
+        //    the band fires only on the uncached reload (the cached path
+        //    answers the stored count), so drop the record first
+        td.channel_recommendation_manager
+            .channel_recommended_dialogs
+            .remove(&channel_id);
+        td.request(
+            4,
+            Function::getChatSimilarChatCount(td_api::getChatSimilarChatCount {
+                chat_id: channel_chat_id,
+                return_local: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 4);
+        let td_api::Object::count(count) = responses.first().expect("the count response") else {
+            panic!("the count response");
+        };
+        assert_eq!(count.count, -1, "the return_local -1 band");
+        // the count settle precedes the wire query; complete it so the
+        // drain runs clean below (the empty chats promise parks null)
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        net_complete(sent, wire!(telegram_api::messages_chats { chats: vec![] }));
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+
+        // 5. the error band — the wire error fails the parked promises
+        //    with the reference-identical code/message (cpp:75-83);
+        //    drop the cached record so the arm reloads
+        {
+            td.channel_recommendation_manager
+                .channel_recommended_dialogs
+                .remove(&channel_id);
+        }
+        td.request(
+            7,
+            Function::getChatSimilarChats(td_api::getChatSimilarChats {
+                chat_id: channel_chat_id,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 6. the net-inert posture — no dispatcher, nothing dispatches
+        let (mut td2, rec2, callback2) =
+            netted_td_with_callback("netdrain61-recommendations-inert");
+        td2.net_query_dispatcher = None; // the net-inert posture
+        td2.request(
+            6,
+            Function::getRecommendedChats(td_api::getRecommendedChats),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 6).is_none() && responses_of(&callback2, 6).is_empty(),
+            "nothing settles offline"
+        );
+        assert!(
+            !td2.channel_recommendation_manager
+                .get_recommended_channels_queries
+                .is_empty(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(
+            td.channel_recommendation_net_completed.lock().is_empty(),
+            "drained"
+        );
     }
 
     #[test]
