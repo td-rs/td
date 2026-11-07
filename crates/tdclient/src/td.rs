@@ -3376,6 +3376,15 @@ pub(crate) type PollNetHandle = NetKindHandle<crate::poll_manager::PollNetKind>;
 /// inside the manager over the shared [`BotEnv`] view's peer reads.
 pub(crate) type CallbackNetHandle = NetKindHandle<crate::callback_queries_manager::CallbackNetKind>;
 
+/// The env-carried message-reaction dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the MessageReaction.cpp
+/// ResultHandler kinds (`messages.getMessageReactionsList`/
+/// `messages.reportReaction`); the answers drain through
+/// [`Td::on_reaction_net_answer`]. Env-carried (the `PollNetHandle`
+/// shape — the value-plane module has no manager struct, the send legs
+/// run inside the env send arms over the split borrows' peer reads).
+pub(crate) type ReactionNetHandle = NetKindHandle<crate::message_reaction::ReactionNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6252,6 +6261,14 @@ pub struct Td {
     /// net-drain 57 families) — the dispatcher callbacks park here, the
     /// actor pump routes them through [`Td::on_game_net_answer`].
     game_net_completed: Arc<Mutex<Vec<(crate::game_manager::GameNetKind, NetQuery)>>>,
+    /// The message-reaction net completed queue (the `ReactionNetKind`
+    /// tags; the net-drain 61 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_reaction_net_answer`].
+    reaction_net_completed: Arc<Mutex<Vec<(crate::message_reaction::ReactionNetKind, NetQuery)>>>,
+    /// The parked message-reaction queries (the net-drain 61 family
+    /// lots — the C++ handlers' `promise_` + non-Copy members).
+    reaction_net_pending: crate::message_reaction::PendingReactionQueries,
     /// The bot-recommendation net completed queue (the
     /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6784,6 +6801,8 @@ impl Td {
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             callback_net_completed: Arc::new(Mutex::new(Vec::new())),
             game_net_completed: Arc::new(Mutex::new(Vec::new())),
+            reaction_net_completed: Arc::new(Mutex::new(Vec::new())),
+            reaction_net_pending: crate::message_reaction::PendingReactionQueries::default(),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -9103,6 +9122,7 @@ impl Td {
         self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_callback_net();
         self.dispatch_completed_game_net();
+        self.dispatch_completed_reaction_net();
         self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9557,6 +9577,18 @@ impl Td {
         Some(GameNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.game_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned message-reaction dispatch surface the
+    /// [`TdMessageReactionQueryEnv`] carries (the net-drain 61
+    /// families' send legs) — `None` keeps the net-inert posture (the
+    /// pre-init windows and the net-inert tests).
+    pub(crate) fn reaction_net(&self) -> Option<ReactionNetHandle> {
+        Some(ReactionNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.reaction_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17919,6 +17951,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the reaction-parked message-reaction answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 61
+    /// families (MessageReaction.cpp:211-341).
+    fn dispatch_completed_reaction_net(&mut self) {
+        let completed = std::mem::take(&mut *self.reaction_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_reaction_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -19828,6 +19871,199 @@ impl Td {
                     }
                 }
                 self.game_manager = manager;
+            }
+        }
+    }
+
+    /// Route one message-reaction net answer by kind — the
+    /// ResultHandler halves of the net-drain 61 families
+    /// (MessageReaction.cpp:211-341): the wire answers parse here, run
+    /// the users/chats intakes and the reaction walk, then settle the
+    /// parked family promises (the parse failures settle through the
+    /// same tails the wire errors do — the fetch_result → on_error
+    /// chain).
+    fn on_reaction_net_answer(
+        &mut self,
+        kind: crate::message_reaction::ReactionNetKind,
+        query: NetQuery,
+    ) {
+        use crate::message_reaction::ReactionNetKind as K;
+        match kind {
+            // `GetMessageReactionsListQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:249-304) — the users/chats intakes
+            // run first, then the reaction walk filters the mismatched
+            // rows and builds the `td_api::addedReactions` over the
+            // resolvable senders.
+            K::GetMessageReactionsList { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_MessageReactionsList::parse(query.ok()) {
+                        Ok(answer) => Ok(answer),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.messageReactionsList: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getMessageReactionsList answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetMessageReactionsListQuery",
+                    );
+                }
+                let parked = if self.reaction_net_pending.list.is_empty() {
+                    None
+                } else {
+                    Some(self.reaction_net_pending.list.remove(0))
+                };
+                match (result, parked) {
+                    (
+                        Ok(answer),
+                        Some(crate::message_reaction::PendingReactionListQuery {
+                            dialog_id: parked_dialog_id,
+                            message_id: parked_message_id,
+                            reaction_type,
+                            offset,
+                            promise,
+                        }),
+                    ) => {
+                        // `on_get_users`/`on_get_chats` (cpp:258-259)
+                        if let Some(options) = self.option_manager.as_mut() {
+                            let mut env = UserEnv {
+                                global: &mut self.global,
+                                options,
+                                auth_is_bot: self.auth_manager.is_bot(),
+                            };
+                            self.user_manager.on_get_users(
+                                &mut env,
+                                answer.users,
+                                "GetMessageReactionsListQuery",
+                            );
+                            self.chat_manager.on_get_chats(
+                                &mut self.user_manager,
+                                &mut env,
+                                answer.chats,
+                                "GetMessageReactionsListQuery",
+                            );
+                        }
+
+                        // the reaction walk (cpp:261-295): the count clamp,
+                        // the mismatch filter and the sender objects
+                        let mut total_count = answer.count;
+                        let received = answer.reactions.len() as i32;
+                        if total_count < received {
+                            tdutils::log_error!(
+                                "Receive invalid total_count in the reactions list"
+                            );
+                            total_count = received;
+                        }
+                        let mut reactions = Vec::new();
+                        for reaction in answer.reactions {
+                            let reaction_dialog_id = reaction
+                                .peer_id
+                                .as_ref()
+                                .map(crate::dialog_id::DialogId::from_peer)
+                                .unwrap_or_default();
+                            let reaction_type_row =
+                                crate::reaction_type::ReactionType::from_telegram(
+                                    reaction.reaction.as_ref(),
+                                );
+                            if !reaction_dialog_id.is_valid()
+                                || (if reaction_type.is_empty() {
+                                    reaction_type_row.is_empty()
+                                } else {
+                                    reaction_type != reaction_type_row
+                                })
+                            {
+                                tdutils::log_error!(
+                                    "Receive unexpected reaction in the reactions list"
+                                );
+                                continue;
+                            }
+                            if let Some(sender) =
+                                crate::messages_manager::get_min_message_sender_object(
+                                    self,
+                                    reaction_dialog_id,
+                                    "GetMessageReactionsListQuery",
+                                )
+                            {
+                                reactions.push(td_api::AddedReaction {
+                                    r#type: reaction_type_row.get_reaction_type_object(),
+                                    sender_id: Some(sender),
+                                    is_outgoing: reaction.my,
+                                    date: reaction.date,
+                                });
+                            }
+                        }
+                        // `on_get_message_reaction_list` (cpp:297-299) —
+                        // the MessagesManager intake is [blocked: M.10]
+                        if offset.is_empty() {
+                            tdutils::log_info!(
+                                "MessagesManager::on_get_message_reaction_list({parked_dialog_id:?}, {parked_message_id:?}) — [blocked: M.10 Messages]"
+                            );
+                        }
+                        let mut promise = promise;
+                        promise.set_value(td_api::AddedReactions {
+                            total_count,
+                            reactions,
+                            next_offset: answer.next_offset,
+                        });
+                    }
+                    (Err(status), Some(mut parked)) => parked.promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.getMessageReactionsList answer"
+                        )
+                    }
+                }
+            }
+            // `ReportReactionQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:328-341) — the Bool answer value is
+            // ignored exactly like the C++.
+            K::ReportReaction { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if parse_wire_bool(query.ok()).is_some() {
+                    // the Bool answer value is ignored exactly like the
+                    // C++ (cpp:328-334)
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_reportReaction answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "ReportReactionQuery",
+                    );
+                }
+                let promise = if self.reaction_net_pending.report.is_empty() {
+                    None
+                } else {
+                    Some(self.reaction_net_pending.report.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected messages.reportReaction answer")
+                    }
+                }
             }
         }
     }
@@ -50860,6 +51096,67 @@ pub(crate) struct TdMessageReactionQueryEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The net-drain 61 dispatch surface (the send legs of the two
+    /// query families); `None` keeps the net-inert posture.
+    pub(crate) net: Option<ReactionNetHandle>,
+    /// The parked-query lots the send legs push and the answers pop
+    /// (the `Td` field the drain reads).
+    pub(crate) pending: &'a mut crate::message_reaction::PendingReactionQueries,
+}
+
+impl TdMessageReactionQueryEnv<'_> {
+    /// The `DialogManager::get_input_peer` ladder over the split
+    /// borrows (the `TdDialogParticipantEnv::dialog_participant_get_input_peer`
+    /// shape — the free function needs a whole-`Td` borrow).
+    fn reaction_get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &user_env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &user_env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+    }
 }
 
 pub(crate) fn message_reactions_query_env_split(
@@ -50868,6 +51165,7 @@ pub(crate) fn message_reactions_query_env_split(
     TdMessageReactionQueryEnv<'_>,
     &mut crate::messages_manager::MessagesManager,
 ) {
+    let net = td.reaction_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -50875,6 +51173,7 @@ pub(crate) fn message_reactions_query_env_split(
         user_manager,
         chat_manager,
         messages_manager,
+        reaction_net_pending,
         ..
     } = td;
     (
@@ -50884,6 +51183,8 @@ pub(crate) fn message_reactions_query_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
+            pending: reaction_net_pending,
         },
         messages_manager,
     )
@@ -50947,6 +51248,108 @@ impl crate::message_reaction::MessageReactionQueryEnv for TdMessageReactionQuery
                 .get_channel(dialog_id.get_channel_id())
                 .is_some(),
             crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    /// `GetMessageReactionsListQuery::send` (MessageReaction.cpp:223-247)
+    /// — the net-drain 61 send leg: the request parks in the family lot
+    /// with the non-Copy handler members (§5's FIFO shape), the read
+    /// peer resolves at the send leg and the wire query dispatches
+    /// (`REACTION_MASK`/`OFFSET_MASK` carry the non-empty reaction and
+    /// offset). `None` on the handle keeps the net-inert posture.
+    fn send_get_message_reactions_list(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::messages_manager::MessageId,
+        reaction_type: crate::reaction_type::ReactionType,
+        offset: String,
+        limit: i32,
+        promise: tdutils::promise::Promise<td_api::AddedReactions>,
+    ) {
+        self.pending
+            .list
+            .push(crate::message_reaction::PendingReactionListQuery {
+                dialog_id,
+                message_id,
+                reaction_type: reaction_type.clone(),
+                offset: offset.clone(),
+                promise,
+            });
+        let kind = crate::message_reaction::ReactionNetKind::GetMessageReactionsList { dialog_id };
+        let reaction_mask = if reaction_type.is_empty() { 0 } else { 1 };
+        let offset_mask = if offset.is_empty() { 0 } else { 1 << 1 };
+        match (
+            self.net.clone(),
+            self.reaction_get_input_peer(dialog_id, crate::user_manager::AccessRights::Read),
+        ) {
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getMessageReactionsList(
+                    telegram_api::messages_getMessageReactionsList {
+                        flags: reaction_mask | offset_mask,
+                        peer: Some(Box::new(peer)),
+                        id: message_id.get_server_message_id().get(),
+                        reaction: Some(reaction_type.get_input_reaction()),
+                        offset,
+                        limit,
+                    },
+                ),
+            ),
+            // the C++ `if (input_peer == nullptr)` band (cpp:229-232) —
+            // the complete_error file-through so the answer half runs
+            // the full `on_error` tail
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => {
+                tdutils::log_info!("Send messages.getMessageReactionsList — [net-inert]");
+            }
+        }
+    }
+
+    /// `ReportReactionQuery::send` (MessageReaction.cpp:313-326) — the
+    /// net-drain 61 send leg: the promise parks in the family lot, the
+    /// dialog read peer and the chooser's Know peer resolve at the send
+    /// leg; the chooser miss answers the promise directly (cpp:319-322,
+    /// no `on_error` run), the dialog-peer miss files through the
+    /// completed queue (the C++ CHECK band, the message-query
+    /// convention).
+    fn send_report_message_reaction(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::messages_manager::MessageId,
+        chooser_dialog_id: crate::dialog_id::DialogId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        self.pending.report.push(promise);
+        let kind = crate::message_reaction::ReactionNetKind::ReportReaction { dialog_id };
+        let peer = self.reaction_get_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        let chooser_peer = self
+            .reaction_get_input_peer(chooser_dialog_id, crate::user_manager::AccessRights::Know);
+        match (self.net.clone(), peer, chooser_peer) {
+            (Some(net), Some(peer), Some(chooser)) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_reportReaction(
+                    telegram_api::messages_reportReaction {
+                        peer: Some(Box::new(peer)),
+                        id: message_id.get_server_message_id().get(),
+                        reaction_peer: Some(Box::new(chooser)),
+                    },
+                ),
+            ),
+            // the C++ `CHECK(input_peer != nullptr)` (cpp:317) — the
+            // complete_error file-through so the `on_error` tail runs
+            (Some(net), None, _) => net.complete_error(kind, 400, "Can't access the chat"),
+            // the chooser-miss band (cpp:319-322) — the C++ answers the
+            // promise directly without dispatching
+            (Some(_), Some(_), None) => {
+                let mut promise = self.pending.report.remove(0);
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Reaction sender is not accessible",
+                ));
+            }
+            (None, _, _) => {
+                tdutils::log_info!("Send messages.reportReaction — [net-inert]");
+            }
         }
     }
 }
@@ -82349,6 +82752,390 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.callback_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn message_reaction_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(message_reaction_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the message-reaction query
+    /// families (MessageReaction.cpp:211-341) dispatch through the real
+    /// dispatcher, the wire bodies carry the C++ payloads and the
+    /// answers drain through `Td::on_reaction_net_answer` into the
+    /// landed walks — the live td_api arms where their gates allow
+    /// (the getMessageAddedReactions/reportMessageReactions arms' M.10
+    /// message probes keep their C++ not-found bands; the seam drives
+    /// run below the probes like the net-drain 28/49 families).
+    fn message_reaction_net_families_ride_the_dispatcher_impl() {
+        use crate::message_reaction::MessageReactionQueryEnv as _;
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-message-reaction");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user_id(&mut td, 700000001, 42);
+        let dialog_id =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001));
+        let message_id = crate::messages_manager::MessageId::new(1 << 21); // server id 2
+        let emoji = crate::reaction_type::ReactionType::new("👍".to_owned());
+
+        // 0. the live td_api arms still answer the C++ not-found bands
+        //    (the [blocked: M.10] message probes) — the arms route into
+        //    the free functions, nothing intercepts them
+        td.request(
+            1,
+            Function::getMessageAddedReactions(td_api::getMessageAddedReactions {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                reaction_type: None,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+        td.request(
+            2,
+            Function::reportMessageReactions(td_api::reportMessageReactions {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                sender_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 700000001 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 1. the list family rides the wire (the seam drive below the
+        //    M.10 probe — GetMessageReactionsListQuery::send,
+        //    MessageReaction.cpp:223-247): the resolved read peer, the
+        //    server message id, the REACTION_MASK for a non-empty
+        //    reaction and the OFFSET_MASK for a non-empty offset
+        let (promise, slot) = record_slot::<td_api::AddedReactions>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_get_message_reactions_list(
+                dialog_id,
+                message_id,
+                emoji.clone(),
+                "off".to_owned(),
+                10,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReactionsList::ID,
+        );
+        let body = telegram_api::messages_getMessageReactionsList::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 2);
+        assert_eq!(body.limit, 10);
+        assert_eq!(body.offset, "off");
+        assert_eq!(body.flags, 1 | (1 << 1), "REACTION_MASK | OFFSET_MASK");
+        assert!(matches!(
+            body.reaction,
+            Some(telegram_api::Reaction::reactionEmoji(_))
+        ));
+
+        // 2. the answer settles the parked promise with the walked
+        //    td_api::addedReactions (cpp:249-301) — the users intake
+        //    makes the reaction sender resolvable, the total-count
+        //    clamp runs and the next_offset rides the flag bit
+        seed_dialog_user_id(&mut td, 700000009, 43);
+        // the thin sender-object map (the M.22 `MessageObjectContext`
+        // read — the C++ user_manager_ min-user probe)
+        td.users.insert(700000009, td_api::User::default());
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_MessageReactionsList {
+                flags: 1 << 0,
+                count: 0, // < reactions.len() — the clamp band
+                reactions: vec![telegram_api::MessagePeerReaction {
+                    flags: 1 << 1,
+                    big: false,
+                    unread: false,
+                    my: true,
+                    peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 700000009
+                    },)),
+                    date: 77,
+                    reaction: Some(telegram_api::Reaction::reactionEmoji(
+                        telegram_api::reactionEmoji {
+                            emoticon: "👍".to_owned(),
+                        },
+                    )),
+                }],
+                chats: Vec::new(),
+                users: Vec::new(),
+                next_offset: "next".to_owned(),
+            }),
+        );
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(added)) => {
+                assert_eq!(added.total_count, 1, "the count clamp (cpp:260-263)");
+                assert_eq!(added.next_offset, "next");
+                assert_eq!(added.reactions.len(), 1);
+                let reaction = added
+                    .reactions
+                    .first()
+                    .and_then(|reaction| reaction.sender_id.as_ref())
+                    .expect("the sender object");
+                assert!(matches!(
+                    reaction,
+                    td_api::MessageSender::messageSenderUser(_)
+                ));
+            }
+            other => panic!("the list answer round trip: {other:?}"),
+        }
+
+        // 3. the mismatched-reaction filter (cpp:269-274) — a reaction
+        //    that is neither the expected emoji nor valid skips with the
+        //    C++ unexpected log
+        let (promise, slot) = record_slot::<td_api::AddedReactions>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_get_message_reactions_list(
+                dialog_id,
+                message_id,
+                emoji.clone(),
+                String::new(),
+                10,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReactionsList::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_MessageReactionsList {
+                flags: 0,
+                count: 3,
+                reactions: vec![telegram_api::MessagePeerReaction {
+                    flags: 0,
+                    big: false,
+                    unread: false,
+                    my: false,
+                    peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 700000009,
+                    })),
+                    date: 1,
+                    reaction: Some(telegram_api::Reaction::reactionEmoji(
+                        telegram_api::reactionEmoji {
+                            emoticon: "❤".to_owned(),
+                        },
+                    )),
+                }],
+                chats: Vec::new(),
+                users: Vec::new(),
+                next_offset: String::new(),
+            }),
+        );
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(added)) => {
+                assert!(added.reactions.is_empty(), "the mismatch skips");
+                assert_eq!(added.total_count, 3, "the count rides untouched");
+            }
+            other => panic!("the filter band: {other:?}"),
+        }
+
+        // 4. the error band — the wire error surfaces with the
+        //    reference-identical code/message (cpp:302-304)
+        let (promise, slot) = record_slot::<td_api::AddedReactions>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_get_message_reactions_list(
+                dialog_id,
+                message_id,
+                emoji.clone(),
+                String::new(),
+                10,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReactionsList::ID,
+        );
+        net_fail(sent, 429, "FLOOD_WAIT_10");
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (429, "FLOOD_WAIT_10"));
+            }
+            other => panic!("the list error band: {other:?}"),
+        }
+
+        // 5. the report family rides the wire (ReportReactionQuery::send,
+        //    cpp:313-326): the dialog read peer, the server message id
+        //    and the chooser's Know peer
+        let (promise, slot) = record_slot::<()>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_report_message_reaction(dialog_id, message_id, dialog_id, promise);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportReaction::ID,
+        );
+        let body =
+            telegram_api::messages_reportReaction::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert!(matches!(
+            body.reaction_peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 2);
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]); // boolTrue#997275b5
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(())) => {}
+            other => panic!("the report answer: {other:?}"),
+        }
+
+        // 6. the report error band surfaces identically (cpp:337-340)
+        let (promise, slot) = record_slot::<()>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_report_message_reaction(dialog_id, message_id, dialog_id, promise);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportReaction::ID,
+        );
+        net_fail(sent, 400, "REACTION_INVALID");
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (400, "REACTION_INVALID"));
+            }
+            other => panic!("the report error band: {other:?}"),
+        }
+
+        // 7. the unresolvable-chooser band (cpp:319-322) — the C++
+        //    answers the promise directly, nothing reaches the wire
+        let (promise, slot) = record_slot::<()>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_report_message_reaction(
+                dialog_id,
+                message_id,
+                crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(
+                    999999999,
+                )),
+                promise,
+            );
+        }
+        assert!(
+            rec.sent
+                .lock()
+                .iter()
+                .all(|query| query.tl_constructor() != telegram_api::messages_reportReaction::ID),
+            "the chooser miss never reaches the wire"
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Reaction sender is not accessible")
+                );
+            }
+            other => panic!("the chooser band: {other:?}"),
+        }
+
+        // 8. the net-inert posture — no handle, the promises park like
+        //    the C++ handlers hold them
+        {
+            let mut netless = netted_td("netdrain61-message-reaction-inert");
+            netless.0.user_manager.set_my_id(
+                &mut crate::user_manager::UserEnv {
+                    global: &mut netless.0.global,
+                    options: netless
+                        .0
+                        .option_manager
+                        .as_mut()
+                        .expect("the option manager exists after init"),
+                    auth_is_bot: netless.0.auth_manager.is_bot(),
+                },
+                crate::user_manager::UserId::new(700000001),
+            );
+            seed_dialog_user_id(&mut netless.0, 700000001, 42);
+            netless.0.net_query_dispatcher = None; // the net-inert posture
+            let (promise, slot) = record_slot::<td_api::AddedReactions>();
+            {
+                let (mut env, _manager) =
+                    crate::td::message_reactions_query_env_split(&mut netless.0);
+                env.send_get_message_reactions_list(
+                    dialog_id,
+                    message_id,
+                    emoji.clone(),
+                    String::new(),
+                    10,
+                    promise,
+                );
+            }
+            assert!(netless.1.sent.lock().is_empty(), "nothing dispatched");
+            assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+            assert!(
+                netless.0.reaction_net_pending.list.pop().is_some(),
+                "the promise parks like the C++ handler holds it"
+            );
+        }
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.reaction_net_completed.lock().is_empty(), "drained");
+        assert!(td.reaction_net_pending.list.is_empty());
+        assert!(td.reaction_net_pending.report.is_empty());
     }
 
     #[test]
