@@ -3413,6 +3413,14 @@ pub(crate) type TopDialogNetHandle = NetKindHandle<crate::top_dialog_manager::To
 pub(crate) type ChannelRecommendationNetHandle =
     NetKindHandle<crate::channel_recommendation_manager::ChannelRecommendationNetKind>;
 
+/// The manager-held device-token dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the DeviceTokenManager.cpp wire
+/// sends (the account.registerDevice/account.unregisterDevice loop,
+/// cpp:384-410); the answers drain through
+/// [`Td::on_device_token_net_answer`].
+pub(crate) type DeviceTokenNetHandle =
+    NetKindHandle<crate::device_token_manager::DeviceTokenNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6330,6 +6338,12 @@ pub struct Td {
             )>,
         >,
     >,
+    /// The device-token net completed queue (the `DeviceTokenNetKind`
+    /// tags; the net-drain 61 family) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_device_token_net_answer`].
+    device_token_net_completed:
+        Arc<Mutex<Vec<(crate::device_token_manager::DeviceTokenNetKind, NetQuery)>>>,
     /// The bot-recommendation net completed queue (the
     /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6869,6 +6883,7 @@ impl Td {
                 crate::inline_message_manager::PendingInlineMessageQueries::default(),
             top_dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
             channel_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
+            device_token_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -7366,6 +7381,7 @@ impl Td {
         self.callback_queries_manager.net = self.callback_net();
         self.game_manager.net = self.game_net();
         self.bot_recommendation_manager.net = self.bot_recommendation_net();
+        self.device_token_manager.net = self.device_token_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9192,6 +9208,7 @@ impl Td {
         self.dispatch_completed_inline_message_net();
         self.dispatch_completed_top_dialog_net();
         self.dispatch_completed_channel_recommendation_net();
+        self.dispatch_completed_device_token_net();
         self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9694,6 +9711,18 @@ impl Td {
         Some(ChannelRecommendationNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.channel_recommendation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned device-token dispatch surface the
+    /// [`crate::device_token_manager::DeviceTokenManager`] holds (the
+    /// net-drain 61 family's send legs) — `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests).
+    pub(crate) fn device_token_net(&self) -> Option<DeviceTokenNetHandle> {
+        Some(DeviceTokenNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.device_token_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -18101,6 +18130,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the device-token-parked answers — the C++ `on_result`
+    /// halves of the net-drain 61 family (DeviceTokenManager.cpp:
+    /// 412-467).
+    fn dispatch_completed_device_token_net(&mut self) {
+        let completed = std::mem::take(&mut *self.device_token_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_device_token_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20460,6 +20500,59 @@ impl Td {
         } else {
             recommendation_manager.on_get_recommended_channels(&mut env, result);
         }
+    }
+
+    /// Route one device-token net answer — the C++ `on_result` half of
+    /// the net-drain 61 family (DeviceTokenManager.cpp:412-467): the
+    /// Bool answer (true or false — the false band is the C++ 400)
+    /// re-enters the manager through the landed
+    /// `on_register_device_result` intake; the kind carries the actor
+    /// link token (the token type) and the query id the in-flight
+    /// guard compares (a re-registered token drops the stale answer).
+    fn on_device_token_net_answer(
+        &mut self,
+        kind: crate::device_token_manager::DeviceTokenNetKind,
+        query: NetQuery,
+    ) {
+        let crate::device_token_manager::DeviceTokenNetKind::SyncDeviceToken {
+            token_type,
+            net_query_id,
+        } = kind;
+        // `CHECK(token_type >= 1 && token_type < TokenType::Size)` —
+        // the kind only carries loop-produced token types
+        debug_assert!(
+            (1..crate::device_token_manager::TOKEN_TYPE_SIZE as i32).contains(&token_type)
+        );
+        let r_flag = if query.is_error() {
+            Err(query.error().clone())
+        } else {
+            match parse_wire_bool_value(query.ok()) {
+                Some(flag) => Ok(flag),
+                None => {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the account_registerDevice answer",
+                    ))
+                }
+            }
+        };
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            notification_updates,
+            device_token_manager,
+            ..
+        } = self;
+        let mut env = NotificationEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        device_token_manager.on_register_device_result(&mut env, token_type, net_query_id, r_flag);
     }
 
     /// Route one ForumTopic net answer by kind — the ResultHandler
@@ -33657,6 +33750,10 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn is_expected_error(&self, status: &Status) -> bool {
+        self.global.is_expected_error(status)
     }
 }
 
@@ -54775,6 +54872,7 @@ mod tests {
         td.callback_queries_manager.net = td.callback_net();
         td.game_manager.net = td.game_net();
         td.bot_recommendation_manager.net = td.bot_recommendation_net();
+        td.device_token_manager.net = td.device_token_net();
         (td, rec, callback)
     }
 
@@ -84479,6 +84577,172 @@ kQIDAQAB\n\
             td.channel_recommendation_net_completed.lock().is_empty(),
             "drained"
         );
+    }
+
+    #[test]
+    fn device_token_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(device_token_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the device-token register/
+    /// unregister loop sends (DeviceTokenManager.cpp:384-410) dispatch
+    /// through the real dispatcher and the Bool answers drain through
+    /// `Td::on_device_token_net_answer` into the landed
+    /// `on_register_device_result` intake (cpp:412-467) — the register
+    /// ack answers `pushReceiverId(my_id)`, the false band answers the
+    /// C++ 400, and the unregister leg clears the slot.
+    fn device_token_net_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-device-token");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the register leg — the APNs token over token type 1 with
+        //    the other_uids vector (cpp:396-405): the wire body carries
+        //    no_muted on bit 0
+        td.request(
+            1,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: "apns-tok".to_owned(),
+                        is_app_sandbox: true,
+                    },
+                )),
+                other_user_ids: vec![7, 8],
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_registerDevice::ID,
+        );
+        let body =
+            telegram_api::account_registerDevice::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1, "the no_muted bit");
+        assert!(body.no_muted);
+        assert_eq!(body.token_type, 1);
+        assert_eq!(body.token, "apns-tok");
+        assert!(body.app_sandbox);
+        assert!(body.secret.is_empty());
+        assert_eq!(body.other_uids, vec![7, 8]);
+
+        // boolTrue answers pushReceiverId(my_id) (cpp:420-431)
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_device_token_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::pushReceiverId(receiver) = responses.first().expect("the response")
+        else {
+            panic!("the register response");
+        };
+        assert_eq!(receiver.id, 700000001);
+
+        // 2. the false band — a changed token re-registers, the false
+        //    answer settles the C++ 400 (cpp:450-454) and flips the slot
+        //    to Unregister (cpp:459-460)
+        td.request(
+            2,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: "apns-tok2".to_owned(),
+                        is_app_sandbox: false,
+                    },
+                )),
+                other_user_ids: vec![],
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_registerDevice::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_device_token_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                400,
+                "Receive false as result of registerDevice server request"
+            )
+        );
+
+        // 3. the unregister leg — the empty token flips the slot to
+        //    Unregister (cpp:432-434) and the loop sends the unregister
+        //    wire form carrying the stored token; boolTrue clears it
+        td.request(
+            3,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: String::new(),
+                        is_app_sandbox: false,
+                    },
+                )),
+                other_user_ids: vec![],
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_unregisterDevice::ID,
+        );
+        let body =
+            telegram_api::account_unregisterDevice::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.token_type, 1);
+        assert_eq!(body.token, "apns-tok2");
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_device_token_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        let td_api::Object::pushReceiverId(receiver) = responses.first().expect("the response")
+        else {
+            panic!("the unregister response");
+        };
+        assert_eq!(receiver.id, 0, "the unregister ack carries no receiver");
+
+        // 4. the net-inert posture — no dispatcher, nothing dispatches
+        //    and the promise parks like the C++ offline
+        let (mut td2, rec2, callback2) = netted_td_with_callback("netdrain61-device-token-inert");
+        td2.net_query_dispatcher = None; // the net-inert posture
+        td2.device_token_manager.net = None; // the manager-held handle too
+        td2.request(
+            6,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: "offline".to_owned(),
+                        is_app_sandbox: false,
+                    },
+                )),
+                other_user_ids: vec![],
+            }),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 6).is_none() && responses_of(&callback2, 6).is_empty(),
+            "nothing settles offline — the loop's in-flight mark parks the promise"
+        );
+
+        // the drain ran clean — nothing parked
+        assert!(td.device_token_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
