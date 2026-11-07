@@ -3,9 +3,12 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`InlineMessageManagerEnv`] trait carries the `Td *td` surfaces, and
-//! every `create_handler<...>` network tail is an env seam marked
-//! `[blocked: net]` — the C++ promise lands in the query and stays
-//! unanswered offline (the M.16 convention). The id-decode helpers mirror
+//! the three edit/score query families ride the net-drain 61
+//! `InlineMessageNetKind` plane — the env-carried handle dispatches the
+//! wire queries (each on the inline message's own DC) and the answers
+//! drain through `crate::td::Td::on_inline_message_net_answer`; the
+//! C++ promise lands in the query and parks in the Td-side family lots
+//! (§5's FIFO shape). The id-decode helpers mirror
 //! the C++ file split: the encode half
 //! ([`crate::inline_queries_manager::get_inline_message_id`]) lives in the
 //! InlineQueriesManager port, this module owns the decode pair — the byte
@@ -27,6 +30,42 @@ use crate::user_manager::UserId;
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+
+/// The in-flight query kinds of the net-drain 61 inline-message
+/// families — the C++ `Td::ResultHandler` query classes
+/// (InlineMessageManager.cpp:87-210) collapsed onto dispatcher tags; the
+/// answers drain through
+/// [`crate::td::Td::on_inline_message_net_answer`] over the
+/// env-carried [`crate::td::InlineMessageNetHandle`]. The handlers
+/// carry only their `promise_` members (cpp:88/144/181), so the lots
+/// park the promises alone (§5's FIFO shape); the send legs route each
+/// query to `DcId::internal(get_inline_message_dc_id(...))`
+/// (cpp:121/168/206).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineMessageNetKind {
+    /// `EditInlineMessageQuery` (InlineMessageManager.cpp:87-140) —
+    /// `messages.editInlineBotMessage`.
+    EditInlineMessage,
+    /// `SetInlineGameScoreQuery` (InlineMessageManager.cpp:143-177) —
+    /// `messages.setInlineGameScore`.
+    SetInlineGameScore,
+    /// `GetInlineGameHighScoresQuery` (InlineMessageManager.cpp:179-210)
+    /// — `messages.getInlineGameHighScores`.
+    GetInlineGameHighScores,
+}
+
+/// The parked inline-message queries (the net-drain 61 families): the
+/// C++ handlers own their promises; the port parks them at the Td-side
+/// lots until the matching `InlineMessageNetKind` answer drains.
+#[derive(Default)]
+pub(crate) struct PendingInlineMessageQueries {
+    /// The parked `messages.editInlineBotMessage` promises.
+    pub(crate) edits: Vec<Promise<()>>,
+    /// The parked `messages.setInlineGameScore` promises.
+    pub(crate) scores: Vec<Promise<()>>,
+    /// The parked `messages.getInlineGameHighScores` promises.
+    pub(crate) high_scores: Vec<Promise<td_api::GameHighScores>>,
+}
 
 /// `DcId::MAX_RAW_DC_ID` (net/DcId.h:30).
 const MAX_RAW_DC_ID: i32 = 1000;
@@ -92,7 +131,10 @@ pub fn get_input_bot_inline_message_id(
 /// The `Td *td` slice of the collapsed InlineMessageManager (over the
 /// shared InlineQueriesManager surfaces).
 pub trait InlineMessageManagerEnv: InlineQueriesManagerEnv {
-    // -- the `[blocked: net]` query tails; each one drops the promise
+    // -- the net-drain 61 query send arms (the td.rs overrides
+    // -- dispatch through the InlineMessageNetKind plane; the defaults
+    // -- keep the offline unit-test posture — each one drops the
+    // -- promise, which keeps the C++ request unanswered offline)
     /// `EditInlineMessageQuery::send` (InlineMessageManager.cpp:87-124) —
     /// the manager builds the full TL query (flags fold included); the
     /// `CHECK(!FileManager::extract_was_uploaded(input_media))` and the

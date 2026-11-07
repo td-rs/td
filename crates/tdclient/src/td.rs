@@ -3385,6 +3385,15 @@ pub(crate) type CallbackNetHandle = NetKindHandle<crate::callback_queries_manage
 /// run inside the env send arms over the split borrows' peer reads).
 pub(crate) type ReactionNetHandle = NetKindHandle<crate::message_reaction::ReactionNetKind>;
 
+/// The env-carried inline-message dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the InlineMessageManager.cpp
+/// ResultHandler kinds (the edit/set-score/high-scores families, each
+/// routed to the inline message's own DC); the answers drain through
+/// [`Td::on_inline_message_net_answer`]. Env-carried over the shared
+/// `TdInlineEnv` (the inline-queries families ride the same env).
+pub(crate) type InlineMessageNetHandle =
+    NetKindHandle<crate::inline_message_manager::InlineMessageNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6269,6 +6278,21 @@ pub struct Td {
     /// The parked message-reaction queries (the net-drain 61 family
     /// lots — the C++ handlers' `promise_` + non-Copy members).
     reaction_net_pending: crate::message_reaction::PendingReactionQueries,
+    /// The inline-message net completed queue (the
+    /// `InlineMessageNetKind` tags; the net-drain 61 families) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_inline_message_net_answer`].
+    inline_message_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::inline_message_manager::InlineMessageNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
+    /// The parked inline-message queries (the net-drain 61 family lots
+    /// — the C++ handlers' `promise_` members).
+    inline_message_net_pending: crate::inline_message_manager::PendingInlineMessageQueries,
     /// The bot-recommendation net completed queue (the
     /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6803,6 +6827,9 @@ impl Td {
             game_net_completed: Arc::new(Mutex::new(Vec::new())),
             reaction_net_completed: Arc::new(Mutex::new(Vec::new())),
             reaction_net_pending: crate::message_reaction::PendingReactionQueries::default(),
+            inline_message_net_completed: Arc::new(Mutex::new(Vec::new())),
+            inline_message_net_pending:
+                crate::inline_message_manager::PendingInlineMessageQueries::default(),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -9123,6 +9150,7 @@ impl Td {
         self.dispatch_completed_callback_net();
         self.dispatch_completed_game_net();
         self.dispatch_completed_reaction_net();
+        self.dispatch_completed_inline_message_net();
         self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9589,6 +9617,18 @@ impl Td {
         Some(ReactionNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.reaction_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned inline-message dispatch surface the [`TdInlineEnv`]
+    /// carries (the net-drain 61 families' send legs) — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn inline_message_net(&self) -> Option<InlineMessageNetHandle> {
+        Some(InlineMessageNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.inline_message_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17962,6 +18002,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the inline-message-parked answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 61
+    /// families (InlineMessageManager.cpp:87-210).
+    fn dispatch_completed_inline_message_net(&mut self) {
+        let completed = std::mem::take(&mut *self.inline_message_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_inline_message_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20062,6 +20113,136 @@ impl Td {
                     (Err(status), Some(mut promise)) => promise.set_error(status),
                     (_, None) => {
                         tdutils::log_info!("Receive an unexpected messages.reportReaction answer")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one inline-message net answer by kind — the ResultHandler
+    /// halves of the net-drain 61 families (InlineMessageManager.cpp:
+    /// 87-210): the Bool answers settle the parked promises (the false
+    /// band logs exactly like the C++ `LOG_IF(ERROR, !result)`), the
+    /// high-scores answer converts through the GameManager object
+    /// builder (cpp:203-206).
+    fn on_inline_message_net_answer(
+        &mut self,
+        kind: crate::inline_message_manager::InlineMessageNetKind,
+        query: NetQuery,
+    ) {
+        use crate::inline_message_manager::InlineMessageNetKind as K;
+        match kind {
+            // `EditInlineMessageQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:126-140)
+            K::EditInlineMessage => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if let Some(value) = parse_wire_bool_value(query.ok()) {
+                    if !value {
+                        tdutils::log_error!("Receive false in result of editInlineMessage");
+                    }
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_editInlineBotMessage answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!("Receive error for EditInlineMessageQuery: {status}");
+                }
+                let promise = if self.inline_message_net_pending.edits.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.edits.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.editInlineBotMessage answer"
+                        )
+                    }
+                }
+            }
+            // `SetInlineGameScoreQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:169-177)
+            K::SetInlineGameScore => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if let Some(value) = parse_wire_bool_value(query.ok()) {
+                    if !value {
+                        tdutils::log_error!("Receive false in result of setInlineGameScore");
+                    }
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_setInlineGameScore answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!("Receive error for SetInlineGameScoreQuery: {status}");
+                }
+                let promise = if self.inline_message_net_pending.scores.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.scores.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.setInlineGameScore answer"
+                        )
+                    }
+                }
+            }
+            // `GetInlineGameHighScoresQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:201-210) — the scores convert
+            // through the GameManager builder (cpp:203-206).
+            K::GetInlineGameHighScores => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_HighScores::parse(query.ok()) {
+                        Ok(high_scores) => Ok(high_scores),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.highScores: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getInlineGameHighScores answer",
+                            ))
+                        }
+                    }
+                };
+                let promise = if self.inline_message_net_pending.high_scores.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.high_scores.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(high_scores), Some(mut promise)) => {
+                        let scores = {
+                            let mut manager = std::mem::take(&mut self.game_manager);
+                            let scores = {
+                                let mut env = crate::td::BotEnv { td: self };
+                                manager.get_game_high_scores_object(&mut env, high_scores)
+                            };
+                            self.game_manager = manager;
+                            scores
+                        };
+                        promise.set_value(scores);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.getInlineGameHighScores answer"
+                        )
                     }
                 }
             }
@@ -46711,6 +46892,7 @@ pub(crate) fn inline_env_split(
     &mut crate::inline_queries_manager::InlineQueriesManager,
     &mut crate::inline_message_manager::InlineMessageManager,
 ) {
+    let net = td.inline_message_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -46720,6 +46902,7 @@ pub(crate) fn inline_env_split(
         inline_queries_manager,
         inline_message_manager,
         inline_updates,
+        inline_message_net_pending,
         ..
     } = td;
     (
@@ -46730,6 +46913,8 @@ pub(crate) fn inline_env_split(
             user_manager,
             chat_manager,
             updates: inline_updates,
+            net,
+            pending: inline_message_net_pending,
         },
         inline_queries_manager,
         inline_message_manager,
@@ -46747,6 +46932,12 @@ pub(crate) struct TdInlineEnv<'a> {
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut ChatManager,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The net-drain 61 dispatch surface (the inline-message send legs);
+    /// `None` keeps the net-inert posture.
+    pub(crate) net: Option<InlineMessageNetHandle>,
+    /// The parked-query lots the send legs push and the answers pop
+    /// (the `Td` field the drain reads).
+    pub(crate) pending: &'a mut crate::inline_message_manager::PendingInlineMessageQueries,
 }
 
 /// Build the UserEnv from the env's fields (the field-level borrows
@@ -47127,28 +47318,93 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
 }
 
 impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> {
+    /// `EditInlineMessageQuery::send` (InlineMessageManager.cpp:87-124)
+    /// — the net-drain 61 send leg: the promise parks in the family lot
+    /// (§5's FIFO shape) and the wire query dispatches on the inline
+    /// message's own DC (`DcId::internal(get_inline_message_dc_id(...))`,
+    /// cpp:121). `None` on the handle keeps the net-inert posture.
     fn send_edit_inline_message_query(
         &mut self,
-        _query: telegram_api::messages_editInlineBotMessage,
-        _promise: Promise<()>,
+        query: telegram_api::messages_editInlineBotMessage,
+        promise: Promise<()>,
     ) {
-        // [blocked: net]
+        self.pending.edits.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::EditInlineMessage,
+                telegram_api::Function::messages_editInlineBotMessage(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.editInlineBotMessage — [net-inert]");
+            }
+        }
     }
 
+    /// `SetInlineGameScoreQuery::send`
+    /// (InlineMessageManager.cpp:143-177) — the net-drain 61 send leg
+    /// over the inline message's own DC (cpp:168).
     fn send_set_inline_game_score_query(
         &mut self,
-        _query: telegram_api::messages_setInlineGameScore,
-        _promise: Promise<()>,
+        query: telegram_api::messages_setInlineGameScore,
+        promise: Promise<()>,
     ) {
-        // [blocked: net]
+        self.pending.scores.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::SetInlineGameScore,
+                telegram_api::Function::messages_setInlineGameScore(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.setInlineGameScore — [net-inert]");
+            }
+        }
     }
 
+    /// `GetInlineGameHighScoresQuery::send`
+    /// (InlineMessageManager.cpp:179-210) — the net-drain 61 send leg
+    /// over the inline message's own DC (cpp:206).
     fn send_get_inline_game_high_scores_query(
         &mut self,
-        _query: telegram_api::messages_getInlineGameHighScores,
-        _promise: Promise<td_api::GameHighScores>,
+        query: telegram_api::messages_getInlineGameHighScores,
+        promise: Promise<td_api::GameHighScores>,
     ) {
-        // [blocked: net]
+        self.pending.high_scores.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::GetInlineGameHighScores,
+                telegram_api::Function::messages_getInlineGameHighScores(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.getInlineGameHighScores — [net-inert]");
+            }
+        }
     }
 
     fn get_input_media_for_edit(
@@ -83136,6 +83392,228 @@ kQIDAQAB\n\
         assert!(td.reaction_net_completed.lock().is_empty(), "drained");
         assert!(td.reaction_net_pending.list.is_empty());
         assert!(td.reaction_net_pending.report.is_empty());
+    }
+
+    #[test]
+    fn inline_message_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(inline_message_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the inline-message query
+    /// families (InlineMessageManager.cpp:87-210) dispatch through the
+    /// real dispatcher on the inline message's own DC
+    /// (`DcId::internal(get_inline_message_dc_id(...))`), the wire
+    /// bodies carry the C++ payloads and the answers drain through
+    /// `Td::on_inline_message_net_answer` — through the live td_api arms
+    /// (the bot posture carries the arms' gates).
+    fn inline_message_net_families_ride_the_dispatcher_impl() {
+        use crate::inline_message_manager::{
+            get_inline_message_dc_id, parse_input_bot_inline_message_id,
+        };
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// The `inputBotInlineMessageID` base64url form (the bare field
+        /// store, the C++ `serialize(*)` shape).
+        fn inline_message_id() -> String {
+            let mut out = Vec::new();
+            telegram_api::inputBotInlineMessageID {
+                dc_id: 2,
+                id: 100,
+                access_hash: 200,
+            }
+            .store(&mut out);
+            let mut encoded = String::new();
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            for chunk in out.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = chunk.get(1).copied().unwrap_or(0);
+                let b2 = chunk.get(2).copied().unwrap_or(0);
+                let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+                encoded.push(ALPHABET[(n >> 18) as usize & 63] as char);
+                encoded.push(ALPHABET[(n >> 12) as usize & 63] as char);
+                if chunk.len() > 1 {
+                    encoded.push(ALPHABET[(n >> 6) as usize & 63] as char);
+                }
+                if chunk.len() > 2 {
+                    encoded.push(ALPHABET[n as usize & 63] as char);
+                }
+            }
+            encoded
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-inline-message");
+        td.auth_manager.force_bot_for_test();
+        // the bot user resolves the game-score arms' get_input_user
+        seed_dialog_user_id(&mut td, 700000009, 43);
+        let inline_id = inline_message_id();
+        assert_eq!(
+            get_inline_message_dc_id(&parse_input_bot_inline_message_id(&inline_id).unwrap()),
+            2
+        );
+
+        // 1. the live edit arm — messages.editInlineBotMessage over the
+        //    inline DC (EditInlineMessageQuery::send, cpp:87-124): the
+        //    MESSAGE_MASK carries the non-empty text, the id rides the
+        //    base64url-decoded form and the query routes to DC 2
+        td.request(
+            1,
+            Function::editInlineMessageText(td_api::editInlineMessageText {
+                inline_message_id: inline_id.clone(),
+                reply_markup: None,
+                input_message_content: Some(Box::new(
+                    td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                        text: Some(td_api::FormattedText {
+                            text: "hi".to_owned(),
+                            entities: Vec::new(),
+                        }),
+                        clear_draft: true,
+                        link_preview_options: None,
+                    }),
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editInlineBotMessage::ID,
+        );
+        assert_eq!(sent.dc_id(), DcId::internal(2), "the inline message DC");
+        let body = telegram_api::messages_editInlineBotMessage::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1 << 11, "MESSAGE_MASK only — no entities");
+        assert_eq!(body.message, "hi");
+        assert!(matches!(
+            body.id,
+            Some(telegram_api::InputBotInlineMessageID::inputBotInlineMessageID(_))
+        ));
+
+        // the boolTrue answer settles the request's deferred promise
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]); // boolTrue#997275b5
+        td.dispatch_completed_inline_message_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 1).len() == 1,
+            "the edit answer settles the request"
+        );
+
+        // 2. the live set-score arm — messages.setInlineGameScore over
+        //    the inline DC (SetInlineGameScoreQuery::send, cpp:143-177)
+        td.request(
+            2,
+            Function::setInlineGameScore(td_api::setInlineGameScore {
+                inline_message_id: inline_id.clone(),
+                edit_message: true,
+                user_id: 700000009,
+                score: 42,
+                force: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setInlineGameScore::ID,
+        );
+        assert_eq!(sent.dc_id(), DcId::internal(2));
+        let body =
+            telegram_api::messages_setInlineGameScore::parse(sent.query()).expect("the sent body");
+        assert!(body.edit_message);
+        assert!(!body.force);
+        assert_eq!(body.score, 42);
+
+        // the error band surfaces identically (cpp:174-177)
+        net_fail(sent, 400, "MESSAGE_ID_INVALID");
+        td.dispatch_completed_inline_message_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "MESSAGE_ID_INVALID")
+        );
+
+        // 3. the live high-scores arm — messages.getInlineGameHighScores
+        //    over the inline DC (GetInlineGameHighScoresQuery::send,
+        //    cpp:179-210); the answer converts through the GameManager
+        //    object builder
+        td.request(
+            3,
+            Function::getInlineGameHighScores(td_api::getInlineGameHighScores {
+                inline_message_id: inline_id.clone(),
+                user_id: 700000009,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineGameHighScores::ID,
+        );
+        assert_eq!(sent.dc_id(), DcId::internal(2));
+        let body = telegram_api::messages_getInlineGameHighScores::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.user_id,
+            Some(telegram_api::InputUser::inputUser(_))
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_HighScores {
+                scores: vec![telegram_api::HighScore {
+                    pos: 1,
+                    user_id: 700000009,
+                    score: 42,
+                }],
+                users: Vec::new(),
+            }),
+        );
+        td.dispatch_completed_inline_message_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        let td_api::Object::gameHighScores(scores) = responses.first().expect("the response")
+        else {
+            panic!("the high-scores response");
+        };
+        assert_eq!(scores.scores.len(), 1);
+        assert_eq!(scores.scores[0].score, 42);
+
+        // 4. the net-inert posture — no dispatcher, the promises park
+        //    like the C++ handlers hold them
+        let (mut td2, rec2, callback2) = netted_td_with_callback("netdrain61-inline-inert");
+        td2.auth_manager.force_bot_for_test();
+        seed_dialog_user_id(&mut td2, 700000009, 43);
+        td2.net_query_dispatcher = None; // the net-inert posture
+        td2.request(
+            4,
+            Function::setInlineGameScore(td_api::setInlineGameScore {
+                inline_message_id: inline_id.clone(),
+                edit_message: true,
+                user_id: 700000009,
+                score: 42,
+                force: false,
+            }),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 4).is_none() && responses_of(&callback2, 4).is_empty(),
+            "nothing settles offline"
+        );
+        assert!(
+            td2.inline_message_net_pending.scores.pop().is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.inline_message_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
