@@ -613,12 +613,22 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             };
             // `OptionManager::get_option` (cpp:758-800): the ConfigManager
             // branch for the content-settings names (is_bot is false until
-            // the AuthManager net step).
+            // the AuthManager net step) + the NotificationManager branch
+            // for the contact-sign-up option (cpp:775-782, net-drain 61).
             if !(td.auth_manager.is_authorized() && td.auth_manager.is_bot())
                 && (name == "can_ignore_sensitive_content_restrictions"
                     || name == "ignore_sensitive_content_restrictions")
             {
                 return td.get_option_content_settings(id, name);
+            }
+            if !(td.auth_manager.is_authorized() && td.auth_manager.is_bot())
+                && name == "disable_contact_registered_notifications"
+                && td
+                    .option_manager
+                    .as_ref()
+                    .is_some_and(crate::option_manager::OptionManager::is_td_inited)
+            {
+                return td.get_option_disable_contact_registered_notifications(id);
             }
             #[allow(clippy::large_enum_variant)] // function-local control flow
             enum Action {

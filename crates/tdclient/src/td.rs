@@ -3421,6 +3421,13 @@ pub(crate) type ChannelRecommendationNetHandle =
 pub(crate) type DeviceTokenNetHandle =
     NetKindHandle<crate::device_token_manager::DeviceTokenNetKind>;
 
+/// The manager-held notification dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the NotificationManager.cpp wire
+/// sends (the contact-sign-up register-sync pair, cpp:73-127); the
+/// answers drain through [`Td::on_notification_net_answer`].
+pub(crate) type NotificationNetHandle =
+    NetKindHandle<crate::notification_manager::NotificationNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6344,6 +6351,12 @@ pub struct Td {
     /// [`Td::on_device_token_net_answer`].
     device_token_net_completed:
         Arc<Mutex<Vec<(crate::device_token_manager::DeviceTokenNetKind, NetQuery)>>>,
+    /// The notification net completed queue (the `NotificationNetKind`
+    /// tags; the net-drain 61 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_notification_net_answer`].
+    notification_net_completed:
+        Arc<Mutex<Vec<(crate::notification_manager::NotificationNetKind, NetQuery)>>>,
     /// The bot-recommendation net completed queue (the
     /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6884,6 +6897,7 @@ impl Td {
             top_dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
             channel_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             device_token_net_completed: Arc::new(Mutex::new(Vec::new())),
+            notification_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -7382,6 +7396,7 @@ impl Td {
         self.game_manager.net = self.game_net();
         self.bot_recommendation_manager.net = self.bot_recommendation_net();
         self.device_token_manager.net = self.device_token_net();
+        self.notification_manager.net = self.notification_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -7823,6 +7838,10 @@ impl Td {
                 || name == "ignore_sensitive_content_restrictions"
             {
                 self.get_option_content_settings(request_id, name);
+                continue;
+            }
+            if name == "disable_contact_registered_notifications" {
+                self.get_option_disable_contact_registered_notifications(request_id);
                 continue;
             }
             let Some(option_manager) = self.option_manager.as_ref() else {
@@ -9209,6 +9228,7 @@ impl Td {
         self.dispatch_completed_top_dialog_net();
         self.dispatch_completed_channel_recommendation_net();
         self.dispatch_completed_device_token_net();
+        self.dispatch_completed_notification_net();
         self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9723,6 +9743,18 @@ impl Td {
         Some(DeviceTokenNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.device_token_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned notification dispatch surface the
+    /// [`crate::notification_manager::NotificationManager`] holds (the
+    /// net-drain 61 families' send legs) — `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests).
+    pub(crate) fn notification_net(&self) -> Option<NotificationNetHandle> {
+        Some(NotificationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.notification_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -18141,6 +18173,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the notification-parked answers — the C++ ResultHandler
+    /// halves of the net-drain 61 families (NotificationManager.cpp:
+    /// 73-127).
+    fn dispatch_completed_notification_net(&mut self) {
+        let completed = std::mem::take(&mut *self.notification_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_notification_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20553,6 +20596,156 @@ impl Td {
             updates: notification_updates,
         };
         device_token_manager.on_register_device_result(&mut env, token_type, net_query_id, r_flag);
+    }
+
+    /// Route one notification net answer by kind — the ResultHandler
+    /// halves of the net-drain 61 families (NotificationManager.cpp:
+    /// 73-127): the set family's any-ok answer walks the sync state
+    /// machine (the resend-forever error arm), the get family's Bool
+    /// answer runs `on_get_disable_contact_registered_notifications`
+    /// and answers the parked `getOption` request with the re-read
+    /// value (the C++ wrap_promise, OptionManager.cpp:761-766).
+    fn on_notification_net_answer(
+        &mut self,
+        kind: crate::notification_manager::NotificationNetKind,
+        query: NetQuery,
+    ) {
+        use crate::notification_manager::NotificationNetKind as K;
+        let is_disabled = match kind {
+            K::SetContactSignUpNotification { is_disabled } => Some(is_disabled),
+            K::GetContactSignUpNotification => None,
+        };
+        if let Some(is_disabled) = is_disabled {
+            // `SetContactSignUpNotificationQuery::on_result`/`on_error`
+            // (cpp:84-98) — any ok answer (Bool true or false) is Unit;
+            // the error runs the expected-error log band
+            let result = if query.is_error() {
+                let status = query.error().clone();
+                if !self.global.is_expected_error(&status) {
+                    tdutils::log_error!(
+                        "Receive error for set contact sign up notification: {status}"
+                    );
+                }
+                Err(status)
+            } else if parse_wire_bool_value(query.ok()).is_some() {
+                Ok(())
+            } else {
+                tdutils::log_error!("Can't parse Bool");
+                Err(Status::error(
+                    500,
+                    "Failed to parse the account_setContactSignUpNotification answer",
+                ))
+            };
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                notification_updates,
+                notification_manager,
+                ..
+            } = self;
+            let mut env = NotificationEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_authorized: auth_manager.is_authorized(),
+                auth_is_bot: auth_manager.is_bot(),
+                updates: notification_updates,
+            };
+            notification_manager.on_contact_registered_notifications_sync(
+                &mut env,
+                is_disabled,
+                result,
+            );
+            return;
+        }
+        // `GetContactSignUpNotificationQuery::on_result`/`on_error`
+        // (cpp:112-126) — the error and parse-failure bands skip the
+        // intake: the wrap_promise is a Unit-lambda, so its `do_error`
+        // invokes the re-read with `Auto()` (Promise.h:136-138) and the
+        // option value answers anyway (OptionManager.cpp:763-765)
+        let (parse_ok, is_disabled) = if query.is_error() {
+            let status = query.error().clone();
+            if !self.global.is_expected_error(&status) {
+                tdutils::log_error!("Receive error for get contact sign up notification: {status}");
+            }
+            (false, false)
+        } else {
+            match parse_wire_bool_value(query.ok()) {
+                Some(value) => (true, value),
+                None => {
+                    tdutils::log_error!("Can't parse Bool");
+                    (false, false)
+                }
+            }
+        };
+        let unix_time = self.global.unix_time();
+        let name = "disable_contact_registered_notifications";
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            notification_updates,
+            notification_manager,
+            ..
+        } = self;
+        let mut env = NotificationEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        let request_id = if parse_ok {
+            notification_manager
+                .on_get_disable_contact_registered_notifications(&mut env, is_disabled)
+        } else {
+            notification_manager
+                .pending_contact_sign_up_get_options
+                .remove(0)
+        };
+        // the wrap_promise answers the re-read store value
+        let value = option_manager
+            .as_ref()
+            .map(|options| options.get_option_value(name, unix_time))
+            .unwrap_or_default();
+        self.send_result(request_id, requests::option_value_to_object(value));
+    }
+
+    /// The `getOption(disable_contact_registered_notifications)` arm
+    /// (OptionManager.cpp:775-782): the NotificationManager family
+    /// answers the request when the wire Bool lands; the disabled band
+    /// answers the re-read value inline.
+    pub(crate) fn get_option_disable_contact_registered_notifications(&mut self, id: u64) {
+        let disabled = self.close_flag != 0
+            || !self.auth_manager.is_authorized()
+            || self.auth_manager.is_bot();
+        if disabled {
+            let unix_time = self.global.unix_time();
+            let value = self
+                .option_manager
+                .as_ref()
+                .map(|options| {
+                    options.get_option_value("disable_contact_registered_notifications", unix_time)
+                })
+                .unwrap_or_default();
+            return self.send_result(id, requests::option_value_to_object(value));
+        }
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            notification_updates,
+            notification_manager,
+            ..
+        } = self;
+        let mut env = NotificationEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        notification_manager.get_disable_contact_registered_notifications(&mut env, id);
     }
 
     /// Route one ForumTopic net answer by kind — the ResultHandler
@@ -32883,6 +33076,21 @@ impl crate::notification_manager::NotificationManagerEnv for NotificationEnv<'_>
     /// td_->auth_manager_->is_bot()` (NotificationManager.cpp:170-172).
     fn is_disabled(&self) -> bool {
         self.global.close_flag() || !self.auth_is_authorized || self.auth_is_bot
+    }
+
+    /// `td_->option_manager_->set_option_boolean`
+    /// (NotificationManager.cpp:2673).
+    fn set_contact_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_deref_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    /// `td_->option_manager_->set_option_empty` (cpp:2675).
+    fn set_contact_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_deref_mut() {
+            options.set_option_empty(name);
+        }
     }
 
     fn close_flag(&self) -> bool {
@@ -54873,6 +55081,7 @@ mod tests {
         td.game_manager.net = td.game_net();
         td.bot_recommendation_manager.net = td.bot_recommendation_net();
         td.device_token_manager.net = td.device_token_net();
+        td.notification_manager.net = td.notification_net();
         (td, rec, callback)
     }
 
@@ -84743,6 +84952,200 @@ kQIDAQAB\n\
 
         // the drain ran clean — nothing parked
         assert!(td.device_token_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn notification_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(notification_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the contact-sign-up pair
+    /// (NotificationManager.cpp:73-127) — the getOption arm routes the
+    /// `GetContactSignUpNotificationQuery` through the live dispatcher
+    /// (OptionManager.cpp:775-782) and the Bool answer answers the
+    /// parked request with the re-read option value (the wrap_promise);
+    /// the set family's sync machine runs end-to-end over the wire.
+    fn notification_net_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) =
+            netted_td_with_callback("netdrain61-notification-contact-signup");
+        td.option_manager
+            .as_mut()
+            .expect("the option manager exists after init")
+            .on_td_inited();
+
+        // 1. the get family — the live getOption arm fires the wire query
+        //    (cpp:108-110) and the request parks FIFO
+        td.request(
+            1,
+            Function::getOption(td_api::getOption {
+                name: "disable_contact_registered_notifications".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getContactSignUpNotification::ID,
+        );
+
+        // boolTrue flips the flag + writes the option; the wrap_promise
+        // answers the re-read boolean value (cpp:112-118 + 2667-2678)
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::optionValueBoolean(value) =
+            responses.first().expect("the option response")
+        else {
+            panic!("the option response");
+        };
+        assert!(value.value);
+        assert!(
+            td.notification_manager
+                .disable_contact_registered_notifications
+        );
+
+        // 2. the set family — the sync machine over the wire: the
+        //    disabled band arms Pending + account.setContactSignUpNotification
+        //    with silent=true (cpp:2693-2714)
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                notification_updates,
+                notification_manager,
+                ..
+            } = &mut td;
+            let mut env = NotificationEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_authorized: auth_manager.is_authorized(),
+                auth_is_bot: auth_manager.is_bot(),
+                updates: notification_updates,
+            };
+            notification_manager.run_contact_registered_notifications_sync(&mut env);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setContactSignUpNotification::ID,
+        );
+        let body = telegram_api::account_setContactSignUpNotification::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.silent, "the is_disabled capture rides the wire");
+        assert_eq!(
+            td.notification_manager
+                .contact_registered_notifications_sync_state,
+            crate::notification_manager::SyncState::Pending
+        );
+
+        // the ok answer completes the machine (cpp:84-91 + 2721-2722)
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+        assert_eq!(
+            td.notification_manager
+                .contact_registered_notifications_sync_state,
+            crate::notification_manager::SyncState::Completed
+        );
+
+        // 3. the resend-forever band — a wire error re-arms the query
+        //    (cpp:93-98 + 2722-2724)
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                notification_updates,
+                notification_manager,
+                ..
+            } = &mut td;
+            let mut env = NotificationEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_authorized: auth_manager.is_authorized(),
+                auth_is_bot: auth_manager.is_bot(),
+                updates: notification_updates,
+            };
+            notification_manager.contact_registered_notifications_sync_state =
+                crate::notification_manager::SyncState::Pending;
+            notification_manager.on_contact_registered_notifications_sync(
+                &mut env,
+                true,
+                Err(tdutils::status::Status::error(400, "NETWORK_ERROR")),
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setContactSignUpNotification::ID,
+        );
+        assert_eq!(
+            td.notification_manager
+                .contact_registered_notifications_sync_state,
+            crate::notification_manager::SyncState::Pending,
+            "the error re-arms the send"
+        );
+        // complete the refired query so the drain runs clean
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+
+        // 4. the get-error band — the error is swallowed by the
+        //    wrap_promise (the re-read answers, OptionManager.cpp:761-766)
+        td.request(
+            2,
+            Function::getOption(td_api::getOption {
+                name: "disable_contact_registered_notifications".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getContactSignUpNotification::ID,
+        );
+        net_fail(sent, 500, "NETWORK_ERROR");
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 2);
+        let td_api::Object::optionValueBoolean(value) =
+            responses.first().expect("the option response")
+        else {
+            panic!("the error-band response");
+        };
+        assert!(
+            value.value,
+            "the wrap_promise answers the re-read store value on errors"
+        );
+
+        // 5. the net-inert posture — no dispatcher, the getOption parks
+        //    at the family lot unanswered
+        let (mut td2, rec2, callback2) =
+            netted_td_with_callback("netdrain61-notification-contact-signup-inert");
+        td2.net_query_dispatcher = None;
+        td2.notification_manager.net = None; // the manager-held handle too
+        td2.option_manager
+            .as_mut()
+            .expect("the option manager exists after init")
+            .on_td_inited();
+        td2.request(
+            6,
+            Function::getOption(td_api::getOption {
+                name: "disable_contact_registered_notifications".to_owned(),
+            }),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 6).is_none() && responses_of(&callback2, 6).is_empty(),
+            "the request parks at the family lot like the C++ offline"
+        );
+
+        // the drain ran clean — nothing parked
+        assert!(td.notification_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
