@@ -4,10 +4,11 @@
 //! `bots.getBotRecommendations` query.
 //!
 //! Seams:
-//! - `GetBotRecommendationsQuery::send`
-//!   (BotRecommendationManager.cpp:39-48) is the
-//!   [`BotRecommendationManagerEnv::send_get_bot_recommendations_query`]
-//!   net seam — `[blocked: net]`, the answer arrives through
+//! - `GetBotRecommendationsQuery` (BotRecommendationManager.cpp:30-64)
+//!   collapses onto the `BotRecommendationNetKind` dispatcher tag (the
+//!   net-drain 53 plane): the send leg rides the manager-held net handle
+//!   (the input user resolves at the send, cpp:42-47) and the answers
+//!   drain through `Td::on_bot_recommendation_net_answer` into
 //!   [`BotRecommendationManager::on_get_bot_recommendations`].
 //! - The `G()->td_db()->get_sqlite_pmc()` row store (the C++
 //!   `SqliteKeyValueAsync` callback hop, BotRecommendationManager.cpp:193-198
@@ -36,6 +37,24 @@ use tdutils::status::Status;
 /// `BotRecommendationManager::BOT_RECOMMENDATIONS_CACHE_TIME`
 /// (BotRecommendationManager.h:35) — some reasonable limit.
 const BOT_RECOMMENDATIONS_CACHE_TIME: i32 = 86400;
+
+/// The in-flight query kind of the net-drain 53 family — the C++
+/// `Td::ResultHandler` query class (`GetBotRecommendationsQuery`,
+/// BotRecommendationManager.cpp:30-64) collapsed onto the dispatcher
+/// tag; the answers drain through `Td::on_bot_recommendation_net_answer`
+/// into [`BotRecommendationManager::on_get_bot_recommendations`]. The
+/// kind carries the query's `bot_user_id_` member (cpp:32, set at the
+/// send cpp:40) — the answer's re-entry key; the C++ query promise is
+/// the `reload_bot_recommendations` lambda (cpp:292-296), so the request
+/// promises park in the manager's family lots (the §5 shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BotRecommendationNetKind {
+    /// `GetBotRecommendationsQuery` (cpp:30-64) —
+    /// `bots.getBotRecommendations`; the input user resolves at the
+    /// send leg (cpp:42-47), the failed resolve riding the same
+    /// `on_error` tail as the wire errors (cpp:43-45 → :61-63).
+    GetBotRecommendations { bot_user_id: UserId },
+}
 
 /// The `G()`/manager slice the collapsed manager reads through.
 pub trait BotRecommendationManagerEnv {
@@ -95,15 +114,6 @@ pub trait BotRecommendationManagerEnv {
     ) {
         let _ = (dialog_id, value, promise);
         tdutils::log_info!("save_app_log({name}) — [blocked: net]");
-    }
-
-    /// `GetBotRecommendationsQuery::send`
-    /// (BotRecommendationManager.cpp:39-48) — `[blocked: net]`; the
-    /// answer arrives through
-    /// [`BotRecommendationManager::on_get_bot_recommendations`].
-    fn send_get_bot_recommendations_query(&mut self, bot_user_id: UserId) {
-        let _ = bot_user_id;
-        tdutils::log_info!("Send bots.getBotRecommendations — [blocked: net]");
     }
 }
 
@@ -185,6 +195,12 @@ fn fail_both(
 /// the C++ `td_`/`parent_` pair becomes the env-parameter methods).
 #[derive(Default)]
 pub struct BotRecommendationManager {
+    /// The net-drain 53 dispatch surface — `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests); wired at
+    /// the dispatcher-creation block through `Td::bot_recommendation_net`
+    /// (the manager-held `UserManager::net` shape — the shared BotEnv
+    /// carries no wire surface).
+    pub(crate) net: Option<crate::td::BotRecommendationNetHandle>,
     /// `bot_recommended_bots_`.
     bot_recommended_bots: HashMap<UserId, RecommendedBots>,
     /// `get_bot_recommendations_queries_`.
@@ -447,7 +463,8 @@ impl BotRecommendationManager {
     }
 
     /// `reload_bot_recommendations` (BotRecommendationManager.cpp:282-297)
-    /// — the local-only count requests answer `-1` before the query send.
+    /// — the local-only count requests answer `-1` before the query send;
+    /// the send leg is `GetBotRecommendationsQuery::send` (cpp:39-48).
     fn reload_bot_recommendations(
         &mut self,
         env: &mut impl BotRecommendationManagerEnv,
@@ -460,7 +477,25 @@ impl BotRecommendationManager {
                 promise.set_value(-1);
             }
         }
-        env.send_get_bot_recommendations_query(bot_user_id);
+        let kind = BotRecommendationNetKind::GetBotRecommendations { bot_user_id };
+        match self.net.clone() {
+            Some(net) => match env.get_input_user(bot_user_id) {
+                Ok(bot_input_user) => net.dispatch(
+                    kind,
+                    telegram_api::Function::bots_getBotRecommendations(
+                        telegram_api::bots_getBotRecommendations {
+                            bot: Some(bot_input_user),
+                        },
+                    ),
+                ),
+                // the C++ `send`'s inline on_error band (cpp:43-45 → :61-63):
+                // the failed resolve files through the completed queue so
+                // the answer half runs the full
+                // `fail_load_bot_recommendations_queries` tail
+                Err(error) => net.complete_error(kind, error.code(), error.message()),
+            },
+            None => tdutils::log_info!("Send bots.getBotRecommendations — [net-inert]"),
+        }
     }
 
     /// `GetBotRecommendationsQuery::on_result` +
@@ -585,6 +620,7 @@ mod tests {
         known: Vec<i64>,
         is_premium: bool,
         use_message_database: bool,
+        close_flag: bool,
         pmc: HashMap<String, Vec<u8>>,
         queries: Vec<String>,
         app_logs: Vec<String>,
@@ -598,6 +634,7 @@ mod tests {
                 known: vec![1, 2, 3],
                 is_premium: false,
                 use_message_database: true,
+                close_flag: false,
                 pmc: HashMap::new(),
                 queries: Vec::new(),
                 app_logs: Vec::new(),
@@ -658,7 +695,7 @@ mod tests {
         }
 
         fn close_flag(&mut self) -> bool {
-            false
+            self.close_flag
         }
 
         fn sqlite_pmc_get_raw(&mut self, key: &str) -> Vec<u8> {
@@ -675,11 +712,6 @@ mod tests {
 
         fn resolve_dependencies(&mut self, user_ids: &[UserId], _source: &str) -> bool {
             self.resolved_all && user_ids.iter().all(|id| self.known.contains(&id.get()))
-        }
-
-        fn send_get_bot_recommendations_query(&mut self, bot_user_id: UserId) {
-            self.queries
-                .push(format!("getBotRecommendations:{}", bot_user_id.get()));
         }
 
         fn save_app_log(
@@ -823,7 +855,8 @@ mod tests {
         let mut env = TestEnv::default();
         let mut manager = BotRecommendationManager::new();
 
-        // the first request parks the query (no cache)
+        // the first request parks the query (no cache; the net-inert
+        // posture keeps it parked — nothing settles)
         let (users_promise, users_outcomes) = recording_promise();
         let (count_promise, count_outcomes) = recording_promise();
         manager.get_bot_recommendations(
@@ -833,7 +866,14 @@ mod tests {
             users_promise,
             count_promise,
         );
-        assert_eq!(env.queries, vec!["getBotRecommendations:1"]);
+        assert_eq!(
+            manager
+                .get_bot_recommendations_queries
+                .get(&UserId::new(1))
+                .map(Vec::len),
+            Some(1),
+            "the users promise parks in the family lot"
+        );
         assert!(users_outcomes.lock().unwrap().is_empty());
 
         // the query answer fills both promises and stores the pmc row
@@ -857,7 +897,6 @@ mod tests {
         assert!(env.pmc.contains_key("bot_recommendations1"));
 
         // a second request inside the cache window answers synchronously
-        env.queries.clear();
         let (users_promise, users_outcomes) = recording_promise();
         let (count_promise, count_outcomes) = recording_promise();
         manager.get_bot_recommendations(
@@ -867,7 +906,6 @@ mod tests {
             users_promise,
             count_promise,
         );
-        assert!(env.queries.is_empty());
         assert_eq!(users_outcomes.lock().unwrap().len(), 1);
         assert_eq!(count_outcomes.lock().unwrap().clone(), vec![Ok(2)]);
     }
@@ -945,7 +983,34 @@ mod tests {
         manager.bot_recommended_bots.clear();
 
         // a fresh load reads the corrupt row, erases it and reloads
-        env.queries.clear();
+        // (the reload's send rides the net-inert posture — the users
+        // promise stays parked in the family lot)
+        let (users_promise, users_outcomes) = recording_promise();
+        manager.get_bot_recommendations(
+            &mut env,
+            UserId::new(1),
+            false,
+            users_promise,
+            empty_count(),
+        );
+        assert!(!env.pmc.contains_key("bot_recommendations1"));
+        assert_eq!(
+            manager
+                .get_bot_recommendations_queries
+                .get(&UserId::new(1))
+                .map(Vec::len),
+            Some(1),
+            "the reload keeps the promise parked"
+        );
+        assert!(users_outcomes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_load_from_database_fails_the_parked_queries_when_closing() {
+        let mut env = TestEnv::default();
+        let mut manager = BotRecommendationManager::new();
+
+        // prime a real row (the in-memory cache drops on a restart)
         manager.get_bot_recommendations(
             &mut env,
             UserId::new(1),
@@ -953,8 +1018,40 @@ mod tests {
             empty_users(),
             empty_count(),
         );
-        assert!(!env.pmc.contains_key("bot_recommendations1"));
-        assert!(env.queries.contains(&"getBotRecommendations:1".to_owned()));
+        manager.on_get_bot_recommendations(
+            &mut env,
+            UserId::new(1),
+            Ok(telegram_api::users_Users::users_users(
+                telegram_api::users_users {
+                    users: vec![user(1, true)],
+                },
+            )),
+        );
+        manager.bot_recommended_bots.clear();
+
+        // `G()->close_flag()` fails the database read's parked queries with
+        // the close status (BotRecommendationManager.cpp:250-252)
+        env.close_flag = true;
+        let (users_promise, users_outcomes) = recording_promise();
+        let (count_promise, count_outcomes) = recording_promise();
+        manager.get_bot_recommendations(
+            &mut env,
+            UserId::new(1),
+            false,
+            users_promise,
+            count_promise,
+        );
+        assert!(
+            matches!(&users_outcomes.lock().unwrap()[0], Err(m) if m == "500 Request aborted"),
+            "the users promise fails with the close status"
+        );
+        assert!(matches!(&count_outcomes.lock().unwrap()[0], Err(m) if m == "500 Request aborted"));
+        assert!(
+            !manager
+                .get_bot_recommendations_queries
+                .contains_key(&UserId::new(1)),
+            "the family lot drained"
+        );
     }
 
     #[test]
@@ -963,7 +1060,7 @@ mod tests {
         let mut manager = BotRecommendationManager::new();
 
         // return_local = true parks a count promise that answers -1 on the
-        // reload path
+        // reload path (the send rides the net-inert posture)
         let (count_promise, count_outcomes) = recording_promise();
         manager.get_bot_recommendations(
             &mut env,
@@ -973,7 +1070,6 @@ mod tests {
             count_promise,
         );
         assert_eq!(count_outcomes.lock().unwrap().clone(), vec![Ok(-1)]);
-        assert_eq!(env.queries, vec!["getBotRecommendations:1"]);
 
         // a query error fails the parked users promise
         let (users_promise, users_outcomes) = recording_promise();
