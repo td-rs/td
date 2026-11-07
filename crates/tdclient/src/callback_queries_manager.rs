@@ -4,14 +4,18 @@
 //! request flips (Requests.cpp:8359-8374).
 //!
 //! Seams:
-//! - The three `Td::ResultHandler` queries ride the
-//!   [`CallbackQueriesManagerEnv`] net seams — `[blocked: net]` with the
-//!   promises parked (the M.41 convention); the answer handlers
-//!   ([`CallbackQueriesManager::on_get_bot_callback_answer`],
-//!   [`CallbackQueriesManager::on_get_ephemeral_callback_answer`],
-//!   [`CallbackQueriesManager::on_set_bot_callback_answer`]) are real and
-//!   unit-tested, including `BOT_RESPONSE_TIMEOUT` → 502 remap and the
-//!   `is_message_edited_recently(31)` empty-answer bail.
+//! - The `messages.getBotCallbackAnswer` network tail rides the
+//!   `CallbackNetKind` plane (net-drain 49): the manager-held
+//!   `CallbackNetHandle` dispatches the wire query and the
+//!   answer drains through `Td::on_callback_net_answer`
+//!   into [`CallbackQueriesManager::on_get_bot_callback_answer`].
+//! - The `ephemeral.getCallbackAnswer` and `messages.setBotCallbackAnswer`
+//!   tails ride the [`CallbackQueriesManagerEnv`] net seams —
+//!   `[blocked: net]` with the promises parked (the M.41 convention);
+//!   the answer handlers
+//!   ([`CallbackQueriesManager::on_get_ephemeral_callback_answer`],
+//!   [`CallbackQueriesManager::on_set_bot_callback_answer`]) are real
+//!   and unit-tested, including `BOT_RESPONSE_TIMEOUT` → 502 remap.
 //! - `td_->password_manager_->get_input_check_password_srp`
 //!   (CallbackQueriesManager.cpp:365-373) is the
 //!   [`CallbackQueriesManagerEnv::get_input_check_password_srp`] seam —
@@ -28,10 +32,36 @@
 use crate::dialog_id::DialogId;
 use crate::message_id::{MessageFullId, MessageId};
 use crate::td_api;
-use crate::user_manager::UserId;
+use crate::user_manager::{AccessRights, UserId};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+
+/// The callback-query-plane in-flight query kinds — the C++
+/// `Td::ResultHandler` query classes the manager's network tails create
+/// (CallbackQueriesManager.cpp:31-179). The completions park by kind
+/// behind the manager-held `crate::td::CallbackNetHandle`;
+/// `Td::on_callback_net_answer` routes them. The kinds
+/// carry the handler members the error heads read (the §5 identity — an
+/// out-of-order answer pairs with its own query), so the family lots
+/// park the promises alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackNetKind {
+    /// `GetBotCallbackAnswerQuery` (CallbackQueriesManager.cpp:31-100)
+    /// — `messages.getBotCallbackAnswer`; the kind carries the
+    /// handler's `dialog_id_`/`message_id_` for the
+    /// `on_get_message_error` head the `on_error` tail runs (cpp:91).
+    GetBotCallbackAnswer {
+        dialog_id: DialogId,
+        message_id: MessageId,
+    },
+}
+
+/// The `messages.getBotCallbackAnswer` wire flags
+/// (CallbackQueriesManager.cpp:49-70) — `DATA_MASK` carries the payload
+/// bytes, `PASSWORD_MASK` the SRP envelope.
+const CALLBACK_DATA_MASK: i32 = 1;
+const CALLBACK_PASSWORD_MASK: i32 = 1 << 2;
 
 /// `InlineQueriesManager::get_inline_message_id`
 /// (InlineQueriesManager.cpp:534-542) — the base64url form of the bare
@@ -191,22 +221,14 @@ pub trait CallbackQueriesManagerEnv {
         );
     }
 
-    /// `GetBotCallbackAnswerQuery::send`
-    /// (CallbackQueriesManager.cpp:41-77) — `[blocked: net]`; the
-    /// `need_resend_on_503_ = false` flag rides the net step. The answer
-    /// arrives through
-    /// [`CallbackQueriesManager::on_get_bot_callback_answer`].
-    fn send_get_bot_callback_answer_query(
+    /// `td_->dialog_manager_->get_input_peer(dialog_id, rights)` — the
+    /// net-drain 49 query send legs resolve the read peer (the
+    /// `ForumTopicEnv` split shape; CallbackQueriesManager.cpp:46).
+    fn get_input_peer(
         &mut self,
         dialog_id: DialogId,
-        message_id: MessageId,
-        is_game: bool,
-        data: Vec<u8>,
-        has_password: bool,
-    ) {
-        let _ = (dialog_id, message_id, is_game, data, has_password);
-        tdutils::log_info!("Send messages.getBotCallbackAnswer — [blocked: net]");
-    }
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputPeer>;
 
     /// `GetEphemeralCallbackAnswerQuery::send`
     /// (CallbackQueriesManager.cpp:111-122) — `[blocked: net]`; the
@@ -239,12 +261,11 @@ pub trait CallbackQueriesManagerEnv {
     }
 }
 
-/// A parked `messages.getBotCallbackAnswer` query: the per-request state
-/// the C++ keeps in the ResultHandler fields (the promise parks until
-/// the net step delivers the answer handler).
+/// A parked `messages.getBotCallbackAnswer` query — the request
+/// promise (the C++ query carries it on the handler's `promise_`
+/// member, CallbackQueriesManager.cpp:32-35; the error head's
+/// dialog/message identity rides the kind).
 struct PendingBotCallbackAnswerQuery {
-    dialog_id: DialogId,
-    message_id: MessageId,
     promise: Promise<td_api::CallbackQueryAnswer>,
 }
 
@@ -263,6 +284,11 @@ struct PendingSetBotCallbackAnswerQuery {
 /// becomes the env-parameter methods).
 #[derive(Default)]
 pub struct CallbackQueriesManager {
+    /// The manager-held dispatch surface of the net-drain 49 families —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests; the `GroupCallManager::net` shape — the shared
+    /// [`crate::td::BotEnv`] view resolves the peer at the send legs).
+    pub(crate) net: Option<crate::td::CallbackNetHandle>,
     /// The parked `messages.getBotCallbackAnswer` queries — the collapsed
     /// `GetBotCallbackAnswerQuery` actor queue.
     pending_bot_callback_answer_queries: Vec<PendingBotCallbackAnswerQuery>,
@@ -652,22 +678,92 @@ impl CallbackQueriesManager {
             return promise.set_error(Status::error(400, "Message not found"));
         }
 
-        let message_id = message_full_id.get_message_id();
-        env.send_get_bot_callback_answer_query(dialog_id, message_id, is_game, data, has_password);
+        self.send_get_bot_callback_answer_query(
+            env,
+            dialog_id,
+            message_full_id.get_message_id(),
+            is_game,
+            data,
+            has_password,
+            promise,
+        );
+    }
+
+    /// The `td_->create_handler<GetBotCallbackAnswerQuery>(promise)
+    /// ->send(...)` collapse (CallbackQueriesManager.cpp:41-77): the
+    /// request promise parks in the family lot (the C++ carries it on
+    /// the query, §5's FIFO shape), then the read peer resolves and the
+    /// wire query dispatches — the `DATA_MASK`/`PASSWORD_MASK`/`GAME`
+    /// bits carry the payload form (cpp:49-70) and the id is the server
+    /// message id (cpp:73). The C++ `CHECK(input_peer != nullptr)` band
+    /// (cpp:46-47) files through the completed queue so the answer half
+    /// runs the full `on_error` tail (the message-query convention);
+    /// `None` on the handle keeps the net-inert posture. The C++
+    /// `need_resend_on_503_ = false` flag (cpp:75) rides the handle's
+    /// 24-hour budget like every landed per-kind send (documented
+    /// divergence).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_get_bot_callback_answer_query(
+        &mut self,
+        env: &mut impl CallbackQueriesManagerEnv,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        is_game: bool,
+        data: Vec<u8>,
+        has_password: bool,
+        promise: Promise<td_api::CallbackQueryAnswer>,
+    ) {
         self.pending_bot_callback_answer_queries
-            .push(PendingBotCallbackAnswerQuery {
-                dialog_id,
-                message_id,
-                promise,
-            });
+            .push(PendingBotCallbackAnswerQuery { promise });
+        let kind = CallbackNetKind::GetBotCallbackAnswer {
+            dialog_id,
+            message_id,
+        };
+        match (
+            self.net.clone(),
+            env.get_input_peer(dialog_id, AccessRights::Read),
+        ) {
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getBotCallbackAnswer(
+                    telegram_api::messages_getBotCallbackAnswer {
+                        flags: if is_game { 0 } else { CALLBACK_DATA_MASK }
+                            | if has_password {
+                                CALLBACK_PASSWORD_MASK
+                            } else {
+                                0
+                            },
+                        game: is_game,
+                        peer: Some(Box::new(peer)),
+                        msg_id: message_id.get_server_message_id().get(),
+                        data,
+                        // the SRP envelope rides the
+                        // [blocked: PasswordManager] seam (the parked
+                        // get_input_check_password_srp call above)
+                        password: None,
+                    },
+                ),
+            ),
+            (Some(net), None) => {
+                // the C++ CHECK(input_peer != nullptr) band (cpp:46-47)
+                net.complete_error(kind, 400, "Can't access the chat");
+            }
+            (None, _) => {
+                tdutils::log_info!("Send messages.getBotCallbackAnswer — [net-inert]");
+            }
+        }
     }
 
     /// `GetBotCallbackAnswerQuery::on_result` (on the parked query) +
     /// `on_error` (CallbackQueriesManager.cpp:79-99) — the caller passes
-    /// the query answer or the fetch/network status.
+    /// the query answer or the fetch/network status; the
+    /// dialog/message pair rides the wire kind (the C++ handler's
+    /// `dialog_id_`/`message_id_` members, cpp:33-34).
     pub fn on_get_bot_callback_answer(
         &mut self,
         env: &mut impl CallbackQueriesManagerEnv,
+        dialog_id: DialogId,
+        message_id: MessageId,
         result: Result<telegram_api::messages_BotCallbackAnswer, Status>,
     ) {
         let Some(query) = self.pending_bot_callback_answer_queries.pop() else {
@@ -675,8 +771,6 @@ impl CallbackQueriesManager {
             return;
         };
         let mut promise = query.promise;
-        let dialog_id = query.dialog_id;
-        let message_id = query.message_id;
         let answer = match result {
             Ok(answer) => answer,
             Err(mut status) => {
@@ -757,6 +851,18 @@ impl CallbackQueriesManager {
             }
             Err(status) => promise.set_error(status),
         }
+    }
+
+    /// Test-only: the parked get-family promise pop — the netted
+    /// net-inert asserts read the park (the `pop_rate_promise`
+    /// convention).
+    #[cfg(test)]
+    pub(crate) fn pop_bot_callback_answer_promise_for_test(
+        &mut self,
+    ) -> Option<Promise<td_api::CallbackQueryAnswer>> {
+        self.pending_bot_callback_answer_queries
+            .pop()
+            .map(|query| query.promise)
     }
 }
 
@@ -914,19 +1020,14 @@ mod tests {
             self.business_message.clone()
         }
 
-        fn send_get_bot_callback_answer_query(
+        fn get_input_peer(
             &mut self,
-            dialog_id: DialogId,
-            message_id: MessageId,
-            is_game: bool,
-            _data: Vec<u8>,
-            has_password: bool,
-        ) {
-            self.queries.push(format!(
-                "getBotCallbackAnswer:{}:{}:{is_game}:{has_password}",
-                dialog_id.get(),
-                message_id.get()
-            ));
+            _dialog_id: DialogId,
+            _access_rights: crate::user_manager::AccessRights,
+        ) -> Option<telegram_api::InputPeer> {
+            Some(telegram_api::InputPeer::inputPeerSelf(
+                telegram_api::inputPeerSelf {},
+            ))
         }
 
         fn send_get_ephemeral_callback_answer_query(
@@ -1330,11 +1431,16 @@ mod tests {
             Some(payload_data()),
             promise,
         );
-        assert_eq!(
-            env.queries,
-            vec!["getBotCallbackAnswer:-3:1048576:false:false"]
+        assert!(
+            !manager.pending_bot_callback_answer_queries.is_empty(),
+            "the promise parks like the C++ handler holds it"
         );
-        manager.on_get_bot_callback_answer(&mut env, Ok(sample_answer()));
+        manager.on_get_bot_callback_answer(
+            &mut env,
+            crate::dialog_id::DialogId::new(-3),
+            crate::message_id::MessageId::new(1 << 20),
+            Ok(sample_answer()),
+        );
         let outcomes = outcomes.lock().unwrap();
         let answer = outcomes[0].as_ref().expect("answered");
         assert_eq!(answer.text, "answer");
@@ -1349,8 +1455,12 @@ mod tests {
             Some(payload_data()),
             promise,
         );
-        manager
-            .on_get_bot_callback_answer(&mut env, Err(Status::error(400, "BOT_RESPONSE_TIMEOUT")));
+        manager.on_get_bot_callback_answer(
+            &mut env,
+            crate::dialog_id::DialogId::new(-3),
+            crate::message_id::MessageId::new(1 << 20),
+            Err(Status::error(400, "BOT_RESPONSE_TIMEOUT")),
+        );
         assert!(matches!(
             &outcomes.lock().unwrap()[0],
             Err(message) if message == "502 The bot is not responding"
@@ -1367,6 +1477,8 @@ mod tests {
         );
         manager.on_get_bot_callback_answer(
             &mut env,
+            crate::dialog_id::DialogId::new(-3),
+            crate::message_id::MessageId::new(1 << 20),
             Err(Status::error(502, "The bot is not responding")),
         );
         let outcomes = outcomes.lock().unwrap();
@@ -1415,6 +1527,8 @@ mod tests {
         ));
 
         // the password payload routes through the SRP seam with the data
+        // — the get-family promise parks (the PASSWORD_MASK band is the
+        // netted test's wire assert)
         env.ephemeral_message_id = 0;
         env.queries.clear();
         let (promise, _outcomes) = recording_promise();
@@ -1431,10 +1545,11 @@ mod tests {
             ),
             promise,
         );
-        assert_eq!(
-            env.queries,
-            vec!["getBotCallbackAnswer:-3:1048576:false:true"]
+        assert!(
+            !manager.pending_bot_callback_answer_queries.is_empty(),
+            "the password-form promise parks like the data form"
         );
+        assert!(env.queries.is_empty(), "no ephemeral query fired");
     }
 
     #[test]

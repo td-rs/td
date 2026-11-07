@@ -3356,6 +3356,15 @@ pub(crate) type CallNetHandle = NetKindHandle<crate::call_manager::CallNetKind>;
 /// the answers drain through [`Td::on_poll_net_answer`].
 pub(crate) type PollNetHandle = NetKindHandle<crate::poll_manager::PollNetKind>;
 
+/// The cloned callback-query dispatch surface the
+/// [`crate::callback_queries_manager::CallbackQueriesManager`] holds —
+/// the per-kind handle over the CallbackQueriesManager.cpp ResultHandler
+/// kinds (the net-drain 49 plane: the get/set callback-answer families);
+/// the answers drain through [`Td::on_callback_net_answer`].
+/// Manager-held (the `GroupCallManager::net` shape): the send legs run
+/// inside the manager over the shared [`BotEnv`] view's peer reads.
+pub(crate) type CallbackNetHandle = NetKindHandle<crate::callback_queries_manager::CallbackNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6192,6 +6201,12 @@ pub struct Td {
     /// [`Td::on_attach_menu_net_answer`].
     attach_menu_net_completed:
         Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
+    /// The callback-query net completed queue (the `CallbackNetKind`
+    /// tags; the net-drain 49 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_callback_net_answer`].
+    callback_net_completed:
+        Arc<Mutex<Vec<(crate::callback_queries_manager::CallbackNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6709,6 +6724,7 @@ impl Td {
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
+            callback_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7202,6 +7218,7 @@ impl Td {
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
+        self.callback_queries_manager.net = self.callback_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9021,6 +9038,7 @@ impl Td {
         self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
         self.dispatch_completed_attach_menu_net();
+        self.dispatch_completed_callback_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9144,6 +9162,18 @@ impl Td {
         Some(PollNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.poll_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned callback-query dispatch surface the
+    /// [`crate::callback_queries_manager::CallbackQueriesManager`] holds
+    /// (the net-drain 49 families' send legs) — `None` keeps the
+    /// net-inert posture (the pre-init windows and the net-inert tests).
+    pub(crate) fn callback_net(&self) -> Option<CallbackNetHandle> {
+        Some(CallbackNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.callback_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17748,6 +17778,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked callback-query answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 49
+    /// families (CallbackQueriesManager.cpp:31-179).
+    fn dispatch_completed_callback_net(&mut self) {
+        let completed = std::mem::take(&mut *self.callback_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_callback_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -19455,6 +19496,52 @@ impl Td {
                     // net-inert posture or a dropped request)
                     (_, None) => {}
                 }
+            }
+        }
+    }
+
+    /// Route one callback-query net answer by kind — the ResultHandler
+    /// halves of the net-drain 49 families (CallbackQueriesManager.cpp:
+    /// 31-179): the wire answers parse here and the landed manager
+    /// intakes run over the shared [`BotEnv`] view (the parse failures
+    /// route through the same tails the wire errors do — the fetch_result
+    /// → on_error chain, cpp:79-83).
+    fn on_callback_net_answer(
+        &mut self,
+        kind: crate::callback_queries_manager::CallbackNetKind,
+        query: NetQuery,
+    ) {
+        use crate::callback_queries_manager::CallbackNetKind as K;
+        match kind {
+            // `GetBotCallbackAnswerQuery::on_result`/`on_error`
+            // (CallbackQueriesManager.cpp:79-99) — the answer converts
+            // through the manager intake (the `on_get_message_error`
+            // head, the BOT_RESPONSE_TIMEOUT remap and the
+            // edited-recently empty-answer bail).
+            K::GetBotCallbackAnswer {
+                dialog_id,
+                message_id,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotCallbackAnswer::parse(query.ok()) {
+                        Ok(answer) => Ok(answer),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.botCallbackAnswer: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getBotCallbackAnswer answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.callback_queries_manager);
+                {
+                    let mut env = crate::td::BotEnv { td: self };
+                    manager.on_get_bot_callback_answer(&mut env, dialog_id, message_id, result);
+                }
+                self.callback_queries_manager = manager;
             }
         }
     }
@@ -43312,6 +43399,16 @@ impl crate::callback_queries_manager::CallbackQueriesManagerEnv for BotEnv<'_> {
         tdutils::log_info!("MessagesManager::have_message_force — [blocked: M.10 Messages]");
         false
     }
+
+    /// `DialogManager::get_input_peer` — the net-drain 49 query send
+    /// legs resolve the read peer here (CallbackQueriesManager.cpp:46).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
 }
 
 impl crate::bot_recommendation_manager::BotRecommendationManagerEnv for BotEnv<'_> {
@@ -53104,6 +53201,7 @@ mod tests {
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
+        td.callback_queries_manager.net = td.callback_net();
         (td, rec, callback)
     }
 
@@ -80083,6 +80181,379 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.transcription_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn callback_query_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(callback_query_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 49 netted round trips: the callback-query
+    /// families dispatch through the real dispatcher, the wire bodies
+    /// carry the C++ payloads (CallbackQueriesManager.cpp:31-188) and
+    /// the answers drain through `Td::on_callback_net_answer` into the
+    /// landed intakes — the live td_api arms where their gates allow
+    /// (answerCallbackQuery; the getCallbackQueryAnswer arm's
+    /// [blocked: M.10] message probe keeps its C++ not-found band, the
+    /// seam drives run below the probe like the net-drain 28 families).
+    fn callback_query_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// A `Promise<T>` slot (the UnitSlot convention over any type).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+        /// The `messages.botCallbackAnswer` wire answer both get
+        /// families return (CallbackQueriesManager.cpp:86-88) — the
+        /// message/url strings ride their flag bits.
+        fn bot_callback_answer() -> Vec<u8> {
+            wire!(telegram_api::messages_BotCallbackAnswer {
+                flags: 1 | (1 << 2),
+                alert: true,
+                has_url: true,
+                native_ui: false,
+                message: "answer".to_owned(),
+                url: "https://t.me".to_owned(),
+                cache_time: 5,
+            })
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain49-callback-queries");
+        // the self user id makes the read peer resolve to `inputPeerSelf`
+        // (UserManager.cpp:7450-7453 shape) and the seeded record carries
+        // the arm's dialog-access gate
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user_id(&mut td, 700000001, 42);
+        let dialog_id =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001));
+        let message_id = crate::messages_manager::MessageId::new(1 << 21); // server id 2
+
+        // 0. the live td_api arm still answers the C++ not-found band
+        //    (the [blocked: M.10] message probe) — the arm routes into
+        //    the manager, nothing intercepts it
+        td.request(
+            1,
+            Function::getCallbackQueryAnswer(td_api::getCallbackQueryAnswer {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                payload: Some(td_api::CallbackQueryPayload::callbackQueryPayloadData(
+                    td_api::callbackQueryPayloadData {
+                        data: b"d".to_vec(),
+                    },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 1. the get family rides the wire (the seam drive below the
+        //    M.10 probe — GetBotCallbackAnswerQuery::send,
+        //    CallbackQueriesManager.cpp:41-77): the resolved read peer,
+        //    the server message id and the payload data on the DATA_MASK
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"payload".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_getBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.msg_id, 2);
+        assert_eq!(body.data, b"payload".to_vec());
+        assert_eq!(body.flags, 1, "DATA_MASK only — no game, no password");
+        assert!(!body.game);
+
+        // 2. the answer settles the parked promise with the
+        //    td_api::callbackQueryAnswer triple (cpp:79-88)
+        net_complete(sent, bot_callback_answer());
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(answer)) => {
+                assert_eq!(answer.text, "answer");
+                assert!(answer.show_alert);
+                assert_eq!(answer.url, "https://t.me");
+            }
+            other => panic!("the answer round trip: {other:?}"),
+        }
+
+        // 3. the game payload sends no data (cpp:62-70) — the GAME bit
+        //    rides the bool, DATA_MASK stays unset
+        let (promise, _slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    true,
+                    Vec::new(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_getBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1 << 1, "the GAME bit only — no DATA_MASK");
+        assert!(body.game, "the GAME bit rides the bool field");
+        assert!(body.data.is_empty());
+
+        // 4. the password payload sets PASSWORD_MASK (cpp:57-61) — the
+        //    SRP bytes ride the [blocked: PasswordManager] seam
+        let (promise, _slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    true,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_getBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1 | (1 << 2), "DATA_MASK | PASSWORD_MASK");
+
+        // 5. the BOT_RESPONSE_TIMEOUT remap (cpp:92-94) — 400 becomes
+        //    the 502 "The bot is not responding"
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        net_fail(sent, 400, "BOT_RESPONSE_TIMEOUT");
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (502, "The bot is not responding")
+                );
+            }
+            other => panic!("the timeout remap, got {other:?}"),
+        }
+
+        // 6. a plain wire error forwards unchanged (cpp:98)
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "FLOOD_WAIT_5"));
+            }
+            other => panic!("the forwarded error, got {other:?}"),
+        }
+
+        // 7. the unresolvable-peer band — the C++ `CHECK(input_peer !=
+        //    nullptr)` (cpp:46-47) is the port's `complete_error`
+        //    file-through (the message-query convention): the answer
+        //    half runs the full `on_error` tail
+        let unknown_dialog =
+            crate::dialog_id::DialogId::from_chat_id(crate::chat_manager::ChatId::new(99));
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    unknown_dialog,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("the access band, got {other:?}"),
+        }
+
+        // 8. the parse-failure 500 — the fetch_result band over the
+        //    on_error tail (the landed-flip convention)
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        net_complete(sent, vec![0xba, 0xad, 0xf0, 0x0d]);
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (
+                        500,
+                        "Failed to parse the messages_getBotCallbackAnswer answer"
+                    )
+                );
+            }
+            other => panic!("the parse band, got {other:?}"),
+        }
+
+        // 9. the net-inert posture — no handle, the promise parks like
+        //    the C++ handler holds it
+        td.callback_queries_manager.net = None;
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.callback_queries_manager
+                .pop_bot_callback_answer_promise_for_test()
+                .is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.callback_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
