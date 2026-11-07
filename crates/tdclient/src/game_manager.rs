@@ -5,12 +5,12 @@
 //!
 //! Seams:
 //! - The two `Td::ResultHandler` queries ride the `GameNetKind` plane
-//! (net-drain 57): the manager-held [`GameNetHandle`] dispatches the
-//! wire queries and the answers drain through
-//! [`crate::td::Td::on_game_net_answer`] into the intakes below — the
-//! `SetGameScoreQuery` ok hop is the Td-side `UmMessage` engine tail
-//! (`on_get_updates(ptr, promise_)`, GameManager.cpp:60, the
-//! `query_promise` lambda cpp:131-137).
+//!   (net-drain 57): the manager-held `GameNetHandle` dispatches the
+//!   wire queries and the answers drain through
+//!   `crate::td::Td::on_game_net_answer` into the intakes below — the
+//!   `SetGameScoreQuery` ok hop is the Td-side `UmMessage` engine tail
+//!   (`on_get_updates(ptr, promise_)`, GameManager.cpp:60, the
+//!   `query_promise` lambda cpp:131-137).
 //! - The MessagesManager reads (`have_message_force`,
 //!   `can_set_game_score`, `get_message_object`) are [blocked: M.10]
 //!   through the env trait.
@@ -36,14 +36,10 @@ pub(crate) enum GameNetKind {
     /// `SetGameScoreQuery` (GameManager.cpp:28-68) —
     /// `messages.setGameScore`; the answer rides the updates engine,
     /// then the parked promise settles with the message object.
-    SetGameScore {
-        dialog_id: DialogId,
-    },
+    SetGameScore { dialog_id: DialogId },
     /// `GetGameHighScoresQuery` (GameManager.cpp:70-103) —
     /// `messages.getGameHighScores`.
-    GetGameHighScores {
-        dialog_id: DialogId,
-    },
+    GetGameHighScores { dialog_id: DialogId },
 }
 
 /// The `G()`/manager slice the collapsed manager reads through.
@@ -288,13 +284,7 @@ impl GameManager {
             Err(status) => return promise.set_error(status),
         };
 
-        self.send_get_game_high_scores_query(
-            env,
-            dialog_id,
-            message_id,
-            input_user,
-            promise,
-        );
+        self.send_get_game_high_scores_query(env, dialog_id, message_id, input_user, promise);
     }
 
     /// The `td_->create_handler<GetGameHighScoresQuery>(promise)
@@ -477,7 +467,9 @@ mod tests {
             _access_rights: AccessRights,
         ) -> Option<telegram_api::InputPeer> {
             self.resolve_peer
-                .then(|| telegram_api::InputPeer::inputPeerSelf(telegram_api::inputPeerSelf {}))
+                .then_some(telegram_api::InputPeer::inputPeerSelf(
+                    telegram_api::inputPeerSelf {},
+                ))
         }
     }
 
@@ -705,7 +697,10 @@ mod tests {
         let mut manager = GameManager::new();
         let (promise, outcomes) = recording_promise();
         manager.get_game_high_scores(&mut env, message_full_id(1 << 20), UserId::new(9), promise);
-        assert!(outcomes.lock().unwrap().is_empty(), "nothing settles offline");
+        assert!(
+            outcomes.lock().unwrap().is_empty(),
+            "nothing settles offline"
+        );
         assert!(
             manager.pop_get_game_high_scores_promise().is_some(),
             "the promise parks like the C++ handler holds it"

@@ -19550,9 +19550,7 @@ impl Td {
                     // no parked promise: the send leg parked none (the
                     // net-inert posture or a dropped request)
                     (_, None) => {
-                        tdutils::log_info!(
-                            "Receive an unexpected messages.setGameScore answer"
-                        )
+                        tdutils::log_info!("Receive an unexpected messages.setGameScore answer")
                     }
                 }
                 self.game_manager = manager;
@@ -19568,9 +19566,7 @@ impl Td {
                     match telegram_api::messages_HighScores::parse(query.ok()) {
                         Ok(high_scores) => Ok(high_scores),
                         Err(error) => {
-                            tdutils::log_error!(
-                                "Can't parse messages.highScores: {error}"
-                            );
+                            tdutils::log_error!("Can't parse messages.highScores: {error}");
                             Err(Status::error(
                                 500,
                                 "Failed to parse the messages_getGameHighScores answer",
@@ -19592,10 +19588,7 @@ impl Td {
                     (Ok(high_scores), Some(mut promise)) => {
                         let scores = {
                             let mut env = crate::td::BotEnv { td: self };
-                            manager.get_game_high_scores_object(
-                                &mut env,
-                                high_scores,
-                            )
+                            manager.get_game_high_scores_object(&mut env, high_scores)
                         };
                         promise.set_value(scores);
                     }
@@ -80362,7 +80355,10 @@ kQIDAQAB\n\
         );
         td.flush_deferred_results();
         let error = error_of(&callback, 1);
-        assert_eq!((error.code, error.message.as_str()), (400, "Message not found"));
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
 
         // 2. getGameHighScores rides the wire: the resolved read peer, the
         //    server message id and the input user (GameManager.cpp:79-88)
@@ -80385,7 +80381,8 @@ kQIDAQAB\n\
             std::mem::take(&mut *rec.sent.lock()),
             telegram_api::messages_getGameHighScores::ID,
         );
-        let body = telegram_api::messages_getGameHighScores::parse(sent.query()).expect("the sent body");
+        let body =
+            telegram_api::messages_getGameHighScores::parse(sent.query()).expect("the sent body");
         assert!(matches!(
             body.peer.as_deref(),
             Some(telegram_api::InputPeer::inputPeerSelf(_))
@@ -80404,7 +80401,11 @@ kQIDAQAB\n\
             Some(tdutils::status::Result::Ok(scores)) => {
                 assert_eq!(scores.scores.len(), 1);
                 assert_eq!(
-                    (scores.scores[0].position, scores.scores[0].user_id, scores.scores[0].score),
+                    (
+                        scores.scores[0].position,
+                        scores.scores[0].user_id,
+                        scores.scores[0].score
+                    ),
                     (1, 9, 100)
                 );
             }
@@ -80471,7 +80472,10 @@ kQIDAQAB\n\
         td.dispatch_completed_game_net();
         match slot.lock().unwrap().take() {
             Some(tdutils::status::Result::Err(error)) => {
-                assert_eq!((error.code(), error.message()), (400, "Can't access the chat"));
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
             }
             other => panic!("expected the access band, got {other:?}"),
         }
@@ -80491,7 +80495,10 @@ kQIDAQAB\n\
         );
         td.flush_deferred_results();
         let error = error_of(&callback, 2);
-        assert_eq!((error.code, error.message.as_str()), (400, "Message not found"));
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
 
         // 8. setGameScore rides the wire: the resolved edit peer, the
         //    edit_message/force flag bits, the server message id, the
@@ -80518,8 +80525,7 @@ kQIDAQAB\n\
             std::mem::take(&mut *rec.sent.lock()),
             telegram_api::messages_setGameScore::ID,
         );
-        let body =
-            telegram_api::messages_setGameScore::parse(sent.query()).expect("the sent body");
+        let body = telegram_api::messages_setGameScore::parse(sent.query()).expect("the sent body");
         assert!(matches!(
             body.peer.as_deref(),
             Some(telegram_api::InputPeer::inputPeerSelf(_))
@@ -80548,7 +80554,10 @@ kQIDAQAB\n\
         td.dispatch_completed_game_net();
         match slot.lock().unwrap().take() {
             Some(tdutils::status::Result::Err(error)) => {
-                assert_eq!((error.code(), error.message()), (500, "Receive invalid message"));
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (500, "Receive invalid message")
+                );
             }
             other => panic!("expected the M.10 object band, got {other:?}"),
         }
@@ -80615,7 +80624,10 @@ kQIDAQAB\n\
         td.dispatch_completed_game_net();
         match slot.lock().unwrap().take() {
             Some(tdutils::status::Result::Err(error)) => {
-                assert_eq!((error.code(), error.message()), (400, "Can't access the chat"));
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
             }
             other => panic!("expected the access band, got {other:?}"),
         }
@@ -80659,7 +80671,10 @@ kQIDAQAB\n\
         }
         assert!(rec.sent.lock().is_empty(), "nothing dispatched");
         assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
-        assert!(scores_slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            scores_slot.lock().unwrap().is_none(),
+            "nothing settles offline"
+        );
         assert!(
             td.game_manager.pop_set_game_score_query().is_some(),
             "the set promise parks like the C++ handler holds it"
