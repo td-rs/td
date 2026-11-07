@@ -3394,6 +3394,14 @@ pub(crate) type ReactionNetHandle = NetKindHandle<crate::message_reaction::React
 pub(crate) type InlineMessageNetHandle =
     NetKindHandle<crate::inline_message_manager::InlineMessageNetKind>;
 
+/// The env-carried top-dialog dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the TopDialogManager.cpp
+/// ResultHandler kinds (the toggle/get-top-peers/reset families); the
+/// answers drain through [`Td::on_top_dialog_net_answer`]. Env-carried
+/// over the shared `TdTopDialogEnv` (the ChannelRecommendationManager
+/// families ride the same env).
+pub(crate) type TopDialogNetHandle = NetKindHandle<crate::top_dialog_manager::TopDialogNetKind>;
+
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
 /// the participant/recent-speaker/file planes stay deferred (§5), the
@@ -6293,6 +6301,12 @@ pub struct Td {
     /// The parked inline-message queries (the net-drain 61 family lots
     /// — the C++ handlers' `promise_` members).
     inline_message_net_pending: crate::inline_message_manager::PendingInlineMessageQueries,
+    /// The top-dialog net completed queue (the `TopDialogNetKind`
+    /// tags; the net-drain 61 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_top_dialog_net_answer`].
+    top_dialog_net_completed:
+        Arc<Mutex<Vec<(crate::top_dialog_manager::TopDialogNetKind, NetQuery)>>>,
     /// The bot-recommendation net completed queue (the
     /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6830,6 +6844,7 @@ impl Td {
             inline_message_net_completed: Arc::new(Mutex::new(Vec::new())),
             inline_message_net_pending:
                 crate::inline_message_manager::PendingInlineMessageQueries::default(),
+            top_dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -9151,6 +9166,7 @@ impl Td {
         self.dispatch_completed_game_net();
         self.dispatch_completed_reaction_net();
         self.dispatch_completed_inline_message_net();
+        self.dispatch_completed_top_dialog_net();
         self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9629,6 +9645,18 @@ impl Td {
         Some(InlineMessageNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.inline_message_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned top-dialog dispatch surface the [`TdTopDialogEnv`]
+    /// carries (the net-drain 61 families' send legs) — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn top_dialog_net(&self) -> Option<TopDialogNetHandle> {
+        Some(TopDialogNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.top_dialog_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -18013,6 +18041,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the top-dialog-parked answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 61
+    /// families (TopDialogManager.cpp:43-122).
+    fn dispatch_completed_top_dialog_net(&mut self) {
+        let completed = std::mem::take(&mut *self.top_dialog_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_top_dialog_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20243,6 +20282,77 @@ impl Td {
                         tdutils::log_info!(
                             "Receive an unexpected messages.getInlineGameHighScores answer"
                         )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one top-dialog net answer by kind — the ResultHandler
+    /// halves of the net-drain 61 families (TopDialogManager.cpp:43-122):
+    /// the answers re-enter the manager state machine through the
+    /// landed intakes (the toggle resend machine, the get-top-peers
+    /// sync walk); the reset family is fire-and-forget with the
+    /// `on_get_dialog_error` head on errors (cpp:114-121).
+    fn on_top_dialog_net_answer(
+        &mut self,
+        kind: crate::top_dialog_manager::TopDialogNetKind,
+        query: NetQuery,
+    ) {
+        use crate::top_dialog_manager::TopDialogNetKind as K;
+        match kind {
+            // `ToggleTopPeersQuery::on_result`/`on_error`
+            // (TopDialogManager.cpp:84-93) — any ok answer settles the
+            // promise lambda (the Bool value is ignored).
+            K::ToggleTopPeers { is_enabled } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if parse_wire_bool(query.ok()).is_some() {
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the contacts_toggleTopPeers answer",
+                    ))
+                };
+                let (mut env, top_dialog_manager) = top_dialog_env_split(self);
+                top_dialog_manager.on_toggle_top_peers(&mut env, is_enabled, result);
+            }
+            // `GetTopPeersQuery::on_result`/`on_error`
+            // (TopDialogManager.cpp:57-68)
+            K::GetTopPeers => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::contacts_TopPeers::parse(query.ok()) {
+                        Ok(top_peers) => Ok(top_peers),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse contacts.TopPeers: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the contacts_getTopPeers answer",
+                            ))
+                        }
+                    }
+                };
+                let (mut env, top_dialog_manager) = top_dialog_env_split(self);
+                top_dialog_manager.on_get_top_peers(&mut env, result);
+            }
+            // `ResetTopPeerRatingQuery::on_result`/`on_error`
+            // (TopDialogManager.cpp:106-122) — the result is ignored;
+            // the error runs the `on_get_dialog_error` head with the
+            // logged fallback (cpp:114-121)
+            K::ResetTopPeerRating { dialog_id } => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ResetTopPeerRatingQuery",
+                    ) {
+                        tdutils::log_info!("Receive error for ResetTopPeerRatingQuery: {status}");
                     }
                 }
             }
@@ -48000,6 +48110,7 @@ pub(crate) fn top_dialog_env_split(
     TdTopDialogEnv<'_>,
     &mut crate::top_dialog_manager::TopDialogManager,
 ) {
+    let net = td.top_dialog_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -48017,6 +48128,7 @@ pub(crate) fn top_dialog_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
         },
         top_dialog_manager,
     )
@@ -48028,6 +48140,7 @@ pub(crate) fn recommendation_env_split(
     TdTopDialogEnv<'_>,
     &mut crate::channel_recommendation_manager::ChannelRecommendationManager,
 ) {
+    let net = td.top_dialog_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -48045,6 +48158,7 @@ pub(crate) fn recommendation_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
         },
         channel_recommendation_manager,
     )
@@ -48061,6 +48175,64 @@ pub(crate) struct TdTopDialogEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The net-drain 61 top-dialog dispatch surface (the query send
+    /// legs); `None` keeps the net-inert posture.
+    pub(crate) net: Option<TopDialogNetHandle>,
+}
+
+impl TdTopDialogEnv<'_> {
+    /// The `DialogManager::get_input_peer` ladder over the split
+    /// borrows (the `TdDialogParticipantEnv::dialog_participant_get_input_peer`
+    /// shape — the free function needs a whole-`Td` borrow).
+    fn top_dialog_get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &user_env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &user_env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+    }
 }
 
 fn top_env_user_env<'a>(
@@ -48238,20 +48410,86 @@ impl crate::top_dialog_manager::TopDialogManagerEnv for TdTopDialogEnv<'_> {
         // [blocked: StateManager]
     }
 
-    fn send_toggle_top_peers_query(&mut self, _is_enabled: bool) {
-        // [blocked: net]
+    /// `ToggleTopPeersQuery::send` (TopDialogManager.cpp:78-82) — the
+    /// net-drain 61 send leg over the env-carried handle; the answer
+    /// re-enters the manager through the kind's captured flag (the C++
+    /// promise lambda, cpp:164-167).
+    fn send_toggle_top_peers_query(&mut self, is_enabled: bool) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                crate::top_dialog_manager::TopDialogNetKind::ToggleTopPeers { is_enabled },
+                telegram_api::Function::contacts_toggleTopPeers(
+                    telegram_api::contacts_toggleTopPeers {
+                        enabled: is_enabled,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send contacts.toggleTopPeers — [net-inert]");
+            }
+        }
     }
 
-    fn send_get_top_peers_query(&mut self, _hash: i64) {
-        // [blocked: net]
+    /// `GetTopPeersQuery::send` (TopDialogManager.cpp:49-53) — the ten
+    /// category bits, limit 100 and the vector hash of the registry
+    /// (cpp:490-515's `get_vector_hash` fold).
+    fn send_get_top_peers_query(&mut self, hash: i64) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                crate::top_dialog_manager::TopDialogNetKind::GetTopPeers,
+                telegram_api::Function::contacts_getTopPeers(telegram_api::contacts_getTopPeers {
+                    flags: 0,
+                    correspondents: true,
+                    bots_pm: true,
+                    bots_inline: true,
+                    phone_calls: true,
+                    forward_users: true,
+                    forward_chats: true,
+                    groups: true,
+                    channels: true,
+                    bots_app: true,
+                    bots_guestchat: true,
+                    offset: 0,
+                    limit: 100,
+                    hash,
+                }),
+            ),
+            None => {
+                tdutils::log_info!("Send contacts.getTopPeers — [net-inert]");
+            }
+        }
     }
 
+    /// `ResetTopPeerRatingQuery::send` (TopDialogManager.cpp:100-107) —
+    /// the category mapping + the resolved read peer; the C++ CHECK
+    /// band downgrades to the complete_error file-through so the
+    /// `on_error` head runs.
     fn send_reset_top_peer_rating_query(
         &mut self,
-        _category: crate::top_dialog_manager::TopDialogCategory,
-        _dialog_id: crate::dialog_id::DialogId,
+        category: crate::top_dialog_manager::TopDialogCategory,
+        dialog_id: crate::dialog_id::DialogId,
     ) {
-        // [blocked: net]
+        let kind = crate::top_dialog_manager::TopDialogNetKind::ResetTopPeerRating { dialog_id };
+        match (
+            self.net.clone(),
+            self.top_dialog_get_input_peer(dialog_id, crate::user_manager::AccessRights::Read),
+        ) {
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::contacts_resetTopPeerRating(
+                    telegram_api::contacts_resetTopPeerRating {
+                        category: Some(crate::top_dialog_manager::get_input_top_peer_category(
+                            category,
+                        )),
+                        peer: Some(Box::new(peer)),
+                    },
+                ),
+            ),
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => {
+                tdutils::log_info!("Send contacts.resetTopPeerRating — [net-inert]");
+            }
+        }
     }
 }
 
@@ -83614,6 +83852,188 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.inline_message_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn top_dialog_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(top_dialog_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the TopDialogManager query
+    /// families (TopDialogManager.cpp:43-122) dispatch through the real
+    /// dispatcher and the answers drain through
+    /// `Td::on_top_dialog_net_answer` into the landed intakes — the
+    /// toggle machine through the update_is_enabled entry, the get
+    /// family through the send seam below the [blocked: StateManager]
+    /// first-sync hop, the reset family through the live removeTopChat
+    /// arm.
+    fn top_dialog_net_families_ride_the_dispatcher_impl() {
+        use crate::top_dialog_manager::TopDialogManagerEnv as _;
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-top-dialog");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user_id(&mut td, 700000009, 43);
+
+        // 1. the toggle family — update_is_enabled(false) fires
+        //    ToggleTopPeersQuery (cpp:151-169): the pmc marks the
+        //    pending toggle and the wire carries the false
+        {
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(&mut td);
+            top_dialog_manager.update_is_enabled(&mut env, false);
+        }
+        assert_eq!(
+            td.global.binlog_pmc().get_raw(b"top_peers_enabled"),
+            b"0".to_vec(),
+            "the pending toggle marks the binlog pmc"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_toggleTopPeers::ID,
+        );
+        let body =
+            telegram_api::contacts_toggleTopPeers::parse(sent.query()).expect("the sent body");
+        assert!(!body.enabled);
+
+        // the boolTrue answer settles the machine — the pmc key erases
+        // (on_toggle_top_peers, cpp:171-191)
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]); // boolTrue#997275b5
+        td.dispatch_completed_top_dialog_net();
+        assert!(
+            td.global
+                .binlog_pmc()
+                .get_raw(b"top_peers_enabled")
+                .is_empty(),
+            "the synchronized toggle erases the pmc key"
+        );
+
+        // 2. the toggle error band — the resend-forever machine
+        //    (cpp:186-188) fires a second query
+        {
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(&mut td);
+            top_dialog_manager.update_is_enabled(&mut env, true);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_toggleTopPeers::ID,
+        );
+        net_fail(sent, 500, "test error");
+        td.dispatch_completed_top_dialog_net();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_toggleTopPeers::ID,
+        );
+        let body =
+            telegram_api::contacts_toggleTopPeers::parse(sent.query()).expect("the resent body");
+        assert!(body.enabled, "the resend-forever machine refires");
+        // settle the machine with ok so the lot drains clean
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]);
+        td.dispatch_completed_top_dialog_net();
+
+        // 3. the get family — the send seam below the [blocked:
+        //    StateManager] first-sync hop (GetTopPeersQuery::send,
+        //    cpp:43-56): the ten category bits, limit 100 and the
+        //    vector hash of the empty registry
+        {
+            let (mut env, _top_dialog_manager) = crate::td::top_dialog_env_split(&mut td);
+            env.send_get_top_peers_query(crate::misc::get_vector_hash(&[]));
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getTopPeers::ID,
+        );
+        let body = telegram_api::contacts_getTopPeers::parse(sent.query()).expect("the sent body");
+        assert!(body.correspondents && body.bots_pm && body.bots_inline && body.phone_calls);
+        assert!(body.forward_users && body.forward_chats && body.groups && body.channels);
+        assert!(body.bots_app && body.bots_guestchat);
+        assert_eq!(body.limit, 100);
+        assert_eq!(body.offset, 0);
+        assert_eq!(body.hash, crate::misc::get_vector_hash(&[]));
+
+        // the contacts.topPeers answer applies through the landed
+        // intake (on_get_top_peers, cpp:517-584) — the machine
+        // synchronizes
+        net_complete(
+            sent,
+            wire!(telegram_api::contacts_topPeers {
+                categories: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }),
+        );
+        td.dispatch_completed_top_dialog_net();
+        assert!(
+            td.top_dialog_manager.is_synchronized_for_test(),
+            "the top-peers answer synchronizes the machine"
+        );
+
+        // 4. the reset family through the live removeTopChat arm —
+        //    ResetTopPeerRatingQuery::send (cpp:95-113) with the
+        //    category mapping and the resolved read peer; the promise
+        //    settles locally like the C++
+        td.request(
+            3,
+            Function::removeTopChat(td_api::removeTopChat {
+                chat_id: 700000009,
+                category: Some(td_api::TopChatCategory::topChatCategoryUsers(
+                    td_api::topChatCategoryUsers,
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 3).len() == 1,
+            "the promise settles locally (fire-and-forget wire)"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resetTopPeerRating::ID,
+        );
+        let body =
+            telegram_api::contacts_resetTopPeerRating::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.category,
+            Some(telegram_api::TopPeerCategory::topPeerCategoryCorrespondents(_))
+        ));
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerUser(_))
+        ));
+        // the fire-and-forget error runs the on_get_dialog_error head
+        net_fail(sent, 400, "PEER_ID_INVALID");
+        td.dispatch_completed_top_dialog_net();
+
+        // 5. the net-inert posture — no dispatcher, nothing dispatches
+        let (mut td2, rec2) = netted_td("netdrain61-top-dialog-inert");
+        td2.net_query_dispatcher = None; // the net-inert posture
+        {
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(&mut td2);
+            top_dialog_manager.update_is_enabled(&mut env, false);
+        }
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.top_dialog_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
