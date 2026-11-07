@@ -49,7 +49,6 @@ use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
 use crate::td::AttachMenuEnv;
 use crate::td::BackgroundEnv;
-use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
@@ -352,6 +351,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     global: &mut td.global,
                     options: td.option_manager.as_mut(),
                     user_manager: &mut td.user_manager,
+                    chat_manager: &mut td.chat_manager,
                     device_token_manager: &mut td.device_token_manager,
                     auth_is_bot: td.auth_manager.is_bot(),
                     updates: &mut td.account_updates,
@@ -612,12 +612,22 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             };
             // `OptionManager::get_option` (cpp:758-800): the ConfigManager
             // branch for the content-settings names (is_bot is false until
-            // the AuthManager net step).
+            // the AuthManager net step) + the NotificationManager branch
+            // for the contact-sign-up option (cpp:775-782, net-drain 61).
             if !(td.auth_manager.is_authorized() && td.auth_manager.is_bot())
                 && (name == "can_ignore_sensitive_content_restrictions"
                     || name == "ignore_sensitive_content_restrictions")
             {
                 return td.get_option_content_settings(id, name);
+            }
+            if !(td.auth_manager.is_authorized() && td.auth_manager.is_bot())
+                && name == "disable_contact_registered_notifications"
+                && td
+                    .option_manager
+                    .as_ref()
+                    .is_some_and(crate::option_manager::OptionManager::is_td_inited)
+            {
+                return td.get_option_disable_contact_registered_notifications(id);
             }
             #[allow(clippy::large_enum_variant)] // function-local control flow
             enum Action {
@@ -1575,8 +1585,10 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::getMessageImportConfirmationText(request) => {
-            // `Requests.cpp:2949-2954` — the text answer parks behind the
-            // import-confirmation query ([blocked: net]).
+            // `Requests.cpp:6584-6588` — the live arm routes into the
+            // manager; the text answer rides the `MessageImportNetKind`
+            // plane (CheckHistoryImportPeerQuery,
+            // MessageImportManager.cpp:67-98).
             if !check_is_user(td, id) {
                 return;
             }
@@ -1586,9 +1598,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let (mut message_import_manager, mut env) = crate::td::message_import_env_split(td);
             message_import_manager
                 .get_message_import_confirmation_text(&mut env, dialog_id, promise);
+            td.message_import_manager = message_import_manager;
         }
         Function::getMessageFileType(request) => {
-            // `Requests.cpp:2956-2962`.
+            // `Requests.cpp:6577-6582` — the live arm routes into the
+            // manager; the answer rides the `MessageImportNetKind` plane
+            // (CheckHistoryImportQuery, MessageImportManager.cpp:30-64).
             if !check_is_user(td, id) {
                 return;
             }
@@ -1648,20 +1663,22 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             td.statistics_manager = manager;
         }
         Function::isLoginEmailAddressRequired(_) => {
-            // `Requests.cpp:1893-1898` — the ok answer parks behind the
-            // promo-data query ([blocked: net]).
+            // `Requests.cpp:1893-1898` — the CheckPromoDataQuery answers
+            // the ok/404 bands (SuggestedActionManager.cpp:65-105).
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
             td.suggested_action_manager
                 .is_login_email_address_required(&mut env, promise);
@@ -1674,12 +1691,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise::<td_api::ChatBoostSlots, _>(id, Object::chatBoostSlots);
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_boost_slots(&mut env, promise);
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_boost_slots(&mut env, promise);
+            td.boost_manager = manager;
         }
         Function::getChatBoostFeatures(request) => {
             // `Requests.cpp:3517-3521` — the local feature-table builder
@@ -1687,14 +1701,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            let features = td
-                .boost_manager
-                .get_chat_boost_features_object(&mut env, !request.is_channel);
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            let features = manager.get_chat_boost_features_object(&mut env, !request.is_channel);
+            td.boost_manager = manager;
             td.send_result(id, Object::chatBoostFeatures(features));
         }
         Function::getChatBoostLevelFeatures(request) => {
@@ -1702,16 +1711,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            let features = td.boost_manager.get_chat_boost_level_features_object(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            let features = manager.get_chat_boost_level_features_object(
                 &mut env,
                 !request.is_channel,
                 request.level,
             );
+            td.boost_manager = manager;
             td.send_result(id, Object::chatBoostLevelFeatures(features));
         }
         Function::getChatAvailablePaidMessageReactionSenders(request) => {
@@ -1960,8 +1966,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::getCustomEmojiReactionAnimations(_) => {
-            // Requests.cpp:3913-3917 — the generic-animations set load
-            // parks ([blocked: net]).
+            // Requests.cpp:3913-3917 — the generic-animations special set
+            // rides the ReloadSpecialStickerSetQuery plane (net-drain 59);
+            // offline the promise parks on the per-type lot.
             if !check_is_user(td, id) {
                 return;
             }
@@ -1970,14 +1977,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             stickers_manager.get_custom_emoji_reaction_generic_animations(&mut env, false, promise);
         }
         Function::getForumTopicDefaultIcons(_) => {
-            // Requests.cpp:4827-4831 — the topic-icons set load parks.
+            // Requests.cpp:4827-4831 — the topic-icons special set rides
+            // the ReloadSpecialStickerSetQuery plane (net-drain 59);
+            // offline the promise parks on the per-type lot.
             let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
             let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
             stickers_manager.get_default_topic_icons(&mut env, false, promise);
         }
         Function::getThemedEmojiStatuses(_) => {
-            // Requests.cpp:6815-6819 — the default-statuses set load
-            // parks ([blocked: net]).
+            // Requests.cpp:6815-6819 — the default-statuses special set
+            // rides the ReloadSpecialStickerSetQuery plane (net-drain 59);
+            // offline the promise parks on the per-type lot.
             if !check_is_user(td, id) {
                 return;
             }
@@ -2011,11 +2021,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             stickers_manager.get_premium_stickers(&mut env, request.limit, promise);
         }
         Function::getPremiumInfoSticker(request) => {
-            // Requests.cpp:9011-9015 — the premium-gift set load parks.
+            // Requests.cpp:9011-9015 — the premium-gift special set rides
+            // the ReloadSpecialStickerSetQuery plane (net-drain 59); the
+            // C++ set_value(nullptr) band parks at the response plane.
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<td_api::Sticker, _>(id, Object::sticker);
+            // the C++ `promise.set_value(nullptr sticker)` answers JSON
+            // null (ClientJson.cpp:94-95); the Rust response plane has no
+            // null object, so that band parks (the `send_null_user`
+            // convention)
+            let promise = td.nullable_deferred_promise::<td_api::Sticker, _>(id, Object::sticker);
             let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
             stickers_manager.load_premium_gift_sticker(&mut env, request.month_count, 0, promise);
         }
@@ -6626,6 +6642,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6635,24 +6652,37 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 .confirm_qr_code_authentication(&mut env, &link, promise);
         }
         Function::hideSuggestedAction(request) => {
+            // `Requests.cpp:8144-8148` → the free `dismiss_suggested_action`
+            // ladder (SuggestedAction.cpp:312-355): the type bands answer
+            // inline, everything else rides the DismissSuggestionQuery
+            // wire family and the promise settles from the Bool answer
+            // (SuggestedActionManager.cpp:26-63).
             if !check_is_user(td, id) {
                 return;
             }
             let Some(action) = request.action.as_ref() else {
                 return td.send_error_impl(id, 400, "Action must be non-empty");
             };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
-            td.suggested_action_manager
-                .hide_suggested_action(&mut env, SuggestedAction::from_td_api(action));
-            td.send_result(id, ok_object());
+            let mut manager = std::mem::take(&mut td.suggested_action_manager);
+            crate::suggested_action_manager::dismiss_suggested_action(
+                &mut env,
+                &mut manager,
+                SuggestedAction::from_td_api(action),
+                promise,
+            );
+            td.suggested_action_manager = manager;
         }
         Function::getUserLink(_) => {
             if !check_is_user(td, id) {
@@ -6666,6 +6696,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6684,6 +6715,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6701,6 +6733,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6719,6 +6752,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6737,6 +6771,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6755,6 +6790,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6777,6 +6813,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6801,6 +6838,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6818,6 +6856,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6836,6 +6875,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6857,6 +6897,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6876,6 +6917,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6898,6 +6940,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -9581,16 +9624,13 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::ChatBoostStatus| Object::chatBoostStatus(s));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_dialog_boost_status(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_dialog_boost_status(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 promise,
             );
+            td.boost_manager = manager;
         }
         Function::boostChat(request) => {
             if !check_is_user(td, id) {
@@ -9598,32 +9638,27 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::ChatBoostSlots| Object::chatBoostSlots(s));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.boost_dialog(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.boost_dialog(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &request.slot_ids,
                 promise,
             );
+            td.boost_manager = manager;
         }
         Function::getChatBoostLink(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let result = {
-                let mut env = BoostEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    chat_manager: &mut td.chat_manager,
-                };
-                td.boost_manager.get_dialog_boost_link(
+                let (mut manager, mut env) = crate::td::boost_env_split(td);
+                let result = manager.get_dialog_boost_link(
                     &mut env,
                     crate::dialog_id::DialogId::new(request.chat_id),
-                )
+                );
+                td.boost_manager = manager;
+                result
             };
             match result {
                 Ok((url, is_public)) => td.send_result(
@@ -9645,12 +9680,8 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_dialog_boosts(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_dialog_boosts(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.only_gift_codes,
@@ -9658,24 +9689,24 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 request.limit,
                 promise,
             );
+            td.boost_manager = manager;
         }
         Function::getUserChatBoosts(request) => {
-            if !check_is_user(td, id) {
+            // `Requests.cpp:6065` — the family is bot-only
+            // (`CHECK_IS_BOT`).
+            if !check_is_bot(td, id) {
                 return;
             }
             let promise =
                 td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_user_dialog_boosts(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_user_dialog_boosts(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.user_id,
                 promise,
             );
+            td.boost_manager = manager;
         }
 
         // Everything else waits for its manager step.
@@ -17925,6 +17956,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -17984,6 +18016,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -18726,6 +18759,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,

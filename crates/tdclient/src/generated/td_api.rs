@@ -272,13 +272,13 @@ pub mod tl_json {
         out.push_str(if v { "true" } else { "false" });
     }
 
-    /// The TDObject JSON string writer (td's generated `to_json`, backed by
-    /// `JsonRawString`): ASCII printable literal; short escapes for
-    /// `"`/`\`/`\b\f\n\r\t`; other controls as lowercase `\uXXXX`; every
-    /// non-ASCII byte passes through raw UTF-8 (verified byte-identical
-    /// against the C++ `td_execute` outputs — M.8 corpus). Note this is
-    /// `JsonRawString` semantics, NOT `JsonString`'s all-non-ASCII `\u`
-    /// escaping.
+    /// td's `JsonString` (tdutils/td/utils/JsonBuilder.cpp:60) — the
+    /// string writer behind every generated `to_json` (a `jo("…", s)`
+    /// field goes through `JsonScope::operator<<(Slice)` → JsonString):
+    /// ASCII printable literal; short escapes for `"`/`\`/`\b\f\n\r\t`;
+    /// other controls and ALL non-ASCII as lowercase `\uXXXX`, astral
+    /// codepoints as UTF-16 surrogate pairs (td's `JsonChar`); DEL passes
+    /// through raw.
     pub fn str(out: &mut String, s: &str) {
         out.push('"');
         for c in s.chars() {
@@ -291,7 +291,17 @@ pub mod tl_json {
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
                 c if (c as u32) < 0x20 => escape_one(out, c as u32),
-                _ => out.push(c),
+                c if (c as u32) < 0x80 => out.push(c),
+                c => {
+                    let cp = c as u32;
+                    if cp < 0x10000 {
+                        escape_one(out, cp);
+                    } else {
+                        // td's JsonChar: encoded as a UTF-16 surrogate pair.
+                        escape_one(out, 0xD7C0 + (cp >> 10));
+                        escape_one(out, 0xDC00 + (cp & 0x3FF));
+                    }
+                }
             }
         }
         out.push('"');

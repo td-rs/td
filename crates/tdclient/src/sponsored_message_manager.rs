@@ -240,9 +240,10 @@ pub trait SponsoredMessageManagerEnv {
     /// answers None.
     fn get_photo_object(&self, photo: &Photo) -> Option<td_api::Photo>;
 
-    // -- the `[blocked: net]` query tails; the answers route through the
-    // -- on_get_* intakes, the click/report promises stay parked in the
-    // -- manager's pending vectors
+    // -- the net-plane query tails (the Td arms dispatch through the
+    // -- `SponsoredNetKind` plane, net-drain; the answers route through
+    // -- the on_get_* intakes, the click/report promises stay parked in
+    // -- the manager's pending vectors; the offline test env parks)
     /// `GetSponsoredMessagesQuery` (SponsoredMessageManager.cpp:37-74);
     /// an empty `message_id` is the per-dialog fetch, otherwise the
     /// per-message video fetch with the MSG_ID_MASK flag.
@@ -1665,7 +1666,8 @@ mod tests {
         let mut manager = SponsoredMessageManager::new();
         let (promise, fulfilled, failed) = flag_promise::<td_api::SponsoredMessages>();
         manager.get_dialog_sponsored_messages(&mut env, DialogId::new(1), promise);
-        // the query tail is [blocked: net] — the promise stays unanswered
+        // the offline test env parks the query tail — the promise stays
+        // unanswered (the Td arm dispatches)
         assert!(!fulfilled.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!failed.load(std::sync::atomic::Ordering::SeqCst));
     }

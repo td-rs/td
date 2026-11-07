@@ -3,10 +3,12 @@
 //!
 //! The manager is the collapsed actor: [`Td`](crate::td::Td) owns the
 //! struct, the [`TopDialogManagerEnv`] trait carries the
-//! `G()`/option/pmc/cross-manager surfaces, and every `create_handler<...>`
-//! network tail is an env seam marked `[blocked: net]` — the C++ promise
-//! lands in the query and stays unanswered offline, exactly like the
-//! collapsed-line convention. The `StateManager::wait_first_sync` hop and
+//! `G()`/option/pmc/cross-manager surfaces, and the three query families
+//! (TopDialogManager.cpp:43-122) ride the net-drain 61
+//! `TopDialogNetKind` plane — the env-carried handle dispatches the wire
+//! queries and the answers drain through
+//! `crate::td::Td::on_top_dialog_net_answer` into the landed intakes.
+//! The `StateManager::wait_first_sync` hop and
 //! the `MessagesManager::load_dialogs` hop are the same kind of seam (the
 //! first waits for the net-backed state machine, the second is the M.10
 //! dialog plane), so `TopDialogManager::on_first_sync` and
@@ -103,6 +105,30 @@ pub fn get_top_dialog_category_from_td_api(
         td_api::TopChatCategory::topChatCategoryWebAppBots(_) => TopDialogCategory::BotApp,
         td_api::TopChatCategory::topChatCategoryGuestBots(_) => TopDialogCategory::BotGuest,
     }
+}
+
+/// The in-flight query kinds of the net-drain 61 top-dialog families —
+/// the C++ `Td::ResultHandler` query classes (TopDialogManager.cpp:43-122)
+/// collapsed onto dispatcher tags; the answers drain through
+/// [`crate::td::Td::on_top_dialog_net_answer`] over the env-carried
+/// [`crate::td::TopDialogNetHandle`]. The handlers park no external
+/// promises (the toggle/get answers re-enter the manager state machine
+/// through their own lambdas, cpp:44-67/70-93; the reset query is
+/// fire-and-forget), so the kinds carry the lambda captures the intakes
+/// read — the toggle's `is_enabled` and the reset's `dialog_id_` for the
+/// `on_error` head (cpp:114-121).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopDialogNetKind {
+    /// `ToggleTopPeersQuery` (TopDialogManager.cpp:70-93) —
+    /// `contacts.toggleTopPeers`; the answer re-enters
+    /// `on_toggle_top_peers` with the captured flag (cpp:164-167).
+    ToggleTopPeers { is_enabled: bool },
+    /// `GetTopPeersQuery` (TopDialogManager.cpp:43-68) —
+    /// `contacts.getTopPeers`; the answer re-enters `on_get_top_peers`.
+    GetTopPeers,
+    /// `ResetTopPeerRatingQuery` (TopDialogManager.cpp:95-122) —
+    /// `contacts.resetTopPeerRating`, fire-and-forget.
+    ResetTopPeerRating { dialog_id: DialogId },
 }
 
 /// `get_top_dialog_category(const telegram_api::TopPeerCategory &)` — the
@@ -348,8 +374,9 @@ pub trait TopDialogManagerEnv {
     /// (`[blocked: StateManager]` — the net-backed state machine).
     fn wait_first_sync(&mut self);
 
-    // -- the `[blocked: net]` query tails; each one drops its promise,
-    // -- which keeps the C++ request unanswered offline
+    // -- the net-drain 61 query send arms (the td.rs overrides dispatch
+    // -- through the TopDialogNetKind plane; the defaults keep the
+    // -- offline unit-test posture)
     /// `ToggleTopPeersQuery` (TopDialogManager.cpp:70-93); the promise
     /// routes back to `TopDialogManager::on_toggle_top_peers`.
     fn send_toggle_top_peers_query(&mut self, is_enabled: bool);
@@ -464,6 +491,13 @@ impl std::fmt::Debug for TopDialogManager {
 impl TopDialogManager {
     pub fn new() -> TopDialogManager {
         TopDialogManager::default()
+    }
+
+    /// The netted round-trip probe — `is_synchronized_` after the
+    /// `contacts.getTopPeers` answer (cpp:530).
+    #[cfg(test)]
+    pub(crate) fn is_synchronized_for_test(&self) -> bool {
+        self.is_synchronized
     }
 
     /// `TopDialogManager::update_is_enabled` (TopDialogManager.cpp:127-138).

@@ -3187,11 +3187,32 @@ pub(crate) enum AccountNetKind {
     /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_accept_terms_of_service`]
     /// with the parked request promise.
     AcceptTermsOfService,
+    /// `DismissSuggestionQuery` (SuggestedActionManager.cpp:26-63) — the
+    /// `help.dismissSuggestion` send; the kind carries the parked lot key
+    /// `(dialog_id, type)` so the answer pops the exact lot; the Bool
+    /// answer (either value) routes the ok half of
+    /// [`crate::suggested_action_manager::SuggestedActionManager::on_dismiss_suggested_action`].
+    DismissSuggestion { dialog_id: i64, action_type: i32 },
+    /// `CheckPromoDataQuery` (SuggestedActionManager.cpp:65-105) — the
+    /// login-email promo check over `help.getPromoData`; the answer
+    /// settles the parked request promise directly (the
+    /// SETUP_LOGIN_EMAIL scan, the 404 "Not Found" band).
+    CheckPromoData,
 }
 
 /// The cloned account dispatch surface the [`AccountEnv`] senders use —
 /// the answers drain through [`Td::on_account_net_answer`].
 type AccountNetHandle = NetKindHandle<AccountNetKind>;
+
+/// The cloned inline-queries dispatch surface the
+/// [`crate::inline_queries_manager::InlineQueriesManager`] holds — the
+/// per-kind handle over the InlineQueriesManager.cpp ResultHandler kinds
+/// (the net-drain 48 plane); the answers drain through
+/// [`Td::dispatch_completed_inline_queries_net`]. Manager-held (the
+/// [`crate::inline_queries_manager::InlineQueriesManager::net`] field, the
+/// forum-topic shape): the send legs run inside the manager.
+pub(crate) type InlineQueriesNetHandle =
+    NetKindHandle<crate::inline_queries_manager::InlineQueriesNetKind>;
 
 /// The StarManager in-flight query kinds — the C++ ResultHandler classes
 /// of StarManager.cpp:49-1400.
@@ -3341,9 +3362,81 @@ pub(crate) type GroupCallNetHandle = NetKindHandle<crate::group_call_manager::Gr
 /// answers drain through [`Td::on_call_net_answer`].
 pub(crate) type CallNetHandle = NetKindHandle<crate::call_manager::CallNetKind>;
 
+/// The cloned message-import dispatch surface the
+/// [`MessageImportManagerEnv`] send legs use — the per-kind handle over
+/// the two head-query ResultHandler classes of
+/// MessageImportManager.cpp:30-98 (the net-drain 58 plane: the
+/// file-type and confirmation-text checks); the answers drain through
+/// [`Td::dispatch_completed_message_import_net`]. Env-held like the
+/// transcription plane: the whole-Td env view resolves the write peer
+/// at the send leg.
+pub(crate) type MessageImportNetHandle =
+    NetKindHandle<crate::message_import_manager::MessageImportNetKind>;
+
 /// The cloned poll dispatch surface the `PollManagerEnv` senders hold —
 /// the answers drain through [`Td::on_poll_net_answer`].
 pub(crate) type PollNetHandle = NetKindHandle<crate::poll_manager::PollNetKind>;
+
+/// The cloned callback-query dispatch surface the
+/// [`crate::callback_queries_manager::CallbackQueriesManager`] holds —
+/// the per-kind handle over the CallbackQueriesManager.cpp ResultHandler
+/// kinds (the net-drain 49 plane: the get/set callback-answer families);
+/// the answers drain through [`Td::on_callback_net_answer`].
+/// Manager-held (the `GroupCallManager::net` shape): the send legs run
+/// inside the manager over the shared [`BotEnv`] view's peer reads.
+pub(crate) type CallbackNetHandle = NetKindHandle<crate::callback_queries_manager::CallbackNetKind>;
+
+/// The env-carried message-reaction dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the MessageReaction.cpp
+/// ResultHandler kinds (`messages.getMessageReactionsList`/
+/// `messages.reportReaction`); the answers drain through
+/// [`Td::on_reaction_net_answer`]. Env-carried (the `PollNetHandle`
+/// shape — the value-plane module has no manager struct, the send legs
+/// run inside the env send arms over the split borrows' peer reads).
+pub(crate) type ReactionNetHandle = NetKindHandle<crate::message_reaction::ReactionNetKind>;
+
+/// The env-carried inline-message dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the InlineMessageManager.cpp
+/// ResultHandler kinds (the edit/set-score/high-scores families, each
+/// routed to the inline message's own DC); the answers drain through
+/// [`Td::on_inline_message_net_answer`]. Env-carried over the shared
+/// `TdInlineEnv` (the inline-queries families ride the same env).
+pub(crate) type InlineMessageNetHandle =
+    NetKindHandle<crate::inline_message_manager::InlineMessageNetKind>;
+
+/// The env-carried top-dialog dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the TopDialogManager.cpp
+/// ResultHandler kinds (the toggle/get-top-peers/reset families); the
+/// answers drain through [`Td::on_top_dialog_net_answer`]. Env-carried
+/// over the shared `TdTopDialogEnv` (the ChannelRecommendationManager
+/// families ride the same env).
+pub(crate) type TopDialogNetHandle = NetKindHandle<crate::top_dialog_manager::TopDialogNetKind>;
+
+/// The env-carried channel-recommendation dispatch surface (the
+/// net-drain 61 plane): the per-kind handle over the
+/// ChannelRecommendationManager.cpp ResultHandler kind (the two
+/// GetChannelRecommendationsQuery forms — the recommended-channels
+/// reload and the per-channel similar-chats reload); the answers drain
+/// through [`Td::on_channel_recommendation_net_answer`]. Env-carried
+/// over the shared `TdTopDialogEnv` (the top-dialog families ride the
+/// same env).
+pub(crate) type ChannelRecommendationNetHandle =
+    NetKindHandle<crate::channel_recommendation_manager::ChannelRecommendationNetKind>;
+
+/// The manager-held device-token dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the DeviceTokenManager.cpp wire
+/// sends (the account.registerDevice/account.unregisterDevice loop,
+/// cpp:384-410); the answers drain through
+/// [`Td::on_device_token_net_answer`].
+pub(crate) type DeviceTokenNetHandle =
+    NetKindHandle<crate::device_token_manager::DeviceTokenNetKind>;
+
+/// The manager-held notification dispatch surface (the net-drain 61
+/// plane): the per-kind handle over the NotificationManager.cpp wire
+/// sends (the contact-sign-up register-sync pair, cpp:73-127); the
+/// answers drain through [`Td::on_notification_net_answer`].
+pub(crate) type NotificationNetHandle =
+    NetKindHandle<crate::notification_manager::NotificationNetKind>;
 
 /// `get_group_call_object` (GroupCallManager.cpp:2934-3060) — the
 /// `td_api::groupCall` build over the port record. The thin-model form:
@@ -3669,6 +3762,33 @@ pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::
 pub(crate) type TranscriptionNetHandle =
     NetKindHandle<crate::transcription_manager::TranscriptionNetKind>;
 
+/// The cloned game dispatch surface the
+/// [`crate::game_manager::GameManager`] holds — the per-kind handle over
+/// the GameManager.cpp ResultHandler kinds (the net-drain 57 plane: the
+/// setGameScore/getGameHighScores families); the answers drain through
+/// [`Td::dispatch_completed_game_net`]. Manager-held (the
+/// [`crate::game_manager::GameManager::net`] field, the forum-topic
+/// shape): the send legs run inside the manager over the env's
+/// peer/input-user reads.
+pub(crate) type GameNetHandle = NetKindHandle<crate::game_manager::GameNetKind>;
+/// The cloned bot-recommendation dispatch surface the
+/// [`crate::bot_recommendation_manager::BotRecommendationManager`] holds
+/// — the net-drain 53 family's send leg (`GetBotRecommendationsQuery`,
+/// BotRecommendationManager.cpp:30-64); the answers drain through
+/// [`Td::on_bot_recommendation_net_answer`]. Manager-held (the
+/// forum-topic shape): the send leg runs inside the manager over the
+/// env's input-user reads.
+pub(crate) type BotRecommendationNetHandle =
+    NetKindHandle<crate::bot_recommendation_manager::BotRecommendationNetKind>;
+
+/// The cloned stickers dispatch surface the
+/// [`crate::stickers_manager::StickersManager`] holds — the net-drain 59
+/// families' send legs (the `StickersManager.cpp` ResultHandler query
+/// classes); the answers drain through [`Td::on_stickers_net_answer`].
+/// Manager-held (the bot-recommendation shape): the send legs run inside
+/// the manager over the env's file-plane reads.
+pub(crate) type StickersNetHandle = NetKindHandle<crate::stickers_manager::StickersNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -3683,6 +3803,14 @@ pub(crate) type WebPagesNetHandle = NetKindHandle<crate::web_pages_manager::WebP
 /// Manager-held (the forum-topic shape): the send legs run inside the
 /// manager over the env's input-user reads.
 pub(crate) type AttachMenuNetHandle = NetKindHandle<crate::attach_menu_manager::AttachMenuNetKind>;
+/// The cloned boost dispatch surface the
+/// [`crate::boost_manager::BoostManager`] holds — the per-kind handle
+/// over the BoostManager.cpp ResultHandler kinds (the net-drain 59
+/// families); the answers drain through
+/// [`Td::dispatch_completed_boost_net`]. Manager-held (the
+/// [`crate::game_manager::GameManager::net`] shape): the send legs run
+/// inside the manager over the env's peer/input-user reads.
+pub(crate) type BoostNetHandle = NetKindHandle<crate::boost_manager::BoostNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -6003,6 +6131,17 @@ pub struct Td {
     /// The call net completed queue (the `CallNetKind` answers park
     /// here; the drain routes them through `Td::on_call_net_answer`).
     call_net_completed: Arc<Mutex<Vec<(crate::call_manager::CallNetKind, NetQuery)>>>,
+    /// The message-import net completed queue (the
+    /// `MessageImportNetKind` answers park here; the drain routes them
+    /// through `Td::on_message_import_net_answer`).
+    message_import_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::message_import_manager::MessageImportNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The poll net completed queue (the `PollNetKind` answers park
     /// here; the drain routes them through `Td::on_poll_net_answer`).
     poll_net_completed: Arc<Mutex<Vec<(crate::poll_manager::PollNetKind, NetQuery)>>>,
@@ -6175,12 +6314,107 @@ pub struct Td {
     /// through [`Td::on_transcription_net_answer`].
     transcription_net_completed:
         Arc<Mutex<Vec<(crate::transcription_manager::TranscriptionNetKind, NetQuery)>>>,
+    /// The inline-queries net completed queue (the
+    /// `InlineQueriesNetKind` tags; the net-drain 48 families) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_inline_queries_net_answer`].
+    inline_queries_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::inline_queries_manager::InlineQueriesNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The attach-menu net completed queue (the `AttachMenuNetKind`
     /// tags; the net-drain 42 families) — the dispatcher callbacks park
     /// here, the actor pump routes them through
     /// [`Td::on_attach_menu_net_answer`].
     attach_menu_net_completed:
         Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
+    /// The boost net completed queue (the `BoostNetKind` tags; the
+    /// net-drain 59 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_boost_net_answer`].
+    boost_net_completed: Arc<Mutex<Vec<(crate::boost_manager::BoostNetKind, NetQuery)>>>,
+    /// The callback-query net completed queue (the `CallbackNetKind`
+    /// tags; the net-drain 49 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_callback_net_answer`].
+    callback_net_completed:
+        Arc<Mutex<Vec<(crate::callback_queries_manager::CallbackNetKind, NetQuery)>>>,
+    /// The game net completed queue (the `GameNetKind` tags; the
+    /// net-drain 57 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_game_net_answer`].
+    game_net_completed: Arc<Mutex<Vec<(crate::game_manager::GameNetKind, NetQuery)>>>,
+    /// The message-reaction net completed queue (the `ReactionNetKind`
+    /// tags; the net-drain 61 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_reaction_net_answer`].
+    reaction_net_completed: Arc<Mutex<Vec<(crate::message_reaction::ReactionNetKind, NetQuery)>>>,
+    /// The parked message-reaction queries (the net-drain 61 family
+    /// lots — the C++ handlers' `promise_` + non-Copy members).
+    reaction_net_pending: crate::message_reaction::PendingReactionQueries,
+    /// The inline-message net completed queue (the
+    /// `InlineMessageNetKind` tags; the net-drain 61 families) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_inline_message_net_answer`].
+    inline_message_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::inline_message_manager::InlineMessageNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
+    /// The parked inline-message queries (the net-drain 61 family lots
+    /// — the C++ handlers' `promise_` members).
+    inline_message_net_pending: crate::inline_message_manager::PendingInlineMessageQueries,
+    /// The top-dialog net completed queue (the `TopDialogNetKind`
+    /// tags; the net-drain 61 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_top_dialog_net_answer`].
+    top_dialog_net_completed:
+        Arc<Mutex<Vec<(crate::top_dialog_manager::TopDialogNetKind, NetQuery)>>>,
+    /// The channel-recommendation net completed queue (the
+    /// `ChannelRecommendationNetKind` tags; the net-drain 61 family)
+    /// — the dispatcher callbacks park here, the actor pump routes
+    /// them through [`Td::on_channel_recommendation_net_answer`].
+    channel_recommendation_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::channel_recommendation_manager::ChannelRecommendationNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
+    /// The device-token net completed queue (the `DeviceTokenNetKind`
+    /// tags; the net-drain 61 family) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_device_token_net_answer`].
+    device_token_net_completed:
+        Arc<Mutex<Vec<(crate::device_token_manager::DeviceTokenNetKind, NetQuery)>>>,
+    /// The notification net completed queue (the `NotificationNetKind`
+    /// tags; the net-drain 61 families) — the dispatcher callbacks park
+    /// here, the actor pump routes them through
+    /// [`Td::on_notification_net_answer`].
+    notification_net_completed:
+        Arc<Mutex<Vec<(crate::notification_manager::NotificationNetKind, NetQuery)>>>,
+    /// The bot-recommendation net completed queue (the
+    /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_bot_recommendation_net_answer`].
+    bot_recommendation_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::bot_recommendation_manager::BotRecommendationNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
+    /// The stickers net completed queue (the `StickersNetKind` tags; the
+    /// net-drain 59 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_stickers_net_answer`].
+    stickers_net_completed: Arc<Mutex<Vec<(crate::stickers_manager::StickersNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6658,6 +6892,7 @@ impl Td {
             pending_background_queries: PendingBackgroundQueries::default(),
             group_call_net_completed: Arc::new(Mutex::new(Vec::new())),
             call_net_completed: Arc::new(Mutex::new(Vec::new())),
+            message_import_net_completed: Arc::new(Mutex::new(Vec::new())),
             poll_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_info_promises: Vec::new(),
@@ -6697,7 +6932,22 @@ impl Td {
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
+            inline_queries_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
+            boost_net_completed: Arc::new(Mutex::new(Vec::new())),
+            callback_net_completed: Arc::new(Mutex::new(Vec::new())),
+            game_net_completed: Arc::new(Mutex::new(Vec::new())),
+            reaction_net_completed: Arc::new(Mutex::new(Vec::new())),
+            reaction_net_pending: crate::message_reaction::PendingReactionQueries::default(),
+            inline_message_net_completed: Arc::new(Mutex::new(Vec::new())),
+            inline_message_net_pending:
+                crate::inline_message_manager::PendingInlineMessageQueries::default(),
+            top_dialog_net_completed: Arc::new(Mutex::new(Vec::new())),
+            channel_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
+            device_token_net_completed: Arc::new(Mutex::new(Vec::new())),
+            notification_net_completed: Arc::new(Mutex::new(Vec::new())),
+            bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
+            stickers_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7191,6 +7441,14 @@ impl Td {
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
+        self.inline_queries_manager.net = self.inline_queries_net();
+        self.boost_manager.net = self.boost_net();
+        self.callback_queries_manager.net = self.callback_net();
+        self.game_manager.net = self.game_net();
+        self.bot_recommendation_manager.net = self.bot_recommendation_net();
+        self.device_token_manager.net = self.device_token_net();
+        self.notification_manager.net = self.notification_net();
+        self.stickers_manager.net = self.stickers_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -7634,6 +7892,10 @@ impl Td {
                 self.get_option_content_settings(request_id, name);
                 continue;
             }
+            if name == "disable_contact_registered_notifications" {
+                self.get_option_disable_contact_registered_notifications(request_id);
+                continue;
+            }
             let Some(option_manager) = self.option_manager.as_ref() else {
                 break;
             };
@@ -7747,6 +8009,7 @@ impl Td {
                 global: &mut self.global,
                 options: self.option_manager.as_mut(),
                 user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
                 device_token_manager: &mut self.device_token_manager,
                 auth_is_bot: self.auth_manager.is_bot(),
                 updates: &mut self.account_updates,
@@ -8979,6 +9242,7 @@ impl Td {
         self.dispatch_completed_background_net();
         self.dispatch_completed_group_call_net();
         self.dispatch_completed_call_net();
+        self.dispatch_completed_message_import_net();
         self.dispatch_completed_poll_net();
         self.dispatch_completed_statistics_net();
         self.dispatch_completed_support_net();
@@ -9008,7 +9272,19 @@ impl Td {
         self.dispatch_completed_forum_topic_net();
         self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
+        self.dispatch_completed_inline_queries_net();
         self.dispatch_completed_attach_menu_net();
+        self.dispatch_completed_boost_net();
+        self.dispatch_completed_callback_net();
+        self.dispatch_completed_game_net();
+        self.dispatch_completed_reaction_net();
+        self.dispatch_completed_inline_message_net();
+        self.dispatch_completed_top_dialog_net();
+        self.dispatch_completed_channel_recommendation_net();
+        self.dispatch_completed_device_token_net();
+        self.dispatch_completed_notification_net();
+        self.dispatch_completed_bot_recommendation_net();
+        self.dispatch_completed_stickers_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9125,6 +9401,16 @@ impl Td {
         })
     }
 
+    /// The cloned message-import dispatch surface (the net-drain 58
+    /// families' send legs — the whole-Td env reads it at the send).
+    pub(crate) fn message_import_net(&self) -> Option<MessageImportNetHandle> {
+        Some(MessageImportNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.message_import_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned poll dispatch surface the `PollManagerEnv` senders
     /// hold — `None` keeps the net-inert posture (the pre-init windows
     /// and the net-inert tests).
@@ -9132,6 +9418,18 @@ impl Td {
         Some(PollNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.poll_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned callback-query dispatch surface the
+    /// [`crate::callback_queries_manager::CallbackQueriesManager`] holds
+    /// (the net-drain 49 families' send legs) — `None` keeps the
+    /// net-inert posture (the pre-init windows and the net-inert tests).
+    pub(crate) fn callback_net(&self) -> Option<CallbackNetHandle> {
+        Some(CallbackNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.callback_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -9421,6 +9719,18 @@ impl Td {
         })
     }
 
+    /// The cloned inline-queries dispatch surface the
+    /// [`crate::inline_queries_manager::InlineQueriesManager`] holds (the
+    /// net-drain 48 families' send legs) — `None` keeps the net-inert
+    /// posture.
+    pub(crate) fn inline_queries_net(&self) -> Option<InlineQueriesNetHandle> {
+        Some(InlineQueriesNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.inline_queries_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned attach-menu dispatch surface the
     /// [`crate::attach_menu_manager::AttachMenuManager`] holds — `None`
     /// keeps the net-inert posture (the pre-init windows and the
@@ -9429,6 +9739,124 @@ impl Td {
         Some(AttachMenuNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.attach_menu_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned boost dispatch surface the
+    /// [`crate::boost_manager::BoostManager`] holds (the net-drain 59
+    /// families' send legs) — `None` keeps the net-inert posture.
+    pub(crate) fn boost_net(&self) -> Option<BoostNetHandle> {
+        Some(BoostNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.boost_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned game dispatch surface the
+    /// [`crate::game_manager::GameManager`] holds (the net-drain 57
+    /// families' send legs) — `None` keeps the net-inert posture.
+    pub(crate) fn game_net(&self) -> Option<GameNetHandle> {
+        Some(GameNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.game_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned message-reaction dispatch surface the
+    /// [`TdMessageReactionQueryEnv`] carries (the net-drain 61
+    /// families' send legs) — `None` keeps the net-inert posture (the
+    /// pre-init windows and the net-inert tests).
+    pub(crate) fn reaction_net(&self) -> Option<ReactionNetHandle> {
+        Some(ReactionNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.reaction_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned inline-message dispatch surface the [`TdInlineEnv`]
+    /// carries (the net-drain 61 families' send legs) — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn inline_message_net(&self) -> Option<InlineMessageNetHandle> {
+        Some(InlineMessageNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.inline_message_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned top-dialog dispatch surface the [`TdTopDialogEnv`]
+    /// carries (the net-drain 61 families' send legs) — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn top_dialog_net(&self) -> Option<TopDialogNetHandle> {
+        Some(TopDialogNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.top_dialog_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned channel-recommendation dispatch surface the
+    /// [`TdTopDialogEnv`] carries (the net-drain 61 family's send
+    /// legs) — `None` keeps the net-inert posture (the pre-init
+    /// windows and the net-inert tests).
+    pub(crate) fn channel_recommendation_net(&self) -> Option<ChannelRecommendationNetHandle> {
+        Some(ChannelRecommendationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.channel_recommendation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned device-token dispatch surface the
+    /// [`crate::device_token_manager::DeviceTokenManager`] holds (the
+    /// net-drain 61 family's send legs) — `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests).
+    pub(crate) fn device_token_net(&self) -> Option<DeviceTokenNetHandle> {
+        Some(DeviceTokenNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.device_token_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned notification dispatch surface the
+    /// [`crate::notification_manager::NotificationManager`] holds (the
+    /// net-drain 61 families' send legs) — `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests).
+    pub(crate) fn notification_net(&self) -> Option<NotificationNetHandle> {
+        Some(NotificationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.notification_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned bot-recommendation dispatch surface the
+    /// [`crate::bot_recommendation_manager::BotRecommendationManager`]
+    /// holds — `None` keeps the net-inert posture (the pre-init windows
+    /// and the net-inert tests).
+    pub(crate) fn bot_recommendation_net(&self) -> Option<BotRecommendationNetHandle> {
+        Some(BotRecommendationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.bot_recommendation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned stickers dispatch surface the
+    /// [`crate::stickers_manager::StickersManager`] holds — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn stickers_net(&self) -> Option<StickersNetHandle> {
+        Some(StickersNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.stickers_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10703,6 +11131,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.call_net_completed.lock());
         for (kind, query) in completed {
             self.on_call_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked message-import answers — the C++
+    /// ResultHandler on_result/on_error halves of the net-drain 58
+    /// head-query families (MessageImportManager.cpp:30-98).
+    fn dispatch_completed_message_import_net(&mut self) {
+        let completed = std::mem::take(&mut *self.message_import_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_message_import_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -16535,8 +16974,8 @@ impl Td {
                             )),
                         }
                     };
-                    let mut manager = std::mem::take(&mut self.premium_manager);
-                    manager.on_get_premium_gift_options(result, promise);
+                    let (mut manager, mut env) = premium_env_split(self);
+                    manager.on_get_premium_gift_options(&mut env, result, promise);
                     self.premium_manager = manager;
                 }
             }
@@ -17725,6 +18164,468 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked inline-query answers — the C++
+    /// ResultHandler halves of the net-drain 48 families
+    /// (InlineQueriesManager.cpp:67-455).
+    fn dispatch_completed_inline_queries_net(&mut self) {
+        let completed = std::mem::take(&mut *self.inline_queries_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_inline_queries_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one inline-query net answer by kind — the ResultHandler
+    /// halves of the net-drain 48 families (InlineQueriesManager.cpp:
+    /// 67-455): the wire answers parse here, run the landed intakes and
+    /// settle the parked family promises exactly where the C++ handler
+    /// settles them (the parse failures run the same `on_error` tails the
+    /// C++ `fetch_result` failure would).
+    fn on_inline_queries_net_answer(
+        &mut self,
+        kind: crate::inline_queries_manager::InlineQueriesNetKind,
+        query: NetQuery,
+    ) {
+        use crate::inline_queries_manager::InlineQueriesNetKind as K;
+        match kind {
+            // `GetInlineBotResultsQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:94-121) — the answer routes
+            // `on_get_inline_query_results` with the handler's re-entry
+            // key triple and the parked promise; the error tail rewrites
+            // the cancel (cpp:112-114) and the bot timeout (cpp:115-117),
+            // runs the nullptr intake for the query hash, then errors the
+            // promise.
+            K::GetInlineBotResults {
+                dialog_id,
+                bot_user_id,
+                query_hash,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotResults::parse(query.ok()) {
+                        Ok(results) => Ok(results),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.botResults: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getInlineBotResults answer",
+                            ))
+                        }
+                    }
+                };
+                let result = match result {
+                    Err(status) => {
+                        let status = if status.code() == tdnet::net_query::CANCELED_ERROR_CODE {
+                            Status::error(406, "Request canceled")
+                        } else if status.message() == "BOT_RESPONSE_TIMEOUT" {
+                            Status::error(502, "The bot is not responding")
+                        } else {
+                            status
+                        };
+                        if status.is_error() {
+                            tdutils::log_info!(
+                                "Receive error for GetInlineBotResultsQuery: {status}"
+                            );
+                        }
+                        Err(status)
+                    }
+                    ok => ok,
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_get_inline_bot_results_promise();
+                match (result, promise) {
+                    (Ok(results), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_inline_query_results(
+                            &mut env,
+                            dialog_id,
+                            bot_user_id,
+                            query_hash,
+                            Some(results),
+                            promise,
+                        );
+                    }
+                    (Err(status), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_inline_query_results(
+                            &mut env,
+                            dialog_id,
+                            bot_user_id,
+                            query_hash,
+                            None,
+                            Promise::default(),
+                        );
+                        let mut promise = promise;
+                        promise.set_error(status);
+                    }
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.getInlineBotResults answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `SetInlineBotResultsQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:153-165) — the Bool answer settles
+            // the parked promise ok either way (the `!result` band only
+            // logs, cpp:156-159); the error band forwards the status.
+            K::SetInlineBotResults => {
+                let status = if query.is_error() {
+                    Some(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(false) => {
+                            tdutils::log_error!("Sending answer to an inline query has failed");
+                            None
+                        }
+                        Some(true) => None,
+                        None => Some(Status::error(
+                            500,
+                            "Failed to parse the messages_setInlineBotResults answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_set_inline_bot_results_promise();
+                match (status, promise) {
+                    (None, Some(mut promise)) => promise.set_value(()),
+                    (Some(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.setInlineBotResults answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `SetBotGuestChatResultQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:184-196) — the
+            // InputBotInlineMessageID answer folds through
+            // get_inline_message_id into the inlineMessageId object.
+            K::SetBotGuestChatResult => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::InputBotInlineMessageID::parse(query.ok()) {
+                        Ok(id) => Ok(id),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse InputBotInlineMessageID: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_setBotGuestChatResult answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_set_bot_guest_chat_result_promise();
+                match (result, promise) {
+                    (Ok(id), Some(mut promise)) => promise.set_value(td_api::InlineMessageId {
+                        id: crate::inline_queries_manager::get_inline_message_id(Some(id)),
+                    }),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.setBotGuestChatResult answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `SavePreparedInlineMessageQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:223-231) — the
+            // messages.BotPreparedInlineMessage answer settles the
+            // preparedInlineMessageId id/expiry pair.
+            K::SavePreparedInlineMessage => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotPreparedInlineMessage::parse(query.ok()) {
+                        Ok(prepared) => Ok(prepared),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.botPreparedInlineMessage: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_savePreparedInlineMessage answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_save_prepared_inline_message_promise();
+                match (result, promise) {
+                    (Ok(prepared), Some(mut promise)) => {
+                        promise.set_value(td_api::PreparedInlineMessageId {
+                            id: prepared.id,
+                            expiration_date: prepared.expire_date,
+                        })
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.savePreparedInlineMessage answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `GetPreparedInlineMessageQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:252-266) — the answer routes
+            // `on_get_prepared_inline_message` with the handler's
+            // re-entry key pair and the parked promise; the error half
+            // runs the nullptr intake for the query hash first
+            // (cpp:263-265).
+            K::GetPreparedInlineMessage {
+                bot_user_id,
+                query_hash,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_PreparedInlineMessage::parse(query.ok()) {
+                        Ok(prepared) => Ok(prepared),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.preparedInlineMessage: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getPreparedInlineMessage answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_get_prepared_inline_message_promise();
+                match (result, promise) {
+                    (Ok(prepared), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_prepared_inline_message(
+                            &mut env,
+                            bot_user_id,
+                            query_hash,
+                            Some(prepared),
+                            promise,
+                        );
+                    }
+                    (Err(status), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_prepared_inline_message(
+                            &mut env,
+                            bot_user_id,
+                            query_hash,
+                            None,
+                            Promise::default(),
+                        );
+                        let mut promise = promise;
+                        promise.set_error(status);
+                    }
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.getPreparedInlineMessage answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `SavePreparedKeyboardButtonQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:283-295) — the bots.RequestedButton
+            // answer settles the prepared button id.
+            K::SavePreparedKeyboardButton => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::bots_RequestedButton::parse(query.ok()) {
+                        Ok(button) => Ok(button),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse bots.requestedButton: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the bots_requestWebViewButton answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_save_prepared_keyboard_button_promise();
+                match (result, promise) {
+                    (Ok(button), Some(mut promise)) => promise.set_value(button.webapp_req_id),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected bots.requestWebViewButton answer")
+                    }
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `GetRequestedWebViewButtonQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:313-337) — the wire
+            // keyboard-button answer folds through the M.22 record: a
+            // button without a requested dialog type answers the 500
+            // "Receive invalid button type" band (cpp:322-327), otherwise
+            // the type registers (`on_get_requested_web_view_button`,
+            // cpp:328-330) and the object settles the promise.
+            K::GetRequestedWebViewButton { bot_user_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::KeyboardButton::parse(query.ok()) {
+                        Ok(button) => Ok(crate::keyboard_button::KeyboardButton::from_telegram(
+                            button,
+                        )),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse KeyboardButton: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the bots_getRequestedWebViewButton answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let parked = manager.pop_get_requested_web_view_button_query();
+                match (result, parked) {
+                    (Ok(button), Some((prepared_button_id, mut promise))) => {
+                        let Some(requested_dialog_type) = button.get_requested_dialog_type() else {
+                            tdutils::log_error!("Receive invalid button type");
+                            promise.set_error(Status::error(500, "Receive invalid button type"));
+                            self.inline_queries_manager = manager;
+                            return;
+                        };
+                        manager.on_get_requested_web_view_button(
+                            bot_user_id,
+                            &prepared_button_id,
+                            requested_dialog_type.clone(),
+                        );
+                        promise.set_value(button.get_keyboard_button_object());
+                    }
+                    (Err(status), Some((_, mut promise))) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected bots.getRequestedWebViewButton answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `RequestSimpleWebViewQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:381-396) — the WebViewResult
+            // answer settles the url/same-origin pair; a non-zero
+            // query_id only logs (cpp:388).
+            K::RequestSimpleWebView => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewResult::parse(query.ok()) {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse WebViewResult: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_requestSimpleWebView answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_request_simple_web_view_promise();
+                match (result, promise) {
+                    (Ok(result), Some(mut promise)) => {
+                        if result.query_id != 0 {
+                            tdutils::log_error!("Receive WebViewResult with query_id");
+                        }
+                        promise.set_value(td_api::WebAppUrl {
+                            url: result.url,
+                            require_same_origin: result.same_origin,
+                        })
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.requestSimpleWebView answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `SendWebViewDataQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:414-424) — the Updates answer
+            // rides the updates engine with the request promise
+            // (`td_->updates_manager_->on_get_updates`); the wire error
+            // forwards to the promise.
+            K::SendWebViewData => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => Ok(updates),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse Updates: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_sendWebViewData answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_send_web_view_data_promise();
+                match (result, promise) {
+                    (Ok(updates), Some(promise)) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected messages.sendWebViewData answer")
+                    }
+                }
+                self.inline_queries_manager = manager;
+            }
+            // `SendWebViewResultMessageQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:440-454) — the WebViewMessageSent
+            // answer folds its msg_id through get_inline_message_id into
+            // the inlineMessageId object.
+            K::SendWebViewResultMessage => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewMessageSent::parse(query.ok()) {
+                        Ok(sent) => Ok(sent),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse WebViewMessageSent: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_sendWebViewResultMessage answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_send_web_view_result_message_promise();
+                match (result, promise) {
+                    (Ok(sent), Some(mut promise)) => promise.set_value(td_api::InlineMessageId {
+                        id: crate::inline_queries_manager::get_inline_message_id(sent.msg_id),
+                    }),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.sendWebViewResultMessage answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+        }
+    }
+
     /// The net-drain 42 attach-menu answers (the dispatcher callback
     /// parks) — the reload/single-bot/toggle intakes route into the
     /// manager's answer handlers over the split env.
@@ -17732,6 +18633,126 @@ impl Td {
         let completed = std::mem::take(&mut *self.attach_menu_net_completed.lock());
         for (kind, query) in completed {
             self.on_attach_menu_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked boost answers — the C++ ResultHandler
+    /// halves of the net-drain 59 families (BoostManager.cpp:109-358).
+    fn dispatch_completed_boost_net(&mut self) {
+        let completed = std::mem::take(&mut *self.boost_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_boost_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked callback-query answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 49
+    /// families (CallbackQueriesManager.cpp:31-179).
+    fn dispatch_completed_callback_net(&mut self) {
+        let completed = std::mem::take(&mut *self.callback_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_callback_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked game answers — the C++ ResultHandler
+    /// halves of the net-drain 57 families (GameManager.cpp:28-103).
+    fn dispatch_completed_game_net(&mut self) {
+        let completed = std::mem::take(&mut *self.game_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_game_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked BotRecommendation answers — the C++
+    /// ResultHandler halves of the net-drain 53 family
+    /// (`GetBotRecommendationsQuery`, BotRecommendationManager.cpp:50-64).
+    fn dispatch_completed_bot_recommendation_net(&mut self) {
+        let completed = std::mem::take(&mut *self.bot_recommendation_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_bot_recommendation_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the reaction-parked message-reaction answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 61
+    /// families (MessageReaction.cpp:211-341).
+    fn dispatch_completed_reaction_net(&mut self) {
+        let completed = std::mem::take(&mut *self.reaction_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_reaction_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the inline-message-parked answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 61
+    /// families (InlineMessageManager.cpp:87-210).
+    fn dispatch_completed_inline_message_net(&mut self) {
+        let completed = std::mem::take(&mut *self.inline_message_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_inline_message_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the top-dialog-parked answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the net-drain 61
+    /// families (TopDialogManager.cpp:43-122).
+    fn dispatch_completed_top_dialog_net(&mut self) {
+        let completed = std::mem::take(&mut *self.top_dialog_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_top_dialog_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the channel-recommendation-parked answers — the C++
+    /// `GetChannelRecommendationsQuery` `on_result`/`on_error` halves
+    /// of the net-drain 61 family (ChannelRecommendationManager.cpp:
+    /// 60-84).
+    fn dispatch_completed_channel_recommendation_net(&mut self) {
+        let completed = std::mem::take(&mut *self.channel_recommendation_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_channel_recommendation_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the device-token-parked answers — the C++ `on_result`
+    /// halves of the net-drain 61 family (DeviceTokenManager.cpp:
+    /// 412-467).
+    fn dispatch_completed_device_token_net(&mut self) {
+        let completed = std::mem::take(&mut *self.device_token_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_device_token_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the notification-parked answers — the C++ ResultHandler
+    /// halves of the net-drain 61 families (NotificationManager.cpp:
+    /// 73-127).
+    fn dispatch_completed_notification_net(&mut self) {
+        let completed = std::mem::take(&mut *self.notification_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_notification_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked Stickers answers — the C++
+    /// ResultHandler halves of the net-drain 59 families (the
+    /// `StickersManager.cpp` query classes).
+    fn dispatch_completed_stickers_net(&mut self) {
+        let completed = std::mem::take(&mut *self.stickers_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_stickers_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -19447,6 +20468,859 @@ impl Td {
         }
     }
 
+    /// Route one callback-query net answer by kind — the ResultHandler
+    /// halves of the net-drain 49 families (CallbackQueriesManager.cpp:
+    /// 31-179): the wire answers parse here and the landed manager
+    /// intakes run over the shared [`BotEnv`] view (the parse failures
+    /// route through the same tails the wire errors do — the fetch_result
+    /// → on_error chain, cpp:79-83).
+    fn on_callback_net_answer(
+        &mut self,
+        kind: crate::callback_queries_manager::CallbackNetKind,
+        query: NetQuery,
+    ) {
+        use crate::callback_queries_manager::CallbackNetKind as K;
+        match kind {
+            // `GetBotCallbackAnswerQuery::on_result`/`on_error`
+            // (CallbackQueriesManager.cpp:79-99) — the answer converts
+            // through the manager intake (the `on_get_message_error`
+            // head, the BOT_RESPONSE_TIMEOUT remap and the
+            // edited-recently empty-answer bail).
+            K::GetBotCallbackAnswer {
+                dialog_id,
+                message_id,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotCallbackAnswer::parse(query.ok()) {
+                        Ok(answer) => Ok(answer),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.botCallbackAnswer: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getBotCallbackAnswer answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.callback_queries_manager);
+                {
+                    let mut env = crate::td::BotEnv { td: self };
+                    manager.on_get_bot_callback_answer(&mut env, dialog_id, message_id, result);
+                }
+                self.callback_queries_manager = manager;
+            }
+            // `SetBotCallbackAnswerQuery::on_result`/`on_error`
+            // (CallbackQueriesManager.cpp:163-178) — both Bool bands
+            // answer ok (the `!result` LOG(INFO) rides the intake), the
+            // wire error forwards unchanged (no dialog-error head on
+            // this family).
+            K::SetBotCallbackAnswer => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(value) => Ok(value),
+                        None => Err(Status::error(
+                            500,
+                            "Failed to parse the messages_setBotCallbackAnswer answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.callback_queries_manager);
+                manager.on_set_bot_callback_answer(result);
+                self.callback_queries_manager = manager;
+            }
+            // `GetEphemeralCallbackAnswerQuery::on_result`/`on_error`
+            // (CallbackQueriesManager.cpp:124-142) — the answer converts
+            // through the manager intake (the landed on_get_dialog_error
+            // head + the BOT_RESPONSE_TIMEOUT remap).
+            K::GetEphemeralCallbackAnswer { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotCallbackAnswer::parse(query.ok()) {
+                        Ok(answer) => Ok(answer),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.botCallbackAnswer: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the ephemeral_getCallbackAnswer answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.callback_queries_manager);
+                {
+                    let mut env = crate::td::BotEnv { td: self };
+                    manager.on_get_ephemeral_callback_answer(&mut env, dialog_id, result);
+                }
+                self.callback_queries_manager = manager;
+            }
+        }
+    }
+
+    /// Route one game net answer by kind — the ResultHandler halves of
+    /// the net-drain 57 families (GameManager.cpp:28-103): the wire
+    /// answer parses here, the parked family promise settles exactly
+    /// where the C++ handler settles it (the parse failures run the
+    /// same `on_error` tails the C++ `fetch_result` failure would,
+    /// cpp:53-56/:91-94).
+    fn on_game_net_answer(&mut self, kind: crate::game_manager::GameNetKind, query: NetQuery) {
+        use crate::game_manager::GameNetKind as K;
+        match kind {
+            // `SetGameScoreQuery::on_result`/`on_error`
+            // (GameManager.cpp:52-67) — the Ok updates ride the engine
+            // with the `query_promise` lambda tail (cpp:131-137, the
+            // `UmMessage::OnGetUpdatesSetGameScore` hop); the errors run
+            // the dialog-error head then the lambda's error arm
+            // (cpp:63-67 + 133-135).
+            K::SetGameScore { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => Ok(updates),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse Updates: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_setGameScore answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!("Receive error for SetGameScoreQuery: {status}");
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "SetGameScoreQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.game_manager);
+                let parked = manager.pop_set_game_score_query();
+                match (result, parked) {
+                    (Ok(updates), Some(query)) => {
+                        self.um_send(UmMessage::OnGetUpdatesSetGameScore {
+                            updates: Box::new(updates),
+                            message_full_id: query.message_full_id,
+                            promise: query.promise,
+                        });
+                    }
+                    (Err(status), Some(mut query)) => query.promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected messages.setGameScore answer")
+                    }
+                }
+                self.game_manager = manager;
+            }
+            // `GetGameHighScoresQuery::on_result`/`on_error`
+            // (GameManager.cpp:90-102) — the answer converts through the
+            // manager intake (the users intake + the wrong-row filter,
+            // cpp:169-186) and settles the parked FIFO-head promise.
+            K::GetGameHighScores { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_HighScores::parse(query.ok()) {
+                        Ok(high_scores) => Ok(high_scores),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.highScores: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getGameHighScores answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetGameHighScoresQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.game_manager);
+                let promise = manager.pop_get_game_high_scores_promise();
+                match (result, promise) {
+                    (Ok(high_scores), Some(mut promise)) => {
+                        let scores = {
+                            let mut env = crate::td::BotEnv { td: self };
+                            manager.get_game_high_scores_object(&mut env, high_scores)
+                        };
+                        promise.set_value(scores);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.getGameHighScores answer"
+                        )
+                    }
+                }
+                self.game_manager = manager;
+            }
+        }
+    }
+
+    /// Route one message-reaction net answer by kind — the
+    /// ResultHandler halves of the net-drain 61 families
+    /// (MessageReaction.cpp:211-341): the wire answers parse here, run
+    /// the users/chats intakes and the reaction walk, then settle the
+    /// parked family promises (the parse failures settle through the
+    /// same tails the wire errors do — the fetch_result → on_error
+    /// chain).
+    fn on_reaction_net_answer(
+        &mut self,
+        kind: crate::message_reaction::ReactionNetKind,
+        query: NetQuery,
+    ) {
+        use crate::message_reaction::ReactionNetKind as K;
+        match kind {
+            // `GetMessageReactionsListQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:249-304) — the users/chats intakes
+            // run first, then the reaction walk filters the mismatched
+            // rows and builds the `td_api::addedReactions` over the
+            // resolvable senders.
+            K::GetMessageReactionsList { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_MessageReactionsList::parse(query.ok()) {
+                        Ok(answer) => Ok(answer),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.messageReactionsList: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getMessageReactionsList answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetMessageReactionsListQuery",
+                    );
+                }
+                let parked = if self.reaction_net_pending.list.is_empty() {
+                    None
+                } else {
+                    Some(self.reaction_net_pending.list.remove(0))
+                };
+                match (result, parked) {
+                    (
+                        Ok(answer),
+                        Some(crate::message_reaction::PendingReactionListQuery {
+                            dialog_id: parked_dialog_id,
+                            message_id: parked_message_id,
+                            reaction_type,
+                            offset,
+                            promise,
+                        }),
+                    ) => {
+                        // `on_get_users`/`on_get_chats` (cpp:258-259)
+                        if let Some(options) = self.option_manager.as_mut() {
+                            let mut env = UserEnv {
+                                global: &mut self.global,
+                                options,
+                                auth_is_bot: self.auth_manager.is_bot(),
+                            };
+                            self.user_manager.on_get_users(
+                                &mut env,
+                                answer.users,
+                                "GetMessageReactionsListQuery",
+                            );
+                            self.chat_manager.on_get_chats(
+                                &mut self.user_manager,
+                                &mut env,
+                                answer.chats,
+                                "GetMessageReactionsListQuery",
+                            );
+                        }
+
+                        // the reaction walk (cpp:261-295): the count clamp,
+                        // the mismatch filter and the sender objects
+                        let mut total_count = answer.count;
+                        let received = answer.reactions.len() as i32;
+                        if total_count < received {
+                            tdutils::log_error!(
+                                "Receive invalid total_count in the reactions list"
+                            );
+                            total_count = received;
+                        }
+                        let mut reactions = Vec::new();
+                        for reaction in answer.reactions {
+                            let reaction_dialog_id = reaction
+                                .peer_id
+                                .as_ref()
+                                .map(crate::dialog_id::DialogId::from_peer)
+                                .unwrap_or_default();
+                            let reaction_type_row =
+                                crate::reaction_type::ReactionType::from_telegram(
+                                    reaction.reaction.as_ref(),
+                                );
+                            if !reaction_dialog_id.is_valid()
+                                || (if reaction_type.is_empty() {
+                                    reaction_type_row.is_empty()
+                                } else {
+                                    reaction_type != reaction_type_row
+                                })
+                            {
+                                tdutils::log_error!(
+                                    "Receive unexpected reaction in the reactions list"
+                                );
+                                continue;
+                            }
+                            if let Some(sender) =
+                                crate::messages_manager::get_min_message_sender_object(
+                                    self,
+                                    reaction_dialog_id,
+                                    "GetMessageReactionsListQuery",
+                                )
+                            {
+                                reactions.push(td_api::AddedReaction {
+                                    r#type: reaction_type_row.get_reaction_type_object(),
+                                    sender_id: Some(sender),
+                                    is_outgoing: reaction.my,
+                                    date: reaction.date,
+                                });
+                            }
+                        }
+                        // `on_get_message_reaction_list` (cpp:297-299) —
+                        // the MessagesManager intake is [blocked: M.10]
+                        if offset.is_empty() {
+                            tdutils::log_info!(
+                                "MessagesManager::on_get_message_reaction_list({parked_dialog_id:?}, {parked_message_id:?}) — [blocked: M.10 Messages]"
+                            );
+                        }
+                        let mut promise = promise;
+                        promise.set_value(td_api::AddedReactions {
+                            total_count,
+                            reactions,
+                            next_offset: answer.next_offset,
+                        });
+                    }
+                    (Err(status), Some(mut parked)) => parked.promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.getMessageReactionsList answer"
+                        )
+                    }
+                }
+            }
+            // `ReportReactionQuery::on_result`/`on_error`
+            // (MessageReaction.cpp:328-341) — the Bool answer value is
+            // ignored exactly like the C++.
+            K::ReportReaction { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if parse_wire_bool(query.ok()).is_some() {
+                    // the Bool answer value is ignored exactly like the
+                    // C++ (cpp:328-334)
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_reportReaction answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "ReportReactionQuery",
+                    );
+                }
+                let promise = if self.reaction_net_pending.report.is_empty() {
+                    None
+                } else {
+                    Some(self.reaction_net_pending.report.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected messages.reportReaction answer")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one inline-message net answer by kind — the ResultHandler
+    /// halves of the net-drain 61 families (InlineMessageManager.cpp:
+    /// 87-210): the Bool answers settle the parked promises (the false
+    /// band logs exactly like the C++ `LOG_IF(ERROR, !result)`), the
+    /// high-scores answer converts through the GameManager object
+    /// builder (cpp:203-206).
+    fn on_inline_message_net_answer(
+        &mut self,
+        kind: crate::inline_message_manager::InlineMessageNetKind,
+        query: NetQuery,
+    ) {
+        use crate::inline_message_manager::InlineMessageNetKind as K;
+        match kind {
+            // `EditInlineMessageQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:126-140)
+            K::EditInlineMessage => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if let Some(value) = parse_wire_bool_value(query.ok()) {
+                    if !value {
+                        tdutils::log_error!("Receive false in result of editInlineMessage");
+                    }
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_editInlineBotMessage answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!("Receive error for EditInlineMessageQuery: {status}");
+                }
+                let promise = if self.inline_message_net_pending.edits.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.edits.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.editInlineBotMessage answer"
+                        )
+                    }
+                }
+            }
+            // `SetInlineGameScoreQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:169-177)
+            K::SetInlineGameScore => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if let Some(value) = parse_wire_bool_value(query.ok()) {
+                    if !value {
+                        tdutils::log_error!("Receive false in result of setInlineGameScore");
+                    }
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_setInlineGameScore answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!("Receive error for SetInlineGameScoreQuery: {status}");
+                }
+                let promise = if self.inline_message_net_pending.scores.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.scores.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.setInlineGameScore answer"
+                        )
+                    }
+                }
+            }
+            // `GetInlineGameHighScoresQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:201-210) — the scores convert
+            // through the GameManager builder (cpp:203-206).
+            K::GetInlineGameHighScores => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_HighScores::parse(query.ok()) {
+                        Ok(high_scores) => Ok(high_scores),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.highScores: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getInlineGameHighScores answer",
+                            ))
+                        }
+                    }
+                };
+                let promise = if self.inline_message_net_pending.high_scores.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.high_scores.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(high_scores), Some(mut promise)) => {
+                        let scores = {
+                            let mut manager = std::mem::take(&mut self.game_manager);
+                            let scores = {
+                                let mut env = crate::td::BotEnv { td: self };
+                                manager.get_game_high_scores_object(&mut env, high_scores)
+                            };
+                            self.game_manager = manager;
+                            scores
+                        };
+                        promise.set_value(scores);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.getInlineGameHighScores answer"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one top-dialog net answer by kind — the ResultHandler
+    /// halves of the net-drain 61 families (TopDialogManager.cpp:43-122):
+    /// the answers re-enter the manager state machine through the
+    /// landed intakes (the toggle resend machine, the get-top-peers
+    /// sync walk); the reset family is fire-and-forget with the
+    /// `on_get_dialog_error` head on errors (cpp:114-121).
+    fn on_top_dialog_net_answer(
+        &mut self,
+        kind: crate::top_dialog_manager::TopDialogNetKind,
+        query: NetQuery,
+    ) {
+        use crate::top_dialog_manager::TopDialogNetKind as K;
+        match kind {
+            // `ToggleTopPeersQuery::on_result`/`on_error`
+            // (TopDialogManager.cpp:84-93) — any ok answer settles the
+            // promise lambda (the Bool value is ignored).
+            K::ToggleTopPeers { is_enabled } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if parse_wire_bool(query.ok()).is_some() {
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the contacts_toggleTopPeers answer",
+                    ))
+                };
+                let (mut env, top_dialog_manager) = top_dialog_env_split(self);
+                top_dialog_manager.on_toggle_top_peers(&mut env, is_enabled, result);
+            }
+            // `GetTopPeersQuery::on_result`/`on_error`
+            // (TopDialogManager.cpp:57-68)
+            K::GetTopPeers => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::contacts_TopPeers::parse(query.ok()) {
+                        Ok(top_peers) => Ok(top_peers),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse contacts.TopPeers: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the contacts_getTopPeers answer",
+                            ))
+                        }
+                    }
+                };
+                let (mut env, top_dialog_manager) = top_dialog_env_split(self);
+                top_dialog_manager.on_get_top_peers(&mut env, result);
+            }
+            // `ResetTopPeerRatingQuery::on_result`/`on_error`
+            // (TopDialogManager.cpp:106-122) — the result is ignored;
+            // the error runs the `on_get_dialog_error` head with the
+            // logged fallback (cpp:114-121)
+            K::ResetTopPeerRating { dialog_id } => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    if !crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ResetTopPeerRatingQuery",
+                    ) {
+                        tdutils::log_info!("Receive error for ResetTopPeerRatingQuery: {status}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one channel-recommendation net answer — the
+    /// `GetChannelRecommendationsQuery` ResultHandler halves of the
+    /// net-drain 61 family (ChannelRecommendationManager.cpp:60-84):
+    /// the answer parses to the `(total_count, chats)` pair and runs
+    /// the landed reload intakes through the promise-lambda hop (the
+    /// recommended-channels walk at cpp:250-287 / the per-channel walk
+    /// at cpp:495-522); the error runs the `on_get_channel_error`
+    /// head first (cpp:75-79).
+    fn on_channel_recommendation_net_answer(
+        &mut self,
+        kind: crate::channel_recommendation_manager::ChannelRecommendationNetKind,
+        query: NetQuery,
+    ) {
+        let crate::channel_recommendation_manager::ChannelRecommendationNetKind::
+            GetChannelRecommendations { channel_id } = kind;
+        let result = if query.is_error() {
+            Err(query.error().clone())
+        } else {
+            match telegram_api::messages_Chats::parse(query.ok()) {
+                // `messages_chats::on_result` (cpp:63-68)
+                Ok(telegram_api::messages_Chats::messages_chats(chats)) => {
+                    Ok((chats.chats.len() as i32, chats.chats))
+                }
+                // `messages_chatsSlice::on_result` (cpp:69-73)
+                Ok(telegram_api::messages_Chats::messages_chatsSlice(chats)) => {
+                    Ok((chats.count, chats.chats))
+                }
+                _ => {
+                    // the C++ `UNREACHABLE` collapses onto the 500
+                    // convention (§5)
+                    tdutils::log_error!("Can't parse messages.Chats");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the channels_getChannelRecommendations answer",
+                    ))
+                }
+            }
+        };
+        let (mut env, recommendation_manager) = recommendation_env_split(self);
+        if let Err(status) = &result
+            && channel_id.is_valid()
+        {
+            // `on_error` (cpp:75-79) — the channel-error head runs
+            // before the promise fires
+            crate::channel_recommendation_manager::ChannelRecommendationManagerEnv::
+                on_get_channel_error(&mut env, channel_id, status, "GetChannelRecommendationsQuery");
+        }
+        if channel_id.is_valid() {
+            recommendation_manager.on_get_channel_recommendations(&mut env, channel_id, result);
+        } else {
+            recommendation_manager.on_get_recommended_channels(&mut env, result);
+        }
+    }
+
+    /// Route one device-token net answer — the C++ `on_result` half of
+    /// the net-drain 61 family (DeviceTokenManager.cpp:412-467): the
+    /// Bool answer (true or false — the false band is the C++ 400)
+    /// re-enters the manager through the landed
+    /// `on_register_device_result` intake; the kind carries the actor
+    /// link token (the token type) and the query id the in-flight
+    /// guard compares (a re-registered token drops the stale answer).
+    fn on_device_token_net_answer(
+        &mut self,
+        kind: crate::device_token_manager::DeviceTokenNetKind,
+        query: NetQuery,
+    ) {
+        let crate::device_token_manager::DeviceTokenNetKind::SyncDeviceToken {
+            token_type,
+            net_query_id,
+        } = kind;
+        // `CHECK(token_type >= 1 && token_type < TokenType::Size)` —
+        // the kind only carries loop-produced token types
+        debug_assert!(
+            (1..crate::device_token_manager::TOKEN_TYPE_SIZE as i32).contains(&token_type)
+        );
+        let r_flag = if query.is_error() {
+            Err(query.error().clone())
+        } else {
+            match parse_wire_bool_value(query.ok()) {
+                Some(flag) => Ok(flag),
+                None => {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the account_registerDevice answer",
+                    ))
+                }
+            }
+        };
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            notification_updates,
+            device_token_manager,
+            ..
+        } = self;
+        let mut env = NotificationEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        device_token_manager.on_register_device_result(&mut env, token_type, net_query_id, r_flag);
+    }
+
+    /// Route one notification net answer by kind — the ResultHandler
+    /// halves of the net-drain 61 families (NotificationManager.cpp:
+    /// 73-127): the set family's any-ok answer walks the sync state
+    /// machine (the resend-forever error arm), the get family's Bool
+    /// answer runs `on_get_disable_contact_registered_notifications`
+    /// and answers the parked `getOption` request with the re-read
+    /// value (the C++ wrap_promise, OptionManager.cpp:761-766).
+    fn on_notification_net_answer(
+        &mut self,
+        kind: crate::notification_manager::NotificationNetKind,
+        query: NetQuery,
+    ) {
+        use crate::notification_manager::NotificationNetKind as K;
+        let is_disabled = match kind {
+            K::SetContactSignUpNotification { is_disabled } => Some(is_disabled),
+            K::GetContactSignUpNotification => None,
+        };
+        if let Some(is_disabled) = is_disabled {
+            // `SetContactSignUpNotificationQuery::on_result`/`on_error`
+            // (cpp:84-98) — any ok answer (Bool true or false) is Unit;
+            // the error runs the expected-error log band
+            let result = if query.is_error() {
+                let status = query.error().clone();
+                if !self.global.is_expected_error(&status) {
+                    tdutils::log_error!(
+                        "Receive error for set contact sign up notification: {status}"
+                    );
+                }
+                Err(status)
+            } else if parse_wire_bool_value(query.ok()).is_some() {
+                Ok(())
+            } else {
+                tdutils::log_error!("Can't parse Bool");
+                Err(Status::error(
+                    500,
+                    "Failed to parse the account_setContactSignUpNotification answer",
+                ))
+            };
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                notification_updates,
+                notification_manager,
+                ..
+            } = self;
+            let mut env = NotificationEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_authorized: auth_manager.is_authorized(),
+                auth_is_bot: auth_manager.is_bot(),
+                updates: notification_updates,
+            };
+            notification_manager.on_contact_registered_notifications_sync(
+                &mut env,
+                is_disabled,
+                result,
+            );
+            return;
+        }
+        // `GetContactSignUpNotificationQuery::on_result`/`on_error`
+        // (cpp:112-126) — the error and parse-failure bands skip the
+        // intake: the wrap_promise is a Unit-lambda, so its `do_error`
+        // invokes the re-read with `Auto()` (Promise.h:136-138) and the
+        // option value answers anyway (OptionManager.cpp:763-765)
+        let (parse_ok, is_disabled) = if query.is_error() {
+            let status = query.error().clone();
+            if !self.global.is_expected_error(&status) {
+                tdutils::log_error!("Receive error for get contact sign up notification: {status}");
+            }
+            (false, false)
+        } else {
+            match parse_wire_bool_value(query.ok()) {
+                Some(value) => (true, value),
+                None => {
+                    tdutils::log_error!("Can't parse Bool");
+                    (false, false)
+                }
+            }
+        };
+        let unix_time = self.global.unix_time();
+        let name = "disable_contact_registered_notifications";
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            notification_updates,
+            notification_manager,
+            ..
+        } = self;
+        let mut env = NotificationEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        let request_id = if parse_ok {
+            notification_manager
+                .on_get_disable_contact_registered_notifications(&mut env, is_disabled)
+        } else {
+            notification_manager
+                .pending_contact_sign_up_get_options
+                .remove(0)
+        };
+        // the wrap_promise answers the re-read store value
+        let value = option_manager
+            .as_ref()
+            .map(|options| options.get_option_value(name, unix_time))
+            .unwrap_or_default();
+        self.send_result(request_id, requests::option_value_to_object(value));
+    }
+
+    /// The `getOption(disable_contact_registered_notifications)` arm
+    /// (OptionManager.cpp:775-782): the NotificationManager family
+    /// answers the request when the wire Bool lands; the disabled band
+    /// answers the re-read value inline.
+    pub(crate) fn get_option_disable_contact_registered_notifications(&mut self, id: u64) {
+        let disabled = self.close_flag != 0
+            || !self.auth_manager.is_authorized()
+            || self.auth_manager.is_bot();
+        if disabled {
+            let unix_time = self.global.unix_time();
+            let value = self
+                .option_manager
+                .as_ref()
+                .map(|options| {
+                    options.get_option_value("disable_contact_registered_notifications", unix_time)
+                })
+                .unwrap_or_default();
+            return self.send_result(id, requests::option_value_to_object(value));
+        }
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            notification_updates,
+            notification_manager,
+            ..
+        } = self;
+        let mut env = NotificationEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        notification_manager.get_disable_contact_registered_notifications(&mut env, id);
+    }
+
     /// Route one ForumTopic net answer by kind — the ResultHandler
     /// halves of the net-drain 41 families (ForumTopicManager.cpp:45-437):
     /// the wire answers parse here, run the users/chats intakes and settle
@@ -20365,6 +22239,413 @@ impl Td {
                     tdutils::log_error!("Failed to add a bot to attachment menu");
                 }
                 manager.reload_attach_menu_bots(&mut env, promise);
+            }
+        }
+    }
+
+    /// Route one boost net answer by kind — the ResultHandler halves of
+    /// the net-drain 59 families (BoostManager.cpp:109-358): the wire
+    /// answer parses here, the parked family promise settles exactly
+    /// where the C++ handler settles it (the parse failures run the same
+    /// `on_error` tails the C++ `fetch_result` failure would).
+    fn on_boost_net_answer(&mut self, kind: crate::boost_manager::BoostNetKind, query: NetQuery) {
+        use crate::boost_manager::BoostNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetMyBoostsQuery::on_result`/`on_error` (cpp:107-118) —
+            // the `premium.myBoosts` answer converts through the
+            // manager intake (the users/chats intakes + the slot loop,
+            // cpp:47-93) and settles the parked FIFO-head promise; the
+            // error leg has no dialog head (cpp:115-118).
+            K::GetMyBoosts => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_MyBoosts::parse(query.ok()) {
+                        Ok(my_boosts) => Ok(my_boosts),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.myBoosts: {error}");
+                            Err(parse_error("premium_getMyBoosts"))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_get_my_boosts_promise();
+                match (result, promise) {
+                    (Ok(my_boosts), Some(mut promise)) => {
+                        let slots = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_chat_boost_slots_object(&mut env, my_boosts)
+                        };
+                        promise.set_value(slots);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.myBoosts answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
+            // `GetUserBoostsQuery::on_result`/`on_error`
+            // (BoostManager.cpp:328-355) — the answer is the shared
+            // `premium.boostsList` conversion of the list family over the
+            // "GetUserBoostsQuery" sources; the error leg runs the
+            // dialog-error head first (cpp:352-355).
+            K::GetUserBoosts { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_BoostsList::parse(query.ok()) {
+                        Ok(list) => Ok(list),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.boostsList: {error}");
+                            Err(parse_error("premium_getUserBoosts"))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetUserBoostsQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_get_user_boosts_promise();
+                match (result, promise) {
+                    (Ok(list), Some(mut promise)) => {
+                        let found = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_found_chat_boosts_object(
+                                &mut env,
+                                list,
+                                "GetUserBoostsQuery",
+                            )
+                        };
+                        promise.set_value(found);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.getUserBoosts answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
+            // `GetBoostsListQuery::on_result`/`on_error`
+            // (BoostManager.cpp:283-307) — the `premium.boostsList`
+            // answer converts through the manager intake (the users
+            // intake + the boost-source loop with the null/expiry drops)
+            // and settles the parked FIFO-head promise; the error leg
+            // runs the dialog-error head first (cpp:304-307).
+            K::GetBoostsList { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_BoostsList::parse(query.ok()) {
+                        Ok(list) => Ok(list),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.boostsList: {error}");
+                            Err(parse_error("premium_getBoostsList"))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetBoostsListQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_get_boosts_list_promise();
+                match (result, promise) {
+                    (Ok(list), Some(mut promise)) => {
+                        let found = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_found_chat_boosts_object(
+                                &mut env,
+                                list,
+                                "GetBoostsListQuery",
+                            )
+                        };
+                        promise.set_value(found);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.boostsList answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
+            // `ApplyBoostQuery::on_result`/`on_error`
+            // (BoostManager.cpp:249-261) — the answer is the shared
+            // `premium.myBoosts` conversion of the slots family; the
+            // error leg runs the dialog-error head first (cpp:260-261).
+            K::ApplyBoost { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_MyBoosts::parse(query.ok()) {
+                        Ok(my_boosts) => Ok(my_boosts),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.myBoosts: {error}");
+                            Err(parse_error("premium_applyBoost"))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "ApplyBoostQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_apply_boost_promise();
+                match (result, promise) {
+                    (Ok(my_boosts), Some(mut promise)) => {
+                        let slots = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_chat_boost_slots_object(&mut env, my_boosts)
+                        };
+                        promise.set_value(slots);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.applyBoost answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
+            // `GetBoostsStatusQuery::on_result`/`on_error` (cpp:135-196)
+            // — the `premium.boostsStatus` answer converts through the
+            // manager intake (the validation ladder, the audience counts
+            // and the prepaid-giveaway transform) and settles the parked
+            // FIFO-head promise; the error leg runs the dialog-error head
+            // first (cpp:193-196).
+            K::GetBoostsStatus { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_BoostsStatus::parse(query.ok()) {
+                        Ok(status) => Ok(status),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.boostsStatus: {error}");
+                            Err(parse_error("premium_getBoostsStatus"))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetBoostsStatusQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_get_boosts_status_promise();
+                match (result, promise) {
+                    (Ok(status), Some(mut promise)) => {
+                        let object = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_chat_boost_status_object(&mut env, dialog_id, status)
+                        };
+                        promise.set_value(object);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.boostsStatus answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
+        }
+    }
+
+    /// Route one BotRecommendation net answer by kind — the
+    /// `GetBotRecommendationsQuery::on_result`/`on_error` halves
+    /// (BotRecommendationManager.cpp:50-64): the `users_Users` answer
+    /// (or the wire error, or the fetch_result parse failure riding the
+    /// same Err path — the landed-flip convention, §5) re-enters the
+    /// manager's `on_get_bot_recommendations` intake over the request
+    /// arms' take/put env shape; the request promises settle from the
+    /// parked family lots.
+    fn on_bot_recommendation_net_answer(
+        &mut self,
+        kind: crate::bot_recommendation_manager::BotRecommendationNetKind,
+        query: NetQuery,
+    ) {
+        match kind {
+            crate::bot_recommendation_manager::BotRecommendationNetKind::GetBotRecommendations {
+                bot_user_id,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::users_Users::parse(query.ok()) {
+                        Ok(users) => {
+                            tdutils::log_info!("Receive result for GetBotRecommendationsQuery");
+                            Ok(users)
+                        }
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the bots.getBotRecommendations answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.bot_recommendation_manager);
+                {
+                    let mut env = BotEnv { td: self };
+                    manager.on_get_bot_recommendations(&mut env, bot_user_id, result);
+                }
+                self.bot_recommendation_manager = manager;
+            }
+        }
+    }
+
+    /// Route one Stickers net answer by kind — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the StickersManager
+    /// query classes: the wire answer (or the wire error, or the
+    /// `fetch_result` parse failure riding the same Err path — the
+    /// landed-flip convention, §5) re-enters the manager's intake over
+    /// the request arms' take/put env shape; the request promises settle
+    /// from the parked family lots.
+    fn on_stickers_net_answer(
+        &mut self,
+        kind: crate::stickers_manager::StickersNetKind,
+        query: NetQuery,
+    ) {
+        match kind {
+            // `GetCustomEmojiDocumentsQuery` (StickersManager.cpp:1432-1459)
+            // — the `Vector<Document>` answer converts at the manager's
+            // `on_get_custom_emoji_documents` (cpp:6587-6606).
+            crate::stickers_manager::StickersNetKind::GetCustomEmojiDocuments => {
+                let (custom_emoji_ids, promise) = self
+                    .stickers_manager
+                    .take_pending_get_custom_emoji_documents()
+                    .unwrap_or_else(|| (Vec::new(), Promise::default()));
+                let result: tdutils::status::Result<Vec<telegram_api::Document>> = if query
+                    .is_error()
+                {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_vector_document(query.ok()) {
+                        Some(documents) => {
+                            tdutils::log_info!("Receive result for GetCustomEmojiDocumentsQuery");
+                            tdutils::status::Result::Ok(documents)
+                        }
+                        None => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getCustomEmojiDocuments answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.stickers_manager);
+                {
+                    let (mut env, _) = crate::td::stickers_env_split(self);
+                    manager.on_get_custom_emoji_documents(
+                        &mut env,
+                        result,
+                        custom_emoji_ids,
+                        promise,
+                    );
+                }
+                self.stickers_manager = manager;
+            }
+            // `ReloadSpecialStickerSetQuery` (StickersManager.cpp:794-832)
+            // — the `messages_StickerSet` answer runs the full record intake
+            // (cpp:3816-3948), then the special-set tail (cpp:4025-4054);
+            // the wire error and the parse failure both land in
+            // `on_load_special_sticker_set` (cpp:829-832). The changed arm
+            // passes an invalid expected id (cpp:809-814 — "sticker_set_id_
+            // must be replaced always") so the intake accepts a set-id
+            // change; the not-modified arm passes the carried id.
+            crate::stickers_manager::StickersNetKind::ReloadSpecialStickerSet {
+                set_type,
+                sticker_set_id,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_StickerSet::parse(query.ok()) {
+                        Ok(set) => {
+                            tdutils::log_info!("Receive result for ReloadSpecialStickerSetQuery");
+                            Ok(set)
+                        }
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getStickerSet answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.stickers_manager);
+                {
+                    let (mut env, _) = crate::td::stickers_env_split(self);
+                    match result {
+                        Err(status) => {
+                            tdutils::log_warning!(
+                                "Receive error for ReloadSpecialStickerSetQuery: {status}"
+                            );
+                            manager.on_load_special_sticker_set(
+                                &mut env,
+                                set_type,
+                                tdutils::status::Result::Err(status),
+                            );
+                        }
+                        Ok(set) => {
+                            let (expected_id, is_changed) =
+                                match &set {
+                                    telegram_api::messages_StickerSet::messages_stickerSet(_) => {
+                                        // cpp:809-814 — the id can change on
+                                        // the changed arm; the invalid expected
+                                        // id keeps the mismatch band off
+                                        (
+                                            crate::stickers_manager::StickerSetId::default(),
+                                            true,
+                                        )
+                                    }
+                                    telegram_api::messages_StickerSet::messages_stickerSetNotModified(_) => {
+                                        (sticker_set_id, false)
+                                    }
+                                };
+                            let received_id = manager.on_get_messages_sticker_set(
+                                &mut env,
+                                expected_id,
+                                set,
+                                is_changed,
+                            );
+                            if !received_id.is_valid() {
+                                manager.on_load_special_sticker_set(
+                                    &mut env,
+                                    set_type,
+                                    tdutils::status::Result::Err(Status::error(
+                                        500,
+                                        "Failed to add special sticker set",
+                                    )),
+                                );
+                            } else {
+                                manager.on_get_special_sticker_set(&mut env, set_type, received_id);
+                            }
+                        }
+                    }
+                }
+                self.stickers_manager = manager;
             }
         }
     }
@@ -22264,6 +24545,7 @@ impl Td {
                         global: &mut self.global,
                         options: self.option_manager.as_mut(),
                         user_manager: &mut self.user_manager,
+                        chat_manager: &mut self.chat_manager,
                         device_token_manager: &mut self.device_token_manager,
                         auth_is_bot: self.auth_manager.is_bot(),
                         updates: &mut self.account_updates,
@@ -22564,6 +24846,7 @@ impl Td {
                     global: &mut self.global,
                     options: self.option_manager.as_mut(),
                     user_manager: &mut self.user_manager,
+                    chat_manager: &mut self.chat_manager,
                     device_token_manager: &mut self.device_token_manager,
                     auth_is_bot: self.auth_manager.is_bot(),
                     updates: &mut self.account_updates,
@@ -22599,6 +24882,7 @@ impl Td {
                     global: &mut self.global,
                     options: self.option_manager.as_mut(),
                     user_manager: &mut self.user_manager,
+                    chat_manager: &mut self.chat_manager,
                     device_token_manager: &mut self.device_token_manager,
                     auth_is_bot: self.auth_manager.is_bot(),
                     updates: &mut self.account_updates,
@@ -22661,6 +24945,102 @@ impl Td {
                             promise.set_error(parse_error("account_getAccountTTL"));
                         }
                     }
+                }
+            }
+            // `DismissSuggestionQuery` (SuggestedActionManager.cpp:26-63)
+            // — the Bool answer (either value) settles the routing lambda
+            // ok (cpp:48-55); the error leg runs the dialog-error head
+            // first (cpp:57-62), then the ok/error halves of
+            // `on_dismiss_suggested_action` (cpp:195-220) run over the
+            // kind-keyed lot — the no-dialog ok branch reports the
+            // `ConfigManager::reload_app_config` tail (cpp:216).
+            AccountNetKind::DismissSuggestion {
+                dialog_id,
+                action_type,
+            } => {
+                let dialog = crate::dialog_id::DialogId::new(dialog_id);
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    if dialog.is_valid() {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog,
+                            &status,
+                            "DismissSuggestionQuery",
+                        );
+                    }
+                    Err(status)
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => Ok(()),
+                        None => Err(parse_error("help.dismissSuggestion")),
+                    }
+                };
+                let net = self.account_net();
+                let mut env = AccountEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    user_manager: &mut self.user_manager,
+                    chat_manager: &mut self.chat_manager,
+                    device_token_manager: &mut self.device_token_manager,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.account_updates,
+                    net,
+                };
+                let reload_app_config = self.suggested_action_manager.on_dismiss_suggested_action(
+                    &mut env,
+                    (dialog_id, action_type),
+                    result,
+                );
+                if reload_app_config {
+                    // `ConfigManager::reload_app_config` (cpp:216 →
+                    // ConfigManager.cpp:970-980) — the td-level config
+                    // tail (the actions dispatch the follow-up
+                    // help.getAppConfig).
+                    let is_bot = self.auth_manager.is_bot();
+                    let close_flag = self.global.close_flag();
+                    let actions = self
+                        .config_manager
+                        .as_mut()
+                        .map(|config_manager| {
+                            config_manager.reload_app_config(None, is_bot, close_flag)
+                        })
+                        .unwrap_or_default();
+                    self.apply_config_actions(actions);
+                }
+            }
+            // `CheckPromoDataQuery` (SuggestedActionManager.cpp:65-105) —
+            // the promoData answer scans the pending suggestions for the
+            // login-email pair (cpp:87-94): a match settles ok, every
+            // other ok band (the empty promo, no match) answers the 404
+            // "Not Found" (cpp:99); errors forward verbatim
+            // (cpp:102-104), parse failures ride the 500 convention.
+            AccountNetKind::CheckPromoData => {
+                let Some(mut promise) = self.suggested_action_manager.take_login_email_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let required = match telegram_api::help_PromoData::parse(query.ok()) {
+                    Ok(telegram_api::help_PromoData::help_promoData(promo)) => {
+                        promo.pending_suggestions.iter().any(|suggestion| {
+                            suggestion == "SETUP_LOGIN_EMAIL"
+                                || suggestion == "SETUP_LOGIN_EMAIL_NOSKIP"
+                        })
+                    }
+                    Ok(telegram_api::help_PromoData::help_promoDataEmpty(_)) => false,
+                    Err(_) => {
+                        promise.set_error(parse_error("help.getPromoData"));
+                        return;
+                    }
+                };
+                if required {
+                    promise.set_value(());
+                } else {
+                    promise.set_error(Status::error(404, "Not Found"));
                 }
             }
         }
@@ -24073,6 +26453,100 @@ impl Td {
                             }
                             None => promise.set_error(parse_error("phone.saveCallLog")),
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one message-import net answer by kind — the ResultHandler
+    /// halves of the net-drain 58 head-query families
+    /// (MessageImportManager.cpp:30-98).
+    fn on_message_import_net_answer(
+        &mut self,
+        kind: crate::message_import_manager::MessageImportNetKind,
+        query: NetQuery,
+    ) {
+        use crate::message_import_manager::MessageImportNetKind as K;
+        match kind {
+            // `CheckHistoryImportQuery::on_result`/`on_error`
+            // (MessageImportManager.cpp:42-64) — the pm/group triad
+            // converts to the td_api MessageFileType (the wire title
+            // rides the private form's `name`, cpp:53), the errors
+            // forward to the request promise verbatim (no dialog-error
+            // head on this family, cpp:62-64).
+            K::CheckHistoryImport => {
+                let Some(mut promise) = self
+                    .message_import_manager
+                    .pop_check_history_import_promise()
+                else {
+                    tdutils::log_info!("Receive an unexpected messages.checkHistoryImport answer");
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::messages_HistoryImportParsed::parse(query.ok()) {
+                    Ok(parsed) => {
+                        let file_type = if parsed.pm {
+                            td_api::MessageFileType::messageFileTypePrivate(
+                                td_api::messageFileTypePrivate { name: parsed.title },
+                            )
+                        } else if parsed.group {
+                            td_api::MessageFileType::messageFileTypeGroup(
+                                td_api::messageFileTypeGroup {
+                                    title: parsed.title,
+                                },
+                            )
+                        } else {
+                            td_api::MessageFileType::messageFileTypeUnknown(
+                                td_api::messageFileTypeUnknown,
+                            )
+                        };
+                        promise.set_value(file_type);
+                    }
+                    Err(_) => promise.set_error(Status::error(
+                        500,
+                        "Failed to parse the messages_checkHistoryImport answer",
+                    )),
+                }
+            }
+            // `CheckHistoryImportPeerQuery::on_result`/`on_error`
+            // (MessageImportManager.cpp:83-97) — the confirm_text answer
+            // settles the parked request; the error tail runs the
+            // on_get_dialog_error head (cpp:94) with the handler's
+            // `dialog_id_` before the promise error (cpp:95-96).
+            K::CheckHistoryImportPeer { dialog_id } => {
+                let Some(mut promise) = self
+                    .message_import_manager
+                    .pop_check_history_import_peer_promise()
+                else {
+                    tdutils::log_info!(
+                        "Receive an unexpected messages.checkHistoryImportPeer answer"
+                    );
+                    return;
+                };
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_CheckedHistoryImportPeer::parse(query.ok()) {
+                        Ok(parsed) => Ok(parsed.confirm_text),
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the messages_checkHistoryImportPeer answer",
+                        )),
+                    }
+                };
+                match result {
+                    Ok(confirm_text) => promise.set_value(confirm_text),
+                    Err(status) => {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog_id,
+                            &status,
+                            "CheckHistoryImportPeerQuery",
+                        );
+                        promise.set_error(status);
                     }
                 }
             }
@@ -27005,6 +29479,7 @@ impl Td {
             global: &mut self.global,
             options: self.option_manager.as_mut(),
             user_manager: &mut self.user_manager,
+            chat_manager: &mut self.chat_manager,
             device_token_manager: &mut self.device_token_manager,
             auth_is_bot: self.auth_manager.is_bot(),
             updates: &mut self.account_updates,
@@ -27118,6 +29593,34 @@ impl Td {
             move |result: tdutils::status::Result<T>| {
                 let result = match result {
                     tdutils::status::Result::Ok(value) => Ok(map(value)),
+                    tdutils::status::Result::Err(status) => Err(status),
+                };
+                outbox.lock().push((id, result));
+            },
+        )
+    }
+
+    /// The `promise<td_api::object_ptr<T>>` form whose `nullptr` value arm
+    /// has no Rust response (ClientJson.cpp:94-95 answers JSON null) — the
+    /// null band parks (the `send_null_user` convention, recorded for the
+    /// S84 audit).
+    pub(crate) fn nullable_deferred_promise<T, F>(
+        &self,
+        id: u64,
+        map: F,
+    ) -> tdutils::promise::Promise<Option<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(T) -> Object + Send + 'static,
+    {
+        let outbox = Arc::clone(&self.deferred_results);
+        tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<Option<T>>| {
+                let result = match result {
+                    tdutils::status::Result::Ok(Some(value)) => Ok(map(value)),
+                    // the C++ answers JSON null; the Rust response plane has
+                    // no null object yet, so the promise parks
+                    tdutils::status::Result::Ok(None) => return,
                     tdutils::status::Result::Err(status) => Err(status),
                 };
                 outbox.lock().push((id, result));
@@ -27516,6 +30019,7 @@ impl Td {
                 global: &mut self.global,
                 options: self.option_manager.as_mut(),
                 user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
                 device_token_manager: &mut self.device_token_manager,
                 auth_is_bot: self.auth_manager.is_bot(),
                 updates: &mut self.account_updates,
@@ -30725,6 +33229,23 @@ fn parse_vector_premium_gift_code_option(
     Some(options)
 }
 
+/// The bare `Vector<Document>` answer reader — the
+/// `fetch_result<messages_getCustomEmojiDocuments>` half
+/// (`GetCustomEmojiDocumentsQuery::on_result`,
+/// StickersManager.cpp:1446-1453).
+fn parse_vector_document(data: &[u8]) -> Option<Vec<telegram_api::Document>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut documents = Vec::with_capacity(count);
+    for _ in 0..count {
+        documents.push(telegram_api::Document::read(&mut reader).ok()?);
+    }
+    Some(documents)
+}
+
 fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
     let mut reader = telegram_api::tl::Reader::new(data);
     if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
@@ -30858,6 +33379,18 @@ pub(crate) enum UmMessage {
         dialog_id: crate::dialog_id::DialogId,
         forum_topic_info: crate::forum_topic::ForumTopicInfo,
         promise: Promise<Option<td_api::ForumTopicInfo>>,
+    },
+    /// `on_get_updates` + the set-game-score tail — the C++
+    /// `PromiseCreator::lambda` chain of `GameManager::set_game_score`
+    /// (GameManager.cpp:131-137): the Updates run through the engine
+    /// (`SetGameScoreQuery::on_result`, cpp:52-61), then the lambda's
+    /// `send_closure` hop runs `on_set_game_score` which completes the
+    /// request promise with the message object (the engine's failure
+    /// wrapper always lands ok, UpdatesManager.cpp:1184-1190).
+    OnGetUpdatesSetGameScore {
+        updates: Box<telegram_api::Updates>,
+        message_full_id: crate::messages_manager::MessageFullId,
+        promise: Promise<td_api::Message>,
     },
     /// `on_get_updates` + the paid-reaction chain tail — the C++
     /// `PromiseCreator::lambda` chain of
@@ -31055,6 +33588,23 @@ impl UmMessage {
                         });
                     }
                 }
+            }
+            UmMessage::OnGetUpdatesSetGameScore {
+                updates,
+                message_full_id,
+                promise,
+            } => {
+                // the empty promise stands in for the C++ `query_promise`
+                // the engine completes — the wrapper converts every band
+                // to ok before the lambda reads it (UpdatesManager.cpp:
+                // 1184-1190), so the tail below is the only continuation
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                let mut manager = std::mem::take(&mut td.game_manager);
+                {
+                    let mut env = crate::td::BotEnv { td };
+                    manager.on_set_game_score(&mut env, message_full_id, promise);
+                }
+                td.game_manager = manager;
             }
             UmMessage::OnGetUpdatesForumTopicCreated {
                 updates,
@@ -31510,6 +34060,21 @@ impl crate::notification_manager::NotificationManagerEnv for NotificationEnv<'_>
     /// td_->auth_manager_->is_bot()` (NotificationManager.cpp:170-172).
     fn is_disabled(&self) -> bool {
         self.global.close_flag() || !self.auth_is_authorized || self.auth_is_bot
+    }
+
+    /// `td_->option_manager_->set_option_boolean`
+    /// (NotificationManager.cpp:2673).
+    fn set_contact_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_deref_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    /// `td_->option_manager_->set_option_empty` (cpp:2675).
+    fn set_contact_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_deref_mut() {
+            options.set_option_empty(name);
+        }
     }
 
     fn close_flag(&self) -> bool {
@@ -32377,6 +34942,10 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn is_expected_error(&self, status: &Status) -> bool {
+        self.global.is_expected_error(status)
     }
 }
 
@@ -35490,12 +38059,14 @@ impl tdnet::net_query::DcInitSink for InertDcInit {
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
 /// the field-split borrows (the `NotificationEnv` convention); the net
 /// field carries the live dispatch surface for the query senders (`None`
-/// keeps the net-inert posture — the account and terms-of-service
-/// families dispatch, the suggested-action arms stay net-inert).
+/// keeps the net-inert posture — the inert arms log instead); the
+/// chat-manager half serves the suggested-action dismiss send legs (the
+/// `MessageQueryEnv` split shape).
 pub(crate) struct AccountEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: Option<&'a mut OptionManager>,
     pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub(crate) device_token_manager: &'a mut crate::device_token_manager::DeviceTokenManager,
     pub(crate) auth_is_bot: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
@@ -35901,8 +38472,153 @@ impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'
         )
     }
 
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    /// `DialogManager::check_dialog_access(dialog_id, false, Read,
+    /// "dismiss_suggested_action")` (SuggestedActionManager.cpp:163-165)
+    /// — the M.6 registry stand-in over the split borrows (the
+    /// `TdDialogParticipantEnv` shape; the full dialog-manager ladder
+    /// lands with the dialog plane).
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        use crate::dialog_id::DialogType;
+        let have = match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            DialogType::SecretChat | DialogType::None => false,
+        };
+        if have {
+            Ok(())
+        } else if !dialog_id.is_valid() {
+            Err(tdutils::status::Status::error(
+                400,
+                "Invalid chat identifier specified",
+            ))
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    /// `DialogManager::get_input_peer(dialog_id, Read)` — the dismiss
+    /// send-leg peer ladder over the split borrows (the
+    /// `MessageQueryEnv::env_input_peer` twin).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                let options = self.options.as_deref_mut()?;
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &env,
+                    user_id,
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            DialogType::Chat => self.chat_manager.get_input_peer_chat(
+                dialog_id.get_chat_id(),
+                crate::user_manager::AccessRights::Read,
+            ),
+            DialogType::Channel => {
+                let channel_id = dialog_id.get_channel_id();
+                let options = self.options.as_deref_mut()?;
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &env,
+                    channel_id,
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    /// `DismissSuggestionQuery::send` (SuggestedActionManager.cpp:34-46)
+    /// — the peer branch at the send leg: the valid dialog resolves its
+    /// read peer (the C++ CHECK band logs inert here), the empty dialog
+    /// sends `inputPeerEmpty`.
+    fn send_dismiss_suggestion_query(&mut self, action: &crate::suggested_action::SuggestedAction) {
+        let Some(net) = self.net.clone() else {
+            return tdutils::log_info!(
+                "Send help.dismissSuggestion for {:?} — [net-inert]",
+                action.type_
+            );
+        };
+        let input_peer = if action.dialog_id.is_valid() {
+            match self.get_input_peer(action.dialog_id) {
+                Some(peer) => peer,
+                None => {
+                    // the C++ CHECK(input_peer != nullptr) band
+                    // (cpp:38-39) — the logged inert skip
+                    return tdutils::log_info!(
+                        "DismissSuggestionQuery has no input peer for {:?}",
+                        action.dialog_id
+                    );
+                }
+            }
+        } else {
+            telegram_api::InputPeer::inputPeerEmpty(telegram_api::inputPeerEmpty {})
+        };
+        net.dispatch(
+            AccountNetKind::DismissSuggestion {
+                dialog_id: action.dialog_id.get(),
+                action_type: action.type_ as i32,
+            },
+            telegram_api::Function::help_dismissSuggestion(telegram_api::help_dismissSuggestion {
+                peer: Some(Box::new(input_peer)),
+                suggestion: action.get_suggested_action_str(),
+            }),
+        );
+    }
+
+    /// `CheckPromoDataQuery::send` (SuggestedActionManager.cpp:72-74).
+    fn send_get_promo_data_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::CheckPromoData,
+                telegram_api::Function::help_getPromoData(telegram_api::help_getPromoData),
+            ),
+            None => tdutils::log_info!("Send help.getPromoData — [net-inert]"),
+        }
     }
 }
 
@@ -37686,6 +40402,16 @@ pub(crate) fn premium_env_split(td: &mut Td) -> (crate::premium::PremiumManager,
 }
 
 impl PremiumEnv for PremiumTdEnv<'_> {
+    fn get_premium_gift_sticker_object(
+        &mut self,
+        month_count: i32,
+        star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        // Premium.cpp:446 — `stickers_manager_->get_premium_gift_sticker_object`
+        let (mut env, stickers_manager) = crate::td::stickers_env_split(self.td);
+        stickers_manager.get_premium_gift_sticker_object(&mut env, month_count, star_count)
+    }
+
     fn get_option_integer(&self, name: &str) -> i64 {
         self.td
             .option_manager
@@ -38203,18 +40929,20 @@ impl PremiumEnv for PremiumTdEnv<'_> {
 
     // `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
     // (Premium.cpp:1461-1465) over the suggested-action manager — the
-    // `AccountEnv` build (the `hide_archive_and_mute_suggested_action`
-    // precedent); the `DismissSuggestionQuery` seam parks with the
-    // suggested-action net slice.
+    // net-armed `AccountEnv` build (the suggested-action families ride
+    // the account dispatch plane, net-drain 52; the wire
+    // `help.dismissSuggestion` goes out for a present action).
     fn dismiss_suggested_action(
         &mut self,
         action_type: crate::suggested_action::SuggestedActionType,
     ) {
+        let net = self.td.account_net();
         let this = &mut *self.td;
         let crate::td::Td {
             global,
             option_manager,
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_manager,
             suggested_action_manager,
@@ -38227,10 +40955,11 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             global,
             options: option_manager.as_mut(),
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_is_bot: auth_manager.is_bot(),
             updates: account_updates,
-            net: None,
+            net,
         };
         // the C++ internal callers drop their promises
         suggested_action_manager.dismiss_suggested_action(
@@ -38415,43 +41144,128 @@ impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
 
 /// The boost-plane env over the `Td` fields.
 pub(crate) struct BoostEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out for the boost manager — the
+/// manager out, the env over the `Td` remainder (the
+/// `premium_env_split` convention); the caller restores the manager
+/// after the call. The net-drain 59 families widened the env from the
+/// field-split form to the whole-Td view: the answer drains resolve
+/// peers/users/chats through the real managers.
+pub(crate) fn boost_env_split(td: &mut Td) -> (crate::boost_manager::BoostManager, BoostEnv<'_>) {
+    let manager = std::mem::take(&mut td.boost_manager);
+    (manager, BoostEnv { td })
 }
 
 impl BoostManagerEnv for BoostEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_integer(name, default_value)
-        })
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_integer(name, default_value)
+            })
     }
 
-    fn send_update(&mut self, _update: td_api::Update) {}
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(td_api::Object::from(update));
+    }
 
     fn check_dialog_access(
         &mut self,
         dialog_id: crate::dialog_id::DialogId,
+        source: &str,
     ) -> std::result::Result<(), tdutils::status::Status> {
-        if dialog_id.is_valid() {
-            Ok(())
-        } else {
-            Err(tdutils::status::Status::error(400, "Chat not found"))
-        }
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            source,
+        ))
     }
 
     fn get_channel_first_username(&mut self, channel_id: crate::chat_manager::ChannelId) -> String {
         // `ChatManager::get_channel_first_username` — the M.5 surface; the
         // seam answers the empty username.
-        let _ = (
-            self.chat_manager as &mut crate::chat_manager::ChatManager,
-            channel_id,
-        );
+        let _ = (&mut self.td.chat_manager, channel_id);
         String::new()
+    }
+
+    // The answer-conversion reads of the net-drain 59 families (the
+    // `PremiumTdEnv` arms over the same managers).
+    fn unix_time(&mut self) -> i32 {
+        self.td.global.unix_time()
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        self.td.intake_users(users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str) {
+        self.td.intake_chats(chats, source);
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+        _force_read: bool,
+    ) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &tdutils::status::Status,
+        source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error(&self.td.global, dialog_id, status, source);
+    }
+
+    fn on_update_channel_participant_count(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        count: i32,
+    ) {
+        // `ChatManager::on_update_channel_participant_count`
+        // (ChatManager.cpp:7994) — the M.5 participant-count plane
+        // stand-in
+        let _ = (channel_id, count);
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        match user_manager.get_input_user(&env, user_id) {
+            Ok(input_user) => Ok(input_user),
+            Err(status) => Err(status),
+        }
     }
 }
 
@@ -39079,6 +41893,7 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
             global,
             option_manager,
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_manager,
             suggested_action_manager,
@@ -39091,6 +41906,7 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
             global,
             options: option_manager.as_mut(),
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_is_bot: auth_manager.is_bot(),
             updates: account_updates,
@@ -43047,6 +45863,16 @@ impl crate::callback_queries_manager::CallbackQueriesManagerEnv for BotEnv<'_> {
         tdutils::log_info!("MessagesManager::have_message_force — [blocked: M.10 Messages]");
         false
     }
+
+    /// `DialogManager::get_input_peer` — the net-drain 49 query send
+    /// legs resolve the read peer here (CallbackQueriesManager.cpp:46).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
 }
 
 impl crate::bot_recommendation_manager::BotRecommendationManagerEnv for BotEnv<'_> {
@@ -43141,13 +45967,14 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
         ))
     }
 
-    fn on_get_dialog_error(
+    /// `DialogManager::get_input_peer` (DialogManager.cpp:1377-1395) — the
+    /// net-drain 57 query send legs resolve the peer here.
+    fn get_input_peer(
         &mut self,
         dialog_id: crate::dialog_id::DialogId,
-        status: &Status,
-        source: &str,
-    ) {
-        crate::dialog_manager::on_get_dialog_error(&self.td.global, dialog_id, status, source);
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
     }
 
     fn have_message_force(
@@ -43174,15 +46001,6 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
         let _ = (message_full_id, source);
         tdutils::log_info!("MessagesManager::get_message_object — [blocked: M.10 Messages]");
         None
-    }
-
-    fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
-        // The public entry's self-bounce (UpdatesManager.cpp:1176-1178) —
-        // the manager's own slice, like every `on_get_updates` caller.
-        self.td.um_send_later(UmMessage::OnGetUpdates {
-            updates: Box::new(updates),
-            promise,
-        });
     }
 }
 
@@ -45671,6 +48489,7 @@ pub(crate) fn inline_env_split(
     &mut crate::inline_queries_manager::InlineQueriesManager,
     &mut crate::inline_message_manager::InlineMessageManager,
 ) {
+    let net = td.inline_message_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -45680,6 +48499,7 @@ pub(crate) fn inline_env_split(
         inline_queries_manager,
         inline_message_manager,
         inline_updates,
+        inline_message_net_pending,
         ..
     } = td;
     (
@@ -45690,6 +48510,8 @@ pub(crate) fn inline_env_split(
             user_manager,
             chat_manager,
             updates: inline_updates,
+            net,
+            pending: inline_message_net_pending,
         },
         inline_queries_manager,
         inline_message_manager,
@@ -45707,6 +48529,12 @@ pub(crate) struct TdInlineEnv<'a> {
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut ChatManager,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The net-drain 61 dispatch surface (the inline-message send legs);
+    /// `None` keeps the net-inert posture.
+    pub(crate) net: Option<InlineMessageNetHandle>,
+    /// The parked-query lots the send legs push and the answers pop
+    /// (the `Td` field the drain reads).
+    pub(crate) pending: &'a mut crate::inline_message_manager::PendingInlineMessageQueries,
 }
 
 /// Build the UserEnv from the env's fields (the field-level borrows
@@ -45902,94 +48730,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
     }
 
-    fn send_get_inline_bot_results_query(
-        &mut self,
-        _query: telegram_api::messages_getInlineBotResults,
-        _dialog_id: crate::dialog_id::DialogId,
-        _bot_user_id: crate::user_manager::UserId,
-        _query_hash: u64,
-        _promise: Promise<Option<td_api::InlineQueryResults>>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_set_inline_bot_results_query(
-        &mut self,
-        _query: telegram_api::messages_setInlineBotResults,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_set_bot_guest_chat_result_query(
-        &mut self,
-        _query_id: i64,
-        _result: telegram_api::InputBotInlineResult,
-        _promise: Promise<td_api::InlineMessageId>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_save_prepared_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_savePreparedInlineMessage,
-        _promise: Promise<td_api::PreparedInlineMessageId>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_prepared_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_getPreparedInlineMessage,
-        _bot_user_id: crate::user_manager::UserId,
-        _query_hash: u64,
-        _promise: Promise<Option<td_api::PreparedInlineMessage>>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_save_prepared_keyboard_button_query(
-        &mut self,
-        _query: telegram_api::bots_requestWebViewButton,
-        _promise: Promise<String>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_requested_web_view_button_query(
-        &mut self,
-        _query: telegram_api::bots_getRequestedWebViewButton,
-        _bot_user_id: crate::user_manager::UserId,
-        _prepared_button_id: String,
-        _promise: Promise<td_api::KeyboardButton>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_request_simple_web_view_query(
-        &mut self,
-        _query: telegram_api::messages_requestSimpleWebView,
-        _promise: Promise<td_api::WebAppUrl>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_send_web_view_data_query(
-        &mut self,
-        _query: telegram_api::messages_sendWebViewData,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_send_web_view_result_message_query(
-        &mut self,
-        _query: telegram_api::messages_sendWebViewResultMessage,
-        _promise: Promise<td_api::InlineMessageId>,
-    ) {
-        // [blocked: net]
-    }
-
     fn get_input_keyboard_button(
         &mut self,
         button: &td_api::KeyboardButton,
@@ -46087,28 +48827,93 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
 }
 
 impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> {
+    /// `EditInlineMessageQuery::send` (InlineMessageManager.cpp:87-124)
+    /// — the net-drain 61 send leg: the promise parks in the family lot
+    /// (§5's FIFO shape) and the wire query dispatches on the inline
+    /// message's own DC (`DcId::internal(get_inline_message_dc_id(...))`,
+    /// cpp:121). `None` on the handle keeps the net-inert posture.
     fn send_edit_inline_message_query(
         &mut self,
-        _query: telegram_api::messages_editInlineBotMessage,
-        _promise: Promise<()>,
+        query: telegram_api::messages_editInlineBotMessage,
+        promise: Promise<()>,
     ) {
-        // [blocked: net]
+        self.pending.edits.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::EditInlineMessage,
+                telegram_api::Function::messages_editInlineBotMessage(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.editInlineBotMessage — [net-inert]");
+            }
+        }
     }
 
+    /// `SetInlineGameScoreQuery::send`
+    /// (InlineMessageManager.cpp:143-177) — the net-drain 61 send leg
+    /// over the inline message's own DC (cpp:168).
     fn send_set_inline_game_score_query(
         &mut self,
-        _query: telegram_api::messages_setInlineGameScore,
-        _promise: Promise<()>,
+        query: telegram_api::messages_setInlineGameScore,
+        promise: Promise<()>,
     ) {
-        // [blocked: net]
+        self.pending.scores.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::SetInlineGameScore,
+                telegram_api::Function::messages_setInlineGameScore(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.setInlineGameScore — [net-inert]");
+            }
+        }
     }
 
+    /// `GetInlineGameHighScoresQuery::send`
+    /// (InlineMessageManager.cpp:179-210) — the net-drain 61 send leg
+    /// over the inline message's own DC (cpp:206).
     fn send_get_inline_game_high_scores_query(
         &mut self,
-        _query: telegram_api::messages_getInlineGameHighScores,
-        _promise: Promise<td_api::GameHighScores>,
+        query: telegram_api::messages_getInlineGameHighScores,
+        promise: Promise<td_api::GameHighScores>,
     ) {
-        // [blocked: net]
+        self.pending.high_scores.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::GetInlineGameHighScores,
+                telegram_api::Function::messages_getInlineGameHighScores(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.getInlineGameHighScores — [net-inert]");
+            }
+        }
     }
 
     fn get_input_media_for_edit(
@@ -46638,20 +49443,50 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         )
     }
 
-    fn send_check_history_import_query(
-        &mut self,
-        _message_file_head: String,
-        _promise: Promise<td_api::MessageFileType>,
-    ) {
-        // [blocked: net]
+    fn send_check_history_import_query(&mut self, message_file_head: String) {
+        // `CheckHistoryImportQuery::send` (MessageImportManager.cpp:38-40)
+        // — the head string is the whole wire form (no peer).
+        let Some(net) = self.td.message_import_net() else {
+            tdutils::log_info!("Check history import — [net-inert]");
+            return;
+        };
+        net.dispatch(
+            crate::message_import_manager::MessageImportNetKind::CheckHistoryImport,
+            telegram_api::Function::messages_checkHistoryImport(
+                telegram_api::messages_checkHistoryImport {
+                    import_head: message_file_head,
+                },
+            ),
+        );
     }
 
-    fn send_check_history_import_peer_query(
-        &mut self,
-        _dialog_id: crate::dialog_id::DialogId,
-        _promise: Promise<String>,
-    ) {
-        // [blocked: net]
+    fn send_check_history_import_peer_query(&mut self, dialog_id: crate::dialog_id::DialogId) {
+        // `CheckHistoryImportPeerQuery::send`
+        // (MessageImportManager.cpp:75-81) — the write peer resolves
+        // here; the C++ CHECK(input_peer != nullptr) downgrades to the
+        // sibling 400 access band (the autosave convention) so the
+        // answer half runs the full on_error tail.
+        use crate::message_import_manager::MessageImportNetKind;
+        let Some(net) = self.td.message_import_net() else {
+            tdutils::log_info!("Check history import peer — [net-inert]");
+            return;
+        };
+        let kind = MessageImportNetKind::CheckHistoryImportPeer { dialog_id };
+        match crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Write,
+        ) {
+            Some(peer) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_checkHistoryImportPeer(
+                    telegram_api::messages_checkHistoryImportPeer {
+                        peer: Some(Box::new(peer)),
+                    },
+                ),
+            ),
+            None => net.complete_error(kind, 400, "Can't access the chat"),
+        }
     }
 
     fn start_history_import(
@@ -46661,7 +49496,10 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         _attached_files: Vec<td_api::InputFile>,
         _promise: Promise<()>,
     ) {
-        // [blocked: Files upload] + [blocked: net]
+        // [blocked: net/Files] — the C++ send resolves the uploaded
+        // InputFile through the FileManager upload chain
+        // (MessageImportManager.cpp:368-386); the request parks at the
+        // upload seam.
     }
 }
 /// Field-split the `Td` for the top-dialog/recommendation manager calls.
@@ -46671,6 +49509,8 @@ pub(crate) fn top_dialog_env_split(
     TdTopDialogEnv<'_>,
     &mut crate::top_dialog_manager::TopDialogManager,
 ) {
+    let net = td.top_dialog_net();
+    let recommendation_net = td.channel_recommendation_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -46688,6 +49528,8 @@ pub(crate) fn top_dialog_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
+            recommendation_net,
         },
         top_dialog_manager,
     )
@@ -46699,6 +49541,8 @@ pub(crate) fn recommendation_env_split(
     TdTopDialogEnv<'_>,
     &mut crate::channel_recommendation_manager::ChannelRecommendationManager,
 ) {
+    let net = td.top_dialog_net();
+    let recommendation_net = td.channel_recommendation_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -46716,6 +49560,8 @@ pub(crate) fn recommendation_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
+            recommendation_net,
         },
         channel_recommendation_manager,
     )
@@ -46732,6 +49578,67 @@ pub(crate) struct TdTopDialogEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The net-drain 61 top-dialog dispatch surface (the query send
+    /// legs); `None` keeps the net-inert posture.
+    pub(crate) net: Option<TopDialogNetHandle>,
+    /// The net-drain 61 channel-recommendation dispatch surface (the
+    /// query send legs); `None` keeps the net-inert posture.
+    pub(crate) recommendation_net: Option<ChannelRecommendationNetHandle>,
+}
+
+impl TdTopDialogEnv<'_> {
+    /// The `DialogManager::get_input_peer` ladder over the split
+    /// borrows (the `TdDialogParticipantEnv::dialog_participant_get_input_peer`
+    /// shape — the free function needs a whole-`Td` borrow).
+    fn top_dialog_get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &user_env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &user_env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+    }
 }
 
 fn top_env_user_env<'a>(
@@ -46909,20 +49816,86 @@ impl crate::top_dialog_manager::TopDialogManagerEnv for TdTopDialogEnv<'_> {
         // [blocked: StateManager]
     }
 
-    fn send_toggle_top_peers_query(&mut self, _is_enabled: bool) {
-        // [blocked: net]
+    /// `ToggleTopPeersQuery::send` (TopDialogManager.cpp:78-82) — the
+    /// net-drain 61 send leg over the env-carried handle; the answer
+    /// re-enters the manager through the kind's captured flag (the C++
+    /// promise lambda, cpp:164-167).
+    fn send_toggle_top_peers_query(&mut self, is_enabled: bool) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                crate::top_dialog_manager::TopDialogNetKind::ToggleTopPeers { is_enabled },
+                telegram_api::Function::contacts_toggleTopPeers(
+                    telegram_api::contacts_toggleTopPeers {
+                        enabled: is_enabled,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send contacts.toggleTopPeers — [net-inert]");
+            }
+        }
     }
 
-    fn send_get_top_peers_query(&mut self, _hash: i64) {
-        // [blocked: net]
+    /// `GetTopPeersQuery::send` (TopDialogManager.cpp:49-53) — the ten
+    /// category bits, limit 100 and the vector hash of the registry
+    /// (cpp:490-515's `get_vector_hash` fold).
+    fn send_get_top_peers_query(&mut self, hash: i64) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                crate::top_dialog_manager::TopDialogNetKind::GetTopPeers,
+                telegram_api::Function::contacts_getTopPeers(telegram_api::contacts_getTopPeers {
+                    flags: 0,
+                    correspondents: true,
+                    bots_pm: true,
+                    bots_inline: true,
+                    phone_calls: true,
+                    forward_users: true,
+                    forward_chats: true,
+                    groups: true,
+                    channels: true,
+                    bots_app: true,
+                    bots_guestchat: true,
+                    offset: 0,
+                    limit: 100,
+                    hash,
+                }),
+            ),
+            None => {
+                tdutils::log_info!("Send contacts.getTopPeers — [net-inert]");
+            }
+        }
     }
 
+    /// `ResetTopPeerRatingQuery::send` (TopDialogManager.cpp:100-107) —
+    /// the category mapping + the resolved read peer; the C++ CHECK
+    /// band downgrades to the complete_error file-through so the
+    /// `on_error` head runs.
     fn send_reset_top_peer_rating_query(
         &mut self,
-        _category: crate::top_dialog_manager::TopDialogCategory,
-        _dialog_id: crate::dialog_id::DialogId,
+        category: crate::top_dialog_manager::TopDialogCategory,
+        dialog_id: crate::dialog_id::DialogId,
     ) {
-        // [blocked: net]
+        let kind = crate::top_dialog_manager::TopDialogNetKind::ResetTopPeerRating { dialog_id };
+        match (
+            self.net.clone(),
+            self.top_dialog_get_input_peer(dialog_id, crate::user_manager::AccessRights::Read),
+        ) {
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::contacts_resetTopPeerRating(
+                    telegram_api::contacts_resetTopPeerRating {
+                        category: Some(crate::top_dialog_manager::get_input_top_peer_category(
+                            category,
+                        )),
+                        peer: Some(Box::new(peer)),
+                    },
+                ),
+            ),
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => {
+                tdutils::log_info!("Send contacts.resetTopPeerRating — [net-inert]");
+            }
+        }
     }
 }
 
@@ -47023,8 +49996,97 @@ impl crate::channel_recommendation_manager::ChannelRecommendationManagerEnv for 
         self.global.td_db().common_kv().erase(key);
     }
 
-    fn reload_recommended_channels(&mut self, _channel_id: crate::chat_manager::ChannelId) {
-        // [blocked: net]
+    fn get_channel_ids(
+        &mut self,
+        chats: Vec<telegram_api::Chat>,
+        source: &str,
+    ) -> Vec<crate::chat_manager::ChannelId> {
+        let Some(options) = self.options.as_deref_mut() else {
+            return Vec::new();
+        };
+        let mut env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .get_channel_ids(self.user_manager, &mut env, chats, source)
+    }
+
+    fn on_get_channel_error(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        let Some(options) = self.options.as_deref_mut() else {
+            return false;
+        };
+        let mut env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.on_get_channel_error(
+            self.user_manager,
+            &mut env,
+            channel_id,
+            status,
+            source,
+        )
+    }
+
+    fn get_input_channel_object(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<telegram_api::InputChannel> {
+        let options = self.options.as_deref_mut()?;
+        let env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.get_input_channel(&env, channel_id)
+    }
+
+    /// `GetChannelRecommendationsQuery::send`
+    /// (ChannelRecommendationManager.cpp:47-58) — the net-drain 61
+    /// send leg over the env-carried handle; the C++ `CHECK` band
+    /// (a valid channel id whose input form misses — unreachable
+    /// behind the `get_channel_recommendations` pre-gate) downgrades
+    /// to the complete_error file-through so the `on_error` head
+    /// runs.
+    fn reload_recommended_channels(&mut self, channel_id: crate::chat_manager::ChannelId) {
+        use crate::channel_recommendation_manager::ChannelRecommendationNetKind;
+        let kind = ChannelRecommendationNetKind::GetChannelRecommendations { channel_id };
+        match self.recommendation_net.clone() {
+            Some(net) => {
+                let input_channel = self.get_input_channel_object(channel_id);
+                if channel_id.is_valid() && input_channel.is_none() {
+                    // the C++ `CHECK(!channel_id.is_valid() ||
+                    // input_channel != nullptr)` band
+                    return net.complete_error(kind, 400, "Can't access the chat");
+                }
+                let flags = if input_channel.is_some() {
+                    // `CHANNEL_MASK` (the generated layer-230 bit 0)
+                    1
+                } else {
+                    0
+                };
+                net.dispatch(
+                    kind,
+                    telegram_api::Function::channels_getChannelRecommendations(
+                        telegram_api::channels_getChannelRecommendations {
+                            flags,
+                            channel: input_channel,
+                        },
+                    ),
+                );
+            }
+            None => {
+                tdutils::log_info!("Send channels.getChannelRecommendations — [net-inert]");
+            }
+        }
     }
 
     fn save_app_log(&mut self, _ref_channel_id: i64, _open_channel_id: i64, _promise: Promise<()>) {
@@ -47148,6 +50210,7 @@ pub(crate) struct TdStickersEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
 }
 
 impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
@@ -47265,6 +50328,92 @@ impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
         let file_manager = self.file_manager.lock();
         Some(file_manager.get_file_object(file_id))
     }
+
+    fn file_suggested_path(&mut self, file_id: crate::files::FileId) -> String {
+        let file_manager = self.file_manager.lock();
+        file_manager
+            .get_file_view(file_id)
+            .map(|view| view.suggested_path())
+            .unwrap_or_default()
+    }
+
+    fn file_register_sticker(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        dc_id: crate::chat_manager::DcId,
+        file_reference: String,
+        size: i64,
+        format: crate::documents_manager::StickerFormat,
+    ) -> crate::files::FileId {
+        let mut file_manager = self.file_manager.lock();
+        file_manager.register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                crate::files::FileType::Sticker,
+                document_id,
+                access_hash,
+                dc_id,
+                file_reference,
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::new(0),
+            size,
+            0,
+            format!(
+                "{}{}",
+                document_id,
+                crate::stickers_manager::get_sticker_format_extension(format)
+            ),
+        )
+    }
+
+    fn photo_size_registered(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        file_reference: String,
+        dc_id: crate::chat_manager::DcId,
+        size_ptr: telegram_api::PhotoSize,
+        format: crate::photo::PhotoFormat,
+    ) -> crate::photo::PhotoSizeOrMinithumbnail {
+        crate::photo::get_photo_size_registered(
+            &mut self.file_manager.lock(),
+            &mut self.file_load_manager.lock(),
+            crate::files::PhotoSizeSource::thumbnail(crate::files::FileType::Thumbnail, 0),
+            document_id,
+            access_hash,
+            file_reference,
+            dc_id,
+            crate::message_id::DialogId::new(0),
+            size_ptr,
+            format,
+        )
+    }
+
+    fn register_photo_size(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        file_reference: String,
+        file_size: i32,
+        dc_id: crate::chat_manager::DcId,
+        format: crate::photo::PhotoFormat,
+    ) -> crate::files::FileId {
+        crate::photo::register_photo_size(
+            &mut self.file_manager.lock(),
+            crate::files::PhotoSizeSource::thumbnail(
+                crate::files::FileType::Thumbnail,
+                b'f' as i32,
+            ),
+            document_id,
+            access_hash,
+            file_reference,
+            crate::message_id::DialogId::new(0),
+            file_size,
+            dc_id,
+            format,
+        )
+    }
 }
 
 /// The field-split over [`Td`] for the StickersManager request arms (the
@@ -47281,6 +50430,7 @@ pub(crate) fn stickers_env_split(
         auth_manager,
         user_manager,
         file_manager,
+        file_load_manager,
         stickers_manager,
         ..
     } = td;
@@ -47291,6 +50441,7 @@ pub(crate) fn stickers_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             file_manager: std::sync::Arc::clone(file_manager),
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
         },
         stickers_manager,
     )
@@ -50023,6 +53174,67 @@ pub(crate) struct TdMessageReactionQueryEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// The net-drain 61 dispatch surface (the send legs of the two
+    /// query families); `None` keeps the net-inert posture.
+    pub(crate) net: Option<ReactionNetHandle>,
+    /// The parked-query lots the send legs push and the answers pop
+    /// (the `Td` field the drain reads).
+    pub(crate) pending: &'a mut crate::message_reaction::PendingReactionQueries,
+}
+
+impl TdMessageReactionQueryEnv<'_> {
+    /// The `DialogManager::get_input_peer` ladder over the split
+    /// borrows (the `TdDialogParticipantEnv::dialog_participant_get_input_peer`
+    /// shape — the free function needs a whole-`Td` borrow).
+    fn reaction_get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &user_env,
+                    dialog_id.get_user_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::Chat => self
+                .chat_manager
+                .get_input_peer_chat(dialog_id.get_chat_id(), access_rights),
+            crate::dialog_id::DialogType::Channel => {
+                let options = self
+                    .options
+                    .as_deref_mut()
+                    .expect("the option manager exists while the env drives");
+                let user_env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &user_env,
+                    dialog_id.get_channel_id(),
+                    access_rights,
+                )
+            }
+            crate::dialog_id::DialogType::SecretChat => None,
+            crate::dialog_id::DialogType::None => {
+                Some(tdmtproto::telegram_api::InputPeer::inputPeerEmpty(
+                    tdmtproto::telegram_api::inputPeerEmpty {},
+                ))
+            }
+        }
+    }
 }
 
 pub(crate) fn message_reactions_query_env_split(
@@ -50031,6 +53243,7 @@ pub(crate) fn message_reactions_query_env_split(
     TdMessageReactionQueryEnv<'_>,
     &mut crate::messages_manager::MessagesManager,
 ) {
+    let net = td.reaction_net();
     let crate::td::Td {
         global,
         option_manager,
@@ -50038,6 +53251,7 @@ pub(crate) fn message_reactions_query_env_split(
         user_manager,
         chat_manager,
         messages_manager,
+        reaction_net_pending,
         ..
     } = td;
     (
@@ -50047,6 +53261,8 @@ pub(crate) fn message_reactions_query_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            net,
+            pending: reaction_net_pending,
         },
         messages_manager,
     )
@@ -50110,6 +53326,108 @@ impl crate::message_reaction::MessageReactionQueryEnv for TdMessageReactionQuery
                 .get_channel(dialog_id.get_channel_id())
                 .is_some(),
             crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    /// `GetMessageReactionsListQuery::send` (MessageReaction.cpp:223-247)
+    /// — the net-drain 61 send leg: the request parks in the family lot
+    /// with the non-Copy handler members (§5's FIFO shape), the read
+    /// peer resolves at the send leg and the wire query dispatches
+    /// (`REACTION_MASK`/`OFFSET_MASK` carry the non-empty reaction and
+    /// offset). `None` on the handle keeps the net-inert posture.
+    fn send_get_message_reactions_list(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::messages_manager::MessageId,
+        reaction_type: crate::reaction_type::ReactionType,
+        offset: String,
+        limit: i32,
+        promise: tdutils::promise::Promise<td_api::AddedReactions>,
+    ) {
+        self.pending
+            .list
+            .push(crate::message_reaction::PendingReactionListQuery {
+                dialog_id,
+                message_id,
+                reaction_type: reaction_type.clone(),
+                offset: offset.clone(),
+                promise,
+            });
+        let kind = crate::message_reaction::ReactionNetKind::GetMessageReactionsList { dialog_id };
+        let reaction_mask = if reaction_type.is_empty() { 0 } else { 1 };
+        let offset_mask = if offset.is_empty() { 0 } else { 1 << 1 };
+        match (
+            self.net.clone(),
+            self.reaction_get_input_peer(dialog_id, crate::user_manager::AccessRights::Read),
+        ) {
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getMessageReactionsList(
+                    telegram_api::messages_getMessageReactionsList {
+                        flags: reaction_mask | offset_mask,
+                        peer: Some(Box::new(peer)),
+                        id: message_id.get_server_message_id().get(),
+                        reaction: Some(reaction_type.get_input_reaction()),
+                        offset,
+                        limit,
+                    },
+                ),
+            ),
+            // the C++ `if (input_peer == nullptr)` band (cpp:229-232) —
+            // the complete_error file-through so the answer half runs
+            // the full `on_error` tail
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => {
+                tdutils::log_info!("Send messages.getMessageReactionsList — [net-inert]");
+            }
+        }
+    }
+
+    /// `ReportReactionQuery::send` (MessageReaction.cpp:313-326) — the
+    /// net-drain 61 send leg: the promise parks in the family lot, the
+    /// dialog read peer and the chooser's Know peer resolve at the send
+    /// leg; the chooser miss answers the promise directly (cpp:319-322,
+    /// no `on_error` run), the dialog-peer miss files through the
+    /// completed queue (the C++ CHECK band, the message-query
+    /// convention).
+    fn send_report_message_reaction(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::messages_manager::MessageId,
+        chooser_dialog_id: crate::dialog_id::DialogId,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        self.pending.report.push(promise);
+        let kind = crate::message_reaction::ReactionNetKind::ReportReaction { dialog_id };
+        let peer = self.reaction_get_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        let chooser_peer = self
+            .reaction_get_input_peer(chooser_dialog_id, crate::user_manager::AccessRights::Know);
+        match (self.net.clone(), peer, chooser_peer) {
+            (Some(net), Some(peer), Some(chooser)) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_reportReaction(
+                    telegram_api::messages_reportReaction {
+                        peer: Some(Box::new(peer)),
+                        id: message_id.get_server_message_id().get(),
+                        reaction_peer: Some(Box::new(chooser)),
+                    },
+                ),
+            ),
+            // the C++ `CHECK(input_peer != nullptr)` (cpp:317) — the
+            // complete_error file-through so the `on_error` tail runs
+            (Some(net), None, _) => net.complete_error(kind, 400, "Can't access the chat"),
+            // the chooser-miss band (cpp:319-322) — the C++ answers the
+            // promise directly without dispatching
+            (Some(_), Some(_), None) => {
+                let mut promise = self.pending.report.remove(0);
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Reaction sender is not accessible",
+                ));
+            }
+            (None, _, _) => {
+                tdutils::log_info!("Send messages.reportReaction — [net-inert]");
+            }
         }
     }
 }
@@ -52839,6 +56157,14 @@ mod tests {
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
+        td.inline_queries_manager.net = td.inline_queries_net();
+        td.boost_manager.net = td.boost_net();
+        td.callback_queries_manager.net = td.callback_net();
+        td.game_manager.net = td.game_net();
+        td.bot_recommendation_manager.net = td.bot_recommendation_net();
+        td.device_token_manager.net = td.device_token_net();
+        td.notification_manager.net = td.notification_net();
+        td.stickers_manager.net = td.stickers_net();
         (td, rec, callback)
     }
 
@@ -53857,6 +57183,7 @@ mod tests {
             global: &mut td.global,
             options: td.option_manager.as_mut(),
             user_manager: &mut td.user_manager,
+            chat_manager: &mut td.chat_manager,
             device_token_manager: &mut td.device_token_manager,
             auth_is_bot: td.auth_manager.is_bot(),
             updates: &mut td.account_updates,
@@ -55462,6 +58789,544 @@ mod tests {
             .unwrap();
     }
 
+    // ---- the net-drain 52 suggested-action slice (the promo family):
+    // the login-email check rides the account dispatch plane (the
+    // SuggestedActionManager.cpp CheckPromoDataQuery handler half). ----
+
+    /// The net-drain 52 promo round-trip — the §3.9 family rides the
+    /// dispatcher through the [`AccountEnv`] send arm
+    /// (CheckPromoDataQuery, SuggestedActionManager.cpp:65-105): the
+    /// live `isLoginEmailAddressRequired` arm dispatches
+    /// `help.getPromoData`, the matching SETUP_LOGIN_EMAIL answer
+    /// settles ok (cpp:87-93), the unmatched and empty promo bands
+    /// answer 404 "Not Found" (cpp:94-99), errors forward verbatim
+    /// (cpp:102-104) and parse failures ride the 500 convention.
+
+    #[test]
+    fn suggested_action_promo_bands_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suggested_action_promo_bands_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn suggested_action_promo_bands_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suggested-actions");
+
+        fn promo_answer(suggestions: &[&str]) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_PromoData::help_promoData(telegram_api::help_promoData {
+                flags: 0,
+                proxy: false,
+                expires: 1_700_003_600,
+                peer: None,
+                psa_type: String::new(),
+                psa_message: String::new(),
+                pending_suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+                dismissed_suggestions: Vec::new(),
+                custom_pending_suggestion: None,
+                chats: Vec::new(),
+                users: Vec::new(),
+            })
+            .store(&mut out);
+            out
+        }
+
+        fn promo_empty_answer() -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_PromoData::help_promoDataEmpty(telegram_api::help_promoDataEmpty {
+                expires: 1_700_003_600,
+            })
+            .store(&mut out);
+            out
+        }
+
+        td.request(
+            310,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_answer(&["SETUP_LOGIN_EMAIL"]));
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 310)
+                .iter()
+                .any(|object| matches!(object, Object::ok(_))),
+            "the matching promo settles ok"
+        );
+
+        td.request(
+            311,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_answer(&["VALIDATE_PASSWORD"]));
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 311);
+        assert_eq!(error.code, 404);
+        assert_eq!(error.message, "Not Found");
+
+        td.request(
+            312,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_empty_answer());
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 312);
+        assert_eq!(error.code, 404);
+        assert_eq!(error.message, "Not Found");
+
+        td.request(
+            313,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_fail(sent, 420, "SLOWMODE_WAIT");
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 313);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "SLOWMODE_WAIT");
+
+        td.request(
+            314,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, vec![0x00, 0x00, 0x00, 0x00]);
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 314);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the help.getPromoData answer"
+        );
+    }
+
+    // ---- the net-drain 52 suggested-action slice (the dismiss
+    // family): the hideSuggestedAction arm rides the account dispatch
+    // plane (the SuggestedAction.cpp free ladder + the manager flow, the
+    // DismissSuggestionQuery handler half). ----
+
+    /// The net-drain 52 dismiss round-trips — the §3.9 family rides the
+    /// dispatcher through the [`AccountEnv`] send arm
+    /// (DismissSuggestionQuery, SuggestedActionManager.cpp:26-63): the
+    /// live `hideSuggestedAction` arm through the free ladder
+    /// (SuggestedAction.cpp:312-355) into the manager flow (cpp:156-193)
+    /// and the wire query — the wire form (inputPeerEmpty + the action
+    /// string), the head-only send + fan-out, the ladder bands, the
+    /// error forward, the dialog-access band — and the Bool answer
+    /// settling the deferred ok with the reload tail (cpp:195-220); the
+    /// premium dismiss-park flip (the assignStoreTransaction trio,
+    /// Premium.cpp:1454-1465).
+    #[test]
+    fn suggested_action_dismiss_bands_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suggested_action_dismiss_bands_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn suggested_action_dismiss_bands_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suggested-actions-dismiss");
+
+        // Load the persistent actions through the real manager intake
+        // (the dismiss entry sends only for present actions) — the env
+        // exactly as the production call sites build it (the take-out
+        // convention).
+        fn load_actions(td: &mut Td, strs: &[&str]) {
+            let mut manager = std::mem::take(&mut td.suggested_action_manager);
+            let net = td.account_net();
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+                net,
+            };
+            manager.update_suggested_actions(
+                &mut env,
+                strs.iter()
+                    .map(|str| crate::suggested_action::SuggestedAction::from_action_str(str))
+                    .collect(),
+            );
+            td.suggested_action_manager = manager;
+        }
+
+        fn dismiss_wire(query: &NetQuery) -> telegram_api::help_dismissSuggestion {
+            telegram_api::help_dismissSuggestion::parse(query.query()).unwrap()
+        }
+
+        // 1. The live hideSuggestedAction arm — the loaded action rides
+        //    the free ladder into the manager flow (Requests.cpp:8144-
+        //    8148 → SuggestedAction.cpp:312-355 → 156-193): the wire form
+        //    carries inputPeerEmpty + the action string; boolTrue settles
+        //    the deferred ok (cpp:48-55), the removal update emits and the
+        //    no-dialog ok branch runs the reload tail (cpp:216) — the
+        //    follow-up help.getAppConfig dispatches.
+        {
+            load_actions(&mut td, &["PREMIUM_UPGRADE"]);
+            td.request(
+                301,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionUpgradePremium(
+                        td_api::suggestedActionUpgradePremium,
+                    )),
+                }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::help_dismissSuggestion::ID,
+            );
+            let wire = dismiss_wire(&sent);
+            assert!(matches!(
+                wire.peer.as_ref().map(|peer| peer.as_ref()),
+                Some(telegram_api::InputPeer::inputPeerEmpty(_))
+            ));
+            assert_eq!(wire.suggestion, "PREMIUM_UPGRADE");
+            net_complete(sent, bool_answer(true));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 301)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the dismiss settles ok"
+            );
+            let removed = td
+                .account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateSuggestedActions(_)))
+                .count();
+            assert_eq!(removed, 2, "the intake load + the removal update");
+            // cpp:216 — the reload tail: the follow-up app-config query
+            // dispatches (the in-flight coalescing keeps it at one).
+            let config_queries = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::help_getAppConfig::ID)
+                .count();
+            assert_eq!(config_queries, 1, "the reload tail dispatches");
+        }
+
+        // 2. The fan-out band — a second dismiss of the same in-flight
+        //    action parks without a second query (cpp:185-192); one
+        //    answer settles both promises.
+        {
+            load_actions(&mut td, &["PREMIUM_RESTORE"]);
+            td.request(
+                302,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionRestorePremium(
+                        td_api::suggestedActionRestorePremium,
+                    )),
+                }),
+            );
+            td.request(
+                303,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionRestorePremium(
+                        td_api::suggestedActionRestorePremium,
+                    )),
+                }),
+            );
+            let dismissals = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::help_dismissSuggestion::ID)
+                .collect::<Vec<_>>();
+            assert_eq!(dismissals.len(), 1, "the head-only send");
+            net_complete(dismissals.into_iter().next().unwrap(), bool_answer(true));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            for id in [302, 303] {
+                assert!(
+                    responses_of(&callback, id)
+                        .iter()
+                        .any(|object| matches!(object, Object::ok(_))),
+                    "the fan-out settles {id}"
+                );
+            }
+            let _ = std::mem::take(&mut *rec.sent.lock());
+        }
+
+        // 3. The absent-action band — a dismiss of an action the manager
+        //    does not hold settles ok inline with no wire query
+        //    (cpp:179-181).
+        {
+            td.request(
+                304,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionCheckPhoneNumber(
+                        td_api::suggestedActionCheckPhoneNumber,
+                    )),
+                }),
+            );
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 304)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the absent action settles ok"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(sent.is_empty(), "no wire query for an absent action");
+        }
+
+        // 4. The ladder bands through the live arm — the noskip 400
+        //    (SuggestedAction.cpp:317-318), the invalid delay 400
+        //    (cpp:333-334) and the matching-days ok band (cpp:339-346:
+        //    the removal update + the cleared option, no wire query).
+        {
+            td.request(
+                305,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(
+                        td_api::SuggestedAction::suggestedActionSetLoginEmailAddress(
+                            td_api::suggestedActionSetLoginEmailAddress {
+                                can_be_hidden: false,
+                            },
+                        ),
+                    ),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 305);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "The action can't be hidden");
+
+            td.request(
+                306,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionSetPassword(
+                        td_api::suggestedActionSetPassword {
+                            authorization_delay: -1,
+                        },
+                    )),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 306);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Invalid authorization_delay specified");
+
+            if let Some(options) = td.option_manager.as_mut() {
+                options.set_option_integer("otherwise_relogin_days", 7);
+            }
+            let updates_before = td
+                .account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateSuggestedActions(_)))
+                .count();
+            td.request(
+                307,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionSetPassword(
+                        td_api::suggestedActionSetPassword {
+                            authorization_delay: 7,
+                        },
+                    )),
+                }),
+            );
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 307)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the days band settles ok"
+            );
+            let updates_after = td
+                .account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateSuggestedActions(_)))
+                .count();
+            assert_eq!(updates_after, updates_before + 1, "the removal update");
+            assert_eq!(
+                td.option_manager
+                    .as_ref()
+                    .map(|options| options.get_option_integer("otherwise_relogin_days", 0)),
+                Some(0),
+                "the option cleared"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(sent.is_empty(), "the days band sends nothing");
+        }
+
+        // 5. The error band — the wire error forwards to the deferred
+        //    promise (cpp:57-62 → 206-208).
+        {
+            load_actions(&mut td, &["BIRTHDAY_SETUP"]);
+            td.request(
+                308,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionSetBirthdate(
+                        td_api::suggestedActionSetBirthdate,
+                    )),
+                }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::help_dismissSuggestion::ID,
+            );
+            net_fail(sent, 400, "SUGGESTION_INVALID");
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 308);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "SUGGESTION_INVALID");
+        }
+
+        // 6. The dialog-form band — the unregistered channel fails the
+        //    access gate before any dispatch (cpp:163-165).
+        {
+            td.request(
+                309,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(
+                        td_api::SuggestedAction::suggestedActionConvertToBroadcastGroup(
+                            td_api::suggestedActionConvertToBroadcastGroup {
+                                supergroup_id: 1099,
+                            },
+                        ),
+                    ),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 309);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Chat not found");
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(sent.is_empty());
+        }
+
+        // 8. The premium dismiss-park flip (§6) — the
+        //    assignStoreTransaction PremiumSubscription purpose dismisses
+        //    the three suggested actions (Premium.cpp:1454-1456): with the
+        //    actions loaded the trio rides the wire (the §6 parks flip),
+        //    the answers drain through the account plane and the reload
+        //    tail parks behind the in-flight app-config query (the
+        //    coalescing).
+        {
+            load_actions(
+                &mut td,
+                &["PREMIUM_UPGRADE", "PREMIUM_ANNUAL", "PREMIUM_RESTORE"],
+            );
+            let (promise, slot) = record_translation_unit();
+            with_premium_manager(&mut td, |manager, env| {
+                manager.assign_store_transaction(
+                    env,
+                    Some(td_api::StoreTransaction::storeTransactionGooglePlay(
+                        td_api::storeTransactionGooglePlay {
+                            package_name: "org.telegram.plus".to_string(),
+                            store_product_id: "product/12".to_string(),
+                            purchase_token: "tok".to_string(),
+                        },
+                    )),
+                    Some(
+                        td_api::StorePaymentPurpose::storePaymentPurposePremiumSubscription(
+                            td_api::storePaymentPurposePremiumSubscription {
+                                is_restore: true,
+                                is_upgrade: false,
+                            },
+                        ),
+                    ),
+                    promise,
+                );
+            });
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            let mut dismiss_queries = Vec::new();
+            let mut rest = Vec::new();
+            for query in sent {
+                if query.tl_constructor() == telegram_api::help_dismissSuggestion::ID {
+                    dismiss_queries.push(query);
+                } else {
+                    rest.push(query);
+                }
+            }
+            let dismissals = dismiss_queries
+                .iter()
+                .map(dismiss_wire)
+                .map(|wire| wire.suggestion.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                dismissals,
+                ["PREMIUM_UPGRADE", "PREMIUM_ANNUAL", "PREMIUM_RESTORE"],
+                "the §6 trio rides the wire"
+            );
+            let assign_query = rest
+                .into_iter()
+                .find(|query| {
+                    query.tl_constructor() == telegram_api::payments_assignPlayMarketTransaction::ID
+                })
+                .expect("the assign query dispatches");
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            net_complete(assign_query, answer);
+            td.dispatch_completed_premium_net();
+            assert!(matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+            // the trio's Bool answers drain through the account plane:
+            // the lots pop, the promise-less internal dismisses settle,
+            // and each no-dialog ok branch queues an app-config reload —
+            // all coalesced behind the in-flight query from case 1 (no
+            // new dispatch).
+            for query in dismiss_queries {
+                net_complete(query, bool_answer(true));
+                td.dispatch_completed_account_net();
+            }
+            assert!(
+                td.suggested_action_manager
+                    .dismiss_suggested_action_queries
+                    .is_empty(),
+                "the dismisses drain"
+            );
+            let config_queries = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::help_getAppConfig::ID)
+                .count();
+            assert_eq!(
+                config_queries, 0,
+                "the reloads coalesce behind the in-flight config"
+            );
+        }
+
+        assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
     fn terms_of_service_families_ride_the_dispatcher_impl() {
         let (mut td, rec, callback) = netted_td_with_callback("netfix-terms");
 
@@ -55474,6 +59339,7 @@ mod tests {
                     global: &mut td.global,
                     options: td.option_manager.as_mut(),
                     user_manager: &mut td.user_manager,
+                    chat_manager: &mut td.chat_manager,
                     device_token_manager: &mut td.device_token_manager,
                     auth_is_bot: td.auth_manager.is_bot(),
                     updates: &mut td.account_updates,
@@ -57139,6 +61005,774 @@ mod tests {
             net_complete(reload, answer);
             td.dispatch_completed_attach_menu_net();
         }
+    }
+
+    #[test]
+    fn bot_recommendation_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(bot_recommendation_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 53 family — `bots.getBotRecommendations` through the
+    /// live td_api arms (getBotSimilarBots/getBotSimilarBotCount,
+    /// Requests.cpp:3209-3222): the outgoing input user resolves at the
+    /// send leg (BotRecommendationManager.cpp:42-47), the answers run the
+    /// users intake + the cache walk (cpp:299-352) and settle the parked
+    /// family promises.
+    fn bot_recommendation_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-bot-recommendations");
+
+        /// The wire `user` record that lands a bot into the cache (the
+        /// seeded bot resolves with its access hash at the send leg).
+        fn wire_user(user_id: i64, is_bot: bool) -> telegram_api::User {
+            telegram_api::User::user(telegram_api::user {
+                flags: 1 | (1 << 1), // ACCESS_HASH | FIRST_NAME
+                id: user_id,
+                access_hash: 700 + user_id,
+                first_name: "Bot".to_owned(),
+                bot: is_bot,
+                ..telegram_api::user::default()
+            })
+        }
+
+        fn seed_user(td: &mut Td, user_id: i64, is_bot: bool) {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager.as_mut().expect("option manager set"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.on_get_user(&mut env, wire_user(user_id, is_bot), "test");
+        }
+
+        /// A boxed `users.usersSlice` answer.
+        fn slice_answer(count: i32, users: Vec<telegram_api::User>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::users_Users::users_usersSlice(telegram_api::users_usersSlice {
+                count,
+                users,
+            })
+            .store(&mut out);
+            out
+        }
+
+        // 1. getBotSimilarBots — the live arm parks the request promise,
+        //    the query rides the dispatcher with the resolved input user
+        //    (cpp:42-47), and the slice answer runs the users intake +
+        //    the non-bot filter (cpp:308-340: the total count decrements
+        //    per dropped user).
+        seed_user(&mut td, 901, true);
+        td.request(
+            301,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 901 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        let body = telegram_api::bots_getBotRecommendations::parse(sent.query())
+            .expect("the getBotRecommendations body");
+        match body.bot.as_ref() {
+            Some(telegram_api::InputUser::inputUser(user)) => {
+                assert_eq!(user.user_id, 901);
+                assert_eq!(user.access_hash, 1601, "the seeded access hash");
+            }
+            other => panic!("the resolved input user: {other:?}"),
+        }
+        net_complete(
+            sent,
+            slice_answer(
+                3,
+                vec![
+                    wire_user(911, true),
+                    wire_user(912, false),
+                    wire_user(913, true),
+                ],
+            ),
+        );
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 301);
+        let users = match responses.first() {
+            Some(Object::users(users)) => users.clone(),
+            other => panic!("the getBotSimilarBots answer: {other:?}"),
+        };
+        assert_eq!(users.total_count, 2, "the non-bot drops the count");
+        assert_eq!(users.user_ids, vec![911, 913]);
+
+        // 2. the fresh cache answers without a wire query (cpp:152-164).
+        td.request(
+            302,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 901 }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "the cache hit sends nothing");
+        let responses = responses_of(&callback, 302);
+        assert!(
+            responses.iter().any(
+                |object| matches!(object, Object::users(users) if users.user_ids == vec![911, 913])
+            ),
+            "the cached answer: {responses:?}"
+        );
+
+        // 3. getBotSimilarBotCount — the cached total count (the same
+        //    family queue, cpp:158-161).
+        td.request(
+            303,
+            Function::getBotSimilarBotCount(td_api::getBotSimilarBotCount {
+                bot_user_id: 901,
+                return_local: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 303)
+                .iter()
+                .any(|object| matches!(object, Object::count(count) if count.count == 2)),
+            "the cached count"
+        );
+
+        // 4. the return_local count answers -1 before the send
+        //    (cpp:283-291); the wire query still fires for the reload.
+        seed_user(&mut td, 902, true);
+        td.request(
+            304,
+            Function::getBotSimilarBotCount(td_api::getBotSimilarBotCount {
+                bot_user_id: 902,
+                return_local: true,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 304)
+                .iter()
+                .any(|object| matches!(object, Object::count(count) if count.count == -1)),
+            "the local count band"
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_complete(sent, slice_answer(0, Vec::new()));
+        td.dispatch_completed_bot_recommendation_net();
+
+        // 5. the error band — the codes forward verbatim through
+        //    fail_load_bot_recommendations_queries (cpp:61-63 → :205-221).
+        seed_user(&mut td, 903, true);
+        td.request(
+            305,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 903 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_fail(sent, 420, "BOT_INVALID");
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 305);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "BOT_INVALID");
+
+        // 6. the parse-failure band — the fetch_result failure rides the
+        //    same Err path as the C++ on_error chain (the §5 convention).
+        seed_user(&mut td, 904, true);
+        td.request(
+            306,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 904 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 306);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the bots.getBotRecommendations answer"
+        );
+
+        // 7. the total-count clamp band — a slice count below the vector
+        //    length LOG(ERROR)s and clamps (cpp:321-325).
+        seed_user(&mut td, 905, true);
+        td.request(
+            307,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 905 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_complete(
+            sent,
+            slice_answer(1, vec![wire_user(906, true), wire_user(907, true)]),
+        );
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 307).iter().any(
+                |object| matches!(object, Object::users(users) if users.total_count == 2
+                    && users.user_ids == vec![906, 907])
+            ),
+            "the clamped total count"
+        );
+
+        assert!(
+            td.bot_recommendation_net_completed.lock().is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn custom_emoji_documents_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(custom_emoji_documents_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 59 custom-emoji family —
+    /// `messages.getCustomEmojiDocuments` through the live td_api arm
+    /// (getCustomEmojiStickers, Requests.cpp:7745-7749): the outgoing
+    /// query carries the deduped unknown ids
+    /// (StickersManager.cpp:6583-6579), the answer runs the sticker-record
+    /// intake (`on_get_sticker_document` → `create_sticker` →
+    /// `on_get_sticker`, cpp:2972-3067/:3376-3435/:2845-2950) and the
+    /// parked request promise settles from the family lot.
+    fn custom_emoji_documents_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-stickers-custom-emoji");
+
+        /// A wire custom-emoji sticker document: the id is the custom
+        /// emoji id, the `documentAttributeCustomEmoji` carries the alt
+        /// and the set.
+        fn custom_emoji_document(
+            custom_emoji_id: i64,
+            alt: &str,
+            set_id: i64,
+        ) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                id: custom_emoji_id,
+                access_hash: 0x5100_0000_0000 + custom_emoji_id,
+                file_reference: b"ref".to_vec(),
+                mime_type: "application/x-tgsticker".to_string(),
+                size: 4096,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![
+                    telegram_api::DocumentAttribute::documentAttributeImageSize(
+                        telegram_api::documentAttributeImageSize { w: 100, h: 100 },
+                    ),
+                    telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                        telegram_api::documentAttributeCustomEmoji {
+                            flags: 0,
+                            free: true,
+                            text_color: false,
+                            alt: alt.to_owned(),
+                            stickerset: Some(telegram_api::InputStickerSet::inputStickerSetID(
+                                telegram_api::inputStickerSetID {
+                                    id: set_id,
+                                    access_hash: 0x6600_0000_0000 + set_id,
+                                },
+                            )),
+                        },
+                    ),
+                ],
+                ..telegram_api::document::default()
+            })
+        }
+
+        /// A boxed bare `Vector<Document>` answer.
+        fn documents_answer(documents: Vec<telegram_api::Document>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::tl::__i32(&mut out, telegram_api::tl::VECTOR_ID);
+            telegram_api::tl::__i32(&mut out, documents.len() as i32);
+            for document in documents {
+                document.store(&mut out);
+            }
+            out
+        }
+
+        // 1. the live arm parks the request promise and the query rides
+        //    the dispatcher with the deduped unknown ids (cpp:6570-6579).
+        let first_id = 5_000_001;
+        let second_id = 5_000_002;
+        td.request(
+            401,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![first_id, second_id, first_id],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        let body = telegram_api::messages_getCustomEmojiDocuments::parse(sent.query())
+            .expect("the getCustomEmojiDocuments body");
+        assert_eq!(body.document_id, vec![first_id, second_id]);
+
+        // 2. the answer builds the sticker records (the set record + the
+        //    custom-emoji id map) and answers the per-id object vector —
+        //    the still-unknown second id contributes nothing
+        //    (cpp:6473-6493).
+        net_complete(
+            sent,
+            documents_answer(vec![custom_emoji_document(first_id, "\u{1f389}", 4242)]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 401);
+        let stickers = match responses.first() {
+            Some(Object::stickers(stickers)) => stickers.clone(),
+            other => panic!("the getCustomEmojiStickers answer: {other:?}"),
+        };
+        assert_eq!(stickers.stickers.len(), 1, "the unknown id drops");
+        let sticker = stickers.stickers[0].clone();
+        assert_eq!(sticker.id, first_id);
+        assert_eq!(sticker.set_id, 4242);
+        assert_eq!(sticker.width, 100);
+        assert_eq!(sticker.height, 100);
+        assert_eq!(sticker.emoji, "\u{1f389}");
+        assert!(matches!(
+            sticker.format,
+            Some(td_api::StickerFormat::stickerFormatTgs(_))
+        ));
+        match sticker.full_type {
+            Some(td_api::StickerFullType::stickerFullTypeCustomEmoji(custom)) => {
+                assert_eq!(custom.custom_emoji_id, first_id);
+                assert!(!custom.needs_repainting);
+            }
+            other => panic!("the custom-emoji full type: {other:?}"),
+        }
+        assert!(sticker.sticker.is_some(), "the registered file object");
+
+        // 3. the id-map cache hit answers without a wire query
+        //    (cpp:6486-6493: both ids resolve after the second load).
+        td.request(
+            402,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![first_id],
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "the cache hit sends nothing");
+        assert!(
+            responses_of(&callback, 402)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.len() == 1))
+        );
+
+        // 4. the error band — the codes forward verbatim through the
+        //    promise (cpp:6593-6594).
+        td.request(
+            403,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_003],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_fail(sent, 420, "EMOJI_INVALID");
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 403);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "EMOJI_INVALID");
+
+        // 5. the parse-failure band — the fetch_result failure rides the
+        //    same Err path as the C++ on_error chain (§5 convention).
+        td.request(
+            404,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_004],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 404);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the messages.getCustomEmojiDocuments answer"
+        );
+
+        // 6. the no-attribute band — a document without the sticker or
+        //    custom-emoji attribute LOG(ERROR)s and drops
+        //    (cpp:3022-3030); the answer is the empty sticker vector.
+        td.request(
+            405,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_005],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(
+            sent,
+            documents_answer(vec![telegram_api::Document::document(
+                telegram_api::document {
+                    id: 5_000_005,
+                    mime_type: "image/webp".to_string(),
+                    dc_id: 2,
+                    ..telegram_api::document::default()
+                },
+            )]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 405)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.is_empty()))
+        );
+
+        // 7. the unknown-mime band — the format guard drops the document
+        //    (cpp:3031-3037: `image/png` is not a sticker mime).
+        td.request(
+            406,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_006],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(
+            sent,
+            documents_answer(vec![telegram_api::Document::document(
+                telegram_api::document {
+                    id: 5_000_006,
+                    mime_type: "image/png".to_string(),
+                    dc_id: 2,
+                    attributes: vec![
+                        telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                            telegram_api::documentAttributeCustomEmoji {
+                                alt: String::new(),
+                                ..telegram_api::documentAttributeCustomEmoji::default()
+                            },
+                        ),
+                    ],
+                    ..telegram_api::document::default()
+                },
+            )]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 406)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.is_empty()))
+        );
+
+        assert!(td.stickers_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn stickers_special_sets_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(stickers_special_sets_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 59 special-sticker-set family —
+    /// `messages.getStickerSet` over the special wire inputs
+    /// (`ReloadSpecialStickerSetQuery`, StickersManager.cpp:794-832) and
+    /// the §6 premium gift-options sticker leg: the premium arm's
+    /// `get_premium_gift_sticker_object` (Premium.cpp:446) triggers the
+    /// premium-gift set load on the first miss, the set record lands from
+    /// the `messages_stickerSet` answer (cpp:3797-3948), and the next
+    /// premium answer carries the live sticker.
+    fn stickers_special_sets_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-stickers-special-sets");
+
+        /// A wire premium-gift sticker document: the id doubles as the
+        /// custom emoji id over the custom-emoji attribute.
+        fn gift_document(document_id: i64, alt: &str) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                id: document_id,
+                access_hash: 0x3100_0000_0000 + document_id,
+                file_reference: b"ref".to_vec(),
+                mime_type: "application/x-tgsticker".to_string(),
+                size: 4096,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![
+                    telegram_api::DocumentAttribute::documentAttributeImageSize(
+                        telegram_api::documentAttributeImageSize { w: 512, h: 512 },
+                    ),
+                    telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                        telegram_api::documentAttributeCustomEmoji {
+                            flags: 0,
+                            free: true,
+                            text_color: false,
+                            alt: alt.to_owned(),
+                            stickerset: Some(telegram_api::InputStickerSet::inputStickerSetID(
+                                telegram_api::inputStickerSetID {
+                                    id: 6106107694985,
+                                    access_hash: 12345,
+                                },
+                            )),
+                        },
+                    ),
+                ],
+                ..telegram_api::document::default()
+            })
+        }
+
+        /// A boxed `messages_stickerSet` answer for the premium-gift set —
+        /// five keycap-emoji stickers (the `1..5` month ladder of
+        /// cpp:2579-2591).
+        fn gift_set_answer() -> Vec<u8> {
+            const SET_ID: i64 = 6106107694985;
+            let mut documents = Vec::new();
+            let mut packs = Vec::new();
+            for number in 1i64..=5 {
+                // the ids double as custom emoji ids, which the C++
+                // validity band floors at 1 << 20 (CustomEmojiId.h:29-31)
+                let document_id = 0x10_0000 + number;
+                documents.push(gift_document(
+                    document_id,
+                    &format!("{}\u{20e3}", char::from(b'0' + number as u8)),
+                ));
+                packs.push(telegram_api::StickerPack {
+                    emoticon: format!("{}\u{20e3}", char::from(b'0' + number as u8)),
+                    documents: vec![document_id],
+                });
+            }
+            let mut out = Vec::new();
+            let set = telegram_api::messages_StickerSet::messages_stickerSet(
+                telegram_api::messages_stickerSet {
+                    set: Some(telegram_api::StickerSet {
+                        flags: 0,
+                        archived: false,
+                        official: true,
+                        masks: false,
+                        emojis: true,
+                        text_color: false,
+                        channel_emoji_status: false,
+                        creator: false,
+                        installed_date: 0,
+                        id: SET_ID,
+                        access_hash: 12345,
+                        title: "Premium Gifts".to_owned(),
+                        short_name: "premium_gifts".to_owned(),
+                        thumbs: Vec::new(),
+                        thumb_dc_id: 0,
+                        thumb_version: 0,
+                        thumb_document_id: 0,
+                        count: 5,
+                        hash: 7,
+                    }),
+                    packs,
+                    keywords: Vec::new(),
+                    documents,
+                },
+            );
+            set.store(&mut out);
+            out
+        }
+
+        /// The boxed bare `Vector<PremiumGiftCodeOption>` answer.
+        fn gift_options_answer() -> Vec<u8> {
+            let mut answer = Vec::new();
+            answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+            answer.extend_from_slice(&2i32.to_le_bytes());
+            for (months, amount) in [(3, 500), (12, 2000)] {
+                telegram_api::PremiumGiftCodeOption {
+                    flags: 0,
+                    users: 1,
+                    months,
+                    store_product: String::new(),
+                    store_quantity: 0,
+                    currency: "USD".to_owned(),
+                    amount,
+                }
+                .store_boxed(&mut answer);
+            }
+            answer
+        }
+
+        // 1. getPremiumGiftPaymentOptions through the live td_api arm —
+        //    the premium answer's sticker leg misses
+        //    (`get_premium_gift_sticker_set` → null, cpp:2528-2546), so
+        //    the first answer carries no sticker and the premium-gift
+        //    special set load rides the dispatcher.
+        td.request(
+            501,
+            Function::getPremiumGiftPaymentOptions(td_api::getPremiumGiftPaymentOptions {}),
+        );
+        let premium_sent =
+            take_sent_query(&rec, telegram_api::payments_getPremiumGiftCodeOptions::ID);
+        net_complete(premium_sent, gift_options_answer());
+        td.dispatch_completed_premium_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 501).first() {
+            Some(Object::premiumGiftPaymentOptions(options)) => {
+                assert!(
+                    options
+                        .options
+                        .iter()
+                        .all(|option| option.sticker.is_none()),
+                    "the pre-flip band answers no sticker"
+                );
+            }
+            other => panic!("the first gift-options answer: {other:?}"),
+        }
+
+        // 2. the miss triggered the special-set load — the
+        //    `inputStickerSetPremiumGifts` wire input with hash 0
+        //    (cpp:802-804).
+        let sticker_sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        let body = telegram_api::messages_getStickerSet::parse(sticker_sent.query()).expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetPremiumGifts(
+                _
+            ))
+        ));
+        assert_eq!(body.hash, 0);
+
+        // 3. the set answer lands the record (the document walk, the packs
+        //    walk into `sticker_emojis_map_`, the set record) and settles
+        //    the premium-gift pending lot.
+        net_complete(sticker_sent, gift_set_answer());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+
+        // 4. the second premium answer carries the live sticker leg — the
+        //    §6 flip, verified through the live td_api arm.
+        td.request(
+            502,
+            Function::getPremiumGiftPaymentOptions(td_api::getPremiumGiftPaymentOptions {}),
+        );
+        let premium_sent =
+            take_sent_query(&rec, telegram_api::payments_getPremiumGiftCodeOptions::ID);
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the loaded special set re-sends no sticker query"
+        );
+        net_complete(premium_sent, gift_options_answer());
+        td.dispatch_completed_premium_net();
+        td.flush_deferred_results();
+        let options = match responses_of(&callback, 502).first() {
+            Some(Object::premiumGiftPaymentOptions(options)) => options.clone(),
+            other => panic!("the second gift-options answer: {other:?}"),
+        };
+        assert_eq!(options.options.len(), 2);
+        for option in &options.options {
+            let sticker = option
+                .sticker
+                .as_ref()
+                .expect("the §6 gift-options sticker leg is live");
+            // cpp:2579-2591 — 3 months → the "2" keycap, 12 months → the
+            // "4" keycap
+            let expected_alt = match option.month_count {
+                3 => "2\u{20e3}",
+                12 => "4\u{20e3}",
+                other => panic!("unexpected month count {other}"),
+            };
+            assert_eq!(sticker.emoji, expected_alt);
+            assert_eq!(sticker.set_id, 6106107694985);
+            match &sticker.full_type {
+                Some(td_api::StickerFullType::stickerFullTypeCustomEmoji(custom)) => {
+                    assert_eq!(
+                        custom.custom_emoji_id,
+                        i64::from(sticker.emoji.as_bytes()[0] - b'0') + 0x10_0000
+                    );
+                }
+                other => panic!("the gift sticker full type: {other:?}"),
+            }
+        }
+
+        // 5. getPremiumInfoSticker through the live td_api arm — the
+        //    loaded set answers immediately (cpp:2648-2651).
+        td.request(
+            503,
+            Function::getPremiumInfoSticker(td_api::getPremiumInfoSticker { month_count: 6 }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 503).first() {
+            Some(Object::sticker(sticker)) => assert_eq!(sticker.emoji, "3\u{20e3}"),
+            other => panic!("the premium info sticker: {other:?}"),
+        }
+
+        // 6. getThemedEmojiStatuses through the live td_api arm
+        //    (Requests.cpp:6815-6819 — the themed reader; the bare
+        //    getDefaultEmojiStatuses arm is the EmojiStatus.cpp plane) —
+        //    the default-statuses set load parks the promise, the answer
+        //    settles it with the first 8 custom emoji ids (cpp:6294-6305).
+        td.request(
+            504,
+            Function::getThemedEmojiStatuses(td_api::getThemedEmojiStatuses {}),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        let body = telegram_api::messages_getStickerSet::parse(sent.query()).expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetEmojiDefaultStatuses(_))
+        ));
+        net_complete(
+            sent,
+            gift_set_answer(), // any loaded set settles the lot
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 504).first() {
+            Some(Object::emojiStatusCustomEmojis(statuses)) => {
+                assert_eq!(statuses.custom_emoji_ids.len(), 5);
+            }
+            other => panic!("the default emoji statuses answer: {other:?}"),
+        }
+
+        // 7. the error band — a failed special-set load keeps the parked
+        //    reader promises parked (cpp:1988-2005: only the premium-gift
+        //    lot settles, over the OK arm; the rest wait for the 300-600s
+        //    retry, which parks at the timer plane). The channel twin
+        //    drives the wire error; a second request joins the parked lot
+        //    without a new wire query (the is_being_loaded guard).
+        td.request(
+            505,
+            Function::getThemedChatEmojiStatuses(td_api::getThemedChatEmojiStatuses {}),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        let body = telegram_api::messages_getStickerSet::parse(sent.query()).expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetEmojiChannelDefaultStatuses(_))
+        ));
+        net_fail(sent, 420, "STICKERSET_INVALID");
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 505).is_empty(),
+            "the parked promise stays parked on the failed load"
+        );
+        td.request(
+            507,
+            Function::getThemedChatEmojiStatuses(td_api::getThemedChatEmojiStatuses {}),
+        );
+        td.flush_deferred_results();
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the in-flight load keeps the second reader parked"
+        );
+        assert!(responses_of(&callback, 507).is_empty());
+
+        // 8. the parse-failure band — the fetch_result failure rides the
+        //    same Err path (§5 convention) and parks the same way.
+        td.request(
+            506,
+            Function::getForumTopicDefaultIcons(td_api::getForumTopicDefaultIcons {}),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(responses_of(&callback, 506).is_empty());
+
+        assert!(td.stickers_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
@@ -62855,7 +67489,7 @@ mod tests {
         // the custom emoji must be known (the have_custom_emoji read)
         td.stickers_manager.custom_emoji_to_sticker_id.insert(
             crate::stickers_manager::CustomEmojiId::new(777),
-            crate::messages_manager::MessageId::new(1),
+            crate::files::FileId::new(1, 1),
         );
 
         let sticker_photo =
@@ -67978,13 +72612,35 @@ mod tests {
                     options.options[1].star_count,
                     crate::star_manager::get_star_count(1000, false)
                 );
+                // the §6 flip's miss band (net-drain 59): the sticker leg
+                // reads the premium-gift special set, misses and triggers
+                // the load — the answer itself carries no sticker
                 assert!(
-                    options.options[1].sticker.is_none(),
-                    "the stickers plane parks"
+                    options
+                        .options
+                        .iter()
+                        .all(|option| option.sticker.is_none()),
+                    "the unloaded premium-gift set answers no sticker"
                 );
             }
             other => panic!("unexpected gift options result: {other:?}"),
         }
+
+        // the miss dispatched the special-set load — the §6 flip's
+        // stickers-plane leg over the inputStickerSetPremiumGifts wire
+        // input (StickersManager.cpp:802-804, hash 0)
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let body = telegram_api::messages_getStickerSet::parse(
+            take_sent(sent, telegram_api::messages_getStickerSet::ID).query(),
+        )
+        .expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetPremiumGifts(
+                _
+            ))
+        ));
+        assert_eq!(body.hash, 0);
 
         // 4. getPremiumGiveawayPaymentOptions — the boost-peer resolution
         //    at the send leg: the channel dialog answers the M.6 stub
@@ -68491,16 +73147,16 @@ mod tests {
             Some(tdutils::status::Result::Ok(()))
         ));
         // the PremiumSubscription purpose dismisses the three
-        // suggested actions (cpp:1461-1465) — the promises park at the
-        // suggested-action plane's net seam
-        assert_eq!(
+        // suggested actions (cpp:1461-1465) — the manager holds no
+        // actions here, so each dismiss settles its Unit promise inline
+        // with no wire query and no park (SuggestedActionManager.cpp:
+        // 179-181); the flip's wire trio rides the net-drain 52
+        // suggested-action round-trips.
+        assert!(
             td.suggested_action_manager
                 .dismiss_suggested_action_queries
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![(0, 7), (0, 8), (0, 9)],
-            "UpgradePremium/SubscribeToAnnualPremium/RestorePremium"
+                .is_empty(),
+            "no parked dismiss lots for absent actions"
         );
 
         // 15. assignStoreTransaction — the empty transaction answers the
@@ -79280,6 +83936,2877 @@ kQIDAQAB\n\
         assert!(td.transcription_net_completed.lock().is_empty(), "drained");
     }
 
+    // ---- net-drain 58: the message-import head families (§3.9) ----
+
+    /// The `messages.historyImportParsed` answer body — the pm/group
+    /// title triad (the `title` bit is the flags' `1 << 2`).
+    fn wire_history_import_parsed(pm: bool, group: bool, title: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::messages_HistoryImportParsed {
+            flags: if title.is_empty() { 0 } else { 1 << 2 },
+            pm,
+            group,
+            title: title.to_owned(),
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    #[test]
+    fn check_history_import_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(check_history_import_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn check_history_import_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain58-check-history-import");
+
+        // 1. the live td_api arm rides the wire — the head string is the
+        //    whole wire form, no peer (CheckHistoryImportQuery::send,
+        //    MessageImportManager.cpp:38-40)
+        td.request(
+            1,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "{\"chat_title\":\"My chat\"}".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        let body =
+            telegram_api::messages_checkHistoryImport::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.import_head, "{\"chat_title\":\"My chat\"}");
+
+        // 2. the pm band converts to messageFileTypePrivate with the
+        //    title (CheckHistoryImportQuery::on_result, cpp:48-59)
+        net_complete(sent, wire_history_import_parsed(true, false, "My chat"));
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::messageFileTypePrivate(file_type)) if file_type.name == "My chat"
+        ));
+
+        // 3. the group band converts to messageFileTypeGroup
+        td.request(
+            2,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_complete(sent, wire_history_import_parsed(false, true, "The Group"));
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::messageFileTypeGroup(file_type)) if file_type.title == "The Group"
+        ));
+
+        // 4. the neither band converts to messageFileTypeUnknown
+        td.request(
+            3,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_complete(sent, wire_history_import_parsed(false, false, ""));
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::messageFileTypeUnknown(_))
+        ));
+
+        // 5. the wire-error band forwards verbatim to the request
+        //    (CheckHistoryImportQuery::on_error, cpp:62-64)
+        td.request(
+            4,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 6. the parse-failure band — the fetch_result failure routes
+        //    through on_error as the 500 (cpp:44-46 → :62-64)
+        td.request(
+            5,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_complete(sent, bool_answer(true)); // the wrong constructor
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                500,
+                "Failed to parse the messages_checkHistoryImport answer"
+            )
+        );
+
+        // 7. the net-inert posture — the send leg logs, the promise parks
+        //    unanswered (the C++ offline shape)
+        td.net_query_dispatcher = None;
+        td.request(
+            6,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            responses_of(&callback, 6).is_empty() && error_of_id(&callback, 6).is_none(),
+            "the request parks unanswered"
+        );
+        assert!(
+            td.message_import_manager
+                .pop_check_history_import_promise()
+                .is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.message_import_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// Seed one mutual-contact user (the `on_get_user` contact-intake
+    /// state) — `access_hash: None` leaves the registry without a peer
+    /// form (the min-user shape).
+    fn seed_import_contact(td: &mut Td, id: i64, access_hash: Option<i64>) {
+        let crate::td::Td {
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            ..
+        } = td;
+        let mut env = crate::user_manager::UserEnv {
+            global,
+            options: option_manager
+                .as_mut()
+                .expect("option manager exists after init"),
+            auth_is_bot: auth_manager.is_bot(),
+        };
+        user_manager.on_get_user(
+            &mut env,
+            telegram_api::User::user(telegram_api::user {
+                id,
+                flags: if access_hash.is_some() { 1 } else { 0 },
+                access_hash: access_hash.unwrap_or(0),
+                contact: true,
+                mutual_contact: true,
+                first_name: "Contact".to_owned(),
+                ..telegram_api::user::default()
+            }),
+            "test",
+        );
+    }
+
+    #[test]
+    fn check_history_import_peer_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(check_history_import_peer_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn check_history_import_peer_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) =
+            netted_td_with_callback("netdrain58-check-history-import-peer");
+        seed_import_contact(&mut td, 700000002, Some(9));
+
+        // 1. the live td_api arm rides the wire after the
+        //    can_import_messages bands — the write peer resolves at the
+        //    send leg (CheckHistoryImportPeerQuery::send, cpp:75-81)
+        td.request(
+            1,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImportPeer::ID,
+        );
+        let body = telegram_api::messages_checkHistoryImportPeer::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerUser(peer))
+                if (peer.user_id, peer.access_hash) == (700000002, 9)
+        ));
+
+        // 2. the confirm_text answer settles the request as the text
+        //    object (cpp:83-91)
+        let mut answer = Vec::new();
+        telegram_api::messages_CheckedHistoryImportPeer {
+            confirm_text: "Import this chat?".to_owned(),
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::text(text)) if text.text == "Import this chat?"
+        ));
+
+        // 3. the live-arm local bands keep the C++ order — the access
+        //    check before the query (can_import_messages, cpp:282-308)
+        td.request(
+            2,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 3,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_checkHistoryImportPeer::ID,
+            "the unaccessed dialog never reaches the wire",
+        );
+
+        // 4. the wire-error band forwards verbatim after the
+        //    on_get_dialog_error head (cpp:93-97)
+        td.request(
+            3,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImportPeer::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 5. the unresolvable-peer band — the C++ CHECK(input_peer !=
+        //    nullptr) downgrades to the sibling 400 access band (the
+        //    autosave convention) so the answer half runs the full
+        //    on_error tail
+        seed_import_contact(&mut td, 700000003, None);
+        td.request(
+            4,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000003,
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_checkHistoryImportPeer::ID,
+            "the unresolvable peer never reaches the wire",
+        );
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Can't access the chat")
+        );
+
+        // 6. the parse-failure band — the fetch_result failure routes
+        //    through on_error (the dialog head + the 500, cpp:44-46 →
+        //    :93-97)
+        td.request(
+            5,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImportPeer::ID,
+        );
+        net_complete(sent, bool_answer(true)); // the wrong constructor
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                500,
+                "Failed to parse the messages_checkHistoryImportPeer answer"
+            )
+        );
+
+        // 7. the net-inert posture — the send leg logs, the promise parks
+        //    unanswered (the C++ offline shape)
+        td.net_query_dispatcher = None;
+        td.request(
+            6,
+            Function::getMessageImportConfirmationText(td_api::getMessageImportConfirmationText {
+                chat_id: 700000002,
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            responses_of(&callback, 6).is_empty() && error_of_id(&callback, 6).is_none(),
+            "the request parks unanswered"
+        );
+        assert!(
+            td.message_import_manager
+                .pop_check_history_import_peer_promise()
+                .is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.message_import_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the net-drain 57 game families: the two §3.9 GameManager wire
+    // ---- queries (GameManager.cpp:28-103) ride the GameNetKind plane. ----
+
+    #[test]
+    fn game_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(game_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn game_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// A `Promise<T>` slot (the poll round-trip's record_slot shape).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+        fn sample_wire_high_scores() -> telegram_api::messages_HighScores {
+            telegram_api::messages_HighScores {
+                scores: vec![
+                    telegram_api::HighScore {
+                        pos: 1,
+                        user_id: 9,
+                        score: 100,
+                    },
+                    telegram_api::HighScore {
+                        pos: 0,
+                        user_id: 9,
+                        score: 50,
+                    },
+                ],
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1 << 15,
+                    id: 9,
+                    ..Default::default()
+                })],
+            }
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain66-game");
+        // the self user id makes the read peer resolve to `inputPeerSelf`
+        // at the send legs (the net-drain 47 fixture)
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        // the self user record makes the live arms' dialog-access guard
+        // pass (have_dialog_force reads the accessible-user registry), so
+        // the [blocked: M.10] message probe answers the band
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "game_net_families_ride_the_dispatcher",
+        );
+        let game = crate::dialog_id::MessageFullId::new(
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001)),
+            crate::messages_manager::MessageId::new(1 << 20), // server id 1
+        );
+        let input_user = telegram_api::InputUser::inputUser(telegram_api::inputUser {
+            user_id: 9,
+            access_hash: 3,
+        });
+
+        // 1. the live td_api arm still answers the C++ not-found band (the
+        //    [blocked: M.10] message probe) — the arm routes into the
+        //    manager, nothing intercepts it (Requests.cpp:4925-4930)
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            1,
+            Function::getGameHighScores(td_api::getGameHighScores {
+                chat_id: 700000001,
+                message_id: 1 << 20,
+                user_id: 9,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 2. getGameHighScores rides the wire: the resolved read peer, the
+        //    server message id and the input user (GameManager.cpp:79-88)
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getGameHighScores::ID,
+        );
+        let body =
+            telegram_api::messages_getGameHighScores::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 1);
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+
+        // 3. the answer converts through the manager intake and settles
+        //    the parked promise (the pos<=0 row drops, cpp:178-181)
+        net_complete(sent, wire!(sample_wire_high_scores()));
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(scores)) => {
+                assert_eq!(scores.scores.len(), 1);
+                assert_eq!(
+                    (
+                        scores.scores[0].position,
+                        scores.scores[0].user_id,
+                        scores.scores[0].score
+                    ),
+                    (1, 9, 100)
+                );
+            }
+            other => panic!("expected the converted scores, got {other:?}"),
+        }
+
+        // 4. the wire-error band runs the on_error tail: the dialog-error
+        //    head then the promise error (GameManager.cpp:99-102)
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getGameHighScores::ID,
+        );
+        net_fail(sent, 420, "GAME_SCORE_INVALID");
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "GAME_SCORE_INVALID"));
+            }
+            other => panic!("expected the forwarded error, got {other:?}"),
+        }
+
+        // 6. the unresolvable-peer band — the C++ `CHECK(input_peer !=
+        //    nullptr)` (cpp:83) is the port's `complete_error` file-through
+        //    (the message-query CHECK convention): the answer half runs the
+        //    full on_error tail
+        let unknown_game = crate::dialog_id::MessageFullId::new(
+            crate::dialog_id::DialogId::from_chat_id(crate::chat_manager::ChatId::new(99)),
+            crate::messages_manager::MessageId::new(1 << 20),
+        );
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    unknown_game.get_dialog_id(),
+                    unknown_game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("expected the access band, got {other:?}"),
+        }
+
+        // 7. the live setGameScore arm — the same M.10 not-found band
+        //    (Requests.cpp:4908-4913)
+        td.request(
+            2,
+            Function::setGameScore(td_api::setGameScore {
+                chat_id: 700000001,
+                message_id: 1 << 20,
+                edit_message: false,
+                user_id: 9,
+                score: 10,
+                force: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 8. setGameScore rides the wire: the resolved edit peer, the
+        //    edit_message/force flag bits, the server message id, the
+        //    input user and the score (GameManager.cpp:36-50)
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    true,
+                    input_user.clone(),
+                    10,
+                    true,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setGameScore::ID,
+        );
+        let body = telegram_api::messages_setGameScore::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert!((body.edit_message, body.force, body.id, body.score) == (true, true, 1, 10));
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+
+        // 9. the Updates answer walks the engine, then the
+        //    `query_promise` lambda tail settles the message (cpp:52-61
+        //    + 131-137) — the [blocked: M.10] object seam answers the
+        //    port's 500 band
+        let mut empty_updates = Vec::new();
+        telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1700000000,
+            seq_start: 0,
+            seq: 0,
+        })
+        .store(&mut empty_updates);
+        net_complete(sent, empty_updates);
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (500, "Receive invalid message")
+                );
+            }
+            other => panic!("expected the M.10 object band, got {other:?}"),
+        }
+
+        // 10. the wire-error band runs the on_error tail (the dialog
+        //     head then the lambda's error arm, cpp:63-67 + 133-135)
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    false,
+                    input_user.clone(),
+                    5,
+                    false,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setGameScore::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "FLOOD_WAIT_7"));
+            }
+            other => panic!("expected the forwarded error, got {other:?}"),
+        }
+
+        // 11. the unresolvable-peer band — the C++ `send`'s inline
+        //     `on_error(400, "Can't access the chat")` (cpp:40-43) files
+        //     through the completed queue, so the answer half runs the
+        //     full on_error tail
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    unknown_game.get_dialog_id(),
+                    unknown_game.get_message_id(),
+                    false,
+                    input_user.clone(),
+                    5,
+                    false,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("expected the access band, got {other:?}"),
+        }
+
+        // 12. the net-inert posture — no dispatcher, both families' promises
+        //     park like the C++ handlers hold them
+        td.net_query_dispatcher = None;
+        td.game_manager.net = None;
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    false,
+                    input_user.clone(),
+                    5,
+                    false,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let (scores_promise, scores_slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    input_user.clone(),
+                    scores_promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            scores_slot.lock().unwrap().is_none(),
+            "nothing settles offline"
+        );
+        assert!(
+            td.game_manager.pop_set_game_score_query().is_some(),
+            "the set promise parks like the C++ handler holds it"
+        );
+        assert!(
+            td.game_manager.pop_get_game_high_scores_promise().is_some(),
+            "the get promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.game_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn callback_query_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(callback_query_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 49 netted round trips: the callback-query
+    /// families dispatch through the real dispatcher, the wire bodies
+    /// carry the C++ payloads (CallbackQueriesManager.cpp:31-188) and
+    /// the answers drain through `Td::on_callback_net_answer` into the
+    /// landed intakes — the live td_api arms where their gates allow
+    /// (answerCallbackQuery; the getCallbackQueryAnswer arm's
+    /// [blocked: M.10] message probe keeps its C++ not-found band, the
+    /// seam drives run below the probe like the net-drain 28 families).
+    fn callback_query_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// A `Promise<T>` slot (the UnitSlot convention over any type).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+        /// The `messages.botCallbackAnswer` wire answer both get
+        /// families return (CallbackQueriesManager.cpp:86-88) — the
+        /// message/url strings ride their flag bits.
+        fn bot_callback_answer() -> Vec<u8> {
+            wire!(telegram_api::messages_BotCallbackAnswer {
+                flags: 1 | (1 << 2),
+                alert: true,
+                has_url: true,
+                native_ui: false,
+                message: "answer".to_owned(),
+                url: "https://t.me".to_owned(),
+                cache_time: 5,
+            })
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain49-callback-queries");
+        // the self user id makes the read peer resolve to `inputPeerSelf`
+        // (UserManager.cpp:7450-7453 shape) and the seeded record carries
+        // the arm's dialog-access gate
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user_id(&mut td, 700000001, 42);
+        let dialog_id =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001));
+        let message_id = crate::messages_manager::MessageId::new(1 << 21); // server id 2
+
+        // 0. the live td_api arm still answers the C++ not-found band
+        //    (the [blocked: M.10] message probe) — the arm routes into
+        //    the manager, nothing intercepts it
+        td.request(
+            1,
+            Function::getCallbackQueryAnswer(td_api::getCallbackQueryAnswer {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                payload: Some(td_api::CallbackQueryPayload::callbackQueryPayloadData(
+                    td_api::callbackQueryPayloadData {
+                        data: b"d".to_vec(),
+                    },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 1. the get family rides the wire (the seam drive below the
+        //    M.10 probe — GetBotCallbackAnswerQuery::send,
+        //    CallbackQueriesManager.cpp:41-77): the resolved read peer,
+        //    the server message id and the payload data on the DATA_MASK
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"payload".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_getBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.msg_id, 2);
+        assert_eq!(body.data, b"payload".to_vec());
+        assert_eq!(body.flags, 1, "DATA_MASK only — no game, no password");
+        assert!(!body.game);
+
+        // 2. the answer settles the parked promise with the
+        //    td_api::callbackQueryAnswer triple (cpp:79-88)
+        net_complete(sent, bot_callback_answer());
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(answer)) => {
+                assert_eq!(answer.text, "answer");
+                assert!(answer.show_alert);
+                assert_eq!(answer.url, "https://t.me");
+            }
+            other => panic!("the answer round trip: {other:?}"),
+        }
+
+        // 3. the game payload sends no data (cpp:62-70) — the GAME bit
+        //    rides the bool, DATA_MASK stays unset
+        let (promise, _slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    true,
+                    Vec::new(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_getBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1 << 1, "the GAME bit only — no DATA_MASK");
+        assert!(body.game, "the GAME bit rides the bool field");
+        assert!(body.data.is_empty());
+
+        // 4. the password payload sets PASSWORD_MASK (cpp:57-61) — the
+        //    SRP bytes ride the [blocked: PasswordManager] seam
+        let (promise, _slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    true,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_getBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1 | (1 << 2), "DATA_MASK | PASSWORD_MASK");
+
+        // 5. the BOT_RESPONSE_TIMEOUT remap (cpp:92-94) — 400 becomes
+        //    the 502 "The bot is not responding"
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        net_fail(sent, 400, "BOT_RESPONSE_TIMEOUT");
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (502, "The bot is not responding")
+                );
+            }
+            other => panic!("the timeout remap, got {other:?}"),
+        }
+
+        // 6. a plain wire error forwards unchanged (cpp:98)
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_5");
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "FLOOD_WAIT_5"));
+            }
+            other => panic!("the forwarded error, got {other:?}"),
+        }
+
+        // 7. the unresolvable-peer band — the C++ `CHECK(input_peer !=
+        //    nullptr)` (cpp:46-47) is the port's `complete_error`
+        //    file-through (the message-query convention): the answer
+        //    half runs the full `on_error` tail
+        let unknown_dialog =
+            crate::dialog_id::DialogId::from_chat_id(crate::chat_manager::ChatId::new(99));
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    unknown_dialog,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("the access band, got {other:?}"),
+        }
+
+        // 8. the parse-failure 500 — the fetch_result band over the
+        //    on_error tail (the landed-flip convention)
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getBotCallbackAnswer::ID,
+        );
+        net_complete(sent, vec![0xba, 0xad, 0xf0, 0x0d]);
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (
+                        500,
+                        "Failed to parse the messages_getBotCallbackAnswer answer"
+                    )
+                );
+            }
+            other => panic!("the parse band, got {other:?}"),
+        }
+
+        // 9. the set family — the bot-only live arm (Requests.cpp:
+        //     8363-8369 + CallbackQueriesManager.cpp:184-188): the
+        //     non-bot band first (CHECK_IS_BOT)
+        td.request(
+            2,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 11,
+                text: "done".to_owned(),
+                show_alert: true,
+                url: "https://t.me".to_owned(),
+                cache_time: 7,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Only bots can use the method")
+        );
+
+        // 10. the bot-mode full round trip (cpp:151-161): the
+        //     MESSAGE_MASK/URL_MASK bits carry the non-empty strings,
+        //     the alert bit and the cache time ride the wire
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            3,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 11,
+                text: "done".to_owned(),
+                show_alert: true,
+                url: "https://t.me".to_owned(),
+                cache_time: 7,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_setBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(
+            body.flags,
+            1 | (1 << 1) | (1 << 2),
+            "MESSAGE_MASK | the alert bit | URL_MASK for the non-empty strings"
+        );
+        assert!(body.alert);
+        assert_eq!(body.query_id, 11);
+        assert_eq!(body.message, "done");
+        assert_eq!(body.url, "https://t.me");
+        assert_eq!(body.cache_time, 7);
+
+        // 11. the boolTrue answer settles the parked request promise ok
+        //     (cpp:163-174)
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_callback_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 12. the boolFalse band answers ok too — the C++ `!result`
+        //     LOG(INFO) (cpp:169-172); the empty strings keep both masks
+        //     off (cpp:152-158)
+        td.request(
+            4,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 12,
+                text: String::new(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotCallbackAnswer::ID,
+        );
+        let body = telegram_api::messages_setBotCallbackAnswer::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 0, "no masks for the empty strings");
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_callback_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 13. the wire-error band forwards the same code/message
+        //     (cpp:176-178) — QUERY_ID_INVALID is the reference band
+        td.request(
+            5,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 13,
+                text: String::new(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotCallbackAnswer::ID,
+        );
+        net_fail(sent, 400, "QUERY_ID_INVALID");
+        td.dispatch_completed_callback_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "QUERY_ID_INVALID")
+        );
+
+        // 14. the ephemeral family (the seam drive — the routing lives
+        //     behind the [blocked: M.10] probe inside send_callback_query,
+        //     cpp:353-358; GetEphemeralCallbackAnswerQuery::send,
+        //     cpp:111-122): the DATA_MASK bit-1, the resolved read peer,
+        //     the raw ephemeral id and the payload bytes
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    9,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_getCallbackAnswer::ID,
+        );
+        let body =
+            telegram_api::ephemeral_getCallbackAnswer::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 1, "the ephemeral DATA_MASK is bit 1");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 9);
+        assert_eq!(body.data, b"ed".to_vec());
+
+        // the answer settles the parked promise with the same triple
+        // (cpp:124-133)
+        net_complete(sent, bot_callback_answer());
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(answer)) => {
+                assert_eq!(answer.text, "answer");
+                assert_eq!(answer.url, "https://t.me");
+            }
+            other => panic!("the ephemeral answer round trip: {other:?}"),
+        }
+
+        // 15. the ephemeral BOT_RESPONSE_TIMEOUT remap (cpp:137-139) —
+        //     the on_get_dialog_error head runs first (the landed one)
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    10,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_getCallbackAnswer::ID,
+        );
+        net_fail(sent, 400, "BOT_RESPONSE_TIMEOUT");
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (502, "The bot is not responding")
+                );
+            }
+            other => panic!("the ephemeral timeout remap, got {other:?}"),
+        }
+
+        // 16. the unresolvable-peer band — the C++ CHECK (cpp:114-115)
+        //     files through the completed queue so the on_error tail runs
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    unknown_dialog,
+                    11,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("the ephemeral access band, got {other:?}"),
+        }
+
+        // 17. the parse-failure 500 — the fetch_result band
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    12,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::ephemeral_getCallbackAnswer::ID,
+        );
+        net_complete(sent, vec![0xba, 0xad, 0xf0, 0x0d]);
+        td.dispatch_completed_callback_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (
+                        500,
+                        "Failed to parse the ephemeral_getCallbackAnswer answer"
+                    )
+                );
+            }
+            other => panic!("the ephemeral parse band, got {other:?}"),
+        }
+
+        // 18. the net-inert posture — no handle, the promises park like
+        //     the C++ handlers hold them
+        td.callback_queries_manager.net = None;
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_bot_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    message_id,
+                    false,
+                    b"d".to_vec(),
+                    false,
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.callback_queries_manager
+                .pop_bot_callback_answer_promise_for_test()
+                .is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the set arm parks the same way offline (the bot posture
+        // stands — the arm gate passed above)
+        td.request(
+            6,
+            Function::answerCallbackQuery(td_api::answerCallbackQuery {
+                callback_query_id: 14,
+                text: String::new(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback, 6).is_none() && responses_of(&callback, 6).is_empty(),
+            "nothing settles offline"
+        );
+        assert!(
+            td.callback_queries_manager
+                .pop_set_bot_callback_answer_promise_for_test()
+                .is_some(),
+            "the set promise parks like the C++ handler holds it"
+        );
+
+        // the ephemeral send parks the same way offline
+        let (promise, slot) = record_slot::<td_api::CallbackQueryAnswer>();
+        {
+            let mut manager = std::mem::take(&mut td.callback_queries_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_ephemeral_callback_answer_query(
+                    &mut env,
+                    dialog_id,
+                    13,
+                    b"ed".to_vec(),
+                    promise,
+                );
+            }
+            td.callback_queries_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.callback_queries_manager
+                .pop_ephemeral_callback_answer_promise_for_test()
+                .is_some(),
+            "the ephemeral promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.callback_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn message_reaction_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(message_reaction_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the message-reaction query
+    /// families (MessageReaction.cpp:211-341) dispatch through the real
+    /// dispatcher, the wire bodies carry the C++ payloads and the
+    /// answers drain through `Td::on_reaction_net_answer` into the
+    /// landed walks — the live td_api arms where their gates allow
+    /// (the getMessageAddedReactions/reportMessageReactions arms' M.10
+    /// message probes keep their C++ not-found bands; the seam drives
+    /// run below the probes like the net-drain 28/49 families).
+    fn message_reaction_net_families_ride_the_dispatcher_impl() {
+        use crate::message_reaction::MessageReactionQueryEnv as _;
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-message-reaction");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user_id(&mut td, 700000001, 42);
+        let dialog_id =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001));
+        let message_id = crate::messages_manager::MessageId::new(1 << 21); // server id 2
+        let emoji = crate::reaction_type::ReactionType::new("👍".to_owned());
+
+        // 0. the live td_api arms still answer the C++ not-found bands
+        //    (the [blocked: M.10] message probes) — the arms route into
+        //    the free functions, nothing intercepts them
+        td.request(
+            1,
+            Function::getMessageAddedReactions(td_api::getMessageAddedReactions {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                reaction_type: None,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+        td.request(
+            2,
+            Function::reportMessageReactions(td_api::reportMessageReactions {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                sender_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 700000001 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 1. the list family rides the wire (the seam drive below the
+        //    M.10 probe — GetMessageReactionsListQuery::send,
+        //    MessageReaction.cpp:223-247): the resolved read peer, the
+        //    server message id, the REACTION_MASK for a non-empty
+        //    reaction and the OFFSET_MASK for a non-empty offset
+        let (promise, slot) = record_slot::<td_api::AddedReactions>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_get_message_reactions_list(
+                dialog_id,
+                message_id,
+                emoji.clone(),
+                "off".to_owned(),
+                10,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReactionsList::ID,
+        );
+        let body = telegram_api::messages_getMessageReactionsList::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 2);
+        assert_eq!(body.limit, 10);
+        assert_eq!(body.offset, "off");
+        assert_eq!(body.flags, 1 | (1 << 1), "REACTION_MASK | OFFSET_MASK");
+        assert!(matches!(
+            body.reaction,
+            Some(telegram_api::Reaction::reactionEmoji(_))
+        ));
+
+        // 2. the answer settles the parked promise with the walked
+        //    td_api::addedReactions (cpp:249-301) — the users intake
+        //    makes the reaction sender resolvable, the total-count
+        //    clamp runs and the next_offset rides the flag bit
+        seed_dialog_user_id(&mut td, 700000009, 43);
+        // the thin sender-object map (the M.22 `MessageObjectContext`
+        // read — the C++ user_manager_ min-user probe)
+        td.users.insert(700000009, td_api::User::default());
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_MessageReactionsList {
+                flags: 1 << 0,
+                count: 0, // < reactions.len() — the clamp band
+                reactions: vec![telegram_api::MessagePeerReaction {
+                    flags: 1 << 1,
+                    big: false,
+                    unread: false,
+                    my: true,
+                    peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 700000009
+                    },)),
+                    date: 77,
+                    reaction: Some(telegram_api::Reaction::reactionEmoji(
+                        telegram_api::reactionEmoji {
+                            emoticon: "👍".to_owned(),
+                        },
+                    )),
+                }],
+                chats: Vec::new(),
+                users: Vec::new(),
+                next_offset: "next".to_owned(),
+            }),
+        );
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(added)) => {
+                assert_eq!(added.total_count, 1, "the count clamp (cpp:260-263)");
+                assert_eq!(added.next_offset, "next");
+                assert_eq!(added.reactions.len(), 1);
+                let reaction = added
+                    .reactions
+                    .first()
+                    .and_then(|reaction| reaction.sender_id.as_ref())
+                    .expect("the sender object");
+                assert!(matches!(
+                    reaction,
+                    td_api::MessageSender::messageSenderUser(_)
+                ));
+            }
+            other => panic!("the list answer round trip: {other:?}"),
+        }
+
+        // 3. the mismatched-reaction filter (cpp:269-274) — a reaction
+        //    that is neither the expected emoji nor valid skips with the
+        //    C++ unexpected log
+        let (promise, slot) = record_slot::<td_api::AddedReactions>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_get_message_reactions_list(
+                dialog_id,
+                message_id,
+                emoji.clone(),
+                String::new(),
+                10,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReactionsList::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_MessageReactionsList {
+                flags: 0,
+                count: 3,
+                reactions: vec![telegram_api::MessagePeerReaction {
+                    flags: 0,
+                    big: false,
+                    unread: false,
+                    my: false,
+                    peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 700000009,
+                    })),
+                    date: 1,
+                    reaction: Some(telegram_api::Reaction::reactionEmoji(
+                        telegram_api::reactionEmoji {
+                            emoticon: "❤".to_owned(),
+                        },
+                    )),
+                }],
+                chats: Vec::new(),
+                users: Vec::new(),
+                next_offset: String::new(),
+            }),
+        );
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(added)) => {
+                assert!(added.reactions.is_empty(), "the mismatch skips");
+                assert_eq!(added.total_count, 3, "the count rides untouched");
+            }
+            other => panic!("the filter band: {other:?}"),
+        }
+
+        // 4. the error band — the wire error surfaces with the
+        //    reference-identical code/message (cpp:302-304)
+        let (promise, slot) = record_slot::<td_api::AddedReactions>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_get_message_reactions_list(
+                dialog_id,
+                message_id,
+                emoji.clone(),
+                String::new(),
+                10,
+                promise,
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getMessageReactionsList::ID,
+        );
+        net_fail(sent, 429, "FLOOD_WAIT_10");
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (429, "FLOOD_WAIT_10"));
+            }
+            other => panic!("the list error band: {other:?}"),
+        }
+
+        // 5. the report family rides the wire (ReportReactionQuery::send,
+        //    cpp:313-326): the dialog read peer, the server message id
+        //    and the chooser's Know peer
+        let (promise, slot) = record_slot::<()>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_report_message_reaction(dialog_id, message_id, dialog_id, promise);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportReaction::ID,
+        );
+        let body =
+            telegram_api::messages_reportReaction::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert!(matches!(
+            body.reaction_peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 2);
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]); // boolTrue#997275b5
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(())) => {}
+            other => panic!("the report answer: {other:?}"),
+        }
+
+        // 6. the report error band surfaces identically (cpp:337-340)
+        let (promise, slot) = record_slot::<()>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_report_message_reaction(dialog_id, message_id, dialog_id, promise);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_reportReaction::ID,
+        );
+        net_fail(sent, 400, "REACTION_INVALID");
+        td.dispatch_completed_reaction_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (400, "REACTION_INVALID"));
+            }
+            other => panic!("the report error band: {other:?}"),
+        }
+
+        // 7. the unresolvable-chooser band (cpp:319-322) — the C++
+        //    answers the promise directly, nothing reaches the wire
+        let (promise, slot) = record_slot::<()>();
+        {
+            let (mut env, _manager) = crate::td::message_reactions_query_env_split(&mut td);
+            env.send_report_message_reaction(
+                dialog_id,
+                message_id,
+                crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(
+                    999999999,
+                )),
+                promise,
+            );
+        }
+        assert!(
+            rec.sent
+                .lock()
+                .iter()
+                .all(|query| query.tl_constructor() != telegram_api::messages_reportReaction::ID),
+            "the chooser miss never reaches the wire"
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Reaction sender is not accessible")
+                );
+            }
+            other => panic!("the chooser band: {other:?}"),
+        }
+
+        // 8. the net-inert posture — no handle, the promises park like
+        //    the C++ handlers hold them
+        {
+            let mut netless = netted_td("netdrain61-message-reaction-inert");
+            netless.0.user_manager.set_my_id(
+                &mut crate::user_manager::UserEnv {
+                    global: &mut netless.0.global,
+                    options: netless
+                        .0
+                        .option_manager
+                        .as_mut()
+                        .expect("the option manager exists after init"),
+                    auth_is_bot: netless.0.auth_manager.is_bot(),
+                },
+                crate::user_manager::UserId::new(700000001),
+            );
+            seed_dialog_user_id(&mut netless.0, 700000001, 42);
+            netless.0.net_query_dispatcher = None; // the net-inert posture
+            let (promise, slot) = record_slot::<td_api::AddedReactions>();
+            {
+                let (mut env, _manager) =
+                    crate::td::message_reactions_query_env_split(&mut netless.0);
+                env.send_get_message_reactions_list(
+                    dialog_id,
+                    message_id,
+                    emoji.clone(),
+                    String::new(),
+                    10,
+                    promise,
+                );
+            }
+            assert!(netless.1.sent.lock().is_empty(), "nothing dispatched");
+            assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+            assert!(
+                netless.0.reaction_net_pending.list.pop().is_some(),
+                "the promise parks like the C++ handler holds it"
+            );
+        }
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.reaction_net_completed.lock().is_empty(), "drained");
+        assert!(td.reaction_net_pending.list.is_empty());
+        assert!(td.reaction_net_pending.report.is_empty());
+    }
+
+    #[test]
+    fn inline_message_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(inline_message_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the inline-message query
+    /// families (InlineMessageManager.cpp:87-210) dispatch through the
+    /// real dispatcher on the inline message's own DC
+    /// (`DcId::internal(get_inline_message_dc_id(...))`), the wire
+    /// bodies carry the C++ payloads and the answers drain through
+    /// `Td::on_inline_message_net_answer` — through the live td_api arms
+    /// (the bot posture carries the arms' gates).
+    fn inline_message_net_families_ride_the_dispatcher_impl() {
+        use crate::inline_message_manager::{
+            get_inline_message_dc_id, parse_input_bot_inline_message_id,
+        };
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// The `inputBotInlineMessageID` base64url form (the bare field
+        /// store, the C++ `serialize(*)` shape).
+        fn inline_message_id() -> String {
+            let mut out = Vec::new();
+            telegram_api::inputBotInlineMessageID {
+                dc_id: 2,
+                id: 100,
+                access_hash: 200,
+            }
+            .store(&mut out);
+            let mut encoded = String::new();
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            for chunk in out.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = chunk.get(1).copied().unwrap_or(0);
+                let b2 = chunk.get(2).copied().unwrap_or(0);
+                let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+                encoded.push(ALPHABET[(n >> 18) as usize & 63] as char);
+                encoded.push(ALPHABET[(n >> 12) as usize & 63] as char);
+                if chunk.len() > 1 {
+                    encoded.push(ALPHABET[(n >> 6) as usize & 63] as char);
+                }
+                if chunk.len() > 2 {
+                    encoded.push(ALPHABET[n as usize & 63] as char);
+                }
+            }
+            encoded
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-inline-message");
+        td.auth_manager.force_bot_for_test();
+        // the bot user resolves the game-score arms' get_input_user
+        seed_dialog_user_id(&mut td, 700000009, 43);
+        let inline_id = inline_message_id();
+        assert_eq!(
+            get_inline_message_dc_id(&parse_input_bot_inline_message_id(&inline_id).unwrap()),
+            2
+        );
+
+        // 1. the live edit arm — messages.editInlineBotMessage over the
+        //    inline DC (EditInlineMessageQuery::send, cpp:87-124): the
+        //    MESSAGE_MASK carries the non-empty text, the id rides the
+        //    base64url-decoded form and the query routes to DC 2
+        td.request(
+            1,
+            Function::editInlineMessageText(td_api::editInlineMessageText {
+                inline_message_id: inline_id.clone(),
+                reply_markup: None,
+                input_message_content: Some(Box::new(
+                    td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                        text: Some(td_api::FormattedText {
+                            text: "hi".to_owned(),
+                            entities: Vec::new(),
+                        }),
+                        clear_draft: true,
+                        link_preview_options: None,
+                    }),
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_editInlineBotMessage::ID,
+        );
+        assert_eq!(sent.dc_id(), DcId::internal(2), "the inline message DC");
+        let body = telegram_api::messages_editInlineBotMessage::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1 << 11, "MESSAGE_MASK only — no entities");
+        assert_eq!(body.message, "hi");
+        assert!(matches!(
+            body.id,
+            Some(telegram_api::InputBotInlineMessageID::inputBotInlineMessageID(_))
+        ));
+
+        // the boolTrue answer settles the request's deferred promise
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]); // boolTrue#997275b5
+        td.dispatch_completed_inline_message_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 1).len() == 1,
+            "the edit answer settles the request"
+        );
+
+        // 2. the live set-score arm — messages.setInlineGameScore over
+        //    the inline DC (SetInlineGameScoreQuery::send, cpp:143-177)
+        td.request(
+            2,
+            Function::setInlineGameScore(td_api::setInlineGameScore {
+                inline_message_id: inline_id.clone(),
+                edit_message: true,
+                user_id: 700000009,
+                score: 42,
+                force: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setInlineGameScore::ID,
+        );
+        assert_eq!(sent.dc_id(), DcId::internal(2));
+        let body =
+            telegram_api::messages_setInlineGameScore::parse(sent.query()).expect("the sent body");
+        assert!(body.edit_message);
+        assert!(!body.force);
+        assert_eq!(body.score, 42);
+
+        // the error band surfaces identically (cpp:174-177)
+        net_fail(sent, 400, "MESSAGE_ID_INVALID");
+        td.dispatch_completed_inline_message_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "MESSAGE_ID_INVALID")
+        );
+
+        // 3. the live high-scores arm — messages.getInlineGameHighScores
+        //    over the inline DC (GetInlineGameHighScoresQuery::send,
+        //    cpp:179-210); the answer converts through the GameManager
+        //    object builder
+        td.request(
+            3,
+            Function::getInlineGameHighScores(td_api::getInlineGameHighScores {
+                inline_message_id: inline_id.clone(),
+                user_id: 700000009,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineGameHighScores::ID,
+        );
+        assert_eq!(sent.dc_id(), DcId::internal(2));
+        let body = telegram_api::messages_getInlineGameHighScores::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.user_id,
+            Some(telegram_api::InputUser::inputUser(_))
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_HighScores {
+                scores: vec![telegram_api::HighScore {
+                    pos: 1,
+                    user_id: 700000009,
+                    score: 42,
+                }],
+                users: Vec::new(),
+            }),
+        );
+        td.dispatch_completed_inline_message_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        let td_api::Object::gameHighScores(scores) = responses.first().expect("the response")
+        else {
+            panic!("the high-scores response");
+        };
+        assert_eq!(scores.scores.len(), 1);
+        assert_eq!(scores.scores[0].score, 42);
+
+        // 4. the net-inert posture — no dispatcher, the promises park
+        //    like the C++ handlers hold them
+        let (mut td2, rec2, callback2) = netted_td_with_callback("netdrain61-inline-inert");
+        td2.auth_manager.force_bot_for_test();
+        seed_dialog_user_id(&mut td2, 700000009, 43);
+        td2.net_query_dispatcher = None; // the net-inert posture
+        td2.request(
+            4,
+            Function::setInlineGameScore(td_api::setInlineGameScore {
+                inline_message_id: inline_id.clone(),
+                edit_message: true,
+                user_id: 700000009,
+                score: 42,
+                force: false,
+            }),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 4).is_none() && responses_of(&callback2, 4).is_empty(),
+            "nothing settles offline"
+        );
+        assert!(
+            td2.inline_message_net_pending.scores.pop().is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.inline_message_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn top_dialog_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(top_dialog_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the TopDialogManager query
+    /// families (TopDialogManager.cpp:43-122) dispatch through the real
+    /// dispatcher and the answers drain through
+    /// `Td::on_top_dialog_net_answer` into the landed intakes — the
+    /// toggle machine through the update_is_enabled entry, the get
+    /// family through the send seam below the [blocked: StateManager]
+    /// first-sync hop, the reset family through the live removeTopChat
+    /// arm.
+    fn top_dialog_net_families_ride_the_dispatcher_impl() {
+        use crate::top_dialog_manager::TopDialogManagerEnv as _;
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-top-dialog");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        seed_dialog_user_id(&mut td, 700000009, 43);
+
+        // 1. the toggle family — update_is_enabled(false) fires
+        //    ToggleTopPeersQuery (cpp:151-169): the pmc marks the
+        //    pending toggle and the wire carries the false
+        {
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(&mut td);
+            top_dialog_manager.update_is_enabled(&mut env, false);
+        }
+        assert_eq!(
+            td.global.binlog_pmc().get_raw(b"top_peers_enabled"),
+            b"0".to_vec(),
+            "the pending toggle marks the binlog pmc"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_toggleTopPeers::ID,
+        );
+        let body =
+            telegram_api::contacts_toggleTopPeers::parse(sent.query()).expect("the sent body");
+        assert!(!body.enabled);
+
+        // the boolTrue answer settles the machine — the pmc key erases
+        // (on_toggle_top_peers, cpp:171-191)
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]); // boolTrue#997275b5
+        td.dispatch_completed_top_dialog_net();
+        assert!(
+            td.global
+                .binlog_pmc()
+                .get_raw(b"top_peers_enabled")
+                .is_empty(),
+            "the synchronized toggle erases the pmc key"
+        );
+
+        // 2. the toggle error band — the resend-forever machine
+        //    (cpp:186-188) fires a second query
+        {
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(&mut td);
+            top_dialog_manager.update_is_enabled(&mut env, true);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_toggleTopPeers::ID,
+        );
+        net_fail(sent, 500, "test error");
+        td.dispatch_completed_top_dialog_net();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_toggleTopPeers::ID,
+        );
+        let body =
+            telegram_api::contacts_toggleTopPeers::parse(sent.query()).expect("the resent body");
+        assert!(body.enabled, "the resend-forever machine refires");
+        // settle the machine with ok so the lot drains clean
+        net_complete(sent, vec![0xb5, 0x75, 0x72, 0x99]);
+        td.dispatch_completed_top_dialog_net();
+
+        // 3. the get family — the send seam below the [blocked:
+        //    StateManager] first-sync hop (GetTopPeersQuery::send,
+        //    cpp:43-56): the ten category bits, limit 100 and the
+        //    vector hash of the empty registry
+        {
+            let (mut env, _top_dialog_manager) = crate::td::top_dialog_env_split(&mut td);
+            env.send_get_top_peers_query(crate::misc::get_vector_hash(&[]));
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_getTopPeers::ID,
+        );
+        let body = telegram_api::contacts_getTopPeers::parse(sent.query()).expect("the sent body");
+        assert!(body.correspondents && body.bots_pm && body.bots_inline && body.phone_calls);
+        assert!(body.forward_users && body.forward_chats && body.groups && body.channels);
+        assert!(body.bots_app && body.bots_guestchat);
+        assert_eq!(body.limit, 100);
+        assert_eq!(body.offset, 0);
+        assert_eq!(body.hash, crate::misc::get_vector_hash(&[]));
+
+        // the contacts.topPeers answer applies through the landed
+        // intake (on_get_top_peers, cpp:517-584) — the machine
+        // synchronizes
+        net_complete(
+            sent,
+            wire!(telegram_api::contacts_topPeers {
+                categories: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }),
+        );
+        td.dispatch_completed_top_dialog_net();
+        assert!(
+            td.top_dialog_manager.is_synchronized_for_test(),
+            "the top-peers answer synchronizes the machine"
+        );
+
+        // 4. the reset family through the live removeTopChat arm —
+        //    ResetTopPeerRatingQuery::send (cpp:95-113) with the
+        //    category mapping and the resolved read peer; the promise
+        //    settles locally like the C++
+        td.request(
+            3,
+            Function::removeTopChat(td_api::removeTopChat {
+                chat_id: 700000009,
+                category: Some(td_api::TopChatCategory::topChatCategoryUsers(
+                    td_api::topChatCategoryUsers,
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 3).len() == 1,
+            "the promise settles locally (fire-and-forget wire)"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::contacts_resetTopPeerRating::ID,
+        );
+        let body =
+            telegram_api::contacts_resetTopPeerRating::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.category,
+            Some(telegram_api::TopPeerCategory::topPeerCategoryCorrespondents(_))
+        ));
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerUser(_))
+        ));
+        // the fire-and-forget error runs the on_get_dialog_error head
+        net_fail(sent, 400, "PEER_ID_INVALID");
+        td.dispatch_completed_top_dialog_net();
+
+        // 5. the net-inert posture — no dispatcher, nothing dispatches
+        let (mut td2, rec2) = netted_td("netdrain61-top-dialog-inert");
+        td2.net_query_dispatcher = None; // the net-inert posture
+        {
+            let (mut env, top_dialog_manager) = crate::td::top_dialog_env_split(&mut td2);
+            top_dialog_manager.update_is_enabled(&mut env, false);
+        }
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.top_dialog_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn channel_recommendation_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(channel_recommendation_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the two
+    /// GetChannelRecommendationsQuery forms (ChannelRecommendationManager.cpp:
+    /// 31-84) dispatch through the real dispatcher and the answers drain
+    /// through `Td::on_channel_recommendation_net_answer` into the
+    /// ported reload intakes — the recommended-channels form through
+    /// the live getRecommendedChats arm, the per-channel form through
+    /// the live getChatSimilarChats arm.
+    fn channel_recommendation_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-channel-recommendations");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        // a broadcast channel the user created — registered, member (the
+        // creator), so the recommendation walk drops it like the C++
+        // is_suitable_recommended_channel band (cpp:133-143)
+        seed_channel_with_usernames(&mut td, 703, &[]);
+        let channel_chat_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(703),
+        )
+        .get();
+
+        // 1. the recommended-channels form — the live getRecommendedChats
+        //    arm parks the promise and fires the bare query (flags 0,
+        //    no channel, cpp:52-58)
+        td.request(
+            1,
+            Function::getRecommendedChats(td_api::getRecommendedChats),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        let body = telegram_api::channels_getChannelRecommendations::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 0, "the bare form carries no channel");
+        assert!(body.channel.is_none());
+
+        // the messages.chats answer walks the intake (cpp:256-299): the
+        // member channel is unsuitable, the count decrements, the
+        // promise resolves with the empty Chats object
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_chats {
+                chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                    broadcast: true,
+                    id: 703,
+                    access_hash: 777,
+                    title: "rec".to_owned(),
+                    ..telegram_api::channel::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::chats(chats) = responses.first().expect("the response") else {
+            panic!("the recommended-chats response");
+        };
+        assert_eq!(chats.total_count, 0, "the unsuitable walk decrements");
+        assert!(chats.chat_ids.is_empty());
+
+        // 2. the cache path — a second request answers locally, no wire
+        //    query (the 24h reload deadline, cpp:160-181)
+        td.request(
+            2,
+            Function::getRecommendedChats(td_api::getRecommendedChats),
+        );
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 2);
+        let td_api::Object::chats(chats) = responses.first().expect("the cached response") else {
+            panic!("the cached response");
+        };
+        assert_eq!(chats.total_count, 0);
+        assert!(
+            !rec.sent.lock().iter().any(|query| query.tl_constructor()
+                == telegram_api::channels_getChannelRecommendations::ID),
+            "the cache answers without a wire query"
+        );
+
+        // 3. the per-channel form — the live getChatSimilarChats arm
+        //    (the seeded channel carries the arm's gates): the
+        //    CHANNEL_MASK form with the inputChannel body (cpp:52-58)
+        td.request(
+            3,
+            Function::getChatSimilarChats(td_api::getChatSimilarChats {
+                chat_id: channel_chat_id,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        let body = telegram_api::channels_getChannelRecommendations::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1, "CHANNEL_MASK");
+        assert!(matches!(
+            body.channel,
+            Some(telegram_api::InputChannel::inputChannel(_))
+        ));
+
+        // the chatsSlice answer (cpp:61-73) — the count rides the slice,
+        // the member channel drops, the record caches with the 24h
+        // deadline (cpp:491-522)
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_chatsSlice {
+                count: 2,
+                chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                    broadcast: true,
+                    id: 703,
+                    access_hash: 777,
+                    title: "rec".to_owned(),
+                    ..telegram_api::channel::default()
+                })],
+            }),
+        );
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        let td_api::Object::chats(chats) = responses.first().expect("the similar response") else {
+            panic!("the similar-chats response");
+        };
+        assert_eq!(chats.total_count, 1, "2 - the dropped member channel");
+        assert!(chats.chat_ids.is_empty());
+        let channel_id = crate::chat_manager::ChannelId::new(703);
+        let record = td
+            .channel_recommendation_manager
+            .channel_recommended_dialogs
+            .get(&channel_id)
+            .expect("the cached record");
+        assert_eq!(record.total_count, 1);
+        assert!(record.next_reload_time > tdutils::time::now());
+
+        // 4. the count form — the live getChatSimilarChatCount arm with
+        //    return_local settles -1 from the reload head (cpp:476-487);
+        //    the band fires only on the uncached reload (the cached path
+        //    answers the stored count), so drop the record first
+        td.channel_recommendation_manager
+            .channel_recommended_dialogs
+            .remove(&channel_id);
+        td.request(
+            4,
+            Function::getChatSimilarChatCount(td_api::getChatSimilarChatCount {
+                chat_id: channel_chat_id,
+                return_local: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 4);
+        let td_api::Object::count(count) = responses.first().expect("the count response") else {
+            panic!("the count response");
+        };
+        assert_eq!(count.count, -1, "the return_local -1 band");
+        // the count settle precedes the wire query; complete it so the
+        // drain runs clean below (the empty chats promise parks null)
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        net_complete(sent, wire!(telegram_api::messages_chats { chats: vec![] }));
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+
+        // 5. the error band — the wire error fails the parked promises
+        //    with the reference-identical code/message (cpp:75-83);
+        //    drop the cached record so the arm reloads
+        {
+            td.channel_recommendation_manager
+                .channel_recommended_dialogs
+                .remove(&channel_id);
+        }
+        td.request(
+            7,
+            Function::getChatSimilarChats(td_api::getChatSimilarChats {
+                chat_id: channel_chat_id,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::channels_getChannelRecommendations::ID,
+        );
+        net_fail(sent, 400, "CHANNEL_PRIVATE");
+        td.dispatch_completed_channel_recommendation_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "CHANNEL_PRIVATE")
+        );
+
+        // 6. the net-inert posture — no dispatcher, nothing dispatches
+        let (mut td2, rec2, callback2) =
+            netted_td_with_callback("netdrain61-recommendations-inert");
+        td2.net_query_dispatcher = None; // the net-inert posture
+        td2.request(
+            6,
+            Function::getRecommendedChats(td_api::getRecommendedChats),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 6).is_none() && responses_of(&callback2, 6).is_empty(),
+            "nothing settles offline"
+        );
+        assert!(
+            !td2.channel_recommendation_manager
+                .get_recommended_channels_queries
+                .is_empty(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(
+            td.channel_recommendation_net_completed.lock().is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn device_token_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(device_token_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the device-token register/
+    /// unregister loop sends (DeviceTokenManager.cpp:384-410) dispatch
+    /// through the real dispatcher and the Bool answers drain through
+    /// `Td::on_device_token_net_answer` into the landed
+    /// `on_register_device_result` intake (cpp:412-467) — the register
+    /// ack answers `pushReceiverId(my_id)`, the false band answers the
+    /// C++ 400, and the unregister leg clears the slot.
+    fn device_token_net_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain61-device-token");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+
+        // 1. the register leg — the APNs token over token type 1 with
+        //    the other_uids vector (cpp:396-405): the wire body carries
+        //    no_muted on bit 0
+        td.request(
+            1,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: "apns-tok".to_owned(),
+                        is_app_sandbox: true,
+                    },
+                )),
+                other_user_ids: vec![7, 8],
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_registerDevice::ID,
+        );
+        let body =
+            telegram_api::account_registerDevice::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1, "the no_muted bit");
+        assert!(body.no_muted);
+        assert_eq!(body.token_type, 1);
+        assert_eq!(body.token, "apns-tok");
+        assert!(body.app_sandbox);
+        assert!(body.secret.is_empty());
+        assert_eq!(body.other_uids, vec![7, 8]);
+
+        // boolTrue answers pushReceiverId(my_id) (cpp:420-431)
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_device_token_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::pushReceiverId(receiver) = responses.first().expect("the response")
+        else {
+            panic!("the register response");
+        };
+        assert_eq!(receiver.id, 700000001);
+
+        // 2. the false band — a changed token re-registers, the false
+        //    answer settles the C++ 400 (cpp:450-454) and flips the slot
+        //    to Unregister (cpp:459-460)
+        td.request(
+            2,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: "apns-tok2".to_owned(),
+                        is_app_sandbox: false,
+                    },
+                )),
+                other_user_ids: vec![],
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_registerDevice::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_device_token_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                400,
+                "Receive false as result of registerDevice server request"
+            )
+        );
+
+        // 3. the unregister leg — the empty token flips the slot to
+        //    Unregister (cpp:432-434) and the loop sends the unregister
+        //    wire form carrying the stored token; boolTrue clears it
+        td.request(
+            3,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: String::new(),
+                        is_app_sandbox: false,
+                    },
+                )),
+                other_user_ids: vec![],
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_unregisterDevice::ID,
+        );
+        let body =
+            telegram_api::account_unregisterDevice::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.token_type, 1);
+        assert_eq!(body.token, "apns-tok2");
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_device_token_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        let td_api::Object::pushReceiverId(receiver) = responses.first().expect("the response")
+        else {
+            panic!("the unregister response");
+        };
+        assert_eq!(receiver.id, 0, "the unregister ack carries no receiver");
+
+        // 4. the net-inert posture — no dispatcher, nothing dispatches
+        //    and the promise parks like the C++ offline
+        let (mut td2, rec2, callback2) = netted_td_with_callback("netdrain61-device-token-inert");
+        td2.net_query_dispatcher = None; // the net-inert posture
+        td2.device_token_manager.net = None; // the manager-held handle too
+        td2.request(
+            6,
+            Function::registerDevice(td_api::registerDevice {
+                device_token: Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: "offline".to_owned(),
+                        is_app_sandbox: false,
+                    },
+                )),
+                other_user_ids: vec![],
+            }),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 6).is_none() && responses_of(&callback2, 6).is_empty(),
+            "nothing settles offline — the loop's in-flight mark parks the promise"
+        );
+
+        // the drain ran clean — nothing parked
+        assert!(td.device_token_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn notification_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(notification_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 61 netted round trips: the contact-sign-up pair
+    /// (NotificationManager.cpp:73-127) — the getOption arm routes the
+    /// `GetContactSignUpNotificationQuery` through the live dispatcher
+    /// (OptionManager.cpp:775-782) and the Bool answer answers the
+    /// parked request with the re-read option value (the wrap_promise);
+    /// the set family's sync machine runs end-to-end over the wire.
+    fn notification_net_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) =
+            netted_td_with_callback("netdrain61-notification-contact-signup");
+        td.option_manager
+            .as_mut()
+            .expect("the option manager exists after init")
+            .on_td_inited();
+
+        // 1. the get family — the live getOption arm fires the wire query
+        //    (cpp:108-110) and the request parks FIFO
+        td.request(
+            1,
+            Function::getOption(td_api::getOption {
+                name: "disable_contact_registered_notifications".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getContactSignUpNotification::ID,
+        );
+
+        // boolTrue flips the flag + writes the option; the wrap_promise
+        // answers the re-read boolean value (cpp:112-118 + 2667-2678)
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::optionValueBoolean(value) =
+            responses.first().expect("the option response")
+        else {
+            panic!("the option response");
+        };
+        assert!(value.value);
+        assert!(
+            td.notification_manager
+                .disable_contact_registered_notifications
+        );
+
+        // 2. the set family — the sync machine over the wire: the
+        //    disabled band arms Pending + account.setContactSignUpNotification
+        //    with silent=true (cpp:2693-2714)
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                notification_updates,
+                notification_manager,
+                ..
+            } = &mut td;
+            let mut env = NotificationEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_authorized: auth_manager.is_authorized(),
+                auth_is_bot: auth_manager.is_bot(),
+                updates: notification_updates,
+            };
+            notification_manager.run_contact_registered_notifications_sync(&mut env);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setContactSignUpNotification::ID,
+        );
+        let body = telegram_api::account_setContactSignUpNotification::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.silent, "the is_disabled capture rides the wire");
+        assert_eq!(
+            td.notification_manager
+                .contact_registered_notifications_sync_state,
+            crate::notification_manager::SyncState::Pending
+        );
+
+        // the ok answer completes the machine (cpp:84-91 + 2721-2722)
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+        assert_eq!(
+            td.notification_manager
+                .contact_registered_notifications_sync_state,
+            crate::notification_manager::SyncState::Completed
+        );
+
+        // 3. the resend-forever band — a wire error re-arms the query
+        //    (cpp:93-98 + 2722-2724)
+        {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                notification_updates,
+                notification_manager,
+                ..
+            } = &mut td;
+            let mut env = NotificationEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_authorized: auth_manager.is_authorized(),
+                auth_is_bot: auth_manager.is_bot(),
+                updates: notification_updates,
+            };
+            notification_manager.contact_registered_notifications_sync_state =
+                crate::notification_manager::SyncState::Pending;
+            notification_manager.on_contact_registered_notifications_sync(
+                &mut env,
+                true,
+                Err(tdutils::status::Status::error(400, "NETWORK_ERROR")),
+            );
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_setContactSignUpNotification::ID,
+        );
+        assert_eq!(
+            td.notification_manager
+                .contact_registered_notifications_sync_state,
+            crate::notification_manager::SyncState::Pending,
+            "the error re-arms the send"
+        );
+        // complete the refired query so the drain runs clean
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+
+        // 4. the get-error band — the error is swallowed by the
+        //    wrap_promise (the re-read answers, OptionManager.cpp:761-766)
+        td.request(
+            2,
+            Function::getOption(td_api::getOption {
+                name: "disable_contact_registered_notifications".to_owned(),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::account_getContactSignUpNotification::ID,
+        );
+        net_fail(sent, 500, "NETWORK_ERROR");
+        td.dispatch_completed_notification_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 2);
+        let td_api::Object::optionValueBoolean(value) =
+            responses.first().expect("the option response")
+        else {
+            panic!("the error-band response");
+        };
+        assert!(
+            value.value,
+            "the wrap_promise answers the re-read store value on errors"
+        );
+
+        // 5. the net-inert posture — no dispatcher, the getOption parks
+        //    at the family lot unanswered
+        let (mut td2, rec2, callback2) =
+            netted_td_with_callback("netdrain61-notification-contact-signup-inert");
+        td2.net_query_dispatcher = None;
+        td2.notification_manager.net = None; // the manager-held handle too
+        td2.option_manager
+            .as_mut()
+            .expect("the option manager exists after init")
+            .on_td_inited();
+        td2.request(
+            6,
+            Function::getOption(td_api::getOption {
+                name: "disable_contact_registered_notifications".to_owned(),
+            }),
+        );
+        td2.flush_deferred_results();
+        assert!(rec2.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            error_of_id(&callback2, 6).is_none() && responses_of(&callback2, 6).is_empty(),
+            "the request parks at the family lot like the C++ offline"
+        );
+
+        // the drain ran clean — nothing parked
+        assert!(td.notification_net_completed.lock().is_empty(), "drained");
+    }
+
     #[test]
     fn notification_settings_net_families_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -87615,5 +95142,2381 @@ kQIDAQAB\n\
                 .expect("the empty-call band");
             assert_eq!(error.message, "Input call must be non-empty");
         }
+    }
+
+    // ---- the net-drain 48 inline-query families: the §3.9
+    // InlineQueriesManager wire queries (InlineQueriesManager.cpp:67-455)
+    // ride the InlineQueriesNetKind plane. ----
+
+    /// The wire form of a received inline bot: the access hash (the
+    /// user-mode input user), the bot + inline flags and the placeholder
+    /// (the `USER_BOT_INLINE_PLACEHOLDER_MASK` band, cpp:3820).
+    fn inline_bot_user(user_id: i64, access_hash: i64) -> telegram_api::User {
+        telegram_api::User::user(telegram_api::user {
+            flags: 1 | (1 << 19), // ACCESS_HASH_MASK | BOT_INLINE_PLACEHOLDER_MASK
+            bot: true,
+            bot_inline_placeholder: "Query...".to_owned(),
+            id: user_id,
+            access_hash,
+            ..Default::default()
+        })
+    }
+
+    /// An empty `updatesCombined` container — the walk-safe Updates
+    /// answer of the web-view-data family (the engine completes the
+    /// request promise).
+    fn empty_combined_updates() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1700000000,
+            seq_start: 0,
+            seq: 0,
+        })
+        .store(&mut out);
+        out
+    }
+
+    #[test]
+    fn inline_queries_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(inline_queries_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn inline_queries_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain48-inline");
+        td.intake_users(
+            vec![inline_bot_user(9, 3)],
+            "inline_queries_net_families_ride_the_dispatcher",
+        );
+
+        // 1. the live getInlineQueryResults arm rides the wire
+        //    (Requests.cpp:8195-8203 → send_inline_query → loop() →
+        //    GetInlineBotResultsQuery::send, cpp:76-92): the flags carry no
+        //    geo point, the bot is the resolved input user and the empty
+        //    dialog resolves to inputPeerEmpty
+        td.request(
+            1,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "weather".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineBotResults::ID,
+        );
+        let body =
+            telegram_api::messages_getInlineBotResults::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 0);
+        assert_eq!(body.query, "weather");
+        assert_eq!(body.offset, "");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerEmpty(_))
+        ));
+        assert!(body.geo_point.is_none());
+
+        // 2. the answer drain runs the landed intake
+        //    (on_get_inline_query_results, cpp:2280-2322): the query id
+        //    rides the results object, the article result parks at the
+        //    [blocked: M.9] content seam so the list answers empty
+        let bot_results = telegram_api::messages_BotResults {
+            flags: 1 << 1, // NEXT_OFFSET_MASK — the offset rides flags.1
+            gallery: false,
+            query_id: 55,
+            next_offset: "2".to_owned(),
+            switch_pm: None,
+            switch_webview: None,
+            results: vec![telegram_api::BotInlineResult::botInlineResult(
+                telegram_api::botInlineResult {
+                    flags: 0,
+                    id: "a".to_owned(),
+                    r#type: "article".to_owned(),
+                    title: String::new(),
+                    description: String::new(),
+                    url: String::new(),
+                    thumb: None,
+                    content: None,
+                    send_message: Some(telegram_api::BotInlineMessage::botInlineMessageText(
+                        telegram_api::botInlineMessageText {
+                            flags: 0,
+                            no_webpage: false,
+                            invert_media: false,
+                            message: "hi".to_owned(),
+                            entities: Vec::new(),
+                            reply_markup: None,
+                        },
+                    )),
+                },
+            )],
+            cache_time: 60,
+            users: Vec::new(),
+        };
+        net_complete(sent, wire!(bot_results));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::inlineQueryResults(results)) => {
+                assert_eq!(results.inline_query_id, 55);
+                assert_eq!(results.next_offset, "2");
+                assert!(results.results.is_empty(), "the M.9 content seam parks");
+                assert!(results.button.is_none());
+            }
+            other => panic!("the inline query results, got {other:?}"),
+        }
+
+        // 3. the error tail (cpp:111-121): the plain wire error forwards
+        //    to the request promise after the nullptr intake. The
+        //    INLINE_QUERY_DELAY_MS gate (cpp:1419-1420) parks the next
+        //    send until the clock jumps past the 400ms window
+        //    (`Time::jump_in_future`, the C++ timeout hop).
+        tdutils::time::jump_in_future(tdutils::time::now() + 0.5);
+        td.request(
+            2,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "other".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineBotResults::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_7"));
+
+        // 4. the BOT_RESPONSE_TIMEOUT rewrite (cpp:115-117) — the 502
+        //    "The bot is not responding" band
+        tdutils::time::jump_in_future(tdutils::time::now() + 0.5);
+        td.request(
+            3,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "third".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineBotResults::ID,
+        );
+        net_fail(sent, 500, "BOT_RESPONSE_TIMEOUT");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (502, "The bot is not responding")
+        );
+
+        // 5. the dropped-pending band (cpp:1389-1399): a new query inside
+        //    the 400ms window parks first, then the next one drops it —
+        //    its promise errors 406 "Request canceled" (the C++
+        //    cancel_query hop's answer) and the nullptr intake runs for
+        //    its hash
+        td.request(
+            4,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "pending".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_getInlineBotResults::ID,
+            "the 400ms inline-query delay parks the pending query",
+        );
+        td.request(
+            5,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "third-b".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (406, "Request canceled")
+        );
+
+        // 6. the bot-mode answerInlineQuery arm rides the wire
+        //    (Requests.cpp:8205-8212 → answer_inline_query →
+        //    SetInlineBotResultsQuery::send, cpp:133-152): the flags carry
+        //    the next-offset + switch-pm bits, the article result folds
+        //    through get_input_bot_inline_result and the button takes the
+        //    switch-pm arm
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            6,
+            Function::answerInlineQuery(td_api::answerInlineQuery {
+                inline_query_id: 77,
+                is_personal: true,
+                button: Some(td_api::InlineQueryResultsButton {
+                    text: "Switch".to_owned(),
+                    r#type: Some(
+                        td_api::InlineQueryResultsButtonType::inlineQueryResultsButtonTypeStartBot(
+                            td_api::inlineQueryResultsButtonTypeStartBot {
+                                parameter: "abc123_XY".to_owned(),
+                            },
+                        ),
+                    ),
+                }),
+                results: vec![
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "r1".to_owned(),
+                            url: "https://t.me".to_owned(),
+                            title: "Title".to_owned(),
+                            description: "Desc".to_owned(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ],
+                cache_time: 30,
+                next_offset: "2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setInlineBotResults::ID,
+        );
+        let body =
+            telegram_api::messages_setInlineBotResults::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, (1 << 1) | (1 << 2) | (1 << 3)); // PRIVATE | NEXT_OFFSET | SWITCH_PM
+        assert_eq!(
+            (body.gallery, body.private, body.query_id),
+            (false, true, 77)
+        );
+        assert_eq!(body.cache_time, 30);
+        assert_eq!(body.next_offset, "2");
+        match body.switch_pm.as_ref() {
+            Some(switch_pm) => {
+                assert_eq!(
+                    (switch_pm.text.as_str(), switch_pm.start_param.as_str()),
+                    ("Switch", "abc123_XY")
+                );
+            }
+            None => panic!("the switch-pm button"),
+        }
+        assert!(body.switch_webview.is_none());
+        assert_eq!(body.results.len(), 1);
+        match &body.results[0] {
+            telegram_api::InputBotInlineResult::inputBotInlineResult(result) => {
+                assert_eq!(
+                    (result.flags, result.id.as_str(), result.r#type.as_str()),
+                    ((1 << 1) | (1 << 2) | (1 << 3), "r1", "article") // TITLE | DESCRIPTION | URL
+                );
+                assert_eq!(result.title, "Title");
+                assert_eq!(result.description, "Desc");
+                assert_eq!(result.url, "https://t.me");
+                assert!(result.thumb.is_none() && result.content.is_none());
+                assert!(matches!(
+                    result.send_message.as_ref(),
+                    Some(telegram_api::InputBotInlineMessage::inputBotInlineMessageText(message))
+                        if message.message == "hi"
+                ));
+            }
+            other => panic!("the article result, got {other:?}"),
+        }
+
+        // 7. the Bool answer settles the parked promise ok (cpp:153-161);
+        //    the false band only logs
+        net_complete(sent, bool_true_bytes());
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. the wire error forwards to the request promise (cpp:162-165)
+        td.request(
+            7,
+            Function::answerInlineQuery(td_api::answerInlineQuery {
+                inline_query_id: 78,
+                is_personal: false,
+                button: None,
+                results: vec![
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "r2".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ],
+                cache_time: 30,
+                next_offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setInlineBotResults::ID,
+        );
+        net_fail(sent, 400, "QUERY_ID_INVALID");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "QUERY_ID_INVALID")
+        );
+
+        // 9. the count band (cpp:728-731) — the 51st result errors before
+        //    any send
+        td.request(
+            8,
+            Function::answerInlineQuery(td_api::answerInlineQuery {
+                inline_query_id: 79,
+                is_personal: false,
+                button: None,
+                results: (0..51)
+                    .map(|index| {
+                        td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                            td_api::inputInlineQueryResultArticle {
+                                id: format!("r{index}"),
+                                url: String::new(),
+                                title: "T".to_owned(),
+                                description: String::new(),
+                                thumbnail_url: String::new(),
+                                thumbnail_width: 0,
+                                thumbnail_height: 0,
+                                reply_markup: None,
+                                input_message_content: Some(Box::new(
+                                    td_api::InputMessageContent::inputMessageText(
+                                        td_api::inputMessageText {
+                                            text: Some(td_api::FormattedText {
+                                                text: "hi".to_owned(),
+                                                entities: Vec::new(),
+                                            }),
+                                            link_preview_options: None,
+                                            clear_draft: false,
+                                        },
+                                    ),
+                                )),
+                            },
+                        )
+                    })
+                    .collect(),
+                cache_time: 30,
+                next_offset: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Too many inline query results specified")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_setInlineBotResults::ID,
+            "the count band sends nothing",
+        );
+
+        // 10. the answerGuestQuery arm rides the wire
+        //    (Requests.cpp:8214-8220 → answer_guest_query →
+        //    SetBotGuestChatResultQuery::send, cpp:180-183): the query id
+        //    and the folded result
+        td.request(
+            10,
+            Function::answerGuestQuery(td_api::answerGuestQuery {
+                guest_query_id: 4242,
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "g1".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotGuestChatResult::ID,
+        );
+        let body = telegram_api::messages_setBotGuestChatResult::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.query_id, 4242);
+        assert!(matches!(
+            body.result,
+            Some(telegram_api::InputBotInlineResult::inputBotInlineResult(ref result))
+                if result.id == "g1"
+        ));
+
+        // 11. the InputBotInlineMessageID answer folds through
+        //     get_inline_message_id (cpp:184-192) — the object's id is the
+        //     base64url form and the public decode pair reads it back
+        let answer = telegram_api::InputBotInlineMessageID::inputBotInlineMessageID(
+            telegram_api::inputBotInlineMessageID {
+                dc_id: 2,
+                id: 77,
+                access_hash: 12345,
+            },
+        );
+        let mut answer_bytes = Vec::new();
+        answer.store(&mut answer_bytes);
+        net_complete(sent, answer_bytes);
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 10).first() {
+            Some(Object::inlineMessageId(inline_message_id)) => {
+                let decoded = crate::inline_message_manager::get_input_bot_inline_message_id(
+                    &inline_message_id.id,
+                )
+                .expect("the base64url form decodes");
+                assert!(matches!(
+                    decoded,
+                    telegram_api::InputBotInlineMessageID::inputBotInlineMessageID(id)
+                        if (id.dc_id, id.id, id.access_hash) == (2, 77, 12345)
+                ));
+            }
+            other => panic!("the inline message id, got {other:?}"),
+        }
+
+        // 12. the savePreparedInlineMessage arm rides the wire
+        //     (Requests.cpp:8222-8227 → save_prepared_inline_message →
+        //     SavePreparedInlineMessageQuery::send, cpp:206-222): the
+        //     peer-types flag bit, the resolved input user (the bot-mode
+        //     access-hash-0 fallback) and the folded result
+        td.request(
+            11,
+            Function::savePreparedInlineMessage(td_api::savePreparedInlineMessage {
+                user_id: 11,
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "p1".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+                chat_types: Some(td_api::TargetChatTypes {
+                    allow_user_chats: true,
+                    allow_bot_chats: false,
+                    allow_group_chats: false,
+                    allow_channel_chats: false,
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_savePreparedInlineMessage::ID,
+        );
+        let body = telegram_api::messages_savePreparedInlineMessage::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1); // PEER_TYPES_MASK
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (11, 0)
+        ));
+        assert!(matches!(
+            body.peer_types.as_slice(),
+            [telegram_api::InlineQueryPeerType::inlineQueryPeerTypePM(_)]
+        ));
+        assert!(matches!(
+            body.result,
+            Some(telegram_api::InputBotInlineResult::inputBotInlineResult(ref result))
+                if result.id == "p1"
+        ));
+
+        // 13. the messages.BotPreparedInlineMessage answer settles the id
+        //     pair (cpp:223-231)
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_BotPreparedInlineMessage {
+                id: "pm1".to_owned(),
+                expire_date: 1700000123,
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 11).first() {
+            Some(Object::preparedInlineMessageId(prepared)) => {
+                assert_eq!(
+                    (prepared.id.as_str(), prepared.expiration_date),
+                    ("pm1", 1700000123)
+                );
+            }
+            other => panic!("the prepared inline message id, got {other:?}"),
+        }
+
+        // 14. the empty chat-types band (TargetDialogTypes.cpp:54-57) —
+        //     no send, the 400 answers inline
+        td.request(
+            12,
+            Function::savePreparedInlineMessage(td_api::savePreparedInlineMessage {
+                user_id: 11,
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "p2".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+                chat_types: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "At least one chat type must be allowed")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_savePreparedInlineMessage::ID,
+            "the empty chat-types band sends nothing",
+        );
+
+        // 15. back to the user mode — the getPreparedInlineMessage arm
+        //     rides the wire (Requests.cpp:8228-8234 →
+        //     get_prepared_inline_message → GetPreparedInlineMessageQuery
+        //     ::send, cpp:244-250): the resolved bot input user and the id
+        td.auth_manager.force_user_for_test();
+        td.request(
+            13,
+            Function::getPreparedInlineMessage(td_api::getPreparedInlineMessage {
+                bot_user_id: 9,
+                prepared_message_id: "pm1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPreparedInlineMessage::ID,
+        );
+        let body = telegram_api::messages_getPreparedInlineMessage::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert_eq!(body.id, "pm1");
+
+        // 16. the answer routes on_get_prepared_inline_message
+        //     (cpp:252-262 → 2324-2357): the article result parks at the
+        //     [blocked: M.9] content seam, so the port answers the C++
+        //     "Receive invalid response" 500 band
+        let prepared = telegram_api::messages_PreparedInlineMessage {
+            query_id: 991,
+            result: Some(telegram_api::BotInlineResult::botInlineResult(
+                telegram_api::botInlineResult {
+                    flags: 0,
+                    id: "a".to_owned(),
+                    r#type: "article".to_owned(),
+                    title: String::new(),
+                    description: String::new(),
+                    url: String::new(),
+                    thumb: None,
+                    content: None,
+                    send_message: Some(telegram_api::BotInlineMessage::botInlineMessageText(
+                        telegram_api::botInlineMessageText {
+                            flags: 0,
+                            no_webpage: false,
+                            invert_media: false,
+                            message: "hi".to_owned(),
+                            entities: Vec::new(),
+                            reply_markup: None,
+                        },
+                    )),
+                },
+            )),
+            peer_types: Vec::new(),
+            cache_time: 60,
+            users: Vec::new(),
+        };
+        net_complete(sent, wire!(prepared));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 13);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 17. the zero-query-id band (cpp:2326-2330) — the "Receive no
+        //     response" 500 after the nullptr intake
+        td.request(
+            14,
+            Function::getPreparedInlineMessage(td_api::getPreparedInlineMessage {
+                bot_user_id: 9,
+                prepared_message_id: "pm2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPreparedInlineMessage::ID,
+        );
+        let prepared = telegram_api::messages_PreparedInlineMessage {
+            query_id: 0,
+            ..prepared
+        };
+        net_complete(sent, wire!(prepared));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive no response")
+        );
+
+        // 18. the wire error forwards through the nullptr intake
+        //     (cpp:263-266)
+        td.request(
+            15,
+            Function::getPreparedInlineMessage(td_api::getPreparedInlineMessage {
+                bot_user_id: 9,
+                prepared_message_id: "pm3".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPreparedInlineMessage::ID,
+        );
+        net_fail(sent, 400, "PREPARED_MESSAGE_INVALID");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 15);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "PREPARED_MESSAGE_INVALID")
+        );
+
+        // 19. the savePreparedKeyboardButton arm rides the wire
+        //     (Requests.cpp:1297-1303 → save_prepared_keyboard_button →
+        //     SavePreparedKeyboardButtonQuery::send, cpp:275-282): the
+        //     resolved input user and the M.22 input keyboard button
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            16,
+            Function::savePreparedKeyboardButton(td_api::savePreparedKeyboardButton {
+                user_id: 11,
+                button: Some(td_api::KeyboardButton {
+                    text: "Pick a chat".to_owned(),
+                    icon_custom_emoji_id: 0,
+                    style: None,
+                    r#type: Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                        td_api::keyboardButtonTypeRequestUsers {
+                            id: 3,
+                            restrict_user_is_bot: false,
+                            user_is_bot: false,
+                            restrict_user_is_premium: false,
+                            user_is_premium: false,
+                            max_quantity: 2,
+                            request_name: false,
+                            request_username: false,
+                            request_photo: false,
+                        },
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_requestWebViewButton::ID,
+        );
+        let body =
+            telegram_api::bots_requestWebViewButton::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (11, 0)
+        ));
+        let button = body.button.expect("the input keyboard button");
+        assert_eq!(button.text, "Pick a chat");
+        match button.r#type {
+            Some(telegram_api::ButtonType::inputButtonTypeRequestPeer(peer)) => {
+                assert_eq!(peer.button_id, 3);
+                assert_eq!(peer.max_quantity, 2);
+                assert!(peer.peer_type.is_some());
+            }
+            other => panic!("the request-peer button, got {other:?}"),
+        }
+
+        // 20. the bots.RequestedButton answer settles the request id
+        //     (cpp:283-293)
+        net_complete(
+            sent,
+            wire!(telegram_api::bots_RequestedButton {
+                webapp_req_id: "wrb-1".to_owned(),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 16).first() {
+            Some(Object::text(text)) => assert_eq!(text.text, "wrb-1"),
+            other => panic!("the prepared button id, got {other:?}"),
+        }
+
+        // 21. the empty-button band (cpp:815-817) — no send
+        td.request(
+            17,
+            Function::savePreparedKeyboardButton(td_api::savePreparedKeyboardButton {
+                user_id: 11,
+                button: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 17);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Button must be non-empty")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::bots_requestWebViewButton::ID,
+            "the empty-button band sends nothing",
+        );
+
+        // 22. back to the user mode — the getPreparedKeyboardButton arm
+        //     rides the wire (Requests.cpp:1290-1296 →
+        //     get_prepared_keyboard_button → GetRequestedWebViewButtonQuery
+        //     ::send, cpp:305-311)
+        td.auth_manager.force_user_for_test();
+        td.request(
+            18,
+            Function::getPreparedKeyboardButton(td_api::getPreparedKeyboardButton {
+                bot_user_id: 9,
+                prepared_button_id: "wrb-1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getRequestedWebViewButton::ID,
+        );
+        let body = telegram_api::bots_getRequestedWebViewButton::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert_eq!(body.webapp_req_id, "wrb-1");
+
+        // 23. the wire keyboard-button answer folds through the M.22
+        //     record (cpp:313-331): the requested dialog type registers
+        //     (on_get_requested_web_view_button) and the object answers
+        let requested_button = telegram_api::KeyboardButton {
+            flags: 0,
+            style: None,
+            text: "Pick a user".to_owned(),
+            r#type: Some(telegram_api::ButtonType::buttonTypeRequestPeer(
+                telegram_api::buttonTypeRequestPeer {
+                    flags: 0,
+                    button_id: 3,
+                    peer_type: Some(telegram_api::RequestPeerType::requestPeerTypeUser(
+                        telegram_api::requestPeerTypeUser {
+                            flags: 0,
+                            bot: false,
+                            premium: false,
+                        },
+                    )),
+                    max_quantity: 2,
+                },
+            )),
+        };
+        net_complete(sent, wire!(requested_button));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 18).first() {
+            Some(Object::keyboardButton(button)) => {
+                assert_eq!(button.text, "Pick a user");
+                assert!(matches!(
+                    button.r#type,
+                    Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                        _
+                    ))
+                ));
+            }
+            other => panic!("the keyboard button, got {other:?}"),
+        }
+        // the registration landed (get_requested_dialog_type,
+        // InlineQueriesManager.cpp:836-843)
+        {
+            let manager = std::mem::take(&mut td.inline_queries_manager);
+            let registered = manager
+                .get_requested_dialog_type(crate::user_manager::UserId::new(9), "wrb-1")
+                .is_some();
+            td.inline_queries_manager = manager;
+            assert!(registered, "the requested dialog type registers");
+        }
+
+        // 24. the invalid-button band (cpp:322-327) — a button without a
+        //     requested dialog type answers the 500
+        td.request(
+            19,
+            Function::getPreparedKeyboardButton(td_api::getPreparedKeyboardButton {
+                bot_user_id: 9,
+                prepared_button_id: "wrb-2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getRequestedWebViewButton::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::KeyboardButton {
+                flags: 0,
+                style: None,
+                text: "Plain".to_owned(),
+                r#type: Some(telegram_api::ButtonType::buttonTypeDefault(
+                    telegram_api::buttonTypeDefault {}
+                )),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 19);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid button type")
+        );
+
+        // 25. the getWebAppUrl arm rides the wire (Requests.cpp:1242-1252
+        //     → get_simple_web_view_url → RequestSimpleWebViewQuery::send,
+        //     cpp:347-379): the `#kb` suffix takes the URL flag, the
+        //     application name rides the platform field and the compact
+        //     mode rides its flag
+        td.request(
+            20,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "https://app.example.com/x#kb".to_owned(),
+                parameters: Some(td_api::WebAppOpenParameters {
+                    theme: None,
+                    application_name: "tdlib-test".to_owned(),
+                    mode: Some(td_api::WebAppOpenMode::webAppOpenModeCompact(
+                        td_api::webAppOpenModeCompact,
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestSimpleWebView::ID,
+        );
+        let body = telegram_api::messages_requestSimpleWebView::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, (1 << 3) | (1 << 7)); // URL_MASK | COMPACT
+        assert_eq!(body.url, "https://app.example.com/x");
+        assert_eq!(
+            (body.from_switch_webview, body.from_side_menu),
+            (false, false)
+        );
+        assert!(body.compact);
+        assert!(!body.fullscreen);
+        assert_eq!(body.platform, "tdlib-test");
+        assert!(body.theme_params.is_none());
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+
+        // 26. the WebViewResult answer settles the url/same-origin pair
+        //     (cpp:381-394)
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewResult {
+                flags: 0,
+                fullsize: false,
+                fullscreen: false,
+                same_origin: true,
+                query_id: 0,
+                url: "https://app.example.com/webapp".to_owned(),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 20).first() {
+            Some(Object::webAppUrl(web_app_url)) => {
+                assert_eq!(web_app_url.url, "https://app.example.com/webapp");
+                assert!(web_app_url.require_same_origin);
+            }
+            other => panic!("the web app url, got {other:?}"),
+        }
+
+        // 27. the `#iq` suffix takes the from_switch_webview flag and the
+        //     start:// form the start_param + from_side_menu pair
+        //     (cpp:359-372)
+        td.request(
+            21,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "https://app.example.com/y#iq".to_owned(),
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestSimpleWebView::ID,
+        );
+        let body = telegram_api::messages_requestSimpleWebView::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, (1 << 3) | (1 << 1)); // URL_MASK | FROM_SWITCH_WEBVIEW
+        assert!(body.from_switch_webview);
+        assert_eq!(body.url, "https://app.example.com/y");
+
+        td.request(
+            22,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "start://hello".to_owned(),
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestSimpleWebView::ID,
+        );
+        let body = telegram_api::messages_requestSimpleWebView::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, (1 << 4) | (1 << 2)); // START_PARAM_MASK | FROM_SIDE_MENU
+        assert_eq!(body.url, "");
+        assert_eq!(body.start_param, "hello");
+        assert!(body.from_side_menu);
+
+        // 28. the invalid-URL band (cpp:372-374) answers the 400 inline —
+        //     no send
+        td.request(
+            23,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "https://app.example.com/no-suffix".to_owned(),
+                parameters: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 23);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid URL specified")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_requestSimpleWebView::ID,
+            "the invalid-URL band sends nothing",
+        );
+
+        // 29. the sendWebAppData arm rides the wire (Requests.cpp:1226-1235
+        //     → send_web_view_data → SendWebViewDataQuery::send,
+        //     cpp:407-413): the resolved bot, the non-zero random id and
+        //     the button/data pair
+        td.request(
+            24,
+            Function::sendWebAppData(td_api::sendWebAppData {
+                bot_user_id: 9,
+                button_text: "Open".to_owned(),
+                data: "payload".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewData::ID,
+        );
+        let body =
+            telegram_api::messages_sendWebViewData::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert_ne!(body.random_id, 0);
+        assert_eq!(
+            (body.button_text.as_str(), body.data.as_str()),
+            ("Open", "payload")
+        );
+
+        // 30. the Updates answer rides the updates engine with the
+        //     request promise (cpp:414-423) — the ok settles the request
+        net_complete(sent, empty_combined_updates());
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 24).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 31. the wire error forwards to the request promise (cpp:424)
+        td.request(
+            25,
+            Function::sendWebAppData(td_api::sendWebAppData {
+                bot_user_id: 9,
+                button_text: "Open".to_owned(),
+                data: "payload2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewData::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 25);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 32. the answerWebAppQuery arm rides the wire (Requests.cpp:
+        //     1202-1208 → answer_web_view_query →
+        //     SendWebViewResultMessageQuery::send, cpp:435-439)
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            26,
+            Function::answerWebAppQuery(td_api::answerWebAppQuery {
+                web_app_query_id: "waq-1".to_owned(),
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "w1".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewResultMessage::ID,
+        );
+        let body = telegram_api::messages_sendWebViewResultMessage::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.bot_query_id, "waq-1");
+        assert!(matches!(
+            body.result,
+            Some(telegram_api::InputBotInlineResult::inputBotInlineResult(ref result))
+                if result.id == "w1"
+        ));
+
+        // 33. the WebViewMessageSent answer folds through
+        //     get_inline_message_id (cpp:440-451) — the msg_id pair decodes
+        //     back through the public pair
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewMessageSent {
+                flags: 1, // MSG_ID_MASK
+                msg_id: Some(
+                    telegram_api::InputBotInlineMessageID::inputBotInlineMessageID64(
+                        telegram_api::inputBotInlineMessageID64 {
+                            dc_id: 4,
+                            owner_id: 9,
+                            id: 12,
+                            access_hash: 77,
+                        },
+                    )
+                ),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 26).first() {
+            Some(Object::inlineMessageId(inline_message_id)) => {
+                let decoded = crate::inline_message_manager::get_input_bot_inline_message_id(
+                    &inline_message_id.id,
+                )
+                .expect("the base64url form decodes");
+                assert!(matches!(
+                    decoded,
+                    telegram_api::InputBotInlineMessageID::inputBotInlineMessageID64(id)
+                        if (id.dc_id, id.owner_id, id.id, id.access_hash) == (4, 9, 12, 77)
+                ));
+            }
+            other => panic!("the inline message id, got {other:?}"),
+        }
+
+        // 34. the wire error forwards to the request promise (cpp:452-454)
+        td.request(
+            27,
+            Function::answerWebAppQuery(td_api::answerWebAppQuery {
+                web_app_query_id: "waq-2".to_owned(),
+                result: Some(td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                    td_api::inputInlineQueryResultGame {
+                        id: "g2".to_owned(),
+                        game_short_name: "snake".to_owned(),
+                        reply_markup: None,
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewResultMessage::ID,
+        );
+        net_fail(sent, 400, "QUERY_ID_INVALID");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 27);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "QUERY_ID_INVALID")
+        );
+    }
+
+    // ---- the net-drain 59 boost families: the five §3.9 BoostManager
+    // ---- wire queries (BoostManager.cpp:94-325) ride the BoostNetKind
+    // ---- plane.
+
+    /// The one `chatBoostSlots` response of a request (the
+    /// `error_of`/`responses_of` companions).
+    fn chat_boost_slots_of(callback: &CollectCallback, id: u64) -> td_api::ChatBoostSlots {
+        let Some(Object::chatBoostSlots(slots)) = responses_of(callback, id).into_iter().next()
+        else {
+            panic!("expected a chatBoostSlots response for {id}");
+        };
+        slots
+    }
+
+    fn sample_my_boosts() -> telegram_api::premium_MyBoosts {
+        let peer = |user_id: i64| {
+            Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id,
+            }))
+        };
+        telegram_api::premium_MyBoosts {
+            my_boosts: vec![
+                // the live user slot — the dates pass through
+                telegram_api::MyBoost {
+                    flags: 3,
+                    slot: 3,
+                    peer: peer(700000001),
+                    date: 100,
+                    expires: 2_000_000_000,
+                    cooldown_until_date: 50,
+                },
+                // the empty slot — no peer, so the chat id stays 0 and
+                // the dates zero (BoostManager.cpp:78-81); flags = the
+                // cooldown bit only (the peer bit stays clear)
+                telegram_api::MyBoost {
+                    flags: 2,
+                    slot: 4,
+                    peer: None,
+                    date: 100,
+                    expires: 2_000_000_000,
+                    cooldown_until_date: 50,
+                },
+                // the expired slot drops (cpp:57-59)
+                telegram_api::MyBoost {
+                    flags: 3,
+                    slot: 5,
+                    peer: peer(700000002),
+                    date: 100,
+                    expires: 1,
+                    cooldown_until_date: 50,
+                },
+                // the invalid-peer slot drops (cpp:68-74)
+                telegram_api::MyBoost {
+                    flags: 1,
+                    slot: 6,
+                    peer: peer(0),
+                    date: 100,
+                    expires: 2_000_000_000,
+                    cooldown_until_date: 0,
+                },
+            ],
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn boost_my_boosts_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_my_boosts_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_my_boosts_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-my-boosts");
+
+        // 1. the live td_api arm rides the wire:
+        //    getAvailableChatBoostSlots sends premium.getMyBoosts
+        //    (BoostManager.cpp:100/416-419)
+        let id = 11;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        telegram_api::premium_getMyBoosts::parse(sent.query()).expect("the sent body");
+
+        // 2. the premium.myBoosts answer converts through
+        //    get_chat_boost_slots_object (cpp:47-93) and settles the
+        //    request promise
+        net_complete(sent, wire!(sample_my_boosts()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let slots = chat_boost_slots_of(&callback, id);
+        assert_eq!(slots.slots.len(), 2, "the expired + invalid slots drop");
+        assert_eq!(
+            (
+                slots.slots[0].slot_id,
+                slots.slots[0].currently_boosted_chat_id,
+                slots.slots[0].start_date,
+                slots.slots[0].expiration_date,
+                slots.slots[0].cooldown_until_date
+            ),
+            (3, 700000001, 100, 2_000_000_000, 50)
+        );
+        assert_eq!(
+            (
+                slots.slots[1].slot_id,
+                slots.slots[1].currently_boosted_chat_id,
+                slots.slots[1].start_date,
+                slots.slots[1].cooldown_until_date
+            ),
+            (4, 0, 0, 0)
+        );
+        assert!(
+            td.boost_net_completed.lock().is_empty(),
+            "the myBoosts answer drained"
+        );
+
+        // 3. the wire-error band forwards the status to the request
+        //    promise (cpp:115-118 — no dialog head on this family)
+        let id = 12;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        net_fail(sent, 420, "BOOSTS_FLOOD");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!((error.code, error.message.as_str()), (420, "BOOSTS_FLOOD"));
+
+        // 4. the parse-failure band answers the C++ 500
+        let id = 13;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the premium_getMyBoosts answer")
+        );
+
+        // 5. the net-inert posture parks the request promise without a
+        //    wire query (the pre-init windows)
+        td.boost_manager.net = None;
+        let id = 14;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getMyBoosts::ID,
+            "the net-inert getAvailableChatBoostSlots",
+        );
+        td.flush_deferred_results();
+        assert_eq!(
+            td.boost_manager.pending_get_my_boosts.len(),
+            1,
+            "the net-inert park"
+        );
+    }
+
+    fn sample_boosts_status() -> telegram_api::premium_BoostsStatus {
+        telegram_api::premium_BoostsStatus {
+            flags: 31, // next-level + audience + my-boost/slots + giveaways + gift-boosts
+            my_boost: true,
+            level: -3,
+            current_level_boosts: 5,
+            boosts: 3,
+            gift_boosts: 9,
+            next_level_boosts: 4,
+            premium_audience: Some(telegram_api::StatsPercentValue {
+                part: 2.5,
+                total: 10.0,
+            }),
+            boost_url: "https://t.me/boost/durov".to_string(),
+            prepaid_giveaways: vec![
+                telegram_api::PrepaidGiveaway::prepaidGiveaway(telegram_api::prepaidGiveaway {
+                    id: 1,
+                    months: 3,
+                    quantity: 10,
+                    date: 77,
+                }),
+                telegram_api::PrepaidGiveaway::prepaidStarsGiveaway(
+                    telegram_api::prepaidStarsGiveaway {
+                        id: 2,
+                        stars: 100,
+                        quantity: 5,
+                        boosts: 25,
+                        date: 88,
+                    },
+                ),
+            ],
+            my_boost_slots: vec![1, 2],
+        }
+    }
+
+    #[test]
+    fn boost_status_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_status_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_status_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-status");
+        // the self user id + record make the dialog-access gate pass and
+        // the read peer resolve to `inputPeerSelf` (the net-drain 47/66
+        // fixtures)
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "boost_status_family_rides_the_dispatcher",
+        );
+        let dialog_id =
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001));
+
+        // 1. the live td_api arm's dialog-access gate: an unknown chat
+        //    answers the C++ "Chat not found" band (DialogManager.cpp:
+        //    1350-1360 — the flow never sends)
+        let id = 21;
+        td.request(
+            id,
+            Function::getChatBoostStatus(td_api::getChatBoostStatus { chat_id: 700000002 }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsStatus::ID,
+            "the gated getChatBoostStatus",
+        );
+
+        // 2. the accessible dialog rides the wire: the resolved read peer
+        //    (BoostManager.cpp:128-133)
+        let id = 22;
+        td.request(
+            id,
+            Function::getChatBoostStatus(td_api::getChatBoostStatus {
+                chat_id: dialog_id.get(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsStatus::ID,
+        );
+        let body =
+            telegram_api::premium_getBoostsStatus::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+
+        // 3. the premium.boostsStatus answer converts through the
+        //    validation ladder + the audience/giveaway transforms
+        //    (cpp:135-191) and settles the request promise
+        net_complete(sent, wire!(sample_boosts_status()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let status = {
+            let Some(Object::chatBoostStatus(status)) =
+                responses_of(&callback, id).into_iter().next()
+            else {
+                panic!("expected a chatBoostStatus response for {id}");
+            };
+            status
+        };
+        assert_eq!(
+            (
+                status.boost_url.as_str(),
+                status.applied_slot_ids.clone(),
+                status.level,
+                status.current_level_boost_count,
+                status.boost_count,
+                status.next_level_boost_count,
+                status.premium_member_count,
+                status.gift_code_boost_count
+            ),
+            (
+                "https://t.me/boost/durov",
+                vec![1, 2],
+                0, // the negative level clamps (cpp:146-148)
+                5,
+                5, // boosts < current_level_boosts lifts to the level floor
+                6, // next_level <= boosts bumps to boosts + 1
+                2,
+                5, // the gift-count clamp to the boost count
+            )
+        );
+        assert_eq!(status.premium_member_percentage, 20.0);
+        assert_eq!(status.prepaid_giveaways.len(), 2);
+        assert_eq!(
+            (
+                status.prepaid_giveaways[0].id,
+                status.prepaid_giveaways[0].winner_count,
+                status.prepaid_giveaways[0].boost_count,
+                status.prepaid_giveaways[0].payment_date
+            ),
+            (1, 10, 0, 77)
+        );
+        assert!(matches!(
+            status.prepaid_giveaways[0].prize.as_ref(),
+            Some(td_api::GiveawayPrize::giveawayPrizePremium(prize)) if prize.month_count == 3
+        ));
+        assert!(matches!(
+            status.prepaid_giveaways[1].prize.as_ref(),
+            Some(td_api::GiveawayPrize::giveawayPrizeStars(prize)) if prize.star_count == 100
+        ));
+        assert_eq!(
+            (
+                status.prepaid_giveaways[1].id,
+                status.prepaid_giveaways[1].winner_count,
+                status.prepaid_giveaways[1].boost_count
+            ),
+            (2, 5, 25)
+        );
+        assert!(
+            td.boost_net_completed.lock().is_empty(),
+            "the answer drained"
+        );
+
+        // 4. the wire-error band runs the on_error tail: the
+        //    dialog-error head then the promise error (cpp:193-196)
+        let id = 23;
+        td.request(
+            id,
+            Function::getChatBoostStatus(td_api::getChatBoostStatus { chat_id: 700000001 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsStatus::ID,
+        );
+        net_fail(sent, 400, "USER_BANNED_IN_CHANNEL");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "USER_BANNED_IN_CHANNEL")
+        );
+
+        // 5. the parse-failure band answers the C++ 500
+        let id = 24;
+        td.request(
+            id,
+            Function::getChatBoostStatus(td_api::getChatBoostStatus { chat_id: 700000001 }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsStatus::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the premium_getBoostsStatus answer")
+        );
+
+        // 6. the net-inert posture parks the request promise without a
+        //    wire query
+        td.boost_manager.net = None;
+        let id = 25;
+        td.request(
+            id,
+            Function::getChatBoostStatus(td_api::getChatBoostStatus { chat_id: 700000001 }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsStatus::ID,
+            "the net-inert getChatBoostStatus",
+        );
+        assert_eq!(
+            td.boost_manager.pending_get_boosts_status.len(),
+            1,
+            "the net-inert park"
+        );
+    }
+
+    #[test]
+    fn boost_apply_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_apply_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_apply_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-apply");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "boost_apply_family_rides_the_dispatcher",
+        );
+
+        // 1. the live td_api arm's gate: an unknown chat answers the
+        //    "Chat not found" band (cpp:429 — the TRY_STATUS_PROMISE)
+        let id = 31;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000002,
+                slot_ids: vec![1],
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_applyBoost::ID,
+            "the gated boostChat",
+        );
+
+        // 2. the empty slot list redirects to the slots family
+        //    (cpp:431-432) — the wire query is premium.getMyBoosts
+        let id = 32;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: Vec::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        net_complete(sent, wire!(sample_my_boosts()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        assert_eq!(chat_boost_slots_of(&callback, id).slots.len(), 2);
+
+        // 3. the slot list rides the wire: the SLOTS flag bit, the slot
+        //    ids and the resolved read peer (cpp:237-247)
+        let id = 33;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: vec![2, 4],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_applyBoost::ID,
+        );
+        let body = telegram_api::premium_applyBoost::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags & 1, 1, "the SLOTS_MASK flag");
+        assert_eq!(body.slots, vec![2, 4]);
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+
+        // 4. the premium.myBoosts answer converts through the shared
+        //    slots intake (cpp:249-258) and settles the request promise
+        net_complete(sent, wire!(sample_my_boosts()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let slots = chat_boost_slots_of(&callback, id);
+        assert_eq!(slots.slots.len(), 2);
+        assert_eq!(
+            td.boost_manager.pending_apply_boost.len(),
+            0,
+            "the apply promise drained"
+        );
+
+        // 5. the wire-error band runs the on_error tail: the
+        //    dialog-error head then the promise error (cpp:260-261)
+        let id = 34;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: vec![1],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_applyBoost::ID,
+        );
+        net_fail(sent, 400, "SLOT_ALREADY_BOOSTED");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "SLOT_ALREADY_BOOSTED")
+        );
+
+        // 6. the net-inert posture parks the request promise without a
+        //    wire query
+        td.boost_manager.net = None;
+        let id = 35;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: vec![1],
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_applyBoost::ID,
+            "the net-inert boostChat",
+        );
+        assert_eq!(
+            td.boost_manager.pending_apply_boost.len(),
+            1,
+            "the net-inert park"
+        );
+    }
+
+    fn sample_boosts_list() -> telegram_api::premium_BoostsList {
+        telegram_api::premium_BoostsList {
+            flags: 1, // the next-offset bit
+            count: 5,
+            boosts: vec![
+                // the premium source (cpp:64-70)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5, // user_id + slug + multiplier
+                    gift: false,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "a".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: -3,
+                    expires: 2_000_000_000,
+                    used_gift_slug: String::new(),
+                    multiplier: 3,
+                    stars: 0,
+                },
+                // the gift-code source (cpp:55-62)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5,
+                    gift: true,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "b".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 2_000_000_000,
+                    used_gift_slug: "slug-b".to_string(),
+                    multiplier: 0, // clamps to 1 (cpp:72)
+                    stars: 0,
+                },
+                // the unclaimed giveaway: the user id zeroes and the
+                // invalid message id floors to MessageId::min (cpp:41-53)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 6,
+                    gift: false,
+                    giveaway: true,
+                    unclaimed: true,
+                    id: "c".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 2_000_000_000,
+                    used_gift_slug: String::new(),
+                    multiplier: 2,
+                    stars: 250,
+                },
+                // the invalid gift-code user drops the boost (cpp:57-60)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5,
+                    gift: true,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "d".to_string(),
+                    user_id: 0,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 2_000_000_000,
+                    used_gift_slug: String::new(),
+                    multiplier: 1,
+                    stars: 0,
+                },
+                // the expired boost drops (cpp:295-298)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5,
+                    gift: false,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "e".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 1,
+                    used_gift_slug: String::new(),
+                    multiplier: 1,
+                    stars: 0,
+                },
+            ],
+            next_offset: "next".to_string(),
+            users: vec![telegram_api::User::userEmpty(telegram_api::userEmpty {
+                id: 9,
+            })],
+        }
+    }
+
+    #[test]
+    fn boost_list_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_list_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_list_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-list");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "boost_list_family_rides_the_dispatcher",
+        );
+
+        // 1. the live td_api arm's gate: an unknown chat answers the
+        //    "Chat not found" band (cpp:483)
+        let id = 41;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000002,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsList::ID,
+            "the gated getChatBoosts",
+        );
+
+        // 2. the limit band answers inline after the gate (cpp:484-486)
+        let id = 42;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Parameter limit must be positive")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsList::ID,
+            "the limit band sends nothing",
+        );
+
+        // 3. the family rides the wire: the gifts flag bit, the offset,
+        //    the limit and the resolved read peer (cpp:272-281)
+        let id = 43;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: true,
+                offset: "off".to_string(),
+                limit: 42,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsList::ID,
+        );
+        let body = telegram_api::premium_getBoostsList::parse(sent.query()).expect("the sent body");
+        assert!(body.gifts);
+        assert_eq!((body.offset.as_str(), body.limit), ("off", 42));
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+
+        // 4. the premium.boostsList answer converts (cpp:283-307) and
+        //    settles the request promise
+        net_complete(sent, wire!(sample_boosts_list()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let found = {
+            let Some(Object::foundChatBoosts(found)) =
+                responses_of(&callback, id).into_iter().next()
+            else {
+                panic!("expected a foundChatBoosts response for {id}");
+            };
+            found
+        };
+        assert_eq!((found.total_count, found.next_offset.as_str()), (5, "next"));
+        assert_eq!(found.boosts.len(), 3, "the invalid + expired drop");
+        // the premium source: the multiplier rides, the negative date
+        // passes through (only the expiry clamps, cpp:71-73)
+        assert_eq!(
+            (
+                found.boosts[0].id.as_str(),
+                found.boosts[0].count,
+                found.boosts[0].start_date,
+                found.boosts[0].expiration_date
+            ),
+            ("a", 3, -3, 2_000_000_000)
+        );
+        assert!(matches!(
+            found.boosts[0].source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourcePremium(source)) if source.user_id == 9
+        ));
+        // the gift-code source: the zero multiplier clamps to 1
+        assert_eq!(
+            (found.boosts[1].id.as_str(), found.boosts[1].count),
+            ("b", 1)
+        );
+        assert!(matches!(
+            found.boosts[1].source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiftCode(source)) if
+                (source.user_id, source.gift_code.as_str()) == (9, "slug-b")
+        ));
+        // the unclaimed giveaway: the user id zeroes, the star count
+        // rides and the invalid message id floors to MessageId::min
+        assert!(matches!(
+            found.boosts[2].source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiveaway(source)) if
+                (source.user_id, source.giveaway_message_id, source.star_count, source.is_unclaimed) == (0, 1, 250, true)
+        ));
+        assert!(
+            td.boost_net_completed.lock().is_empty(),
+            "the answer drained"
+        );
+
+        // 5. the wire-error band runs the on_error tail (cpp:304-307)
+        let id = 44;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsList::ID,
+        );
+        net_fail(sent, 420, "BOOSTS_LIST_FLOOD");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "BOOSTS_LIST_FLOOD")
+        );
+
+        // 6. the parse-failure band answers the C++ 500
+        let id = 45;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsList::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the premium_getBoostsList answer")
+        );
+
+        // 7. the net-inert posture parks the request promise without a
+        //    wire query
+        td.boost_manager.net = None;
+        let id = 46;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsList::ID,
+            "the net-inert getChatBoosts",
+        );
+        assert_eq!(
+            td.boost_manager.pending_get_boosts_list.len(),
+            1,
+            "the net-inert park"
+        );
+    }
+
+    #[test]
+    fn boost_user_boosts_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_user_boosts_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_user_boosts_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-user");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "boost_user_boosts_family_rides_the_dispatcher",
+        );
+
+        // 1. the live td_api arm is bot-only (Requests.cpp:6065 — the
+        //    CHECK_IS_BOT band); the user session answers inline
+        let id = 51;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000001,
+                user_id: 9,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Only bots can use the method")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getUserBoosts::ID,
+            "the user-session getUserChatBoosts",
+        );
+
+        // the bot session from here (the C++ posture of the family)
+        td.auth_manager.force_bot_for_test();
+
+        // 2. the dialog-access gate band (cpp:493-494)
+        let id = 52;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000002,
+                user_id: 9,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+
+        // 3. the invalid-user band answers inline (cpp:495-498)
+        let id = 53;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000001,
+                user_id: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "User not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getUserBoosts::ID,
+            "the invalid-user band sends nothing",
+        );
+
+        // 4. the family rides the wire: the resolved read peer and the
+        //    input user (cpp:317-326) — the bot session resolves the
+        //    unknown user over the zero access hash
+        let id = 54;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000001,
+                user_id: 9,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getUserBoosts::ID,
+        );
+        let body = telegram_api::premium_getUserBoosts::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 0)
+        ));
+
+        // 5. the premium.boostsList answer converts through the shared
+        //    list intake (cpp:328-355) and settles the request promise
+        net_complete(sent, wire!(sample_boosts_list()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let found = {
+            let Some(Object::foundChatBoosts(found)) =
+                responses_of(&callback, id).into_iter().next()
+            else {
+                panic!("expected a foundChatBoosts response for {id}");
+            };
+            found
+        };
+        assert_eq!(found.boosts.len(), 3, "the invalid + expired drop");
+        assert_eq!(found.total_count, 5);
+        assert!(
+            td.boost_net_completed.lock().is_empty(),
+            "the answer drained"
+        );
+
+        // 6. the wire-error band runs the on_error tail (cpp:352-355)
+        let id = 55;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000001,
+                user_id: 9,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getUserBoosts::ID,
+        );
+        net_fail(sent, 400, "USER_INVALID");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!((error.code, error.message.as_str()), (400, "USER_INVALID"));
+
+        // 7. the parse-failure band answers the C++ 500
+        let id = 56;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000001,
+                user_id: 9,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getUserBoosts::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the premium_getUserBoosts answer")
+        );
+
+        // 8. the net-inert posture parks the request promise without a
+        //    wire query
+        td.boost_manager.net = None;
+        let id = 57;
+        td.request(
+            id,
+            Function::getUserChatBoosts(td_api::getUserChatBoosts {
+                chat_id: 700000001,
+                user_id: 9,
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getUserBoosts::ID,
+            "the net-inert getUserChatBoosts",
+        );
+        assert_eq!(
+            td.boost_manager.pending_get_user_boosts.len(),
+            1,
+            "the net-inert park"
+        );
     }
 }

@@ -11,9 +11,13 @@
 //! (the wire intake), the object builders (`get_message_reaction(s)_object`,
 //! `get_unread_reaction_object`, `get_paid_reactor_object`),
 //! `add_min_channels`/`add_dependencies`, `send_paid_message_reaction` and
-//! `set_paid_message_reaction_type` (their net tails are
-//! `[blocked: net]`). Everything locally observable — the mutation
-//! machine, the consistency checks and the db record — is here.
+//! `set_paid_message_reaction_type` (the paid-reaction sends ride the
+//! MessagesManager plane, [blocked: M.10]). Everything locally
+//! observable — the mutation machine, the consistency checks and the
+//! db record — is here. The two query families
+//! (`messages.getMessageReactionsList`/
+//! `messages.reportReaction`, MessageReaction.cpp:211-341) ride the
+//! net-drain 61 `ReactionNetKind` plane over the env-carried handle.
 
 use crate::chat_manager::{ChannelId, MinChannel};
 use crate::dialog_id::DialogId;
@@ -23,6 +27,52 @@ use crate::reaction_type::ReactionType;
 use crate::store_parse::{Parser, store_flags, store_i32};
 use crate::td_api;
 use std::collections::HashMap;
+
+/// The in-flight query kinds of the net-drain 61 message-reaction
+/// families — the C++ `Td::ResultHandler` query classes
+/// (MessageReaction.cpp:211-341) collapsed onto dispatcher tags; the
+/// answers drain through [`crate::td::Td::on_reaction_net_answer`]
+/// over the env-carried [`crate::td::ReactionNetHandle`] (the
+/// `PollNetHandle` shape — the send legs run inside the env send
+/// arms over the split borrows' peer reads). The kinds carry the
+/// handlers' `dialog_id_` members (the `on_error` dialog heads); the
+/// non-Copy `reaction_type_`/`offset_` handler members park in the
+/// family lots alongside the promises (§5's FIFO shape — an
+/// out-of-order answer pairs with its own query).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReactionNetKind {
+    /// `GetMessageReactionsListQuery` (MessageReaction.cpp:211-303) —
+    /// `messages.getMessageReactionsList`; the kind carries the
+    /// handler's `dialog_id_` for the `on_error` head (cpp:302-304),
+    /// the `message_id_`/`reaction_type_`/`offset_` members park in
+    /// the family lot.
+    GetMessageReactionsList { dialog_id: DialogId },
+    /// `ReportReactionQuery` (MessageReaction.cpp:305-341) —
+    /// `messages.reportReaction`.
+    ReportReaction { dialog_id: DialogId },
+}
+
+/// The parked `GetMessageReactionsListQuery` — the C++ handler's
+/// non-Copy members (`reaction_type_`/`offset_`, cpp:213-217) + the
+/// `promise_` the answer settles (§5's FIFO-per-family shape).
+pub(crate) struct PendingReactionListQuery {
+    pub(crate) dialog_id: DialogId,
+    pub(crate) message_id: crate::messages_manager::MessageId,
+    pub(crate) reaction_type: ReactionType,
+    pub(crate) offset: String,
+    pub(crate) promise: tdutils::promise::Promise<td_api::AddedReactions>,
+}
+
+/// The parked message-reaction queries (the net-drain 61 families):
+/// the C++ handlers own their promises; the port parks them at the
+/// Td-side lots until the matching `ReactionNetKind` answer drains.
+#[derive(Default)]
+pub(crate) struct PendingReactionQueries {
+    /// The parked `messages.getMessageReactionsList` queries.
+    pub(crate) list: Vec<PendingReactionListQuery>,
+    /// The parked `messages.reportReaction` promises.
+    pub(crate) report: Vec<tdutils::promise::Promise<()>>,
+}
 
 /// `MessageReaction::MAX_CHOOSE_COUNT` (MessageReaction.h:34).
 pub const MAX_CHOOSE_COUNT: i32 = 2147483640;
@@ -1247,9 +1297,12 @@ pub trait MessageReactionQueryEnv {
         access_rights: crate::user_manager::AccessRights,
     ) -> bool;
 
-    // -- the net query seams ([blocked: net]); each one drops the
-    // -- promise, which keeps the C++ request unanswered offline
-    /// `GetMessageReactionsListQuery` (MessageReaction.cpp:69-99).
+    // -- the net query seams (the net-drain 61 plane rides the live td.rs
+    // -- overrides; the defaults keep the offline unit-test posture —
+    // -- each one drops the promise, which keeps the C++ request
+    // -- unanswered offline)
+    /// `GetMessageReactionsListQuery` (MessageReaction.cpp:69-99 →
+    /// 211-303): `messages.getMessageReactionsList`.
     fn send_get_message_reactions_list(
         &mut self,
         dialog_id: DialogId,

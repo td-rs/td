@@ -579,8 +579,12 @@ impl OptionManager {
                 Self::get_option_value_object(&self.get_option(name))
             }
             "disable_contact_registered_notifications" => {
-                // NotificationManager — TODO (Wave 1).
-                OptionValue::optionValueEmpty(td_api::optionValueEmpty)
+                // The NotificationManager getOption routes through the
+                // contact-sign-up wire family at the `requests` dispatch
+                // (the net-drain 61 slice, OptionManager.cpp:775-782);
+                // the value itself is the plain store read (the wrap_promise
+                // re-read)
+                Self::get_option_value_object(&self.get_option(name))
             }
             "online" => {
                 // OnlineManager::is_online — TODO (Wave 1).

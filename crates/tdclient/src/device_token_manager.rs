@@ -4,9 +4,10 @@
 //! The C++ actor collapses into a plain struct owned by
 //! [`Td`](crate::td::Td): `start_up` becomes the explicit
 //! [`load_states`](DeviceTokenManager::load_states) call, the net query
-//! dispatch in `loop` is a `[blocked: net]` seam that marks the token
-//! in-flight (the `u64::MAX` sentinel net-query id), and `on_result` is
-//! driven by the net step once it lands. The `sync_cnt`/`force_sync`
+//! dispatch in `loop` rides the `DeviceTokenNetKind` plane (the
+//! manager-held handle; the answers drain through
+//! [`Td::on_device_token_net_answer`](crate::td::Td) into the landed
+//! `on_register_device_result` intake) and the `sync_cnt`/`force_sync`
 //! promise hop collapses into the synchronous pmc write (the gate only
 //! matters once `loop` really sends).
 
@@ -18,6 +19,22 @@ use tdmtproto::dh_handshake::DhHandshake;
 use tdutils::promise::Promise;
 use tdutils::random::secure_bytes;
 use tdutils::status::Status;
+
+/// The in-flight query kind of the net-drain 61 device-token family —
+/// the C++ `account_registerDevice`/`account_unregisterDevice` loop
+/// sends (DeviceTokenManager.cpp:384-410) collapsed onto a dispatcher
+/// tag; the answer drains through
+/// `Td::on_device_token_net_answer` into the landed
+/// [`DeviceTokenManager::on_register_device_result`] intake. The kind
+/// carries the C++ actor link token (`token_type`, the per-query
+/// `get_link_token()` hop) and the query id the in-flight guard
+/// compares (the C++ `net_query->id()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceTokenNetKind {
+    /// The register/unregister pair over one token slot (cpp:384-410);
+    /// both wire forms answer `Bool` and the intake reads the state.
+    SyncDeviceToken { token_type: i32, net_query_id: u64 },
+}
 
 /// The `TokenType` enum (DeviceTokenManager.h:23-38) — the pmc keys and
 /// the wire enum value share the numbering; index 0 stays unused so the
@@ -221,6 +238,13 @@ pub trait DeviceTokenManagerEnv: NotificationManagerEnv {
 
     /// `G()->td_db()->get_binlog_pmc()->set` for the binary token blobs.
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]);
+
+    /// `G()->is_expected_error` (the on_result error band,
+    /// DeviceTokenManager.cpp:441) — the flood-wait family arms the
+    /// Reregister retry delay.
+    fn is_expected_error(&self, _status: &Status) -> bool {
+        false
+    }
 }
 
 /// The collapsed manager state.
@@ -229,6 +253,13 @@ pub struct DeviceTokenManager {
     /// The `set_timeout_in(clamp(retry_after, 1, 3600))` Reregister retry
     /// (DeviceTokenManager.cpp:457) — a single slot, monotonic seconds.
     retry_deadline: Option<f64>,
+    /// The net-drain 61 dispatch surface (the query send legs); `None`
+    /// keeps the net-inert posture.
+    pub(crate) net: Option<crate::td::DeviceTokenNetHandle>,
+    /// The net-query id counter (the C++ `net_query->id()` stand-in —
+    /// each send gets a fresh id so the in-flight guard drops stale
+    /// answers).
+    next_net_query_id: u64,
 }
 
 impl Default for DeviceTokenManager {
@@ -236,6 +267,8 @@ impl Default for DeviceTokenManager {
         DeviceTokenManager {
             tokens: (0..TOKEN_TYPE_SIZE).map(|_| TokenInfo::default()).collect(),
             retry_deadline: None,
+            net: None,
+            next_net_query_id: 1,
         }
     }
 }
@@ -519,8 +552,11 @@ impl DeviceTokenManager {
         result
     }
 
-    /// `loop` (DeviceTokenManager.cpp:384-410) — the dispatch is the net
-    /// seam: an in-flight mark (`u64::MAX`) stands in for the sent query.
+    /// `loop` (DeviceTokenManager.cpp:384-410) — the net-drain 61 send
+    /// leg: each non-Sync idle token sends its register/unregister wire
+    /// query over the manager-held handle; the answer drains through
+    /// `Td::on_device_token_net_answer`. `None` keeps the net-inert
+    /// posture (the promise parks like the C++ offline).
     pub fn loop_(&mut self, env: &mut impl DeviceTokenManagerEnv) {
         if env.close_flag() {
             return;
@@ -531,9 +567,51 @@ impl DeviceTokenManager {
                 continue;
             }
             // have to send query — account_registerDevice/account_unregisterDevice
-            tdutils::log_info!("Device token {token_type} sync query — [blocked: net]");
+            let net_query_id = self.next_net_query_id;
+            self.next_net_query_id += 1;
             let info = &mut self.tokens[token_type];
-            info.net_query_id = u64::MAX;
+            let kind = DeviceTokenNetKind::SyncDeviceToken {
+                token_type: token_type as i32,
+                net_query_id,
+            };
+            match self.net.clone() {
+                Some(net) => {
+                    // `account_registerDevice(0, no_muted=true, ...)` /
+                    // `account_unregisterDevice(...)` (cpp:396-405)
+                    let function = if info.state == TokenState::Unregister {
+                        tdmtproto::telegram_api::Function::account_unregisterDevice(
+                            tdmtproto::telegram_api::account_unregisterDevice {
+                                token_type: token_type as i32,
+                                token: info.token.clone(),
+                                other_uids: info.other_user_ids.clone(),
+                            },
+                        )
+                    } else {
+                        tdmtproto::telegram_api::Function::account_registerDevice(
+                            tdmtproto::telegram_api::account_registerDevice {
+                                flags: 0,
+                                no_muted: true,
+                                token_type: token_type as i32,
+                                token: info.token.clone(),
+                                app_sandbox: info.is_app_sandbox,
+                                secret: info.encryption_key.clone(),
+                                other_uids: info.other_user_ids.clone(),
+                            },
+                        )
+                    };
+                    info.net_query_id = net_query_id;
+                    net.dispatch(kind, function);
+                }
+                None => {
+                    // the in-flight mark still lands (the C++ loop marks
+                    // before the send); without a dispatcher nothing
+                    // ever answers it — the parked posture
+                    info.net_query_id = net_query_id;
+                    tdutils::log_info!(
+                        "Send account.{{un,}}registerDevice — [net-inert] (token {token_type})"
+                    );
+                }
+            }
         }
     }
 
@@ -572,13 +650,20 @@ impl DeviceTokenManager {
         } else {
             match &r_flag {
                 Err(error) => {
-                    // `Global::get_retry_after` rides the net step; until
-                    // then no retry delay is known
-                    retry_after = 0;
+                    // `G()->is_expected_error` + `Global::get_retry_after`
+                    // (cpp:440-447) — the flood-wait band arms the
+                    // Reregister retry delay
+                    if !env.is_expected_error(error) {
+                        tdutils::log_error!("Failed to {:?} device: {}", info.state, error);
+                    } else {
+                        retry_after = crate::transcription_manager::get_retry_after(
+                            error.code(),
+                            error.message(),
+                        ) as i64;
+                    }
                     if let Some(mut promise) = info.promise.take() {
                         promise.set_error(error.clone());
                     }
-                    let _ = error;
                 }
                 Ok(false) => {
                     if let Some(mut promise) = info.promise.take() {
@@ -822,9 +907,8 @@ mod tests {
         assert_eq!(info.token, "tok1");
         assert_eq!(info.other_user_ids, vec![7, 8]);
         assert_eq!(
-            info.net_query_id,
-            u64::MAX,
-            "the seam marks the query in flight"
+            info.net_query_id, 1,
+            "the loop marks the query in flight (the fresh id)"
         );
         // the pmc blob is stored with the '*' prefix and parses back
         let stored = env.pmc.get(&b"device_token1"[..]).expect("persisted");
@@ -856,7 +940,8 @@ mod tests {
         // fast path answering my_id
         let (promise, captured) = capturing_promise();
         manager.register_device(&mut env, apns_token("tok"), &[], promise);
-        manager.on_register_device_result(&mut env, 1, u64::MAX, Ok(true));
+        let stamped = manager.tokens[1].net_query_id;
+        manager.on_register_device_result(&mut env, 1, stamped, Ok(true));
         assert_eq!(
             captured
                 .lock()
@@ -909,18 +994,19 @@ mod tests {
         // Register + error -> Unregister
         let (promise, _captured) = capturing_promise();
         manager.register_device(&mut env, apns_token("tok"), &[], promise);
+        let stamped = manager.tokens[1].net_query_id;
         manager.on_register_device_result(
             &mut env,
             1,
-            u64::MAX,
+            stamped,
             Err(Status::error(400, "FLOOD_WAIT_1")),
         );
         assert_eq!(manager.tokens[1].state, TokenState::Unregister);
         assert_eq!(manager.tokens[1].token, "tok");
 
         // Unregister + error -> Sync with a cleared token
-        manager.tokens[1].net_query_id = u64::MAX;
-        manager.on_register_device_result(&mut env, 1, u64::MAX, Err(Status::error(400, "oops")));
+        manager.tokens[1].net_query_id = stamped;
+        manager.on_register_device_result(&mut env, 1, stamped, Err(Status::error(400, "oops")));
         assert_eq!(manager.tokens[1].state, TokenState::Sync);
         assert_eq!(manager.tokens[1].token, "");
         assert!(
@@ -933,8 +1019,8 @@ mod tests {
         manager.tokens[2].state = TokenState::Reregister;
         manager.tokens[2].token = "rt".to_owned();
         manager.loop_(&mut env);
-        assert_eq!(manager.tokens[2].net_query_id, u64::MAX);
-        manager.on_register_device_result(&mut env, 2, u64::MAX, Err(Status::error(500, "down")));
+        let stamped2 = manager.tokens[2].net_query_id;
+        manager.on_register_device_result(&mut env, 2, stamped2, Err(Status::error(500, "down")));
         assert_eq!(manager.tokens[2].state, TokenState::Reregister);
         assert_eq!(manager.next_deadline(), Some(1.0));
 
@@ -971,7 +1057,8 @@ mod tests {
         // the ack answers with the encryption key id, and the key round-trips
         let key = info.encryption_key.clone();
         let key_id = info.encryption_key_id;
-        manager.on_register_device_result(&mut env, 2, u64::MAX, Ok(true));
+        let stamped2 = manager.tokens[2].net_query_id;
+        manager.on_register_device_result(&mut env, 2, stamped2, Ok(true));
         assert_eq!(
             captured
                 .lock()

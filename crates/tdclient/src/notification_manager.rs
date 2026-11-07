@@ -12,9 +12,13 @@
 //!   the media managers). The default answers mirror the C++ "not loaded"
 //!   results.
 //! - The contact-registered sync (`run_contact_registered_notifications_sync`,
-//!   cpp:2693) is `[blocked: net]`: the state loads from the pmc, but the
-//!   `account.getContactSignUpNotification` query cannot run until the net
-//!   step; the sync trigger is logged and skipped.
+//!   cpp:2693) rides the `NotificationNetKind` plane (net-drain 61): the
+//!   `account.{get,set}ContactSignUpNotification` queries dispatch over
+//!   the manager-held handle and the answers drain through
+//!   `Td::on_notification_net_answer` into the landed sync state machine.
+//! - The push decrypt/run plane (`process_push_notification`, cpp:2146-2166)
+//!   stays a parked seam — the C++ tail is the local decrypt +
+//!   `process_push_notification_payload` value plane, not a wire family.
 //! - The StateManager online callback (cpp:301-314) is dropped until the
 //!   StateManager lands; `flush_all_pending_notifications` is the flip
 //!   target.
@@ -41,6 +45,24 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+
+/// The in-flight query kinds of the net-drain 61 contact-sign-up
+/// families — the C++ `SetContactSignUpNotificationQuery`/
+/// `GetContactSignUpNotificationQuery` (NotificationManager.cpp:73-127)
+/// collapsed onto dispatcher tags; the answers drain through
+/// `Td::on_notification_net_answer`. The set kind carries the promise
+/// lambda's send-time `is_disabled` capture (cpp:2708-2710) for the
+/// `on_contact_registered_notifications_sync` routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationNetKind {
+    /// `SetContactSignUpNotificationQuery` (cpp:73-99) — any ok answer
+    /// (Bool true or false) completes the sync; the capture routes the
+    /// answer walk.
+    SetContactSignUpNotification { is_disabled: bool },
+    /// `GetContactSignUpNotificationQuery` (cpp:101-127) — the Bool
+    /// answer feeds `on_get_disable_contact_registered_notifications`.
+    GetContactSignUpNotification,
+}
 
 use crate::message_id::{DialogId, DialogType, MessageId};
 use crate::notification::{
@@ -105,10 +127,22 @@ pub trait NotificationManagerEnv: NotificationTypeEnv {
     fn is_disabled(&self) -> bool;
 
     /// `DeviceTokenManager::get_actor_unsafe()->get_encryption_keys()` +
-    /// the push decrypt/run plane (cpp:2146-2166) — `[blocked: net]`.
+    /// the push decrypt/run plane (cpp:2146-2166) — `[blocked:
+    /// push-plane]`: the C++ tail is the local decrypt +
+    /// `process_push_notification_payload` value plane (no wire query);
+    /// the seam parks the promise until that plane lands.
     fn send_process_push_notification_query(&mut self, _receiver_id: i64) {
-        tdutils::log_info!("Process the push decrypt/run plane — [blocked: net]");
+        tdutils::log_info!("Process the push decrypt/run plane — [blocked: push-plane]");
     }
+
+    /// `td_->option_manager_->set_option_boolean` — the
+    /// `disable_contact_registered_notifications` write
+    /// (NotificationManager.cpp:2673).
+    fn set_contact_option_boolean(&mut self, _name: &str, _value: bool) {}
+
+    /// `td_->option_manager_->set_option_empty` — the
+    /// `disable_contact_registered_notifications` clear (cpp:2675).
+    fn set_contact_option_empty(&mut self, _name: &str) {}
 
     /// `G()->close_flag()` — used separately from [`Self::is_disabled`].
     fn close_flag(&self) -> bool;
@@ -351,6 +385,18 @@ pub struct NotificationManager {
     pub active_call_notifications: HashMap<DialogId, Vec<ActiveCallNotification>>,
 
     pub announcement_id_date: HashMap<i32, i32>,
+
+    /// The manager-held dispatch surface (the net-drain 61
+    /// contact-sign-up families; `UserManager::net` shape) — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) net: Option<crate::td::NotificationNetHandle>,
+    /// The parked `getOption(disable_contact_registered_notifications)`
+    /// requests (the C++ `get_disable_contact_registered_notifications`
+    /// parks the wrap_promise'd td_api promise, cpp:2729-2744; the port's
+    /// request plumbing is the id) — FIFO-paired with the
+    /// `GetContactSignUpNotification` answers.
+    pub(crate) pending_contact_sign_up_get_options: Vec<u64>,
 }
 
 impl Default for NotificationManager {
@@ -391,6 +437,8 @@ impl Default for NotificationManager {
             parked_process_push_promises: Vec::new(),
             active_call_notifications: HashMap::new(),
             announcement_id_date: HashMap::new(),
+            net: None,
+            pending_contact_sign_up_get_options: Vec::new(),
         }
     }
 }
@@ -404,7 +452,8 @@ impl NotificationManager {
     /// `NotificationManager::process_push_notification`
     /// (NotificationManager.cpp:2124-2160) — the disabled/"{}" band and
     /// the push-receiver-id parse are real; the encryption-key
-    /// decrypt/run plane is the `[blocked: net]` seam and the promise
+    /// decrypt/run plane is the `[blocked: push-plane]` seam (the local
+    /// decrypt + payload value plane, no wire query) and the promise
     /// parks (the wrapping lambda's error-200 mapping inlines to the OK
     /// answer here).
     pub fn process_push_notification(
@@ -1357,8 +1406,9 @@ impl NotificationManager {
     }
 
     /// `NotificationManager::set_contact_registered_notifications_sync_state`
-    /// (cpp:2681-2691) — the pmc write is real; the query that drives the
-    /// state machine is `[blocked: net]`.
+    /// (cpp:2681-2691) — the pmc write is real; the query that drives
+    /// the state machine rides the `NotificationNetKind` plane
+    /// (net-drain 61).
     pub fn set_contact_registered_notifications_sync_state(
         &mut self,
         env: &mut impl NotificationManagerEnv,
@@ -1383,19 +1433,134 @@ impl NotificationManager {
         env.pmc_set(CONTACT_REGISTERED_SYNC_KEY, &value);
     }
 
-    /// `NotificationManager::run_contact_registered_notifications_sync`
-    /// (cpp:2693-2714) — `[blocked: net]`: the
-    /// `account.getContactSignUpNotification` query needs the session layer.
-    /// The state stays as loaded until the net step flips this seam.
+    /// `run_contact_registered_notifications_sync`
+    /// (cpp:2693-2714) — the net-drain 61 send leg: the
+    /// `account.setContactSignUpNotification` query rides the
+    /// `NotificationNetKind` plane; the answer walks
+    /// `on_contact_registered_notifications_sync` (the promise lambda's
+    /// send-time capture rides the kind).
     pub fn run_contact_registered_notifications_sync(
         &mut self,
-        _env: &mut impl NotificationManagerEnv,
+        env: &mut impl NotificationManagerEnv,
     ) {
-        tdutils::log_error!(
-            "Skipping contact registered notifications sync — [blocked: net] (state {:?}, disabled {})",
-            self.contact_registered_notifications_sync_state,
-            self.disable_contact_registered_notifications
+        if env.is_disabled() {
+            return;
+        }
+
+        let is_disabled = self.disable_contact_registered_notifications;
+        if self.contact_registered_notifications_sync_state == SyncState::NotSynced && !is_disabled
+        {
+            self.set_contact_registered_notifications_sync_state(env, SyncState::Completed);
+            return;
+        }
+        if self.contact_registered_notifications_sync_state != SyncState::Pending {
+            self.set_contact_registered_notifications_sync_state(env, SyncState::Pending);
+        }
+
+        tdutils::log_info!("Send SetContactSignUpNotificationQuery with {is_disabled}");
+        self.send_notification_net_query(
+            NotificationNetKind::SetContactSignUpNotification { is_disabled },
+            tdmtproto::telegram_api::Function::account_setContactSignUpNotification(
+                tdmtproto::telegram_api::account_setContactSignUpNotification {
+                    silent: is_disabled,
+                },
+            ),
+            "account.setContactSignUpNotification",
         );
+    }
+
+    /// `on_contact_registered_notifications_sync` (cpp:2716-2724) — the
+    /// set-answer walk: a changed flag re-runs the sync, an ok marks
+    /// Completed, an error resends forever.
+    pub fn on_contact_registered_notifications_sync(
+        &mut self,
+        env: &mut impl NotificationManagerEnv,
+        is_disabled: bool,
+        result: Result<(), Status>,
+    ) {
+        debug_assert_eq!(
+            self.contact_registered_notifications_sync_state,
+            SyncState::Pending,
+            "the C++ CHECK(state == Pending)"
+        );
+        if is_disabled != self.disable_contact_registered_notifications {
+            return self.run_contact_registered_notifications_sync(env);
+        }
+        match result {
+            // everything is synchronized
+            Ok(()) => {
+                self.set_contact_registered_notifications_sync_state(env, SyncState::Completed)
+            }
+            // let's resend the query forever
+            Err(_) => self.run_contact_registered_notifications_sync(env),
+        }
+    }
+
+    /// `get_disable_contact_registered_notifications`
+    /// (cpp:2729-2744) — the option getter half over the
+    /// `GetContactSignUpNotificationQuery` family; the request parks
+    /// FIFO until the Bool answer lands. The disabled band answers
+    /// inline at the caller (the C++ `promise.set_value(Unit())`,
+    /// cpp:2731-2733) — nothing parks.
+    pub fn get_disable_contact_registered_notifications(
+        &mut self,
+        env: &mut impl NotificationManagerEnv,
+        request_id: u64,
+    ) {
+        if env.is_disabled() {
+            return;
+        }
+        self.pending_contact_sign_up_get_options.push(request_id);
+        self.send_notification_net_query(
+            NotificationNetKind::GetContactSignUpNotification,
+            tdmtproto::telegram_api::Function::account_getContactSignUpNotification(
+                tdmtproto::telegram_api::account_getContactSignUpNotification {},
+            ),
+            "account.getContactSignUpNotification",
+        );
+    }
+
+    /// `on_get_disable_contact_registered_notifications`
+    /// (cpp:2667-2678) — the Bool answer walk: an unchanged flag or a
+    /// closing client answers immediately, otherwise the flag flips and
+    /// the option store write lands; the caller answers the parked
+    /// request with the re-read value (the C++ wrap_promise,
+    /// OptionManager.cpp:761-766).
+    pub fn on_get_disable_contact_registered_notifications(
+        &mut self,
+        env: &mut impl NotificationManagerEnv,
+        is_disabled: bool,
+    ) -> u64 {
+        let Some(request_id) = self.pending_contact_sign_up_get_options.first().copied() else {
+            return 0;
+        };
+        self.pending_contact_sign_up_get_options.remove(0);
+        if env.close_flag() || self.disable_contact_registered_notifications == is_disabled {
+            return request_id;
+        }
+        self.disable_contact_registered_notifications = is_disabled;
+
+        if is_disabled {
+            env.set_contact_option_boolean("disable_contact_registered_notifications", is_disabled);
+        } else {
+            env.set_contact_option_empty("disable_contact_registered_notifications");
+        }
+        request_id
+    }
+
+    /// The `td_->create_handler<…>()->send(...)` collapse (the
+    /// `CallManager::send_call_net_query` shape) — `None` keeps the
+    /// net-inert posture.
+    fn send_notification_net_query(
+        &self,
+        kind: NotificationNetKind,
+        function: tdmtproto::telegram_api::Function,
+        what: &str,
+    ) {
+        match &self.net {
+            Some(net) => net.dispatch(kind, function),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
     }
 
     /// `NotificationManager::add_update` (cpp:989-1006).
@@ -4521,6 +4686,10 @@ mod tests {
         db_error: bool,
         use_message_db: bool,
         force_created_dialogs: Vec<DialogId>,
+        /// the `set_contact_option_boolean` writes (the contact-sign-up band).
+        bool_writes: Vec<(String, bool)>,
+        /// the `set_contact_option_empty` writes.
+        empty_writes: Vec<String>,
     }
 
     impl TestEnv {
@@ -4542,6 +4711,8 @@ mod tests {
                 db_error: false,
                 use_message_db: true,
                 force_created_dialogs: Vec::new(),
+                bool_writes: Vec::new(),
+                empty_writes: Vec::new(),
             }
         }
     }
@@ -4563,6 +4734,16 @@ mod tests {
     impl NotificationManagerEnv for TestEnv {
         fn is_disabled(&self) -> bool {
             self.disabled
+        }
+
+        fn set_contact_option_boolean(&mut self, name: &str, value: bool) {
+            self.bool_writes.push((name.to_owned(), value));
+            self.bool_options.insert(name.to_owned(), value);
+        }
+
+        fn set_contact_option_empty(&mut self, name: &str) {
+            self.empty_writes.push(name.to_owned());
+            self.bool_options.remove(name);
         }
 
         fn close_flag(&self) -> bool {
@@ -5300,6 +5481,122 @@ mod tests {
         assert_eq!(
             manager.contact_registered_notifications_sync_state,
             SyncState::Completed
+        );
+    }
+
+    #[test]
+    fn contact_sign_up_sync_machine_bands() {
+        // the NotSynced + enabled band completes without a query
+        // (cpp:2698-2701)
+        let mut manager = NotificationManager::default();
+        let mut env = TestEnv::new();
+        manager.run_contact_registered_notifications_sync(&mut env);
+        assert_eq!(
+            manager.contact_registered_notifications_sync_state,
+            SyncState::Completed,
+            "the enabled NotSynced band completes locally"
+        );
+        assert_eq!(env.pmc.get(CONTACT_REGISTERED_SYNC_KEY).unwrap(), "20");
+
+        // the disabled band arms the Pending state + the wire send
+        // (cpp:2702-2714) — the net-inert posture parks at Pending
+        let mut manager = NotificationManager {
+            disable_contact_registered_notifications: true,
+            ..NotificationManager::default()
+        };
+        let mut env = TestEnv::new();
+        manager.run_contact_registered_notifications_sync(&mut env);
+        assert_eq!(
+            manager.contact_registered_notifications_sync_state,
+            SyncState::Pending
+        );
+        assert_eq!(env.pmc.get(CONTACT_REGISTERED_SYNC_KEY).unwrap(), "11");
+
+        // the ok answer completes the machine (cpp:2721-2722)
+        manager.on_contact_registered_notifications_sync(&mut env, true, Ok(()));
+        assert_eq!(
+            manager.contact_registered_notifications_sync_state,
+            SyncState::Completed
+        );
+
+        // the error answer resends forever — the state re-arms Pending
+        // (cpp:2722-2724)
+        let mut manager = NotificationManager {
+            disable_contact_registered_notifications: true,
+            ..NotificationManager::default()
+        };
+        let mut env = TestEnv::new();
+        manager.run_contact_registered_notifications_sync(&mut env);
+        manager.on_contact_registered_notifications_sync(
+            &mut env,
+            true,
+            Err(Status::error(400, "CHANNEL_PRIVATE")),
+        );
+        assert_eq!(
+            manager.contact_registered_notifications_sync_state,
+            SyncState::Pending,
+            "the resend-forever arm re-arms the wire query"
+        );
+
+        // a changed flag re-runs the sync with the fresh capture
+        // (cpp:2718-2720)
+        let mut manager = NotificationManager {
+            disable_contact_registered_notifications: false,
+            ..NotificationManager::default()
+        };
+        manager.contact_registered_notifications_sync_state = SyncState::Pending;
+        let mut env = TestEnv::new();
+        manager.on_contact_registered_notifications_sync(&mut env, true, Ok(()));
+        assert_eq!(
+            manager.contact_registered_notifications_sync_state,
+            SyncState::Pending,
+            "the changed flag re-arms instead of completing"
+        );
+    }
+
+    #[test]
+    fn contact_sign_up_get_family_parks_and_flips() {
+        // the request parks FIFO + the wire send arms (cpp:2729-2744)
+        let mut manager = NotificationManager::default();
+        let mut env = TestEnv::new();
+        manager.get_disable_contact_registered_notifications(&mut env, 11);
+        manager.get_disable_contact_registered_notifications(&mut env, 12);
+        assert_eq!(
+            manager.pending_contact_sign_up_get_options,
+            vec![11, 12],
+            "FIFO"
+        );
+
+        // the disabled band parks nothing
+        env.disabled = true;
+        manager.get_disable_contact_registered_notifications(&mut env, 13);
+        assert_eq!(manager.pending_contact_sign_up_get_options, vec![11, 12]);
+        env.disabled = false;
+
+        // the Bool answer flips the flag + writes the option
+        // (cpp:2667-2678)
+        let answered = manager.on_get_disable_contact_registered_notifications(&mut env, true);
+        assert_eq!(answered, 11, "the head request pops");
+        assert!(manager.disable_contact_registered_notifications);
+        assert_eq!(
+            env.bool_writes
+                .last()
+                .map(|(name, value)| (name.as_str(), *value)),
+            Some(("disable_contact_registered_notifications", true))
+        );
+
+        // the unchanged-flag band answers without the write
+        let answered = manager.on_get_disable_contact_registered_notifications(&mut env, true);
+        assert_eq!(answered, 12);
+        assert_eq!(env.bool_writes.len(), 1, "no second write");
+
+        // the false answer clears the option (cpp:2673-2676)
+        manager.get_disable_contact_registered_notifications(&mut env, 14);
+        manager.on_get_disable_contact_registered_notifications(&mut env, false);
+        assert!(!manager.disable_contact_registered_notifications);
+        assert_eq!(
+            env.empty_writes.last().map(String::as_str),
+            Some("disable_contact_registered_notifications")
         );
     }
 

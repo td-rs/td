@@ -802,13 +802,14 @@ mod tests {
     /// `get_message_entities` does, wrong-typed fields, unknown and
     /// numeric `@type`s, the `@extra` splice through the null bridge),
     /// entity-heavy `getTextEntities` kitchen-sink texts and
-    /// parseMarkdown/getMarkdownText round-trips. Corpus responses store
-    /// the oracle output
-    /// decoded: tdlib's
-    /// JSON layer escapes non-ASCII as \uXXXX (astral chars as surrogate
-    /// pairs) while the Rust layer emits raw UTF-8, so non-ASCII was
-    /// normalized to characters at recording time (control-char escapes
-    /// stay, matching both layers).
+    /// parseMarkdown/getMarkdownText round-trips. Corpus responses are
+    /// byte-exact oracle output: tdlib's JSON layer escapes non-ASCII as
+    /// lowercase \uXXXX (astral chars as surrogate pairs — td's
+    /// `JsonString`), and so does the Rust layer since the #72 fix. The
+    /// responses were originally recorded through a JSON round-trip that
+    /// normalized those escapes away (non-ASCII stored as characters) and
+    /// were re-encoded to the oracle bytes in the same fix; control-char
+    /// escapes were always exact.
     #[test]
     fn message_entity_requests_match_the_cpp_oracle() {
         use tdutils::json::{JsonValue, json_decode};
@@ -981,14 +982,15 @@ mod tests {
     #[test]
     fn get_country_flag_emoji_answers_the_cpp_bytes() {
         // SynchronousRequests.cpp:257-260 — the CountryInfoManager static.
-        // The JsonEmitter keeps non-ASCII raw UTF-8 (the M.8 codegen fact,
-        // the 234-record golden); no surrogate escaping.
+        // Non-ASCII goes out as lowercase \uXXXX with astral codepoints as
+        // UTF-16 surrogate pairs (td's JsonString — JsonBuilder.cpp:60,
+        // restored by the #72 fix; byte-pinned by the S12 oracle).
         let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
             country_code: "US".to_string(),
         });
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"text\",\"text\":\"\u{1F1FA}\u{1F1F8}\"}"
+            "{\"@type\":\"text\",\"text\":\"\\ud83c\\uddfa\\ud83c\\uddf8\"}"
         );
         let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
             country_code: "yl".to_string(),
@@ -996,7 +998,7 @@ mod tests {
         // the crystal ball special case
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"text\",\"text\":\"\u{1F52E}\"}"
+            "{\"@type\":\"text\",\"text\":\"\\ud83d\\udd2e\"}"
         );
         let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
             country_code: "FT".to_string(),
@@ -1004,7 +1006,7 @@ mod tests {
         // the pirate flag special case
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"text\",\"text\":\"\u{1F3F4}\u{200D}\u{2620}\u{FE0F}\"}"
+            "{\"@type\":\"text\",\"text\":\"\\ud83c\\udff4\\u200d\\u2620\\ufe0f\"}"
         );
         let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
             country_code: "USA".to_string(),
@@ -1025,18 +1027,19 @@ mod tests {
         });
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"US\",\"name\":\"USA\",\"english_name\":\"USA\",\"flag_emoji\":\"\u{1F1FA}\u{1F1F8}\",\"is_hidden\":false,\"calling_codes\":[\"1\"]},\"country_calling_code\":\"1\",\"formatted_phone_number\":\"999 123 4567\",\"is_anonymous\":false}"
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"US\",\"name\":\"USA\",\"english_name\":\"USA\",\"flag_emoji\":\"\\ud83c\\uddfa\\ud83c\\uddf8\",\"is_hidden\":false,\"calling_codes\":[\"1\"]},\"country_calling_code\":\"1\",\"formatted_phone_number\":\"999 123 4567\",\"is_anonymous\":false}"
         );
         // the missing-language "en" fallback + the fragment country
-        // (the FT flag rides the pirate-flag special case); the JsonEmitter
-        // keeps non-ASCII raw UTF-8 (the M.8 codegen fact)
+        // (the FT flag rides the pirate-flag special case); non-ASCII
+        // answers ride the JsonString \uXXXX escaping like every other
+        // response string (the #72 fix)
         let function = Function::getPhoneNumberInfoSync(td_api::getPhoneNumberInfoSync {
             language_code: "de".to_string(),
             phone_number_prefix: "88812345678".to_string(),
         });
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"FT\",\"name\":\"Anonymous Numbers\",\"english_name\":\"Anonymous Numbers\",\"flag_emoji\":\"\u{1F3F4}\u{200D}\u{2620}\u{FE0F}\",\"is_hidden\":true,\"calling_codes\":[\"888\"]},\"country_calling_code\":\"888\",\"formatted_phone_number\":\"1234 5678\",\"is_anonymous\":true}"
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"FT\",\"name\":\"Anonymous Numbers\",\"english_name\":\"Anonymous Numbers\",\"flag_emoji\":\"\\ud83c\\udff4\\u200d\\u2620\\ufe0f\",\"is_hidden\":true,\"calling_codes\":[\"888\"]},\"country_calling_code\":\"888\",\"formatted_phone_number\":\"1234 5678\",\"is_anonymous\":true}"
         );
     }
 

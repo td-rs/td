@@ -222,6 +222,17 @@ pub trait PremiumEnv {
         td_api::FormattedText::default()
     }
 
+    /// `td_->stickers_manager_->get_premium_gift_sticker_object(month_count,
+    /// star_count)` (Premium.cpp:446, StickersManager.cpp:2496-2507) — the
+    /// §6 gift-options sticker leg over the stickers plane.
+    fn get_premium_gift_sticker_object(
+        &mut self,
+        _month_count: i32,
+        _star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        None
+    }
+
     /// `td_->documents_manager_->on_get_document(document, DialogId(),
     /// false, false, nullptr, Document::Type::Animation)`
     /// (Premium.cpp:360-362) over the documents intake.
@@ -333,7 +344,9 @@ pub trait PremiumEnv {
 
     /// `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
     /// — the premium-subscription assign legs (Premium.cpp:1461-1465);
-    /// the suggested-action plane parks at its own seam.
+    /// the td env routes the trio into the suggested-action manager's
+    /// live dismiss flow (net-drain 52) — this default stays for the
+    /// plane-less test envs.
     fn dismiss_suggested_action(
         &mut self,
         action_type: crate::suggested_action::SuggestedActionType,
@@ -1080,10 +1093,12 @@ impl PremiumManager {
     /// currency, store_quantity <= 1), the XTR star-price map, the
     /// per-currency max monthly price and the relative discount, sorted
     /// by month count. The sticker leg
-    /// (`stickers_manager_->get_premium_gift_sticker_object`) rides the
-    /// stickers plane — the None-leg convention.
+    /// (`stickers_manager_->get_premium_gift_sticker_object`,
+    /// StickersManager.cpp:2496-2507) rides the stickers plane — live
+    /// since net-drain 59.
     pub(crate) fn on_get_premium_gift_options(
         &mut self,
+        env: &mut impl PremiumEnv,
         result: Result<Vec<telegram_api::PremiumGiftCodeOption>>,
         promise: Promise<td_api::PremiumGiftPaymentOptions>,
     ) {
@@ -1143,8 +1158,10 @@ impl PremiumManager {
                 discount_percentage: (100.0 * (1.0 - relative_price)) as i32,
                 month_count: option.months,
                 store_product_id: option.store_product,
-                // `get_premium_gift_sticker_object` — [blocked: stickers]
-                sticker: None,
+                // `get_premium_gift_sticker_object`
+                // (StickersManager.cpp:2496-2507) — the §6 gift-options
+                // sticker leg, live since net-drain 59
+                sticker: env.get_premium_gift_sticker_object(option.months, 0),
             });
         }
         options.sort_by_key(|option| option.month_count);

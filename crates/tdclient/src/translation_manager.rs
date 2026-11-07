@@ -550,8 +550,9 @@ pub trait TranslationManagerEnv {
     /// `user_manager_->get_me` — the create/edit-tone pre-step.
     fn get_me(&mut self);
 
-    // -- the `[blocked: net]` query tails; each one drops the promise,
-    // -- which keeps the C++ request unanswered offline
+    // -- the net-plane query tails (the Td arms dispatch through the
+    // -- `TranslationNetKind` plane, net-drain; the offline test env
+    // -- drops the promise, which keeps the request unanswered)
     /// `TranslateTextQuery::send` (TranslationManager.cpp:34-85); the
     /// `message_full_id` flips the wire between the PEER form (a valid
     /// message id) and the TEXT form, and the
@@ -1410,8 +1411,9 @@ mod tests {
     }
 
     /// The offline env: the pmc state in a plain map, the recorded
-    /// `[blocked: net]`/`[blocked: RichMessage]` query tails, and the
-    /// user plane answered by a synchronous empty cache.
+    /// net-plane query tails (the Td arms dispatch; the tests park) and
+    /// the `[blocked: RichMessage]` rich-message tails, and the user
+    /// plane answered by a synchronous empty cache.
     struct TestTranslationEnv {
         pmc: HashMap<Vec<u8>, Vec<u8>>,
         authorized: bool,

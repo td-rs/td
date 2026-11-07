@@ -1180,8 +1180,9 @@ fn set_promises(promises: Vec<Promise<()>>) {
 }
 
 /// `Global::get_retry_after` (Global.cpp:173-187) — the 429 band of the
-/// `on_transcribed_audio` rate-limit table.
-fn get_retry_after(error_code: i32, error_message: &str) -> i32 {
+/// `on_transcribed_audio` rate-limit table (and the device-token
+/// Reregister retry, DeviceTokenManager.cpp:441-447).
+pub(crate) fn get_retry_after(error_code: i32, error_message: &str) -> i32 {
     if error_code != 429 {
         return 0;
     }
