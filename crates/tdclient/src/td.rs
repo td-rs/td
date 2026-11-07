@@ -3669,6 +3669,16 @@ pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::
 pub(crate) type TranscriptionNetHandle =
     NetKindHandle<crate::transcription_manager::TranscriptionNetKind>;
 
+/// The cloned bot-recommendation dispatch surface the
+/// [`crate::bot_recommendation_manager::BotRecommendationManager`] holds
+/// — the net-drain 53 family's send leg (`GetBotRecommendationsQuery`,
+/// BotRecommendationManager.cpp:30-64); the answers drain through
+/// [`Td::on_bot_recommendation_net_answer`]. Manager-held (the
+/// forum-topic shape): the send leg runs inside the manager over the
+/// env's input-user reads.
+pub(crate) type BotRecommendationNetHandle =
+    NetKindHandle<crate::bot_recommendation_manager::BotRecommendationNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -6181,6 +6191,18 @@ pub struct Td {
     /// [`Td::on_attach_menu_net_answer`].
     attach_menu_net_completed:
         Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
+    /// The bot-recommendation net completed queue (the
+    /// `BotRecommendationNetKind` tags; the net-drain 53 family) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_bot_recommendation_net_answer`].
+    bot_recommendation_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::bot_recommendation_manager::BotRecommendationNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6698,6 +6720,7 @@ impl Td {
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
+            bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7191,6 +7214,7 @@ impl Td {
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
+        self.bot_recommendation_manager.net = self.bot_recommendation_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9009,6 +9033,7 @@ impl Td {
         self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
         self.dispatch_completed_attach_menu_net();
+        self.dispatch_completed_bot_recommendation_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9429,6 +9454,18 @@ impl Td {
         Some(AttachMenuNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.attach_menu_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned bot-recommendation dispatch surface the
+    /// [`crate::bot_recommendation_manager::BotRecommendationManager`]
+    /// holds — `None` keeps the net-inert posture (the pre-init windows
+    /// and the net-inert tests).
+    pub(crate) fn bot_recommendation_net(&self) -> Option<BotRecommendationNetHandle> {
+        Some(BotRecommendationNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.bot_recommendation_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17736,6 +17773,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked BotRecommendation answers — the C++
+    /// ResultHandler halves of the net-drain 53 family
+    /// (`GetBotRecommendationsQuery`, BotRecommendationManager.cpp:50-64).
+    fn dispatch_completed_bot_recommendation_net(&mut self) {
+        let completed = std::mem::take(&mut *self.bot_recommendation_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_bot_recommendation_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20365,6 +20413,47 @@ impl Td {
                     tdutils::log_error!("Failed to add a bot to attachment menu");
                 }
                 manager.reload_attach_menu_bots(&mut env, promise);
+            }
+        }
+    }
+
+    /// Route one BotRecommendation net answer by kind — the
+    /// `GetBotRecommendationsQuery::on_result`/`on_error` halves
+    /// (BotRecommendationManager.cpp:50-64): the `users_Users` answer
+    /// (or the wire error, or the fetch_result parse failure riding the
+    /// same Err path — the landed-flip convention, §5) re-enters the
+    /// manager's `on_get_bot_recommendations` intake over the request
+    /// arms' take/put env shape; the request promises settle from the
+    /// parked family lots.
+    fn on_bot_recommendation_net_answer(
+        &mut self,
+        kind: crate::bot_recommendation_manager::BotRecommendationNetKind,
+        query: NetQuery,
+    ) {
+        match kind {
+            crate::bot_recommendation_manager::BotRecommendationNetKind::GetBotRecommendations {
+                bot_user_id,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::users_Users::parse(query.ok()) {
+                        Ok(users) => {
+                            tdutils::log_info!("Receive result for GetBotRecommendationsQuery");
+                            Ok(users)
+                        }
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the bots.getBotRecommendations answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.bot_recommendation_manager);
+                {
+                    let mut env = BotEnv { td: self };
+                    manager.on_get_bot_recommendations(&mut env, bot_user_id, result);
+                }
+                self.bot_recommendation_manager = manager;
             }
         }
     }
@@ -52839,6 +52928,7 @@ mod tests {
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
+        td.bot_recommendation_manager.net = td.bot_recommendation_net();
         (td, rec, callback)
     }
 
@@ -57139,6 +57229,220 @@ mod tests {
             net_complete(reload, answer);
             td.dispatch_completed_attach_menu_net();
         }
+    }
+
+    #[test]
+    fn bot_recommendation_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(bot_recommendation_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 53 family — `bots.getBotRecommendations` through the
+    /// live td_api arms (getBotSimilarBots/getBotSimilarBotCount,
+    /// Requests.cpp:3209-3222): the outgoing input user resolves at the
+    /// send leg (BotRecommendationManager.cpp:42-47), the answers run the
+    /// users intake + the cache walk (cpp:299-352) and settle the parked
+    /// family promises.
+    fn bot_recommendation_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-bot-recommendations");
+
+        /// The wire `user` record that lands a bot into the cache (the
+        /// seeded bot resolves with its access hash at the send leg).
+        fn wire_user(user_id: i64, is_bot: bool) -> telegram_api::User {
+            telegram_api::User::user(telegram_api::user {
+                flags: 1 | (1 << 1), // ACCESS_HASH | FIRST_NAME
+                id: user_id,
+                access_hash: 700 + user_id,
+                first_name: "Bot".to_owned(),
+                bot: is_bot,
+                ..telegram_api::user::default()
+            })
+        }
+
+        fn seed_user(td: &mut Td, user_id: i64, is_bot: bool) {
+            let crate::td::Td {
+                global,
+                option_manager,
+                auth_manager,
+                user_manager,
+                ..
+            } = td;
+            let mut env = crate::user_manager::UserEnv {
+                global,
+                options: option_manager.as_mut().expect("option manager set"),
+                auth_is_bot: auth_manager.is_bot(),
+            };
+            user_manager.on_get_user(&mut env, wire_user(user_id, is_bot), "test");
+        }
+
+        /// A boxed `users.usersSlice` answer.
+        fn slice_answer(count: i32, users: Vec<telegram_api::User>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::users_Users::users_usersSlice(telegram_api::users_usersSlice {
+                count,
+                users,
+            })
+            .store(&mut out);
+            out
+        }
+
+        // 1. getBotSimilarBots — the live arm parks the request promise,
+        //    the query rides the dispatcher with the resolved input user
+        //    (cpp:42-47), and the slice answer runs the users intake +
+        //    the non-bot filter (cpp:308-340: the total count decrements
+        //    per dropped user).
+        seed_user(&mut td, 901, true);
+        td.request(
+            301,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 901 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        let body = telegram_api::bots_getBotRecommendations::parse(sent.query())
+            .expect("the getBotRecommendations body");
+        match body.bot.as_ref() {
+            Some(telegram_api::InputUser::inputUser(user)) => {
+                assert_eq!(user.user_id, 901);
+                assert_eq!(user.access_hash, 1601, "the seeded access hash");
+            }
+            other => panic!("the resolved input user: {other:?}"),
+        }
+        net_complete(
+            sent,
+            slice_answer(
+                3,
+                vec![
+                    wire_user(911, true),
+                    wire_user(912, false),
+                    wire_user(913, true),
+                ],
+            ),
+        );
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 301);
+        let users = match responses.first() {
+            Some(Object::users(users)) => users.clone(),
+            other => panic!("the getBotSimilarBots answer: {other:?}"),
+        };
+        assert_eq!(users.total_count, 2, "the non-bot drops the count");
+        assert_eq!(users.user_ids, vec![911, 913]);
+
+        // 2. the fresh cache answers without a wire query (cpp:152-164).
+        td.request(
+            302,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 901 }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "the cache hit sends nothing");
+        let responses = responses_of(&callback, 302);
+        assert!(
+            responses.iter().any(
+                |object| matches!(object, Object::users(users) if users.user_ids == vec![911, 913])
+            ),
+            "the cached answer: {responses:?}"
+        );
+
+        // 3. getBotSimilarBotCount — the cached total count (the same
+        //    family queue, cpp:158-161).
+        td.request(
+            303,
+            Function::getBotSimilarBotCount(td_api::getBotSimilarBotCount {
+                bot_user_id: 901,
+                return_local: false,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 303)
+                .iter()
+                .any(|object| matches!(object, Object::count(count) if count.count == 2)),
+            "the cached count"
+        );
+
+        // 4. the return_local count answers -1 before the send
+        //    (cpp:283-291); the wire query still fires for the reload.
+        seed_user(&mut td, 902, true);
+        td.request(
+            304,
+            Function::getBotSimilarBotCount(td_api::getBotSimilarBotCount {
+                bot_user_id: 902,
+                return_local: true,
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 304)
+                .iter()
+                .any(|object| matches!(object, Object::count(count) if count.count == -1)),
+            "the local count band"
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_complete(sent, slice_answer(0, Vec::new()));
+        td.dispatch_completed_bot_recommendation_net();
+
+        // 5. the error band — the codes forward verbatim through
+        //    fail_load_bot_recommendations_queries (cpp:61-63 → :205-221).
+        seed_user(&mut td, 903, true);
+        td.request(
+            305,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 903 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_fail(sent, 420, "BOT_INVALID");
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 305);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "BOT_INVALID");
+
+        // 6. the parse-failure band — the fetch_result failure rides the
+        //    same Err path as the C++ on_error chain (the §5 convention).
+        seed_user(&mut td, 904, true);
+        td.request(
+            306,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 904 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 306);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the bots.getBotRecommendations answer"
+        );
+
+        // 7. the total-count clamp band — a slice count below the vector
+        //    length LOG(ERROR)s and clamps (cpp:321-325).
+        seed_user(&mut td, 905, true);
+        td.request(
+            307,
+            Function::getBotSimilarBots(td_api::getBotSimilarBots { bot_user_id: 905 }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::bots_getBotRecommendations::ID);
+        net_complete(
+            sent,
+            slice_answer(1, vec![wire_user(906, true), wire_user(907, true)]),
+        );
+        td.dispatch_completed_bot_recommendation_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 307).iter().any(
+                |object| matches!(object, Object::users(users) if users.total_count == 2
+                    && users.user_ids == vec![906, 907])
+            ),
+            "the clamped total count"
+        );
+
+        assert!(
+            td.bot_recommendation_net_completed.lock().is_empty(),
+            "drained"
+        );
     }
 
     #[test]
