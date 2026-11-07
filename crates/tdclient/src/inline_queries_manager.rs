@@ -11,10 +11,13 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`InlineQueriesManagerEnv`] trait carries the `G()`/option/pmc/
-//! cross-manager surfaces, and every `create_handler<...>` network tail is
-//! an env seam marked `[blocked: net]` — the C++ promise lands in the
-//! query and stays unanswered offline, exactly like the collapsed-line
-//! convention (M.16). The seams that stand in for unlanded planes:
+//! cross-manager surfaces, and the `Td::ResultHandler` query families
+//! (InlineQueriesManager.cpp:67-455) ride the `InlineQueriesNetKind`
+//! plane over the manager-held net handle (net-drain 48): the send legs
+//! run inside the manager, the request promises park in the family lots
+//! (the handler `promise_` members) and the answers drain through
+//! `Td::on_inline_queries_net_answer` into the intakes
+//! below. The seams that stand in for unlanded planes:
 //!
 //! - `process_input_message_text` — ported here (the function is
 //!   self-contained over the landed MessageEntity plane); it lifts to the
@@ -56,6 +59,7 @@ use crate::files::FileId;
 use crate::link_manager;
 use crate::message_entity::{FormattedText, get_first_url};
 use crate::misc::{add_to_top, clean_input_string, is_base64url_characters, to_integer_i64};
+use crate::requested_dialog_type::RequestedDialogType;
 use crate::target_dialog_types::TargetDialogTypes;
 use crate::td_api;
 use crate::user_manager::{BotData, UserId};
@@ -659,8 +663,10 @@ pub trait InlineQueriesManagerEnv {
     fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool;
     /// `dialog_manager_->resolve_dialog(username, ChannelId(), lambda)` —
     /// the get_weather resolve chain (`do_get_weather` → send_inline_query
-    /// → `on_get_weather` folds inside) — `[blocked: net]`; the promise
-    /// lands in the (never-sent) resolve.
+    /// → `on_get_weather` folds inside) — `[blocked: dialog-plane
+    /// resolve]`: `DialogManager::resolve_dialog` (cpp:3185-3207) is the
+    /// MessagesManager/link step the dialog module still parks (its own
+    /// inventory row); the promise lands in the (never-sent) resolve.
     fn resolve_weather_dialog(
         &mut self,
         username: &str,
@@ -692,79 +698,8 @@ pub trait InlineQueriesManagerEnv {
         source: &str,
     ) -> Vec<telegram_api::MessageEntity>;
 
-    // -- the `[blocked: net]` query tails; each one drops the promise,
-    // -- which keeps the C++ request unanswered offline
-    /// `GetInlineBotResultsQuery` (InlineQueriesManager.cpp:68-121); the
-    /// C++ sets `need_resend_on_503_ = false` and keeps the NetQueryRef
-    /// for the pending-query cancel — both are the net-step's business.
-    fn send_get_inline_bot_results_query(
-        &mut self,
-        query: telegram_api::messages_getInlineBotResults,
-        dialog_id: DialogId,
-        bot_user_id: UserId,
-        query_hash: u64,
-        promise: Promise<Option<td_api::InlineQueryResults>>,
-    );
-    /// `SetInlineBotResultsQuery` (InlineQueriesManager.cpp:123-166).
-    fn send_set_inline_bot_results_query(
-        &mut self,
-        query: telegram_api::messages_setInlineBotResults,
-        promise: Promise<()>,
-    );
-    /// `SetBotGuestChatResultQuery` (InlineQueriesManager.cpp:168-196).
-    fn send_set_bot_guest_chat_result_query(
-        &mut self,
-        query_id: i64,
-        result: telegram_api::InputBotInlineResult,
-        promise: Promise<td_api::InlineMessageId>,
-    );
-    /// `SavePreparedInlineMessageQuery` (InlineQueriesManager.cpp:198-231).
-    fn send_save_prepared_inline_message_query(
-        &mut self,
-        query: telegram_api::messages_savePreparedInlineMessage,
-        promise: Promise<td_api::PreparedInlineMessageId>,
-    );
-    /// `GetPreparedInlineMessageQuery` (InlineQueriesManager.cpp:233-267);
-    /// the response lands in on_get_prepared_inline_message.
-    fn send_get_prepared_inline_message_query(
-        &mut self,
-        query: telegram_api::messages_getPreparedInlineMessage,
-        bot_user_id: UserId,
-        query_hash: u64,
-        promise: Promise<Option<td_api::PreparedInlineMessage>>,
-    );
-    /// `SavePreparedKeyboardButtonQuery` (InlineQueriesManager.cpp:269-295).
-    fn send_save_prepared_keyboard_button_query(
-        &mut self,
-        query: telegram_api::bots_requestWebViewButton,
-        promise: Promise<String>,
-    );
-    /// `GetRequestedWebViewButtonQuery` (InlineQueriesManager.cpp:297-337).
-    fn send_get_requested_web_view_button_query(
-        &mut self,
-        query: telegram_api::bots_getRequestedWebViewButton,
-        bot_user_id: UserId,
-        prepared_button_id: String,
-        promise: Promise<td_api::KeyboardButton>,
-    );
-    /// `RequestSimpleWebViewQuery` (InlineQueriesManager.cpp:339-396).
-    fn send_request_simple_web_view_query(
-        &mut self,
-        query: telegram_api::messages_requestSimpleWebView,
-        promise: Promise<td_api::WebAppUrl>,
-    );
-    /// `SendWebViewDataQuery` (InlineQueriesManager.cpp:398-425).
-    fn send_send_web_view_data_query(
-        &mut self,
-        query: telegram_api::messages_sendWebViewData,
-        promise: Promise<()>,
-    );
-    /// `SendWebViewResultMessageQuery` (InlineQueriesManager.cpp:427-455).
-    fn send_send_web_view_result_message_query(
-        &mut self,
-        query: telegram_api::messages_sendWebViewResultMessage,
-        promise: Promise<td_api::InlineMessageId>,
-    );
+    // -- the remaining cross-plane resolve tails; each one drops the
+    // -- promise, which keeps the C++ request unanswered offline
 
     // -- the M.22 reply-markup plane intakes
     /// `KeyboardButton::get_keyboard_button(button, true)` +
@@ -868,6 +803,94 @@ impl InlineMessageContent {
 // the manager
 // ---------------------------------------------------------------------------
 
+/// The InlineQueriesManager in-flight query kinds — the C++
+/// ResultHandler classes of InlineQueriesManager.cpp:67-455 (the net-drain
+/// 48 families). The kind carries the handler members the answer needs
+/// (the `dialog_id_`/`bot_user_id_`/`query_hash_` re-entry keys); the
+/// request promises park in the manager's family lots (the handler
+/// `promise_` members, §5's FIFO-per-family shape).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InlineQueriesNetKind {
+    /// `GetInlineBotResultsQuery` (cpp:67-121) —
+    /// `messages.getInlineBotResults`; the answer routes
+    /// [`InlineQueriesManager::on_get_inline_query_results`] with the
+    /// handler's re-entry key triple.
+    GetInlineBotResults {
+        dialog_id: DialogId,
+        bot_user_id: UserId,
+        query_hash: u64,
+    },
+    /// `SetInlineBotResultsQuery` (cpp:123-166) —
+    /// `messages.setInlineBotResults`; the Bool answer settles the parked
+    /// promise ok either way (the `!result` band only logs, cpp:156-159).
+    SetInlineBotResults,
+    /// `SetBotGuestChatResultQuery` (cpp:168-196) —
+    /// `messages.setBotGuestChatResult`; the InputBotInlineMessageID
+    /// answer folds through `get_inline_message_id`.
+    SetBotGuestChatResult,
+    /// `SavePreparedInlineMessageQuery` (cpp:198-231) —
+    /// `messages.savePreparedInlineMessage`; the
+    /// messages.BotPreparedInlineMessage answer settles the id pair.
+    SavePreparedInlineMessage,
+    /// `GetPreparedInlineMessageQuery` (cpp:233-267) —
+    /// `messages.getPreparedInlineMessage`; the answer routes
+    /// [`InlineQueriesManager::on_get_prepared_inline_message`] with the
+    /// handler's `bot_user_id_`/`query_hash_` re-entry key pair.
+    GetPreparedInlineMessage {
+        bot_user_id: UserId,
+        query_hash: u64,
+    },
+    /// `SavePreparedKeyboardButtonQuery` (cpp:269-295) —
+    /// `bots.requestWebViewButton`; the bots.RequestedButton answer
+    /// settles the prepared button id.
+    SavePreparedKeyboardButton,
+    /// `GetRequestedWebViewButtonQuery` (cpp:297-337) —
+    /// `bots.getRequestedWebViewButton`; the kind carries the handler's
+    /// `bot_user_id_` member, the `prepared_button_id_` rides the parked
+    /// lot (a String is not `Copy`); the wire KeyboardButton answer folds
+    /// through the M.22 record and registers the requested dialog type.
+    GetRequestedWebViewButton { bot_user_id: UserId },
+    /// `RequestSimpleWebViewQuery` (cpp:339-396) —
+    /// `messages.requestSimpleWebView`; the WebViewResult answer settles
+    /// the url/same-origin pair (the query_id band only logs).
+    RequestSimpleWebView,
+    /// `SendWebViewDataQuery` (cpp:398-425) —
+    /// `messages.sendWebViewData`; the Updates answer rides the updates
+    /// engine with the request promise.
+    SendWebViewData,
+    /// `SendWebViewResultMessageQuery` (cpp:427-455) —
+    /// `messages.sendWebViewResultMessage`; the WebViewMessageSent answer
+    /// folds through [`get_inline_message_id`].
+    SendWebViewResultMessage,
+}
+
+/// The parked family promises (the ResultHandler `promise_` members) —
+/// popped FIFO by the answers (`Td::on_inline_queries_net_answer`).
+#[derive(Default)]
+pub(crate) struct PendingInlineQueries {
+    /// `GetInlineBotResultsQuery::promise_`.
+    get_inline_bot_results: Vec<Promise<Option<td_api::InlineQueryResults>>>,
+    /// `SetInlineBotResultsQuery::promise_`.
+    set_inline_bot_results: Vec<Promise<()>>,
+    /// `SetBotGuestChatResultQuery::promise_`.
+    set_bot_guest_chat_result: Vec<Promise<td_api::InlineMessageId>>,
+    /// `SavePreparedInlineMessageQuery::promise_`.
+    save_prepared_inline_message: Vec<Promise<td_api::PreparedInlineMessageId>>,
+    /// `GetPreparedInlineMessageQuery::promise_`.
+    get_prepared_inline_message: Vec<Promise<Option<td_api::PreparedInlineMessage>>>,
+    /// `SavePreparedKeyboardButtonQuery::promise_`.
+    save_prepared_keyboard_button: Vec<Promise<String>>,
+    /// `GetRequestedWebViewButtonQuery::promise_` + the handler's
+    /// `prepared_button_id_` member (the answer's re-entry key).
+    get_requested_web_view_button: Vec<(String, Promise<td_api::KeyboardButton>)>,
+    /// `RequestSimpleWebViewQuery::promise_`.
+    request_simple_web_view: Vec<Promise<td_api::WebAppUrl>>,
+    /// `SendWebViewDataQuery::promise_`.
+    send_web_view_data: Vec<Promise<()>>,
+    /// `SendWebViewResultMessageQuery::promise_`.
+    send_web_view_result_message: Vec<Promise<td_api::InlineMessageId>>,
+}
+
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
 pub(crate) struct PendingInlineQuery {
     query_hash: u64,
@@ -927,7 +950,14 @@ pub struct InlineQueriesManager {
 
     last_requested_web_view_button_bot_user_id: UserId,
     last_requested_web_view_button_prepared_button_id: String,
-    last_requested_web_view_button_requested_dialog_type: Option<TargetDialogTypes>,
+    last_requested_web_view_button_requested_dialog_type: Option<RequestedDialogType>,
+
+    /// The manager-held dispatch surface of the net-drain 48 families —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests; the `ForumTopicManager::net` shape).
+    pub(crate) net: Option<crate::td::InlineQueriesNetHandle>,
+    /// The parked family promises (the ResultHandler `promise_` members).
+    pub(crate) pending: PendingInlineQueries,
 }
 
 impl std::fmt::Debug for InlineQueriesManager {
@@ -1220,7 +1250,7 @@ impl InlineQueriesManager {
             switch_pm,
             switch_webview: web_view,
         };
-        env.send_set_inline_bot_results_query(query, promise);
+        self.send_set_inline_bot_results_query(query, promise);
     }
 
     /// `answer_guest_query` (InlineQueriesManager.cpp:762-768).
@@ -1233,7 +1263,7 @@ impl InlineQueriesManager {
     ) {
         match self.get_input_bot_inline_result(env, input_result, &mut false, &mut false) {
             Ok(Some(result)) => {
-                env.send_set_bot_guest_chat_result_query(guest_query_id, result, promise);
+                self.send_set_bot_guest_chat_result_query(guest_query_id, result, promise);
             }
             // the promise lands in the (never-sent) seam query
             Ok(None) => {}
@@ -1285,7 +1315,7 @@ impl InlineQueriesManager {
             user_id: Some(input_user),
             peer_types,
         };
-        env.send_save_prepared_inline_message_query(query, promise);
+        self.send_save_prepared_inline_message_query(query, promise);
     }
 
     /// `get_prepared_inline_message` (InlineQueriesManager.cpp:782-809).
@@ -1309,7 +1339,10 @@ impl InlineQueriesManager {
         let query_hash = finish_query_hash(query_hash);
 
         if let Some(entry) = self.inline_query_results.get_mut(&query_hash) {
-            if !entry.is_inline_query {
+            // `if (it->second.is_inline_query)` (cpp:798-800) — the
+            // collision names an *inline-query* entry (the mirror of
+            // send_inline_query's band, cpp:1387-1389)
+            if entry.is_inline_query {
                 promise.set_error(Status::error(500, "Request hash collision"));
                 return;
             }
@@ -1336,7 +1369,7 @@ impl InlineQueriesManager {
             bot: Some(input_user),
             id: prepared_message_id.to_owned(),
         };
-        env.send_get_prepared_inline_message_query(query, bot_user_id, query_hash, promise);
+        self.send_get_prepared_inline_message_query(query, bot_user_id, query_hash, promise);
     }
 
     /// `save_prepared_keyboard_button` (InlineQueriesManager.cpp:811-819).
@@ -1367,7 +1400,7 @@ impl InlineQueriesManager {
                     user_id: Some(input_user),
                     button: Some(input_button),
                 };
-                env.send_save_prepared_keyboard_button_query(query, promise);
+                self.send_save_prepared_keyboard_button_query(query, promise);
             }
             Err(status) => promise.set_error(status),
         }
@@ -1392,7 +1425,7 @@ impl InlineQueriesManager {
             bot: Some(input_user),
             webapp_req_id: prepared_button_id.to_owned(),
         };
-        env.send_get_requested_web_view_button_query(
+        self.send_get_requested_web_view_button_query(
             query,
             bot_user_id,
             prepared_button_id.to_owned(),
@@ -1400,12 +1433,15 @@ impl InlineQueriesManager {
         );
     }
 
-    /// `on_get_requested_web_view_button` (InlineQueriesManager.cpp:828-834).
+    /// `on_get_requested_web_view_button` (InlineQueriesManager.cpp:828-834)
+    /// — the stored record is the C++ `RequestedDialogType` copy
+    /// (`make_unique<RequestedDialogType>(*requested_dialog_type)`,
+    /// cpp:832).
     pub fn on_get_requested_web_view_button(
         &mut self,
         bot_user_id: UserId,
         prepared_button_id: &str,
-        requested_dialog_type: TargetDialogTypes,
+        requested_dialog_type: RequestedDialogType,
     ) {
         self.last_requested_web_view_button_bot_user_id = bot_user_id;
         self.last_requested_web_view_button_prepared_button_id = prepared_button_id.to_owned();
@@ -1417,7 +1453,7 @@ impl InlineQueriesManager {
         &self,
         bot_user_id: UserId,
         prepared_button_id: &str,
-    ) -> Option<&TargetDialogTypes> {
+    ) -> Option<&RequestedDialogType> {
         if bot_user_id == self.last_requested_web_view_button_bot_user_id
             && prepared_button_id == self.last_requested_web_view_button_prepared_button_id
             && !prepared_button_id.is_empty()
@@ -1501,9 +1537,11 @@ impl InlineQueriesManager {
             url,
             start_param: start_parameter,
             theme_params: theme_parameters.map(|json| telegram_api::DataJSON { data: json }),
-            platform: String::new(),
+            // `parameters.get_application_name()` (cpp:378) — the C++
+            // rides the application name on the platform field
+            platform: parameters.get_application_name().to_owned(),
         };
-        env.send_request_simple_web_view_query(query, promise);
+        self.send_request_simple_web_view_query(query, promise);
     }
 
     /// `send_web_view_data` (InlineQueriesManager.cpp:856-869).
@@ -1539,7 +1577,7 @@ impl InlineQueriesManager {
             button_text: button_text.to_owned(),
             data: data.to_owned(),
         };
-        env.send_send_web_view_data_query(query, promise);
+        self.send_send_web_view_data_query(query, promise);
     }
 
     /// `answer_web_view_query` (InlineQueriesManager.cpp:871-879).
@@ -1558,7 +1596,7 @@ impl InlineQueriesManager {
                     bot_query_id: web_view_query_id.to_owned(),
                     result: Some(result),
                 };
-                env.send_send_web_view_result_message_query(query, promise);
+                self.send_send_web_view_result_message_query(query, promise);
             }
             // the promise lands in the (never-sent) seam query
             Ok(None) => {}
@@ -1744,7 +1782,7 @@ impl InlineQueriesManager {
                     query: pending.query,
                     offset: pending.offset,
                 };
-                env.send_get_inline_bot_results_query(
+                self.send_get_inline_bot_results_query(
                     query,
                     pending.dialog_id,
                     pending.bot_user_id,
@@ -1758,6 +1796,376 @@ impl InlineQueriesManager {
                 // fails (`pending_inline_query_ = nullptr`); the dropped
                 // promise answers "Lost promise" like the C++
             }
+        }
+    }
+
+    /// The `td_->create_handler<GetInlineBotResultsQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:76-92) — the request
+    /// promise parks in the family lot first (the handler's `promise_`
+    /// member), then the wire query dispatches over the manager-held net
+    /// handle. `None` on the handle keeps the net-inert posture. The C++
+    /// `net_query->need_resend_on_503_ = false` and the returned
+    /// NetQueryRef (the pending-query cancel) are dispatcher business the
+    /// collapsed plane drops (documented divergence #M.21-netref).
+    pub(crate) fn send_get_inline_bot_results_query(
+        &mut self,
+        query: telegram_api::messages_getInlineBotResults,
+        dialog_id: DialogId,
+        bot_user_id: UserId,
+        query_hash: u64,
+        promise: Promise<Option<td_api::InlineQueryResults>>,
+    ) {
+        self.pending.get_inline_bot_results.push(promise);
+        let kind = InlineQueriesNetKind::GetInlineBotResults {
+            dialog_id,
+            bot_user_id,
+            query_hash,
+        };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getInlineBotResults(query),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.getInlineBotResults for bot {} — [net-inert]",
+                bot_user_id.get()
+            ),
+        }
+    }
+
+    /// The get-inline-bot-results family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_get_inline_bot_results_promise(
+        &mut self,
+    ) -> Option<Promise<Option<td_api::InlineQueryResults>>> {
+        if self.pending.get_inline_bot_results.is_empty() {
+            None
+        } else {
+            Some(self.pending.get_inline_bot_results.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SetInlineBotResultsQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:133-152) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_set_inline_bot_results_query(
+        &mut self,
+        query: telegram_api::messages_setInlineBotResults,
+        promise: Promise<()>,
+    ) {
+        self.pending.set_inline_bot_results.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SetInlineBotResults,
+                telegram_api::Function::messages_setInlineBotResults(query),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.setInlineBotResults for query {} — [net-inert]",
+                query.query_id
+            ),
+        }
+    }
+
+    /// The set-inline-bot-results family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_set_inline_bot_results_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending.set_inline_bot_results.is_empty() {
+            None
+        } else {
+            Some(self.pending.set_inline_bot_results.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SetBotGuestChatResultQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:180-183) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_set_bot_guest_chat_result_query(
+        &mut self,
+        query_id: i64,
+        result: telegram_api::InputBotInlineResult,
+        promise: Promise<td_api::InlineMessageId>,
+    ) {
+        self.pending.set_bot_guest_chat_result.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SetBotGuestChatResult,
+                telegram_api::Function::messages_setBotGuestChatResult(
+                    telegram_api::messages_setBotGuestChatResult {
+                        query_id,
+                        result: Some(result),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.setBotGuestChatResult — [net-inert]")
+            }
+        }
+    }
+
+    /// The set-bot-guest-chat-result family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_set_bot_guest_chat_result_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::InlineMessageId>> {
+        if self.pending.set_bot_guest_chat_result.is_empty() {
+            None
+        } else {
+            Some(self.pending.set_bot_guest_chat_result.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SavePreparedInlineMessageQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:206-222) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_save_prepared_inline_message_query(
+        &mut self,
+        query: telegram_api::messages_savePreparedInlineMessage,
+        promise: Promise<td_api::PreparedInlineMessageId>,
+    ) {
+        self.pending.save_prepared_inline_message.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SavePreparedInlineMessage,
+                telegram_api::Function::messages_savePreparedInlineMessage(query),
+            ),
+            None => tdutils::log_info!("Send messages.savePreparedInlineMessage — [net-inert]"),
+        }
+    }
+
+    /// The save-prepared-inline-message family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_save_prepared_inline_message_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::PreparedInlineMessageId>> {
+        if self.pending.save_prepared_inline_message.is_empty() {
+            None
+        } else {
+            Some(self.pending.save_prepared_inline_message.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<GetPreparedInlineMessageQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:244-250) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches with the
+    /// handler's `bot_user_id_`/`query_hash_` members on the kind. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_get_prepared_inline_message_query(
+        &mut self,
+        query: telegram_api::messages_getPreparedInlineMessage,
+        bot_user_id: UserId,
+        query_hash: u64,
+        promise: Promise<Option<td_api::PreparedInlineMessage>>,
+    ) {
+        self.pending.get_prepared_inline_message.push(promise);
+        let kind = InlineQueriesNetKind::GetPreparedInlineMessage {
+            bot_user_id,
+            query_hash,
+        };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getPreparedInlineMessage(query),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.getPreparedInlineMessage for bot {} — [net-inert]",
+                bot_user_id.get()
+            ),
+        }
+    }
+
+    /// The get-prepared-inline-message family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_get_prepared_inline_message_promise(
+        &mut self,
+    ) -> Option<Promise<Option<td_api::PreparedInlineMessage>>> {
+        if self.pending.get_prepared_inline_message.is_empty() {
+            None
+        } else {
+            Some(self.pending.get_prepared_inline_message.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SavePreparedKeyboardButtonQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:275-282) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_save_prepared_keyboard_button_query(
+        &mut self,
+        query: telegram_api::bots_requestWebViewButton,
+        promise: Promise<String>,
+    ) {
+        self.pending.save_prepared_keyboard_button.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SavePreparedKeyboardButton,
+                telegram_api::Function::bots_requestWebViewButton(query),
+            ),
+            None => tdutils::log_info!("Send bots.requestWebViewButton — [net-inert]"),
+        }
+    }
+
+    /// The save-prepared-keyboard-button family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_save_prepared_keyboard_button_promise(&mut self) -> Option<Promise<String>> {
+        if self.pending.save_prepared_keyboard_button.is_empty() {
+            None
+        } else {
+            Some(self.pending.save_prepared_keyboard_button.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<GetRequestedWebViewButtonQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:305-311) — the
+    /// request promise and the handler's `prepared_button_id_` member
+    /// park in the family lot first, then the built wire query dispatches
+    /// with the `bot_user_id_` member on the kind. `None` on the handle
+    /// keeps the net-inert posture.
+    pub(crate) fn send_get_requested_web_view_button_query(
+        &mut self,
+        query: telegram_api::bots_getRequestedWebViewButton,
+        bot_user_id: UserId,
+        prepared_button_id: String,
+        promise: Promise<td_api::KeyboardButton>,
+    ) {
+        self.pending
+            .get_requested_web_view_button
+            .push((prepared_button_id, promise));
+        let kind = InlineQueriesNetKind::GetRequestedWebViewButton { bot_user_id };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                kind,
+                telegram_api::Function::bots_getRequestedWebViewButton(query),
+            ),
+            None => tdutils::log_info!(
+                "Send bots.getRequestedWebViewButton for bot {} — [net-inert]",
+                bot_user_id.get()
+            ),
+        }
+    }
+
+    /// The get-requested-web-view-button family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_get_requested_web_view_button_query(
+        &mut self,
+    ) -> Option<(String, Promise<td_api::KeyboardButton>)> {
+        if self.pending.get_requested_web_view_button.is_empty() {
+            None
+        } else {
+            Some(self.pending.get_requested_web_view_button.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<RequestSimpleWebViewQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:347-379) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_request_simple_web_view_query(
+        &mut self,
+        query: telegram_api::messages_requestSimpleWebView,
+        promise: Promise<td_api::WebAppUrl>,
+    ) {
+        self.pending.request_simple_web_view.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::RequestSimpleWebView,
+                telegram_api::Function::messages_requestSimpleWebView(query),
+            ),
+            None => tdutils::log_info!("Send messages.requestSimpleWebView — [net-inert]"),
+        }
+    }
+
+    /// The request-simple-web-view family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_request_simple_web_view_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::WebAppUrl>> {
+        if self.pending.request_simple_web_view.is_empty() {
+            None
+        } else {
+            Some(self.pending.request_simple_web_view.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SendWebViewDataQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:407-413) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_send_web_view_data_query(
+        &mut self,
+        query: telegram_api::messages_sendWebViewData,
+        promise: Promise<()>,
+    ) {
+        self.pending.send_web_view_data.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SendWebViewData,
+                telegram_api::Function::messages_sendWebViewData(query),
+            ),
+            None => tdutils::log_info!("Send messages.sendWebViewData — [net-inert]"),
+        }
+    }
+
+    /// The send-web-view-data family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_send_web_view_data_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending.send_web_view_data.is_empty() {
+            None
+        } else {
+            Some(self.pending.send_web_view_data.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SendWebViewResultMessageQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:435-439) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_send_web_view_result_message_query(
+        &mut self,
+        query: telegram_api::messages_sendWebViewResultMessage,
+        promise: Promise<td_api::InlineMessageId>,
+    ) {
+        self.pending.send_web_view_result_message.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SendWebViewResultMessage,
+                telegram_api::Function::messages_sendWebViewResultMessage(query),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.sendWebViewResultMessage — [net-inert]")
+            }
+        }
+    }
+
+    /// The send-web-view-result-message family pop for the
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_send_web_view_result_message_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::InlineMessageId>> {
+        if self.pending.send_web_view_result_message.is_empty() {
+            None
+        } else {
+            Some(self.pending.send_web_view_result_message.remove(0))
         }
     }
 
@@ -2398,10 +2806,15 @@ impl InlineQueriesManager {
         if self.recently_used_bots_loaded == 0 {
             self.recently_used_bots_loaded = 1;
             if !env.use_chat_info_database() {
-                // search_public_dialog per username — [blocked: net]; the
-                // parked promises wait for the resolutions
+                // search_public_dialog per username — [blocked:
+                // dialog-plane resolve]: the resolution is a td-level
+                // walk over the dialog plane (dialog creation + the
+                // ResolveUsername family) the split env can't reach, and
+                // the completion must re-enter this manager (the C++
+                // MultiPromiseActor hop, InlineQueriesManager.cpp:
+                // 2428-2443); the parked promises wait for it
                 tdutils::log_info!(
-                    "Resolve {} recent inline bot usernames — [blocked: net]",
+                    "Resolve {} recent inline bot usernames — [blocked: dialog-plane resolve]",
                     bot_usernames.len()
                 );
                 self.resolve_recent_inline_bots_pending += bot_usernames.len();
@@ -2412,9 +2825,13 @@ impl InlineQueriesManager {
                         // UserManager::get_user completes synchronously
                         // from memory
                     } else {
-                        // the users.getUsers fetch — [blocked: net]
+                        // the users.getUsers fetch — [blocked: user-plane
+                        // re-entry]: the GetUserMerger promise would have
+                        // to hop back into this manager's multipromise
+                        // (InlineQueriesManager.cpp:2440), and the split
+                        // env carries no such completion surface
                         tdutils::log_info!(
-                            "Load recent inline bot {} — [blocked: net]",
+                            "Load recent inline bot {} — [blocked: user-plane re-entry]",
                             user_id.get()
                         );
                         self.resolve_recent_inline_bots_pending += 1;
@@ -3352,7 +3769,9 @@ fn extract_input_invert_media(content: &td_api::InputMessageContent) -> bool {
 }
 
 /// `on_get_weather` (InlineQueriesManager.cpp:1320-1333) — the weather
-/// fold over the single-article result; the feed tail is [blocked: net].
+/// fold over the single-article result; the feed tail (the resolve →
+/// send_inline_query chain that reaches it) is [blocked: dialog-plane
+/// resolve] (see `resolve_weather_dialog`).
 #[allow(dead_code)]
 pub(crate) fn on_get_weather(
     results: td_api::InlineQueryResults,
@@ -3393,5 +3812,900 @@ fn get_photo_size_object(size: &crate::photo::PhotoSize) -> td_api::PhotoSize {
         width: i32::from(size.dimensions.width),
         height: i32::from(size.dimensions.height),
         progressive_sizes: size.progressive_sizes.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tdutils::promise::PromiseInterface;
+
+    /// The recording env: the bot/user caches, the option rows and the
+    /// fired intakes — the net handle stays `None` so the send legs park
+    /// their promises in the family lots without dispatching (the
+    /// [net-inert] posture; the netted_td round-trips drive the wire).
+    struct TestEnv {
+        is_bot: bool,
+        bots: Vec<i64>,
+        inline: Vec<i64>,
+        known: Vec<i64>,
+        use_chat_info_database: bool,
+        option_strings: HashMap<String, String>,
+        updates: Vec<String>,
+        users_intakes: usize,
+        bot_usages: Vec<i64>,
+    }
+
+    impl Default for TestEnv {
+        fn default() -> Self {
+            TestEnv {
+                is_bot: false,
+                bots: vec![9],
+                inline: vec![9],
+                known: vec![9],
+                use_chat_info_database: true,
+                option_strings: HashMap::new(),
+                updates: Vec::new(),
+                users_intakes: 0,
+                bot_usages: Vec::new(),
+            }
+        }
+    }
+
+    impl TestEnv {
+        fn bot_data(&self, user_id: UserId) -> Result<BotData, Status> {
+            if !self.bots.contains(&user_id.get()) {
+                return Err(Status::error(400, "Bot not found"));
+            }
+            Ok(BotData {
+                username: "bot".to_owned(),
+                is_inline: self.inline.contains(&user_id.get()),
+                ..BotData::default()
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    impl InlineQueriesManagerEnv for TestEnv {
+        fn auth_is_bot(&self) -> bool {
+            self.is_bot
+        }
+
+        fn close_flag(&self) -> bool {
+            false
+        }
+
+        fn use_chat_info_database(&self) -> bool {
+            self.use_chat_info_database
+        }
+
+        fn is_test_dc(&self) -> bool {
+            false
+        }
+
+        fn unix_time(&self) -> i32 {
+            1700000000
+        }
+
+        fn get_option_string(&self, name: &str, default_value: &str) -> String {
+            self.option_strings
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| default_value.to_owned())
+        }
+
+        fn binlog_pmc_get(&mut self, key: &str) -> String {
+            self.option_strings.get(key).cloned().unwrap_or_default()
+        }
+
+        fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+            self.option_strings.insert(key.to_owned(), value.to_owned());
+        }
+
+        fn send_update(&mut self, update: td_api::Update) {
+            self.updates.push(format!("{:?}", update));
+        }
+
+        fn get_bot_data(&self, user_id: UserId) -> Result<BotData, Status> {
+            self.bot_data(user_id)
+        }
+
+        fn have_min_user(&self, user_id: UserId) -> bool {
+            self.known.contains(&user_id.get())
+        }
+
+        fn have_user_force(&self, user_id: UserId) -> bool {
+            self.known.contains(&user_id.get())
+        }
+
+        fn get_user_first_username(&self, user_id: UserId) -> String {
+            let _ = user_id;
+            "bot".to_owned()
+        }
+
+        fn get_user_id_object(&mut self, user_id: UserId, _source: &str) -> i64 {
+            user_id.get()
+        }
+
+        fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+            if !self.known.contains(&user_id.get()) {
+                return Err(Status::error(400, "User not found"));
+            }
+            Ok(telegram_api::InputUser::inputUser(
+                telegram_api::inputUser {
+                    user_id: user_id.get(),
+                    access_hash: 0,
+                },
+            ))
+        }
+
+        fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {
+            self.users_intakes += 1;
+        }
+
+        fn get_input_peer(&mut self, _dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
+            Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            ))
+        }
+
+        fn get_channel_type(&self, _channel_id: ChannelId) -> ChannelType {
+            ChannelType::Broadcast
+        }
+
+        fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+            true
+        }
+
+        fn resolve_weather_dialog(
+            &mut self,
+            _username: &str,
+            _location: Location,
+            _promise: Promise<td_api::CurrentWeather>,
+        ) {
+            // [blocked: dialog-plane resolve]: the resolve never sends
+        }
+
+        fn can_add_web_page_previews(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn get_my_dialog_id(&self) -> DialogId {
+            DialogId::new(1)
+        }
+
+        fn parse_formatted_text(
+            &mut self,
+            _dialog_id: DialogId,
+            text: Option<td_api::FormattedText>,
+            _is_bot: bool,
+            _allow_empty: bool,
+            _skip_media_timestamps: bool,
+            _skip_trim: bool,
+        ) -> Result<FormattedText, Status> {
+            Ok(FormattedText {
+                text: text.map(|text| text.text).unwrap_or_default(),
+                ..FormattedText::default()
+            })
+        }
+
+        fn get_input_message_entities(
+            &mut self,
+            _entities: &[crate::message_entity::MessageEntity],
+            _source: &str,
+        ) -> Vec<telegram_api::MessageEntity> {
+            Vec::new()
+        }
+
+        fn get_input_keyboard_button(
+            &mut self,
+            button: &td_api::KeyboardButton,
+        ) -> Result<telegram_api::KeyboardButton, Status> {
+            crate::keyboard_button::KeyboardButton::from_td_api(button.clone(), true, false)
+                .map(|button| button.get_input_keyboard_button())
+        }
+
+        fn get_input_reply_markup(
+            &mut self,
+            reply_markup: Option<td_api::ReplyMarkup>,
+            is_bot: bool,
+            switch_inline_buttons_allowed: bool,
+        ) -> Result<Option<telegram_api::ReplyMarkup>, Status> {
+            let markup = crate::reply_markup::get_inline_reply_markup(
+                reply_markup,
+                is_bot,
+                switch_inline_buttons_allowed,
+                false,
+            )?;
+            Ok(markup.and_then(|markup| crate::reply_markup::get_input_reply_markup(&markup)))
+        }
+
+        fn get_input_rich_message(
+            &mut self,
+            _message: &td_api::inputMessageRichMessage,
+        ) -> Result<Option<telegram_api::InputRichMessage>, Status> {
+            Ok(None) // [blocked: M.17]
+        }
+
+        fn get_input_bot_inline_message_media_invoice(
+            &mut self,
+            _invoice: &td_api::inputMessageInvoice,
+            _reply_markup: Option<telegram_api::ReplyMarkup>,
+        ) -> Result<Option<telegram_api::InputBotInlineMessage>, Status> {
+            Ok(None) // [blocked: Wave-3 payments]
+        }
+
+        fn create_inline_message_content(
+            &mut self,
+            _file_id: FileId,
+            _inline_message: Option<telegram_api::BotInlineMessage>,
+            _allowed_media_content_id: i32,
+        ) -> Option<InlineMessageContent> {
+            None // [blocked: M.9]
+        }
+
+        fn register_thumbnail(
+            &mut self,
+            _web_document: telegram_api::WebDocument,
+        ) -> Option<td_api::Thumbnail> {
+            None // [blocked: Files]
+        }
+
+        fn get_web_document_temp_photo_size(
+            &mut self,
+            _web_document: telegram_api::WebDocument,
+        ) -> Option<crate::photo::PhotoSize> {
+            None // [blocked: Files]
+        }
+
+        fn get_web_document_thumbnail_photo_size(
+            &mut self,
+            _web_document: telegram_api::WebDocument,
+        ) -> Option<crate::photo::PhotoSize> {
+            None // [blocked: Files]
+        }
+
+        fn get_theme_parameters_json_string(
+            &self,
+            _theme: &td_api::ThemeParameters,
+        ) -> Option<String> {
+            None // [blocked: Wave-3 ThemeManager]
+        }
+
+        fn on_dialog_used(
+            &mut self,
+            _category: TopDialogCategory,
+            dialog_id: DialogId,
+            _unix_time: i32,
+        ) {
+            self.bot_usages.push(dialog_id.get());
+        }
+    }
+
+    // --- the test promise helpers (the M.45 RecordingPromise convention) ---
+
+    type Recorded<T> = std::sync::Arc<std::sync::Mutex<Vec<std::result::Result<T, String>>>>;
+
+    struct RecordingPromise<T: Send + 'static> {
+        outcomes: Recorded<T>,
+    }
+
+    impl<T: Send + 'static> PromiseInterface<T> for RecordingPromise<T> {
+        fn set_value(&mut self, value: T) {
+            self.outcomes.lock().unwrap().push(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            self.outcomes.lock().unwrap().push(Err(format!(
+                "{} {}",
+                error.code(),
+                error.message()
+            )));
+        }
+    }
+
+    fn recording_promise<T: Send + 'static>() -> (Promise<T>, Recorded<T>) {
+        let outcomes: Recorded<T> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Promise::from_interface(RecordingPromise {
+                outcomes: outcomes.clone(),
+            }),
+            outcomes,
+        )
+    }
+
+    /// The net-inert park + FIFO pop band of the get-inline-bot-results
+    /// family: the promise parks through the send leg (the handler's
+    /// `promise_` member) and the pop pairs the answers FIFO.
+    #[test]
+    fn get_inline_bot_results_family_parks_and_pops_fifo() {
+        let mut manager = InlineQueriesManager::new();
+        assert!(manager.pop_get_inline_bot_results_promise().is_none());
+        for index in 0..2 {
+            let (promise, _outcomes) = recording_promise();
+            manager.send_get_inline_bot_results_query(
+                telegram_api::messages_getInlineBotResults {
+                    flags: 0,
+                    bot: None,
+                    peer: None,
+                    geo_point: None,
+                    query: format!("q{index}"),
+                    offset: String::new(),
+                },
+                DialogId::new(1),
+                UserId::new(9),
+                index as u64,
+                promise,
+            );
+        }
+        assert_eq!(manager.pending.get_inline_bot_results.len(), 2);
+        assert!(manager.pop_get_inline_bot_results_promise().is_some());
+        assert!(manager.pop_get_inline_bot_results_promise().is_some());
+        assert!(manager.pop_get_inline_bot_results_promise().is_none());
+    }
+
+    /// The answer_inline_query bands over the bot env: the button
+    /// validation ladder (cpp:705-737) answers inline, the good article
+    /// parks the promise in the family lot and the game result's
+    /// short-name form rides the inputBotInlineResultGame arm.
+    #[test]
+    fn answer_inline_query_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let article = || {
+            td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                td_api::inputInlineQueryResultArticle {
+                    id: "r1".to_owned(),
+                    url: String::new(),
+                    title: "T".to_owned(),
+                    description: String::new(),
+                    thumbnail_url: String::new(),
+                    thumbnail_width: 0,
+                    thumbnail_height: 0,
+                    reply_markup: None,
+                    input_message_content: Some(Box::new(
+                        td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                            text: Some(td_api::FormattedText {
+                                text: "hi".to_owned(),
+                                entities: Vec::new(),
+                            }),
+                            link_preview_options: None,
+                            clear_draft: false,
+                        }),
+                    )),
+                },
+            )
+        };
+
+        // the empty start_parameter band (cpp:712-714)
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.answer_inline_query(
+            &mut env,
+            7,
+            false,
+            Some(td_api::InlineQueryResultsButton {
+                text: "S".to_owned(),
+                r#type: Some(
+                    td_api::InlineQueryResultsButtonType::inlineQueryResultsButtonTypeStartBot(
+                        td_api::inlineQueryResultsButtonTypeStartBot {
+                            parameter: String::new(),
+                        },
+                    ),
+                ),
+            }),
+            vec![article()],
+            30,
+            String::new(),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Can't use empty start_parameter"
+        ));
+
+        // the game result takes the inputBotInlineResultGame arm
+        // (cpp:1013-1038) — no inline-message fold, no content fields
+        let (promise, _outcomes) = recording_promise::<()>();
+        manager.answer_inline_query(
+            &mut env,
+            7,
+            false,
+            None,
+            vec![td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                td_api::inputInlineQueryResultGame {
+                    id: "g1".to_owned(),
+                    game_short_name: "snake".to_owned(),
+                    reply_markup: None,
+                },
+            )],
+            30,
+            String::new(),
+            promise,
+        );
+        assert_eq!(
+            manager.pending.set_inline_bot_results.len(),
+            1,
+            "the net-inert park"
+        );
+        assert!(
+            manager.pop_set_inline_bot_results_promise().is_some(),
+            "the FIFO pop"
+        );
+    }
+
+    /// The answer_web_view_query bands: the folded result parks the
+    /// promise in the web-view-result lot without a dispatch, and the
+    /// seam-parked `Ok(None)` band answers nothing.
+    #[test]
+    fn answer_web_view_query_parks_net_inert() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<td_api::InlineMessageId>();
+        manager.answer_web_view_query(
+            &mut env,
+            "waq-1",
+            Some(td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                td_api::inputInlineQueryResultGame {
+                    id: "g1".to_owned(),
+                    game_short_name: "snake".to_owned(),
+                    reply_markup: None,
+                },
+            )),
+            promise,
+        );
+        assert_eq!(manager.pending.send_web_view_result_message.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_send_web_view_result_message_promise().is_some());
+
+        // the empty-result band (cpp:877)
+        let (promise, outcomes) = recording_promise::<td_api::InlineMessageId>();
+        manager.answer_web_view_query(&mut env, "waq-1", None, promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Inline query result must be non-empty"
+        ));
+    }
+
+    /// The send_web_view_data bands: the not-a-bot band answers inline
+    /// and the good form parks the promise net-inert.
+    #[test]
+    fn send_web_view_data_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.send_web_view_data(&mut env, UserId::new(9), "Open", "payload", promise);
+        assert_eq!(manager.pending.send_web_view_data.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_send_web_view_data_promise().is_some());
+
+        let mut env = TestEnv {
+            bots: Vec::new(),
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.send_web_view_data(&mut env, UserId::new(9), "Open", "payload", promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Bot not found"
+        ));
+    }
+
+    /// The get_simple_web_view_url bands: the URL ladder (cpp:359-374)
+    /// answers inline, the good form parks the promise net-inert and the
+    /// application name rides the platform field (cpp:378).
+    #[test]
+    fn get_simple_web_view_url_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+
+        // the invalid-URL band (cpp:372-374)
+        let (promise, outcomes) = recording_promise::<td_api::WebAppUrl>();
+        manager.get_simple_web_view_url(
+            &mut env,
+            UserId::new(9),
+            "https://app.example.com/no-suffix",
+            WebAppOpenParameters::default(),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Invalid URL specified"
+        ));
+
+        // the `#iq` form parks net-inert with the platform name
+        let (promise, outcomes) = recording_promise::<td_api::WebAppUrl>();
+        manager.get_simple_web_view_url(
+            &mut env,
+            UserId::new(9),
+            "https://app.example.com/y#iq",
+            WebAppOpenParameters::from_td_api(Some(td_api::WebAppOpenParameters {
+                theme: None,
+                application_name: "tdlib-test".to_owned(),
+                mode: None,
+            })),
+            promise,
+        );
+        assert_eq!(manager.pending.request_simple_web_view.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_request_simple_web_view_promise().is_some());
+
+        // the not-a-bot band (cpp:851-853)
+        let mut env = TestEnv {
+            bots: Vec::new(),
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<td_api::WebAppUrl>();
+        manager.get_simple_web_view_url(
+            &mut env,
+            UserId::new(9),
+            "",
+            WebAppOpenParameters::default(),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Bot not found"
+        ));
+    }
+
+    /// The get_prepared_keyboard_button bands: the net-inert park keeps
+    /// the prepared button id beside the promise (the handler's
+    /// `prepared_button_id_` member) and the registered record answers
+    /// `get_requested_dialog_type` (cpp:836-843).
+    #[test]
+    fn get_prepared_keyboard_button_bands_and_registration() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+        let (promise, outcomes) = recording_promise::<td_api::KeyboardButton>();
+        manager.get_prepared_keyboard_button(&mut env, UserId::new(9), "wrb-1", promise);
+        assert_eq!(manager.pending.get_requested_web_view_button.len(), 1);
+        assert_eq!(manager.pending.get_requested_web_view_button[0].0, "wrb-1");
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+
+        // the unknown-bot band (cpp:824-826)
+        let (promise, outcomes) = recording_promise::<td_api::KeyboardButton>();
+        manager.get_prepared_keyboard_button(&mut env, UserId::new(404), "wrb-1", promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+
+        // the registration + the lookup (cpp:828-843)
+        let requested = RequestedDialogType::from_telegram(
+            telegram_api::RequestPeerType::requestPeerTypeUser(telegram_api::requestPeerTypeUser {
+                flags: 0,
+                bot: false,
+                premium: false,
+            }),
+            3,
+            2,
+        );
+        manager.on_get_requested_web_view_button(UserId::new(9), "wrb-1", requested);
+        assert!(
+            manager
+                .get_requested_dialog_type(UserId::new(9), "wrb-1")
+                .is_some()
+        );
+        // the empty id and the other bot answer no
+        assert!(
+            manager
+                .get_requested_dialog_type(UserId::new(9), "")
+                .is_none()
+        );
+        assert!(
+            manager
+                .get_requested_dialog_type(UserId::new(8), "wrb-1")
+                .is_none()
+        );
+        assert!(manager.pop_get_requested_web_view_button_query().is_some());
+    }
+
+    /// The save_prepared_keyboard_button bands: the button ladder (the
+    /// M.22 get_keyboard_button(request_buttons_allowed=true) validation)
+    /// answers inline, the good form parks the promise net-inert and the
+    /// request-users button carries the button id through the fold.
+    #[test]
+    fn save_prepared_keyboard_button_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+
+        // the empty-button band (cpp:815-817)
+        let (promise, outcomes) = recording_promise::<String>();
+        manager.save_prepared_keyboard_button(&mut env, UserId::new(9), None, promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Button must be non-empty"
+        ));
+
+        // the unknown-user band (cpp:812-814)
+        let (promise, outcomes) = recording_promise::<String>();
+        manager.save_prepared_keyboard_button(
+            &mut env,
+            UserId::new(404),
+            Some(td_api::KeyboardButton {
+                text: "Pick".to_owned(),
+                icon_custom_emoji_id: 0,
+                style: None,
+                r#type: None,
+            }),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+
+        // the good form parks net-inert
+        let (promise, outcomes) = recording_promise::<String>();
+        manager.save_prepared_keyboard_button(
+            &mut env,
+            UserId::new(9),
+            Some(td_api::KeyboardButton {
+                text: "Pick".to_owned(),
+                icon_custom_emoji_id: 0,
+                style: None,
+                r#type: Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                    td_api::keyboardButtonTypeRequestUsers {
+                        id: 3,
+                        restrict_user_is_bot: false,
+                        user_is_bot: false,
+                        restrict_user_is_premium: false,
+                        user_is_premium: false,
+                        max_quantity: 2,
+                        request_name: false,
+                        request_username: false,
+                        request_photo: false,
+                    },
+                )),
+            }),
+            promise,
+        );
+        assert_eq!(manager.pending.save_prepared_keyboard_button.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(
+            manager
+                .pop_save_prepared_keyboard_button_promise()
+                .is_some()
+        );
+    }
+
+    /// The get_prepared_inline_message bands: the cache-hash ladder parks
+    /// the promise per request (the C++ handler carries it on the query),
+    /// the double call answers FIFO and the collision band fires when the
+    /// hash names an inline-query entry.
+    #[test]
+    fn get_prepared_inline_message_bands_and_fifo() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+        let (promise, outcomes) = recording_promise::<Option<td_api::PreparedInlineMessage>>();
+        manager.get_prepared_inline_message(&mut env, UserId::new(9), "pm1", promise);
+        assert_eq!(manager.pending.get_prepared_inline_message.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+
+        // the second call for the same key increments the pending count
+        // and parks another promise (cpp:794-804)
+        let (promise, _outcomes) = recording_promise::<Option<td_api::PreparedInlineMessage>>();
+        manager.get_prepared_inline_message(&mut env, UserId::new(9), "pm1", promise);
+        assert_eq!(manager.pending.get_prepared_inline_message.len(), 2);
+        assert!(manager.pop_get_prepared_inline_message_promise().is_some());
+        assert!(manager.pop_get_prepared_inline_message_promise().is_some());
+        assert!(manager.pop_get_prepared_inline_message_promise().is_none());
+
+        // the unknown-bot band (cpp:785-789)
+        let (promise, outcomes) = recording_promise::<Option<td_api::PreparedInlineMessage>>();
+        manager.get_prepared_inline_message(&mut env, UserId::new(404), "pm1", promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+    }
+
+    /// The save_prepared_inline_message bands: the chat-types ladder
+    /// (TargetDialogTypes.cpp:43-59) answers inline and the good form
+    /// parks the promise in the prepared-message lot without a dispatch.
+    #[test]
+    fn save_prepared_inline_message_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let result = td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+            td_api::inputInlineQueryResultGame {
+                id: "g1".to_owned(),
+                game_short_name: "snake".to_owned(),
+                reply_markup: None,
+            },
+        );
+
+        // the empty chat-types band
+        let (promise, outcomes) = recording_promise::<td_api::PreparedInlineMessageId>();
+        manager.save_prepared_inline_message(
+            &mut env,
+            UserId::new(9),
+            Some(result.clone()),
+            None,
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 At least one chat type must be allowed"
+        ));
+
+        // the unknown-user band (cpp:773-776)
+        let (promise, outcomes) = recording_promise::<td_api::PreparedInlineMessageId>();
+        manager.save_prepared_inline_message(
+            &mut env,
+            UserId::new(404),
+            Some(result),
+            Some(td_api::TargetChatTypes {
+                allow_user_chats: true,
+                allow_bot_chats: false,
+                allow_group_chats: false,
+                allow_channel_chats: false,
+            }),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+
+        // the good form parks net-inert
+        let (promise, outcomes) = recording_promise::<td_api::PreparedInlineMessageId>();
+        manager.save_prepared_inline_message(
+            &mut env,
+            UserId::new(9),
+            Some(
+                td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                    td_api::inputInlineQueryResultArticle {
+                        id: "p1".to_owned(),
+                        url: String::new(),
+                        title: "T".to_owned(),
+                        description: String::new(),
+                        thumbnail_url: String::new(),
+                        thumbnail_width: 0,
+                        thumbnail_height: 0,
+                        reply_markup: None,
+                        input_message_content: Some(Box::new(
+                            td_api::InputMessageContent::inputMessageText(
+                                td_api::inputMessageText {
+                                    text: Some(td_api::FormattedText {
+                                        text: "hi".to_owned(),
+                                        entities: Vec::new(),
+                                    }),
+                                    link_preview_options: None,
+                                    clear_draft: false,
+                                },
+                            ),
+                        )),
+                    },
+                ),
+            ),
+            Some(td_api::TargetChatTypes {
+                allow_user_chats: true,
+                allow_bot_chats: false,
+                allow_group_chats: false,
+                allow_channel_chats: false,
+            }),
+            promise,
+        );
+        assert_eq!(manager.pending.save_prepared_inline_message.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_save_prepared_inline_message_promise().is_some());
+    }
+
+    /// The answer_guest_query net-inert park band: the folded result
+    /// parks the promise in the guest-chat lot without a dispatch, and
+    /// the seam-parked `Ok(None)` band (the [blocked: M.17] rich message)
+    /// answers nothing (cpp:764-768).
+    #[test]
+    fn answer_guest_query_parks_net_inert() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<td_api::InlineMessageId>();
+        manager.answer_guest_query(
+            &mut env,
+            4242,
+            Some(td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                td_api::inputInlineQueryResultGame {
+                    id: "g1".to_owned(),
+                    game_short_name: "snake".to_owned(),
+                    reply_markup: None,
+                },
+            )),
+            promise,
+        );
+        assert_eq!(manager.pending.set_bot_guest_chat_result.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_set_bot_guest_chat_result_promise().is_some());
+
+        // the error band of the fold (cpp:767) — the bad phone number
+        let (promise, outcomes) = recording_promise::<td_api::InlineMessageId>();
+        manager.answer_guest_query(
+            &mut env,
+            4242,
+            Some(
+                td_api::InputInlineQueryResult::inputInlineQueryResultContact(
+                    td_api::inputInlineQueryResultContact {
+                        id: "c1".to_owned(),
+                        contact: Some(td_api::Contact {
+                            phone_number: " ".to_owned(),
+                            first_name: " ".to_owned(),
+                            last_name: String::new(),
+                            vcard: String::new(),
+                            user_id: 0,
+                        }),
+                        thumbnail_url: String::new(),
+                        thumbnail_width: 0,
+                        thumbnail_height: 0,
+                        reply_markup: None,
+                        input_message_content: None,
+                    },
+                ),
+            ),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Field \"phone_number\" must contain a valid phone number"
+        ));
+    }
+
+    /// The net-inert band of the whole send_inline_query ladder: the bot
+    /// gates pass (the bot data read, the peer resolve, the input-user
+    /// fetch), the query hash lands in the cache and the request promise
+    /// parks in the family lot — nothing dispatches and nothing answers
+    /// (the C++ request without a network).
+    #[test]
+    fn send_inline_query_parks_net_inert() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+        let (promise, outcomes) = recording_promise::<Option<td_api::InlineQueryResults>>();
+        manager.send_inline_query(
+            &mut env,
+            UserId::new(9),
+            DialogId::new(0),
+            Location::default(),
+            "weather",
+            "",
+            promise,
+        );
+        assert_eq!(manager.pending.get_inline_bot_results.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.next_inline_query_time > 0.0);
+
+        // the not-inline bot band (cpp:1354-1356)
+        let mut env = TestEnv {
+            inline: Vec::new(),
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<Option<td_api::InlineQueryResults>>();
+        manager.send_inline_query(
+            &mut env,
+            UserId::new(9),
+            DialogId::new(0),
+            Location::default(),
+            "weather",
+            "",
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Bot doesn't support inline queries"
+        ));
     }
 }
