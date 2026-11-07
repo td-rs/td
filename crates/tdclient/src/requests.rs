@@ -9317,6 +9317,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,

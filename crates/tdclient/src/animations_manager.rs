@@ -15,11 +15,11 @@
 //! (AnimationsManager.hpp).
 //!
 //! Deferred intakes:
-//! - `on_get_saved_animations`'s per-document conversion is the
-//!   [`AnimationsManagerEnv::on_get_document_animation`] seam
-//!   `[blocked: M.28 DocumentsManager]`; the manager-side control flow
-//!   (ctor checks, the empty/non-animation skips, the repair split and
-//!   the hash fold) is fully ported and tested against wire shapes.
+//! - `on_get_saved_animations`'s per-document conversion rides the real
+//!   documents intake through the split walk ([`walk_saved_animations`]);
+//!   the manager-side control flow (the empty/non-animation skips, the
+//!   repair split and the hash fold) is fully ported and tested against
+//!   wire shapes.
 //! - `get_secret_input_media` is not ported — it builds the
 //!   `SecretInputMedia` value (SecretInputMedia.h), which lands with the
 //!   secret-chat line (`[blocked: SecretInputMedia]`).
@@ -59,6 +59,14 @@ pub trait AnimationsManagerEnv: DialogPhotoStoreEnv {
     /// `send_closure(G()->td(), &Td::send_update, ...)`.
     fn send_update(&mut self, update: td_api::Update);
 
+    // -- the G() error surface
+    /// `G()->is_expected_error(status)` (Global.h:723-737) — the
+    /// `on_error` log heads (the device-token/secure trait convention;
+    /// the default answers false).
+    fn is_expected_error(&self, _status: &tdutils::status::Status) -> bool {
+        false
+    }
+
     // -- the cross-manager surfaces
     /// The `FileManager` handle behind the file-view probes
     /// (`td_->file_manager_->get_file_view/get_file_object/merge`).
@@ -91,12 +99,6 @@ pub trait AnimationsManagerEnv: DialogPhotoStoreEnv {
         input_document: telegram_api::InputDocument,
         promise: Promise<()>,
     );
-
-    // -- the `[blocked: M.28 DocumentsManager]` intake seam
-    /// `td_->documents_manager_->on_get_document(std::move(document), ...)`
-    /// — answers `None` until the document plane lands, which the caller
-    /// handles exactly like the C++ non-animation case.
-    fn on_get_document_animation(&mut self, document: telegram_api::document) -> Option<FileId>;
 }
 
 /// `AnimationsManager::Animation` (AnimationsManager.h:103-117).
@@ -452,11 +454,14 @@ impl AnimationsManager {
         }
     }
 
-    /// `create_animation` (AnimationsManager.cpp:264-282).
+    /// `create_animation` (AnimationsManager.cpp:264-282) — the only env
+    /// read is `auth_is_bot` (the minithumbnail drop, cpp:271-273), so
+    /// the record dispatch takes the bool directly (the documents intake
+    /// envs route without an animations env build).
     #[allow(clippy::too_many_arguments)]
     pub fn create_animation(
         &mut self,
-        env: &mut impl AnimationsManagerEnv,
+        auth_is_bot: bool,
         file_id: FileId,
         minithumbnail: String,
         thumbnail: PhotoSize,
@@ -481,7 +486,7 @@ impl AnimationsManager {
             has_stickers,
             sticker_file_ids,
         };
-        if !env.auth_is_bot() {
+        if !auth_is_bot {
             a.minithumbnail = minithumbnail;
         }
         self.on_get_animation(a, replace);
@@ -834,13 +839,18 @@ impl AnimationsManager {
         }
     }
 
-    /// `on_get_saved_animations` (AnimationsManager.cpp:558-608); the
-    /// per-document conversion rides the DocumentsManager seam.
+    /// `on_get_saved_animations` (AnimationsManager.cpp:558-608) — the
+    /// state-machine half. The per-document conversion (cpp:584-589)
+    /// runs in [`walk_saved_animations`] over the documents intake: the
+    /// C++ hop re-enters `animations_manager_->create_animation` while
+    /// this method is live on the manager, which the collapsed line's
+    /// field-split envs keep borrow-disjoint (the router-side walk — the
+    /// saved-music convention, td.rs `GetUserSavedMusicById`).
     pub fn on_get_saved_animations(
         &mut self,
         env: &mut impl AnimationsManagerEnv,
         is_repair: bool,
-        saved_animations_ptr: telegram_api::messages_SavedGifs,
+        walk: SavedGifsWalk,
     ) {
         assert!(!env.auth_is_bot());
         if !is_repair {
@@ -849,56 +859,30 @@ impl AnimationsManager {
                 tdutils::time::now_cached() + tdutils::random::fast(30 * 60, 50 * 60) as f64;
         }
 
-        match saved_animations_ptr {
-            telegram_api::messages_SavedGifs::messages_savedGifsNotModified(_) => {
-                if is_repair {
-                    return self.on_get_saved_animations_failed(
-                        true,
-                        tdutils::status::Status::error(500, "Failed to reload saved animations"),
-                    );
-                }
-                tdutils::log_info!("Saved animations are not modified");
-            }
-            telegram_api::messages_SavedGifs::messages_savedGifs(saved_animations) => {
-                tdutils::log_info!(
-                    "Receive {} saved animations from server",
-                    saved_animations.gifs.len()
+        if walk.not_modified {
+            if is_repair {
+                return self.on_get_saved_animations_failed(
+                    true,
+                    tdutils::status::Status::error(500, "Failed to reload saved animations"),
                 );
+            }
+            tdutils::log_info!("Saved animations are not modified");
+            return;
+        }
 
-                let mut saved_animation_ids: Vec<FileId> = Vec::new();
-                for document in saved_animations.gifs {
-                    match document {
-                        telegram_api::Document::documentEmpty(_) => {
-                            tdutils::log_error!("Empty saved animation document received");
-                        }
-                        telegram_api::Document::document(document) => {
-                            let Some(document_file_id) = env.on_get_document_animation(document)
-                            else {
-                                tdutils::log_error!("Receive non-animation as saved animation");
-                                continue;
-                            };
-                            if !is_repair {
-                                saved_animation_ids.push(document_file_id);
-                            }
-                        }
-                    }
-                }
+        if is_repair {
+            set_promises(&mut self.repair_saved_animations_queries);
+        } else {
+            self.on_load_saved_animations_finished(env, walk.animation_ids, false);
 
-                if is_repair {
-                    set_promises(&mut self.repair_saved_animations_queries);
-                } else {
-                    self.on_load_saved_animations_finished(env, saved_animation_ids, false);
-
-                    let source = "on_get_saved_animations";
-                    let calculated_hash = self.get_saved_animations_hash(env, source);
-                    if calculated_hash != saved_animations.hash {
-                        tdutils::log_error!(
-                            "Saved animations hash mismatch: {} vs {}",
-                            saved_animations.hash,
-                            calculated_hash
-                        );
-                    }
-                }
+            let source = "on_get_saved_animations";
+            let calculated_hash = self.get_saved_animations_hash(env, source);
+            if calculated_hash != walk.wire_hash {
+                tdutils::log_error!(
+                    "Saved animations hash mismatch: {} vs {}",
+                    walk.wire_hash,
+                    calculated_hash
+                );
             }
         }
     }
@@ -1403,6 +1387,83 @@ impl AnimationsManager {
 // collapsed-line convention, recorded at
 // `AnimationsManagerEnv::send_save_gif_query_net`).
 
+/// The walked shape of a `messages.savedGifs` answer — the input of the
+/// [`AnimationsManager::on_get_saved_animations`] state machine.
+pub struct SavedGifsWalk {
+    /// The `messages.savedGifsNotModified` arm (cpp:566-573).
+    pub not_modified: bool,
+    /// The walked `document` ids — only the Animation-classified
+    /// documents (cpp:575-604); empty on the not-modified/repair forms.
+    pub animation_ids: Vec<FileId>,
+    /// The wire `hash` field (the manager-side mismatch check,
+    /// cpp:604-607).
+    pub wire_hash: i64,
+}
+
+/// The documents-walk half of `on_get_saved_animations`
+/// (AnimationsManager.cpp:575-604): the `td_->documents_manager_->
+/// on_get_document(...)` loop over the split env. The C++ inline hop
+/// re-enters `animations_manager_->create_animation` while the answer
+/// half is live on the manager; the port runs the walk WITHOUT the
+/// manager as a live receiver — the documents intake env routes the
+/// record dispatch (the `TdDocumentsEnv.animations` field), then the
+/// caller feeds [`SavedGifsWalk`] into the manager. The C++ passes the
+/// default intake arguments (cpp:584-586 — `DialogId()`, the General
+/// default type); the Animation classification comes from
+/// `documentAttributeAnimated`.
+pub fn walk_saved_animations(
+    documents: &mut crate::documents_manager::DocumentsManager,
+    documents_env: &mut impl crate::documents_manager::DocumentsManagerEnv,
+    saved_animations_ptr: telegram_api::messages_SavedGifs,
+) -> SavedGifsWalk {
+    let telegram_api::messages_SavedGifs::messages_savedGifs(saved_animations) =
+        saved_animations_ptr
+    else {
+        return SavedGifsWalk {
+            not_modified: true,
+            animation_ids: Vec::new(),
+            wire_hash: 0,
+        };
+    };
+    tdutils::log_info!(
+        "Receive {} saved animations from server",
+        saved_animations.gifs.len()
+    );
+
+    let mut saved_animation_ids: Vec<FileId> = Vec::new();
+    for document in saved_animations.gifs {
+        match document {
+            telegram_api::Document::documentEmpty(_) => {
+                tdutils::log_error!("Empty saved animation document received");
+            }
+            telegram_api::Document::document(document) => {
+                let parsed = documents.on_get_document(
+                    documents_env,
+                    crate::documents_manager::RemoteDocument::from_server_document(document),
+                    crate::message_id::DialogId::default(),
+                    false,
+                    false,
+                    crate::document::DocumentType::General,
+                    crate::documents_manager::Subtype::Other,
+                );
+                if parsed.type_ != crate::document::DocumentType::Animation {
+                    tdutils::log_error!(
+                        "Receive {:?} instead of animation as saved animation",
+                        parsed.type_
+                    );
+                    continue;
+                }
+                saved_animation_ids.push(parsed.file_id);
+            }
+        }
+    }
+    SavedGifsWalk {
+        not_modified: false,
+        animation_ids: saved_animation_ids,
+        wire_hash: saved_animations.hash,
+    }
+}
+
 /// `td_->file_manager_->get_input_file_id(FileType::Animation,
 /// input_file, DialogId(), false, false)` (AnimationsManager.cpp:644-645,
 /// 750-751) with the C++ default arguments.
@@ -1612,8 +1673,6 @@ mod tests {
         queries: Vec<String>,
         is_bot: bool,
         use_sqlite: bool,
-        /// the `[blocked: M.28 DocumentsManager]` seam answer
-        document_animation: Option<FileId>,
     }
 
     impl Default for TestEnv {
@@ -1630,7 +1689,6 @@ mod tests {
                 queries: Vec::new(),
                 is_bot: false,
                 use_sqlite: true,
-                document_animation: None,
             }
         }
     }
@@ -1792,13 +1850,6 @@ mod tests {
                 .push(format!("save_gif {} unsave={unsave}", file_id.get()));
             drop(promise);
         }
-
-        fn on_get_document_animation(
-            &mut self,
-            _document: telegram_api::document,
-        ) -> Option<FileId> {
-            self.document_animation
-        }
     }
 
     /// Builds a fully populated animation over `file_id` and returns the
@@ -1833,7 +1884,7 @@ mod tests {
             main_frame_timestamp: 1.5,
         };
         manager.create_animation(
-            env,
+            env.is_bot,
             file_id,
             "\u{1}\u{0}\u{0}packed".to_owned(),
             thumbnail,
@@ -1969,7 +2020,7 @@ mod tests {
         let id3 = env.register_animation_file(300);
         for file_id in [id1, id2, id3] {
             manager.create_animation(
-                &mut env,
+                env.is_bot,
                 file_id,
                 String::new(),
                 PhotoSize::default(),
@@ -2058,7 +2109,7 @@ mod tests {
         // only MPEG4 animations can be saved
         let webm_id = env.register_animation_file(400);
         manager.create_animation(
-            &mut env,
+            env.is_bot,
             webm_id,
             String::new(),
             PhotoSize::default(),
@@ -2149,7 +2200,7 @@ mod tests {
         let id2 = env.register_animation_file(600);
         for file_id in [id1, id2] {
             manager.create_animation(
-                &mut env,
+                env.is_bot,
                 file_id,
                 String::new(),
                 PhotoSize::default(),
@@ -2215,33 +2266,220 @@ mod tests {
         assert!(updates.is_empty());
     }
 
-    /// `on_get_saved_animations` (AnimationsManager.cpp:558-608): the
-    /// documentEmpty skip, the DocumentsManager seam answering non-animations,
-    /// the loaded flip and the hash fold over the real remote locations.
+    /// The documents-intake env of the walk tests: the real
+    /// [`crate::documents_manager::DocumentsManagerEnv`] over the shared
+    /// FileManager, with the walk's animation-record dispatch landing in
+    /// the carried manager (the `TdDocumentsEnv.animations` route).
+    /// The load-net stub of the walk tests (the documents-test env
+    /// convention — the intake registers remote locations only).
+    struct StubLoadNet;
+    impl crate::files::FileDownloaderNet for StubLoadNet {
+        fn download(
+            &mut self,
+            _query: crate::files::DownloadQuery,
+            _query_type: crate::files::DownloadQueryType,
+            _meta: crate::files::DownloadNetMeta,
+        ) -> std::result::Result<crate::files::DownloadResult, tdutils::status::Status> {
+            Err(tdutils::status::Status::error(400, "Not connected"))
+        }
+        fn open_temp_file(
+            &mut self,
+            _file_type: crate::files::FileType,
+        ) -> std::result::Result<(std::fs::File, String), tdutils::status::Status> {
+            Err(tdutils::status::Status::error_message(
+                "no temp files in this test",
+            ))
+        }
+        fn open_partial_file(
+            &mut self,
+            _path: &str,
+            _write: bool,
+        ) -> std::result::Result<std::fs::File, tdutils::status::Status> {
+            Err(tdutils::status::Status::error_message(
+                "no partial files in this test",
+            ))
+        }
+        fn create_from_temp(
+            &mut self,
+            _file_type: crate::files::FileType,
+            _path: &str,
+            _name: &str,
+        ) -> std::result::Result<String, tdutils::status::Status> {
+            Err(tdutils::status::Status::error_message(
+                "no temp files in this test",
+            ))
+        }
+    }
+    impl crate::files::FileLoadNetFactory for StubLoadNet {
+        fn download_net(&mut self) -> Box<dyn crate::files::FileDownloaderNet> {
+            Box::new(StubLoadNet)
+        }
+        fn upload_net(&mut self) -> Box<dyn crate::files::FileUploaderNet> {
+            unreachable!("no uploads in these tests")
+        }
+        fn hash_net(&mut self) -> Box<dyn crate::files::FileHashUploaderNet> {
+            unreachable!("no hash uploads in these tests")
+        }
+        fn utils_net(&mut self) -> Box<dyn crate::files::FileDownloaderNet> {
+            self.download_net()
+        }
+    }
+
+    /// The documents-intake env of the walk tests: the real
+    /// [`crate::documents_manager::DocumentsManagerEnv`] over the shared
+    /// FileManager, with the walk's animation-record dispatch landing in
+    /// the carried manager (the `TdDocumentsEnv.animations` route).
+    struct WalkDocumentsEnv<'a> {
+        files: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+        loads: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
+        animations: &'a mut AnimationsManager,
+    }
+
+    impl crate::photo::DialogPhotoStoreEnv for WalkDocumentsEnv<'_> {
+        fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+            self.files.lock().store_file(file_id, out);
+        }
+
+        fn parse_file_id(&mut self, parser: &mut Parser<'_>) -> Result<FileId, &'static str> {
+            self.files.lock().parse_file(parser)
+        }
+    }
+
+    impl crate::documents_manager::DocumentsManagerEnv for WalkDocumentsEnv<'_> {
+        fn auth_is_bot(&self) -> bool {
+            false
+        }
+
+        fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+            std::sync::Arc::clone(&self.files)
+        }
+
+        fn file_load_manager(
+            &self,
+        ) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>> {
+            std::sync::Arc::clone(&self.loads)
+        }
+
+        fn create_animation(
+            &mut self,
+            file_id: FileId,
+            minithumbnail: String,
+            thumbnail: PhotoSize,
+            animated_thumbnail: AnimationSize,
+            has_stickers: bool,
+            file_name: String,
+            mime_type: String,
+            duration: i32,
+            dimensions: crate::photo::Dimensions,
+            replace: bool,
+        ) {
+            // the C++ `animations_manager_->create_animation` route with
+            // the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+            self.animations.create_animation(
+                false,
+                file_id,
+                minithumbnail,
+                thumbnail,
+                animated_thumbnail,
+                has_stickers,
+                Vec::new(),
+                file_name,
+                mime_type,
+                duration,
+                dimensions,
+                replace,
+            );
+        }
+
+        // the walk answers only Animation-classified documents; the
+        // other record arms are unreachable no-ops (the documents-test
+        // env convention)
+        fn create_sticker(
+            &mut self,
+            _file_id: FileId,
+            _premium_animation_file_id: FileId,
+            _minithumbnail: String,
+            _thumbnail: PhotoSize,
+            _dimensions: crate::photo::Dimensions,
+            _sticker: Option<telegram_api::documentAttributeSticker>,
+            _custom_emoji: Option<telegram_api::documentAttributeCustomEmoji>,
+            _sticker_format: crate::documents_manager::StickerFormat,
+        ) {
+        }
+
+        fn create_audio(
+            &mut self,
+            _file_id: FileId,
+            _minithumbnail: String,
+            _thumbnail: PhotoSize,
+            _file_name: String,
+            _mime_type: String,
+            _duration: i32,
+            _title: String,
+            _performer: String,
+            _date: i32,
+            _replace: bool,
+        ) {
+        }
+
+        fn create_video(
+            &mut self,
+            _file_id: FileId,
+            _minithumbnail: String,
+            _thumbnail: PhotoSize,
+            _animated_thumbnail: AnimationSize,
+            _has_stickers: bool,
+            _sticker_file_ids: Vec<FileId>,
+            _file_name: String,
+            _mime_type: String,
+            _duration: i32,
+            _precise_duration: f64,
+            _dimensions: crate::photo::Dimensions,
+            _supports_streaming: bool,
+            _is_animation: bool,
+            _preload_prefix_size: i32,
+            _start_ts: f64,
+            _codec: String,
+            _replace: bool,
+        ) {
+        }
+
+        fn create_video_note(
+            &mut self,
+            _file_id: FileId,
+            _minithumbnail: String,
+            _thumbnail: PhotoSize,
+            _duration: i32,
+            _dimensions: crate::photo::Dimensions,
+            _waveform: String,
+            _replace: bool,
+        ) {
+        }
+
+        fn create_voice_note(
+            &mut self,
+            _file_id: FileId,
+            _mime_type: String,
+            _duration: i32,
+            _waveform: String,
+            _replace: bool,
+        ) {
+        }
+    }
+
+    /// `on_get_saved_animations` (AnimationsManager.cpp:558-608) over the
+    /// split walk: the documentEmpty skip, the real documents intake (the
+    /// record dispatch + the non-animation skip), the loaded flip and the
+    /// hash fold over the real remote locations.
     #[test]
     fn saved_animations_intake_skips_and_folds() {
         let mut env = TestEnv::default();
         let mut manager = AnimationsManager::new();
-        let id1 = env.register_animation_file(700);
-        manager.create_animation(
-            &mut env,
-            id1,
-            String::new(),
-            PhotoSize::default(),
-            AnimationSize::default(),
-            false,
-            Vec::new(),
-            "d.mp4".to_owned(),
-            "video/mp4".to_owned(),
-            1,
-            crate::photo::get_dimensions(30, 30, "test intake"),
-            true,
-        );
 
-        // the intake seam answers id1 for any document (the M.28 DocumentsManager
-        // half); both wire shapes are exercised
-        env.document_animation = Some(id1);
-        let minimal_document = telegram_api::document {
+        // the walk documents: an empty document (skip), an animated
+        // document (the real intake → Animation), a non-animated document
+        // (the General classification → skip)
+        let animated_document = telegram_api::document {
             flags: 0,
             id: 700,
             access_hash: 42,
@@ -2252,49 +2490,132 @@ mod tests {
             thumbs: Vec::new(),
             video_thumbs: Vec::new(),
             dc_id: 2,
+            attributes: vec![telegram_api::DocumentAttribute::documentAttributeAnimated(
+                telegram_api::documentAttributeAnimated,
+            )],
+        };
+        let general_document = telegram_api::document {
+            id: 701,
             attributes: Vec::new(),
+            ..animated_document.clone()
         };
         let saved_gifs = telegram_api::messages_SavedGifs::messages_savedGifs(
             telegram_api::messages_savedGifs {
                 hash: crate::misc::get_vector_hash(&[700]),
                 gifs: vec![
                     telegram_api::Document::documentEmpty(telegram_api::documentEmpty { id: 1 }),
-                    telegram_api::Document::document(minimal_document.clone()),
+                    telegram_api::Document::document(animated_document),
+                    telegram_api::Document::document(general_document),
                 ],
             },
         );
-        manager.on_get_saved_animations(&mut env, false, saved_gifs);
+
+        // the walk runs over the REAL documents intake; the animation
+        // record lands in the carried manager, the file registers in the
+        // shared FileManager
+        let mut documents = crate::documents_manager::DocumentsManager::new();
+        let mut walk_env = WalkDocumentsEnv {
+            files: std::sync::Arc::clone(&env.files),
+            loads: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::files::FileLoadManager::new(
+                    Box::new(StubLoadNet),
+                    crate::files::FileLoadManagerOptions::default(),
+                ),
+            )),
+            animations: &mut manager,
+        };
+        let walk = walk_saved_animations(&mut documents, &mut walk_env, saved_gifs);
+        assert!(!walk.not_modified);
+        assert_eq!(walk.animation_ids.len(), 1, "the skips dropped the rest");
+        let animation_id = walk.animation_ids[0];
+        // the registered remote location carries the wire document id
+        let full_remote = env
+            .files
+            .lock()
+            .get_file_view(animation_id)
+            .unwrap()
+            .get_full_remote_location()
+            .unwrap()
+            .clone();
+        assert!(full_remote.is_document());
+        assert_eq!(full_remote.get_id(), 700);
+        assert_eq!(walk.wire_hash, crate::misc::get_vector_hash(&[700]));
+        // the record dispatch built the Animation record
+        let animation = manager.get_animation(animation_id).unwrap();
+        assert_eq!(animation.mime_type, "video/mp4");
+        assert_eq!(animation.file_name, "");
+
+        // the finish: the ring loads, the update fires, the hash fold
+        // matches the wire hash
+        manager.on_get_saved_animations(&mut env, false, walk);
         assert!(manager.are_saved_animations_loaded);
-        assert_eq!(manager.saved_animation_ids, vec![id1]);
-        // the hash check passed (no error-only updates in between)
+        assert_eq!(manager.saved_animation_ids, vec![animation_id]);
         assert!(matches!(
             env.updates.last(),
             Some(td_api::Update::updateSavedAnimations(_))
         ));
-
-        // the seam answering None is the C++ non-animation skip
-        env.document_animation = None;
-        let mut manager2 = AnimationsManager::new();
-        let saved_gifs = telegram_api::messages_SavedGifs::messages_savedGifs(
-            telegram_api::messages_savedGifs {
-                hash: 0,
-                gifs: vec![telegram_api::Document::document(minimal_document)],
-            },
-        );
-        manager2.on_get_saved_animations(&mut env, false, saved_gifs);
-        assert!(manager2.are_saved_animations_loaded);
-        assert!(manager2.saved_animation_ids.is_empty());
 
         // savedGifsNotModified on a repair fails the repair promises
         let mut manager3 = AnimationsManager::new();
         let (promise, fulfilled, failed, _) = flag_promise();
         manager3.repair_saved_animations(&mut env, promise);
         assert!(!fulfilled.load(std::sync::atomic::Ordering::SeqCst));
-        let not_modified = telegram_api::messages_SavedGifs::messages_savedGifsNotModified(
-            telegram_api::messages_savedGifsNotModified,
+        manager3.on_get_saved_animations(
+            &mut env,
+            true,
+            SavedGifsWalk {
+                not_modified: true,
+                animation_ids: Vec::new(),
+                wire_hash: 0,
+            },
         );
-        manager3.on_get_saved_animations(&mut env, true, not_modified);
         assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
+
+        // the repair form over a real answer settles the repair promises
+        // but never rebuilds the ring (cpp:591-597)
+        let mut manager4 = AnimationsManager::new();
+        let (promise, fulfilled, failed, _) = flag_promise();
+        manager4.repair_saved_animations(&mut env, promise);
+        let saved_gifs = telegram_api::messages_SavedGifs::messages_savedGifs(
+            telegram_api::messages_savedGifs {
+                hash: 0,
+                gifs: vec![telegram_api::Document::document(telegram_api::document {
+                    flags: 0,
+                    id: 700,
+                    access_hash: 42,
+                    file_reference: Vec::new(),
+                    date: 0,
+                    mime_type: "video/mp4".to_owned(),
+                    size: 1000,
+                    thumbs: Vec::new(),
+                    video_thumbs: Vec::new(),
+                    dc_id: 2,
+                    attributes: vec![telegram_api::DocumentAttribute::documentAttributeAnimated(
+                        telegram_api::documentAttributeAnimated,
+                    )],
+                })],
+            },
+        );
+        let mut documents = crate::documents_manager::DocumentsManager::new();
+        let mut walk_env = WalkDocumentsEnv {
+            files: std::sync::Arc::clone(&env.files),
+            loads: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::files::FileLoadManager::new(
+                    Box::new(StubLoadNet),
+                    crate::files::FileLoadManagerOptions::default(),
+                ),
+            )),
+            animations: &mut manager4,
+        };
+        let walk = walk_saved_animations(&mut documents, &mut walk_env, saved_gifs);
+        assert_eq!(walk.animation_ids.len(), 1);
+        manager4.on_get_saved_animations(&mut env, true, walk);
+        assert!(fulfilled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!failed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            manager4.saved_animation_ids.is_empty(),
+            "the repair form never rebuilds the ring"
+        );
     }
 
     /// `get_saved_animations_hash` (AnimationsManager.cpp:619-635) folds the
@@ -2307,7 +2628,7 @@ mod tests {
         let id2 = env.register_animation_file(900);
         for file_id in [id1, id2] {
             manager.create_animation(
-                &mut env,
+                env.is_bot,
                 file_id,
                 String::new(),
                 PhotoSize::default(),
@@ -2423,7 +2744,7 @@ mod tests {
         let mut manager = AnimationsManager::new();
         let old_id = env.register_animation_file(1100);
         manager.create_animation(
-            &mut env,
+            env.is_bot,
             old_id,
             String::new(),
             PhotoSize::default(),
@@ -2446,7 +2767,7 @@ mod tests {
 
         // the same name with the ".mp4" suffix — no file merge needed
         manager.create_animation(
-            &mut env,
+            env.is_bot,
             new_id,
             String::new(),
             PhotoSize::default(),
@@ -2467,7 +2788,7 @@ mod tests {
         // the real FileManager merge)
         let other_id = env.register_animation_file(1102);
         manager.create_animation(
-            &mut env,
+            env.is_bot,
             other_id,
             String::new(),
             PhotoSize::default(),
@@ -2498,7 +2819,7 @@ mod tests {
         let mut manager = AnimationsManager::new();
         let id1 = env.register_animation_file(1200);
         manager.create_animation(
-            &mut env,
+            env.is_bot,
             id1,
             String::new(),
             PhotoSize::default(),

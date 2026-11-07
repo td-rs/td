@@ -9980,6 +9980,7 @@ impl Td {
             file_manager,
             file_load_manager,
             documents_manager,
+            animations_manager,
             videos_manager,
             audios_manager,
             voice_notes_manager,
@@ -9997,6 +9998,7 @@ impl Td {
             file_manager: file_manager.clone(),
             file_load_manager: std::sync::Arc::clone(file_load_manager),
             documents: documents_manager,
+            animations: animations_manager,
             videos: videos_manager,
             audios: audios_manager,
             voice_notes: voice_notes_manager,
@@ -23031,6 +23033,7 @@ impl Td {
                 file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
                 file_reference_manager: &mut self.file_reference_manager,
                 documents_manager: &mut self.documents_manager,
+                animations: &mut self.animations_manager,
                 audios: &mut self.audios_manager,
                 videos: &mut self.videos_manager,
                 voice_notes: &mut self.voice_notes_manager,
@@ -29362,6 +29365,7 @@ impl Td {
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
             file_reference_manager: &mut self.file_reference_manager,
             documents_manager: &mut self.documents_manager,
+            animations: &mut self.animations_manager,
             audios: &mut self.audios_manager,
             videos: &mut self.videos_manager,
             voice_notes: &mut self.voice_notes_manager,
@@ -32008,12 +32012,8 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
         }
     }
 
-    fn on_get_document_animation(&mut self, _document: telegram_api::document) -> Option<FileId> {
-        // `td_->documents_manager_->on_get_document` — the
-        // [blocked: M.28] intake seam; answers None until the document
-        // plane lands, which the caller handles like the C++
-        // non-animation case.
-        None
+    fn is_expected_error(&self, status: &tdutils::status::Status) -> bool {
+        self.global.is_expected_error(status)
     }
 
     fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64) {
@@ -32047,11 +32047,14 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
 
 /// The field-split [`crate::documents_manager::DocumentsManagerEnv`]
 /// of the `on_get_document` intake: the document manager itself plus
-/// the disjoint sibling records its `create_*` tails build.
+/// the disjoint sibling records its `create_*` tails build — the
+/// animations manager carries the record dispatch
+/// (`animations_manager_->create_animation`, DocumentsManager.cpp:552).
 pub(crate) struct TdDocumentsEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
+    pub(crate) animations: &'a mut crate::animations_manager::AnimationsManager,
     pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
     pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
     pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -32088,22 +32091,33 @@ impl crate::documents_manager::DocumentsManagerEnv for TdDocumentsEnv<'_> {
 
     fn create_animation(
         &mut self,
-        _file_id: FileId,
-        _minithumbnail: String,
-        _thumbnail: crate::photo::PhotoSize,
-        _animated_thumbnail: crate::photo::AnimationSize,
-        _has_stickers: bool,
-        _file_name: String,
-        _mime_type: String,
-        _duration: i32,
-        _dimensions: crate::photo::Dimensions,
-        _replace: bool,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
     ) {
         // the C++ routes this to `animations_manager_->create_animation`
-        // (with the empty sticker-file-ids vector); the animation record
-        // dispatch rides the M.20 env construction at the message-content
-        // intake flip
-        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+        // with the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+        self.animations.create_animation(
+            self.auth_is_bot,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
     }
 
     fn create_sticker(
@@ -32254,16 +32268,8 @@ impl crate::documents_manager::DocumentsManagerEnv for Td {
     ) {
         // the C++ DocumentsManager dispatch passes the empty
         // sticker-file-ids vector (DocumentsManager.cpp:552-554)
-        let mut env = TdAnimationsEnv {
-            global: &mut self.global,
-            options: self.option_manager.as_mut(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            file_manager: std::sync::Arc::clone(&self.file_manager),
-            file_reference_manager: &mut self.file_reference_manager,
-            updates: &mut self.animations_updates,
-        };
         self.animations_manager.create_animation(
-            &mut env,
+            self.auth_manager.is_bot(),
             file_id,
             minithumbnail,
             thumbnail,
@@ -32411,6 +32417,7 @@ impl Td {
                 auth_is_bot: self.auth_manager.is_bot(),
                 file_manager: std::sync::Arc::clone(&self.file_manager),
                 file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+                animations: &mut self.animations_manager,
                 audios: &mut self.audios_manager,
                 videos: &mut self.videos_manager,
                 voice_notes: &mut self.voice_notes_manager,
@@ -42754,6 +42761,7 @@ pub(crate) struct ThemeEnv<'a> {
     pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
     pub(crate) documents_manager: &'a mut crate::documents_manager::DocumentsManager,
+    pub(crate) animations: &'a mut crate::animations_manager::AnimationsManager,
     pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
     pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
     pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -42782,21 +42790,33 @@ impl crate::documents_manager::DocumentsManagerEnv for ThemeEnv<'_> {
 
     fn create_animation(
         &mut self,
-        _file_id: FileId,
-        _minithumbnail: String,
-        _thumbnail: crate::photo::PhotoSize,
-        _animated_thumbnail: crate::photo::AnimationSize,
-        _has_stickers: bool,
-        _file_name: String,
-        _mime_type: String,
-        _duration: i32,
-        _dimensions: crate::photo::Dimensions,
-        _replace: bool,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
     ) {
         // the C++ routes this to `animations_manager_->create_animation`
-        // (the TdDocumentsEnv collapse; the theme path never creates
-        // animation records)
-        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+        // with the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+        self.animations.create_animation(
+            self.auth_is_bot,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
     }
 
     fn create_sticker(
@@ -42973,6 +42993,7 @@ impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations: self.animations,
             audios: self.audios,
             videos: self.videos,
             voice_notes: self.voice_notes,
@@ -43005,6 +43026,7 @@ impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations: self.animations,
             audios: self.audios,
             videos: self.videos,
             voice_notes: self.voice_notes,
@@ -43022,6 +43044,7 @@ impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations: self.animations,
             audios: self.audios,
             videos: self.videos,
             voice_notes: self.voice_notes,
@@ -46021,6 +46044,7 @@ pub(crate) struct StoryEnv<'a> {
     pub file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub documents: &'a mut crate::documents_manager::DocumentsManager,
+    pub animations: &'a mut crate::animations_manager::AnimationsManager,
     pub videos: &'a mut crate::videos_manager::VideosManager,
     pub audios: &'a mut crate::audios_manager::AudiosManager,
     pub voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -46458,10 +46482,12 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
         // `DocumentsManager::on_get_document(..., Type::Video, Subtype::Story)`
         // (StoryContent.cpp:257-266)
         let documents = &mut *self.documents;
+        let animations = &mut *self.animations;
         let mut env = TdDocumentsEnv {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations,
             audios: &mut *self.audios,
             videos: &mut *self.videos,
             voice_notes: &mut *self.voice_notes,
@@ -47926,6 +47952,7 @@ pub(crate) fn web_pages_env_split(
         file_load_manager,
         file_reference_manager,
         documents_manager,
+        animations_manager,
         audios_manager,
         videos_manager,
         voice_notes_manager,
@@ -47944,6 +47971,7 @@ pub(crate) fn web_pages_env_split(
             file_load_manager: std::sync::Arc::clone(file_load_manager),
             file_reference_manager,
             documents: documents_manager,
+            animations: animations_manager,
             audios: audios_manager,
             videos: videos_manager,
             voice_notes: voice_notes_manager,
@@ -47966,6 +47994,7 @@ pub(crate) struct TdWebPagesEnv<'a> {
     pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
     pub(crate) documents: &'a mut crate::documents_manager::DocumentsManager,
+    pub(crate) animations: &'a mut crate::animations_manager::AnimationsManager,
     pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
     pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
     pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -48003,18 +48032,33 @@ impl crate::documents_manager::DocumentsManagerEnv for TdWebPagesEnv<'_> {
 
     fn create_animation(
         &mut self,
-        _file_id: FileId,
-        _minithumbnail: String,
-        _thumbnail: crate::photo::PhotoSize,
-        _animated_thumbnail: crate::photo::AnimationSize,
-        _has_stickers: bool,
-        _file_name: String,
-        _mime_type: String,
-        _duration: i32,
-        _dimensions: crate::photo::Dimensions,
-        _replace: bool,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
     ) {
-        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+        // the C++ routes this to `animations_manager_->create_animation`
+        // with the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+        self.animations.create_animation(
+            self.auth_is_bot,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
     }
 
     fn create_sticker(
@@ -48433,10 +48477,12 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
             return None;
         };
         let documents = &mut *self.documents;
+        let animations = &mut *self.animations;
         let mut env = TdDocumentsEnv {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations,
             audios: &mut *self.audios,
             videos: &mut *self.videos,
             voice_notes: &mut *self.voice_notes,
@@ -73560,6 +73606,7 @@ mod tests {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
@@ -73610,6 +73657,7 @@ mod tests {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
@@ -73665,6 +73713,7 @@ mod tests {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
