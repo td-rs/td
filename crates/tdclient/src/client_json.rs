@@ -323,6 +323,26 @@ mod tests {
     }
 
     #[test]
+    fn from_response_escapes_non_ascii_like_the_cpp_json_string() {
+        // The tdjson output surface serializes strings through td's
+        // JsonString (tdutils/td/utils/JsonBuilder.cpp:60): named escapes
+        // for \" \\ \b \f \n \r \t, other controls as lowercase \uXXXX,
+        // EVERY non-ASCII codepoint as lowercase \uXXXX with astral chars
+        // as UTF-16 surrogate pairs, and DEL (0x7f) raw. Byte-pinned to the
+        // S12 oracle sample (conformance/tl_json_oracle/dump_json.cpp
+        // "error"), the evidence class the M.8 golden round-trip could
+        // not provide (issue #72).
+        let object = Object::error(td_api::Error {
+            code: -42,
+            message: "line1\n\"quoted\" \\ \u{1} é中😀 tab\tend\u{8}\u{c}\r \u{7f} del".to_string(),
+        });
+        assert_eq!(
+            from_response(&object, "", 0),
+            "{\"@type\":\"error\",\"code\":-42,\"message\":\"line1\\n\\\"quoted\\\" \\\\ \\u0001 \\u00e9\\u4e2d\\ud83d\\ude00 tab\\tend\\b\\f\\r \u{7f} del\"}"
+        );
+    }
+
+    #[test]
     fn legacy_client_execute_round_trips() {
         let client = ClientJson::new();
         assert_eq!(
