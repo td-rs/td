@@ -59,6 +59,7 @@ use crate::files::FileId;
 use crate::link_manager;
 use crate::message_entity::{FormattedText, get_first_url};
 use crate::misc::{add_to_top, clean_input_string, is_base64url_characters, to_integer_i64};
+use crate::requested_dialog_type::RequestedDialogType;
 use crate::target_dialog_types::TargetDialogTypes;
 use crate::td_api;
 use crate::user_manager::{BotData, UserId};
@@ -697,14 +698,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `GetRequestedWebViewButtonQuery` (InlineQueriesManager.cpp:297-337).
-    fn send_get_requested_web_view_button_query(
-        &mut self,
-        query: telegram_api::bots_getRequestedWebViewButton,
-        bot_user_id: UserId,
-        prepared_button_id: String,
-        promise: Promise<td_api::KeyboardButton>,
-    );
     /// `RequestSimpleWebViewQuery` (InlineQueriesManager.cpp:339-396).
     fn send_request_simple_web_view_query(
         &mut self,
@@ -867,6 +860,12 @@ pub(crate) enum InlineQueriesNetKind {
     /// `bots.requestWebViewButton`; the bots.RequestedButton answer
     /// settles the prepared button id.
     SavePreparedKeyboardButton,
+    /// `GetRequestedWebViewButtonQuery` (cpp:297-337) —
+    /// `bots.getRequestedWebViewButton`; the kind carries the handler's
+    /// `bot_user_id_` member, the `prepared_button_id_` rides the parked
+    /// lot (a String is not `Copy`); the wire KeyboardButton answer folds
+    /// through the M.22 record and registers the requested dialog type.
+    GetRequestedWebViewButton { bot_user_id: UserId },
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -885,6 +884,9 @@ pub(crate) struct PendingInlineQueries {
     get_prepared_inline_message: Vec<Promise<Option<td_api::PreparedInlineMessage>>>,
     /// `SavePreparedKeyboardButtonQuery::promise_`.
     save_prepared_keyboard_button: Vec<Promise<String>>,
+    /// `GetRequestedWebViewButtonQuery::promise_` + the handler's
+    /// `prepared_button_id_` member (the answer's re-entry key).
+    get_requested_web_view_button: Vec<(String, Promise<td_api::KeyboardButton>)>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -946,7 +948,7 @@ pub struct InlineQueriesManager {
 
     last_requested_web_view_button_bot_user_id: UserId,
     last_requested_web_view_button_prepared_button_id: String,
-    last_requested_web_view_button_requested_dialog_type: Option<TargetDialogTypes>,
+    last_requested_web_view_button_requested_dialog_type: Option<RequestedDialogType>,
 
     /// The manager-held dispatch surface of the net-drain 48 families —
     /// `None` keeps the net-inert posture (the pre-init windows and the
@@ -1421,7 +1423,7 @@ impl InlineQueriesManager {
             bot: Some(input_user),
             webapp_req_id: prepared_button_id.to_owned(),
         };
-        env.send_get_requested_web_view_button_query(
+        self.send_get_requested_web_view_button_query(
             query,
             bot_user_id,
             prepared_button_id.to_owned(),
@@ -1429,12 +1431,15 @@ impl InlineQueriesManager {
         );
     }
 
-    /// `on_get_requested_web_view_button` (InlineQueriesManager.cpp:828-834).
+    /// `on_get_requested_web_view_button` (InlineQueriesManager.cpp:828-834)
+    /// — the stored record is the C++ `RequestedDialogType` copy
+    /// (`make_unique<RequestedDialogType>(*requested_dialog_type)`,
+    /// cpp:832).
     pub fn on_get_requested_web_view_button(
         &mut self,
         bot_user_id: UserId,
         prepared_button_id: &str,
-        requested_dialog_type: TargetDialogTypes,
+        requested_dialog_type: RequestedDialogType,
     ) {
         self.last_requested_web_view_button_bot_user_id = bot_user_id;
         self.last_requested_web_view_button_prepared_button_id = prepared_button_id.to_owned();
@@ -1446,7 +1451,7 @@ impl InlineQueriesManager {
         &self,
         bot_user_id: UserId,
         prepared_button_id: &str,
-    ) -> Option<&TargetDialogTypes> {
+    ) -> Option<&RequestedDialogType> {
         if bot_user_id == self.last_requested_web_view_button_bot_user_id
             && prepared_button_id == self.last_requested_web_view_button_prepared_button_id
             && !prepared_button_id.is_empty()
@@ -2016,6 +2021,48 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.save_prepared_keyboard_button.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<GetRequestedWebViewButtonQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:305-311) — the
+    /// request promise and the handler's `prepared_button_id_` member
+    /// park in the family lot first, then the built wire query dispatches
+    /// with the `bot_user_id_` member on the kind. `None` on the handle
+    /// keeps the net-inert posture.
+    pub(crate) fn send_get_requested_web_view_button_query(
+        &mut self,
+        query: telegram_api::bots_getRequestedWebViewButton,
+        bot_user_id: UserId,
+        prepared_button_id: String,
+        promise: Promise<td_api::KeyboardButton>,
+    ) {
+        self.pending
+            .get_requested_web_view_button
+            .push((prepared_button_id, promise));
+        let kind = InlineQueriesNetKind::GetRequestedWebViewButton { bot_user_id };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                kind,
+                telegram_api::Function::bots_getRequestedWebViewButton(query),
+            ),
+            None => tdutils::log_info!(
+                "Send bots.getRequestedWebViewButton for bot {} — [net-inert]",
+                bot_user_id.get()
+            ),
+        }
+    }
+
+    /// The get-requested-web-view-button family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_get_requested_web_view_button_query(
+        &mut self,
+    ) -> Option<(String, Promise<td_api::KeyboardButton>)> {
+        if self.pending.get_requested_web_view_button.is_empty() {
+            None
+        } else {
+            Some(self.pending.get_requested_web_view_button.remove(0))
         }
     }
 
@@ -3836,16 +3883,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_get_requested_web_view_button_query(
-            &mut self,
-            _query: telegram_api::bots_getRequestedWebViewButton,
-            _bot_user_id: UserId,
-            _prepared_button_id: String,
-            _promise: Promise<td_api::KeyboardButton>,
-        ) {
-            // [blocked: net]
-        }
-
         fn send_request_simple_web_view_query(
             &mut self,
             _query: telegram_api::messages_requestSimpleWebView,
@@ -4107,6 +4144,58 @@ mod tests {
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
         );
+    }
+
+    /// The get_prepared_keyboard_button bands: the net-inert park keeps
+    /// the prepared button id beside the promise (the handler's
+    /// `prepared_button_id_` member) and the registered record answers
+    /// `get_requested_dialog_type` (cpp:836-843).
+    #[test]
+    fn get_prepared_keyboard_button_bands_and_registration() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+        let (promise, outcomes) = recording_promise::<td_api::KeyboardButton>();
+        manager.get_prepared_keyboard_button(&mut env, UserId::new(9), "wrb-1", promise);
+        assert_eq!(manager.pending.get_requested_web_view_button.len(), 1);
+        assert_eq!(manager.pending.get_requested_web_view_button[0].0, "wrb-1");
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+
+        // the unknown-bot band (cpp:824-826)
+        let (promise, outcomes) = recording_promise::<td_api::KeyboardButton>();
+        manager.get_prepared_keyboard_button(&mut env, UserId::new(404), "wrb-1", promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+
+        // the registration + the lookup (cpp:828-843)
+        let requested = RequestedDialogType::from_telegram(
+            telegram_api::RequestPeerType::requestPeerTypeUser(telegram_api::requestPeerTypeUser {
+                flags: 0,
+                bot: false,
+                premium: false,
+            }),
+            3,
+            2,
+        );
+        manager.on_get_requested_web_view_button(UserId::new(9), "wrb-1", requested);
+        assert!(
+            manager
+                .get_requested_dialog_type(UserId::new(9), "wrb-1")
+                .is_some()
+        );
+        // the empty id and the other bot answer no
+        assert!(
+            manager
+                .get_requested_dialog_type(UserId::new(9), "")
+                .is_none()
+        );
+        assert!(
+            manager
+                .get_requested_dialog_type(UserId::new(8), "wrb-1")
+                .is_none()
+        );
+        assert!(manager.pop_get_requested_web_view_button_query().is_some());
     }
 
     /// The save_prepared_keyboard_button bands: the button ladder (the

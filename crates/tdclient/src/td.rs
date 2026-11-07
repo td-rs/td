@@ -18073,6 +18073,56 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `GetRequestedWebViewButtonQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:313-337) — the wire
+            // keyboard-button answer folds through the M.22 record: a
+            // button without a requested dialog type answers the 500
+            // "Receive invalid button type" band (cpp:322-327), otherwise
+            // the type registers (`on_get_requested_web_view_button`,
+            // cpp:328-330) and the object settles the promise.
+            K::GetRequestedWebViewButton { bot_user_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::KeyboardButton::parse(query.ok()) {
+                        Ok(button) => Ok(crate::keyboard_button::KeyboardButton::from_telegram(
+                            button,
+                        )),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse KeyboardButton: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the bots_getRequestedWebViewButton answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let parked = manager.pop_get_requested_web_view_button_query();
+                match (result, parked) {
+                    (Ok(button), Some((prepared_button_id, mut promise))) => {
+                        let Some(requested_dialog_type) = button.get_requested_dialog_type() else {
+                            tdutils::log_error!("Receive invalid button type");
+                            promise.set_error(Status::error(500, "Receive invalid button type"));
+                            self.inline_queries_manager = manager;
+                            return;
+                        };
+                        manager.on_get_requested_web_view_button(
+                            bot_user_id,
+                            &prepared_button_id,
+                            requested_dialog_type.clone(),
+                        );
+                        promise.set_value(button.get_keyboard_button_object());
+                    }
+                    (Err(status), Some((_, mut promise))) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected bots.getRequestedWebViewButton answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46504,16 +46554,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_get_requested_web_view_button_query(
-        &mut self,
-        _query: telegram_api::bots_getRequestedWebViewButton,
-        _bot_user_id: crate::user_manager::UserId,
-        _prepared_button_id: String,
-        _promise: Promise<td_api::KeyboardButton>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_request_simple_web_view_query(
@@ -89536,6 +89576,110 @@ kQIDAQAB\n\
             &rec,
             telegram_api::bots_requestWebViewButton::ID,
             "the empty-button band sends nothing",
+        );
+
+        // 22. back to the user mode — the getPreparedKeyboardButton arm
+        //     rides the wire (Requests.cpp:1290-1296 →
+        //     get_prepared_keyboard_button → GetRequestedWebViewButtonQuery
+        //     ::send, cpp:305-311)
+        td.auth_manager.force_user_for_test();
+        td.request(
+            18,
+            Function::getPreparedKeyboardButton(td_api::getPreparedKeyboardButton {
+                bot_user_id: 9,
+                prepared_button_id: "wrb-1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getRequestedWebViewButton::ID,
+        );
+        let body = telegram_api::bots_getRequestedWebViewButton::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert_eq!(body.webapp_req_id, "wrb-1");
+
+        // 23. the wire keyboard-button answer folds through the M.22
+        //     record (cpp:313-331): the requested dialog type registers
+        //     (on_get_requested_web_view_button) and the object answers
+        let requested_button = telegram_api::KeyboardButton {
+            flags: 0,
+            style: None,
+            text: "Pick a user".to_owned(),
+            r#type: Some(telegram_api::ButtonType::buttonTypeRequestPeer(
+                telegram_api::buttonTypeRequestPeer {
+                    flags: 0,
+                    button_id: 3,
+                    peer_type: Some(telegram_api::RequestPeerType::requestPeerTypeUser(
+                        telegram_api::requestPeerTypeUser {
+                            flags: 0,
+                            bot: false,
+                            premium: false,
+                        },
+                    )),
+                    max_quantity: 2,
+                },
+            )),
+        };
+        net_complete(sent, wire!(requested_button));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 18).first() {
+            Some(Object::keyboardButton(button)) => {
+                assert_eq!(button.text, "Pick a user");
+                assert!(matches!(
+                    button.r#type,
+                    Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                        _
+                    ))
+                ));
+            }
+            other => panic!("the keyboard button, got {other:?}"),
+        }
+        // the registration landed (get_requested_dialog_type,
+        // InlineQueriesManager.cpp:836-843)
+        {
+            let manager = std::mem::take(&mut td.inline_queries_manager);
+            let registered = manager
+                .get_requested_dialog_type(crate::user_manager::UserId::new(9), "wrb-1")
+                .is_some();
+            td.inline_queries_manager = manager;
+            assert!(registered, "the requested dialog type registers");
+        }
+
+        // 24. the invalid-button band (cpp:322-327) — a button without a
+        //     requested dialog type answers the 500
+        td.request(
+            19,
+            Function::getPreparedKeyboardButton(td_api::getPreparedKeyboardButton {
+                bot_user_id: 9,
+                prepared_button_id: "wrb-2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_getRequestedWebViewButton::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::KeyboardButton {
+                flags: 0,
+                style: None,
+                text: "Plain".to_owned(),
+                r#type: Some(telegram_api::ButtonType::buttonTypeDefault(
+                    telegram_api::buttonTypeDefault {}
+                )),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 19);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid button type")
         );
     }
 }
