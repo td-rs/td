@@ -200,6 +200,107 @@ impl StickerSetId {
     }
 }
 
+/// `StickersManager::Sticker` (StickersManager.h:499-545) — the M.15
+/// record core the net-drain 59 intakes build (`on_get_sticker_document`
+/// → `create_sticker` → `on_get_sticker`, StickersManager.cpp:3376-3435 /
+/// :2845-2950); only the fields the answer builders read are carried
+/// (the database/secret-media halves stay with their planes).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sticker {
+    /// `file_id_`.
+    file_id: crate::files::FileId,
+    /// `dimensions_`.
+    dimensions: crate::photo::Dimensions,
+    /// `minithumbnail_` — empty over the bot band
+    /// (`!td_->auth_manager_->is_bot()`).
+    minithumbnail: String,
+    /// `s_thumbnail_` — the `'s'`/`'t'` thumbnail.
+    s_thumbnail: crate::photo::PhotoSize,
+    /// `m_thumbnail_` — the `'m'` thumbnail.
+    m_thumbnail: crate::photo::PhotoSize,
+    /// `premium_animation_file_id_`.
+    premium_animation_file_id: crate::files::FileId,
+    /// `is_premium_`.
+    is_premium: bool,
+    /// `set_id_`.
+    set_id: StickerSetId,
+    /// `alt_`.
+    alt: String,
+    /// `mask_position_` — the raw `StickerMaskPosition` (the C++ holds
+    /// the parsed `mask_coords_`; only the object build reads it).
+    mask_position: Option<td_api::MaskPosition>,
+    /// `emoji_receive_date_` — the 86400s freshness watermark
+    /// (`G()->unix_time()` at the custom-emoji create).
+    emoji_receive_date: i32,
+    /// `is_being_reloaded_` — the one-shot reload guard.
+    is_being_reloaded: bool,
+    /// `type_` (`StickerType::Regular` default).
+    sticker_type: StickerType,
+    /// `has_text_color_` (the custom-emoji attribute).
+    has_text_color: bool,
+    /// `format_`.
+    format: StickerFormat,
+}
+
+impl Sticker {
+    /// `StickersManager::get_sticker_id` (StickersManager.cpp:2088-2093)
+    /// — the full-remote document id over the file view; the caller's
+    /// `is_document()` guard is the [`StickerFileView`] read.
+    fn get_sticker_id(&self, view: &StickerFileView) -> i64 {
+        view.full_remote_document_id.unwrap_or(0)
+    }
+}
+
+/// `StickersManager::StickerSet` (StickersManager.h:388-440) — the
+/// record core the set intakes build. The database/save halves stay
+/// with their planes; only the fields the answer builders and the
+/// special-set machinery read are carried.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct StickerSet {
+    /// `id_`.
+    id: StickerSetId,
+    /// `access_hash_`.
+    access_hash: i64,
+    /// `title_`.
+    title: String,
+    /// `short_name_`.
+    short_name: String,
+    /// `sticker_type_`.
+    sticker_type: StickerType,
+    /// `sticker_ids_`.
+    sticker_ids: Vec<crate::files::FileId>,
+    /// `sticker_emojis_map_` — `sticker_id → emojis` (the premium-gift
+    /// option pick reads it, StickersManager.cpp:2583-2595).
+    sticker_emojis_map: std::collections::HashMap<crate::files::FileId, Vec<String>>,
+    /// `was_loaded_` — the full-record marker (`is_loaded_` covers the
+    /// id/hash half only).
+    was_loaded: bool,
+    /// `is_loaded_`.
+    is_loaded: bool,
+    /// `is_inited_` — the record carries the short name.
+    is_inited: bool,
+    /// `is_installed_` / `is_archived_` / `is_official_` /
+    /// `is_viewed_` / `is_created_`.
+    is_installed: bool,
+    is_archived: bool,
+    is_official: bool,
+    is_viewed: bool,
+    is_created: bool,
+    /// `has_text_color_` / `channel_emoji_status_`.
+    has_text_color: bool,
+    channel_emoji_status: bool,
+    /// `sticker_count_` — the unloaded-set total.
+    sticker_count: i32,
+    /// `hash_`.
+    hash: i64,
+    /// `minithumbnail_`.
+    minithumbnail: String,
+    /// `thumbnail_`.
+    thumbnail: crate::photo::PhotoSize,
+    /// `thumbnail_document_id_`.
+    thumbnail_document_id: i64,
+}
+
 /// `StickersManager::CheckStickerSetNameResult`
 /// (StickersManager.h:454-462).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +344,64 @@ pub enum SpecialStickerSetType {
     DefaultStatuses,
     DefaultChannelStatuses,
     PremiumGifts,
+}
+
+/// `get_sticker_format_by_mime_type` (StickerFormat.cpp:27-37) — the
+/// `on_get_sticker_document` mime read (StickersManager.cpp:3032).
+pub(crate) fn get_sticker_format_by_mime_type(mime_type: &str) -> StickerFormat {
+    match mime_type {
+        "application/x-tgsticker" => StickerFormat::Tgs,
+        "image/webp" => StickerFormat::Webp,
+        "video/webm" => StickerFormat::Webm,
+        _ => StickerFormat::Unknown,
+    }
+}
+
+/// `get_sticker_format_by_extension` (StickerFormat.cpp:39-49) — the
+/// `create_sticker` format-guess fallback (cpp:3385-3390).
+pub(crate) fn get_sticker_format_by_extension(extension: &str) -> StickerFormat {
+    match extension {
+        "tgs" => StickerFormat::Tgs,
+        "webp" => StickerFormat::Webp,
+        "webm" => StickerFormat::Webm,
+        _ => StickerFormat::Unknown,
+    }
+}
+
+/// `is_sticker_format_vector` (StickerFormat.cpp:123-135) — the TGS-only
+/// band (the `create_sticker` dimension default, cpp:3392-3395).
+pub(crate) fn is_sticker_format_vector(sticker_format: StickerFormat) -> bool {
+    sticker_format == StickerFormat::Tgs
+}
+
+/// `get_sticker_format_extension` (StickerFormat.cpp:82-93) — the
+/// `PSTRING() << document_id << extension` join half
+/// (StickersManager.cpp:3036-3040).
+pub(crate) fn get_sticker_format_extension(sticker_format: StickerFormat) -> &'static str {
+    match sticker_format {
+        StickerFormat::Unknown => "",
+        StickerFormat::Webp => ".webp",
+        StickerFormat::Tgs => ".tgs",
+        StickerFormat::Webm => ".webm",
+    }
+}
+
+/// `get_sticker_format_object` (StickerFormat.cpp:51-65) — the
+/// `Unknown` band LOG(ERROR)s and answers Webp.
+pub(crate) fn get_sticker_format_object(sticker_format: StickerFormat) -> td_api::StickerFormat {
+    match sticker_format {
+        StickerFormat::Tgs => td_api::StickerFormat::stickerFormatTgs(td_api::stickerFormatTgs {}),
+        StickerFormat::Webm => {
+            td_api::StickerFormat::stickerFormatWebm(td_api::stickerFormatWebm {})
+        }
+        StickerFormat::Unknown => {
+            tdutils::log_error!("Have a sticker of unknown format");
+            td_api::StickerFormat::stickerFormatWebp(td_api::stickerFormatWebp {})
+        }
+        StickerFormat::Webp => {
+            td_api::StickerFormat::stickerFormatWebp(td_api::stickerFormatWebp {})
+        }
+    }
 }
 
 /// `StickersManager::get_max_sticker_file_size`
@@ -373,6 +532,56 @@ pub trait StickersManagerEnv {
     /// `finish_upload_sticker_file` answer over the already-remote band.
     fn file_get_file_object(&mut self, _file_id: crate::files::FileId) -> Option<td_api::File> {
         None
+    }
+    /// `td_->file_manager_->get_file_view(file_id).suggested_path()` —
+    /// the `get_sticker_object` JPEG-thumbnail band
+    /// (StickersManager.cpp:2180-2186).
+    fn file_suggested_path(&mut self, _file_id: crate::files::FileId) -> String {
+        String::new()
+    }
+    /// `file_manager_->register_remote(FullRemoteFileLocation(FileType::Sticker,
+    /// …), FromServer, DialogId(), size, 0, document_id + extension)`
+    /// (StickersManager.cpp:3036-3040).
+    #[allow(clippy::too_many_arguments)]
+    fn file_register_sticker(
+        &mut self,
+        _document_id: i64,
+        _access_hash: i64,
+        _dc_id: crate::chat_manager::DcId,
+        _file_reference: String,
+        _size: i64,
+        _format: StickerFormat,
+    ) -> crate::files::FileId {
+        crate::files::FileId::default()
+    }
+    /// `get_photo_size(file_manager, PhotoSizeSource::thumbnail(FileType::Thumbnail,
+    /// 0), …)` (StickersManager.cpp:3043-3061) — the full registered form.
+    #[allow(clippy::too_many_arguments)]
+    fn photo_size_registered(
+        &mut self,
+        _document_id: i64,
+        _access_hash: i64,
+        _file_reference: String,
+        _dc_id: crate::chat_manager::DcId,
+        _size_ptr: telegram_api::PhotoSize,
+        _format: crate::photo::PhotoFormat,
+    ) -> crate::photo::PhotoSizeOrMinithumbnail {
+        crate::photo::PhotoSizeOrMinithumbnail::Size(crate::photo::PhotoSize::default())
+    }
+    /// `register_photo_size(file_manager, PhotoSizeSource::thumbnail(FileType::Thumbnail,
+    /// 'f'), …)` (StickersManager.cpp:3065-3073) — the premium-animation
+    /// registration.
+    #[allow(clippy::too_many_arguments)]
+    fn register_photo_size(
+        &mut self,
+        _document_id: i64,
+        _access_hash: i64,
+        _file_reference: String,
+        _file_size: i32,
+        _dc_id: crate::chat_manager::DcId,
+        _format: crate::photo::PhotoFormat,
+    ) -> crate::files::FileId {
+        crate::files::FileId::default()
     }
 
     // -- the `[blocked: net]`/`[blocked: Files]` query tails; each one
@@ -993,11 +1202,44 @@ fn parse_sticker_list(
     Ok(sticker_ids)
 }
 
+/// The in-flight query kinds of the net-drain 59 families — the C++
+/// `Td::ResultHandler` query classes of StickersManager.cpp collapsed
+/// onto the dispatcher tag; the answers drain through
+/// `Td::on_stickers_net_answer` into the manager intakes. The kinds stay
+/// `Copy`: the C++ handler members the answer needs beyond the kind ride
+/// the per-family parked lots (the §5 shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StickersNetKind {
+    /// `GetCustomEmojiDocumentsQuery` (cpp:1432-1459) —
+    /// `messages.getCustomEmojiDocuments`; the request's deduped id
+    /// vector + promise park in the family lot (the C++ promise lambda
+    /// captures both, cpp:6570-6579), the answer re-entering
+    /// [`StickersManager::on_get_custom_emoji_documents`].
+    GetCustomEmojiDocuments,
+}
+
 /// `StickersManager` — the collapsed state the request plane reads and
 /// mutates. The caches start empty (offline the sets never load) and the
 /// tests pre-seed them to drive the cache-hit tables.
 #[derive(Default)]
 pub struct StickersManager {
+    /// The net-drain 59 dispatch surface — `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests); wired at
+    /// the dispatcher-creation block through `Td::stickers_net` (the
+    /// manager-held `BotRecommendationNetHandle` shape).
+    pub(crate) net: Option<crate::td::StickersNetHandle>,
+    /// `stickers_` — the `FileId → Sticker` record store (the M.15 core
+    /// the net-drain 59 intakes build).
+    stickers: std::collections::HashMap<crate::files::FileId, Sticker>,
+    /// `sticker_sets_` — the `StickerSetId → StickerSet` record store.
+    sticker_sets: std::collections::HashMap<StickerSetId, StickerSet>,
+    /// `next_sticker_set_access_hash_` is not needed: the access hash
+    /// rides the record.
+    ///
+    /// the parked `GetCustomEmojiDocumentsQuery` requests — the C++
+    /// promise lambda's captures (cpp:6570-6579); FIFO per the C++
+    /// one-query-per-request shape.
+    pending_get_custom_emoji_documents: Vec<(Vec<CustomEmojiId>, Promise<td_api::Stickers>)>,
     /// `are_installed_sticker_sets_loaded_[type]`.
     are_installed_sticker_sets_loaded: [bool; MAX_STICKER_TYPE],
     /// `installed_sticker_set_ids_[type]`.
@@ -1005,7 +1247,8 @@ pub struct StickersManager {
     /// `custom_emoji_to_sticker_id_` (the WaitFreeHashMap collapses to a
     /// plain map). `pub(crate)` for the td-level test seeds (the wire
     /// intakes fill it at their slices).
-    pub(crate) custom_emoji_to_sticker_id: std::collections::HashMap<CustomEmojiId, MessageId>,
+    pub(crate) custom_emoji_to_sticker_id:
+        std::collections::HashMap<CustomEmojiId, crate::files::FileId>,
     /// `found_stickers_[type][emoji]` — the `(sticker_ids,
     /// next_reload_time)` cache.
     found_stickers: [std::collections::HashMap<String, (Vec<MessageId>, f64)>; MAX_STICKER_TYPE],
@@ -1128,6 +1371,85 @@ enum EmojiSearchPark {
     Keywords(Vec<String>),
 }
 
+/// `get_mask_point_object` (StickerMaskPosition.cpp:11-25) — the wire
+/// `maskCoords.n` to the `td_api::maskPoint*` table; the C++ `default:`
+/// arm is `UNREACHABLE()`, reached only over the 0-3 range guard the
+/// ctor enforces (cpp:32-34).
+fn get_mask_point_object(point: i32) -> Option<td_api::MaskPoint> {
+    match point {
+        0 => Some(td_api::MaskPoint::maskPointForehead(
+            td_api::maskPointForehead {},
+        )),
+        1 => Some(td_api::MaskPoint::maskPointEyes(td_api::maskPointEyes {})),
+        2 => Some(td_api::MaskPoint::maskPointMouth(td_api::maskPointMouth {})),
+        3 => Some(td_api::MaskPoint::maskPointChin(td_api::maskPointChin {})),
+        _ => None,
+    }
+}
+
+/// `StickerMaskPosition(mask_coords)` (StickerMaskPosition.cpp:27-43) —
+/// the 0-3 point guard folds the C++ `point_ = -1` sentinel away
+/// (an out-of-range `n` answers no `maskPosition`).
+fn get_mask_position_object(
+    mask_coords: &telegram_api::MaskCoords,
+) -> Option<td_api::MaskPosition> {
+    if !(0..=3).contains(&mask_coords.n) {
+        return None;
+    }
+    Some(td_api::MaskPosition {
+        point: get_mask_point_object(mask_coords.n),
+        x_shift: mask_coords.x,
+        y_shift: mask_coords.y,
+        scale: mask_coords.zoom,
+    })
+}
+
+/// `SpecialStickerSetType(InputStickerSet)` (StickersManager.h:298-342)
+/// — the wire special-set constructors the request plane reads;
+/// `inputStickerSetDice` answers `None` (its set id is per-emoji).
+fn special_sticker_set_type(
+    input_sticker_set: &telegram_api::InputStickerSet,
+) -> Option<SpecialStickerSetType> {
+    match input_sticker_set {
+        telegram_api::InputStickerSet::inputStickerSetAnimatedEmojiAnimations(_) => {
+            Some(SpecialStickerSetType::GenericAnimations)
+        }
+        telegram_api::InputStickerSet::inputStickerSetAnimatedEmoji(_) => {
+            Some(SpecialStickerSetType::AnimatedEmoji)
+        }
+        telegram_api::InputStickerSet::inputStickerSetEmojiDefaultTopicIcons(_) => {
+            Some(SpecialStickerSetType::DefaultTopicIcons)
+        }
+        telegram_api::InputStickerSet::inputStickerSetEmojiDefaultStatuses(_) => {
+            Some(SpecialStickerSetType::DefaultStatuses)
+        }
+        telegram_api::InputStickerSet::inputStickerSetEmojiChannelDefaultStatuses(_) => {
+            Some(SpecialStickerSetType::DefaultChannelStatuses)
+        }
+        telegram_api::InputStickerSet::inputStickerSetPremiumGifts(_) => {
+            Some(SpecialStickerSetType::PremiumGifts)
+        }
+        _ => None,
+    }
+}
+
+/// `InputStickerSet` id read — the `inputStickerSetID` band of the
+/// special-set fold (`add_sticker_set` needs the id).
+fn input_sticker_set_id(input_sticker_set: &telegram_api::InputStickerSet) -> Option<StickerSetId> {
+    match input_sticker_set {
+        telegram_api::InputStickerSet::inputStickerSetID(set) => Some(StickerSetId::new(set.id)),
+        _ => None,
+    }
+}
+
+/// `InputStickerSet` access-hash read.
+fn input_sticker_set_access_hash(input_sticker_set: &telegram_api::InputStickerSet) -> i64 {
+    match input_sticker_set {
+        telegram_api::InputStickerSet::inputStickerSetID(set) => set.access_hash,
+        _ => 0,
+    }
+}
+
 impl StickersManager {
     pub fn new() -> StickersManager {
         // StickersManager.h:1061 — `old_featured_sticker_set_count_ =
@@ -1149,13 +1471,567 @@ impl StickersManager {
         }
     }
 
-    /// `get_custom_emoji_stickers_object` over the collapsed cache —
-    /// same class as [`Self::get_stickers_object`].
-    fn get_custom_emoji_stickers_object(custom_emoji_ids: &[CustomEmojiId]) -> td_api::Stickers {
-        let _ = custom_emoji_ids;
-        td_api::Stickers {
-            stickers: Vec::new(),
+    /// `get_custom_emoji_stickers_object` (StickersManager.cpp:6473-6502)
+    /// — the id-map walk; an unknown id contributes nothing (the C++
+    /// `file_id.is_valid()` guard), the 86400s-stale records queue a
+    /// background reload (cpp:6486-6499) and the answer is the per-id
+    /// [`Self::get_sticker_object`] vector.
+    fn get_custom_emoji_stickers_object(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        custom_emoji_ids: &[CustomEmojiId],
+    ) -> td_api::Stickers {
+        let update_before_date = env.unix_time() - 86400;
+        let mut reload_custom_emoji_ids = Vec::new();
+        let mut stickers = Vec::new();
+        for &custom_emoji_id in custom_emoji_ids {
+            if let Some(&file_id) = self.custom_emoji_to_sticker_id.get(&custom_emoji_id) {
+                if let Some(sticker) = self.stickers.get_mut(&file_id)
+                    && sticker.emoji_receive_date < update_before_date
+                    && !sticker.is_being_reloaded
+                {
+                    sticker.is_being_reloaded = true;
+                    reload_custom_emoji_ids.push(custom_emoji_id);
+                }
+                if let Some(sticker) = self.get_sticker_object(env, file_id) {
+                    stickers.push(sticker);
+                }
+            }
         }
+        if !reload_custom_emoji_ids.is_empty() {
+            // cpp:6494-6499 — the fire-and-forget reload (an empty
+            // promise + id vector at the answer half)
+            self.pending_get_custom_emoji_documents
+                .push((Vec::new(), Promise::default()));
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    StickersNetKind::GetCustomEmojiDocuments,
+                    telegram_api::Function::messages_getCustomEmojiDocuments(
+                        telegram_api::messages_getCustomEmojiDocuments {
+                            document_id: reload_custom_emoji_ids
+                                .iter()
+                                .map(|custom_emoji_id| custom_emoji_id.get())
+                                .collect(),
+                        },
+                    ),
+                ),
+                None => {
+                    tdutils::log_info!("Send messages.getCustomEmojiDocuments — [net-inert]")
+                }
+            }
+        }
+        td_api::Stickers { stickers }
+    }
+
+    /// `StickersManager::get_sticker_object` (StickersManager.cpp:2163-2226)
+    /// — the `td_api::sticker` build over the record + the file plane;
+    /// an invalid id or a missing record answers `None` (the C++ `nullptr`
+    /// over `documentEmpty`).
+    fn get_sticker_object(
+        &self,
+        env: &mut impl StickersManagerEnv,
+        file_id: crate::files::FileId,
+    ) -> Option<td_api::Sticker> {
+        if !file_id.is_valid() {
+            return None;
+        }
+        let sticker = self.stickers.get(&file_id)?;
+        // cpp:2172-2188 — the `m_thumbnail_` wins, then the `s_thumbnail_`; the
+        // JPEG band reads the thumbnail file's suggested path (the
+        // encrypted-upload convention)
+        let thumbnail = if sticker.m_thumbnail.file_id.is_valid() {
+            &sticker.m_thumbnail
+        } else {
+            &sticker.s_thumbnail
+        };
+        let mut thumbnail_format = crate::photo::PhotoFormat::Webp;
+        if !sticker.set_id.is_valid() {
+            let view = env.file_get_view(file_id);
+            let is_jpeg = view.is_encrypted
+                || (thumbnail.file_id.is_valid()
+                    && env.file_suggested_path(thumbnail.file_id).ends_with(".jpg"));
+            if is_jpeg {
+                thumbnail_format = crate::photo::PhotoFormat::Jpeg;
+            }
+        }
+        let thumbnail_object = crate::photo::get_thumbnail_object(thumbnail, thumbnail_format);
+        // cpp:2189-2203 — the zoom ladder is `for_animated_emoji`-only;
+        // both flags are false at every current caller, so the plain copy
+        // lands (the `Dimensions` u16 → the td_api i32)
+        let width = i32::from(sticker.dimensions.width);
+        let height = i32::from(sticker.dimensions.height);
+        let full_type = match sticker.sticker_type {
+            StickerType::Regular => {
+                td_api::StickerFullType::stickerFullTypeRegular(td_api::stickerFullTypeRegular {
+                    premium_animation: if sticker.premium_animation_file_id.is_valid() {
+                        env.file_get_file_object(sticker.premium_animation_file_id)
+                    } else {
+                        None
+                    },
+                })
+            }
+            StickerType::Mask => {
+                td_api::StickerFullType::stickerFullTypeMask(td_api::stickerFullTypeMask {
+                    mask_position: sticker.mask_position.clone(),
+                })
+            }
+            StickerType::CustomEmoji => td_api::StickerFullType::stickerFullTypeCustomEmoji(
+                td_api::stickerFullTypeCustomEmoji {
+                    // the wire `documentAttributeCustomEmoji.text_color`
+                    // lands in the td_api `needs_repainting` slot (the
+                    // pinned-scheme naming drift, cpp:2214-2216)
+                    custom_emoji_id: sticker.get_sticker_id(&env.file_get_view(file_id)),
+                    needs_repainting: sticker.has_text_color,
+                },
+            ),
+        };
+        let mut sticker_id = 0;
+        if sticker.set_id.is_valid() {
+            sticker_id = sticker.get_sticker_id(&env.file_get_view(file_id));
+        }
+        Some(td_api::Sticker {
+            id: sticker_id,
+            set_id: sticker.set_id.get(),
+            width,
+            height,
+            emoji: sticker.alt.clone(),
+            format: Some(get_sticker_format_object(sticker.format)),
+            full_type: Some(full_type),
+            thumbnail: thumbnail_object,
+            sticker: env.file_get_file_object(file_id),
+        })
+    }
+
+    /// Pop the head of the parked `GetCustomEmojiDocumentsQuery` lot —
+    /// the `GetCustomEmojiDocumentsQuery` answer half's re-entry pair
+    /// (the C++ promise lambda's captures, cpp:6570-6579); FIFO per the
+    /// C++ one-query-per-request shape.
+    pub(crate) fn take_pending_get_custom_emoji_documents(
+        &mut self,
+    ) -> Option<(Vec<CustomEmojiId>, Promise<td_api::Stickers>)> {
+        if self.pending_get_custom_emoji_documents.is_empty() {
+            None
+        } else {
+            Some(self.pending_get_custom_emoji_documents.remove(0))
+        }
+    }
+
+    /// `on_get_custom_emoji_documents` (StickersManager.cpp:6587-6606) —
+    /// the `GetCustomEmojiDocumentsQuery` answer half: the close band,
+    /// the per-document `on_get_sticker_document` walk and the parked
+    /// request's object answer.
+    pub fn on_get_custom_emoji_documents(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        r_documents: tdutils::status::Result<Vec<telegram_api::Document>>,
+        custom_emoji_ids: Vec<CustomEmojiId>,
+        mut promise: Promise<td_api::Stickers>,
+    ) {
+        if env.close_flag() {
+            promise.set_error(tdutils::status::Status::error(500, "Request aborted"));
+            return;
+        }
+        let documents = match r_documents {
+            Result::Err(status) => return promise.set_error(status),
+            Result::Ok(documents) => documents,
+        };
+        for document in documents {
+            if let telegram_api::Document::documentEmpty(_) = document {
+                continue;
+            }
+            self.on_get_sticker_document(env, document, StickerFormat::Unknown);
+        }
+        promise.set_value(self.get_custom_emoji_stickers_object(env, &custom_emoji_ids));
+    }
+
+    /// `on_get_sticker_document` (StickersManager.cpp:2972-3067) — the
+    /// sticker-document record machine: the empty/dc/attribute bands, the
+    /// mime-format guard, the remote registration, the thumbnail walk and
+    /// the `create_sticker` tail. Returns the `(document_id, file_id)`
+    /// pair (`{}` on every drop band).
+    fn on_get_sticker_document(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        document_ptr: telegram_api::Document,
+        expected_format: StickerFormat,
+    ) -> (i64, crate::files::FileId) {
+        let telegram_api::Document::document(document) = document_ptr else {
+            // the documentEmpty band is filtered at the callers; the
+            // default arm (no other Document constructor exists)
+            return (0, crate::files::FileId::default());
+        };
+        if !crate::chat_manager::DcId::is_valid_raw(document.dc_id) {
+            tdutils::log_error!(
+                "Wrong dc_id = {} in document {}",
+                document.dc_id,
+                document.id
+            );
+            return (0, crate::files::FileId::default());
+        }
+        let dc_id = crate::chat_manager::DcId::internal(document.dc_id);
+
+        let mut dimensions = crate::photo::Dimensions::default();
+        let mut sticker: Option<telegram_api::documentAttributeSticker> = None;
+        let mut custom_emoji: Option<telegram_api::documentAttributeCustomEmoji> = None;
+        for attribute in document.attributes {
+            match attribute {
+                telegram_api::DocumentAttribute::documentAttributeVideo(video) => {
+                    dimensions = crate::photo::get_dimensions(
+                        video.w,
+                        video.h,
+                        "sticker documentAttributeVideo",
+                    );
+                }
+                telegram_api::DocumentAttribute::documentAttributeImageSize(image_size) => {
+                    dimensions = crate::photo::get_dimensions(
+                        image_size.w,
+                        image_size.h,
+                        "sticker documentAttributeImageSize",
+                    );
+                }
+                telegram_api::DocumentAttribute::documentAttributeSticker(value) => {
+                    sticker = Some(value);
+                }
+                telegram_api::DocumentAttribute::documentAttributeCustomEmoji(value) => {
+                    custom_emoji = Some(value);
+                }
+                _ => continue,
+            }
+        }
+        if sticker.is_none() && custom_emoji.is_none() {
+            if document.mime_type != "application/x-bad-tgsticker" {
+                tdutils::log_error!("Have no attributeSticker in {}", document.id);
+            }
+            return (0, crate::files::FileId::default());
+        }
+
+        let format = get_sticker_format_by_mime_type(&document.mime_type);
+        if format == StickerFormat::Unknown
+            || (expected_format != StickerFormat::Unknown && format != expected_format)
+        {
+            tdutils::log_error!(
+                "Expected sticker of the type {:?}, but received of the type {:?}",
+                expected_format,
+                format
+            );
+            return (0, crate::files::FileId::default());
+        }
+        let document_id = document.id;
+        let file_reference = String::from_utf8_lossy(&document.file_reference).into_owned();
+        let sticker_id = env.file_register_sticker(
+            document_id,
+            document.access_hash,
+            dc_id,
+            file_reference.clone(),
+            document.size,
+            format,
+        );
+
+        let mut thumbnail = crate::photo::PhotoSize::default();
+        let mut minithumbnail = String::new();
+        let thumbnail_format = if crate::documents_manager::has_webp_thumbnail(&document.thumbs) {
+            crate::photo::PhotoFormat::Webp
+        } else {
+            crate::photo::PhotoFormat::Jpeg
+        };
+        let mut premium_animation_file_id = crate::files::FileId::default();
+        for thumbnail_ptr in &document.thumbs {
+            let photo_size = env.photo_size_registered(
+                document_id,
+                document.access_hash,
+                file_reference.clone(),
+                dc_id,
+                thumbnail_ptr.clone(),
+                thumbnail_format,
+            );
+            match photo_size {
+                crate::photo::PhotoSizeOrMinithumbnail::Size(size) => {
+                    if !thumbnail.file_id.is_valid() {
+                        thumbnail = size;
+                    }
+                    break;
+                }
+                crate::photo::PhotoSizeOrMinithumbnail::Minithumbnail(packed) => {
+                    if thumbnail_format == crate::photo::PhotoFormat::Webp {
+                        minithumbnail = packed;
+                    }
+                }
+            }
+        }
+        for thumbnail_ptr in &document.video_thumbs {
+            let telegram_api::VideoSize::videoSize(video_size) = thumbnail_ptr else {
+                continue;
+            };
+            if video_size.r#type == "f" && !premium_animation_file_id.is_valid() {
+                premium_animation_file_id = env.register_photo_size(
+                    document_id,
+                    document.access_hash,
+                    file_reference.clone(),
+                    video_size.size,
+                    dc_id,
+                    crate::documents_manager::get_sticker_format_photo_format(format),
+                );
+            }
+        }
+
+        self.create_sticker(
+            env,
+            sticker_id,
+            premium_animation_file_id,
+            minithumbnail,
+            thumbnail,
+            dimensions,
+            sticker,
+            custom_emoji,
+            format,
+        );
+        (document_id, sticker_id)
+    }
+
+    /// `StickersManager::create_sticker` (StickersManager.cpp:3376-3435) —
+    /// the record build over the parsed attributes (the
+    /// `load_data_multipromise_ptr` half is the database-load plane and
+    /// drops with it).
+    #[allow(clippy::too_many_arguments)]
+    fn create_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        file_id: crate::files::FileId,
+        premium_animation_file_id: crate::files::FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        mut dimensions: crate::photo::Dimensions,
+        sticker: Option<telegram_api::documentAttributeSticker>,
+        custom_emoji: Option<telegram_api::documentAttributeCustomEmoji>,
+        mut format: StickerFormat,
+    ) {
+        if format == StickerFormat::Unknown && sticker.is_none() {
+            format = match self.stickers.get(&file_id) {
+                Some(old_sticker) => old_sticker.format,
+                None => {
+                    // guess the format by the file extension
+                    // (cpp:3385-3390), defaulting to Webp
+                    let suggested_path = env.file_suggested_path(file_id);
+                    let extension = suggested_path
+                        .rsplit('.')
+                        .find(|part| !part.is_empty() && part.len() <= 4)
+                        .unwrap_or("");
+                    let guessed = get_sticker_format_by_extension(extension);
+                    if guessed == StickerFormat::Unknown {
+                        StickerFormat::Webp
+                    } else {
+                        guessed
+                    }
+                }
+            };
+        }
+        if is_sticker_format_vector(format) && dimensions.width == 0 {
+            dimensions.width = if custom_emoji.is_some() { 100 } else { 512 };
+            dimensions.height = if custom_emoji.is_some() { 100 } else { 512 };
+        }
+
+        let mut s = Sticker {
+            file_id,
+            dimensions,
+            format,
+            ..Sticker::default()
+        };
+        if !env.auth_is_bot() {
+            s.minithumbnail = minithumbnail;
+        }
+        Self::add_sticker_thumbnail(&mut s, thumbnail);
+        s.is_premium = premium_animation_file_id.is_valid();
+        s.premium_animation_file_id = premium_animation_file_id;
+        let replace = sticker.is_some() || custom_emoji.is_some();
+        if let Some(sticker) = sticker {
+            s.set_id = self.on_get_input_sticker_set(sticker.stickerset);
+            s.alt = sticker.alt;
+            if sticker.mask {
+                s.sticker_type = StickerType::Mask;
+            }
+            s.mask_position = sticker
+                .mask_coords
+                .as_ref()
+                .and_then(get_mask_position_object);
+        } else if let Some(custom_emoji) = custom_emoji {
+            s.set_id = self.on_get_input_sticker_set(custom_emoji.stickerset);
+            s.alt = custom_emoji.alt;
+            s.sticker_type = StickerType::CustomEmoji;
+            s.is_premium = !custom_emoji.free;
+            s.has_text_color = custom_emoji.text_color;
+            s.emoji_receive_date = env.unix_time();
+        }
+        self.on_get_sticker(env, s, replace);
+    }
+
+    /// `StickersManager::add_sticker_thumbnail` (cpp:3361-3374).
+    fn add_sticker_thumbnail(s: &mut Sticker, thumbnail: crate::photo::PhotoSize) {
+        if !thumbnail.file_id.is_valid() {
+            return;
+        }
+        match thumbnail.size_type as u8 as char {
+            'm' => s.m_thumbnail = thumbnail,
+            's' | 't' => s.s_thumbnail = thumbnail,
+            other => {
+                tdutils::log_error!("Receive sticker thumbnail of unsupported type {other}");
+            }
+        }
+    }
+
+    /// `StickersManager::on_get_input_sticker_set` (cpp:3292-3334) — the
+    /// attribute's `InputStickerSet` to `StickerSetId` fold over the
+    /// empty/id/special-set bands. The `ShortName` half (cpp:3306-3325)
+    /// is the database/search plane and parks at its seam.
+    fn on_get_input_sticker_set(
+        &mut self,
+        set_ptr: Option<telegram_api::InputStickerSet>,
+    ) -> StickerSetId {
+        let Some(set_ptr) = set_ptr else {
+            return StickerSetId::default();
+        };
+        match set_ptr {
+            telegram_api::InputStickerSet::inputStickerSetEmpty(_) => StickerSetId::default(),
+            telegram_api::InputStickerSet::inputStickerSetID(set) => {
+                let set_id = StickerSetId::new(set.id);
+                self.add_sticker_set(set_id, set.access_hash);
+                set_id
+            }
+            telegram_api::InputStickerSet::inputStickerSetShortName(set) => {
+                tdutils::log_error!("Receive sticker set {} by its short name", set.short_name);
+                StickerSetId::default()
+            }
+            special => self.add_special_sticker_set(special),
+        }
+    }
+
+    /// `StickersManager::add_sticker_set` (cpp:3082-3110) — the id/hash
+    /// record insert (the database save half parks at its plane).
+    fn add_sticker_set(&mut self, set_id: StickerSetId, access_hash: i64) {
+        let sticker_set = self.sticker_sets.entry(set_id).or_default();
+        if sticker_set.id.is_valid() {
+            if sticker_set.access_hash != access_hash {
+                sticker_set.access_hash = access_hash;
+            }
+        } else {
+            sticker_set.id = set_id;
+            sticker_set.access_hash = access_hash;
+            sticker_set.is_created = true;
+            sticker_set.is_inited = true;
+        }
+    }
+
+    /// `StickersManager::add_special_sticker_set` (cpp:3112-3145) — the
+    /// `SpecialStickerSetType`-keyed band of `on_get_input_sticker_set`
+    /// (cpp:3323-3331); over the collapsed special-set store the
+    /// `type_.get_input_sticker_set()` id is the record seed.
+    fn add_special_sticker_set(
+        &mut self,
+        input_sticker_set: telegram_api::InputStickerSet,
+    ) -> StickerSetId {
+        if special_sticker_set_type(&input_sticker_set).is_none() {
+            return StickerSetId::default();
+        }
+        let set_id = input_sticker_set_id(&input_sticker_set).unwrap_or_default();
+        self.add_sticker_set(set_id, input_sticker_set_access_hash(&input_sticker_set));
+        set_id
+    }
+
+    /// `StickersManager::on_get_sticker` (cpp:2845-2950) — the insert or
+    /// the guarded replace walk, then the custom-emoji id-map tail
+    /// (cpp:2929-2943) over the final record; the database save and the
+    /// message-update fan-out park at their planes.
+    fn on_get_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        new_sticker: Sticker,
+        replace: bool,
+    ) -> crate::files::FileId {
+        let file_id = new_sticker.file_id;
+        match self.stickers.get_mut(&file_id) {
+            None => {
+                self.stickers.insert(file_id, new_sticker);
+            }
+            Some(s) if replace => {
+                let mut updated_custom_emoji_id = CustomEmojiId::default();
+                if s.sticker_type == StickerType::CustomEmoji {
+                    let view = env.file_get_view(file_id);
+                    let custom_emoji_id = CustomEmojiId::new(s.get_sticker_id(&view));
+                    if custom_emoji_id.is_valid()
+                        && self.custom_emoji_to_sticker_id.get(&custom_emoji_id) == Some(&file_id)
+                    {
+                        self.custom_emoji_to_sticker_id.remove(&custom_emoji_id);
+                        updated_custom_emoji_id = custom_emoji_id;
+                    }
+                }
+                if new_sticker.dimensions.width != 0 {
+                    s.dimensions = new_sticker.dimensions;
+                }
+                if new_sticker.set_id.is_valid() {
+                    if s.set_id.is_valid() && s.set_id != new_sticker.set_id {
+                        tdutils::log_error!("Sticker {} set_id has changed", file_id.get());
+                    }
+                    s.set_id = new_sticker.set_id;
+                }
+                if !new_sticker.alt.is_empty() {
+                    s.alt = new_sticker.alt;
+                }
+                s.minithumbnail = new_sticker.minithumbnail;
+                if new_sticker.s_thumbnail.file_id.is_valid() {
+                    s.s_thumbnail = new_sticker.s_thumbnail;
+                }
+                if new_sticker.m_thumbnail.file_id.is_valid() {
+                    s.m_thumbnail = new_sticker.m_thumbnail;
+                }
+                s.is_premium = new_sticker.is_premium;
+                if new_sticker.premium_animation_file_id.is_valid() {
+                    s.premium_animation_file_id = new_sticker.premium_animation_file_id;
+                }
+                if new_sticker.format != StickerFormat::Unknown {
+                    s.format = new_sticker.format;
+                }
+                if new_sticker.sticker_type != StickerType::Regular {
+                    s.sticker_type = new_sticker.sticker_type;
+                }
+                s.mask_position = new_sticker.mask_position.clone();
+                if s.emoji_receive_date < new_sticker.emoji_receive_date {
+                    s.emoji_receive_date = new_sticker.emoji_receive_date;
+                }
+                let _ = updated_custom_emoji_id;
+            }
+            Some(_) => {}
+        }
+        // cpp:2929-2943 — the custom-emoji tail over the final record
+        let view = env.file_get_view(file_id);
+        self.apply_custom_emoji_id(&view, file_id);
+        file_id
+    }
+
+    /// the `on_get_sticker` custom-emoji map tail (cpp:2914-2943) — the
+    /// id key follows the record's `get_sticker_id` and the id map keeps
+    /// the last writer.
+    fn apply_custom_emoji_id(&mut self, view: &StickerFileView, file_id: crate::files::FileId) {
+        let Some(sticker) = self.stickers.get(&file_id) else {
+            return;
+        };
+        if sticker.sticker_type != StickerType::CustomEmoji {
+            return;
+        }
+        let custom_emoji_id = CustomEmojiId::new(sticker.get_sticker_id(view));
+        if !custom_emoji_id.is_valid() {
+            return;
+        }
+        if let Some(&old_file_id) = self.custom_emoji_to_sticker_id.get(&custom_emoji_id)
+            && old_file_id != file_id
+        {
+            tdutils::log_info!(
+                "Change custom emoji {} sticker from {} to {}",
+                custom_emoji_id.get(),
+                old_file_id.get(),
+                file_id.get()
+            );
+        }
+        self.custom_emoji_to_sticker_id
+            .insert(custom_emoji_id, file_id);
     }
 
     /// `search_stickers` (StickersManager.cpp:4548-4610).
@@ -1371,7 +2247,7 @@ impl StickersManager {
             .collect();
 
         if unknown_custom_emoji_ids.is_empty() {
-            promise.set_value(Self::get_custom_emoji_stickers_object(&custom_emoji_ids));
+            promise.set_value(self.get_custom_emoji_stickers_object(env, &custom_emoji_ids));
             return;
         }
 
@@ -1382,7 +2258,26 @@ impl StickersManager {
             return;
         }
 
-        env.send_get_custom_emoji_documents_query(unknown_custom_emoji_ids);
+        // `GetCustomEmojiDocumentsQuery::send` (cpp:1437-1441) — the C++
+        // promise lambda captures the deduped id vector and the request
+        // promise (cpp:6570-6579); the kind rides the dispatcher and the
+        // pair parks in the family lot
+        self.pending_get_custom_emoji_documents
+            .push((custom_emoji_ids, promise));
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                StickersNetKind::GetCustomEmojiDocuments,
+                telegram_api::Function::messages_getCustomEmojiDocuments(
+                    telegram_api::messages_getCustomEmojiDocuments {
+                        document_id: unknown_custom_emoji_ids
+                            .iter()
+                            .map(|custom_emoji_id| custom_emoji_id.get())
+                            .collect(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send messages.getCustomEmojiDocuments — [net-inert]"),
+        }
     }
 
     /// `get_default_custom_emoji_stickers`
@@ -1397,7 +2292,7 @@ impl StickersManager {
         let index = sticker_list_type as usize;
         if self.are_default_custom_emoji_ids_loaded[index] && !force_reload {
             let ids = self.default_custom_emoji_ids[index].clone();
-            promise.set_value(Self::get_custom_emoji_stickers_object(&ids));
+            promise.set_value(self.get_custom_emoji_stickers_object(env, &ids));
             return;
         }
         let _ = promise;
@@ -3703,6 +4598,7 @@ mod tests {
     #[derive(Clone)]
     struct TestEnv {
         is_bot: bool,
+        close: bool,
         now: f64,
         use_sqlite_pmc: bool,
         input_user_ok: bool,
@@ -3714,6 +4610,7 @@ mod tests {
         fn default() -> Self {
             TestEnv {
                 is_bot: false,
+                close: false,
                 now: 100.0,
                 use_sqlite_pmc: false,
                 input_user_ok: true,
@@ -3738,7 +4635,7 @@ mod tests {
             self.is_bot
         }
         fn close_flag(&self) -> bool {
-            false
+            self.close
         }
         fn unix_time(&self) -> i32 {
             1_700_000_000
@@ -3778,6 +4675,17 @@ mod tests {
         }
         fn file_get_view(&mut self, _file_id: crate::files::FileId) -> StickerFileView {
             self.file_view
+        }
+        fn file_register_sticker(
+            &mut self,
+            _document_id: i64,
+            _access_hash: i64,
+            _dc_id: crate::chat_manager::DcId,
+            _file_reference: String,
+            _size: i64,
+            _format: StickerFormat,
+        ) -> crate::files::FileId {
+            crate::files::FileId::new(1, 1)
         }
 
         // The seam-recording overrides follow (same impl block); the
@@ -3824,11 +4732,6 @@ mod tests {
             self.queries
                 .borrow_mut()
                 .push("LoadCustomEmojiFromDatabase".to_owned());
-        }
-        fn send_get_custom_emoji_documents_query(&mut self, _custom_emoji_ids: Vec<CustomEmojiId>) {
-            self.queries
-                .borrow_mut()
-                .push("GetCustomEmojiDocumentsQuery".to_owned());
         }
         fn load_default_custom_emoji_ids(
             &mut self,
@@ -4107,9 +5010,134 @@ mod tests {
         manager.get_custom_emoji_stickers(&mut env, ids.clone(), true, promise_unused());
         assert_eq!(env.recorded("LoadCustomEmojiFromDatabase"), 1);
         env.use_sqlite_pmc = false;
-        let (promise, _) = record::<td_api::Stickers>();
+        let (promise, cell) = record::<td_api::Stickers>();
         manager.get_custom_emoji_stickers(&mut env, ids, false, promise);
-        assert_eq!(env.recorded("GetCustomEmojiDocumentsQuery"), 1);
+        // the net-inert posture keeps the request parked in the family
+        // lot (no dispatcher to ride); the deduped unknown id vector is
+        // the lot's head (cpp:6570-6579)
+        assert_eq!(manager.pending_get_custom_emoji_documents.len(), 1);
+        assert_eq!(
+            manager.pending_get_custom_emoji_documents[0]
+                .0
+                .iter()
+                .map(|id| id.get())
+                .collect::<Vec<_>>(),
+            vec![1 << 21]
+        );
+        assert!(cell.lock().unwrap().is_none(), "the promise stays parked");
+    }
+
+    #[test]
+    fn the_custom_emoji_documents_answer_bands_follow_the_cpp() {
+        let mut manager = StickersManager::new();
+
+        // the close band — the answer half fails the parked promise with
+        // the close status (cpp:6590-6591)
+        let mut env = TestEnv {
+            close: true,
+            ..TestEnv::default()
+        };
+        let (promise, cell) = record::<td_api::Stickers>();
+        manager.on_get_custom_emoji_documents(
+            &mut env,
+            Result::Ok(Vec::new()),
+            Vec::new(),
+            promise,
+        );
+        assert_eq!(recorded_error(&cell), (500, "Request aborted".to_owned()));
+        let mut env = TestEnv::default();
+
+        // the error band — the codes forward verbatim (cpp:6593-6594)
+        let (promise, cell) = record::<td_api::Stickers>();
+        manager.on_get_custom_emoji_documents(
+            &mut env,
+            Result::Err(tdutils::status::Status::error(420, "EMOJI_INVALID")),
+            Vec::new(),
+            promise,
+        );
+        assert_eq!(recorded_error(&cell), (420, "EMOJI_INVALID".to_owned()));
+
+        // the record intake — the id map + the set record land and the
+        // per-id object vector answers over the stored record
+        // (cpp:6596-6605)
+        let custom_emoji_id = 1 << 21;
+        // the id map keys on the file view's remote document id
+        // (`get_sticker_id`, cpp:2101-2105)
+        env.file_view.full_remote_document_id = Some(custom_emoji_id);
+        let document = telegram_api::Document::document(telegram_api::document {
+            id: custom_emoji_id,
+            access_hash: 77,
+            file_reference: b"ref".to_vec(),
+            mime_type: "application/x-tgsticker".to_string(),
+            size: 4096,
+            thumbs: Vec::new(),
+            video_thumbs: Vec::new(),
+            dc_id: 2,
+            attributes: vec![
+                telegram_api::DocumentAttribute::documentAttributeImageSize(
+                    telegram_api::documentAttributeImageSize { w: 100, h: 100 },
+                ),
+                telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                    telegram_api::documentAttributeCustomEmoji {
+                        flags: 0,
+                        free: true,
+                        text_color: true,
+                        alt: "\u{1f389}".to_owned(),
+                        stickerset: Some(telegram_api::InputStickerSet::inputStickerSetID(
+                            telegram_api::inputStickerSetID {
+                                id: 4242,
+                                access_hash: 99,
+                            },
+                        )),
+                    },
+                ),
+            ],
+            ..telegram_api::document::default()
+        });
+        let (promise, cell) = record::<td_api::Stickers>();
+        manager.on_get_custom_emoji_documents(
+            &mut env,
+            Result::Ok(vec![document]),
+            vec![CustomEmojiId::new(custom_emoji_id)],
+            promise,
+        );
+        let stickers = match &*cell.lock().unwrap() {
+            Some(Result::Ok(stickers)) => stickers.clone(),
+            other => panic!("expected the sticker vector, got {other:?}"),
+        };
+        assert_eq!(stickers.stickers.len(), 1);
+        let sticker = &stickers.stickers[0];
+        assert_eq!(sticker.set_id, 4242);
+        assert_eq!(sticker.emoji, "\u{1f389}");
+        match &sticker.full_type {
+            Some(td_api::StickerFullType::stickerFullTypeCustomEmoji(custom)) => {
+                assert_eq!(custom.custom_emoji_id, custom_emoji_id);
+                assert!(custom.needs_repainting, "the text_color attribute");
+            }
+            other => panic!("the custom-emoji full type: {other:?}"),
+        }
+        assert!(
+            manager
+                .custom_emoji_to_sticker_id
+                .contains_key(&CustomEmojiId::new(custom_emoji_id)),
+            "the id map lands"
+        );
+
+        // the known-id band — no wire query, the stored record answers
+        // (cpp:6486-6493)
+        manager.pending_get_custom_emoji_documents.clear();
+        let (promise, cell) = record::<td_api::Stickers>();
+        manager.get_custom_emoji_stickers(
+            &mut env,
+            vec![CustomEmojiId::new(custom_emoji_id)],
+            false,
+            promise,
+        );
+        assert!(manager.pending_get_custom_emoji_documents.is_empty());
+        match &*cell.lock().unwrap() {
+            Some(Result::Ok(stickers)) => assert_eq!(stickers.stickers.len(), 1),
+            other => panic!("expected the cached answer, got {other:?}"),
+        }
     }
 
     fn promise_unused() -> Promise<td_api::Stickers> {

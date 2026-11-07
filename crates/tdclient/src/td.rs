@@ -3710,6 +3710,14 @@ pub(crate) type GameNetHandle = NetKindHandle<crate::game_manager::GameNetKind>;
 pub(crate) type BotRecommendationNetHandle =
     NetKindHandle<crate::bot_recommendation_manager::BotRecommendationNetKind>;
 
+/// The cloned stickers dispatch surface the
+/// [`crate::stickers_manager::StickersManager`] holds — the net-drain 59
+/// families' send legs (the `StickersManager.cpp` ResultHandler query
+/// classes); the answers drain through [`Td::on_stickers_net_answer`].
+/// Manager-held (the bot-recommendation shape): the send legs run inside
+/// the manager over the env's file-plane reads.
+pub(crate) type StickersNetHandle = NetKindHandle<crate::stickers_manager::StickersNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -6249,6 +6257,10 @@ pub struct Td {
             )>,
         >,
     >,
+    /// The stickers net completed queue (the `StickersNetKind` tags; the
+    /// net-drain 59 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_stickers_net_answer`].
+    stickers_net_completed: Arc<Mutex<Vec<(crate::stickers_manager::StickersNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6769,6 +6781,7 @@ impl Td {
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             game_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
+            stickers_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7264,6 +7277,7 @@ impl Td {
         self.attach_menu_manager.net = self.attach_menu_net();
         self.game_manager.net = self.game_net();
         self.bot_recommendation_manager.net = self.bot_recommendation_net();
+        self.stickers_manager.net = self.stickers_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9086,6 +9100,7 @@ impl Td {
         self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_game_net();
         self.dispatch_completed_bot_recommendation_net();
+        self.dispatch_completed_stickers_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9539,6 +9554,18 @@ impl Td {
         Some(BotRecommendationNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.bot_recommendation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned stickers dispatch surface the
+    /// [`crate::stickers_manager::StickersManager`] holds — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn stickers_net(&self) -> Option<StickersNetHandle> {
+        Some(StickersNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.stickers_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17878,6 +17905,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked Stickers answers — the C++
+    /// ResultHandler halves of the net-drain 59 families (the
+    /// `StickersManager.cpp` query classes).
+    fn dispatch_completed_stickers_net(&mut self) {
+        let completed = std::mem::take(&mut *self.stickers_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_stickers_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20657,6 +20695,58 @@ impl Td {
                     manager.on_get_bot_recommendations(&mut env, bot_user_id, result);
                 }
                 self.bot_recommendation_manager = manager;
+            }
+        }
+    }
+
+    /// Route one Stickers net answer by kind — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the StickersManager
+    /// query classes: the wire answer (or the wire error, or the
+    /// `fetch_result` parse failure riding the same Err path — the
+    /// landed-flip convention, §5) re-enters the manager's intake over
+    /// the request arms' take/put env shape; the request promises settle
+    /// from the parked family lots.
+    fn on_stickers_net_answer(
+        &mut self,
+        kind: crate::stickers_manager::StickersNetKind,
+        query: NetQuery,
+    ) {
+        match kind {
+            // `GetCustomEmojiDocumentsQuery` (StickersManager.cpp:1432-1459)
+            // — the `Vector<Document>` answer converts at the manager's
+            // `on_get_custom_emoji_documents` (cpp:6587-6606).
+            crate::stickers_manager::StickersNetKind::GetCustomEmojiDocuments => {
+                let (custom_emoji_ids, promise) = self
+                    .stickers_manager
+                    .take_pending_get_custom_emoji_documents()
+                    .unwrap_or_else(|| (Vec::new(), Promise::default()));
+                let result: tdutils::status::Result<Vec<telegram_api::Document>> = if query
+                    .is_error()
+                {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_vector_document(query.ok()) {
+                        Some(documents) => {
+                            tdutils::log_info!("Receive result for GetCustomEmojiDocumentsQuery");
+                            tdutils::status::Result::Ok(documents)
+                        }
+                        None => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getCustomEmojiDocuments answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.stickers_manager);
+                {
+                    let (mut env, _) = crate::td::stickers_env_split(self);
+                    manager.on_get_custom_emoji_documents(
+                        &mut env,
+                        result,
+                        custom_emoji_ids,
+                        promise,
+                    );
+                }
+                self.stickers_manager = manager;
             }
         }
     }
@@ -31210,6 +31300,23 @@ fn parse_vector_premium_gift_code_option(
         options.push(telegram_api::PremiumGiftCodeOption::read(&mut reader).ok()?);
     }
     Some(options)
+}
+
+/// The bare `Vector<Document>` answer reader — the
+/// `fetch_result<messages_getCustomEmojiDocuments>` half
+/// (`GetCustomEmojiDocumentsQuery::on_result`,
+/// StickersManager.cpp:1446-1453).
+fn parse_vector_document(data: &[u8]) -> Option<Vec<telegram_api::Document>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut documents = Vec::with_capacity(count);
+    for _ in 0..count {
+        documents.push(telegram_api::Document::read(&mut reader).ok()?);
+    }
+    Some(documents)
 }
 
 fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
@@ -47841,6 +47948,7 @@ pub(crate) struct TdStickersEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
 }
 
 impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
@@ -47958,6 +48066,92 @@ impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
         let file_manager = self.file_manager.lock();
         Some(file_manager.get_file_object(file_id))
     }
+
+    fn file_suggested_path(&mut self, file_id: crate::files::FileId) -> String {
+        let file_manager = self.file_manager.lock();
+        file_manager
+            .get_file_view(file_id)
+            .map(|view| view.suggested_path())
+            .unwrap_or_default()
+    }
+
+    fn file_register_sticker(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        dc_id: crate::chat_manager::DcId,
+        file_reference: String,
+        size: i64,
+        format: crate::documents_manager::StickerFormat,
+    ) -> crate::files::FileId {
+        let mut file_manager = self.file_manager.lock();
+        file_manager.register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                crate::files::FileType::Sticker,
+                document_id,
+                access_hash,
+                dc_id,
+                file_reference,
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::new(0),
+            size,
+            0,
+            format!(
+                "{}{}",
+                document_id,
+                crate::stickers_manager::get_sticker_format_extension(format)
+            ),
+        )
+    }
+
+    fn photo_size_registered(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        file_reference: String,
+        dc_id: crate::chat_manager::DcId,
+        size_ptr: telegram_api::PhotoSize,
+        format: crate::photo::PhotoFormat,
+    ) -> crate::photo::PhotoSizeOrMinithumbnail {
+        crate::photo::get_photo_size_registered(
+            &mut self.file_manager.lock(),
+            &mut self.file_load_manager.lock(),
+            crate::files::PhotoSizeSource::thumbnail(crate::files::FileType::Thumbnail, 0),
+            document_id,
+            access_hash,
+            file_reference,
+            dc_id,
+            crate::message_id::DialogId::new(0),
+            size_ptr,
+            format,
+        )
+    }
+
+    fn register_photo_size(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        file_reference: String,
+        file_size: i32,
+        dc_id: crate::chat_manager::DcId,
+        format: crate::photo::PhotoFormat,
+    ) -> crate::files::FileId {
+        crate::photo::register_photo_size(
+            &mut self.file_manager.lock(),
+            crate::files::PhotoSizeSource::thumbnail(
+                crate::files::FileType::Thumbnail,
+                b'f' as i32,
+            ),
+            document_id,
+            access_hash,
+            file_reference,
+            crate::message_id::DialogId::new(0),
+            file_size,
+            dc_id,
+            format,
+        )
+    }
 }
 
 /// The field-split over [`Td`] for the StickersManager request arms (the
@@ -47974,6 +48168,7 @@ pub(crate) fn stickers_env_split(
         auth_manager,
         user_manager,
         file_manager,
+        file_load_manager,
         stickers_manager,
         ..
     } = td;
@@ -47984,6 +48179,7 @@ pub(crate) fn stickers_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             file_manager: std::sync::Arc::clone(file_manager),
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
         },
         stickers_manager,
     )
@@ -53534,6 +53730,7 @@ mod tests {
         td.attach_menu_manager.net = td.attach_menu_net();
         td.game_manager.net = td.game_net();
         td.bot_recommendation_manager.net = td.bot_recommendation_net();
+        td.stickers_manager.net = td.stickers_net();
         (td, rec, callback)
     }
 
@@ -58588,6 +58785,250 @@ mod tests {
             td.bot_recommendation_net_completed.lock().is_empty(),
             "drained"
         );
+    }
+
+    #[test]
+    fn custom_emoji_documents_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(custom_emoji_documents_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 59 custom-emoji family —
+    /// `messages.getCustomEmojiDocuments` through the live td_api arm
+    /// (getCustomEmojiStickers, Requests.cpp:7745-7749): the outgoing
+    /// query carries the deduped unknown ids
+    /// (StickersManager.cpp:6583-6579), the answer runs the sticker-record
+    /// intake (`on_get_sticker_document` → `create_sticker` →
+    /// `on_get_sticker`, cpp:2972-3067/:3376-3435/:2845-2950) and the
+    /// parked request promise settles from the family lot.
+    fn custom_emoji_documents_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-stickers-custom-emoji");
+
+        /// A wire custom-emoji sticker document: the id is the custom
+        /// emoji id, the `documentAttributeCustomEmoji` carries the alt
+        /// and the set.
+        fn custom_emoji_document(
+            custom_emoji_id: i64,
+            alt: &str,
+            set_id: i64,
+        ) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                id: custom_emoji_id,
+                access_hash: 0x5100_0000_0000 + custom_emoji_id,
+                file_reference: b"ref".to_vec(),
+                mime_type: "application/x-tgsticker".to_string(),
+                size: 4096,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![
+                    telegram_api::DocumentAttribute::documentAttributeImageSize(
+                        telegram_api::documentAttributeImageSize { w: 100, h: 100 },
+                    ),
+                    telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                        telegram_api::documentAttributeCustomEmoji {
+                            flags: 0,
+                            free: true,
+                            text_color: false,
+                            alt: alt.to_owned(),
+                            stickerset: Some(telegram_api::InputStickerSet::inputStickerSetID(
+                                telegram_api::inputStickerSetID {
+                                    id: set_id,
+                                    access_hash: 0x6600_0000_0000 + set_id,
+                                },
+                            )),
+                        },
+                    ),
+                ],
+                ..telegram_api::document::default()
+            })
+        }
+
+        /// A boxed bare `Vector<Document>` answer.
+        fn documents_answer(documents: Vec<telegram_api::Document>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::tl::__i32(&mut out, telegram_api::tl::VECTOR_ID);
+            telegram_api::tl::__i32(&mut out, documents.len() as i32);
+            for document in documents {
+                document.store(&mut out);
+            }
+            out
+        }
+
+        // 1. the live arm parks the request promise and the query rides
+        //    the dispatcher with the deduped unknown ids (cpp:6570-6579).
+        let first_id = 5_000_001;
+        let second_id = 5_000_002;
+        td.request(
+            401,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![first_id, second_id, first_id],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        let body = telegram_api::messages_getCustomEmojiDocuments::parse(sent.query())
+            .expect("the getCustomEmojiDocuments body");
+        assert_eq!(body.document_id, vec![first_id, second_id]);
+
+        // 2. the answer builds the sticker records (the set record + the
+        //    custom-emoji id map) and answers the per-id object vector —
+        //    the still-unknown second id contributes nothing
+        //    (cpp:6473-6493).
+        net_complete(
+            sent,
+            documents_answer(vec![custom_emoji_document(first_id, "\u{1f389}", 4242)]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 401);
+        let stickers = match responses.first() {
+            Some(Object::stickers(stickers)) => stickers.clone(),
+            other => panic!("the getCustomEmojiStickers answer: {other:?}"),
+        };
+        assert_eq!(stickers.stickers.len(), 1, "the unknown id drops");
+        let sticker = stickers.stickers[0].clone();
+        assert_eq!(sticker.id, first_id);
+        assert_eq!(sticker.set_id, 4242);
+        assert_eq!(sticker.width, 100);
+        assert_eq!(sticker.height, 100);
+        assert_eq!(sticker.emoji, "\u{1f389}");
+        assert!(matches!(
+            sticker.format,
+            Some(td_api::StickerFormat::stickerFormatTgs(_))
+        ));
+        match sticker.full_type {
+            Some(td_api::StickerFullType::stickerFullTypeCustomEmoji(custom)) => {
+                assert_eq!(custom.custom_emoji_id, first_id);
+                assert!(!custom.needs_repainting);
+            }
+            other => panic!("the custom-emoji full type: {other:?}"),
+        }
+        assert!(sticker.sticker.is_some(), "the registered file object");
+
+        // 3. the id-map cache hit answers without a wire query
+        //    (cpp:6486-6493: both ids resolve after the second load).
+        td.request(
+            402,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![first_id],
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "the cache hit sends nothing");
+        assert!(
+            responses_of(&callback, 402)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.len() == 1))
+        );
+
+        // 4. the error band — the codes forward verbatim through the
+        //    promise (cpp:6593-6594).
+        td.request(
+            403,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_003],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_fail(sent, 420, "EMOJI_INVALID");
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 403);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "EMOJI_INVALID");
+
+        // 5. the parse-failure band — the fetch_result failure rides the
+        //    same Err path as the C++ on_error chain (§5 convention).
+        td.request(
+            404,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_004],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 404);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the messages.getCustomEmojiDocuments answer"
+        );
+
+        // 6. the no-attribute band — a document without the sticker or
+        //    custom-emoji attribute LOG(ERROR)s and drops
+        //    (cpp:3022-3030); the answer is the empty sticker vector.
+        td.request(
+            405,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_005],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(
+            sent,
+            documents_answer(vec![telegram_api::Document::document(
+                telegram_api::document {
+                    id: 5_000_005,
+                    mime_type: "image/webp".to_string(),
+                    dc_id: 2,
+                    ..telegram_api::document::default()
+                },
+            )]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 405)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.is_empty()))
+        );
+
+        // 7. the unknown-mime band — the format guard drops the document
+        //    (cpp:3031-3037: `image/png` is not a sticker mime).
+        td.request(
+            406,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_006],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(
+            sent,
+            documents_answer(vec![telegram_api::Document::document(
+                telegram_api::document {
+                    id: 5_000_006,
+                    mime_type: "image/png".to_string(),
+                    dc_id: 2,
+                    attributes: vec![
+                        telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                            telegram_api::documentAttributeCustomEmoji {
+                                alt: String::new(),
+                                ..telegram_api::documentAttributeCustomEmoji::default()
+                            },
+                        ),
+                    ],
+                    ..telegram_api::document::default()
+                },
+            )]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 406)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.is_empty()))
+        );
+
+        assert!(td.stickers_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
@@ -64304,7 +64745,7 @@ mod tests {
         // the custom emoji must be known (the have_custom_emoji read)
         td.stickers_manager.custom_emoji_to_sticker_id.insert(
             crate::stickers_manager::CustomEmojiId::new(777),
-            crate::messages_manager::MessageId::new(1),
+            crate::files::FileId::new(1, 1),
         );
 
         let sticker_photo =
