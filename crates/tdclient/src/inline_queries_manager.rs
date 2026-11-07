@@ -697,12 +697,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `SavePreparedKeyboardButtonQuery` (InlineQueriesManager.cpp:269-295).
-    fn send_save_prepared_keyboard_button_query(
-        &mut self,
-        query: telegram_api::bots_requestWebViewButton,
-        promise: Promise<String>,
-    );
     /// `GetRequestedWebViewButtonQuery` (InlineQueriesManager.cpp:297-337).
     fn send_get_requested_web_view_button_query(
         &mut self,
@@ -869,6 +863,10 @@ pub(crate) enum InlineQueriesNetKind {
         bot_user_id: UserId,
         query_hash: u64,
     },
+    /// `SavePreparedKeyboardButtonQuery` (cpp:269-295) —
+    /// `bots.requestWebViewButton`; the bots.RequestedButton answer
+    /// settles the prepared button id.
+    SavePreparedKeyboardButton,
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -885,6 +883,8 @@ pub(crate) struct PendingInlineQueries {
     save_prepared_inline_message: Vec<Promise<td_api::PreparedInlineMessageId>>,
     /// `GetPreparedInlineMessageQuery::promise_`.
     get_prepared_inline_message: Vec<Promise<Option<td_api::PreparedInlineMessage>>>,
+    /// `SavePreparedKeyboardButtonQuery::promise_`.
+    save_prepared_keyboard_button: Vec<Promise<String>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1396,7 +1396,7 @@ impl InlineQueriesManager {
                     user_id: Some(input_user),
                     button: Some(input_button),
                 };
-                env.send_save_prepared_keyboard_button_query(query, promise);
+                self.send_save_prepared_keyboard_button_query(query, promise);
             }
             Err(status) => promise.set_error(status),
         }
@@ -1985,6 +1985,37 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.get_prepared_inline_message.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SavePreparedKeyboardButtonQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:275-282) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_save_prepared_keyboard_button_query(
+        &mut self,
+        query: telegram_api::bots_requestWebViewButton,
+        promise: Promise<String>,
+    ) {
+        self.pending.save_prepared_keyboard_button.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SavePreparedKeyboardButton,
+                telegram_api::Function::bots_requestWebViewButton(query),
+            ),
+            None => tdutils::log_info!("Send bots.requestWebViewButton — [net-inert]"),
+        }
+    }
+
+    /// The save-prepared-keyboard-button family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_save_prepared_keyboard_button_promise(&mut self) -> Option<Promise<String>> {
+        if self.pending.save_prepared_keyboard_button.is_empty() {
+            None
+        } else {
+            Some(self.pending.save_prepared_keyboard_button.remove(0))
         }
     }
 
@@ -3805,14 +3836,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_save_prepared_keyboard_button_query(
-            &mut self,
-            _query: telegram_api::bots_requestWebViewButton,
-            _promise: Promise<String>,
-        ) {
-            // [blocked: net]
-        }
-
         fn send_get_requested_web_view_button_query(
             &mut self,
             _query: telegram_api::bots_getRequestedWebViewButton,
@@ -4083,6 +4106,78 @@ mod tests {
         assert!(
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
+        );
+    }
+
+    /// The save_prepared_keyboard_button bands: the button ladder (the
+    /// M.22 get_keyboard_button(request_buttons_allowed=true) validation)
+    /// answers inline, the good form parks the promise net-inert and the
+    /// request-users button carries the button id through the fold.
+    #[test]
+    fn save_prepared_keyboard_button_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+
+        // the empty-button band (cpp:815-817)
+        let (promise, outcomes) = recording_promise::<String>();
+        manager.save_prepared_keyboard_button(&mut env, UserId::new(9), None, promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Button must be non-empty"
+        ));
+
+        // the unknown-user band (cpp:812-814)
+        let (promise, outcomes) = recording_promise::<String>();
+        manager.save_prepared_keyboard_button(
+            &mut env,
+            UserId::new(404),
+            Some(td_api::KeyboardButton {
+                text: "Pick".to_owned(),
+                icon_custom_emoji_id: 0,
+                style: None,
+                r#type: None,
+            }),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+
+        // the good form parks net-inert
+        let (promise, outcomes) = recording_promise::<String>();
+        manager.save_prepared_keyboard_button(
+            &mut env,
+            UserId::new(9),
+            Some(td_api::KeyboardButton {
+                text: "Pick".to_owned(),
+                icon_custom_emoji_id: 0,
+                style: None,
+                r#type: Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                    td_api::keyboardButtonTypeRequestUsers {
+                        id: 3,
+                        restrict_user_is_bot: false,
+                        user_is_bot: false,
+                        restrict_user_is_premium: false,
+                        user_is_premium: false,
+                        max_quantity: 2,
+                        request_name: false,
+                        request_username: false,
+                        request_photo: false,
+                    },
+                )),
+            }),
+            promise,
+        );
+        assert_eq!(manager.pending.save_prepared_keyboard_button.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(
+            manager
+                .pop_save_prepared_keyboard_button_promise()
+                .is_some()
         );
     }
 

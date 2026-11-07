@@ -18042,6 +18042,37 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `SavePreparedKeyboardButtonQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:283-295) — the bots.RequestedButton
+            // answer settles the prepared button id.
+            K::SavePreparedKeyboardButton => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::bots_RequestedButton::parse(query.ok()) {
+                        Ok(button) => Ok(button),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse bots.requestedButton: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the bots_requestWebViewButton answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_save_prepared_keyboard_button_promise();
+                match (result, promise) {
+                    (Ok(button), Some(mut promise)) => promise.set_value(button.webapp_req_id),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected bots.requestWebViewButton answer")
+                    }
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46473,14 +46504,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_save_prepared_keyboard_button_query(
-        &mut self,
-        _query: telegram_api::bots_requestWebViewButton,
-        _promise: Promise<String>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_get_requested_web_view_button_query(
@@ -89428,6 +89451,91 @@ kQIDAQAB\n\
         assert_eq!(
             (error.code, error.message.as_str()),
             (400, "PREPARED_MESSAGE_INVALID")
+        );
+
+        // 19. the savePreparedKeyboardButton arm rides the wire
+        //     (Requests.cpp:1297-1303 → save_prepared_keyboard_button →
+        //     SavePreparedKeyboardButtonQuery::send, cpp:275-282): the
+        //     resolved input user and the M.22 input keyboard button
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            16,
+            Function::savePreparedKeyboardButton(td_api::savePreparedKeyboardButton {
+                user_id: 11,
+                button: Some(td_api::KeyboardButton {
+                    text: "Pick a chat".to_owned(),
+                    icon_custom_emoji_id: 0,
+                    style: None,
+                    r#type: Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                        td_api::keyboardButtonTypeRequestUsers {
+                            id: 3,
+                            restrict_user_is_bot: false,
+                            user_is_bot: false,
+                            restrict_user_is_premium: false,
+                            user_is_premium: false,
+                            max_quantity: 2,
+                            request_name: false,
+                            request_username: false,
+                            request_photo: false,
+                        },
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::bots_requestWebViewButton::ID,
+        );
+        let body =
+            telegram_api::bots_requestWebViewButton::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (11, 0)
+        ));
+        let button = body.button.expect("the input keyboard button");
+        assert_eq!(button.text, "Pick a chat");
+        match button.r#type {
+            Some(telegram_api::ButtonType::inputButtonTypeRequestPeer(peer)) => {
+                assert_eq!(peer.button_id, 3);
+                assert_eq!(peer.max_quantity, 2);
+                assert!(peer.peer_type.is_some());
+            }
+            other => panic!("the request-peer button, got {other:?}"),
+        }
+
+        // 20. the bots.RequestedButton answer settles the request id
+        //     (cpp:283-293)
+        net_complete(
+            sent,
+            wire!(telegram_api::bots_RequestedButton {
+                webapp_req_id: "wrb-1".to_owned(),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 16).first() {
+            Some(Object::text(text)) => assert_eq!(text.text, "wrb-1"),
+            other => panic!("the prepared button id, got {other:?}"),
+        }
+
+        // 21. the empty-button band (cpp:815-817) — no send
+        td.request(
+            17,
+            Function::savePreparedKeyboardButton(td_api::savePreparedKeyboardButton {
+                user_id: 11,
+                button: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 17);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Button must be non-empty")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::bots_requestWebViewButton::ID,
+            "the empty-button band sends nothing",
         );
     }
 }
