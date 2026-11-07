@@ -3532,6 +3532,10 @@ pub(crate) enum AutoDownloadNetKind {
 /// use — the answers drain through [`Td::on_auto_download_net_answer`].
 type AutoDownloadNetHandle = NetKindHandle<AutoDownloadNetKind>;
 
+/// The cloned autosave dispatch surface the [`AutosaveEnv`] senders use —
+/// the answers drain through [`Td::on_autosave_net_answer`].
+pub(crate) type AutosaveNetHandle = NetKindHandle<crate::autosave_manager::AutosaveNetKind>;
+
 /// The cloned quick-reply dispatch surface the [`QuickReplyEnv`]
 /// senders use — the answers drain through
 /// [`Td::on_quick_reply_net_answer`].
@@ -6008,6 +6012,9 @@ pub struct Td {
     /// The callback-parked auto-download query answers
     /// (the `Td::on_auto_download_net_answer` drain).
     auto_download_net_completed: Arc<Mutex<Vec<(AutoDownloadNetKind, NetQuery)>>>,
+    /// The callback-parked autosave query answers
+    /// (the `Td::on_autosave_net_answer` drain).
+    autosave_net_completed: Arc<Mutex<Vec<(crate::autosave_manager::AutosaveNetKind, NetQuery)>>>,
     /// The parked auto-download promises.
     auto_download_promises: Vec<PendingAutoDownloadQuery>,
     /// The callback-parked quick-reply query answers (the
@@ -6626,6 +6633,7 @@ impl Td {
             privacy_net_completed: Arc::new(Mutex::new(Vec::new())),
             privacy_promises: Vec::new(),
             auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
+            autosave_net_completed: Arc::new(Mutex::new(Vec::new())),
             auto_download_promises: Vec::new(),
             quick_reply_net_completed: Arc::new(Mutex::new(Vec::new())),
             theme_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -8950,6 +8958,7 @@ impl Td {
         self.dispatch_completed_translation_net();
         self.dispatch_completed_privacy_net();
         self.dispatch_completed_auto_download_net();
+        self.dispatch_completed_autosave_net();
         self.dispatch_completed_quick_reply_net();
         self.dispatch_completed_theme_net();
         self.dispatch_completed_premium_net();
@@ -9172,6 +9181,15 @@ impl Td {
         Some(AutoDownloadNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.auto_download_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned autosave dispatch surface (the `AutosaveEnv` senders).
+    pub(crate) fn autosave_net(&self) -> Option<AutosaveNetHandle> {
+        Some(AutosaveNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.autosave_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10750,6 +10768,56 @@ impl Td {
             self.on_quick_reply_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked autosave answers — the C++ ResultHandler
+    /// halves (AutosaveManager.cpp:32-95).
+    fn dispatch_completed_autosave_net(&mut self) {
+        let completed = std::mem::take(&mut *self.autosave_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_autosave_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one autosave net answer by kind — the get promise chains
+    /// into the real [`crate::autosave_manager::AutosaveManager::
+    /// on_get_auto_save_settings`] intake (the C++ promise lambda,
+    /// AutosaveManager.cpp:346-350); the save value drops and the error
+    /// band reloads (cpp:82-94, the manager's own FIFO).
+    fn on_autosave_net_answer(
+        &mut self,
+        kind: crate::autosave_manager::AutosaveNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        // the split carries the live handle — the get intake's SCOPE_EXIT
+        // reload tail and the save error band re-send through it
+        let (mut manager, mut env) = autosave_env_split(self);
+        match kind {
+            crate::autosave_manager::AutosaveNetKind::GetAutoSaveSettings => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_AutoSaveSettings::parse(query.ok())
+                        .map_err(|_| parse_error("account_getAutoSaveSettings"))
+                };
+                manager.on_get_auto_save_settings(&mut env, result);
+            }
+            crate::autosave_manager::AutosaveNetKind::SaveAutoSaveSettings => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .map(|_| ())
+                        .ok_or_else(|| parse_error("account_saveAutoSaveSettings"))
+                };
+                manager.on_save_auto_save_settings(&mut env, result);
+            }
+        }
+        self.autosave_manager = manager;
     }
 
     /// Drain the callback-parked theme answers — the C++ ResultHandler
@@ -37918,40 +37986,60 @@ impl BoostManagerEnv for BoostEnv<'_> {
     }
 }
 
-/// The [`crate::autosave_manager::AutosaveManagerEnv`] over the `Td`
-/// fields — built per call with the field-split borrows (the
-/// `NotificationEnv` convention), never held across calls. The sqlite pmc
+/// The [`crate::autosave_manager::AutosaveManagerEnv`] over the whole
+/// `Td` — built per call through [`autosave_env_split`] (the
+/// `QuickReplyEnv` convention), never held across calls. The sqlite pmc
 /// surface routes to `TdDb::common_kv` (the C++ `get_sqlite_pmc` home);
 /// the calls are gated on `use_message_database` by the manager, matching
 /// the C++ branch that guards them.
 pub(crate) struct AutosaveEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out for the autosave manager — the
+/// manager out, the env over the `Td` remainder (the
+/// `quick_reply_env_split` convention); the caller restores the manager
+/// after the call.
+pub(crate) fn autosave_env_split(
+    td: &mut Td,
+) -> (crate::autosave_manager::AutosaveManager, AutosaveEnv<'_>) {
+    let manager = std::mem::take(&mut td.autosave_manager);
+    (manager, AutosaveEnv { td })
 }
 
 impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn use_message_database(&self) -> bool {
-        self.global.use_message_database()
+        self.td.global.use_message_database()
     }
 
     fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.td_db().common_kv().get(key)
+        self.td.global.td_db().common_kv().get(key)
     }
 
     fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.td_db().common_kv().set(key, value);
+        self.td.global.td_db().common_kv().set(key, value);
     }
 
     fn binlog_pmc_erase(&mut self, key: &str) {
-        self.global.binlog_pmc().erase(key);
+        self.td.global.binlog_pmc().erase(key);
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.autosave_updates.push(update);
+    }
+
+    /// `td_->dialog_manager_->get_input_peer` — the full InputPeer family
+    /// over the free fn (the whole-Td env reaches it directly).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
     }
 
     /// the simplified dialog seam until the M.5/M.7 dialog integration
@@ -37970,6 +38058,62 @@ impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
     fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
         // `dialog_manager::force_create_dialog` — the M.6/M.7 cache seam;
         // every dialog id is resolvable in the collapsed cache
+    }
+
+    /// `GetAutoSaveSettingsQuery::send` (AutosaveManager.cpp:40-42) —
+    /// the answers drain through `Td::on_autosave_net_answer`.
+    fn send_get_auto_save_settings_query(&mut self) {
+        match self.td.autosave_net() {
+            Some(net) => net.dispatch(
+                crate::autosave_manager::AutosaveNetKind::GetAutoSaveSettings,
+                telegram_api::Function::account_getAutoSaveSettings(
+                    telegram_api::account_getAutoSaveSettings,
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send GetAutoSaveSettings — [net-inert]");
+            }
+        }
+    }
+
+    /// `SaveAutoSaveSettingsQuery::send` (AutosaveManager.cpp:67-80) —
+    /// the peer form rides the `PEER_MASK` flag (the generated storer
+    /// carries the bare bool flags itself).
+    fn send_save_auto_save_settings_query(
+        &mut self,
+        users: bool,
+        chats: bool,
+        broadcasts: bool,
+        dialog_id: crate::dialog_id::DialogId,
+        peer: Option<tdmtproto::telegram_api::InputPeer>,
+        settings: &tdmtproto::telegram_api::AutoSaveSettings,
+    ) {
+        match self.td.autosave_net() {
+            Some(net) => net.dispatch(
+                crate::autosave_manager::AutosaveNetKind::SaveAutoSaveSettings,
+                telegram_api::Function::account_saveAutoSaveSettings(
+                    telegram_api::account_saveAutoSaveSettings {
+                        flags: if peer.is_some() {
+                            crate::autosave_manager::SAVE_AUTO_SAVE_SETTINGS_PEER_MASK
+                        } else {
+                            0
+                        },
+                        users,
+                        chats,
+                        broadcasts,
+                        peer: peer.map(Box::new),
+                        settings: Some(settings.clone()),
+                    },
+                ),
+            ),
+            None => {
+                let _ = dialog_id;
+                tdutils::log_info!(
+                    "Send SaveAutoSaveSettings(users = {users}, chats = {chats}, \
+                     broadcasts = {broadcasts}) — [net-inert]"
+                );
+            }
+        }
     }
 }
 
@@ -67977,6 +68121,254 @@ mod tests {
         assert!(
             td.quick_reply_manager.net_promises.is_empty(),
             "all promises resolved"
+        );
+    }
+
+    // ---- the autosave net slice (§3.9): the get/save settings pair rides
+    // the dispatcher (AutosaveManager.cpp:32-95); the delete query stays
+    // parked at its seam. ----
+
+    /// A wire `autoSaveSettings` with the video-size flag (the
+    /// manager-test helper shape).
+    fn autosave_wire_settings(
+        photos: bool,
+        videos: bool,
+        size: i64,
+    ) -> telegram_api::AutoSaveSettings {
+        telegram_api::AutoSaveSettings {
+            flags: 1 << 2,
+            photos,
+            videos,
+            video_max_size: size,
+        }
+    }
+
+    /// A boxed `account.autoSaveSettings` answer.
+    fn autosave_answer(
+        users: telegram_api::AutoSaveSettings,
+        chats: telegram_api::AutoSaveSettings,
+        broadcasts: telegram_api::AutoSaveSettings,
+    ) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::account_AutoSaveSettings {
+            users_settings: Some(users),
+            chats_settings: Some(chats),
+            broadcasts_settings: Some(broadcasts),
+            exceptions: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    fn autosave_private_scope() -> td_api::AutosaveSettingsScope {
+        td_api::AutosaveSettingsScope::autosaveSettingsScopePrivateChats(
+            td_api::autosaveSettingsScopePrivateChats,
+        )
+    }
+
+    fn autosave_scope_chat(chat_id: i64) -> td_api::AutosaveSettingsScope {
+        td_api::AutosaveSettingsScope::autosaveSettingsScopeChat(
+            td_api::autosaveSettingsScopeChat { chat_id },
+        )
+    }
+
+    #[test]
+    fn autosave_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(autosave_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn autosave_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-autosave");
+
+        // seed a received user so the per-dialog save form resolves the
+        // peer with its access hash (the C++ in-query build, cpp:72-75)
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(7, "Bob")], "t");
+        });
+
+        // 1. the get leg: the reload query dispatches, the answer lands
+        //    in the real intake and the parked request promise resolves.
+        let (promise, slot) = record_bot_info_result::<td_api::AutosaveSettings>();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.get_autosave_settings(&mut env, promise);
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAutoSaveSettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            autosave_answer(
+                autosave_wire_settings(true, false, 10_000_000),
+                autosave_wire_settings(false, false, 1),
+                autosave_wire_settings(false, false, 1),
+            ),
+        );
+        td.dispatch_completed_autosave_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(settings)) => {
+                let private = settings.private_chat_settings.expect("inited");
+                assert!(private.autosave_photos && !private.autosave_videos);
+                assert!(settings.exceptions.is_empty());
+            }
+            other => panic!("unexpected get result: {other:?}"),
+        }
+        assert_eq!(td.autosave_updates.len(), 3, "one update per scope");
+
+        // 2. the save leg (the scope form): peer-less, the users flag
+        //    rides, no PEER_MASK.
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_private_scope()),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: true,
+                    autosave_videos: true,
+                    max_video_file_size: 20_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let parsed = telegram_api::account_saveAutoSaveSettings::parse(sent[0].query()).unwrap();
+        assert!(parsed.users && !parsed.chats && !parsed.broadcasts);
+        assert_eq!(parsed.flags & (1 << 3), 0, "the scope form is peer-less");
+        assert!(parsed.peer.is_none());
+        assert_eq!(parsed.settings.as_ref().unwrap().video_max_size, 20_000_000);
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_autosave_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the per-dialog save form: the peer resolves with the access
+        //    hash and PEER_MASK rides the flags.
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_scope_chat(7)),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: true,
+                    autosave_videos: false,
+                    max_video_file_size: 3_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let parsed = telegram_api::account_saveAutoSaveSettings::parse(sent[0].query()).unwrap();
+        assert_eq!(
+            parsed.flags & (1 << 3),
+            1 << 3,
+            "the peer form rides PEER_MASK"
+        );
+        match parsed.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(u)) => {
+                assert_eq!(u.user_id, 7);
+                assert_eq!(u.access_hash, 42);
+            }
+            other => panic!("the user peer rides the access hash: {other:?}"),
+        }
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_autosave_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 4. the unresolvable-peer band — the C++ in-query CHECK
+        //    downgrades to the sibling access band; no query goes out.
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_scope_chat(999)),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: true,
+                    autosave_videos: false,
+                    max_video_file_size: 3_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "no query for the banded save");
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "Chat not found");
+            }
+            other => panic!("the peer band answers 400: {other:?}"),
+        }
+
+        // 5. the save error band: the promise fails and the reload tail
+        //    re-fires the get query (the C++ on_error, cpp:91-94).
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_private_scope()),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: false,
+                    autosave_videos: false,
+                    max_video_file_size: 20_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 429, "Too Many Requests");
+        td.dispatch_completed_autosave_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 429);
+            }
+            other => panic!("the error band fails the promise: {other:?}"),
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the reload re-fires");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAutoSaveSettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            autosave_answer(
+                autosave_wire_settings(false, false, 10_000_000),
+                autosave_wire_settings(false, false, 1),
+                autosave_wire_settings(false, false, 1),
+            ),
+        );
+        td.dispatch_completed_autosave_net();
+
+        assert!(td.autosave_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.autosave_manager.pending_save_promises.is_empty(),
+            "all save promises resolved"
         );
     }
 
