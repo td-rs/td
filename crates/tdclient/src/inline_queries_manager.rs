@@ -697,15 +697,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `GetPreparedInlineMessageQuery` (InlineQueriesManager.cpp:233-267);
-    /// the response lands in on_get_prepared_inline_message.
-    fn send_get_prepared_inline_message_query(
-        &mut self,
-        query: telegram_api::messages_getPreparedInlineMessage,
-        bot_user_id: UserId,
-        query_hash: u64,
-        promise: Promise<Option<td_api::PreparedInlineMessage>>,
-    );
     /// `SavePreparedKeyboardButtonQuery` (InlineQueriesManager.cpp:269-295).
     fn send_save_prepared_keyboard_button_query(
         &mut self,
@@ -870,6 +861,14 @@ pub(crate) enum InlineQueriesNetKind {
     /// `messages.savePreparedInlineMessage`; the
     /// messages.BotPreparedInlineMessage answer settles the id pair.
     SavePreparedInlineMessage,
+    /// `GetPreparedInlineMessageQuery` (cpp:233-267) —
+    /// `messages.getPreparedInlineMessage`; the answer routes
+    /// [`InlineQueriesManager::on_get_prepared_inline_message`] with the
+    /// handler's `bot_user_id_`/`query_hash_` re-entry key pair.
+    GetPreparedInlineMessage {
+        bot_user_id: UserId,
+        query_hash: u64,
+    },
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -884,6 +883,8 @@ pub(crate) struct PendingInlineQueries {
     set_bot_guest_chat_result: Vec<Promise<td_api::InlineMessageId>>,
     /// `SavePreparedInlineMessageQuery::promise_`.
     save_prepared_inline_message: Vec<Promise<td_api::PreparedInlineMessageId>>,
+    /// `GetPreparedInlineMessageQuery::promise_`.
+    get_prepared_inline_message: Vec<Promise<Option<td_api::PreparedInlineMessage>>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1334,7 +1335,10 @@ impl InlineQueriesManager {
         let query_hash = finish_query_hash(query_hash);
 
         if let Some(entry) = self.inline_query_results.get_mut(&query_hash) {
-            if !entry.is_inline_query {
+            // `if (it->second.is_inline_query)` (cpp:798-800) — the
+            // collision names an *inline-query* entry (the mirror of
+            // send_inline_query's band, cpp:1387-1389)
+            if entry.is_inline_query {
                 promise.set_error(Status::error(500, "Request hash collision"));
                 return;
             }
@@ -1361,7 +1365,7 @@ impl InlineQueriesManager {
             bot: Some(input_user),
             id: prepared_message_id.to_owned(),
         };
-        env.send_get_prepared_inline_message_query(query, bot_user_id, query_hash, promise);
+        self.send_get_prepared_inline_message_query(query, bot_user_id, query_hash, promise);
     }
 
     /// `save_prepared_keyboard_button` (InlineQueriesManager.cpp:811-819).
@@ -1938,6 +1942,49 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.save_prepared_inline_message.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<GetPreparedInlineMessageQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:244-250) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches with the
+    /// handler's `bot_user_id_`/`query_hash_` members on the kind. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_get_prepared_inline_message_query(
+        &mut self,
+        query: telegram_api::messages_getPreparedInlineMessage,
+        bot_user_id: UserId,
+        query_hash: u64,
+        promise: Promise<Option<td_api::PreparedInlineMessage>>,
+    ) {
+        self.pending.get_prepared_inline_message.push(promise);
+        let kind = InlineQueriesNetKind::GetPreparedInlineMessage {
+            bot_user_id,
+            query_hash,
+        };
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getPreparedInlineMessage(query),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.getPreparedInlineMessage for bot {} — [net-inert]",
+                bot_user_id.get()
+            ),
+        }
+    }
+
+    /// The get-prepared-inline-message family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_get_prepared_inline_message_promise(
+        &mut self,
+    ) -> Option<Promise<Option<td_api::PreparedInlineMessage>>> {
+        if self.pending.get_prepared_inline_message.is_empty() {
+            None
+        } else {
+            Some(self.pending.get_prepared_inline_message.remove(0))
         }
     }
 
@@ -3758,16 +3805,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_get_prepared_inline_message_query(
-            &mut self,
-            _query: telegram_api::messages_getPreparedInlineMessage,
-            _bot_user_id: UserId,
-            _query_hash: u64,
-            _promise: Promise<Option<td_api::PreparedInlineMessage>>,
-        ) {
-            // [blocked: net]
-        }
-
         fn send_save_prepared_keyboard_button_query(
             &mut self,
             _query: telegram_api::bots_requestWebViewButton,
@@ -4047,6 +4084,37 @@ mod tests {
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
         );
+    }
+
+    /// The get_prepared_inline_message bands: the cache-hash ladder parks
+    /// the promise per request (the C++ handler carries it on the query),
+    /// the double call answers FIFO and the collision band fires when the
+    /// hash names an inline-query entry.
+    #[test]
+    fn get_prepared_inline_message_bands_and_fifo() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+        let (promise, outcomes) = recording_promise::<Option<td_api::PreparedInlineMessage>>();
+        manager.get_prepared_inline_message(&mut env, UserId::new(9), "pm1", promise);
+        assert_eq!(manager.pending.get_prepared_inline_message.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+
+        // the second call for the same key increments the pending count
+        // and parks another promise (cpp:794-804)
+        let (promise, _outcomes) = recording_promise::<Option<td_api::PreparedInlineMessage>>();
+        manager.get_prepared_inline_message(&mut env, UserId::new(9), "pm1", promise);
+        assert_eq!(manager.pending.get_prepared_inline_message.len(), 2);
+        assert!(manager.pop_get_prepared_inline_message_promise().is_some());
+        assert!(manager.pop_get_prepared_inline_message_promise().is_some());
+        assert!(manager.pop_get_prepared_inline_message_promise().is_none());
+
+        // the unknown-bot band (cpp:785-789)
+        let (promise, outcomes) = recording_promise::<Option<td_api::PreparedInlineMessage>>();
+        manager.get_prepared_inline_message(&mut env, UserId::new(404), "pm1", promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
     }
 
     /// The save_prepared_inline_message bands: the chat-types ladder

@@ -17983,6 +17983,65 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `GetPreparedInlineMessageQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:252-266) — the answer routes
+            // `on_get_prepared_inline_message` with the handler's
+            // re-entry key pair and the parked promise; the error half
+            // runs the nullptr intake for the query hash first
+            // (cpp:263-265).
+            K::GetPreparedInlineMessage {
+                bot_user_id,
+                query_hash,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_PreparedInlineMessage::parse(query.ok()) {
+                        Ok(prepared) => Ok(prepared),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.preparedInlineMessage: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getPreparedInlineMessage answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_get_prepared_inline_message_promise();
+                match (result, promise) {
+                    (Ok(prepared), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_prepared_inline_message(
+                            &mut env,
+                            bot_user_id,
+                            query_hash,
+                            Some(prepared),
+                            promise,
+                        );
+                    }
+                    (Err(status), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_prepared_inline_message(
+                            &mut env,
+                            bot_user_id,
+                            query_hash,
+                            None,
+                            Promise::default(),
+                        );
+                        let mut promise = promise;
+                        promise.set_error(status);
+                    }
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.getPreparedInlineMessage answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46414,16 +46473,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_get_prepared_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_getPreparedInlineMessage,
-        _bot_user_id: crate::user_manager::UserId,
-        _query_hash: u64,
-        _promise: Promise<Option<td_api::PreparedInlineMessage>>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_save_prepared_keyboard_button_query(
@@ -89266,6 +89315,119 @@ kQIDAQAB\n\
             &rec,
             telegram_api::messages_savePreparedInlineMessage::ID,
             "the empty chat-types band sends nothing",
+        );
+
+        // 15. back to the user mode — the getPreparedInlineMessage arm
+        //     rides the wire (Requests.cpp:8228-8234 →
+        //     get_prepared_inline_message → GetPreparedInlineMessageQuery
+        //     ::send, cpp:244-250): the resolved bot input user and the id
+        td.auth_manager.force_user_for_test();
+        td.request(
+            13,
+            Function::getPreparedInlineMessage(td_api::getPreparedInlineMessage {
+                bot_user_id: 9,
+                prepared_message_id: "pm1".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPreparedInlineMessage::ID,
+        );
+        let body = telegram_api::messages_getPreparedInlineMessage::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert_eq!(body.id, "pm1");
+
+        // 16. the answer routes on_get_prepared_inline_message
+        //     (cpp:252-262 → 2324-2357): the article result parks at the
+        //     [blocked: M.9] content seam, so the port answers the C++
+        //     "Receive invalid response" 500 band
+        let prepared = telegram_api::messages_PreparedInlineMessage {
+            query_id: 991,
+            result: Some(telegram_api::BotInlineResult::botInlineResult(
+                telegram_api::botInlineResult {
+                    flags: 0,
+                    id: "a".to_owned(),
+                    r#type: "article".to_owned(),
+                    title: String::new(),
+                    description: String::new(),
+                    url: String::new(),
+                    thumb: None,
+                    content: None,
+                    send_message: Some(telegram_api::BotInlineMessage::botInlineMessageText(
+                        telegram_api::botInlineMessageText {
+                            flags: 0,
+                            no_webpage: false,
+                            invert_media: false,
+                            message: "hi".to_owned(),
+                            entities: Vec::new(),
+                            reply_markup: None,
+                        },
+                    )),
+                },
+            )),
+            peer_types: Vec::new(),
+            cache_time: 60,
+            users: Vec::new(),
+        };
+        net_complete(sent, wire!(prepared));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 13);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive invalid response")
+        );
+
+        // 17. the zero-query-id band (cpp:2326-2330) — the "Receive no
+        //     response" 500 after the nullptr intake
+        td.request(
+            14,
+            Function::getPreparedInlineMessage(td_api::getPreparedInlineMessage {
+                bot_user_id: 9,
+                prepared_message_id: "pm2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPreparedInlineMessage::ID,
+        );
+        let prepared = telegram_api::messages_PreparedInlineMessage {
+            query_id: 0,
+            ..prepared
+        };
+        net_complete(sent, wire!(prepared));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive no response")
+        );
+
+        // 18. the wire error forwards through the nullptr intake
+        //     (cpp:263-266)
+        td.request(
+            15,
+            Function::getPreparedInlineMessage(td_api::getPreparedInlineMessage {
+                bot_user_id: 9,
+                prepared_message_id: "pm3".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getPreparedInlineMessage::ID,
+        );
+        net_fail(sent, 400, "PREPARED_MESSAGE_INVALID");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 15);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "PREPARED_MESSAGE_INVALID")
         );
     }
 }

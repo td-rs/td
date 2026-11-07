@@ -726,6 +726,13 @@ impl AuthManager {
         self.is_bot = true;
     }
 
+    /// Test-only: the counterpart reset (a netted round-trip that walks
+    /// both the user-mode and the bot-mode request arms in one td).
+    #[cfg(test)]
+    pub(crate) fn force_user_for_test(&mut self) {
+        self.is_bot = false;
+    }
+
     /// The api_id/api_hash half of `setTdlibParameters` (Td passes them
     /// through after its own validation).
     pub fn set_api_credentials(&mut self, api_id: i32, api_hash: String) {
