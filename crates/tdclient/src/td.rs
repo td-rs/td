@@ -3659,6 +3659,15 @@ pub(crate) type DialogParticipantNetHandle =
 /// [`crate::group_call_manager::GroupCallManager::net`] shape): the send
 /// legs run inside the manager over the env's peer/permission reads.
 pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::ForumTopicNetKind>;
+/// The cloned Transcription dispatch surface the [`TdTranscriptionEnv`]
+/// send legs use — the per-kind handle over the two ResultHandler classes
+/// of TranscriptionInfo.cpp:21-91 (the net-drain 47 plane: the
+/// transcribe/rate speech-recognition families); the answers drain
+/// through [`Td::dispatch_completed_transcription_net`]. Env-held like
+/// the translation plane: the whole-Td env view resolves the read peer
+/// at the send leg.
+pub(crate) type TranscriptionNetHandle =
+    NetKindHandle<crate::transcription_manager::TranscriptionNetKind>;
 
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
@@ -6160,6 +6169,12 @@ pub struct Td {
     /// the actor pump routes them through
     /// [`Td::on_web_pages_net_answer`].
     web_pages_net_completed: Arc<Mutex<Vec<(crate::web_pages_manager::WebPagesNetKind, NetQuery)>>>,
+    /// The transcription net completed queue (the
+    /// `TranscriptionNetKind` tags; the net-drain 47 families) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_transcription_net_answer`].
+    transcription_net_completed:
+        Arc<Mutex<Vec<(crate::transcription_manager::TranscriptionNetKind, NetQuery)>>>,
     /// The attach-menu net completed queue (the `AttachMenuNetKind`
     /// tags; the net-drain 42 families) — the dispatcher callbacks park
     /// here, the actor pump routes them through
@@ -6681,6 +6696,7 @@ impl Td {
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
+            transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -7331,14 +7347,9 @@ impl Td {
         // restore collapses into the earlier `init_freeze_state`). The
         // gate is inside (the C++ load guards is_authorized && !is_bot).
         {
-            let mut env = NotificationEnv {
-                global: &mut self.global,
-                options: self.option_manager.as_mut(),
-                auth_is_authorized: self.auth_manager.is_authorized(),
-                auth_is_bot: self.auth_manager.is_bot(),
-                updates: &mut self.transcription_updates,
-            };
-            self.transcription_manager.init(&mut env);
+            let (mut manager, mut env) = crate::td::transcription_env_split(self);
+            manager.init(&mut env);
+            self.transcription_manager = manager;
         }
 
         // `make_unique<TranslationManager>` + the constructor
@@ -8357,19 +8368,14 @@ impl Td {
                         duration_max,
                         cooldown_until,
                     } => {
-                        let mut env = NotificationEnv {
-                            global: &mut self.global,
-                            options: self.option_manager.as_mut(),
-                            auth_is_authorized: self.auth_manager.is_authorized(),
-                            auth_is_bot: self.auth_manager.is_bot(),
-                            updates: &mut self.transcription_updates,
-                        };
-                        self.transcription_manager.on_update_trial_parameters(
+                        let (mut manager, mut env) = crate::td::transcription_env_split(self);
+                        manager.on_update_trial_parameters(
                             &mut env,
                             weekly_number,
                             duration_max,
                             cooldown_until,
                         );
+                        self.transcription_manager = manager;
                         None
                     }
                     update => {
@@ -9001,6 +9007,7 @@ impl Td {
         self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_forum_topic_net();
         self.dispatch_completed_web_pages_net();
+        self.dispatch_completed_transcription_net();
         self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9400,6 +9407,16 @@ impl Td {
         Some(WebPagesNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.web_pages_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned Transcription dispatch surface (the net-drain 47
+    /// families' send legs — the whole-Td env reads it at the send).
+    pub(crate) fn transcription_net(&self) -> Option<TranscriptionNetHandle> {
+        Some(TranscriptionNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.transcription_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17697,6 +17714,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked Transcription answers — the C++
+    /// ResultHandler halves of the net-drain 47 families
+    /// (TranscriptionInfo.cpp:21-91).
+    fn dispatch_completed_transcription_net(&mut self) {
+        let completed = std::mem::take(&mut *self.transcription_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_transcription_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// The net-drain 42 attach-menu answers (the dispatcher callback
     /// parks) — the reload/single-bot/toggle intakes route into the
     /// manager's answer handlers over the split env.
@@ -19334,6 +19362,89 @@ impl Td {
     ) -> R {
         let (mut env, manager) = crate::td::message_query_env_split(self);
         run(&mut env, manager)
+    }
+
+    /// Route one Transcription net answer by kind — the ResultHandler
+    /// halves of the net-drain 47 families (TranscriptionInfo.cpp:21-91):
+    /// the transcribe answer re-enters the landed
+    /// [`crate::transcription_manager::TranscriptionManager::on_transcribed_audio`]
+    /// intake with the handler closure's `FileInfo` capture, the rate
+    /// answer is the bootstrap Bool both value bands of which settle the
+    /// FIFO-head promise ok on both value bands — no `LOG_IF` on this
+    /// family (cpp:82-84). The wire errors run the C++ `on_error` tails:
+    /// the `on_get_dialog_error` head, then the handler/promise error
+    /// (cpp:51-55/:87-90).
+    fn on_transcription_net_answer(
+        &mut self,
+        kind: crate::transcription_manager::TranscriptionNetKind,
+        query: NetQuery,
+    ) {
+        use crate::transcription_manager::TranscriptionNetKind as K;
+        match kind {
+            // `TranscribeAudioQuery::on_result`/`on_error`
+            // (TranscriptionInfo.cpp:40-49).
+            K::TranscribeAudio {
+                dialog_id,
+                file_info,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_TranscribedAudio::parse(query.ok()) {
+                        Ok(audio) => Ok(audio),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.transcribedAudio: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_transcribeAudio answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "TranscribeAudioQuery",
+                    );
+                }
+                let (mut manager, mut env) = crate::td::transcription_env_split(self);
+                manager.on_transcribed_audio(&mut env, file_info, result.into());
+                self.transcription_manager = manager;
+            }
+            // `RateTranscribedAudioQuery::on_result`/`on_error`
+            // (TranscriptionInfo.cpp:76-91) — both Bool value bands
+            // answer ok (no `LOG_IF` on this family).
+            K::RateTranscribedAudio { dialog_id } => {
+                let status = if query.is_error() {
+                    Some(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok()).is_none().then(|| {
+                        Status::error(
+                            500,
+                            "Failed to parse the messages_rateTranscribedAudio answer",
+                        )
+                    })
+                };
+                if let Some(status) = &status {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "RateTranscribedAudioQuery",
+                    );
+                }
+                let promise = self.transcription_manager.pop_rate_promise();
+                match (status, promise) {
+                    (Some(status), Some(mut promise)) => promise.set_error(status),
+                    (None, Some(mut promise)) => promise.set_value(()),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {}
+                }
+            }
+        }
     }
 
     /// Route one ForumTopic net answer by kind — the ResultHandler
@@ -32269,21 +32380,44 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
     }
 }
 
-impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'_> {
+/// The whole-Td [`crate::transcription_manager::TranscriptionManagerEnv`]
+/// (the `TdTranslationEnv` convention) — the net slice sends through the
+/// cloned [`TranscriptionNetHandle`] with the read peer resolved at the
+/// send leg, and the rate-family promise parks on the manager's FIFO lot.
+/// The dedicated whole-Td view replaces the shared `NotificationEnv`
+/// impl: the send legs need `Td`'s dialog-manager peer reads, which the
+/// field-split env cannot carry.
+pub(crate) struct TdTranscriptionEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out (the `translation_env_split`
+/// convention).
+pub(crate) fn transcription_env_split(
+    td: &mut Td,
+) -> (
+    crate::transcription_manager::TranscriptionManager,
+    TdTranscriptionEnv<'_>,
+) {
+    let manager = std::mem::take(&mut td.transcription_manager);
+    (manager, TdTranscriptionEnv { td })
+}
+
+impl crate::transcription_manager::TranscriptionManagerEnv for TdTranscriptionEnv<'_> {
     fn auth_is_authorized(&self) -> bool {
-        self.auth_is_authorized
+        self.td.auth_manager.is_authorized()
     }
 
     fn auth_is_bot(&self) -> bool {
-        self.auth_is_bot
+        self.td.auth_manager.is_bot()
     }
 
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn unix_time(&self) -> i32 {
-        self.global.unix_time()
+        self.td.global.unix_time()
     }
 
     fn now(&self) -> f64 {
@@ -32291,15 +32425,15 @@ impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'
     }
 
     fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.binlog_pmc().get_raw(key)
+        self.td.global.binlog_pmc().get_raw(key)
     }
 
     fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.binlog_pmc().set_raw(key, value);
+        self.td.global.binlog_pmc().set_raw(key, value);
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.transcription_updates.push(update);
     }
 
     /// `messages_manager_->have_message_force` — [blocked: M.10]; no
@@ -32345,23 +32479,86 @@ impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'
         None
     }
 
-    /// `TranscribeAudioQuery` — [blocked: net]; the query drops, the
-    /// parked promises stay unanswered like the C++ offline.
-    fn send_transcribe_audio_query(&mut self, message_full_id: crate::dialog_id::MessageFullId) {
-        tdutils::log_info!("Transcribe audio {message_full_id:?} — [blocked: net]");
+    /// `TranscribeAudioQuery::send` (TranscriptionInfo.cpp:26-38) — the
+    /// read peer resolves here (the C++ `on_error(400, "Can't access the
+    /// chat")` inline band files through the completed queue so the
+    /// answer half runs the full `on_error` tail). The C++
+    /// `query->total_timeout_limit_ = 8` rides the handle's 24-hour
+    /// budget like every landed per-kind send (the walking-skeleton
+    /// default; documented divergence).
+    fn send_transcribe_audio_query(
+        &mut self,
+        message_full_id: crate::dialog_id::MessageFullId,
+        file_info: crate::transcription_manager::FileInfo,
+    ) {
+        use crate::transcription_manager::TranscriptionNetKind;
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(net) = self.td.transcription_net() else {
+            tdutils::log_info!("Transcribe audio {message_full_id:?} — [net-inert]");
+            return;
+        };
+        let kind = TranscriptionNetKind::TranscribeAudio {
+            dialog_id,
+            file_info,
+        };
+        match crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) {
+            Some(peer) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_transcribeAudio(
+                    telegram_api::messages_transcribeAudio {
+                        peer: Some(Box::new(peer)),
+                        msg_id: message_full_id
+                            .get_message_id()
+                            .get_server_message_id()
+                            .get(),
+                    },
+                ),
+            ),
+            None => net.complete_error(kind, 400, "Can't access the chat"),
+        }
     }
 
-    /// `RateTranscribedAudioQuery` — [blocked: net].
+    /// `RateTranscribedAudioQuery::send` (TranscriptionInfo.cpp:65-74) —
+    /// the request promise has already parked in the manager's family lot
+    /// by the caller; the same read-peer band and the same wire form.
     fn send_rate_transcribed_audio_query(
         &mut self,
         message_full_id: crate::dialog_id::MessageFullId,
         transcription_id: i64,
         is_good: bool,
-        _promise: tdutils::promise::Promise<()>,
     ) {
-        tdutils::log_info!(
-            "Rate transcribed audio {message_full_id:?} id {transcription_id} good {is_good} — [blocked: net]"
-        );
+        use crate::transcription_manager::TranscriptionNetKind;
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(net) = self.td.transcription_net() else {
+            tdutils::log_info!("Rate transcribed audio {message_full_id:?} — [net-inert]");
+            return;
+        };
+        let kind = TranscriptionNetKind::RateTranscribedAudio { dialog_id };
+        match crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) {
+            Some(peer) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_rateTranscribedAudio(
+                    telegram_api::messages_rateTranscribedAudio {
+                        peer: Some(Box::new(peer)),
+                        msg_id: message_full_id
+                            .get_message_id()
+                            .get_server_message_id()
+                            .get(),
+                        transcription_id,
+                        good: is_good,
+                    },
+                ),
+            ),
+            None => net.complete_error(kind, 400, "Can't access the chat"),
+        }
     }
 }
 
@@ -78796,6 +78993,291 @@ kQIDAQAB\n\
         // the drain ran clean — nothing parked, no strays
         assert!(td.web_browser_net_completed.lock().is_empty(), "drained");
         assert!(td.web_browser_manager.pop_update_promise().is_none());
+    }
+
+    #[test]
+    fn transcription_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(transcription_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn transcription_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// The recorded `()`-promise outcome (the `record_ton_unit` shape).
+        fn record_unit() -> (Promise<()>, UnitSlot) {
+            struct Rec(UnitSlot);
+            impl tdutils::promise::PromiseInterface<()> for Rec {
+                fn set_value(&mut self, _value: ()) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(()));
+                }
+                fn set_error(&mut self, error: Status) {
+                    *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+                }
+            }
+            let slot: UnitSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            (Promise::from_interface(Rec(slot.clone())), slot)
+        }
+        /// The `updateSpeechRecognitionTrial` objects the trial plane
+        /// outboxed so far (the [blocked: M.28] seam leaves the rest of
+        /// the intake parked, the trial table is the observable half).
+        fn trial_updates(td: &Td) -> Vec<(i32, i32, i32, i32)> {
+            td.transcription_updates
+                .iter()
+                .filter_map(|update| match update {
+                    td_api::Update::updateSpeechRecognitionTrial(update) => Some((
+                        update.max_media_duration,
+                        update.weekly_count,
+                        update.left_count,
+                        update.next_reset_date,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain47-transcription");
+        // the self user id makes the read peer resolve to `inputPeerSelf`
+        // (UserManager.cpp:7450-7453 shape — no user record needed)
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        let voice = crate::dialog_id::MessageFullId::new(
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001)),
+            crate::messages_manager::MessageId::new(1 << 21), // server id 2
+        );
+
+        // 0. the live td_api arm still answers the C++ not-found band (the
+        //    [blocked: M.10] message probe) — the arm routes into the
+        //    manager, nothing intercepts it
+        td.request(
+            1,
+            Function::rateSpeechRecognition(td_api::rateSpeechRecognition {
+                chat_id: 700000001,
+                message_id: 1 << 21,
+                is_good: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message not found")
+        );
+
+        // 1. the rate family rides the wire: the resolved read peer, the
+        //    server message id, the transcription id and the rating
+        let (promise, slot) = record_unit();
+        {
+            let (mut manager, mut env) = crate::td::transcription_env_split(&mut td);
+            manager.send_rate_transcribed_audio_query(&mut env, voice, 77, false, promise);
+            td.transcription_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_rateTranscribedAudio::ID,
+        );
+        let body = telegram_api::messages_rateTranscribedAudio::parse(sent.query())
+            .expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(
+            (body.msg_id, body.transcription_id, body.good),
+            (2, 77, false)
+        );
+
+        // 2. the boolTrue answer settles the parked promise ok
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_transcription_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the boolFalse band answers ok too — the C++ `on_result` has
+        //    no `LOG_IF(!result)` on this family (cpp:82-84)
+        let (promise, slot) = record_unit();
+        {
+            let (mut manager, mut env) = crate::td::transcription_env_split(&mut td);
+            manager.send_rate_transcribed_audio_query(&mut env, voice, 78, true, promise);
+            td.transcription_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_rateTranscribedAudio::ID,
+        );
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_transcription_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 4. the wire-error band forwards the same code/message to the
+        //    promise (the `on_error` tail after the dialog-error head)
+        let (promise, slot) = record_unit();
+        {
+            let (mut manager, mut env) = crate::td::transcription_env_split(&mut td);
+            manager.send_rate_transcribed_audio_query(&mut env, voice, 79, true, promise);
+            td.transcription_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_rateTranscribedAudio::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_transcription_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "FLOOD_WAIT_9"));
+            }
+            other => panic!("expected the forwarded error, got {other:?}"),
+        }
+
+        // 5. the unresolvable-peer band — the C++ `send`'s inline
+        //    `on_error(400, "Can't access the chat")` files through the
+        //    completed queue, so the answer half runs the full tail
+        let unknown_voice = crate::dialog_id::MessageFullId::new(
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(5)),
+            crate::messages_manager::MessageId::new(1 << 21),
+        );
+        let (promise, slot) = record_unit();
+        {
+            let (mut manager, mut env) = crate::td::transcription_env_split(&mut td);
+            manager.send_rate_transcribed_audio_query(&mut env, unknown_voice, 80, true, promise);
+            td.transcription_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_transcription_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Can't access the chat")
+                );
+            }
+            other => panic!("expected the access band, got {other:?}"),
+        }
+
+        // 6. the transcribe family rides the wire with the same read peer
+        {
+            let (manager, mut env) = crate::td::transcription_env_split(&mut td);
+            crate::transcription_manager::TranscriptionManagerEnv::send_transcribe_audio_query(
+                &mut env,
+                voice,
+                crate::transcription_manager::FileInfo {
+                    kind: crate::transcription_manager::TranscriptionKind::VoiceNote,
+                    file_id: crate::files::FileId::new(3, 0),
+                },
+            );
+            td.transcription_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_transcribeAudio::ID,
+        );
+        let body =
+            telegram_api::messages_transcribeAudio::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.msg_id, 2);
+
+        // 7. the trial-remains tail of the answer lands in the trial table
+        //    (`flags.1`, TranscriptionManager.cpp:307-313) — the weekly
+        //    number primes through the config intake first, so the clamp
+        //    keeps the 5 remaining tries
+        {
+            let (mut manager, mut env) = crate::td::transcription_env_split(&mut td);
+            manager.on_update_trial_parameters(&mut env, 10, 30, 0);
+            td.transcription_manager = manager;
+        }
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_TranscribedAudio {
+                flags: 1 | (1 << 1),
+                pending: true,
+                transcription_id: 77,
+                text: "par".to_string(),
+                trial_remains_num: 5,
+                trial_remains_until_date: 2_000_000_000,
+            }),
+        );
+        td.dispatch_completed_transcription_net();
+        assert_eq!(
+            trial_updates(&td),
+            vec![
+                (30, 10, 10, 0),            // the config intake primes the weekly number
+                (30, 10, 5, 2_000_000_000), // the answer's trial-remains pair
+            ]
+        );
+
+        // 8. the transcribe wire-error band: no retry-after, so the trial
+        //    table stands and the drain runs clean
+        {
+            let (manager, mut env) = crate::td::transcription_env_split(&mut td);
+            crate::transcription_manager::TranscriptionManagerEnv::send_transcribe_audio_query(
+                &mut env,
+                voice,
+                crate::transcription_manager::FileInfo {
+                    kind: crate::transcription_manager::TranscriptionKind::VoiceNote,
+                    file_id: crate::files::FileId::new(3, 0),
+                },
+            );
+            td.transcription_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_transcribeAudio::ID,
+        );
+        net_fail(sent, 400, "VOICE_MESSAGES_FORBIDDEN");
+        td.dispatch_completed_transcription_net();
+        assert_eq!(trial_updates(&td).len(), 2, "the trial table stands");
+
+        // 9. the net-inert posture — no dispatcher, the send leg logs and
+        //    parks nothing (the C++ offline shape)
+        td.net_query_dispatcher = None;
+        let (promise, slot) = record_unit();
+        {
+            let (mut manager, mut env) = crate::td::transcription_env_split(&mut td);
+            manager.send_rate_transcribed_audio_query(&mut env, voice, 81, true, promise);
+            td.transcription_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settled");
+        // the park stands unanswered — the port's offline shape (the C++
+        // handler would hold the promise until an answer that never
+        // comes without a dispatcher)
+        assert!(
+            td.transcription_manager.pop_rate_promise().is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.transcription_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
