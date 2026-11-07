@@ -3669,6 +3669,16 @@ pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::
 pub(crate) type TranscriptionNetHandle =
     NetKindHandle<crate::transcription_manager::TranscriptionNetKind>;
 
+/// The cloned game dispatch surface the
+/// [`crate::game_manager::GameManager`] holds — the per-kind handle over
+/// the GameManager.cpp ResultHandler kinds (the net-drain 57 plane: the
+/// setGameScore/getGameHighScores families); the answers drain through
+/// [`Td::dispatch_completed_game_net`]. Manager-held (the
+/// [`crate::game_manager::GameManager::net`] field, the forum-topic
+/// shape): the send legs run inside the manager over the env's
+/// peer/input-user reads.
+pub(crate) type GameNetHandle = NetKindHandle<crate::game_manager::GameNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -6181,6 +6191,10 @@ pub struct Td {
     /// [`Td::on_attach_menu_net_answer`].
     attach_menu_net_completed:
         Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
+    /// The game net completed queue (the `GameNetKind` tags; the
+    /// net-drain 57 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_game_net_answer`].
+    game_net_completed: Arc<Mutex<Vec<(crate::game_manager::GameNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6698,6 +6712,7 @@ impl Td {
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
+            game_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7191,6 +7206,7 @@ impl Td {
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
+        self.game_manager.net = self.game_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9009,6 +9025,7 @@ impl Td {
         self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
         self.dispatch_completed_attach_menu_net();
+        self.dispatch_completed_game_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9429,6 +9446,17 @@ impl Td {
         Some(AttachMenuNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.attach_menu_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned game dispatch surface the
+    /// [`crate::game_manager::GameManager`] holds (the net-drain 57
+    /// families' send legs) — `None` keeps the net-inert posture.
+    pub(crate) fn game_net(&self) -> Option<GameNetHandle> {
+        Some(GameNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.game_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17736,6 +17764,16 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked game answers — the C++ ResultHandler
+    /// halves of the net-drain 57 families (GameManager.cpp:28-103).
+    fn dispatch_completed_game_net(&mut self) {
+        let completed = std::mem::take(&mut *self.game_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_game_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -19443,6 +19481,71 @@ impl Td {
                     // net-inert posture or a dropped request)
                     (_, None) => {}
                 }
+            }
+        }
+    }
+
+    /// Route one game net answer by kind — the ResultHandler halves of
+    /// the net-drain 57 families (GameManager.cpp:28-103): the wire
+    /// answer parses here, the parked family promise settles exactly
+    /// where the C++ handler settles it (the parse failures run the
+    /// same `on_error` tails the C++ `fetch_result` failure would,
+    /// cpp:53-56/:91-94).
+    fn on_game_net_answer(&mut self, kind: crate::game_manager::GameNetKind, query: NetQuery) {
+        use crate::game_manager::GameNetKind as K;
+        match kind {
+            // `GetGameHighScoresQuery::on_result`/`on_error`
+            // (GameManager.cpp:90-102) — the answer converts through the
+            // manager intake (the users intake + the wrong-row filter,
+            // cpp:169-186) and settles the parked FIFO-head promise.
+            K::GetGameHighScores { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_HighScores::parse(query.ok()) {
+                        Ok(high_scores) => Ok(high_scores),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.highScores: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getGameHighScores answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetGameHighScoresQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.game_manager);
+                let promise = manager.pop_get_game_high_scores_promise();
+                match (result, promise) {
+                    (Ok(high_scores), Some(mut promise)) => {
+                        let scores = {
+                            let mut env = crate::td::BotEnv { td: self };
+                            manager.get_game_high_scores_object(
+                                &mut env,
+                                high_scores,
+                            )
+                        };
+                        promise.set_value(scores);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.getGameHighScores answer"
+                        )
+                    }
+                }
+                self.game_manager = manager;
             }
         }
     }
@@ -43150,6 +43253,16 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
         crate::dialog_manager::on_get_dialog_error(&self.td.global, dialog_id, status, source);
     }
 
+    /// `DialogManager::get_input_peer` (DialogManager.cpp:1377-1395) — the
+    /// net-drain 57 query send legs resolve the peer here.
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
+
     fn have_message_force(
         &mut self,
         message_full_id: crate::message_id::MessageFullId,
@@ -52839,6 +52952,7 @@ mod tests {
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
+        td.game_manager.net = td.game_net();
         (td, rec, callback)
     }
 
@@ -79278,6 +79392,253 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.transcription_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the net-drain 57 game families: the two §3.9 GameManager wire
+    // ---- queries (GameManager.cpp:28-103) ride the GameNetKind plane. ----
+
+    #[test]
+    fn game_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(game_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn game_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        /// A `Promise<T>` slot (the poll round-trip's record_slot shape).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+        fn sample_wire_high_scores() -> telegram_api::messages_HighScores {
+            telegram_api::messages_HighScores {
+                scores: vec![
+                    telegram_api::HighScore {
+                        pos: 1,
+                        user_id: 9,
+                        score: 100,
+                    },
+                    telegram_api::HighScore {
+                        pos: 0,
+                        user_id: 9,
+                        score: 50,
+                    },
+                ],
+                users: vec![telegram_api::User::user(telegram_api::user {
+                    flags: 1 << 15,
+                    id: 9,
+                    ..Default::default()
+                })],
+            }
+        }
+
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain66-game");
+        // the self user id makes the read peer resolve to `inputPeerSelf`
+        // at the send legs (the net-drain 47 fixture)
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        // the self user record makes the live arms' dialog-access guard
+        // pass (have_dialog_force reads the accessible-user registry), so
+        // the [blocked: M.10] message probe answers the band
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "game_net_families_ride_the_dispatcher",
+        );
+        let game = crate::dialog_id::MessageFullId::new(
+            crate::dialog_id::DialogId::from_user_id(crate::user_manager::UserId::new(700000001)),
+            crate::messages_manager::MessageId::new(1 << 20), // server id 1
+        );
+        let input_user = telegram_api::InputUser::inputUser(telegram_api::inputUser {
+            user_id: 9,
+            access_hash: 3,
+        });
+
+        // 1. the live td_api arm still answers the C++ not-found band (the
+        //    [blocked: M.10] message probe) — the arm routes into the
+        //    manager, nothing intercepts it (Requests.cpp:4925-4930)
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            1,
+            Function::getGameHighScores(td_api::getGameHighScores {
+                chat_id: 700000001,
+                message_id: 1 << 20,
+                user_id: 9,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!((error.code, error.message.as_str()), (400, "Message not found"));
+
+        // 2. getGameHighScores rides the wire: the resolved read peer, the
+        //    server message id and the input user (GameManager.cpp:79-88)
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getGameHighScores::ID,
+        );
+        let body = telegram_api::messages_getGameHighScores::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert_eq!(body.id, 1);
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+
+        // 3. the answer converts through the manager intake and settles
+        //    the parked promise (the pos<=0 row drops, cpp:178-181)
+        net_complete(sent, wire!(sample_wire_high_scores()));
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(scores)) => {
+                assert_eq!(scores.scores.len(), 1);
+                assert_eq!(
+                    (scores.scores[0].position, scores.scores[0].user_id, scores.scores[0].score),
+                    (1, 9, 100)
+                );
+            }
+            other => panic!("expected the converted scores, got {other:?}"),
+        }
+
+        // 4. the wire-error band runs the on_error tail: the dialog-error
+        //    head then the promise error (GameManager.cpp:99-102)
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getGameHighScores::ID,
+        );
+        net_fail(sent, 420, "GAME_SCORE_INVALID");
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "GAME_SCORE_INVALID"));
+            }
+            other => panic!("expected the forwarded error, got {other:?}"),
+        }
+
+        // 5. the unresolvable-peer band — the C++ `CHECK(input_peer !=
+        //    nullptr)` (cpp:83) is the port's `complete_error` file-through
+        //    (the message-query CHECK convention): the answer half runs the
+        //    full on_error tail. A bot td resolves any user id through
+        //    the access-hash-0 fallback, so the unresolvable dialog is an
+        //    unregistered basic group
+        let unknown_game = crate::dialog_id::MessageFullId::new(
+            crate::dialog_id::DialogId::from_chat_id(crate::chat_manager::ChatId::new(99)),
+            crate::messages_manager::MessageId::new(1 << 20),
+        );
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    unknown_game.get_dialog_id(),
+                    unknown_game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (400, "Can't access the chat"));
+            }
+            other => panic!("expected the access band, got {other:?}"),
+        }
+
+        // 6. the net-inert posture — no dispatcher, the promise parks like
+        //    the C++ handler holds it
+        td.net_query_dispatcher = None;
+        td.game_manager.net = None;
+        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_get_game_high_scores_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    input_user.clone(),
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settled");
+        assert!(
+            td.game_manager.pop_get_game_high_scores_promise().is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.game_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]

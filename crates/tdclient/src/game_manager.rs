@@ -4,15 +4,17 @@
 //! `messages.getGameHighScores` queries.
 //!
 //! Seams:
-//! - The two `Td::ResultHandler` queries ride the [`GameManagerEnv`]
-//!   net seams — `[blocked: net]`, the promises park (the M.41
-//!   convention); the answer handlers
-//!   ([`GameManager::on_set_game_score_query`],
-//!   [`GameManager::on_get_game_high_scores_query`]) are real and unit-tested.
-//! - `SetGameScoreQuery::on_result` hops into
-//!   `td_->updates_manager_->on_get_updates` (GameManager.cpp:60) — the
-//!   [`GameManagerEnv::on_get_updates`] seam; the production env calls
-//!   the landed M.7 UpdatesManager.
+//! - `GetGameHighScoresQuery` rides the `GameNetKind` plane (net-drain
+//! 57): the manager-held [`GameNetHandle`] dispatches the wire query
+//! and the answer drains through
+//! [`crate::td::Td::on_game_net_answer`] into
+//! [`GameManager::get_game_high_scores_object`].
+//! - `SetGameScoreQuery::send` is the [`GameManagerEnv`] net seam —
+//! `[blocked: net]`, the promise parks (the M.41 convention); the
+//! answer handler ([`GameManager::on_set_game_score_query`]) hops into
+//! `td_->updates_manager_->on_get_updates` (GameManager.cpp:60) — the
+//! [`GameManagerEnv::on_get_updates`] seam; the production env calls
+//! the landed M.7 UpdatesManager.
 //! - The MessagesManager reads (`have_message_force`,
 //!   `can_set_game_score`, `get_message_object`) are [blocked: M.10]
 //!   through the env trait.
@@ -24,6 +26,23 @@ use crate::user_manager::{AccessRights, UserId};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+
+/// The in-flight query kinds of the net-drain 57 game families — the
+/// C++ `SetGameScoreQuery`/`GetGameHighScoresQuery` `Td::ResultHandler`
+/// classes (GameManager.cpp:28-103) collapsed onto dispatcher tags; the
+/// answers drain through [`crate::td::Td::on_game_net_answer`]. The
+/// kinds carry the handlers' `dialog_id_` members (the `on_error`
+/// dialog head); the request promises park in the manager's family lots
+/// (the C++ carries them on the queries' `promise_` members — §5's
+/// FIFO-per-family shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GameNetKind {
+    /// `GetGameHighScoresQuery` (GameManager.cpp:70-103) —
+    /// `messages.getGameHighScores`.
+    GetGameHighScores {
+        dialog_id: DialogId,
+    },
+}
 
 /// The `G()`/manager slice the collapsed manager reads through.
 pub trait GameManagerEnv {
@@ -69,6 +88,15 @@ pub trait GameManagerEnv {
         source: &str,
     ) -> Option<td_api::Message>;
 
+    /// `td_->dialog_manager_->get_input_peer(dialog_id, rights)` —
+    /// the query send legs resolve the peer (the `ForumTopicEnv`
+    /// split shape; GameManager.cpp:82).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputPeer>;
+
     /// `td_->updates_manager_->on_get_updates(updates, promise)`
     /// (GameManager.cpp:60) — the production env calls the M.7
     /// UpdatesManager.
@@ -96,19 +124,6 @@ pub trait GameManagerEnv {
         );
         tdutils::log_info!("Send messages.setGameScore — [blocked: net]");
     }
-
-    /// `GetGameHighScoresQuery::send` (GameManager.cpp:79-88) —
-    /// `[blocked: net]`; the answer arrives through
-    /// [`GameManager::on_get_game_high_scores_query`].
-    fn send_get_game_high_scores_query(
-        &mut self,
-        dialog_id: DialogId,
-        message_id: MessageId,
-        input_user: telegram_api::InputUser,
-    ) {
-        let _ = (dialog_id, message_id, input_user);
-        tdutils::log_info!("Send messages.getGameHighScores — [blocked: net]");
-    }
 }
 
 /// A parked `messages.setGameScore` query — the ResultHandler keeps the
@@ -120,7 +135,8 @@ struct PendingSetGameScoreQuery {
     promise: Promise<td_api::Message>,
 }
 
-/// A parked `messages.getGameHighScores` query.
+/// A parked `messages.getGameHighScores` query — the handler's
+/// `dialog_id_`/`promise_` members (GameManager.cpp:71-72).
 struct PendingGetGameHighScoresQuery {
     dialog_id: DialogId,
     promise: Promise<td_api::GameHighScores>,
@@ -129,6 +145,11 @@ struct PendingGetGameHighScoresQuery {
 /// The port of `td::GameManager`.
 #[derive(Default)]
 pub struct GameManager {
+    /// The manager-held dispatch surface of the net-drain 57 families —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests; the `GroupCallManager::net` shape — the shared
+    /// [`crate::td::BotEnv`] view resolves the peers at the send legs).
+    pub(crate) net: Option<crate::td::GameNetHandle>,
     /// The parked `messages.setGameScore` queries.
     pending_set_game_score_queries: Vec<PendingSetGameScoreQuery>,
     /// The parked `messages.getGameHighScores` queries.
@@ -266,33 +287,65 @@ impl GameManager {
             Err(status) => return promise.set_error(status),
         };
 
-        env.send_get_game_high_scores_query(dialog_id, message_id, input_user);
-        self.pending_get_game_high_scores_queries
-            .push(PendingGetGameHighScoresQuery { dialog_id, promise });
+        self.send_get_game_high_scores_query(
+            env,
+            dialog_id,
+            message_id,
+            input_user,
+            promise,
+        );
     }
 
-    /// `GetGameHighScoresQuery::on_result`/`on_error`
-    /// (GameManager.cpp:90-102).
-    pub fn on_get_game_high_scores_query(
+    /// The `td_->create_handler<GetGameHighScoresQuery>(promise)
+    /// ->send(...)` collapse (GameManager.cpp:166): the request promise
+    /// parks in the family lot (the C++ carries it on the query's
+    /// `promise_` member, cpp:71 — §5's FIFO shape), then the read peer
+    /// resolves and the wire query dispatches. `None` on the handle
+    /// keeps the net-inert posture.
+    pub(crate) fn send_get_game_high_scores_query(
         &mut self,
         env: &mut impl GameManagerEnv,
-        result: Result<telegram_api::messages_HighScores, Status>,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        input_user: telegram_api::InputUser,
+        promise: Promise<td_api::GameHighScores>,
     ) {
-        let Some(query) = self.pending_get_game_high_scores_queries.pop() else {
-            tdutils::log_info!("Receive an unexpected messages.getGameHighScores answer");
-            return;
-        };
-        let mut promise = query.promise;
-        match result {
-            Ok(high_scores) => {
-                let scores = self.get_game_high_scores_object(env, high_scores);
-                promise.set_value(scores);
-            }
-            Err(status) => {
-                env.on_get_dialog_error(query.dialog_id, &status, "GetGameHighScoresQuery");
-                promise.set_error(status);
-            }
+        self.pending_get_game_high_scores_queries
+            .push(PendingGetGameHighScoresQuery { dialog_id, promise });
+        let kind = GameNetKind::GetGameHighScores { dialog_id };
+        match (
+            self.net.clone(),
+            env.get_input_peer(dialog_id, AccessRights::Read),
+        ) {
+            // `GetGameHighScoresQuery::send` (cpp:79-88)
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_getGameHighScores(
+                    telegram_api::messages_getGameHighScores {
+                        peer: Some(Box::new(peer)),
+                        id: message_id.get_server_message_id().get(),
+                        user_id: Some(input_user),
+                    },
+                ),
+            ),
+            // the C++ `CHECK(input_peer != nullptr)` (cpp:83) — the
+            // `check_dialog_access` ladder gated the flow; the None band
+            // settles through the completed queue (the message-query
+            // CHECK convention, MessageQueryManager.cpp:1182-1193)
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => tdutils::log_info!("Send messages.getGameHighScores — [net-inert]"),
         }
+    }
+
+    /// The high-scores family promise pop for the
+    /// [`crate::td::Td::on_game_net_answer`] drain — the FIFO head the
+    /// answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_get_game_high_scores_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::GameHighScores>> {
+        self.pending_get_game_high_scores_queries
+            .pop()
+            .map(|query| query.promise)
     }
 
     /// `get_game_high_scores_object` (GameManager.cpp:169-186) — public
@@ -328,8 +381,10 @@ mod tests {
     use super::*;
     use tdutils::promise::PromiseInterface;
 
-    /// The recording env: the bot flag, the message-plane answer toggles
-    /// and the fired query seams.
+    /// The recording env: the bot flag, the message-plane answer toggles,
+    /// the fired set-query seam and the peer-resolution band (the get
+    /// send leg reads the peer; the [net-inert] None-handle posture is
+    /// what these unit bands drive).
     struct TestEnv {
         bot: bool,
         known_users: Vec<i64>,
@@ -339,6 +394,7 @@ mod tests {
         queries: Vec<String>,
         updates: usize,
         dialog_errors: Vec<String>,
+        resolve_peer: bool,
         users_intakes: usize,
     }
 
@@ -353,6 +409,7 @@ mod tests {
                 queries: Vec::new(),
                 updates: 0,
                 dialog_errors: Vec::new(),
+                resolve_peer: true,
                 users_intakes: 0,
             }
         }
@@ -429,6 +486,15 @@ mod tests {
             self.message_answer.clone()
         }
 
+        fn get_input_peer(
+            &mut self,
+            _dialog_id: crate::dialog_id::DialogId,
+            _access_rights: AccessRights,
+        ) -> Option<telegram_api::InputPeer> {
+            self.resolve_peer
+                .then(|| telegram_api::InputPeer::inputPeerSelf(telegram_api::inputPeerSelf {}))
+        }
+
         fn on_get_updates(&mut self, _updates: telegram_api::Updates, _promise: Promise<()>) {
             self.updates += 1;
         }
@@ -444,19 +510,6 @@ mod tests {
         ) {
             self.queries.push(format!(
                 "setGameScore:{}:{}:{edit_message}:{score}:{force}",
-                dialog_id.get(),
-                message_id.get()
-            ));
-        }
-
-        fn send_get_game_high_scores_query(
-            &mut self,
-            dialog_id: crate::dialog_id::DialogId,
-            message_id: MessageId,
-            _input_user: telegram_api::InputUser,
-        ) {
-            self.queries.push(format!(
-                "getGameHighScores:{}:{}",
                 dialog_id.get(),
                 message_id.get()
             ));
@@ -565,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn get_game_high_scores_guards_and_answers() {
+    fn get_game_high_scores_guards_and_parks() {
         let mut env = TestEnv::default();
         let mut manager = GameManager::new();
 
@@ -608,27 +661,14 @@ mod tests {
             matches!(&outcomes.lock().unwrap()[0], Err(m) if m == "400 Wrong message identifier specified")
         );
 
-        // the healthy path parks and answers
+        // the healthy path parks the promise (the C++ handler carries it
+        // on the query; the wire form and the answer intakes ride the
+        // netted round-trip)
         let (promise, outcomes) = recording_promise();
         manager.get_game_high_scores(&mut env, message_full_id(1 << 20), UserId::new(9), promise);
-        assert_eq!(env.queries, vec!["getGameHighScores:-3:1048576"]);
         assert!(outcomes.lock().unwrap().is_empty());
-        manager.on_get_game_high_scores_query(&mut env, Ok(sample_high_scores()));
-        let outcomes = outcomes.lock().unwrap();
-        assert_eq!(outcomes[0].as_ref().expect("answered").scores.len(), 2);
-
-        // an error maps through the dialog-error sink
-        let (promise, outcomes) = recording_promise();
-        manager.get_game_high_scores(&mut env, message_full_id(1 << 20), UserId::new(9), promise);
-        manager.on_get_game_high_scores_query(
-            &mut env,
-            Err(Status::error(400, "CHAT_ADMIN_REQUIRED")),
-        );
-        assert_eq!(env.dialog_errors, vec!["-3:CHAT_ADMIN_REQUIRED"]);
-        assert!(matches!(
-            &outcomes.lock().unwrap()[0],
-            Err(m) if m == "400 CHAT_ADMIN_REQUIRED"
-        ));
+        assert!(manager.pop_get_game_high_scores_promise().is_some());
+        assert!(manager.pop_get_game_high_scores_promise().is_none());
     }
 
     #[test]
@@ -706,6 +746,24 @@ mod tests {
             &outcomes.lock().unwrap()[0],
             Err(m) if m == "400 MESSAGE_EDIT_TIME_EXPIRED"
         ));
+    }
+
+    #[test]
+    fn get_game_high_scores_parks_net_inert_when_no_dispatcher() {
+        // net-drain 57: the manager-held handle is `None` (the pre-init
+        // windows, the net-inert tests) — the promise parks in the family
+        // lot like the C++ handler holds it on the query
+        let mut env = TestEnv::default();
+        let mut manager = GameManager::new();
+        let (promise, outcomes) = recording_promise();
+        manager.get_game_high_scores(&mut env, message_full_id(1 << 20), UserId::new(9), promise);
+        assert!(outcomes.lock().unwrap().is_empty(), "nothing settles offline");
+        assert!(
+            manager.pop_get_game_high_scores_promise().is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+        // the lot is empty — the answer drain's log band pairs nothing
+        assert!(manager.pop_get_game_high_scores_promise().is_none());
     }
 
     #[test]
