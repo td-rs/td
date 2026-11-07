@@ -697,12 +697,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `SavePreparedInlineMessageQuery` (InlineQueriesManager.cpp:198-231).
-    fn send_save_prepared_inline_message_query(
-        &mut self,
-        query: telegram_api::messages_savePreparedInlineMessage,
-        promise: Promise<td_api::PreparedInlineMessageId>,
-    );
     /// `GetPreparedInlineMessageQuery` (InlineQueriesManager.cpp:233-267);
     /// the response lands in on_get_prepared_inline_message.
     fn send_get_prepared_inline_message_query(
@@ -872,6 +866,10 @@ pub(crate) enum InlineQueriesNetKind {
     /// `messages.setBotGuestChatResult`; the InputBotInlineMessageID
     /// answer folds through [`get_inline_message_id`].
     SetBotGuestChatResult,
+    /// `SavePreparedInlineMessageQuery` (cpp:198-231) —
+    /// `messages.savePreparedInlineMessage`; the
+    /// messages.BotPreparedInlineMessage answer settles the id pair.
+    SavePreparedInlineMessage,
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -884,6 +882,8 @@ pub(crate) struct PendingInlineQueries {
     set_inline_bot_results: Vec<Promise<()>>,
     /// `SetBotGuestChatResultQuery::promise_`.
     set_bot_guest_chat_result: Vec<Promise<td_api::InlineMessageId>>,
+    /// `SavePreparedInlineMessageQuery::promise_`.
+    save_prepared_inline_message: Vec<Promise<td_api::PreparedInlineMessageId>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1310,7 +1310,7 @@ impl InlineQueriesManager {
             user_id: Some(input_user),
             peer_types,
         };
-        env.send_save_prepared_inline_message_query(query, promise);
+        self.send_save_prepared_inline_message_query(query, promise);
     }
 
     /// `get_prepared_inline_message` (InlineQueriesManager.cpp:782-809).
@@ -1905,6 +1905,39 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.set_bot_guest_chat_result.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SavePreparedInlineMessageQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:206-222) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_save_prepared_inline_message_query(
+        &mut self,
+        query: telegram_api::messages_savePreparedInlineMessage,
+        promise: Promise<td_api::PreparedInlineMessageId>,
+    ) {
+        self.pending.save_prepared_inline_message.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SavePreparedInlineMessage,
+                telegram_api::Function::messages_savePreparedInlineMessage(query),
+            ),
+            None => tdutils::log_info!("Send messages.savePreparedInlineMessage — [net-inert]"),
+        }
+    }
+
+    /// The save-prepared-inline-message family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_save_prepared_inline_message_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::PreparedInlineMessageId>> {
+        if self.pending.save_prepared_inline_message.is_empty() {
+            None
+        } else {
+            Some(self.pending.save_prepared_inline_message.remove(0))
         }
     }
 
@@ -3725,14 +3758,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_save_prepared_inline_message_query(
-            &mut self,
-            _query: telegram_api::messages_savePreparedInlineMessage,
-            _promise: Promise<td_api::PreparedInlineMessageId>,
-        ) {
-            // [blocked: net]
-        }
-
         fn send_get_prepared_inline_message_query(
             &mut self,
             _query: telegram_api::messages_getPreparedInlineMessage,
@@ -4022,6 +4047,101 @@ mod tests {
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
         );
+    }
+
+    /// The save_prepared_inline_message bands: the chat-types ladder
+    /// (TargetDialogTypes.cpp:43-59) answers inline and the good form
+    /// parks the promise in the prepared-message lot without a dispatch.
+    #[test]
+    fn save_prepared_inline_message_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let result = td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+            td_api::inputInlineQueryResultGame {
+                id: "g1".to_owned(),
+                game_short_name: "snake".to_owned(),
+                reply_markup: None,
+            },
+        );
+
+        // the empty chat-types band
+        let (promise, outcomes) = recording_promise::<td_api::PreparedInlineMessageId>();
+        manager.save_prepared_inline_message(
+            &mut env,
+            UserId::new(9),
+            Some(result.clone()),
+            None,
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 At least one chat type must be allowed"
+        ));
+
+        // the unknown-user band (cpp:773-776)
+        let (promise, outcomes) = recording_promise::<td_api::PreparedInlineMessageId>();
+        manager.save_prepared_inline_message(
+            &mut env,
+            UserId::new(404),
+            Some(result),
+            Some(td_api::TargetChatTypes {
+                allow_user_chats: true,
+                allow_bot_chats: false,
+                allow_group_chats: false,
+                allow_channel_chats: false,
+            }),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 User not found"
+        ));
+
+        // the good form parks net-inert
+        let (promise, outcomes) = recording_promise::<td_api::PreparedInlineMessageId>();
+        manager.save_prepared_inline_message(
+            &mut env,
+            UserId::new(9),
+            Some(
+                td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                    td_api::inputInlineQueryResultArticle {
+                        id: "p1".to_owned(),
+                        url: String::new(),
+                        title: "T".to_owned(),
+                        description: String::new(),
+                        thumbnail_url: String::new(),
+                        thumbnail_width: 0,
+                        thumbnail_height: 0,
+                        reply_markup: None,
+                        input_message_content: Some(Box::new(
+                            td_api::InputMessageContent::inputMessageText(
+                                td_api::inputMessageText {
+                                    text: Some(td_api::FormattedText {
+                                        text: "hi".to_owned(),
+                                        entities: Vec::new(),
+                                    }),
+                                    link_preview_options: None,
+                                    clear_draft: false,
+                                },
+                            ),
+                        )),
+                    },
+                ),
+            ),
+            Some(td_api::TargetChatTypes {
+                allow_user_chats: true,
+                allow_bot_chats: false,
+                allow_group_chats: false,
+                allow_channel_chats: false,
+            }),
+            promise,
+        );
+        assert_eq!(manager.pending.save_prepared_inline_message.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_save_prepared_inline_message_promise().is_some());
     }
 
     /// The answer_guest_query net-inert park band: the folded result

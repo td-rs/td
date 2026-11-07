@@ -17944,6 +17944,45 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `SavePreparedInlineMessageQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:223-231) — the
+            // messages.BotPreparedInlineMessage answer settles the
+            // preparedInlineMessageId id/expiry pair.
+            K::SavePreparedInlineMessage => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotPreparedInlineMessage::parse(query.ok()) {
+                        Ok(prepared) => Ok(prepared),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.botPreparedInlineMessage: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_savePreparedInlineMessage answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_save_prepared_inline_message_promise();
+                match (result, promise) {
+                    (Ok(prepared), Some(mut promise)) => {
+                        promise.set_value(td_api::PreparedInlineMessageId {
+                            id: prepared.id,
+                            expiration_date: prepared.expire_date,
+                        })
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.savePreparedInlineMessage answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46375,14 +46414,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_save_prepared_inline_message_query(
-        &mut self,
-        _query: telegram_api::messages_savePreparedInlineMessage,
-        _promise: Promise<td_api::PreparedInlineMessageId>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_get_prepared_inline_message_query(
@@ -89104,5 +89135,137 @@ kQIDAQAB\n\
             }
             other => panic!("the inline message id, got {other:?}"),
         }
+
+        // 12. the savePreparedInlineMessage arm rides the wire
+        //     (Requests.cpp:8222-8227 → save_prepared_inline_message →
+        //     SavePreparedInlineMessageQuery::send, cpp:206-222): the
+        //     peer-types flag bit, the resolved input user (the bot-mode
+        //     access-hash-0 fallback) and the folded result
+        td.request(
+            11,
+            Function::savePreparedInlineMessage(td_api::savePreparedInlineMessage {
+                user_id: 11,
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "p1".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+                chat_types: Some(td_api::TargetChatTypes {
+                    allow_user_chats: true,
+                    allow_bot_chats: false,
+                    allow_group_chats: false,
+                    allow_channel_chats: false,
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_savePreparedInlineMessage::ID,
+        );
+        let body = telegram_api::messages_savePreparedInlineMessage::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, 1); // PEER_TYPES_MASK
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (11, 0)
+        ));
+        assert!(matches!(
+            body.peer_types.as_slice(),
+            [telegram_api::InlineQueryPeerType::inlineQueryPeerTypePM(_)]
+        ));
+        assert!(matches!(
+            body.result,
+            Some(telegram_api::InputBotInlineResult::inputBotInlineResult(ref result))
+                if result.id == "p1"
+        ));
+
+        // 13. the messages.BotPreparedInlineMessage answer settles the id
+        //     pair (cpp:223-231)
+        net_complete(
+            sent,
+            wire!(telegram_api::messages_BotPreparedInlineMessage {
+                id: "pm1".to_owned(),
+                expire_date: 1700000123,
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 11).first() {
+            Some(Object::preparedInlineMessageId(prepared)) => {
+                assert_eq!(
+                    (prepared.id.as_str(), prepared.expiration_date),
+                    ("pm1", 1700000123)
+                );
+            }
+            other => panic!("the prepared inline message id, got {other:?}"),
+        }
+
+        // 14. the empty chat-types band (TargetDialogTypes.cpp:54-57) —
+        //     no send, the 400 answers inline
+        td.request(
+            12,
+            Function::savePreparedInlineMessage(td_api::savePreparedInlineMessage {
+                user_id: 11,
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "p2".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+                chat_types: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "At least one chat type must be allowed")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_savePreparedInlineMessage::ID,
+            "the empty chat-types band sends nothing",
+        );
     }
 }
