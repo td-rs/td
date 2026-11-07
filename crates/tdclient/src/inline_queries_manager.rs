@@ -698,12 +698,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `SendWebViewDataQuery` (InlineQueriesManager.cpp:398-425).
-    fn send_send_web_view_data_query(
-        &mut self,
-        query: telegram_api::messages_sendWebViewData,
-        promise: Promise<()>,
-    );
     /// `SendWebViewResultMessageQuery` (InlineQueriesManager.cpp:427-455).
     fn send_send_web_view_result_message_query(
         &mut self,
@@ -864,6 +858,10 @@ pub(crate) enum InlineQueriesNetKind {
     /// `messages.requestSimpleWebView`; the WebViewResult answer settles
     /// the url/same-origin pair (the query_id band only logs).
     RequestSimpleWebView,
+    /// `SendWebViewDataQuery` (cpp:398-425) —
+    /// `messages.sendWebViewData`; the Updates answer rides the updates
+    /// engine with the request promise.
+    SendWebViewData,
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -887,6 +885,8 @@ pub(crate) struct PendingInlineQueries {
     get_requested_web_view_button: Vec<(String, Promise<td_api::KeyboardButton>)>,
     /// `RequestSimpleWebViewQuery::promise_`.
     request_simple_web_view: Vec<Promise<td_api::WebAppUrl>>,
+    /// `SendWebViewDataQuery::promise_`.
+    send_web_view_data: Vec<Promise<()>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1575,7 +1575,7 @@ impl InlineQueriesManager {
             button_text: button_text.to_owned(),
             data: data.to_owned(),
         };
-        env.send_send_web_view_data_query(query, promise);
+        self.send_send_web_view_data_query(query, promise);
     }
 
     /// `answer_web_view_query` (InlineQueriesManager.cpp:871-879).
@@ -2098,6 +2098,37 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.request_simple_web_view.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SendWebViewDataQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:407-413) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_send_web_view_data_query(
+        &mut self,
+        query: telegram_api::messages_sendWebViewData,
+        promise: Promise<()>,
+    ) {
+        self.pending.send_web_view_data.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SendWebViewData,
+                telegram_api::Function::messages_sendWebViewData(query),
+            ),
+            None => tdutils::log_info!("Send messages.sendWebViewData — [net-inert]"),
+        }
+    }
+
+    /// The send-web-view-data family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_send_web_view_data_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending.send_web_view_data.is_empty() {
+            None
+        } else {
+            Some(self.pending.send_web_view_data.remove(0))
         }
     }
 
@@ -3918,14 +3949,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_send_web_view_data_query(
-            &mut self,
-            _query: telegram_api::messages_sendWebViewData,
-            _promise: Promise<()>,
-        ) {
-            // [blocked: net]
-        }
-
         fn send_send_web_view_result_message_query(
             &mut self,
             _query: telegram_api::messages_sendWebViewResultMessage,
@@ -4171,6 +4194,31 @@ mod tests {
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
         );
+    }
+
+    /// The send_web_view_data bands: the not-a-bot band answers inline
+    /// and the good form parks the promise net-inert.
+    #[test]
+    fn send_web_view_data_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.send_web_view_data(&mut env, UserId::new(9), "Open", "payload", promise);
+        assert_eq!(manager.pending.send_web_view_data.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_send_web_view_data_promise().is_some());
+
+        let mut env = TestEnv {
+            bots: Vec::new(),
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.send_web_view_data(&mut env, UserId::new(9), "Open", "payload", promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Bot not found"
+        ));
     }
 
     /// The get_simple_web_view_url bands: the URL ladder (cpp:359-374)

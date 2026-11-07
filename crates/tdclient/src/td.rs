@@ -18163,6 +18163,42 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `SendWebViewDataQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:414-424) — the Updates answer
+            // rides the updates engine with the request promise
+            // (`td_->updates_manager_->on_get_updates`); the wire error
+            // forwards to the promise.
+            K::SendWebViewData => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => Ok(updates),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse Updates: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_sendWebViewData answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_send_web_view_data_promise();
+                match (result, promise) {
+                    (Ok(updates), Some(promise)) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected messages.sendWebViewData answer")
+                    }
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46594,14 +46630,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_send_web_view_data_query(
-        &mut self,
-        _query: telegram_api::messages_sendWebViewData,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_send_web_view_result_message_query(
@@ -88798,6 +88826,23 @@ kQIDAQAB\n\
         })
     }
 
+    /// An empty `updatesCombined` container — the walk-safe Updates
+    /// answer of the web-view-data family (the engine completes the
+    /// request promise).
+    fn empty_combined_updates() -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1700000000,
+            seq_start: 0,
+            seq: 0,
+        })
+        .store(&mut out);
+        out
+    }
+
     #[test]
     fn inline_queries_net_families_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -89838,5 +89883,62 @@ kQIDAQAB\n\
             telegram_api::messages_requestSimpleWebView::ID,
             "the invalid-URL band sends nothing",
         );
+
+        // 29. the sendWebAppData arm rides the wire (Requests.cpp:1226-1235
+        //     → send_web_view_data → SendWebViewDataQuery::send,
+        //     cpp:407-413): the resolved bot, the non-zero random id and
+        //     the button/data pair
+        td.request(
+            24,
+            Function::sendWebAppData(td_api::sendWebAppData {
+                bot_user_id: 9,
+                button_text: "Open".to_owned(),
+                data: "payload".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewData::ID,
+        );
+        let body =
+            telegram_api::messages_sendWebViewData::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert_ne!(body.random_id, 0);
+        assert_eq!(
+            (body.button_text.as_str(), body.data.as_str()),
+            ("Open", "payload")
+        );
+
+        // 30. the Updates answer rides the updates engine with the
+        //     request promise (cpp:414-423) — the ok settles the request
+        net_complete(sent, empty_combined_updates());
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 24).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 31. the wire error forwards to the request promise (cpp:424)
+        td.request(
+            25,
+            Function::sendWebAppData(td_api::sendWebAppData {
+                bot_user_id: 9,
+                button_text: "Open".to_owned(),
+                data: "payload2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewData::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 25);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
     }
 }
