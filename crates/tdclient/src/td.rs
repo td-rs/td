@@ -3341,6 +3341,17 @@ pub(crate) type GroupCallNetHandle = NetKindHandle<crate::group_call_manager::Gr
 /// answers drain through [`Td::on_call_net_answer`].
 pub(crate) type CallNetHandle = NetKindHandle<crate::call_manager::CallNetKind>;
 
+/// The cloned message-import dispatch surface the
+/// [`MessageImportManagerEnv`] send legs use — the per-kind handle over
+/// the two head-query ResultHandler classes of
+/// MessageImportManager.cpp:30-98 (the net-drain 58 plane: the
+/// file-type and confirmation-text checks); the answers drain through
+/// [`Td::dispatch_completed_message_import_net`]. Env-held like the
+/// transcription plane: the whole-Td env view resolves the write peer
+/// at the send leg.
+pub(crate) type MessageImportNetHandle =
+    NetKindHandle<crate::message_import_manager::MessageImportNetKind>;
+
 /// The cloned poll dispatch surface the `PollManagerEnv` senders hold —
 /// the answers drain through [`Td::on_poll_net_answer`].
 pub(crate) type PollNetHandle = NetKindHandle<crate::poll_manager::PollNetKind>;
@@ -6003,6 +6014,17 @@ pub struct Td {
     /// The call net completed queue (the `CallNetKind` answers park
     /// here; the drain routes them through `Td::on_call_net_answer`).
     call_net_completed: Arc<Mutex<Vec<(crate::call_manager::CallNetKind, NetQuery)>>>,
+    /// The message-import net completed queue (the
+    /// `MessageImportNetKind` answers park here; the drain routes them
+    /// through `Td::on_message_import_net_answer`).
+    message_import_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::message_import_manager::MessageImportNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The poll net completed queue (the `PollNetKind` answers park
     /// here; the drain routes them through `Td::on_poll_net_answer`).
     poll_net_completed: Arc<Mutex<Vec<(crate::poll_manager::PollNetKind, NetQuery)>>>,
@@ -6658,6 +6680,7 @@ impl Td {
             pending_background_queries: PendingBackgroundQueries::default(),
             group_call_net_completed: Arc::new(Mutex::new(Vec::new())),
             call_net_completed: Arc::new(Mutex::new(Vec::new())),
+            message_import_net_completed: Arc::new(Mutex::new(Vec::new())),
             poll_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_info_promises: Vec::new(),
@@ -8979,6 +9002,7 @@ impl Td {
         self.dispatch_completed_background_net();
         self.dispatch_completed_group_call_net();
         self.dispatch_completed_call_net();
+        self.dispatch_completed_message_import_net();
         self.dispatch_completed_poll_net();
         self.dispatch_completed_statistics_net();
         self.dispatch_completed_support_net();
@@ -9121,6 +9145,16 @@ impl Td {
         Some(CallNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.call_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned message-import dispatch surface (the net-drain 58
+    /// families' send legs — the whole-Td env reads it at the send).
+    pub(crate) fn message_import_net(&self) -> Option<MessageImportNetHandle> {
+        Some(MessageImportNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.message_import_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10703,6 +10737,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.call_net_completed.lock());
         for (kind, query) in completed {
             self.on_call_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked message-import answers — the C++
+    /// ResultHandler on_result/on_error halves of the net-drain 58
+    /// head-query families (MessageImportManager.cpp:30-98).
+    fn dispatch_completed_message_import_net(&mut self) {
+        let completed = std::mem::take(&mut *self.message_import_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_message_import_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -24074,6 +24119,61 @@ impl Td {
                             None => promise.set_error(parse_error("phone.saveCallLog")),
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Route one message-import net answer by kind — the ResultHandler
+    /// halves of the net-drain 58 head-query families
+    /// (MessageImportManager.cpp:30-98).
+    fn on_message_import_net_answer(
+        &mut self,
+        kind: crate::message_import_manager::MessageImportNetKind,
+        query: NetQuery,
+    ) {
+        use crate::message_import_manager::MessageImportNetKind as K;
+        match kind {
+            // `CheckHistoryImportQuery::on_result`/`on_error`
+            // (MessageImportManager.cpp:42-64) — the pm/group triad
+            // converts to the td_api MessageFileType (the wire title
+            // rides the private form's `name`, cpp:53), the errors
+            // forward to the request promise verbatim (no dialog-error
+            // head on this family, cpp:62-64).
+            K::CheckHistoryImport => {
+                let Some(mut promise) = self
+                    .message_import_manager
+                    .pop_check_history_import_promise()
+                else {
+                    tdutils::log_info!("Receive an unexpected messages.checkHistoryImport answer");
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::messages_HistoryImportParsed::parse(query.ok()) {
+                    Ok(parsed) => {
+                        let file_type = if parsed.pm {
+                            td_api::MessageFileType::messageFileTypePrivate(
+                                td_api::messageFileTypePrivate { name: parsed.title },
+                            )
+                        } else if parsed.group {
+                            td_api::MessageFileType::messageFileTypeGroup(
+                                td_api::messageFileTypeGroup {
+                                    title: parsed.title,
+                                },
+                            )
+                        } else {
+                            td_api::MessageFileType::messageFileTypeUnknown(
+                                td_api::messageFileTypeUnknown,
+                            )
+                        };
+                        promise.set_value(file_type);
+                    }
+                    Err(_) => promise.set_error(Status::error(
+                        500,
+                        "Failed to parse the messages_checkHistoryImport answer",
+                    )),
                 }
             }
         }
@@ -46638,12 +46738,21 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         )
     }
 
-    fn send_check_history_import_query(
-        &mut self,
-        _message_file_head: String,
-        _promise: Promise<td_api::MessageFileType>,
-    ) {
-        // [blocked: net]
+    fn send_check_history_import_query(&mut self, message_file_head: String) {
+        // `CheckHistoryImportQuery::send` (MessageImportManager.cpp:38-40)
+        // — the head string is the whole wire form (no peer).
+        let Some(net) = self.td.message_import_net() else {
+            tdutils::log_info!("Check history import — [net-inert]");
+            return;
+        };
+        net.dispatch(
+            crate::message_import_manager::MessageImportNetKind::CheckHistoryImport,
+            telegram_api::Function::messages_checkHistoryImport(
+                telegram_api::messages_checkHistoryImport {
+                    import_head: message_file_head,
+                },
+            ),
+        );
     }
 
     fn send_check_history_import_peer_query(
@@ -46661,7 +46770,10 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         _attached_files: Vec<td_api::InputFile>,
         _promise: Promise<()>,
     ) {
-        // [blocked: Files upload] + [blocked: net]
+        // [blocked: net/Files] — the C++ send resolves the uploaded
+        // InputFile through the FileManager upload chain
+        // (MessageImportManager.cpp:368-386); the request parks at the
+        // upload seam.
     }
 }
 /// Field-split the `Td` for the top-dialog/recommendation manager calls.
@@ -79278,6 +79390,167 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.transcription_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- net-drain 58: the message-import head families (§3.9) ----
+
+    /// The `messages.historyImportParsed` answer body — the pm/group
+    /// title triad (the `title` bit is the flags' `1 << 2`).
+    fn wire_history_import_parsed(pm: bool, group: bool, title: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::messages_HistoryImportParsed {
+            flags: if title.is_empty() { 0 } else { 1 << 2 },
+            pm,
+            group,
+            title: title.to_owned(),
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    #[test]
+    fn check_history_import_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(check_history_import_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn check_history_import_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain58-check-history-import");
+
+        // 1. the live td_api arm rides the wire — the head string is the
+        //    whole wire form, no peer (CheckHistoryImportQuery::send,
+        //    MessageImportManager.cpp:38-40)
+        td.request(
+            1,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "{\"chat_title\":\"My chat\"}".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        let body =
+            telegram_api::messages_checkHistoryImport::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.import_head, "{\"chat_title\":\"My chat\"}");
+
+        // 2. the pm band converts to messageFileTypePrivate with the
+        //    title (CheckHistoryImportQuery::on_result, cpp:48-59)
+        net_complete(sent, wire_history_import_parsed(true, false, "My chat"));
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::messageFileTypePrivate(file_type)) if file_type.name == "My chat"
+        ));
+
+        // 3. the group band converts to messageFileTypeGroup
+        td.request(
+            2,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_complete(sent, wire_history_import_parsed(false, true, "The Group"));
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::messageFileTypeGroup(file_type)) if file_type.title == "The Group"
+        ));
+
+        // 4. the neither band converts to messageFileTypeUnknown
+        td.request(
+            3,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_complete(sent, wire_history_import_parsed(false, false, ""));
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::messageFileTypeUnknown(_))
+        ));
+
+        // 5. the wire-error band forwards verbatim to the request
+        //    (CheckHistoryImportQuery::on_error, cpp:62-64)
+        td.request(
+            4,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_9");
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 6. the parse-failure band — the fetch_result failure routes
+        //    through on_error as the 500 (cpp:44-46 → :62-64)
+        td.request(
+            5,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkHistoryImport::ID,
+        );
+        net_complete(sent, bool_answer(true)); // the wrong constructor
+        td.dispatch_completed_message_import_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 5);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (
+                500,
+                "Failed to parse the messages_checkHistoryImport answer"
+            )
+        );
+
+        // 7. the net-inert posture — the send leg logs, the promise parks
+        //    unanswered (the C++ offline shape)
+        td.net_query_dispatcher = None;
+        td.request(
+            6,
+            Function::getMessageFileType(td_api::getMessageFileType {
+                message_file_head: "head".to_owned(),
+            }),
+        );
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(
+            responses_of(&callback, 6).is_empty() && error_of_id(&callback, 6).is_none(),
+            "the request parks unanswered"
+        );
+        assert!(
+            td.message_import_manager
+                .pop_check_history_import_promise()
+                .is_some(),
+            "the promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.message_import_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]

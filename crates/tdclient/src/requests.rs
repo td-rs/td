@@ -1588,7 +1588,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 .get_message_import_confirmation_text(&mut env, dialog_id, promise);
         }
         Function::getMessageFileType(request) => {
-            // `Requests.cpp:2956-2962`.
+            // `Requests.cpp:6577-6582` — the live arm routes into the
+            // manager; the answer rides the `MessageImportNetKind` plane
+            // (CheckHistoryImportQuery, MessageImportManager.cpp:30-64).
             if !check_is_user(td, id) {
                 return;
             }
