@@ -12,11 +12,11 @@
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`InlineQueriesManagerEnv`] trait carries the `G()`/option/pmc/
 //! cross-manager surfaces, and the `Td::ResultHandler` query families
-//! (InlineQueriesManager.cpp:67-455) ride the [`InlineQueriesNetKind`]
+//! (InlineQueriesManager.cpp:67-455) ride the `InlineQueriesNetKind`
 //! plane over the manager-held net handle (net-drain 48): the send legs
 //! run inside the manager, the request promises park in the family lots
 //! (the handler `promise_` members) and the answers drain through
-//! [`crate::td::Td::on_inline_queries_net_answer`] into the intakes
+//! `Td::on_inline_queries_net_answer` into the intakes
 //! below. The seams that stand in for unlanded planes:
 //!
 //! - `process_input_message_text` — ported here (the function is
@@ -663,8 +663,10 @@ pub trait InlineQueriesManagerEnv {
     fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool;
     /// `dialog_manager_->resolve_dialog(username, ChannelId(), lambda)` —
     /// the get_weather resolve chain (`do_get_weather` → send_inline_query
-    /// → `on_get_weather` folds inside) — `[blocked: net]`; the promise
-    /// lands in the (never-sent) resolve.
+    /// → `on_get_weather` folds inside) — `[blocked: dialog-plane
+    /// resolve]`: `DialogManager::resolve_dialog` (cpp:3185-3207) is the
+    /// MessagesManager/link step the dialog module still parks (its own
+    /// inventory row); the promise lands in the (never-sent) resolve.
     fn resolve_weather_dialog(
         &mut self,
         username: &str,
@@ -696,7 +698,7 @@ pub trait InlineQueriesManagerEnv {
         source: &str,
     ) -> Vec<telegram_api::MessageEntity>;
 
-    // -- the remaining `[blocked: net]` query tails; each one drops the
+    // -- the remaining cross-plane resolve tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
 
     // -- the M.22 reply-markup plane intakes
@@ -824,7 +826,7 @@ pub(crate) enum InlineQueriesNetKind {
     SetInlineBotResults,
     /// `SetBotGuestChatResultQuery` (cpp:168-196) —
     /// `messages.setBotGuestChatResult`; the InputBotInlineMessageID
-    /// answer folds through [`get_inline_message_id`].
+    /// answer folds through `get_inline_message_id`.
     SetBotGuestChatResult,
     /// `SavePreparedInlineMessageQuery` (cpp:198-231) —
     /// `messages.savePreparedInlineMessage`; the
@@ -863,7 +865,7 @@ pub(crate) enum InlineQueriesNetKind {
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
-/// popped FIFO by the answers ([`crate::td::Td::on_inline_queries_net_answer`]).
+/// popped FIFO by the answers (`Td::on_inline_queries_net_answer`).
 #[derive(Default)]
 pub(crate) struct PendingInlineQueries {
     /// `GetInlineBotResultsQuery::promise_`.
@@ -1832,7 +1834,7 @@ impl InlineQueriesManager {
     }
 
     /// The get-inline-bot-results family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_get_inline_bot_results_promise(
         &mut self,
@@ -1868,7 +1870,7 @@ impl InlineQueriesManager {
     }
 
     /// The set-inline-bot-results family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_set_inline_bot_results_promise(&mut self) -> Option<Promise<()>> {
         if self.pending.set_inline_bot_results.is_empty() {
@@ -1907,7 +1909,7 @@ impl InlineQueriesManager {
     }
 
     /// The set-bot-guest-chat-result family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_set_bot_guest_chat_result_promise(
         &mut self,
@@ -1940,7 +1942,7 @@ impl InlineQueriesManager {
     }
 
     /// The save-prepared-inline-message family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_save_prepared_inline_message_promise(
         &mut self,
@@ -1983,7 +1985,7 @@ impl InlineQueriesManager {
     }
 
     /// The get-prepared-inline-message family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_get_prepared_inline_message_promise(
         &mut self,
@@ -2016,7 +2018,7 @@ impl InlineQueriesManager {
     }
 
     /// The save-prepared-keyboard-button family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_save_prepared_keyboard_button_promise(&mut self) -> Option<Promise<String>> {
         if self.pending.save_prepared_keyboard_button.is_empty() {
@@ -2056,7 +2058,7 @@ impl InlineQueriesManager {
     }
 
     /// The get-requested-web-view-button family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_get_requested_web_view_button_query(
         &mut self,
@@ -2089,7 +2091,7 @@ impl InlineQueriesManager {
     }
 
     /// The request-simple-web-view family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_request_simple_web_view_promise(
         &mut self,
@@ -2122,7 +2124,7 @@ impl InlineQueriesManager {
     }
 
     /// The send-web-view-data family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_send_web_view_data_promise(&mut self) -> Option<Promise<()>> {
         if self.pending.send_web_view_data.is_empty() {
@@ -2155,7 +2157,7 @@ impl InlineQueriesManager {
     }
 
     /// The send-web-view-result-message family pop for the
-    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// `Td::on_inline_queries_net_answer` drain — the FIFO
     /// head the answer pairs with (the C++ promise rides the query).
     pub(crate) fn pop_send_web_view_result_message_promise(
         &mut self,
@@ -2804,10 +2806,15 @@ impl InlineQueriesManager {
         if self.recently_used_bots_loaded == 0 {
             self.recently_used_bots_loaded = 1;
             if !env.use_chat_info_database() {
-                // search_public_dialog per username — [blocked: net]; the
-                // parked promises wait for the resolutions
+                // search_public_dialog per username — [blocked:
+                // dialog-plane resolve]: the resolution is a td-level
+                // walk over the dialog plane (dialog creation + the
+                // ResolveUsername family) the split env can't reach, and
+                // the completion must re-enter this manager (the C++
+                // MultiPromiseActor hop, InlineQueriesManager.cpp:
+                // 2428-2443); the parked promises wait for it
                 tdutils::log_info!(
-                    "Resolve {} recent inline bot usernames — [blocked: net]",
+                    "Resolve {} recent inline bot usernames — [blocked: dialog-plane resolve]",
                     bot_usernames.len()
                 );
                 self.resolve_recent_inline_bots_pending += bot_usernames.len();
@@ -2818,9 +2825,13 @@ impl InlineQueriesManager {
                         // UserManager::get_user completes synchronously
                         // from memory
                     } else {
-                        // the users.getUsers fetch — [blocked: net]
+                        // the users.getUsers fetch — [blocked: user-plane
+                        // re-entry]: the GetUserMerger promise would have
+                        // to hop back into this manager's multipromise
+                        // (InlineQueriesManager.cpp:2440), and the split
+                        // env carries no such completion surface
                         tdutils::log_info!(
-                            "Load recent inline bot {} — [blocked: net]",
+                            "Load recent inline bot {} — [blocked: user-plane re-entry]",
                             user_id.get()
                         );
                         self.resolve_recent_inline_bots_pending += 1;
@@ -3758,7 +3769,9 @@ fn extract_input_invert_media(content: &td_api::InputMessageContent) -> bool {
 }
 
 /// `on_get_weather` (InlineQueriesManager.cpp:1320-1333) — the weather
-/// fold over the single-article result; the feed tail is [blocked: net].
+/// fold over the single-article result; the feed tail (the resolve →
+/// send_inline_query chain that reaches it) is [blocked: dialog-plane
+/// resolve] (see `resolve_weather_dialog`).
 #[allow(dead_code)]
 pub(crate) fn on_get_weather(
     results: td_api::InlineQueryResults,
@@ -3950,7 +3963,7 @@ mod tests {
             _location: Location,
             _promise: Promise<td_api::CurrentWeather>,
         ) {
-            // [blocked: net]: the resolve never sends
+            // [blocked: dialog-plane resolve]: the resolve never sends
         }
 
         fn can_add_web_page_previews(&self, _dialog_id: DialogId) -> bool {
