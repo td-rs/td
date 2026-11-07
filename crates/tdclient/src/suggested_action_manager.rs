@@ -1,8 +1,11 @@
 //! `SuggestedActionManager` (td/telegram/SuggestedActionManager.{h,cpp}) —
-//! the M.33 Wave-3 suggested-action manager. The queries
-//! (DismissSuggestion/CheckPromoData) are `[blocked: net]` seams; the
-//! `dismissSuggestedAction` td_api arm does not exist in this revision
-//! (recorded collapse — only `hideSuggestedAction` remains).
+//! the M.33 Wave-3 suggested-action manager. The login-email promo
+//! family (CheckPromoDataQuery) rides the account dispatch plane
+//! (SuggestedActionManager.cpp:65-105): the send arm dispatches
+//! `help.getPromoData` and the `Td::on_account_net_answer` drain settles
+//! the parked request promise (the SETUP_LOGIN_EMAIL scan, the 404 "Not
+//! Found" band). The DismissSuggestionQuery send stays a
+//! `[blocked: net]` seam (the net-drain dismiss family).
 
 use crate::dialog_id::DialogId;
 use crate::store_parse::{self, Parser};
@@ -31,11 +34,10 @@ pub trait SuggestedActionManagerEnv {
         tdutils::log_info!("Send help.dismissSuggestion for {action:?} — [blocked: net]");
     }
 
-    /// `CheckPromoDataQuery::send` — `[blocked: net]`; the answer handler
-    /// is [`SuggestedActionManager::on_check_promo_data`].
-    fn send_get_promo_data_query(&mut self) {
-        tdutils::log_info!("Send help.getPromoData — [blocked: net]");
-    }
+    /// `CheckPromoDataQuery::send` (SuggestedActionManager.cpp:72-74) —
+    /// the wire `help.getPromoData`; the answer handler is the
+    /// `Td::on_account_net_answer` `CheckPromoData` arm (cpp:76-104).
+    fn send_get_promo_data_query(&mut self);
 }
 
 /// The collapsed `SuggestedActionManager`.
@@ -47,8 +49,10 @@ pub struct SuggestedActionManager {
     /// sends, keyed by the action.
     pub(crate) dismiss_suggested_action_queries:
         std::collections::BTreeMap<(i64, i32), Vec<Promise<()>>>,
-    /// The login-email check promises parked at the promo-data seam.
-    pub parked_login_email_promises: Vec<Promise<()>>,
+    /// The login-email check promises parked at the promo-data send — the
+    /// C++ carries the promise into the CheckPromoDataQuery handler
+    /// (cpp:276-278); the Rust drain pops this FIFO lot.
+    pub(crate) parked_login_email_promises: Vec<Promise<()>>,
 }
 
 impl SuggestedActionManager {
@@ -228,8 +232,8 @@ impl SuggestedActionManager {
         let _ = env;
     }
 
-    /// `is_login_email_address_required` (SuggestedActionManager.cpp) —
-    /// the promo-data check is the seam.
+    /// `is_login_email_address_required` (SuggestedActionManager.cpp:276-278)
+    /// — the CheckPromoDataQuery send with the request promise.
     pub fn is_login_email_address_required(
         &mut self,
         env: &mut impl SuggestedActionManagerEnv,
@@ -239,23 +243,15 @@ impl SuggestedActionManager {
         self.parked_login_email_promises.push(promise);
     }
 
-    /// `on_check_promo_data` — the promo-data answer handler.
-    pub fn on_check_promo_data(
-        &mut self,
-        result: std::result::Result<Option<Vec<String>>, Status>,
-    ) {
-        let required = result.ok().flatten().is_some_and(|suggestions| {
-            suggestions
-                .iter()
-                .any(|s| s == "SETUP_LOGIN_EMAIL" || s == "SETUP_LOGIN_EMAIL_NOSKIP")
-        });
-        for promise in std::mem::take(&mut self.parked_login_email_promises) {
-            let mut promise = promise;
-            if required {
-                promise.set_value(());
-            } else {
-                promise.set_error(Status::error(404, "Not Found"));
-            }
+    /// Pop the head of the login-email lot (the FIFO `take_promise`
+    /// convention; the C++ carries the promise through the
+    /// CheckPromoDataQuery handler — SuggestedActionManager.cpp:276-278 —
+    /// the §5 pairing note).
+    pub(crate) fn take_login_email_promise(&mut self) -> Option<Promise<()>> {
+        if self.parked_login_email_promises.is_empty() {
+            None
+        } else {
+            Some(self.parked_login_email_promises.remove(0))
         }
     }
 
@@ -293,6 +289,17 @@ mod tests {
         queries: Vec<String>,
     }
 
+    impl TestEnv {
+        fn new() -> TestEnv {
+            TestEnv {
+                pmc: BTreeMap::new(),
+                erased: Vec::new(),
+                updates: Vec::new(),
+                queries: Vec::new(),
+            }
+        }
+    }
+
     impl SuggestedActionManagerEnv for TestEnv {
         fn close_flag(&self) -> bool {
             false
@@ -325,6 +332,20 @@ mod tests {
         fn send_get_promo_data_query(&mut self) {
             self.queries.push("getPromoData".to_string());
         }
+    }
+
+    #[test]
+    fn login_email_park_and_pop() {
+        // The request promise parks at the send; the answer drain pops
+        // the head FIFO (the C++ carries the promise through the query
+        // handler — cpp:276-278, the §5 pairing note).
+        let mut env = TestEnv::new();
+        let mut manager = SuggestedActionManager::new();
+        let (promise, _slot) = record();
+        manager.is_login_email_address_required(&mut env, promise);
+        assert_eq!(env.queries, ["getPromoData"]);
+        assert!(manager.take_login_email_promise().is_some());
+        assert!(manager.take_login_email_promise().is_none());
     }
 
     #[test]

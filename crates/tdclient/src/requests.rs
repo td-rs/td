@@ -1648,12 +1648,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             td.statistics_manager = manager;
         }
         Function::isLoginEmailAddressRequired(_) => {
-            // `Requests.cpp:1893-1898` — the ok answer parks behind the
-            // promo-data query ([blocked: net]).
+            // `Requests.cpp:1893-1898` — the CheckPromoDataQuery answers
+            // the ok/404 bands (SuggestedActionManager.cpp:65-105).
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -1661,7 +1662,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
             td.suggested_action_manager
                 .is_login_email_address_required(&mut env, promise);

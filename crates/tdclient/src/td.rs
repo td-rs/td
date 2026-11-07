@@ -3187,6 +3187,11 @@ pub(crate) enum AccountNetKind {
     /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_accept_terms_of_service`]
     /// with the parked request promise.
     AcceptTermsOfService,
+    /// `CheckPromoDataQuery` (SuggestedActionManager.cpp:65-105) — the
+    /// login-email promo check over `help.getPromoData`; the answer
+    /// settles the parked request promise directly (the
+    /// SETUP_LOGIN_EMAIL scan, the 404 "Not Found" band).
+    CheckPromoData,
 }
 
 /// The cloned account dispatch surface the [`AccountEnv`] senders use —
@@ -22607,6 +22612,42 @@ impl Td {
                 self.terms_of_service_manager
                     .on_accept_terms_of_service(&mut env, promise);
             }
+            // `CheckPromoDataQuery` (SuggestedActionManager.cpp:65-105) —
+            // the promoData answer scans the pending suggestions for the
+            // login-email pair (cpp:87-94): a match settles ok, every
+            // other ok band (the empty promo, no match) answers the 404
+            // "Not Found" (cpp:99); errors forward verbatim
+            // (cpp:102-104), parse failures ride the 500 convention.
+            AccountNetKind::CheckPromoData => {
+                let Some(mut promise) =
+                    self.suggested_action_manager.take_login_email_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let required = match telegram_api::help_PromoData::parse(query.ok()) {
+                    Ok(telegram_api::help_PromoData::help_promoData(promo)) => promo
+                        .pending_suggestions
+                        .iter()
+                        .any(|suggestion| {
+                            suggestion == "SETUP_LOGIN_EMAIL"
+                                || suggestion == "SETUP_LOGIN_EMAIL_NOSKIP"
+                        }),
+                    Ok(telegram_api::help_PromoData::help_promoDataEmpty(_)) => false,
+                    Err(_) => {
+                        promise.set_error(parse_error("help.getPromoData"));
+                        return;
+                    }
+                };
+                if required {
+                    promise.set_value(());
+                } else {
+                    promise.set_error(Status::error(404, "Not Found"));
+                }
+            }
             // `SetAccountTtlQuery` (cpp:180-209) — the `!result` 500 band.
             AccountNetKind::SetAccountTtl => {
                 let promise = self
@@ -35490,8 +35531,8 @@ impl tdnet::net_query::DcInitSink for InertDcInit {
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
 /// the field-split borrows (the `NotificationEnv` convention); the net
 /// field carries the live dispatch surface for the query senders (`None`
-/// keeps the net-inert posture — the account and terms-of-service
-/// families dispatch, the suggested-action arms stay net-inert).
+/// keeps the net-inert posture — the inert arms log instead; the account,
+/// terms-of-service and login-email promo families dispatch).
 pub(crate) struct AccountEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: Option<&'a mut OptionManager>,
@@ -35903,6 +35944,17 @@ impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'
 
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    /// `CheckPromoDataQuery::send` (SuggestedActionManager.cpp:72-74).
+    fn send_get_promo_data_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::CheckPromoData,
+                telegram_api::Function::help_getPromoData(telegram_api::help_getPromoData),
+            ),
+            None => tdutils::log_info!("Send help.getPromoData — [net-inert]"),
+        }
     }
 }
 
@@ -55439,6 +55491,142 @@ mod tests {
         }
 
         assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the net-drain 52 suggested-action slice (the promo family):
+    // the login-email check rides the account dispatch plane (the
+    // SuggestedActionManager.cpp CheckPromoDataQuery handler half). ----
+
+    /// The net-drain 52 promo round-trip — the §3.9 family rides the
+    /// dispatcher through the [`AccountEnv`] send arm
+    /// (CheckPromoDataQuery, SuggestedActionManager.cpp:65-105): the
+    /// live `isLoginEmailAddressRequired` arm dispatches
+    /// `help.getPromoData`, the matching SETUP_LOGIN_EMAIL answer
+    /// settles ok (cpp:87-93), the unmatched and empty promo bands
+    /// answer 404 "Not Found" (cpp:94-99), errors forward verbatim
+    /// (cpp:102-104) and parse failures ride the 500 convention.
+
+    #[test]
+    fn suggested_action_promo_bands_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suggested_action_promo_bands_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn suggested_action_promo_bands_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suggested-actions");
+
+        fn promo_answer(suggestions: &[&str]) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_PromoData::help_promoData(telegram_api::help_promoData {
+                flags: 0,
+                proxy: false,
+                expires: 1_700_003_600,
+                peer: None,
+                psa_type: String::new(),
+                psa_message: String::new(),
+                pending_suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+                dismissed_suggestions: Vec::new(),
+                custom_pending_suggestion: None,
+                chats: Vec::new(),
+                users: Vec::new(),
+            })
+            .store(&mut out);
+            out
+        }
+
+        fn promo_empty_answer() -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_PromoData::help_promoDataEmpty(telegram_api::help_promoDataEmpty {
+                expires: 1_700_003_600,
+            })
+            .store(&mut out);
+            out
+        }
+
+        td.request(
+            310,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_answer(&["SETUP_LOGIN_EMAIL"]));
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 310)
+                .iter()
+                .any(|object| matches!(object, Object::ok(_))),
+            "the matching promo settles ok"
+        );
+
+        td.request(
+            311,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_answer(&["VALIDATE_PASSWORD"]));
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 311);
+        assert_eq!(error.code, 404);
+        assert_eq!(error.message, "Not Found");
+
+        td.request(
+            312,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_empty_answer());
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 312);
+        assert_eq!(error.code, 404);
+        assert_eq!(error.message, "Not Found");
+
+        td.request(
+            313,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_fail(sent, 420, "SLOWMODE_WAIT");
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 313);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "SLOWMODE_WAIT");
+
+        td.request(
+            314,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, vec![0x00, 0x00, 0x00, 0x00]);
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 314);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the help.getPromoData answer"
+        );
     }
 
     // ---- the net-drain 51 terms-of-service slice: the poll + accept
