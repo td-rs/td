@@ -18123,6 +18123,46 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `RequestSimpleWebViewQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:381-396) — the WebViewResult
+            // answer settles the url/same-origin pair; a non-zero
+            // query_id only logs (cpp:388).
+            K::RequestSimpleWebView => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewResult::parse(query.ok()) {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse WebViewResult: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_requestSimpleWebView answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_request_simple_web_view_promise();
+                match (result, promise) {
+                    (Ok(result), Some(mut promise)) => {
+                        if result.query_id != 0 {
+                            tdutils::log_error!("Receive WebViewResult with query_id");
+                        }
+                        promise.set_value(td_api::WebAppUrl {
+                            url: result.url,
+                            require_same_origin: result.same_origin,
+                        })
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.requestSimpleWebView answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46554,14 +46594,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_request_simple_web_view_query(
-        &mut self,
-        _query: telegram_api::messages_requestSimpleWebView,
-        _promise: Promise<td_api::WebAppUrl>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_send_web_view_data_query(
@@ -89680,6 +89712,131 @@ kQIDAQAB\n\
         assert_eq!(
             (error.code, error.message.as_str()),
             (500, "Receive invalid button type")
+        );
+
+        // 25. the getWebAppUrl arm rides the wire (Requests.cpp:1242-1252
+        //     → get_simple_web_view_url → RequestSimpleWebViewQuery::send,
+        //     cpp:347-379): the `#kb` suffix takes the URL flag, the
+        //     application name rides the platform field and the compact
+        //     mode rides its flag
+        td.request(
+            20,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "https://app.example.com/x#kb".to_owned(),
+                parameters: Some(td_api::WebAppOpenParameters {
+                    theme: None,
+                    application_name: "tdlib-test".to_owned(),
+                    mode: Some(td_api::WebAppOpenMode::webAppOpenModeCompact(
+                        td_api::webAppOpenModeCompact,
+                    )),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestSimpleWebView::ID,
+        );
+        let body = telegram_api::messages_requestSimpleWebView::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, (1 << 3) | (1 << 7)); // URL_MASK | COMPACT
+        assert_eq!(body.url, "https://app.example.com/x");
+        assert_eq!(
+            (body.from_switch_webview, body.from_side_menu),
+            (false, false)
+        );
+        assert!(body.compact);
+        assert!(!body.fullscreen);
+        assert_eq!(body.platform, "tdlib-test");
+        assert!(body.theme_params.is_none());
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+
+        // 26. the WebViewResult answer settles the url/same-origin pair
+        //     (cpp:381-394)
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewResult {
+                flags: 0,
+                fullsize: false,
+                fullscreen: false,
+                same_origin: true,
+                query_id: 0,
+                url: "https://app.example.com/webapp".to_owned(),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 20).first() {
+            Some(Object::webAppUrl(web_app_url)) => {
+                assert_eq!(web_app_url.url, "https://app.example.com/webapp");
+                assert!(web_app_url.require_same_origin);
+            }
+            other => panic!("the web app url, got {other:?}"),
+        }
+
+        // 27. the `#iq` suffix takes the from_switch_webview flag and the
+        //     start:// form the start_param + from_side_menu pair
+        //     (cpp:359-372)
+        td.request(
+            21,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "https://app.example.com/y#iq".to_owned(),
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestSimpleWebView::ID,
+        );
+        let body = telegram_api::messages_requestSimpleWebView::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, (1 << 3) | (1 << 1)); // URL_MASK | FROM_SWITCH_WEBVIEW
+        assert!(body.from_switch_webview);
+        assert_eq!(body.url, "https://app.example.com/y");
+
+        td.request(
+            22,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "start://hello".to_owned(),
+                parameters: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_requestSimpleWebView::ID,
+        );
+        let body = telegram_api::messages_requestSimpleWebView::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.flags, (1 << 4) | (1 << 2)); // START_PARAM_MASK | FROM_SIDE_MENU
+        assert_eq!(body.url, "");
+        assert_eq!(body.start_param, "hello");
+        assert!(body.from_side_menu);
+
+        // 28. the invalid-URL band (cpp:372-374) answers the 400 inline —
+        //     no send
+        td.request(
+            23,
+            Function::getWebAppUrl(td_api::getWebAppUrl {
+                bot_user_id: 9,
+                url: "https://app.example.com/no-suffix".to_owned(),
+                parameters: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 23);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid URL specified")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_requestSimpleWebView::ID,
+            "the invalid-URL band sends nothing",
         );
     }
 }

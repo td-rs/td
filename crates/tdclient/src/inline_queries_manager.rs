@@ -698,12 +698,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `RequestSimpleWebViewQuery` (InlineQueriesManager.cpp:339-396).
-    fn send_request_simple_web_view_query(
-        &mut self,
-        query: telegram_api::messages_requestSimpleWebView,
-        promise: Promise<td_api::WebAppUrl>,
-    );
     /// `SendWebViewDataQuery` (InlineQueriesManager.cpp:398-425).
     fn send_send_web_view_data_query(
         &mut self,
@@ -866,6 +860,10 @@ pub(crate) enum InlineQueriesNetKind {
     /// lot (a String is not `Copy`); the wire KeyboardButton answer folds
     /// through the M.22 record and registers the requested dialog type.
     GetRequestedWebViewButton { bot_user_id: UserId },
+    /// `RequestSimpleWebViewQuery` (cpp:339-396) —
+    /// `messages.requestSimpleWebView`; the WebViewResult answer settles
+    /// the url/same-origin pair (the query_id band only logs).
+    RequestSimpleWebView,
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -887,6 +885,8 @@ pub(crate) struct PendingInlineQueries {
     /// `GetRequestedWebViewButtonQuery::promise_` + the handler's
     /// `prepared_button_id_` member (the answer's re-entry key).
     get_requested_web_view_button: Vec<(String, Promise<td_api::KeyboardButton>)>,
+    /// `RequestSimpleWebViewQuery::promise_`.
+    request_simple_web_view: Vec<Promise<td_api::WebAppUrl>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1535,9 +1535,11 @@ impl InlineQueriesManager {
             url,
             start_param: start_parameter,
             theme_params: theme_parameters.map(|json| telegram_api::DataJSON { data: json }),
-            platform: String::new(),
+            // `parameters.get_application_name()` (cpp:378) — the C++
+            // rides the application name on the platform field
+            platform: parameters.get_application_name().to_owned(),
         };
-        env.send_request_simple_web_view_query(query, promise);
+        self.send_request_simple_web_view_query(query, promise);
     }
 
     /// `send_web_view_data` (InlineQueriesManager.cpp:856-869).
@@ -2063,6 +2065,39 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.get_requested_web_view_button.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<RequestSimpleWebViewQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:347-379) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_request_simple_web_view_query(
+        &mut self,
+        query: telegram_api::messages_requestSimpleWebView,
+        promise: Promise<td_api::WebAppUrl>,
+    ) {
+        self.pending.request_simple_web_view.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::RequestSimpleWebView,
+                telegram_api::Function::messages_requestSimpleWebView(query),
+            ),
+            None => tdutils::log_info!("Send messages.requestSimpleWebView — [net-inert]"),
+        }
+    }
+
+    /// The request-simple-web-view family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_request_simple_web_view_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::WebAppUrl>> {
+        if self.pending.request_simple_web_view.is_empty() {
+            None
+        } else {
+            Some(self.pending.request_simple_web_view.remove(0))
         }
     }
 
@@ -3883,14 +3918,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_request_simple_web_view_query(
-            &mut self,
-            _query: telegram_api::messages_requestSimpleWebView,
-            _promise: Promise<td_api::WebAppUrl>,
-        ) {
-            // [blocked: net]
-        }
-
         fn send_send_web_view_data_query(
             &mut self,
             _query: telegram_api::messages_sendWebViewData,
@@ -4144,6 +4171,64 @@ mod tests {
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
         );
+    }
+
+    /// The get_simple_web_view_url bands: the URL ladder (cpp:359-374)
+    /// answers inline, the good form parks the promise net-inert and the
+    /// application name rides the platform field (cpp:378).
+    #[test]
+    fn get_simple_web_view_url_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv::default();
+
+        // the invalid-URL band (cpp:372-374)
+        let (promise, outcomes) = recording_promise::<td_api::WebAppUrl>();
+        manager.get_simple_web_view_url(
+            &mut env,
+            UserId::new(9),
+            "https://app.example.com/no-suffix",
+            WebAppOpenParameters::default(),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Invalid URL specified"
+        ));
+
+        // the `#iq` form parks net-inert with the platform name
+        let (promise, outcomes) = recording_promise::<td_api::WebAppUrl>();
+        manager.get_simple_web_view_url(
+            &mut env,
+            UserId::new(9),
+            "https://app.example.com/y#iq",
+            WebAppOpenParameters::from_td_api(Some(td_api::WebAppOpenParameters {
+                theme: None,
+                application_name: "tdlib-test".to_owned(),
+                mode: None,
+            })),
+            promise,
+        );
+        assert_eq!(manager.pending.request_simple_web_view.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_request_simple_web_view_promise().is_some());
+
+        // the not-a-bot band (cpp:851-853)
+        let mut env = TestEnv {
+            bots: Vec::new(),
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<td_api::WebAppUrl>();
+        manager.get_simple_web_view_url(
+            &mut env,
+            UserId::new(9),
+            "",
+            WebAppOpenParameters::default(),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Bot not found"
+        ));
     }
 
     /// The get_prepared_keyboard_button bands: the net-inert park keeps
