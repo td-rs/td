@@ -3516,6 +3516,32 @@ pub(crate) enum CountryNetKind {
 /// the answers drain through [`Td::on_country_net_answer`].
 type CountryNetHandle = NetKindHandle<CountryNetKind>;
 
+/// The LanguagePackManager in-flight query kinds — the C++ request
+/// lambdas of LanguagePackManager.cpp:433-458, 871-897 and 1128-1161
+/// (all five sends are `create_unauth` over the main DC). The payload
+/// is the index of the Td-side [`crate::language_pack_manager::
+/// PendingLangPackQuery`] slot (the kinds stay `Copy`; the params and
+/// the promises wait in the slot — the capture-exact pairing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LangPackNetKind {
+    /// `GetLanguagesQuery` (cpp:871-878) — the localization-target rows.
+    Languages { pending_index: u32 },
+    /// `GetLanguageQuery` (cpp:887-897) — the searched info.
+    LanguageInfo { pending_index: u32 },
+    /// `GetLangPackQuery` (cpp:1128-1150) — the full pack (its promise
+    /// chain parks in the manager's query map).
+    LangPack { pending_index: u32 },
+    /// `GetStringsQuery` (cpp:1152-1161) — the keyed fetch.
+    Strings { pending_index: u32 },
+    /// `GetDifferenceQuery` (cpp:433-458) — the difference (its promises
+    /// park in the language's difference queue).
+    Difference { pending_index: u32 },
+}
+
+/// The cloned langpack dispatch surface the [`LanguagePackEnv`] senders
+/// use — the answers drain through [`Td::on_lang_pack_net_answer`].
+type LangPackNetHandle = NetKindHandle<LangPackNetKind>;
+
 /// The PromoDataManager in-flight query kinds — the C++ ResultHandler
 /// classes of PromoDataManager.cpp:31-86.
 #[derive(Clone, Copy)]
@@ -4045,6 +4071,62 @@ fn parse_wire_bool_value(data: &[u8]) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// Take the [`crate::language_pack_manager::PendingLangPackQuery`] slot
+/// the net kind names — the capture-exact pairing (the slot stays `None`
+/// behind, so a stale or duplicated answer cannot double-answer).
+fn take_lang_pack_pending(
+    pending: &mut [Option<crate::language_pack_manager::PendingLangPackQuery>],
+    index: u32,
+) -> Option<crate::language_pack_manager::PendingLangPackQuery> {
+    let index = index as usize;
+    if index >= pending.len() {
+        return None;
+    }
+    pending[index].take()
+}
+
+/// Park one langpack pending entry, reusing a drained `None` slot when
+/// one exists (the vec stays bounded by the in-flight query count) —
+/// returns the slot index the `Copy` net kind carries.
+fn push_lang_pack_pending(
+    pending: &mut Vec<Option<crate::language_pack_manager::PendingLangPackQuery>>,
+    entry: crate::language_pack_manager::PendingLangPackQuery,
+) -> u32 {
+    if let Some(index) = pending.iter().position(|slot| slot.is_none()) {
+        pending[index] = Some(entry);
+        return index as u32;
+    }
+    pending.push(Some(entry));
+    (pending.len() - 1) as u32
+}
+
+/// The chained-`langpack.getLangPack` promise slot (the C++
+/// `PromiseCreator::lambda` one-hop catcher, cpp:1133-1139).
+type CaughtLanguagePackStrings =
+    Arc<Mutex<Option<tdutils::status::Result<td_api::LanguagePackStrings>>>>;
+
+/// The one-slot value catcher standing in for the C++
+/// `PromiseCreator::lambda` chain hop of `langpack.getLangPack`
+/// (cpp:1133-1139): the rebuilt strings ride the chained promise into
+/// the slot, then the intake feeds `on_get_all_language_pack_strings`
+/// with the caught result.
+fn catch_language_pack_strings() -> (
+    Promise<td_api::LanguagePackStrings>,
+    CaughtLanguagePackStrings,
+) {
+    struct Catch(CaughtLanguagePackStrings);
+    impl tdutils::promise::PromiseInterface<td_api::LanguagePackStrings> for Catch {
+        fn set_value(&mut self, value: td_api::LanguagePackStrings) {
+            *self.0.lock() = Some(tdutils::status::Result::Ok(value));
+        }
+        fn set_error(&mut self, error: Status) {
+            *self.0.lock() = Some(tdutils::status::Result::Err(error));
+        }
+    }
+    let slot: CaughtLanguagePackStrings = Arc::new(Mutex::new(None));
+    (Promise::from_interface(Catch(Arc::clone(&slot))), slot)
 }
 
 /// Pop the first parked [`PendingTranslationQuery`] matching the
@@ -6178,6 +6260,13 @@ pub struct Td {
     /// The parked TranslationManager promises (the C++ handlers' own
     /// promises) — popped by the answer drain.
     translation_promises: Vec<crate::translation_manager::PendingTranslationQuery>,
+    /// The callback-parked LanguagePackManager query answers, parked by
+    /// kind (the `Td::on_lang_pack_net_answer` drain).
+    langpack_net_completed: Arc<Mutex<Vec<(LangPackNetKind, NetQuery)>>>,
+    /// The parked LanguagePackManager query state (the C++ lambdas'
+    /// captured params + promises) — slot-indexed by the net kinds; the
+    /// intake leaves `None` behind so stale answers can't double-answer.
+    pub(crate) langpack_pending: Vec<Option<crate::language_pack_manager::PendingLangPackQuery>>,
     /// The callback-parked PrivacyManager query answers, parked by kind
     /// (the `Td::on_privacy_net_answer` drain).
     privacy_net_completed: Arc<Mutex<Vec<(PrivacyNetKind, NetQuery)>>>,
@@ -6912,6 +7001,8 @@ impl Td {
             sponsored_net_completed: Arc::new(Mutex::new(Vec::new())),
             translation_net_completed: Arc::new(Mutex::new(Vec::new())),
             translation_promises: Vec::new(),
+            langpack_net_completed: Arc::new(Mutex::new(Vec::new())),
+            langpack_pending: Vec::new(),
             privacy_net_completed: Arc::new(Mutex::new(Vec::new())),
             privacy_promises: Vec::new(),
             auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -9259,6 +9350,7 @@ impl Td {
         self.dispatch_completed_statistics_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
+        self.dispatch_completed_lang_pack_net();
         self.dispatch_completed_promo_net();
         self.dispatch_completed_sponsored_net();
         self.dispatch_completed_translation_net();
@@ -9504,6 +9596,16 @@ impl Td {
         Some(TranslationNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.translation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned langpack dispatch surface — the [`LanguagePackEnv`]
+    /// senders use it; `None` keeps the net-inert posture.
+    pub(crate) fn langpack_net(&self) -> Option<LangPackNetHandle> {
+        Some(LangPackNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.langpack_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -11229,6 +11331,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.country_net_completed.lock());
         for (kind, query) in completed {
             self.on_country_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked LanguagePackManager answers — the C++
+    /// request lambdas of LanguagePackManager.cpp:433-458, 871-897 and
+    /// 1128-1161 (the `create_unauth` band).
+    fn dispatch_completed_lang_pack_net(&mut self) {
+        let completed = std::mem::take(&mut *self.langpack_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_lang_pack_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -24179,6 +24292,309 @@ impl Td {
         }
     }
 
+    /// Route one langpack net answer by kind — the five C++ request
+    /// lambdas of LanguagePackManager.cpp:433-458, 871-897 and 1128-1161.
+    /// Every arm takes its pending slot (the capture-exact pairing) and
+    /// runs the landed manager response half through the production env
+    /// (the take-out keeps the borrows disjoint; the env carries the live
+    /// net so the version-changed re-fire chains keep dispatching, the
+    /// C++ `send_closure(actor_id, ...)` behavior).
+    fn on_lang_pack_net_answer(&mut self, kind: LangPackNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        let pending = match kind {
+            LangPackNetKind::Languages { pending_index }
+            | LangPackNetKind::LanguageInfo { pending_index }
+            | LangPackNetKind::LangPack { pending_index }
+            | LangPackNetKind::Strings { pending_index }
+            | LangPackNetKind::Difference { pending_index } => {
+                take_lang_pack_pending(&mut self.langpack_pending, pending_index)
+            }
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        match pending {
+            // `langpack.getLanguages` (cpp:871-876) — the answer re-enters
+            // `on_get_languages` (the merge + the server-info cache save).
+            crate::language_pack_manager::PendingLangPackQuery::Languages {
+                language_pack,
+                mut promise,
+            } => {
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Some(languages) =
+                    parse_wire_vector(query.ok(), telegram_api::LangPackLanguage::read)
+                else {
+                    promise.set_error(parse_error("langpack_getLanguages"));
+                    return;
+                };
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_languages(&mut env, languages, language_pack, false, promise);
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getLanguage` (cpp:887-894) — the answer re-enters
+            // `on_get_language` (the info build + the cache update).
+            crate::language_pack_manager::PendingLangPackQuery::LanguageInfo {
+                language_pack,
+                language_code,
+                mut promise,
+            } => {
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Ok(language) = telegram_api::LangPackLanguage::parse(query.ok()) else {
+                    promise.set_error(parse_error("langpack_getLanguage"));
+                    return;
+                };
+                tdutils::log_info!("Receive {language:?}");
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_language(&mut env, language, language_pack, language_code, promise);
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getLangPack` (cpp:1128-1150) — the chained hop:
+            // the fetch failure fails the parked get-all promises through
+            // the chained promise (cpp:1134-1136); the answer runs
+            // `on_get_language_pack_strings` first, the rebuilt strings
+            // then ride the catch-slot into `on_get_all_language_pack_strings`
+            // (the C++ promise-lambda chain, here a one-slot catcher).
+            crate::language_pack_manager::PendingLangPackQuery::LangPack {
+                language_pack,
+                language_code,
+            } => {
+                let difference = if query.is_error() {
+                    let status = query.error().clone();
+                    let mut manager = std::mem::take(&mut self.language_pack_manager);
+                    manager.on_get_all_language_pack_strings(
+                        language_pack,
+                        language_code,
+                        tdutils::status::Result::Err(status),
+                    );
+                    self.language_pack_manager = manager;
+                    return;
+                } else {
+                    match telegram_api::LangPackDifference::parse(query.ok()) {
+                        Ok(difference) => difference,
+                        Err(_) => {
+                            let status = parse_error("langpack_getLangPack");
+                            let mut manager = std::mem::take(&mut self.language_pack_manager);
+                            manager.on_get_all_language_pack_strings(
+                                language_pack,
+                                language_code,
+                                tdutils::status::Result::Err(status),
+                            );
+                            self.language_pack_manager = manager;
+                            return;
+                        }
+                    }
+                };
+                let wire_lang_code = difference.lang_code.to_ascii_lowercase();
+                tdutils::log_info!(
+                    "Receive language pack {} from version {} with version {} of size {}",
+                    wire_lang_code,
+                    difference.from_version,
+                    difference.version,
+                    difference.strings.len()
+                );
+                if wire_lang_code != language_code {
+                    tdutils::log_error!(
+                        "Receive strings for {} instead of {}",
+                        wire_lang_code,
+                        language_code
+                    );
+                }
+                if difference.from_version != 0 {
+                    tdutils::log_error!(
+                        "Receive language pack from version {}",
+                        difference.from_version
+                    );
+                }
+                let (chained, chained_slot) = catch_language_pack_strings();
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                {
+                    let mut env = LanguagePackEnv {
+                        options: self.option_manager.as_mut(),
+                        updates: &mut self.language_pack_updates,
+                        net,
+                        pending: &mut self.langpack_pending,
+                    };
+                    manager.on_get_language_pack_strings(
+                        &mut env,
+                        language_pack.clone(),
+                        language_code.clone(),
+                        difference.version,
+                        false,
+                        Vec::new(),
+                        difference.strings,
+                        chained,
+                    );
+                }
+                let r_strings = chained_slot.lock().take().unwrap_or_else(|| {
+                    tdutils::status::Result::Err(Status::error(
+                        500,
+                        "Langpack answer chain lost the strings",
+                    ))
+                });
+                manager.on_get_all_language_pack_strings(language_pack, language_code, r_strings);
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getStrings` (cpp:1152-1158) — the answer re-enters
+            // `on_get_language_pack_strings` with version −1 (the keyed
+            // fetch never bumps the pack version).
+            crate::language_pack_manager::PendingLangPackQuery::Strings {
+                language_pack,
+                language_code,
+                keys,
+                mut promise,
+            } => {
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Some(strings) =
+                    parse_wire_vector(query.ok(), telegram_api::LangPackString::read)
+                else {
+                    promise.set_error(parse_error("langpack_getStrings"));
+                    return;
+                };
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_language_pack_strings(
+                    &mut env,
+                    language_pack,
+                    language_code,
+                    -1,
+                    false,
+                    keys,
+                    strings,
+                    promise,
+                );
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getDifference` (cpp:433-455) — the failure half is
+            // `on_failed_get_difference` (the parked difference queue), the
+            // answer re-enters `on_get_language_pack_strings(..., is_diff =
+            // true)` with an empty promise (the difference queue is the
+            // answer surface, cpp:449-455).
+            crate::language_pack_manager::PendingLangPackQuery::Difference {
+                language_pack,
+                language_code,
+                from_version,
+            } => {
+                let difference = if query.is_error() {
+                    let status = query.error().clone();
+                    let mut manager = std::mem::take(&mut self.language_pack_manager);
+                    let net = self.langpack_net();
+                    let mut env = LanguagePackEnv {
+                        options: self.option_manager.as_mut(),
+                        updates: &mut self.language_pack_updates,
+                        net,
+                        pending: &mut self.langpack_pending,
+                    };
+                    crate::language_pack_manager::on_failed_get_difference(
+                        &mut manager,
+                        &mut env,
+                        &language_pack,
+                        &language_code,
+                        status,
+                    );
+                    self.language_pack_manager = manager;
+                    return;
+                } else {
+                    match telegram_api::LangPackDifference::parse(query.ok()) {
+                        Ok(difference) => difference,
+                        Err(_) => {
+                            let status = parse_error("langpack_getDifference");
+                            let mut manager = std::mem::take(&mut self.language_pack_manager);
+                            let net = self.langpack_net();
+                            let mut env = LanguagePackEnv {
+                                options: self.option_manager.as_mut(),
+                                updates: &mut self.language_pack_updates,
+                                net,
+                                pending: &mut self.langpack_pending,
+                            };
+                            crate::language_pack_manager::on_failed_get_difference(
+                                &mut manager,
+                                &mut env,
+                                &language_pack,
+                                &language_code,
+                                status,
+                            );
+                            self.language_pack_manager = manager;
+                            return;
+                        }
+                    }
+                };
+                let wire_lang_code = difference.lang_code.to_ascii_lowercase();
+                tdutils::log_info!(
+                    "Receive language pack difference for language pack {} from version {} with version {} of size {}",
+                    wire_lang_code,
+                    difference.from_version,
+                    difference.version,
+                    difference.strings.len()
+                );
+                if wire_lang_code != language_code {
+                    tdutils::log_error!(
+                        "Receive strings for {} instead of {}",
+                        wire_lang_code,
+                        language_code
+                    );
+                }
+                if difference.from_version != from_version {
+                    tdutils::log_error!(
+                        "Receive strings from {} instead of {}",
+                        difference.from_version,
+                        from_version
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_language_pack_strings(
+                    &mut env,
+                    language_pack,
+                    language_code,
+                    difference.version,
+                    true,
+                    Vec::new(),
+                    difference.strings,
+                    Promise::default(),
+                );
+                self.language_pack_manager = manager;
+            }
+        }
+    }
+
     /// Route one CountryInfoManager net answer by kind (the C++ query
     /// handler halves of CountryInfoManager.cpp:30-71).
     fn on_country_net_answer(&mut self, kind: CountryNetKind, query: NetQuery) {
@@ -29610,9 +30026,12 @@ impl Td {
     /// plus `start_up` (cpp:228-250) — the collapsed actor start reads the
     /// restored options and opens the language pack database (M.24).
     fn init_language_pack_manager(&mut self) {
+        let net = self.langpack_net();
         let mut env = LanguagePackEnv {
             options: self.option_manager.as_mut(),
             updates: &mut self.language_pack_updates,
+            net,
+            pending: &mut self.langpack_pending,
         };
         self.language_pack_manager.init(&mut env);
     }
@@ -35798,11 +36217,21 @@ impl crate::message_entity::UserManagerLike for TdTranslationEnv<'_> {
 /// [`Td::init_language_pack_manager`]). The `send_update`s buffer into
 /// [`Td::language_pack_updates`] and Td drains them — the collapsed
 /// `send_closure(G()->td(), &Td::send_update)` hop. The five net queries
-/// are the M.24 `[blocked: net]` seams: the C++ promises land in the
-/// query (or the manager's pending maps) and stay unanswered offline.
+/// ride the `LangPackNetKind` unauth band (the `create_unauth` shape,
+/// LanguagePackManager.cpp:456/877/896/1149/1159): the promises park in
+/// the pending slots the kinds name, and the answers drain through
+/// [`Td::on_lang_pack_net_answer`].
 pub(crate) struct LanguagePackEnv<'a> {
     pub(crate) options: Option<&'a mut OptionManager>,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The net-drain 60 dispatch surface (the five langpack.* wire
+    /// queries over the unauth band); `None` keeps the net-inert
+    /// posture (pre-init and in the net-inert tests).
+    pub(crate) net: Option<LangPackNetHandle>,
+    /// The parked query state (the C++ lambdas' captured params +
+    /// promises) — slot-indexed by the net kinds; the send legs push
+    /// `Some(...)` and carry the index.
+    pub(crate) pending: &'a mut Vec<Option<crate::language_pack_manager::PendingLangPackQuery>>,
 }
 
 impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_> {
@@ -35829,59 +36258,159 @@ impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_
         self.updates.push(update);
     }
 
-    /// `langpack_getLanguages` (LanguagePackManager.cpp:871-878).
+    /// `langpack_getLanguages` (LanguagePackManager.cpp:871-878) — the
+    /// unauth dispatch; the promise parks in the pending slot the kind
+    /// names (the capture-exact pairing).
     fn send_get_languages_query(
         &mut self,
         language_pack: String,
-        _promise: tdutils::promise::Promise<td_api::LocalizationTargetInfo>,
+        promise: tdutils::promise::Promise<td_api::LocalizationTargetInfo>,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getLanguages for language pack {language_pack} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getLanguages for language pack {language_pack} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::Languages {
+                language_pack: language_pack.clone(),
+                promise,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::Languages { pending_index },
+            telegram_api::Function::langpack_getLanguages(telegram_api::langpack_getLanguages {
+                lang_pack: language_pack,
+            }),
         );
     }
 
-    /// `langpack_getLanguage` (LanguagePackManager.cpp:887-897).
+    /// `langpack_getLanguage` (LanguagePackManager.cpp:887-897) — the
+    /// unauth dispatch over the parked slot.
     fn send_get_language_query(
         &mut self,
         language_pack: String,
         language_code: String,
-        _promise: tdutils::promise::Promise<td_api::LanguagePackInfo>,
+        promise: tdutils::promise::Promise<td_api::LanguagePackInfo>,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getLanguage for language pack {language_pack}, language code {language_code} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getLanguage for language pack {language_pack}, language code {language_code} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::LanguageInfo {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+                promise,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::LanguageInfo { pending_index },
+            telegram_api::Function::langpack_getLanguage(telegram_api::langpack_getLanguage {
+                lang_pack: language_pack,
+                lang_code: language_code,
+            }),
         );
     }
 
-    /// `langpack_getLangPack` (LanguagePackManager.cpp:1148-1150).
+    /// `langpack_getLangPack` (LanguagePackManager.cpp:1148-1150) — the
+    /// get-all promises park in the manager's query map, so the slot
+    /// carries only the params (the answer chain re-enters through
+    /// `Td::on_lang_pack_net_answer`).
     fn send_get_lang_pack_query(&mut self, language_pack: String, language_code: String) {
-        tdutils::log_info!(
-            "Send langpack.getLangPack for language pack {language_pack}, language code {language_code} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getLangPack for language pack {language_pack}, language code {language_code} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::LangPack {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::LangPack { pending_index },
+            telegram_api::Function::langpack_getLangPack(telegram_api::langpack_getLangPack {
+                lang_pack: language_pack,
+                lang_code: language_code,
+            }),
         );
     }
 
-    /// `langpack_getStrings` (LanguagePackManager.cpp:1159-1161).
+    /// `langpack_getStrings` (LanguagePackManager.cpp:1159-1161) — the
+    /// keyed fetch over the parked slot.
     fn send_get_strings_query(
         &mut self,
         language_pack: String,
         language_code: String,
         keys: Vec<String>,
-        _promise: tdutils::promise::Promise<td_api::LanguagePackStrings>,
+        promise: tdutils::promise::Promise<td_api::LanguagePackStrings>,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getStrings for language pack {language_pack}, language code {language_code}, {} keys — [blocked: net]",
-            keys.len()
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getStrings for language pack {language_pack}, language code {language_code}, {} keys — [net-inert]",
+                keys.len()
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::Strings {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+                keys: keys.clone(),
+                promise,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::Strings { pending_index },
+            telegram_api::Function::langpack_getStrings(telegram_api::langpack_getStrings {
+                lang_pack: language_pack,
+                lang_code: language_code,
+                keys,
+            }),
         );
     }
 
-    /// `langpack_getDifference` (LanguagePackManager.cpp:456-458).
+    /// `langpack_getDifference` (LanguagePackManager.cpp:456-458) — the
+    /// difference promises park in the language's difference queue, so
+    /// the slot carries only the params (the from_version rides along
+    /// for the C++ mismatch log, cpp:446-448).
     fn send_get_difference_query(
         &mut self,
         language_pack: String,
         language_code: String,
         from_version: i32,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getDifference for language pack {language_pack}, language code {language_code}, from version {from_version} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getDifference for language pack {language_pack}, language code {language_code}, from version {from_version} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::Difference {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+                from_version,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::Difference { pending_index },
+            telegram_api::Function::langpack_getDifference(telegram_api::langpack_getDifference {
+                lang_pack: language_pack,
+                lang_code: language_code,
+                from_version,
+            }),
         );
     }
 }
@@ -41874,9 +42403,12 @@ impl crate::country_info_manager::CountryInfoManagerEnv for CountryEnv<'_> {
     /// (CountryInfoManager.cpp:188-190) — the collapsed manager runs
     /// through its own env, like [`Td::init_language_pack_manager`].
     fn get_main_language_code(&mut self) -> String {
+        let net = self.td.langpack_net();
         let mut env = LanguagePackEnv {
             options: self.td.option_manager.as_mut(),
             updates: &mut self.td.language_pack_updates,
+            net,
+            pending: &mut self.td.langpack_pending,
         };
         self.td
             .language_pack_manager
@@ -62771,6 +63303,560 @@ mod tests {
         );
 
         assert!(td.country_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the langpack net slice: the five langpack.* queries ride the
+    // unauth dispatcher band (LanguagePackManager.cpp:433-458, 871-897,
+    // 1128-1161; the `create_unauth` shape). ----
+
+    type LocalizationTargetInfoSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::LocalizationTargetInfo>>>,
+    >;
+
+    fn record_localization_target_info() -> (
+        Promise<td_api::LocalizationTargetInfo>,
+        LocalizationTargetInfoSlot,
+    ) {
+        struct Rec(LocalizationTargetInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::LocalizationTargetInfo> for Rec {
+            fn set_value(&mut self, value: td_api::LocalizationTargetInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: LocalizationTargetInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type LanguagePackInfoSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::LanguagePackInfo>>>>;
+
+    fn record_language_pack_info() -> (Promise<td_api::LanguagePackInfo>, LanguagePackInfoSlot) {
+        struct Rec(LanguagePackInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::LanguagePackInfo> for Rec {
+            fn set_value(&mut self, value: td_api::LanguagePackInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: LanguagePackInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type LanguagePackStringsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::LanguagePackStrings>>>,
+    >;
+
+    fn record_language_pack_strings() -> (
+        Promise<td_api::LanguagePackStrings>,
+        LanguagePackStringsSlot,
+    ) {
+        struct Rec(LanguagePackStringsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::LanguagePackStrings> for Rec {
+            fn set_value(&mut self, value: td_api::LanguagePackStrings) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: LanguagePackStringsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_lang_pack_language(lang_code: &str, name: &str) -> telegram_api::LangPackLanguage {
+        telegram_api::LangPackLanguage {
+            flags: 0,
+            official: true,
+            rtl: false,
+            beta: false,
+            name: name.to_owned(),
+            native_name: name.to_owned(),
+            lang_code: lang_code.to_owned(),
+            base_lang_code: String::new(),
+            plural_code: lang_code.to_owned(),
+            strings_count: 3,
+            translated_count: 2,
+            translations_url: "https://example.org".to_owned(),
+        }
+    }
+
+    /// the bare `Vector<LangPackLanguage>` answer body (the
+    /// `parse_wire_vector` counterpart shape).
+    fn wire_language_vector(languages: Vec<telegram_api::LangPackLanguage>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        out.extend_from_slice(&(languages.len() as i32).to_le_bytes());
+        for language in languages {
+            language.store_boxed(&mut out);
+        }
+        out
+    }
+
+    fn wire_lang_pack_string(key: &str, value: &str) -> telegram_api::LangPackString {
+        telegram_api::LangPackString::langPackString(telegram_api::langPackString {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+
+    /// the bare `Vector<LangPackString>` answer body.
+    fn wire_string_vector(strings: Vec<telegram_api::LangPackString>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        out.extend_from_slice(&(strings.len() as i32).to_le_bytes());
+        for string in strings {
+            // the enum store writes each variant boxed
+            string.store(&mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn langpack_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(langpack_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn langpack_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-langpack");
+        // the chosen language: the manager init reads the options (the
+        // C++ constructor + start_up). The production init runs before
+        // the dispatcher exists, so the re-init here models it with the
+        // net-less env (the bootstrap repair/load chains stay net-inert
+        // — the inert posture itself is scenario 9).
+        {
+            let options = td.option_manager.as_mut().expect("option manager set");
+            options.set_option_string("localization_target", "android");
+            options.set_option_string("language_pack_id", "en");
+        }
+        {
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net: None,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.init(&mut env);
+        }
+
+        // 1. getLanguagePackStrings without keys — the get-all lot: two
+        //    callers park in the manager's query map, the
+        //    langpack.getLangPack query rides once, the answer fans out
+        //    through the chained on_get_language_pack_strings →
+        //    on_get_all_language_pack_strings hop and flushes the
+        //    updateLanguagePackStrings update.
+        let (promise_1, slot_1) = record_language_pack_strings();
+        let (promise_2, slot_2) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "de".to_owned(),
+                Vec::new(),
+                promise_1,
+            );
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "de".to_owned(),
+                Vec::new(),
+                promise_2,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the get-all query rides once");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getLangPack::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::LangPackDifference {
+            lang_code: "de".to_owned(),
+            from_version: 0,
+            version: 5,
+            strings: vec![
+                wire_lang_pack_string("key1", "value1"),
+                telegram_api::LangPackString::langPackStringPluralized(
+                    telegram_api::langPackStringPluralized {
+                        flags: 1 | (1 << 1) | (1 << 5),
+                        key: "key2".to_owned(),
+                        zero_value: "zero2".to_owned(),
+                        one_value: "one2".to_owned(),
+                        two_value: String::new(),
+                        few_value: String::new(),
+                        many_value: String::new(),
+                        other_value: "other2".to_owned(),
+                    },
+                ),
+                telegram_api::LangPackString::langPackStringDeleted(
+                    telegram_api::langPackStringDeleted {
+                        key: "key3".to_owned(),
+                    },
+                ),
+            ],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_lang_pack_net();
+        for (slot, label) in [(&slot_1, "first"), (&slot_2, "second")] {
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(strings)) => {
+                    // the get-all rebuild lists the ordinary + pluralized
+                    // strings (the deleted keys ride only in the update
+                    // plane), in the storage-map order
+                    assert_eq!(strings.strings.len(), 2, "{label} fan-out entry");
+                    let by_key: std::collections::HashMap<&str, &_> = strings
+                        .strings
+                        .iter()
+                        .map(|s| (s.key.as_str(), &s.value))
+                        .collect();
+                    assert!(matches!(
+                        by_key["key1"].as_ref(),
+                        Some(td_api::LanguagePackStringValue::languagePackStringValueOrdinary(v))
+                            if v.value == "value1"
+                    ));
+                    assert!(matches!(
+                        by_key["key2"].as_ref(),
+                        Some(td_api::LanguagePackStringValue::languagePackStringValuePluralized(v))
+                            if v.other_value == "other2"
+                    ));
+                }
+                other => panic!("unexpected {label} get-all result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            td.language_pack_updates.len(),
+            1,
+            "the first-full strings update flushed"
+        );
+        assert!(matches!(
+            &td.language_pack_updates[0],
+            td_api::Update::updateLanguagePackStrings(u) if u.language_pack_id == "de"
+        ));
+        td.language_pack_updates.clear();
+        assert!(
+            td.langpack_pending.iter().all(|slot| slot.is_none()),
+            "the pending slots drained"
+        );
+
+        // 2. getLanguagePackStrings with a key — the keyed fetch over a
+        //    not-yet-loaded language.
+        let (promise, slot) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "fr".to_owned(),
+                vec!["greeting".to_owned()],
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getStrings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_string_vector(vec![wire_lang_pack_string("greeting", "bonjour")]),
+        );
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(strings)) => {
+                assert_eq!(strings.strings.len(), 1);
+                assert_eq!(strings.strings[0].key, "greeting");
+            }
+            other => panic!("unexpected keyed strings result: {other:?}"),
+        }
+
+        // 3. the wire error band — the keyed fetch fails the promise
+        //    (an unloaded key, so the fetch stays on the wire).
+        let (promise, slot) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "fr".to_owned(),
+                vec!["farewell".to_owned()],
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(
+            sent.into_iter().next().unwrap(),
+            400,
+            "LANGUAGE_PACK_INVALID",
+        );
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 400);
+                assert_eq!(error.message(), "LANGUAGE_PACK_INVALID");
+            }
+            other => panic!("unexpected strings error result: {other:?}"),
+        }
+
+        // 4. the parse band — the garbage answer is the fetch_result 500.
+        let (promise, slot) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "fr".to_owned(),
+                vec!["farewell".to_owned()],
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(sent.into_iter().next().unwrap(), vec![1, 2, 3, 4]);
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 500);
+                assert_eq!(
+                    error.message(),
+                    "Failed to parse the langpack_getStrings answer"
+                );
+            }
+            other => panic!("unexpected strings parse result: {other:?}"),
+        }
+
+        // 5. getLocalizationTargetInfo — the localization rows merge into
+        //    the target info.
+        let (promise, slot) = record_localization_target_info();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .get_languages(&mut env, false, promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getLanguages::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_language_vector(vec![wire_lang_pack_language("it", "Italiano")]),
+        );
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(info)) => {
+                assert_eq!(info.language_packs.len(), 1);
+                assert_eq!(info.language_packs[0].id, "it");
+                assert_eq!(info.language_packs[0].name, "Italiano");
+                assert!(info.language_packs[0].is_official);
+            }
+            other => panic!("unexpected localization target info: {other:?}"),
+        }
+
+        // 6. getLanguagePackInfo — the searched info round-trip, plus the
+        //    unsupported-code band (the C++ get_language_info 500).
+        let (promise, slot) = record_language_pack_info();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .search_language_info(&mut env, "de".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getLanguage::ID
+        );
+        let mut answer = Vec::new();
+        wire_lang_pack_language("de", "Deutsch").store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(info)) => {
+                assert_eq!(info.id, "de");
+                assert_eq!(info.name, "Deutsch");
+            }
+            other => panic!("unexpected language pack info: {other:?}"),
+        }
+        let (promise, slot) = record_language_pack_info();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .search_language_info(&mut env, "xx".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let mut answer = Vec::new();
+        wire_lang_pack_language("", "Broken").store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 500);
+                assert_eq!(error.message(), "Unsupported language pack ID");
+            }
+            other => panic!("unexpected unsupported-code result: {other:?}"),
+        }
+
+        // 7. synchronizeLanguagePack — the difference query completes the
+        //    parked promise through the language's difference queue and
+        //    flushes the strings update.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .synchronize_language_pack(&mut env, "en".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getDifference::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::LangPackDifference {
+            lang_code: "en".to_owned(),
+            from_version: 0,
+            version: 7,
+            strings: vec![wire_lang_pack_string("en_key", "en_value")],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.language_pack_updates.clear();
+        td.dispatch_completed_lang_pack_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.language_pack_updates
+                .iter()
+                .any(|update| matches!(update,
+                    td_api::Update::updateLanguagePackStrings(u) if u.language_pack_id == "en")),
+            "the difference strings update flushed"
+        );
+
+        // 8. the difference wire error band — on_failed_get_difference
+        //    fails the parked queue.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .synchronize_language_pack(&mut env, "en".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(
+            sent.into_iter().next().unwrap(),
+            500,
+            "Internal Server Error",
+        );
+        td.dispatch_completed_lang_pack_net();
+        match unit_slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 500);
+            }
+            other => panic!("unexpected difference error result: {other:?}"),
+        }
+
+        // 9. the net-inert posture — a bare pre-init Td (no dispatcher):
+        //    the send arm logs and drops (the offline request stays
+        //    unanswered), the pending lot stays empty.
+        let inert_callback = CollectCallback::default();
+        let inert_td = Td::new(Box::new(CollectCallback {
+            responses: inert_callback.responses.clone(),
+            errors: inert_callback.errors.clone(),
+        }));
+        let net = inert_td.langpack_net();
+        assert!(net.is_none(), "no dispatcher — the inert posture");
+        let mut inert_updates = Vec::new();
+        let mut inert_pending: Vec<Option<crate::language_pack_manager::PendingLangPackQuery>> =
+            Vec::new();
+        let mut env = LanguagePackEnv {
+            options: None,
+            updates: &mut inert_updates,
+            net,
+            pending: &mut inert_pending,
+        };
+        let (promise, slot) = record_language_pack_strings();
+        use crate::language_pack_manager::LanguagePackManagerEnv as _;
+        env.send_get_strings_query(
+            "android".to_owned(),
+            "de".to_owned(),
+            vec!["key".to_owned()],
+            promise,
+        );
+        assert!(slot.lock().unwrap().is_none(), "the offline park");
+        assert!(inert_pending.is_empty());
+        assert!(
+            td.langpack_pending.iter().all(|slot| slot.is_none()),
+            "no stale slot survives"
+        );
+
+        assert!(td.langpack_net_completed.lock().is_empty(), "drained");
+        assert!(td.langpack_pending.iter().all(|slot| slot.is_none()));
     }
 
     // ---- the promo net slice: the promo-data queries ride the
