@@ -19494,6 +19494,57 @@ impl Td {
     fn on_game_net_answer(&mut self, kind: crate::game_manager::GameNetKind, query: NetQuery) {
         use crate::game_manager::GameNetKind as K;
         match kind {
+            // `SetGameScoreQuery::on_result`/`on_error`
+            // (GameManager.cpp:52-67) — the Ok updates ride the engine
+            // with the `query_promise` lambda tail (cpp:131-137, the
+            // `UmMessage::OnGetUpdatesSetGameScore` hop); the errors run
+            // the dialog-error head then the lambda's error arm
+            // (cpp:63-67 + 133-135).
+            K::SetGameScore { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => Ok(updates),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse Updates: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_setGameScore answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!("Receive error for SetGameScoreQuery: {status}");
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "SetGameScoreQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.game_manager);
+                let parked = manager.pop_set_game_score_query();
+                match (result, parked) {
+                    (Ok(updates), Some(query)) => {
+                        self.um_send(UmMessage::OnGetUpdatesSetGameScore {
+                            updates: Box::new(updates),
+                            message_full_id: query.message_full_id,
+                            promise: query.promise,
+                        });
+                    }
+                    (Err(status), Some(mut query)) => query.promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.setGameScore answer"
+                        )
+                    }
+                }
+                self.game_manager = manager;
+            }
             // `GetGameHighScoresQuery::on_result`/`on_error`
             // (GameManager.cpp:90-102) — the answer converts through the
             // manager intake (the users intake + the wrong-row filter,
@@ -30962,6 +31013,18 @@ pub(crate) enum UmMessage {
         forum_topic_info: crate::forum_topic::ForumTopicInfo,
         promise: Promise<Option<td_api::ForumTopicInfo>>,
     },
+    /// `on_get_updates` + the set-game-score tail — the C++
+    /// `PromiseCreator::lambda` chain of `GameManager::set_game_score`
+    /// (GameManager.cpp:131-137): the Updates run through the engine
+    /// (`SetGameScoreQuery::on_result`, cpp:52-61), then the lambda's
+    /// `send_closure` hop runs `on_set_game_score` which completes the
+    /// request promise with the message object (the engine's failure
+    /// wrapper always lands ok, UpdatesManager.cpp:1184-1190).
+    OnGetUpdatesSetGameScore {
+        updates: Box<telegram_api::Updates>,
+        message_full_id: crate::messages_manager::MessageFullId,
+        promise: Promise<td_api::Message>,
+    },
     /// `on_get_updates` + the paid-reaction chain tail — the C++
     /// `PromiseCreator::lambda` chain of
     /// `MessagesManager::commit_paid_message_reactions`
@@ -31158,6 +31221,23 @@ impl UmMessage {
                         });
                     }
                 }
+            }
+            UmMessage::OnGetUpdatesSetGameScore {
+                updates,
+                message_full_id,
+                promise,
+            } => {
+                // the empty promise stands in for the C++ `query_promise`
+                // the engine completes — the wrapper converts every band
+                // to ok before the lambda reads it (UpdatesManager.cpp:
+                // 1184-1190), so the tail below is the only continuation
+                td.with_updates_env(|um, env| um.on_get_updates(env, *updates, Promise::default()));
+                let mut manager = std::mem::take(&mut td.game_manager);
+                {
+                    let mut env = crate::td::BotEnv { td };
+                    manager.on_set_game_score(&mut env, message_full_id, promise);
+                }
+                td.game_manager = manager;
             }
             UmMessage::OnGetUpdatesForumTopicCreated {
                 updates,
@@ -43244,15 +43324,6 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
         ))
     }
 
-    fn on_get_dialog_error(
-        &mut self,
-        dialog_id: crate::dialog_id::DialogId,
-        status: &Status,
-        source: &str,
-    ) {
-        crate::dialog_manager::on_get_dialog_error(&self.td.global, dialog_id, status, source);
-    }
-
     /// `DialogManager::get_input_peer` (DialogManager.cpp:1377-1395) — the
     /// net-drain 57 query send legs resolve the peer here.
     fn get_input_peer(
@@ -43287,15 +43358,6 @@ impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
         let _ = (message_full_id, source);
         tdutils::log_info!("MessagesManager::get_message_object — [blocked: M.10 Messages]");
         None
-    }
-
-    fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
-        // The public entry's self-bounce (UpdatesManager.cpp:1176-1178) —
-        // the manager's own slice, like every `on_get_updates` caller.
-        self.td.um_send_later(UmMessage::OnGetUpdates {
-            updates: Box::new(updates),
-            promise,
-        });
     }
 }
 
@@ -79574,12 +79636,10 @@ kQIDAQAB\n\
             other => panic!("expected the forwarded error, got {other:?}"),
         }
 
-        // 5. the unresolvable-peer band — the C++ `CHECK(input_peer !=
+        // 6. the unresolvable-peer band — the C++ `CHECK(input_peer !=
         //    nullptr)` (cpp:83) is the port's `complete_error` file-through
         //    (the message-query CHECK convention): the answer half runs the
-        //    full on_error tail. A bot td resolves any user id through
-        //    the access-hash-0 fallback, so the unresolvable dialog is an
-        //    unregistered basic group
+        //    full on_error tail
         let unknown_game = crate::dialog_id::MessageFullId::new(
             crate::dialog_id::DialogId::from_chat_id(crate::chat_manager::ChatId::new(99)),
             crate::messages_manager::MessageId::new(1 << 20),
@@ -79611,11 +79671,173 @@ kQIDAQAB\n\
             other => panic!("expected the access band, got {other:?}"),
         }
 
-        // 6. the net-inert posture — no dispatcher, the promise parks like
-        //    the C++ handler holds it
+        // 7. the live setGameScore arm — the same M.10 not-found band
+        //    (Requests.cpp:4908-4913)
+        td.request(
+            2,
+            Function::setGameScore(td_api::setGameScore {
+                chat_id: 700000001,
+                message_id: 1 << 20,
+                edit_message: false,
+                user_id: 9,
+                score: 10,
+                force: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!((error.code, error.message.as_str()), (400, "Message not found"));
+
+        // 8. setGameScore rides the wire: the resolved edit peer, the
+        //    edit_message/force flag bits, the server message id, the
+        //    input user and the score (GameManager.cpp:36-50)
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    true,
+                    input_user.clone(),
+                    10,
+                    true,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setGameScore::ID,
+        );
+        let body =
+            telegram_api::messages_setGameScore::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+        assert!((body.edit_message, body.force, body.id, body.score) == (true, true, 1, 10));
+        assert!(matches!(
+            body.user_id.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+
+        // 9. the Updates answer walks the engine, then the
+        //    `query_promise` lambda tail settles the message (cpp:52-61
+        //    + 131-137) — the [blocked: M.10] object seam answers the
+        //    port's 500 band
+        let mut empty_updates = Vec::new();
+        telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1700000000,
+            seq_start: 0,
+            seq: 0,
+        })
+        .store(&mut empty_updates);
+        net_complete(sent, empty_updates);
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (500, "Receive invalid message"));
+            }
+            other => panic!("expected the M.10 object band, got {other:?}"),
+        }
+
+        // 10. the wire-error band runs the on_error tail (the dialog
+        //     head then the lambda's error arm, cpp:63-67 + 133-135)
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    false,
+                    input_user.clone(),
+                    5,
+                    false,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setGameScore::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (420, "FLOOD_WAIT_7"));
+            }
+            other => panic!("expected the forwarded error, got {other:?}"),
+        }
+
+        // 11. the unresolvable-peer band — the C++ `send`'s inline
+        //     `on_error(400, "Can't access the chat")` (cpp:40-43) files
+        //     through the completed queue, so the answer half runs the
+        //     full on_error tail
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    unknown_game.get_dialog_id(),
+                    unknown_game.get_message_id(),
+                    false,
+                    input_user.clone(),
+                    5,
+                    false,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the unresolvable peer never reaches the wire"
+        );
+        td.dispatch_completed_game_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!((error.code(), error.message()), (400, "Can't access the chat"));
+            }
+            other => panic!("expected the access band, got {other:?}"),
+        }
+
+        // 12. the net-inert posture — no dispatcher, both families' promises
+        //     park like the C++ handlers hold them
         td.net_query_dispatcher = None;
         td.game_manager.net = None;
-        let (promise, slot) = record_slot::<td_api::GameHighScores>();
+        let (promise, slot) = record_slot::<td_api::Message>();
+        {
+            let mut manager = std::mem::take(&mut td.game_manager);
+            {
+                let mut env = crate::td::BotEnv { td: &mut td };
+                manager.send_set_game_score_query(
+                    &mut env,
+                    game.get_dialog_id(),
+                    game.get_message_id(),
+                    false,
+                    input_user.clone(),
+                    5,
+                    false,
+                    promise,
+                );
+            }
+            td.game_manager = manager;
+        }
+        let (scores_promise, scores_slot) = record_slot::<td_api::GameHighScores>();
         {
             let mut manager = std::mem::take(&mut td.game_manager);
             {
@@ -79625,16 +79847,21 @@ kQIDAQAB\n\
                     game.get_dialog_id(),
                     game.get_message_id(),
                     input_user.clone(),
-                    promise,
+                    scores_promise,
                 );
             }
             td.game_manager = manager;
         }
         assert!(rec.sent.lock().is_empty(), "nothing dispatched");
-        assert!(slot.lock().unwrap().is_none(), "nothing settled");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(scores_slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.game_manager.pop_set_game_score_query().is_some(),
+            "the set promise parks like the C++ handler holds it"
+        );
         assert!(
             td.game_manager.pop_get_game_high_scores_promise().is_some(),
-            "the promise parks like the C++ handler holds it"
+            "the get promise parks like the C++ handler holds it"
         );
 
         // the drains ran clean — nothing parked, no strays
