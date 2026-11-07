@@ -5,7 +5,7 @@
 //!
 //! Seams:
 //! - `GetBotRecommendationsQuery` (BotRecommendationManager.cpp:30-64)
-//!   collapses onto the [`BotRecommendationNetKind`] dispatcher tag (the
+//!   collapses onto the `BotRecommendationNetKind` dispatcher tag (the
 //!   net-drain 53 plane): the send leg rides the manager-held net handle
 //!   (the input user resolves at the send, cpp:42-47) and the answers
 //!   drain through `Td::on_bot_recommendation_net_answer` into
