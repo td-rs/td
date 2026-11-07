@@ -14,7 +14,10 @@
 //! - the sqlite-pmc/database loads (`load_custom_emoji_sticker_from_database`,
 //!   the found-stickers/emoji-group database keys) — `[blocked: net]` class
 //! - the special-sticker-set loads (animated emoji, the emoji-status and
-//!   topic-icon sets, the premium gift set) — `[blocked: net]`
+//!   topic-icon sets, the premium gift set) ride the
+//!   `ReloadSpecialStickerSetQuery` plane since net-drain 59 (the six
+//!   special-set readers' misses park on the per-type lots; the dice /
+//!   click / ton-gift twins stay with their planes)
 //! - the file/upload half of `create_new_sticker_set`/`upload_sticker_file`
 //!   — `[blocked: Files]` (the M.12 upload orchestration)
 //! - the recorded null-response divergences (`get_sticker_outline_object`
@@ -299,6 +302,24 @@ struct StickerSet {
     thumbnail: crate::photo::PhotoSize,
     /// `thumbnail_document_id_`.
     thumbnail_document_id: i64,
+}
+
+/// `StickersManager::SpecialStickerSet` (StickersManager.h:596-603) — the
+/// per-type load state the special-set plane keeps beside the shared
+/// `sticker_sets_` records (the type is the map key, matching the C++
+/// `special_sticker_sets_[type]`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SpecialStickerSet {
+    /// `id_`.
+    id: StickerSetId,
+    /// `access_hash_`.
+    access_hash: i64,
+    /// `short_name_`.
+    short_name: String,
+    /// `is_being_loaded_`.
+    is_being_loaded: bool,
+    /// `is_being_reloaded_`.
+    is_being_reloaded: bool,
 }
 
 /// `StickersManager::CheckStickerSetNameResult`
@@ -586,9 +607,6 @@ pub trait StickersManagerEnv {
 
     // -- the `[blocked: net]`/`[blocked: Files]` query tails; each one
     // -- owns the promise, which keeps the C++ request unanswered offline
-    /// `load_special_sticker_set` — the animated-emoji / emoji-status /
-    /// topic-icon / premium-gift set loads (the special-set plane).
-    fn load_special_sticker_set(&mut self, _set_type: SpecialStickerSetType) {}
     /// `CheckStickerSetShortNameQuery` (StickersManager.cpp:8125-8132);
     /// the SHORT_NAME_INVALID/OCCUPIED result mapping rides the net step.
     fn send_check_sticker_set_short_name_query(
@@ -1216,6 +1234,15 @@ pub(crate) enum StickersNetKind {
     /// captures both, cpp:6570-6579), the answer re-entering
     /// [`StickersManager::on_get_custom_emoji_documents`].
     GetCustomEmojiDocuments,
+    /// `ReloadSpecialStickerSetQuery` (cpp:794-832) —
+    /// `messages.getStickerSet` over the special set's wire input; the
+    /// kind carries the query's `sticker_set_id_` member (cpp:797, the
+    /// `stickerSetNotModified` branch's key) and its `type_` (cpp:798,
+    /// the `on_get_special_sticker_set` re-entry key).
+    ReloadSpecialStickerSet {
+        set_type: SpecialStickerSetType,
+        sticker_set_id: StickerSetId,
+    },
 }
 
 /// `StickersManager` — the collapsed state the request plane reads and
@@ -1240,6 +1267,28 @@ pub struct StickersManager {
     /// promise lambda's captures (cpp:6570-6579); FIFO per the C++
     /// one-query-per-request shape.
     pending_get_custom_emoji_documents: Vec<(Vec<CustomEmojiId>, Promise<td_api::Stickers>)>,
+    /// `special_sticker_sets_[type]` (StickersManager.h:596-603 — the
+    /// C++ unique_ptr map collapses to the plain map keyed by the type).
+    special_sticker_sets: std::collections::HashMap<SpecialStickerSetType, SpecialStickerSet>,
+    /// `pending_get_animated_emoji_queries_` (the re-entry pair's second
+    /// half rides the stored `emoji`, cpp:6171-6179).
+    pending_get_animated_emoji_queries: Vec<(String, Promise<td_api::AnimatedEmoji>)>,
+    /// `pending_get_generic_animations_queries_` (cpp:6235-6243).
+    pending_get_generic_animations_queries: Vec<Promise<td_api::Stickers>>,
+    /// `pending_get_default_topic_icons_queries_` (cpp:6361-6369).
+    pending_get_default_topic_icons_queries: Vec<Promise<td_api::Stickers>>,
+    /// `pending_get_default_statuses_queries_` (cpp:6272-6280).
+    pending_get_default_statuses_queries: Vec<Promise<td_api::EmojiStatusCustomEmojis>>,
+    /// `pending_get_default_channel_statuses_queries_` (cpp:6331-6339).
+    pending_get_default_channel_statuses_queries: Vec<Promise<td_api::EmojiStatusCustomEmojis>>,
+    /// `pending_get_premium_gift_option_sticker_queries_` — the C++
+    /// promise lambda's captures (cpp:2653-2660); the C++ lot also
+    /// carries the `load_premium_gift_sticker_set(Promise<Unit>)`
+    /// fire-and-forget riders (cpp:2618-2624, the getStarTransactions
+    /// prefetch — the star-plane seam keeps its park, so the triples
+    /// are all reader promises).
+    pending_get_premium_gift_option_sticker_queries:
+        Vec<(i32, i64, Promise<Option<td_api::Sticker>>)>,
     /// `are_installed_sticker_sets_loaded_[type]`.
     are_installed_sticker_sets_loaded: [bool; MAX_STICKER_TYPE],
     /// `installed_sticker_set_ids_[type]`.
@@ -1404,16 +1453,18 @@ fn get_mask_position_object(
     })
 }
 
-/// `SpecialStickerSetType(InputStickerSet)` (StickersManager.h:298-342)
-/// — the wire special-set constructors the request plane reads;
-/// `inputStickerSetDice` answers `None` (its set id is per-emoji).
+/// `SpecialStickerSetType(InputStickerSet)` (SpecialStickerSetType.cpp:55-99)
+/// — the wire special-set constructors the manager's special-set store
+/// keys on. `inputStickerSetAnimatedEmojiAnimations` (the
+/// `animated_emoji_click` type), `inputStickerSetDice` (the per-emoji
+/// `animated_dice` type) and `inputStickerSetTonGifts` (the `ton_gifts`
+/// type) answer `None` — none of the six request-plane readers owns
+/// them, and `add_special_sticker_set`'s id for them stays the C++'s
+/// empty `StickerSetId` until their own slices land.
 fn special_sticker_set_type(
     input_sticker_set: &telegram_api::InputStickerSet,
 ) -> Option<SpecialStickerSetType> {
     match input_sticker_set {
-        telegram_api::InputStickerSet::inputStickerSetAnimatedEmojiAnimations(_) => {
-            Some(SpecialStickerSetType::GenericAnimations)
-        }
         telegram_api::InputStickerSet::inputStickerSetAnimatedEmoji(_) => {
             Some(SpecialStickerSetType::AnimatedEmoji)
         }
@@ -1431,6 +1482,73 @@ fn special_sticker_set_type(
         }
         _ => None,
     }
+}
+
+/// `SpecialStickerSetType::type_` — the string key the binlog-pmc row
+/// and the per-type map share (SpecialStickerSetType.cpp:17-53).
+fn special_sticker_set_type_key(set_type: SpecialStickerSetType) -> &'static str {
+    match set_type {
+        SpecialStickerSetType::AnimatedEmoji => "animated_emoji_sticker_set",
+        SpecialStickerSetType::GenericAnimations => "generic_animations_sticker_set",
+        SpecialStickerSetType::DefaultTopicIcons => "default_topic_icons_sticker_set",
+        SpecialStickerSetType::DefaultStatuses => "default_statuses_sticker_set",
+        SpecialStickerSetType::DefaultChannelStatuses => "default_channel_statuses_sticker_set",
+        SpecialStickerSetType::PremiumGifts => "premium_gifts_sticker_set",
+    }
+}
+
+/// `SpecialStickerSetType::get_input_sticker_set()`
+/// (SpecialStickerSetType.cpp:101-135) — the six request-plane special
+/// sets' wire inputs (the `ReloadSpecialStickerSetQuery` body,
+/// StickersManager.cpp:802).
+fn get_special_sticker_set_input(set_type: SpecialStickerSetType) -> telegram_api::InputStickerSet {
+    match set_type {
+        SpecialStickerSetType::AnimatedEmoji => {
+            telegram_api::InputStickerSet::inputStickerSetAnimatedEmoji(
+                telegram_api::inputStickerSetAnimatedEmoji {},
+            )
+        }
+        SpecialStickerSetType::GenericAnimations => {
+            telegram_api::InputStickerSet::inputStickerSetEmojiGenericAnimations(
+                telegram_api::inputStickerSetEmojiGenericAnimations {},
+            )
+        }
+        SpecialStickerSetType::DefaultTopicIcons => {
+            telegram_api::InputStickerSet::inputStickerSetEmojiDefaultTopicIcons(
+                telegram_api::inputStickerSetEmojiDefaultTopicIcons {},
+            )
+        }
+        SpecialStickerSetType::DefaultStatuses => {
+            telegram_api::InputStickerSet::inputStickerSetEmojiDefaultStatuses(
+                telegram_api::inputStickerSetEmojiDefaultStatuses {},
+            )
+        }
+        SpecialStickerSetType::DefaultChannelStatuses => {
+            telegram_api::InputStickerSet::inputStickerSetEmojiChannelDefaultStatuses(
+                telegram_api::inputStickerSetEmojiChannelDefaultStatuses {},
+            )
+        }
+        SpecialStickerSetType::PremiumGifts => {
+            telegram_api::InputStickerSet::inputStickerSetPremiumGifts(
+                telegram_api::inputStickerSetPremiumGifts {},
+            )
+        }
+    }
+}
+
+/// `StickersManager::get_emoji_number` (StickersManager.cpp:6826-6834) —
+/// the `'0'-'9' + U+20E3` keycap read the premium-gift option pick uses.
+fn get_emoji_number(emoji: &str) -> i32 {
+    let bytes = emoji.as_bytes();
+    if bytes.len() != 4
+        || !bytes[0].is_ascii_digit()
+        || bytes[1] != 0xE2
+        || bytes[2] != 0x83
+        || bytes[3] != 0xA3
+    {
+        return -1;
+    }
+    i32::from(bytes[0] - b'0')
 }
 
 /// `InputStickerSet` id read — the `inputStickerSetID` band of the
@@ -1460,14 +1578,21 @@ impl StickersManager {
         }
     }
 
-    /// `get_stickers_object` over the collapsed cache — offline the id
-    /// vector resolves to no sticker objects, so the answer is the empty
-    /// `stickers` (the C++ builds per-id objects; the unknown-id band
-    /// drops them).
-    fn get_stickers_object(sticker_ids: &[MessageId]) -> td_api::Stickers {
-        let _ = sticker_ids;
+    /// `StickersManager::get_stickers_object` (StickersManager.cpp:2231-2234)
+    /// — the per-id [`Self::get_sticker_object`] vector; the C++ keeps
+    /// `nullptr` entries for invalid ids, which the td_api writer
+    /// answers as JSON null — the collapsed port drops them (the
+    /// unknown-id band, the M.15 record-less convention).
+    fn get_stickers_object(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_ids: &[crate::files::FileId],
+    ) -> td_api::Stickers {
         td_api::Stickers {
-            stickers: Vec::new(),
+            stickers: sticker_ids
+                .iter()
+                .filter_map(|&sticker_id| self.get_sticker_object(env, sticker_id))
+                .collect(),
         }
     }
 
@@ -1600,6 +1725,535 @@ impl StickersManager {
             thumbnail: thumbnail_object,
             sticker: env.file_get_file_object(file_id),
         })
+    }
+
+    /// `StickersManager::add_special_sticker_set(const
+    /// SpecialStickerSetType&)` (cpp:1799-1815) — the per-type entry.
+    fn special_sticker_set_mut(
+        &mut self,
+        set_type: SpecialStickerSetType,
+    ) -> &mut SpecialStickerSet {
+        self.special_sticker_sets.entry(set_type).or_default()
+    }
+
+    /// `StickersManager::load_special_sticker_set(SpecialStickerSet&)`
+    /// (cpp:1869-1892) — the id/hash ladder: a loaded record reloads by
+    /// its hash, and an unknown id reloads from the wire input. The
+    /// valid-but-never-was-loaded middle band rides the
+    /// `load_sticker_sets({id})` fan (the `GetStickerSetQuery` over
+    /// `inputStickerSetID`) — unreachable in the collapsed port (the id
+    /// only becomes valid through `on_get_special_sticker_set`, which
+    /// always lands a was-loaded record; the C++ reaches it over the
+    /// binlog-pmc startup read), so the fan parks here until that slice.
+    fn load_special_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set_type: SpecialStickerSetType,
+    ) {
+        if env.auth_is_bot() && set_type != SpecialStickerSetType::DefaultTopicIcons {
+            // the C++ CHECK band (cpp:1870) — the collapsed port keeps the
+            // no-op (the readers gate the bot band before the load)
+            return;
+        }
+        let id = {
+            let data = self.special_sticker_set_mut(set_type);
+            if data.is_being_loaded {
+                return;
+            }
+            data.is_being_loaded = true;
+            data.id
+        };
+        if id.is_valid() {
+            match self.sticker_sets.get(&id) {
+                Some(record) if record.was_loaded => {
+                    let hash = if record.is_loaded { record.hash } else { 0 };
+                    self.reload_special_sticker_set(set_type, hash as i32);
+                    return;
+                }
+                _ => {
+                    // the `load_sticker_sets({id}, promise)` fan
+                    // (cpp:1886-1892) — the GetStickerSetQuery slice
+                    tdutils::log_info!("load_sticker_sets({}) — [blocked: net]", id.get());
+                    return;
+                }
+            }
+        }
+        self.reload_special_sticker_set(set_type, 0);
+    }
+
+    /// `StickersManager::reload_special_sticker_set` (cpp:1926-1932) — the
+    /// `ReloadSpecialStickerSetQuery` send (cpp:801-805).
+    fn reload_special_sticker_set(&mut self, set_type: SpecialStickerSetType, hash: i32) {
+        let data = self.special_sticker_set_mut(set_type);
+        if data.is_being_reloaded {
+            return;
+        }
+        data.is_being_reloaded = true;
+        let sticker_set_id = data.id;
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                StickersNetKind::ReloadSpecialStickerSet {
+                    set_type,
+                    sticker_set_id,
+                },
+                telegram_api::Function::messages_getStickerSet(
+                    telegram_api::messages_getStickerSet {
+                        stickerset: Some(get_special_sticker_set_input(set_type)),
+                        hash,
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.getStickerSet — [net-inert]");
+            }
+        }
+    }
+
+    /// `StickersManager::on_load_special_sticker_set`
+    /// (cpp:1934-2010) — the load half's settle: the reloaded flag clears,
+    /// the loaded flag clears only on success, and the per-type pending
+    /// lots settle on success only. The error band (cpp:1988-2005) is the
+    /// C++ divergence point kept exact: only the premium-gift lot
+    /// settles — `set_promises` sets them OK, so the parked
+    /// `return_premium_gift_sticker` lambdas re-enter over the still
+    /// unloaded set and answer the null sticker (the ton-gift twin parks
+    /// with its plane) — every other lot stays parked for the 300-600s
+    /// `SleepActor` retry, which parks at the timer plane.
+    pub(crate) fn on_load_special_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set_type: SpecialStickerSetType,
+        result: Result<()>,
+    ) {
+        if env.close_flag() {
+            return;
+        }
+        {
+            let data = self.special_sticker_set_mut(set_type);
+            data.is_being_reloaded = false;
+            if !data.is_being_loaded {
+                return;
+            }
+        }
+        match result {
+            Result::Err(error) => {
+                tdutils::log_info!(
+                    "Failed to load special sticker set {:?}: {}",
+                    set_type,
+                    error.message()
+                );
+                if set_type == SpecialStickerSetType::PremiumGifts {
+                    let pending =
+                        std::mem::take(&mut self.pending_get_premium_gift_option_sticker_queries);
+                    for (month_count, star_count, promise) in pending {
+                        self.return_premium_gift_sticker(env, month_count, star_count, promise);
+                    }
+                }
+                // cpp:1998-2005 — the 300-600s retry SleepActor parks at
+                // the timer plane; the other lots stay parked until it
+                // refires
+            }
+            Result::Ok(()) => {
+                self.special_sticker_set_mut(set_type).is_being_loaded = false;
+                self.settle_special_sticker_set_queries(env, set_type);
+            }
+        }
+    }
+
+    /// the success band of the per-type pending lots — the C++
+    /// re-entry closures (cpp:1968-1995: `set_promises` runs the lambdas,
+    /// which re-enter the reader with `is_recursive = true`); the
+    /// `try_update_animated_emoji_messages`/
+    /// `try_update_premium_gift_messages` tails (cpp:1977-1978/:1983-1984)
+    /// park at the messages plane.
+    fn settle_special_sticker_set_queries(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set_type: SpecialStickerSetType,
+    ) {
+        match set_type {
+            SpecialStickerSetType::AnimatedEmoji => {
+                let pending = std::mem::take(&mut self.pending_get_animated_emoji_queries);
+                for (emoji, promise) in pending {
+                    self.get_animated_emoji(env, emoji, true, promise);
+                }
+            }
+            SpecialStickerSetType::PremiumGifts => {
+                let pending =
+                    std::mem::take(&mut self.pending_get_premium_gift_option_sticker_queries);
+                for (month_count, star_count, promise) in pending {
+                    self.return_premium_gift_sticker(env, month_count, star_count, promise);
+                }
+            }
+            SpecialStickerSetType::GenericAnimations => {
+                for promise in std::mem::take(&mut self.pending_get_generic_animations_queries) {
+                    self.get_custom_emoji_reaction_generic_animations(env, true, promise);
+                }
+            }
+            SpecialStickerSetType::DefaultStatuses => {
+                for promise in std::mem::take(&mut self.pending_get_default_statuses_queries) {
+                    self.get_special_emoji_statuses(
+                        env,
+                        SpecialStickerSetType::DefaultStatuses,
+                        true,
+                        promise,
+                    );
+                }
+            }
+            SpecialStickerSetType::DefaultChannelStatuses => {
+                for promise in
+                    std::mem::take(&mut self.pending_get_default_channel_statuses_queries)
+                {
+                    self.get_special_emoji_statuses(
+                        env,
+                        SpecialStickerSetType::DefaultChannelStatuses,
+                        true,
+                        promise,
+                    );
+                }
+            }
+            SpecialStickerSetType::DefaultTopicIcons => {
+                for promise in std::mem::take(&mut self.pending_get_default_topic_icons_queries) {
+                    self.get_default_topic_icons(env, true, promise);
+                }
+            }
+        }
+    }
+
+    /// `StickersManager::on_get_special_sticker_set` (cpp:4025-4054) — the
+    /// `ReloadSpecialStickerSetQuery` ok half's tail: the record lands on
+    /// the per-type entry, the binlog pmc row parks at the database plane.
+    pub(crate) fn on_get_special_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set_type: SpecialStickerSetType,
+        sticker_set_id: StickerSetId,
+    ) {
+        let Some((record_access_hash, record_short_name)) = self
+            .sticker_sets
+            .get(&sticker_set_id)
+            .map(|record| (record.access_hash, record.short_name.clone()))
+        else {
+            // the C++ CHECK(s != nullptr && is_inited_ && is_loaded_)
+            // (cpp:4029-4031) — the record always exists at the callers
+            return;
+        };
+        let new_short_name = clean_username(&record_short_name);
+        {
+            let data = self.special_sticker_set_mut(set_type);
+            if sticker_set_id == data.id
+                && record_access_hash == data.access_hash
+                && new_short_name == data.short_name
+                && !new_short_name.is_empty()
+            {
+                self.on_load_special_sticker_set(env, set_type, Result::Ok(()));
+                return;
+            }
+            data.id = sticker_set_id;
+            data.access_hash = record_access_hash;
+            data.short_name = new_short_name.clone();
+        }
+        if !env.auth_is_bot() {
+            // the binlog-pmc row (cpp:4043-4048) — `type → "id hash
+            // short_name"`; the startup read
+            // (`load_special_sticker_set_info_from_binlog`, cpp:1826-1866)
+            // rides the start-up plane
+            env.binlog_pmc_set_raw(
+                special_sticker_set_type_key(set_type).as_bytes(),
+                format!(
+                    "{} {} {}",
+                    sticker_set_id.get(),
+                    record_access_hash,
+                    new_short_name
+                )
+                .as_bytes(),
+            );
+        }
+        self.special_sticker_set_mut(set_type).is_being_loaded = true;
+        self.on_load_special_sticker_set(env, set_type, Result::Ok(()));
+    }
+
+    /// `StickersManager::on_get_messages_sticker_set` (cpp:3797-3950) —
+    /// the `messages_StickerSet` intake: the set record build
+    /// (`on_get_sticker_set`), the `stickerSetNotModified` band, the
+    /// document walk and the packs walk into `sticker_emojis_map_`. The
+    /// update fan-outs (`update_sticker_set`/`send_update_installed_
+    /// sticker_sets`, the animated-emoji/premium-gift message refresh),
+    /// the `load_requests_` promise fan, the keyword maps walk, the
+    /// `emoji_stickers_map_`/`premium_sticker_positions_` tables and the
+    /// `expires_at` freshness watermark park at their planes (messages,
+    /// load-fan, search, premium-stickers and the bot freshness reload
+    /// respectively); the expected-id mismatch's
+    /// `on_load_sticker_set_fail` tail is the load-fan park.
+    pub(crate) fn on_get_messages_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_set_id: StickerSetId,
+        set_ptr: telegram_api::messages_StickerSet,
+        is_changed: bool,
+    ) -> StickerSetId {
+        if let telegram_api::messages_StickerSet::messages_stickerSet(_) = set_ptr {
+            return self.on_get_messages_sticker_set_full(env, sticker_set_id, set_ptr, is_changed);
+        }
+        if !sticker_set_id.is_valid() {
+            tdutils::log_error!("Receive unexpected stickerSetNotModified");
+            return sticker_set_id;
+        }
+        let Some(record) = self.sticker_sets.get_mut(&sticker_set_id) else {
+            return sticker_set_id;
+        };
+        record.is_loaded = true;
+        sticker_set_id
+    }
+
+    /// the `messages_stickerSet` arm of
+    /// [`Self::on_get_messages_sticker_set`] (cpp:3816-3948).
+    fn on_get_messages_sticker_set_full(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        sticker_set_id: StickerSetId,
+        set_ptr: telegram_api::messages_StickerSet,
+        is_changed: bool,
+    ) -> StickerSetId {
+        let telegram_api::messages_StickerSet::messages_stickerSet(set) = set_ptr else {
+            return StickerSetId::default();
+        };
+        let Some(wire_set) = set.set else {
+            return StickerSetId::default();
+        };
+        let set_id = self.on_get_sticker_set(env, wire_set, is_changed);
+        if !set_id.is_valid() {
+            return StickerSetId::default();
+        }
+        if sticker_set_id.is_valid() && sticker_set_id != set_id {
+            tdutils::log_error!(
+                "Expected {}, but receive {}",
+                sticker_set_id.get(),
+                set_id.get()
+            );
+            return StickerSetId::default();
+        }
+        if self
+            .sticker_sets
+            .get(&set_id)
+            .is_some_and(|record| record.is_loaded)
+        {
+            // the already-loaded band (cpp:3835-3839): the record is up to
+            // date, only the update fan-outs would run
+            return set_id;
+        }
+        {
+            let record = self.sticker_sets.entry(set_id).or_default();
+            record.was_loaded = true;
+            record.is_loaded = true;
+            record.sticker_ids.clear();
+            record.sticker_emojis_map.clear();
+        }
+
+        let is_bot = env.auth_is_bot();
+        let mut document_id_to_sticker_id =
+            std::collections::HashMap::<i64, crate::files::FileId>::new();
+        for document in set.documents {
+            let (document_id, sticker_file_id) =
+                self.on_get_sticker_document(env, document, StickerFormat::Unknown);
+            if !sticker_file_id.is_valid() || document_id == 0 {
+                continue;
+            }
+            self.sticker_sets
+                .entry(set_id)
+                .or_default()
+                .sticker_ids
+                .push(sticker_file_id);
+            if !is_bot {
+                document_id_to_sticker_id.insert(document_id, sticker_file_id);
+            }
+        }
+        let mut sticker_emojis_map: std::collections::HashMap<crate::files::FileId, Vec<String>> =
+            std::collections::HashMap::new();
+        if !is_bot {
+            for pack in &set.packs {
+                let cleaned_emoji = tdutils::emoji::remove_emoji_modifiers(&pack.emoticon, false);
+                if cleaned_emoji.is_empty() {
+                    tdutils::log_error!("Receive empty emoji in {}", set_id.get());
+                    continue;
+                }
+                for &document_id in &pack.documents {
+                    let Some(&sticker_file_id) = document_id_to_sticker_id.get(&document_id) else {
+                        tdutils::log_error!(
+                            "Can't find document with ID {document_id} in {}",
+                            set_id.get()
+                        );
+                        continue;
+                    };
+                    sticker_emojis_map
+                        .entry(sticker_file_id)
+                        .or_default()
+                        .push(pack.emoticon.clone());
+                }
+            }
+        }
+        let record = self.sticker_sets.entry(set_id).or_default();
+        record.sticker_emojis_map = sticker_emojis_map;
+        if i32::try_from(record.sticker_ids.len()).unwrap_or(i32::MAX) != record.sticker_count {
+            record.sticker_count = i32::try_from(record.sticker_ids.len()).unwrap_or(i32::MAX);
+        }
+        set_id
+    }
+
+    /// `StickersManager::on_get_sticker_set` (cpp:3574-3795) — the
+    /// `stickerSet` record build. Only the init half's fields and the
+    /// `stickerSet` record build. Only the init half's fields and the
+    /// guarded else-branch updates the answer builders read land (the
+    /// installed-sets hints, the set-thumbnail registration and the
+    /// database save park at their planes). The count/hash change band
+    /// (cpp:3671-3683) resets `is_loaded` so a hash-changed reload
+    /// re-runs the document walk.
+    fn on_get_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        set: telegram_api::StickerSet,
+        _is_changed: bool,
+    ) -> StickerSetId {
+        let set_id = StickerSetId::new(set.id);
+        let sticker_type = if set.emojis {
+            StickerType::CustomEmoji
+        } else if set.masks {
+            StickerType::Mask
+        } else {
+            StickerType::Regular
+        };
+        self.add_sticker_set(set_id, set.access_hash);
+        let record = self.sticker_sets.entry(set_id).or_default();
+        if !record.is_inited {
+            record.is_inited = true;
+            record.title = set.title;
+            record.short_name = set.short_name;
+            record.sticker_count = set.count;
+            record.hash = i64::from(set.hash);
+            record.is_official = set.official;
+            record.sticker_type = sticker_type;
+            record.has_text_color = set.emojis && set.text_color;
+            record.channel_emoji_status = set.emojis && set.channel_emoji_status;
+            record.is_created = set.creator;
+        } else {
+            if record.access_hash != set.access_hash {
+                record.access_hash = set.access_hash;
+            }
+            if record.title != set.title {
+                record.title = set.title;
+            }
+            if record.short_name != set.short_name {
+                record.short_name = set.short_name;
+            }
+            if record.sticker_count != set.count || record.hash != i64::from(set.hash) {
+                // cpp:3671-3683 — the count/hash change marks the record
+                // stale so the caller re-runs the document walk
+                record.is_loaded = false;
+                record.sticker_count = set.count;
+                record.hash = i64::from(set.hash);
+            }
+            if record.is_official != set.official {
+                record.is_official = set.official;
+            }
+            if record.sticker_type != sticker_type {
+                record.sticker_type = sticker_type;
+            }
+            record.has_text_color = set.emojis && set.text_color;
+            record.channel_emoji_status = set.emojis && set.channel_emoji_status;
+            if record.is_created != set.creator {
+                record.is_created = set.creator;
+            }
+        }
+        let _ = env;
+        set_id
+    }
+
+    /// `StickersManager::get_premium_gift_sticker_set` (cpp:2528-2546) —
+    /// the loaded-set read (a miss triggers the load and answers `None`).
+    fn get_premium_gift_sticker_set(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+    ) -> Option<StickerSetId> {
+        if env.auth_is_bot() {
+            return None;
+        }
+        let set_type = SpecialStickerSetType::PremiumGifts;
+        let id = self.special_sticker_set_mut(set_type).id;
+        if !id.is_valid() {
+            self.load_special_sticker_set(env, set_type);
+            return None;
+        }
+        let was_loaded = self.sticker_sets.get(&id)?.was_loaded;
+        if !was_loaded {
+            self.load_special_sticker_set(env, set_type);
+            return None;
+        }
+        Some(id)
+    }
+
+    /// `StickersManager::get_premium_gift_sticker_object` (cpp:2496-2507)
+    /// — the month/star ladder over the premium-gift set (the §6
+    /// gift-options sticker leg). The `premium_gift_messages_` cache
+    /// (cpp:2499-2504, the try_update_premium_gift_messages plane) parks
+    /// with the messages plane — the ladder runs the option-sticker id
+    /// read directly.
+    pub fn get_premium_gift_sticker_object(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        month_count: i32,
+        star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        let month_count = if month_count == 0 {
+            crate::star_manager::get_months_by_star_count(star_count)
+        } else {
+            month_count
+        };
+        let file_id = self.get_premium_gift_option_sticker_id(env, month_count)?;
+        self.get_sticker_object(env, file_id)
+    }
+
+    /// `StickersManager::get_premium_gift_option_sticker_id` (cpp:2570-2601)
+    /// — the month table walk over the set's `sticker_emojis_map_`.
+    fn get_premium_gift_option_sticker_id(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        month_count: i32,
+    ) -> Option<crate::files::FileId> {
+        let set_id = self.get_premium_gift_sticker_set(env)?;
+        let record = self.sticker_sets.get(&set_id)?;
+        if record.sticker_ids.is_empty() || month_count <= 0 {
+            return None;
+        }
+        let number = match month_count {
+            1 => 1,
+            3 => 2,
+            6 => 3,
+            12 => 4,
+            24 => 5,
+            _ => -1,
+        };
+        for &sticker_id in &record.sticker_ids {
+            if let Some(emojis) = record.sticker_emojis_map.get(&sticker_id) {
+                for emoji in emojis {
+                    if get_emoji_number(emoji) == number {
+                        return Some(sticker_id);
+                    }
+                }
+            }
+        }
+        // there is no match; return the first sticker
+        record.sticker_ids.first().copied()
+    }
+
+    /// `StickersManager::return_premium_gift_sticker` (cpp:2677-2680).
+    fn return_premium_gift_sticker(
+        &mut self,
+        env: &mut impl StickersManagerEnv,
+        month_count: i32,
+        star_count: i64,
+        mut promise: Promise<Option<td_api::Sticker>>,
+    ) {
+        promise.set_value(self.get_premium_gift_sticker_object(env, month_count, star_count));
     }
 
     /// Pop the head of the parked `GetCustomEmojiDocumentsQuery` lot —
@@ -2055,7 +2709,7 @@ impl StickersManager {
             return;
         }
         if limit == 0 {
-            promise.set_value(Self::get_stickers_object(&[]));
+            promise.set_value(self.get_stickers_object(env, &[]));
             return;
         }
         if limit < 0 {
@@ -2070,14 +2724,21 @@ impl StickersManager {
         let emoji = tdutils::emoji::remove_emoji_modifiers(&emoji, false);
         let key = search_cache_key(&emoji, &query, &input_language_codes, offset, limit);
         if emoji.is_empty() || sticker_type == StickerType::Mask {
-            promise.set_value(Self::get_stickers_object(&[]));
+            promise.set_value(self.get_stickers_object(env, &[]));
             return;
         }
 
         let type_index = sticker_type as usize;
         if let Some((sticker_ids, next_reload_time)) = self.found_stickers[type_index].get(&key) {
             let result_size = (limit as usize).min(sticker_ids.len());
-            promise.set_value(Self::get_stickers_object(&sticker_ids[..result_size]));
+            let _ = &sticker_ids[..result_size];
+            // the found-stickers ids are `MessageId`s over the collapsed
+            // search cache — the per-id object build rides the
+            // search/found-stickers plane (SearchStickersQuery), so the
+            // hit answers the record-less empty band
+            promise.set_value(td_api::Stickers {
+                stickers: Vec::new(),
+            });
             if env.now() < *next_reload_time {
                 return;
             }
@@ -2104,21 +2765,29 @@ impl StickersManager {
         is_recursive: bool,
         mut promise: Promise<td_api::AnimatedEmoji>,
     ) {
-        let _ = &emoji;
         if env.close_flag() {
             promise.set_error(tdutils::status::Status::error(500, "Request aborted"));
             return;
         }
-        if !is_recursive {
-            // the C++ queues the promise on the special-set load and
-            // parks; the is_recursive re-entry answers null over the
-            // never-loaded set — the recorded null-response divergence,
-            // equally a park here
-            env.load_special_sticker_set(SpecialStickerSetType::AnimatedEmoji);
+        let set_type = SpecialStickerSetType::AnimatedEmoji;
+        let id = self.special_sticker_set_mut(set_type).id;
+        let was_loaded = self.sticker_sets.get(&id).is_some_and(|s| s.was_loaded);
+        if !was_loaded {
+            if is_recursive {
+                // the C++ promise.set_value(nullptr) is inexpressible — the
+                // recorded null-response divergence stays parked
+                return;
+            }
+            // cpp:6171-6179 — the re-entry lambda parks on the per-type lot
+            self.pending_get_animated_emoji_queries
+                .push((emoji, promise));
+            self.load_special_sticker_set(env, set_type);
             return;
         }
-        // the C++ promise.set_value(nullptr) is inexpressible — park
-        let _ = promise;
+        // the animated-emoji object build rides the M.15 sticker seam over
+        // the per-emoji set walk (`get_animated_emoji_sticker`,
+        // cpp:6188-6189) — the recorded null-response divergence parks
+        let _ = &mut promise;
     }
 
     /// `get_custom_emoji_reaction_generic_animations`
@@ -2133,11 +2802,25 @@ impl StickersManager {
             promise.set_error(tdutils::status::Status::error(500, "Request aborted"));
             return;
         }
-        if is_recursive {
-            promise.set_value(Self::get_stickers_object(&[]));
+        let set_type = SpecialStickerSetType::GenericAnimations;
+        let id = self.special_sticker_set_mut(set_type).id;
+        let was_loaded = self.sticker_sets.get(&id).is_some_and(|s| s.was_loaded);
+        if !was_loaded {
+            if is_recursive {
+                promise.set_value(self.get_stickers_object(env, &[]));
+                return;
+            }
+            // cpp:6235-6243 — the re-entry lambda parks on the per-type lot
+            self.pending_get_generic_animations_queries.push(promise);
+            self.load_special_sticker_set(env, set_type);
             return;
         }
-        env.load_special_sticker_set(SpecialStickerSetType::GenericAnimations);
+        let sticker_ids = self
+            .sticker_sets
+            .get(&id)
+            .map(|record| record.sticker_ids.clone())
+            .unwrap_or_default();
+        promise.set_value(self.get_stickers_object(env, &sticker_ids));
     }
 
     /// `get_default_topic_icons` (StickersManager.cpp:6345-6390).
@@ -2151,15 +2834,34 @@ impl StickersManager {
             promise.set_error(tdutils::status::Status::error(500, "Request aborted"));
             return;
         }
-        if is_recursive {
-            promise.set_value(Self::get_stickers_object(&[]));
+        let set_type = SpecialStickerSetType::DefaultTopicIcons;
+        let id = self.special_sticker_set_mut(set_type).id;
+        let was_loaded = self.sticker_sets.get(&id).is_some_and(|s| s.was_loaded);
+        if !was_loaded {
+            if is_recursive {
+                promise.set_value(self.get_stickers_object(env, &[]));
+                return;
+            }
+            // cpp:6361-6369 — the re-entry lambda parks on the per-type lot
+            self.pending_get_default_topic_icons_queries.push(promise);
+            self.load_special_sticker_set(env, set_type);
             return;
         }
-        env.load_special_sticker_set(SpecialStickerSetType::DefaultTopicIcons);
+        let sticker_ids = self
+            .sticker_sets
+            .get(&id)
+            .map(|record| record.sticker_ids.clone())
+            .unwrap_or_default();
+        // the bot freshness reload (cpp:6377-6389 — `!is_recursive &&
+        // is_bot && unix_time >= expires_at_` → `do_reload_sticker_set`)
+        // parks with the `expires_at_` watermark: the collapsed record
+        // carries no expiry, so the loaded band always answers
+        promise.set_value(self.get_stickers_object(env, &sticker_ids));
     }
 
     /// `get_default_emoji_statuses` (StickersManager.cpp:6248-6305) —
-    /// the loaded band answers the first 8 custom emoji ids of the set.
+    /// the themed-statuses reader; the loaded band answers the first 8
+    /// custom emoji ids of the set.
     pub fn get_default_emoji_statuses(
         &mut self,
         env: &mut impl StickersManagerEnv,
@@ -2202,13 +2904,54 @@ impl StickersManager {
             promise.set_error(tdutils::status::Status::error(500, "Request aborted"));
             return;
         }
-        if is_recursive {
-            promise.set_value(td_api::EmojiStatusCustomEmojis {
-                custom_emoji_ids: Vec::new(),
-            });
+        let id = self.special_sticker_set_mut(set_type).id;
+        let was_loaded = self.sticker_sets.get(&id).is_some_and(|s| s.was_loaded);
+        if !was_loaded {
+            if is_recursive {
+                promise.set_value(td_api::EmojiStatusCustomEmojis {
+                    custom_emoji_ids: Vec::new(),
+                });
+                return;
+            }
+            // cpp:6272-6280 / :6331-6339 — the re-entry lambda parks on the
+            // per-type lot
+            match set_type {
+                SpecialStickerSetType::DefaultStatuses => {
+                    self.pending_get_default_statuses_queries.push(promise)
+                }
+                SpecialStickerSetType::DefaultChannelStatuses => self
+                    .pending_get_default_channel_statuses_queries
+                    .push(promise),
+                _ => return,
+            }
+            self.load_special_sticker_set(env, set_type);
             return;
         }
-        env.load_special_sticker_set(set_type);
+        // cpp:6294-6305 / :6353-6364 — the first 8 custom emoji ids of the
+        // set (`get_custom_emoji_id` per sticker)
+        let sticker_ids = self
+            .sticker_sets
+            .get(&id)
+            .map(|record| record.sticker_ids.clone())
+            .unwrap_or_default();
+        let mut custom_emoji_ids = Vec::new();
+        for sticker_id in sticker_ids {
+            let custom_emoji_id = CustomEmojiId::new(
+                self.stickers
+                    .get(&sticker_id)
+                    .map(|sticker| sticker.get_sticker_id(&env.file_get_view(sticker_id)))
+                    .unwrap_or(0),
+            );
+            if !custom_emoji_id.is_valid() {
+                tdutils::log_error!("Ignore wrong sticker {}", sticker_id.get());
+                continue;
+            }
+            custom_emoji_ids.push(custom_emoji_id.get());
+            if custom_emoji_ids.len() >= 8 {
+                break;
+            }
+        }
+        promise.set_value(td_api::EmojiStatusCustomEmojis { custom_emoji_ids });
     }
 
     /// `get_custom_emoji_stickers` (StickersManager.cpp:6532-6606).
@@ -2348,17 +3091,25 @@ impl StickersManager {
         env.load_emoji_groups(group_type, String::new(), promise);
     }
 
-    /// `load_premium_gift_sticker` (StickersManager.cpp:2648-2662) — the
-    /// premium-gift set never loads offline; the pending queue parks.
+    /// `load_premium_gift_sticker` (StickersManager.cpp:2648-2666) — the
+    /// §6 gift-options sticker leg: the loaded set answers immediately,
+    /// else the (month, star, promise) triple parks on the per-type lot
+    /// and the premium-gift special set loads.
     pub fn load_premium_gift_sticker(
         &mut self,
         env: &mut impl StickersManagerEnv,
         month_count: i32,
         star_count: i64,
-        mut promise: Promise<td_api::Sticker>,
+        promise: Promise<Option<td_api::Sticker>>,
     ) {
-        let _ = (month_count, star_count, &mut promise);
-        env.load_special_sticker_set(SpecialStickerSetType::PremiumGifts);
+        if self.get_premium_gift_sticker_set(env).is_some() {
+            return self.return_premium_gift_sticker(env, month_count, star_count, promise);
+        }
+        self.pending_get_premium_gift_option_sticker_queries.push((
+            month_count,
+            star_count,
+            promise,
+        ));
     }
 
     /// `get_premium_stickers` (StickersManager.cpp:4853-4883) — the
@@ -2374,7 +3125,7 @@ impl StickersManager {
             return;
         }
         if limit == 0 {
-            promise.set_value(Self::get_stickers_object(&[]));
+            promise.set_value(self.get_stickers_object(env, &[]));
             return;
         }
         let limit = limit.min(MAX_FOUND_STICKERS);
@@ -4723,11 +5474,6 @@ mod tests {
                 .borrow_mut()
                 .push("ReloadFoundStickers".to_owned());
         }
-        fn load_special_sticker_set(&mut self, set_type: SpecialStickerSetType) {
-            self.queries
-                .borrow_mut()
-                .push(format!("LoadSpecialStickerSet({set_type:?})"));
-        }
         fn load_custom_emoji_sticker_from_database(&mut self, _custom_emoji_id: CustomEmojiId) {
             self.queries
                 .borrow_mut()
@@ -5525,7 +6271,9 @@ mod tests {
         let mut manager = StickersManager::new();
         let mut env = TestEnv::default();
 
-        // the special-set readers park on their loads
+        // the special-set readers park their promises on the per-type lots
+        // and the net-inert load keeps them parked (cpp:6171-6179/:6235-6243/
+        // :6272-6280/:6331-6339/:6361-6369)
         let (promise, _) = record::<td_api::AnimatedEmoji>();
         manager.get_animated_emoji(&mut env, "\u{1f600}".to_owned(), false, promise);
         let (promise, _) = record::<td_api::Stickers>();
@@ -5536,23 +6284,75 @@ mod tests {
         manager.get_default_emoji_statuses(&mut env, false, promise);
         let (promise, _) = record::<td_api::EmojiStatusCustomEmojis>();
         manager.get_default_channel_emoji_statuses(&mut env, false, promise);
+        assert_eq!(manager.pending_get_animated_emoji_queries.len(), 1);
+        assert_eq!(manager.pending_get_generic_animations_queries.len(), 1);
+        assert_eq!(manager.pending_get_default_topic_icons_queries.len(), 1);
+        assert_eq!(manager.pending_get_default_statuses_queries.len(), 1);
         assert_eq!(
-            env.recorded("LoadSpecialStickerSet"),
-            5,
-            "the five special-set loads"
+            manager.pending_get_default_channel_statuses_queries.len(),
+            1
         );
+        // the second reader of an in-flight load parks without re-sending
+        let (promise, _) = record::<td_api::Stickers>();
+        manager.get_custom_emoji_reaction_generic_animations(&mut env, false, promise);
+        assert_eq!(manager.pending_get_generic_animations_queries.len(), 2);
 
         // the recursive re-entries answer the empty bands
         let (promise, cell) = record::<td_api::Stickers>();
         manager.get_custom_emoji_reaction_generic_animations(&mut env, true, promise);
         assert!(matches!(&*cell.lock().unwrap(), Some(Result::Ok(_))));
 
-        // the premium planes park
-        let (promise, _) = record::<td_api::Sticker>();
+        // the premium plane parks on the per-type lot (cpp:2660-2666)
+        let (promise, _) = record::<Option<td_api::Sticker>>();
         manager.load_premium_gift_sticker(&mut env, 3, 0, promise);
+        assert_eq!(
+            manager
+                .pending_get_premium_gift_option_sticker_queries
+                .len(),
+            1
+        );
         let (promise, _) = record::<td_api::Stickers>();
         manager.get_premium_stickers(&mut env, 10, promise);
         assert_eq!(env.recorded("LoadPremiumStickers"), 1);
+
+        // the load-settle bands (cpp:1934-2010): the error band settles
+        // only the premium-gift lot, over the OK arm — the re-entered
+        // `return_premium_gift_sticker` runs over the still-unloaded set
+        // and answers the null sticker — while every other lot stays
+        // parked for the 300-600s retry (the parked timer plane); the ok
+        // band clears the loaded flag and re-enters the readers, whose
+        // recursive not-loaded arms answer the empty bands
+        let (promise, cell) = record::<Option<td_api::Sticker>>();
+        manager.load_premium_gift_sticker(&mut env, 6, 0, promise);
+        assert_eq!(
+            manager
+                .pending_get_premium_gift_option_sticker_queries
+                .len(),
+            2
+        );
+        manager.on_load_special_sticker_set(
+            &mut env,
+            SpecialStickerSetType::PremiumGifts,
+            Result::Err(tdutils::status::Status::error(420, "STICKERSET_INVALID")),
+        );
+        assert!(
+            manager
+                .pending_get_premium_gift_option_sticker_queries
+                .is_empty(),
+            "the premium-gift lot settles on the failed load"
+        );
+        assert!(matches!(&*cell.lock().unwrap(), Some(Result::Ok(None))));
+        assert_eq!(
+            manager.pending_get_generic_animations_queries.len(),
+            2,
+            "the non-premium lots stay parked for the retry"
+        );
+        manager.on_load_special_sticker_set(
+            &mut env,
+            SpecialStickerSetType::GenericAnimations,
+            Result::Ok(()),
+        );
+        assert!(manager.pending_get_generic_animations_queries.is_empty());
 
         // the premium limit bands
         let (promise, cell) = record::<td_api::Stickers>();
