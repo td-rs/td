@@ -17910,6 +17910,40 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `SetBotGuestChatResultQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:184-196) — the
+            // InputBotInlineMessageID answer folds through
+            // get_inline_message_id into the inlineMessageId object.
+            K::SetBotGuestChatResult => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::InputBotInlineMessageID::parse(query.ok()) {
+                        Ok(id) => Ok(id),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse InputBotInlineMessageID: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_setBotGuestChatResult answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_set_bot_guest_chat_result_promise();
+                match (result, promise) {
+                    (Ok(id), Some(mut promise)) => promise.set_value(td_api::InlineMessageId {
+                        id: crate::inline_queries_manager::get_inline_message_id(Some(id)),
+                    }),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.setBotGuestChatResult answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46341,15 +46375,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_set_bot_guest_chat_result_query(
-        &mut self,
-        _query_id: i64,
-        _result: telegram_api::InputBotInlineResult,
-        _promise: Promise<td_api::InlineMessageId>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_save_prepared_inline_message_query(
@@ -89000,5 +89025,84 @@ kQIDAQAB\n\
             telegram_api::messages_setInlineBotResults::ID,
             "the count band sends nothing",
         );
+
+        // 10. the answerGuestQuery arm rides the wire
+        //    (Requests.cpp:8214-8220 → answer_guest_query →
+        //    SetBotGuestChatResultQuery::send, cpp:180-183): the query id
+        //    and the folded result
+        td.request(
+            10,
+            Function::answerGuestQuery(td_api::answerGuestQuery {
+                guest_query_id: 4242,
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "g1".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setBotGuestChatResult::ID,
+        );
+        let body = telegram_api::messages_setBotGuestChatResult::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.query_id, 4242);
+        assert!(matches!(
+            body.result,
+            Some(telegram_api::InputBotInlineResult::inputBotInlineResult(ref result))
+                if result.id == "g1"
+        ));
+
+        // 11. the InputBotInlineMessageID answer folds through
+        //     get_inline_message_id (cpp:184-192) — the object's id is the
+        //     base64url form and the public decode pair reads it back
+        let answer = telegram_api::InputBotInlineMessageID::inputBotInlineMessageID(
+            telegram_api::inputBotInlineMessageID {
+                dc_id: 2,
+                id: 77,
+                access_hash: 12345,
+            },
+        );
+        let mut answer_bytes = Vec::new();
+        answer.store(&mut answer_bytes);
+        net_complete(sent, answer_bytes);
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 10).first() {
+            Some(Object::inlineMessageId(inline_message_id)) => {
+                let decoded = crate::inline_message_manager::get_input_bot_inline_message_id(
+                    &inline_message_id.id,
+                )
+                .expect("the base64url form decodes");
+                assert!(matches!(
+                    decoded,
+                    telegram_api::InputBotInlineMessageID::inputBotInlineMessageID(id)
+                        if (id.dc_id, id.id, id.access_hash) == (2, 77, 12345)
+                ));
+            }
+            other => panic!("the inline message id, got {other:?}"),
+        }
     }
 }
