@@ -3362,6 +3362,11 @@ pub(crate) type GroupCallNetHandle = NetKindHandle<crate::group_call_manager::Gr
 /// answers drain through [`Td::on_call_net_answer`].
 pub(crate) type CallNetHandle = NetKindHandle<crate::call_manager::CallNetKind>;
 
+/// The cloned secret-chats dispatch surface the [`SecretChatsManager`]
+/// holds — the five wire families' answers drain through
+/// [`Td::on_secret_net_answer`].
+pub(crate) type SecretNetHandle = NetKindHandle<crate::secret_chats_manager::SecretNetKind>;
+
 /// The cloned message-import dispatch surface the
 /// [`MessageImportManagerEnv`] send legs use — the per-kind handle over
 /// the two head-query ResultHandler classes of
@@ -6131,6 +6136,10 @@ pub struct Td {
     /// The call net completed queue (the `CallNetKind` answers park
     /// here; the drain routes them through `Td::on_call_net_answer`).
     call_net_completed: Arc<Mutex<Vec<(crate::call_manager::CallNetKind, NetQuery)>>>,
+    /// The secret-chats net completed queue (the `SecretNetKind`
+    /// answers park here; the drain routes them through
+    /// [`Td::on_secret_net_answer`]).
+    secret_net_completed: Arc<Mutex<Vec<(crate::secret_chats_manager::SecretNetKind, NetQuery)>>>,
     /// The message-import net completed queue (the
     /// `MessageImportNetKind` answers park here; the drain routes them
     /// through `Td::on_message_import_net_answer`).
@@ -6892,6 +6901,7 @@ impl Td {
             pending_background_queries: PendingBackgroundQueries::default(),
             group_call_net_completed: Arc::new(Mutex::new(Vec::new())),
             call_net_completed: Arc::new(Mutex::new(Vec::new())),
+            secret_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_import_net_completed: Arc::new(Mutex::new(Vec::new())),
             poll_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -7438,6 +7448,7 @@ impl Td {
         self.notification_settings_manager.net = self.notification_settings_net();
         self.group_call_manager.net = self.group_call_net();
         self.call_manager.net = self.call_net();
+        self.secret_chats_manager.net = self.secret_net();
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
@@ -9242,6 +9253,7 @@ impl Td {
         self.dispatch_completed_background_net();
         self.dispatch_completed_group_call_net();
         self.dispatch_completed_call_net();
+        self.dispatch_completed_secret_net();
         self.dispatch_completed_message_import_net();
         self.dispatch_completed_poll_net();
         self.dispatch_completed_statistics_net();
@@ -9397,6 +9409,17 @@ impl Td {
         Some(CallNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.call_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned secret-chats dispatch surface the `SecretChatsManager`
+    /// holds — `None` keeps the net-inert posture (the pre-init windows
+    /// and the net-inert tests).
+    pub(crate) fn secret_net(&self) -> Option<SecretNetHandle> {
+        Some(SecretNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.secret_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -11131,6 +11154,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.call_net_completed.lock());
         for (kind, query) in completed {
             self.on_call_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked secret-chats answers — the C++
+    /// on_result_resendable halves of the five wire families
+    /// (SecretChatActor.cpp:105-135).
+    fn dispatch_completed_secret_net(&mut self) {
+        let completed = std::mem::take(&mut *self.secret_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_secret_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -26453,6 +26487,128 @@ impl Td {
                             }
                             None => promise.set_error(parse_error("phone.saveCallLog")),
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one secret-chats net answer by kind — the C++
+    /// ResultHandler/on_result_resendable halves of the five wire
+    /// families (SecretChatActor.cpp:105-135). The manager holds the
+    /// per-family parking lots; the intakes run over the env split
+    /// (the `SecretChatsTdEnv` field borrows stay disjoint from the
+    /// manager borrow).
+    fn on_secret_net_answer(
+        &mut self,
+        kind: crate::secret_chats_manager::SecretNetKind,
+        query: NetQuery,
+    ) {
+        use crate::secret_chats_manager::SecretNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        macro_rules! secret_env {
+            () => {
+                crate::td::SecretChatsTdEnv {
+                    global: &mut self.global,
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    use_secret_chats: true,
+                    user_manager: &mut self.user_manager,
+                    updates: &mut self.notification_updates,
+                }
+            };
+        }
+        match kind {
+            // `on_update_chat(NetQueryPtr)` over the create entry
+            // (SecretChatActor.cpp:1805-1815); the wire error is the
+            // check_status fatal band (cpp:626-640).
+            K::RequestEncryption => {
+                if self.secret_chats_manager.pending.creates.is_empty() {
+                    tdutils::log_info!("Receive an unexpected messages.requestEncryption answer");
+                    return;
+                }
+                let pending = self.secret_chats_manager.pending.creates.remove(0);
+                let answer = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::EncryptedChat::parse(query.ok())
+                        .map_err(|_| parse_error("messages.requestEncryption"))
+                };
+                let mut env = secret_env!();
+                self.secret_chats_manager
+                    .on_secret_net_create_answer(&mut env, pending, answer);
+            }
+            // The SendAccept answer — the same union over the planted
+            // accept handshake (cpp:1769-1803).
+            K::AcceptEncryption { secret_chat_id } => {
+                let answer = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::EncryptedChat::parse(query.ok())
+                        .map_err(|_| parse_error("messages.acceptEncryption"))
+                };
+                let mut env = secret_env!();
+                self.secret_chats_manager.on_secret_net_accept_answer(
+                    &mut env,
+                    crate::secret_chat::SecretChatId::new(secret_chat_id),
+                    answer,
+                );
+            }
+            // The close receipt — the C++ close_flag_ branch settles
+            // `discard_encryption_promise_` on any outcome (cpp:113-117).
+            K::DiscardEncryption => {
+                if self.secret_chats_manager.pending.discards.is_empty() {
+                    tdutils::log_info!("Receive an unexpected messages.discardEncryption answer");
+                    return;
+                }
+                let mut promise = self.secret_chats_manager.pending.discards.remove(0);
+                promise.set_value(());
+            }
+            // The read receipt — the body is not parsed; the
+            // generation match settles the parked promise (cpp:1823-1828)
+            // and stale generations drop.
+            K::ReadHistory { generation } => {
+                let position = self
+                    .secret_chats_manager
+                    .pending
+                    .read_history
+                    .iter()
+                    .position(|(parked, _)| *parked == generation);
+                match position {
+                    Some(index) => {
+                        let (_, mut promise) =
+                            self.secret_chats_manager.pending.read_history.remove(index);
+                        promise.set_value(());
+                    }
+                    None => {
+                        tdutils::log_info!("Receive a stale messages.readEncryptedHistory answer");
+                    }
+                }
+            }
+            // The outbound send answer (on_outbound_send_message_result,
+            // cpp:1520-1600): the error forwards to the send receipt (the
+            // C++ routes it through MessagesManager on_send_message_error,
+            // unported); the `sentEncryptedMessage`/`sentEncryptedFile`
+            // ok leg settles `Unit` — the
+            // `MessageId(ServerMessageId(random_id))` routing rides
+            // MessagesManager too.
+            K::SendEncrypted { service } => {
+                let Some(mut promise) = self.secret_chats_manager.pending.sends.pop() else {
+                    tdutils::log_info!("Receive an unexpected messages.sendEncrypted answer");
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                } else {
+                    let what = if service {
+                        "messages.sendEncryptedService"
+                    } else {
+                        "messages.sendEncrypted"
+                    };
+                    match telegram_api::messages_SentEncryptedMessage::parse(query.ok()) {
+                        Ok(_) => promise.set_value(()),
+                        Err(_) => promise.set_error(parse_error(what)),
                     }
                 }
             }
@@ -56153,6 +56309,7 @@ mod tests {
         }
         td.group_call_manager.net = td.group_call_net();
         td.call_manager.net = td.call_net();
+        td.secret_chats_manager.net = td.secret_net();
         td.statistics_manager.net = td.statistics_net();
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
@@ -97518,5 +97675,810 @@ kQIDAQAB\n\
             1,
             "the net-inert park"
         );
+    }
+
+    // ---- the secret-chats net slice: the five wire families ride the
+    // manager-held SecretNetKind plane over the ported DhHandshake
+    // machinery (SecretChatsManager.cpp:98-204, SecretChatActor.cpp:68-71,
+    // 507-529, 626-640, 692-722, 1769-1828). ----
+
+    /// The requests.rs `secret_chat_arm` shape for the tests — the
+    /// field-split env + manager borrows off one `&mut Td`.
+    fn test_secret_chat_arm(
+        td: &mut Td,
+        run: impl FnOnce(
+            &mut crate::td::SecretChatsTdEnv<'_>,
+            &mut crate::secret_chats_manager::SecretChatsManager,
+        ),
+    ) {
+        let crate::td::Td {
+            global,
+            auth_manager,
+            user_manager,
+            notification_updates,
+            secret_chats_manager,
+            ..
+        } = td;
+        let mut env = crate::td::SecretChatsTdEnv {
+            global,
+            auth_is_authorized: auth_manager.is_authorized(),
+            use_secret_chats: true,
+            user_manager,
+            updates: notification_updates,
+        };
+        run(&mut env, secret_chats_manager);
+    }
+
+    type SecretChatIdSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<crate::secret_chat::SecretChatId>>>,
+    >;
+
+    fn record_secret_chat_id() -> (Promise<crate::secret_chat::SecretChatId>, SecretChatIdSlot) {
+        struct Rec(SecretChatIdSlot);
+        impl tdutils::promise::PromiseInterface<crate::secret_chat::SecretChatId> for Rec {
+            fn set_value(&mut self, value: crate::secret_chat::SecretChatId) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: SecretChatIdSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_encrypted_chat_waiting(id: i32, access_hash: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::encryptedChatWaiting {
+            id,
+            access_hash,
+            date: 1_700_000_000,
+            admin_id: 0,
+            participant_id: 0,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn wire_encrypted_chat(
+        id: i32,
+        access_hash: i64,
+        g_a_or_b: Vec<u8>,
+        key_fingerprint: i64,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::encryptedChat {
+            id,
+            access_hash,
+            date: 1_700_000_000,
+            admin_id: 0,
+            participant_id: 0,
+            g_a_or_b,
+            key_fingerprint,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn wire_encrypted_chat_discarded(id: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::encryptedChatDiscarded {
+            flags: 0,
+            history_deleted: false,
+            id,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn wire_sent_encrypted_message(date: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::messages_SentEncryptedMessage::messages_sentEncryptedMessage(
+            telegram_api::messages_sentEncryptedMessage { date },
+        )
+        .store(&mut out);
+        out
+    }
+
+    #[test]
+    fn secret_chat_create_request_encryption_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_create");
+
+        // 1. the create: the receipt settles at the dispatch with the
+        //    random_id the query carries (cpp:124), the handshake g_b
+        //    rides as the request g_a (SecretChatActor.cpp:507-516)
+        let (promise, slot) = record_secret_chat_id();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.create_chat(env, crate::user_manager::UserId::new(5), 42, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_requestEncryption::ID
+        );
+        let random_id = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_requestEncryption(function) => {
+                match function.user_id.expect("the inputUser peer") {
+                    telegram_api::InputUser::inputUser(user) => {
+                        assert_eq!(user.user_id, 5);
+                        assert_eq!(user.access_hash, 42);
+                    }
+                    other => panic!("unexpected requestEncryption peer: {other:?}"),
+                }
+                assert!(!function.g_a.is_empty(), "the handshake g_b rides as g_a");
+                function.random_id
+            }
+            other => panic!("unexpected create query: {other:?}"),
+        };
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(id)) if id.get() == random_id
+        ));
+
+        // 2. the encryptedChatWaiting answer folds the registry record
+        //    (save_common_info + the state stays WaitRequestResponse,
+        //    cpp:1748-1755)
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat_waiting(7, 99),
+        );
+        td.dispatch_completed_secret_net();
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(7))
+            .expect("the folded record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Waiting);
+        assert_eq!(chat.access_hash, 99);
+        assert_eq!(chat.user_id.get(), 5);
+        assert!(matches!(
+            td.notification_updates.last(),
+            Some(crate::td_api::Update::updateSecretChat(_))
+        ));
+
+        // 3. the encryptedChat answer with a real peer handshake runs
+        //    set_g_a + gen_key + the fingerprint check → Active
+        //    (cpp:1756-1798)
+        let (promise, _slot) = record_secret_chat_id();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.create_chat(env, crate::user_manager::UserId::new(5), 42, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let manager_g_b = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_requestEncryption(function) => function.g_a,
+            other => panic!("unexpected create query: {other:?}"),
+        };
+        let seed = crate::dh_cache::DhCache::built_in_dh_config();
+        let mut peer = tdmtproto::dh_handshake::DhHandshake::new();
+        peer.set_config(seed.g, &seed.prime);
+        peer.set_g_a(&manager_g_b);
+        if peer
+            .run_checks(true, &crate::dh_cache::DhCache::instance())
+            .is_error()
+        {
+            panic!("the peer handshake checks");
+        }
+        let (peer_fingerprint, _peer_key) = peer.gen_key();
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat(8, 100, peer.get_g_b(), peer_fingerprint),
+        );
+        td.dispatch_completed_secret_net();
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(8))
+            .expect("the folded record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Active);
+        assert_eq!(chat.access_hash, 100);
+
+        // 4. the band: the wire error is the C++ fatal (check_status →
+        //    cancel_chat, cpp:626-640) — the record plants Closed and
+        //    the discard tail fires for the receipt id
+        let (promise, _slot) = record_secret_chat_id();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.create_chat(env, crate::user_manager::UserId::new(5), 42, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let failed_random_id = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_requestEncryption(function) => function.random_id,
+            other => panic!("unexpected create query: {other:?}"),
+        };
+        net_fail(sent.into_iter().next().unwrap(), 400, "CHAT_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the fatal fires the discard tail");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_discardEncryption(function) => {
+                assert_eq!(function.chat_id, failed_random_id);
+                assert_eq!(function.flags, 0);
+                assert!(!function.delete_history);
+            }
+            other => panic!("unexpected discard query: {other:?}"),
+        }
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(failed_random_id))
+            .expect("the planted closed record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Closed);
+        assert!(
+            td.secret_chats_manager.pending.creates.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_accept_encryption_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_accept");
+        let seed = crate::dh_cache::DhCache::built_in_dh_config();
+
+        // the peer request's g_a — a throwaway handshake's public
+        let mut requester = tdmtproto::dh_handshake::DhHandshake::new();
+        requester.set_config(seed.g, &seed.prime);
+        let request_g_a = requester.get_g_b();
+
+        // 1. the encryptedChatRequested intake folds Waiting and runs
+        //    the SendAccept tail (cpp:517-529, 1740-1760)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(7),
+                crate::user_manager::UserId::new(5),
+                99,
+                &request_g_a,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_acceptEncryption::ID
+        );
+        let manager_g_b = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_acceptEncryption(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 7);
+                assert_eq!(peer.access_hash, 99);
+                assert!(!function.g_b.is_empty());
+                assert!(function.key_fingerprint != 0, "the gen_key fingerprint");
+                function.g_b
+            }
+            other => panic!("unexpected accept query: {other:?}"),
+        };
+
+        // 2. the test plays the peer on the requester's handshake — its
+        //    exponent is the peer half of the shared key, so the derived
+        //    fingerprint must agree with the manager's
+        requester.set_g_a(&manager_g_b);
+        if requester
+            .run_checks(true, &crate::dh_cache::DhCache::instance())
+            .is_error()
+        {
+            panic!("the peer handshake checks");
+        }
+        let (fingerprint, _key) = requester.gen_key();
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat(7, 99, requester.get_g_b(), fingerprint),
+        );
+        td.dispatch_completed_secret_net();
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(7))
+            .expect("the folded record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Active);
+        assert_eq!(chat.access_hash, 99);
+
+        // 3. the fingerprint-mismatch band: the fatal closes the chat
+        //    and fires the discard tail (cpp:1777-1779, 626-640)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(6),
+                98,
+                &request_g_a,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat(9, 98, requester.get_g_b(), fingerprint ^ 1),
+        );
+        td.dispatch_completed_secret_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the fatal fires the discard tail");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_discardEncryption(function) => {
+                assert_eq!(function.chat_id, 9);
+            }
+            other => panic!("unexpected discard query: {other:?}"),
+        }
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(9))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+
+        // 4. the encryptedChatDiscarded answer closes without a
+        //    discard query (cpp:1800-1803)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(11),
+                crate::user_manager::UserId::new(7),
+                97,
+                &request_g_a,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat_discarded(11),
+        );
+        td.dispatch_completed_secret_net();
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(11))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "already discarded — no query"
+        );
+
+        // 5. the bad-g_a band: the SendAccept checks fail → the fatal
+        //    closes and discards without an acceptEncryption query
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(13),
+                crate::user_manager::UserId::new(8),
+                96,
+                &[1],
+            );
+        });
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(13))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        assert!(
+            td.secret_chats_manager.accept_handshakes.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_close_discard_encryption_live_arm_round_trip() {
+        let (mut td, rec, callback) = netted_td_with_callback("secret_chat_close");
+
+        // the chat record folds first (the close needs the record)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+
+        // 1. the live arm: closeSecretChat → messages.discardEncryption
+        //    (Requests.cpp:7409-7415 → cpp:707-711)
+        td.request(
+            301,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 9 }),
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_discardEncryption(function) => {
+                assert_eq!(function.chat_id, 9);
+                assert!(!function.delete_history, "the arm closes without the flag");
+                assert_eq!(function.flags, 0);
+            }
+            other => panic!("unexpected close query: {other:?}"),
+        }
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(9))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_secret_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 301).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the C++ band: the close absorbs every outcome (the
+        //    SafePromise / close_flag_ branch, cpp:108-117) — the wire
+        //    error still answers ok
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(10),
+                crate::user_manager::UserId::new(6),
+                78,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+        td.request(
+            302,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 10 }),
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "CHAT_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 302).first(), Some(Object::ok(_))),
+            "the absorb band"
+        );
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(10))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+
+        // 3. the invalid-id band answers 400 with no query
+        td.request(
+            303,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 0 }),
+        );
+        td.flush_deferred_results();
+        assert!(std::mem::take(&mut *rec.sent.lock()).is_empty());
+        let error = error_of(&callback, 303);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Invalid secret chat identifier specified");
+
+        // 4. the empty-actor no-op absorbs into ok with no query
+        //    (SecretChatsManager.cpp:108-112)
+        td.request(
+            304,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 55 }),
+        );
+        td.flush_deferred_results();
+        assert!(std::mem::take(&mut *rec.sent.lock()).is_empty());
+        assert!(matches!(
+            responses_of(&callback, 304).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(
+            td.secret_chats_manager.pending.discards.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_read_encrypted_history_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_read");
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+
+        // 1. the send rides the peer + date; the Bool answer settles Unit
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 500, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_readEncryptedHistory::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_readEncryptedHistory(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 9);
+                assert_eq!(peer.access_hash, 77);
+                assert_eq!(function.max_date, 500);
+            }
+            other => panic!("unexpected read query: {other:?}"),
+        }
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(9))
+                .unwrap()
+                .last_read_history_date,
+            500
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. the dedup band: date <= last_read_history_date_ settles
+        //    Unit without a query (cpp:319-320)
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 400, promise);
+        });
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no query on the dedup"
+        );
+
+        // 3. the not-Ready band (cpp:313-316)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(12),
+                crate::user_manager::UserId::new(6),
+                78,
+                crate::secret_chat::SecretChatState::Waiting,
+            );
+        });
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(12), 500, promise);
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "Can't access the chat");
+            }
+            other => panic!("unexpected read result: {other:?}"),
+        }
+
+        // 4. the closed band (cpp:310-312)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Closed,
+            );
+        });
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 600, promise);
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Chat is closed");
+            }
+            other => panic!("unexpected read result: {other:?}"),
+        }
+
+        // 5. the generation pairing: a re-send settles the previous
+        //    receipt (cpp:322-326), the stale gen-0 answer drops and
+        //    the live gen-1 answer settles (cpp:1823-1828)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+        let (promise1, slot1) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 700, promise1);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query1 = sent.into_iter().next().unwrap();
+        let (promise2, slot2) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 800, promise2);
+        });
+        assert!(
+            matches!(
+                slot1.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the re-send settles the previous receipt"
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query2 = sent.into_iter().next().unwrap();
+        net_complete(query1, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(slot2.lock().unwrap().is_none(), "the stale answer drops");
+        net_complete(query2, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot2.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.secret_chats_manager.pending.read_history.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_send_encrypted_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_send");
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+
+        // 1. the sendEncrypted leg: the constructor rides the peer + a
+        //    fresh random_id, the payload buffer stays empty (the codec
+        //    parks [blocked: tde2e]); the sentEncryptedMessage answer
+        //    settles Unit (the MessageId routing rides MessagesManager)
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_sendEncrypted::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_sendEncrypted(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 9);
+                assert_eq!(peer.access_hash, 77);
+                assert_eq!(function.flags, 0, "not silent");
+                assert!(!function.silent);
+                assert!(function.random_id != 0);
+                assert!(function.data.is_empty());
+            }
+            other => panic!("unexpected send query: {other:?}"),
+        }
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_sent_encrypted_message(500),
+        );
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. the error band forwards to the send receipt (the C++
+        //    on_send_message_error tail rides MessagesManager)
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "PEER_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "PEER_ID_INVALID");
+            }
+            other => panic!("unexpected send result: {other:?}"),
+        }
+
+        // 3. the service leg: fire-and-forget constructor assert
+        //    (cpp:1386-1404)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message_action(env, crate::secret_chat::SecretChatId::new(9));
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_sendEncryptedService::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_sendEncryptedService(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 9);
+                assert_eq!(peer.access_hash, 77);
+                assert!(function.random_id != 0);
+                assert!(function.data.is_empty());
+            }
+            other => panic!("unexpected service query: {other:?}"),
+        }
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_sent_encrypted_message(501),
+        );
+        td.dispatch_completed_secret_net();
+
+        // 4. the not-Ready bands: the send errors, the action ignores
+        //    (cpp:294-297)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(12),
+                crate::user_manager::UserId::new(6),
+                78,
+                crate::secret_chat::SecretChatState::Waiting,
+            );
+        });
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(12), promise);
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Can't access the chat");
+            }
+            other => panic!("unexpected send result: {other:?}"),
+        }
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message_action(env, crate::secret_chat::SecretChatId::new(12));
+        });
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "the not-Ready action ignores"
+        );
+        assert!(td.secret_chats_manager.pending.sends.is_empty(), "drained");
+    }
+
+    #[test]
+    fn secret_chat_create_new_secret_chat_arm_band() {
+        let (mut td, rec, callback) = netted_td_with_callback("secret_chat_create_arm");
+        // no user planted — the arm's input-user resolution errors
+        // before the wire (UserManager.cpp:9845-9854)
+        td.request(
+            305,
+            Function::createNewSecretChat(td_api::createNewSecretChat { user_id: 5 }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no query without the peer"
+        );
+        let error = error_of(&callback, 305);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "User not found");
+        assert!(td.secret_chats_manager.pending.creates.is_empty());
     }
 }
