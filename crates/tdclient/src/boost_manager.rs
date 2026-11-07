@@ -17,22 +17,28 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 /// The boost-plane in-flight query kinds — the C++ `Td::ResultHandler`
-/// classes of BoostManager.cpp:94-325 collapsed onto dispatcher tags; the
+/// classes of BoostManager.cpp:109-358 collapsed onto dispatcher tags; the
 /// answers drain through [`crate::td::Td::on_boost_net_answer`]. The kinds
 /// carry the handlers' `dialog_id_` members (the `on_error` dialog head);
 /// the request promises park in the manager's family lots (the C++ carries
 /// them on the queries' `promise_` members — §5's FIFO-per-family shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoostNetKind {
-    /// `GetMyBoostsQuery` (BoostManager.cpp:94-118) — `premium.getMyBoosts`;
+    /// `GetMyBoostsQuery` (BoostManager.cpp:109-135) — `premium.getMyBoosts`;
     /// the answer converts through
-    /// [`BoostManager::get_chat_boost_slots_object`] (cpp:47-93).
+    /// [`BoostManager::get_chat_boost_slots_object`] (cpp:75-107).
     GetMyBoosts,
     /// `ApplyBoostQuery` (BoostManager.cpp:228-261) —
     /// `premium.applyBoost`; the kind carries the handler's `dialog_id_`
     /// member for the `on_error` dialog head (cpp:260); the answer is
     /// the shared `premium.myBoosts` conversion of the slots family.
     ApplyBoost { dialog_id: DialogId },
+    /// `GetUserBoostsQuery` (BoostManager.cpp:310-358) —
+    /// `premium.getUserBoosts`; the kind carries the handler's
+    /// `dialog_id_` member for the `on_error` dialog head (cpp:352); the
+    /// answer is the shared `premium.boostsList` conversion of the list
+    /// family.
+    GetUserBoosts { dialog_id: DialogId },
     /// `GetBoostsListQuery` (BoostManager.cpp:264-308) —
     /// `premium.getBoostsList`; the kind carries the handler's
     /// `dialog_id_` member for the `on_error` dialog head (cpp:304); the
@@ -111,6 +117,13 @@ pub trait BoostManagerEnv {
     /// (UserManager.cpp) — the boost-source conversions.
     fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64;
 
+    /// `td_->user_manager_->get_input_user(user_id)` (UserManager.cpp) —
+    /// the user-boosts send leg resolves the user.
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<telegram_api::InputUser, Status>;
+
     /// `td_->dialog_manager_->get_input_peer(dialog_id, access_rights)`
     /// (DialogManager.cpp:1377) — the query send legs resolve the peer.
     fn get_input_peer(
@@ -129,11 +142,6 @@ pub trait BoostManagerEnv {
     /// the status answer's premium audience; the M.5 participant-count
     /// plane stand-in.
     fn on_update_channel_participant_count(&mut self, _channel_id: ChannelId, _count: i32) {}
-
-    fn send_get_user_boosts_query(&mut self, dialog_id: DialogId, user_id: i64) {
-        tdutils::log_info!("Send premium.getUserBoosts for {dialog_id:?} — [blocked: net]");
-        let _ = user_id;
-    }
 }
 
 /// The collapsed `BoostManager`.
@@ -159,9 +167,10 @@ pub struct BoostManager {
     /// member, cpp:266) — popped FIFO by the `premium.boostsList`
     /// answers of the list family.
     pub(crate) pending_get_boosts_list: Vec<Promise<td_api::FoundChatBoosts>>,
-    /// The `FoundChatBoosts`-typed promises parked at the user-boosts
-    /// seam (the fifth family lands next).
-    pub parked_found_boosts: Vec<Promise<td_api::FoundChatBoosts>>,
+    /// The `GetUserBoostsQuery` promises (the handler's `promise_`
+    /// member, cpp:312) — popped FIFO by the user-boosts family's
+    /// `premium.boostsList` answers.
+    pub(crate) pending_get_user_boosts: Vec<Promise<td_api::FoundChatBoosts>>,
 }
 
 impl BoostManager {
@@ -262,14 +271,14 @@ impl BoostManager {
     }
 
     /// The `td_->create_handler<GetMyBoostsQuery>(promise)->send()`
-    /// collapse (BoostManager.cpp:94-118) — the request promise parks in
+    /// collapse (BoostManager.cpp:109-135) — the request promise parks in
     /// the family lot (the C++ carries it on the query's `promise_`
     /// member, cpp:96 — §5's FIFO shape), then the wire query dispatches;
     /// `None` on the handle keeps the net-inert posture.
     pub(crate) fn send_get_my_boosts_query(&mut self, promise: Promise<td_api::ChatBoostSlots>) {
         self.pending_get_my_boosts.push(promise);
         match self.net.clone() {
-            // `GetMyBoostsQuery::send` (cpp:100)
+            // `GetMyBoostsQuery::send` (cpp:118-120)
             Some(net) => net.dispatch(
                 BoostNetKind::GetMyBoosts,
                 telegram_api::Function::premium_getMyBoosts(telegram_api::premium_getMyBoosts),
@@ -284,7 +293,7 @@ impl BoostManager {
         (!self.pending_get_my_boosts.is_empty()).then(|| self.pending_get_my_boosts.remove(0))
     }
 
-    /// `get_chat_boost_slots_object` (BoostManager.cpp:47-93) — the
+    /// `get_chat_boost_slots_object` (BoostManager.cpp:75-107) — the
     /// `premium.myBoosts` answer conversion of the slots family (and of
     /// the apply family, cpp:139-143): the users/chats intakes run first,
     /// then the slot loop (the expiry filter, the date clamps, the
@@ -759,16 +768,73 @@ impl BoostManager {
         }
     }
 
-    /// `get_user_dialog_boosts` (cpp:492-502).
+    /// `get_user_dialog_boosts` (cpp:492-501) — the dialog-access gate,
+    /// then the invalid-user band, then the handler collapse.
     pub fn get_user_dialog_boosts(
         &mut self,
         env: &mut impl BoostManagerEnv,
         dialog_id: DialogId,
         user_id: i64,
+        mut promise: Promise<td_api::FoundChatBoosts>,
+    ) {
+        if let Err(status) = env.check_dialog_access(dialog_id, "get_user_dialog_boosts") {
+            return promise.set_error(status);
+        }
+        let user_id = crate::user_manager::UserId::new(user_id);
+        if !user_id.is_valid() {
+            return promise.set_error(Status::error(400, "User not found"));
+        }
+        self.send_get_user_boosts_query(env, dialog_id, user_id, promise);
+    }
+
+    /// The `td_->create_handler<GetUserBoostsQuery>(promise)
+    /// ->send(dialog_id, user_id)` collapse (BoostManager.cpp:317-326):
+    /// the request promise parks in the family lot (the C++ carries it on
+    /// the query's `promise_` member, cpp:312 — §5's FIFO shape), then the
+    /// read peer and the input user resolve and the wire query dispatches.
+    /// The C++ `CHECK`s (cpp:321/:323) are the port's `complete_error`
+    /// file-throughs (the message-query CHECK convention): the failures
+    /// run the full `on_error` tail. `None` on the handle keeps the
+    /// net-inert posture.
+    pub(crate) fn send_get_user_boosts_query(
+        &mut self,
+        env: &mut impl BoostManagerEnv,
+        dialog_id: DialogId,
+        user_id: crate::user_manager::UserId,
         promise: Promise<td_api::FoundChatBoosts>,
     ) {
-        env.send_get_user_boosts_query(dialog_id, user_id);
-        self.parked_found_boosts.push(promise);
+        self.pending_get_user_boosts.push(promise);
+        let kind = BoostNetKind::GetUserBoosts { dialog_id };
+        match (
+            self.net.clone(),
+            env.get_input_peer(dialog_id, crate::user_manager::AccessRights::Read),
+        ) {
+            // `GetUserBoostsQuery::send` (cpp:317-326)
+            (Some(net), Some(peer)) => match env.get_input_user(user_id) {
+                Ok(input_user) => net.dispatch(
+                    kind,
+                    telegram_api::Function::premium_getUserBoosts(
+                        telegram_api::premium_getUserBoosts {
+                            peer: Some(Box::new(peer)),
+                            user_id: Some(input_user),
+                        },
+                    ),
+                ),
+                Err(error) => net.complete_error(kind, error.code(), error.message()),
+            },
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => {
+                tdutils::log_info!("Send premium.getUserBoosts for {dialog_id:?} — [net-inert]")
+            }
+        }
+    }
+
+    /// The FIFO-head promise pop for the `Td::on_boost_net_answer` drain
+    /// (the C++ promise rides the query).
+    pub(crate) fn pop_get_user_boosts_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::FoundChatBoosts>> {
+        (!self.pending_get_user_boosts.is_empty()).then(|| self.pending_get_user_boosts.remove(0))
     }
 
     /// `on_update_dialog_boost` (cpp:503-521) — the boost intake; the
@@ -786,7 +852,6 @@ mod tests {
 
     struct TestEnv {
         options: BTreeMap<String, i64>,
-        queries: Vec<String>,
         username: String,
         now: i32,
         intakes: Vec<String>,
@@ -794,6 +859,7 @@ mod tests {
         resolve_peer: bool,
         dialog_errors: Vec<String>,
         participant_counts: Vec<(i64, i32)>,
+        known_users: Vec<i64>,
     }
 
     impl BoostManagerEnv for TestEnv {
@@ -821,11 +887,6 @@ mod tests {
 
         fn get_channel_first_username(&mut self, _channel_id: ChannelId) -> String {
             self.username.clone()
-        }
-
-        fn send_get_user_boosts_query(&mut self, dialog_id: DialogId, user_id: i64) {
-            self.queries
-                .push(format!("getUserBoosts {} {user_id}", dialog_id.get()));
         }
 
         fn unix_time(&mut self) -> i32 {
@@ -867,6 +928,22 @@ mod tests {
             user_id.get()
         }
 
+        fn get_input_user(
+            &mut self,
+            user_id: crate::user_manager::UserId,
+        ) -> std::result::Result<telegram_api::InputUser, Status> {
+            if self.known_users.contains(&user_id.get()) {
+                Ok(telegram_api::InputUser::inputUser(
+                    telegram_api::inputUser {
+                        user_id: user_id.get(),
+                        access_hash: 7,
+                    },
+                ))
+            } else {
+                Err(Status::error(400, "User not found"))
+            }
+        }
+
         fn on_get_dialog_error(&mut self, dialog_id: DialogId, status: &Status, source: &str) {
             self.dialog_errors
                 .push(format!("{source} {} {}", dialog_id.get(), status.message()));
@@ -884,7 +961,6 @@ mod tests {
         options.insert("channel_transcribe_level_min".to_string(), 2);
         TestEnv {
             options,
-            queries: Vec::new(),
             username: String::new(),
             now: 1000,
             intakes: Vec::new(),
@@ -892,6 +968,7 @@ mod tests {
             resolve_peer: true,
             dialog_errors: Vec::new(),
             participant_counts: Vec::new(),
+            known_users: vec![9],
         }
     }
 
@@ -989,6 +1066,52 @@ mod tests {
         assert!(manager.pop_get_my_boosts_promise().is_some());
         assert!(
             manager.pop_get_my_boosts_promise().is_none(),
+            "the FIFO lot"
+        );
+    }
+
+    #[test]
+    fn the_user_boosts_gate_bands_answer_inline() {
+        // `get_user_dialog_boosts` (cpp:492-501): the access gate, then
+        // the invalid-user band, then the park (the net-inert posture)
+        let mut env = env();
+        let mut manager = BoostManager::new();
+        let error_of = |manager: &mut BoostManager, env: &mut TestEnv, chat: i64, user: i64| {
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<td_api::FoundChatBoosts>| {
+                    *capture.lock().unwrap() = Some(match result {
+                        tdutils::status::Result::Err(status) => {
+                            Some((status.code(), status.message().to_string()))
+                        }
+                        tdutils::status::Result::Ok(_) => None,
+                    });
+                },
+            );
+            manager.get_user_dialog_boosts(env, DialogId::new(chat), user, promise);
+            slot.lock().unwrap().take().flatten()
+        };
+        assert_eq!(
+            error_of(&mut manager, &mut env, 0, 9),
+            Some((400, "Chat not found".to_string()))
+        );
+        assert_eq!(
+            error_of(&mut manager, &mut env, 1, 0),
+            Some((400, "User not found".to_string()))
+        );
+        assert_eq!(
+            error_of(&mut manager, &mut env, 1, -5),
+            Some((400, "User not found".to_string()))
+        );
+        assert!(manager.pending_get_user_boosts.is_empty());
+        manager.get_user_dialog_boosts(&mut env, DialogId::new(1), 9, Promise::default());
+        manager.get_user_dialog_boosts(&mut env, DialogId::new(1), 9, Promise::default());
+        assert_eq!(manager.pending_get_user_boosts.len(), 2);
+        assert!(manager.pop_get_user_boosts_promise().is_some());
+        assert!(manager.pop_get_user_boosts_promise().is_some());
+        assert!(
+            manager.pop_get_user_boosts_promise().is_none(),
             "the FIFO lot"
         );
     }
@@ -1248,7 +1371,7 @@ mod tests {
 
     #[test]
     fn the_slots_conversion_runs_the_cxx_bands() {
-        // `get_chat_boost_slots_object` (cpp:47-93): the users/chats
+        // `get_chat_boost_slots_object` (cpp:75-107): the users/chats
         // intakes run first, the expiry filter drops, the invalid peer
         // drops, the no-peer slot zeroes the dates and the live peer
         // force-creates its dialog

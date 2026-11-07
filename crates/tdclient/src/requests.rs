@@ -9667,7 +9667,9 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             td.boost_manager = manager;
         }
         Function::getUserChatBoosts(request) => {
-            if !check_is_user(td, id) {
+            // `Requests.cpp:6065` — the family is bot-only
+            // (`CHECK_IS_BOT`).
+            if !check_is_bot(td, id) {
                 return;
             }
             let promise =
