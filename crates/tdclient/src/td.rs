@@ -18199,6 +18199,40 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `SendWebViewResultMessageQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:440-454) — the WebViewMessageSent
+            // answer folds its msg_id through get_inline_message_id into
+            // the inlineMessageId object.
+            K::SendWebViewResultMessage => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::WebViewMessageSent::parse(query.ok()) {
+                        Ok(sent) => Ok(sent),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse WebViewMessageSent: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_sendWebViewResultMessage answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_send_web_view_result_message_promise();
+                match (result, promise) {
+                    (Ok(sent), Some(mut promise)) => promise.set_value(td_api::InlineMessageId {
+                        id: crate::inline_queries_manager::get_inline_message_id(sent.msg_id),
+                    }),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.sendWebViewResultMessage answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46630,14 +46664,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_send_web_view_result_message_query(
-        &mut self,
-        _query: telegram_api::messages_sendWebViewResultMessage,
-        _promise: Promise<td_api::InlineMessageId>,
-    ) {
-        // [blocked: net]
     }
 
     fn get_input_keyboard_button(
@@ -89940,5 +89966,117 @@ kQIDAQAB\n\
         td.flush_deferred_results();
         let error = error_of(&callback, 25);
         assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_9"));
+
+        // 32. the answerWebAppQuery arm rides the wire (Requests.cpp:
+        //     1202-1208 → answer_web_view_query →
+        //     SendWebViewResultMessageQuery::send, cpp:435-439)
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            26,
+            Function::answerWebAppQuery(td_api::answerWebAppQuery {
+                web_app_query_id: "waq-1".to_owned(),
+                result: Some(
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "w1".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewResultMessage::ID,
+        );
+        let body = telegram_api::messages_sendWebViewResultMessage::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(body.bot_query_id, "waq-1");
+        assert!(matches!(
+            body.result,
+            Some(telegram_api::InputBotInlineResult::inputBotInlineResult(ref result))
+                if result.id == "w1"
+        ));
+
+        // 33. the WebViewMessageSent answer folds through
+        //     get_inline_message_id (cpp:440-451) — the msg_id pair decodes
+        //     back through the public pair
+        net_complete(
+            sent,
+            wire!(telegram_api::WebViewMessageSent {
+                flags: 1, // MSG_ID_MASK
+                msg_id: Some(
+                    telegram_api::InputBotInlineMessageID::inputBotInlineMessageID64(
+                        telegram_api::inputBotInlineMessageID64 {
+                            dc_id: 4,
+                            owner_id: 9,
+                            id: 12,
+                            access_hash: 77,
+                        },
+                    )
+                ),
+            }),
+        );
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 26).first() {
+            Some(Object::inlineMessageId(inline_message_id)) => {
+                let decoded = crate::inline_message_manager::get_input_bot_inline_message_id(
+                    &inline_message_id.id,
+                )
+                .expect("the base64url form decodes");
+                assert!(matches!(
+                    decoded,
+                    telegram_api::InputBotInlineMessageID::inputBotInlineMessageID64(id)
+                        if (id.dc_id, id.owner_id, id.id, id.access_hash) == (4, 9, 12, 77)
+                ));
+            }
+            other => panic!("the inline message id, got {other:?}"),
+        }
+
+        // 34. the wire error forwards to the request promise (cpp:452-454)
+        td.request(
+            27,
+            Function::answerWebAppQuery(td_api::answerWebAppQuery {
+                web_app_query_id: "waq-2".to_owned(),
+                result: Some(td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                    td_api::inputInlineQueryResultGame {
+                        id: "g2".to_owned(),
+                        game_short_name: "snake".to_owned(),
+                        reply_markup: None,
+                    },
+                )),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_sendWebViewResultMessage::ID,
+        );
+        net_fail(sent, 400, "QUERY_ID_INVALID");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 27);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "QUERY_ID_INVALID")
+        );
     }
 }

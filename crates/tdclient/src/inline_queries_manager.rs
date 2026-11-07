@@ -698,12 +698,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `SendWebViewResultMessageQuery` (InlineQueriesManager.cpp:427-455).
-    fn send_send_web_view_result_message_query(
-        &mut self,
-        query: telegram_api::messages_sendWebViewResultMessage,
-        promise: Promise<td_api::InlineMessageId>,
-    );
 
     // -- the M.22 reply-markup plane intakes
     /// `KeyboardButton::get_keyboard_button(button, true)` +
@@ -862,6 +856,10 @@ pub(crate) enum InlineQueriesNetKind {
     /// `messages.sendWebViewData`; the Updates answer rides the updates
     /// engine with the request promise.
     SendWebViewData,
+    /// `SendWebViewResultMessageQuery` (cpp:427-455) —
+    /// `messages.sendWebViewResultMessage`; the WebViewMessageSent answer
+    /// folds through [`get_inline_message_id`].
+    SendWebViewResultMessage,
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -887,6 +885,8 @@ pub(crate) struct PendingInlineQueries {
     request_simple_web_view: Vec<Promise<td_api::WebAppUrl>>,
     /// `SendWebViewDataQuery::promise_`.
     send_web_view_data: Vec<Promise<()>>,
+    /// `SendWebViewResultMessageQuery::promise_`.
+    send_web_view_result_message: Vec<Promise<td_api::InlineMessageId>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1594,7 +1594,7 @@ impl InlineQueriesManager {
                     bot_query_id: web_view_query_id.to_owned(),
                     result: Some(result),
                 };
-                env.send_send_web_view_result_message_query(query, promise);
+                self.send_send_web_view_result_message_query(query, promise);
             }
             // the promise lands in the (never-sent) seam query
             Ok(None) => {}
@@ -2129,6 +2129,41 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.send_web_view_data.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SendWebViewResultMessageQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:435-439) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_send_web_view_result_message_query(
+        &mut self,
+        query: telegram_api::messages_sendWebViewResultMessage,
+        promise: Promise<td_api::InlineMessageId>,
+    ) {
+        self.pending.send_web_view_result_message.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SendWebViewResultMessage,
+                telegram_api::Function::messages_sendWebViewResultMessage(query),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.sendWebViewResultMessage — [net-inert]")
+            }
+        }
+    }
+
+    /// The send-web-view-result-message family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_send_web_view_result_message_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::InlineMessageId>> {
+        if self.pending.send_web_view_result_message.is_empty() {
+            None
+        } else {
+            Some(self.pending.send_web_view_result_message.remove(0))
         }
     }
 
@@ -3949,14 +3984,6 @@ mod tests {
             Vec::new()
         }
 
-        fn send_send_web_view_result_message_query(
-            &mut self,
-            _query: telegram_api::messages_sendWebViewResultMessage,
-            _promise: Promise<td_api::InlineMessageId>,
-        ) {
-            // [blocked: net]
-        }
-
         fn get_input_keyboard_button(
             &mut self,
             button: &td_api::KeyboardButton,
@@ -4194,6 +4221,42 @@ mod tests {
             manager.pop_set_inline_bot_results_promise().is_some(),
             "the FIFO pop"
         );
+    }
+
+    /// The answer_web_view_query bands: the folded result parks the
+    /// promise in the web-view-result lot without a dispatch, and the
+    /// seam-parked `Ok(None)` band answers nothing.
+    #[test]
+    fn answer_web_view_query_parks_net_inert() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let (promise, outcomes) = recording_promise::<td_api::InlineMessageId>();
+        manager.answer_web_view_query(
+            &mut env,
+            "waq-1",
+            Some(td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                td_api::inputInlineQueryResultGame {
+                    id: "g1".to_owned(),
+                    game_short_name: "snake".to_owned(),
+                    reply_markup: None,
+                },
+            )),
+            promise,
+        );
+        assert_eq!(manager.pending.send_web_view_result_message.len(), 1);
+        assert!(outcomes.lock().unwrap().is_empty(), "the promise parks");
+        assert!(manager.pop_send_web_view_result_message_promise().is_some());
+
+        // the empty-result band (cpp:877)
+        let (promise, outcomes) = recording_promise::<td_api::InlineMessageId>();
+        manager.answer_web_view_query(&mut env, "waq-1", None, promise);
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Inline query result must be non-empty"
+        ));
     }
 
     /// The send_web_view_data bands: the not-a-bot band answers inline
