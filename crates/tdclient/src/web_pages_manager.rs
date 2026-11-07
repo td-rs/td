@@ -7,9 +7,17 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct and the
 //! [`WebPagesManagerEnv`] trait carries the `G()`/pmc/binlog/cross-manager
-//! surfaces. Every `create_handler<...>` network tail (the
-//! `GetWebPagePreviewQuery`/`GetWebPageQuery` sends) is an env seam
-//! marked `[blocked: net]`; the promise parks exactly like the C++.
+//! surfaces. The `GetWebPageQuery` network tail (WebPagesManager.cpp:117-166)
+//! rides the `WebPagesNetKind` plane — the manager-held net handle, the
+//! queries dispatch through the dispatcher and the answers drain through
+//! `Td::on_web_pages_net_answer` into the landed intakes; the
+//! `Promise<WebPageId>` chains park in the family lots
+//! (`WebPageIdTail`) exactly where the C++ parks them. The
+//! `GetWebPagePreviewQuery` tail (cpp:77-115) stays `[blocked:
+//! net/M.17]` — its answer settles through
+//! `get_link_preview_object` (cpp:2040-2196 + the
+//! `get_link_preview_type_object` walk cpp:1759-2038), the M.17
+//! link-preview object builder family the module records below.
 //!
 //! Divergences, all recorded at the seams:
 //! - sticker FileIds of `webPageAttributeStickerSet`/`StarGiftCollection`
@@ -22,7 +30,17 @@
 //! - the poll web-page linkage (`register_poll_web_pages` +
 //!   `web_page_polls_`) is `[blocked: M.19]` (PollManager owns `PollId`);
 //! - the welcome-message linkage is `[blocked: Wave 3]`
-//!   (WelcomeMessageManager owns `EphemeralMessageFullId`).
+//!   (WelcomeMessageManager owns `EphemeralMessageFullId`);
+//! - the instant-view content plane — the wire `telegram_api::page` →
+//!   `WebPageBlock` conversion (`on_get_web_page_instant_view`,
+//!   cpp:2455-2576, over `get_page_blocks` in WebPageBlock.cpp) — stays
+//!   `[blocked: M.17]`: a `webPage` answer's `cached_page` drops, so a
+//!   fresh answer never lands instant-view blocks and the ladder's
+//!   not-loaded band answers through the null-object rewrite (the db
+//!   half keeps loading stored views);
+//! - `GetWebPagePreviewQuery` (the `getLinkPreview` request family) is
+//!   `[blocked: net/M.17]` — the wire query and the
+//!   `on_get_web_page_preview` walk land with the builder family.
 
 use crate::dialog_id::DialogId;
 use crate::document::Document;
@@ -30,7 +48,7 @@ use crate::emoji_status::CustomEmojiId;
 use crate::files::{FileId, FileSourceId};
 use crate::message_entity::get_first_url;
 use crate::message_id::MessageFullId;
-use crate::messages_manager::{QuickReplyMessageFullId, QuickReplyShortcutId, StoryFullId};
+use crate::messages_manager::{QuickReplyMessageFullId, StoryFullId};
 use crate::photo::Photo;
 use crate::store_parse::{
     Parser, store_flags, store_i32, store_i64, store_log_event_version, store_string,
@@ -41,6 +59,7 @@ use crate::webpage::{WebPageBlock, WebPageBlockEnv, WebPageId, get_page_blocks_o
 use std::collections::{HashMap, HashSet};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
+use tdutils::status::Result as TdResult;
 use tdutils::status::Status;
 
 /// The binlog handler id of the WebPages events
@@ -101,12 +120,6 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
     );
     /// `messages_manager_->get_messages_from_server` [blocked: M.10/net].
     fn get_messages_from_server(&mut self, message_full_ids: &[MessageFullId]);
-    /// `quick_reply_manager_->reload_quick_reply_message` [blocked: net].
-    fn reload_quick_reply_message(
-        &mut self,
-        shortcut_id: QuickReplyShortcutId,
-        message_id: crate::messages_manager::MessageId,
-    );
     /// `dialog_manager_->force_create_dialog` [blocked: M.6].
     fn force_create_dialog(&mut self, dialog_id: DialogId);
     /// `story_manager_->on_get_story` [blocked: Wave 3]; answers `None`
@@ -146,26 +159,52 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
     fn has_video_chat_invite_hash(&self, url: &str) -> bool;
     /// `option_manager_->get_option_boolean("is_premium")`.
     fn is_premium(&self) -> bool;
-    /// `td_->user_manager_->get_user_id_object` — inherited via
-    /// WebPageBlockEnv.
-    // -- the `[blocked: net]` query tails; each drops/parks the promise,
-    // -- keeping the C++ request unanswered offline
-    /// `GetWebPagePreviewQuery` (WebPagesManager.cpp:77-115).
-    fn send_get_web_page_preview_query(
-        &mut self,
-        text: crate::message_entity::FormattedText,
-        options: Box<GetWebPagePreviewOptions>,
-        promise: Promise<Option<td_api::LinkPreview>>,
-    );
-    /// `GetWebPageQuery` (WebPagesManager.cpp:117-166) — the reload
-    /// fetch; `hash` is the instant-view hash (0 reloads in full).
-    fn send_get_web_page_query(
-        &mut self,
-        web_page_id: WebPageId,
-        url: String,
-        hash: i32,
-        promise: Promise<WebPageId>,
-    );
+}
+
+/// The in-flight query kinds of the net-drain 46 web-page family —
+/// the C++ `GetWebPageQuery` `Td::ResultHandler` class
+/// (WebPagesManager.cpp:117-166) collapsed onto one dispatcher tag;
+/// the answers drain through `Td::on_web_pages_net_answer`. The kind
+/// carries the handler's `web_page_id_` member (set at `send`,
+/// cpp:126-135): the valid-id sends are the instant-view reload heads
+/// (the answer drains the `load_server_web_page_instant_view_queries`
+/// lot), the invalid-id sends are the by-URL reloads (the answer
+/// settles the parked [`WebPageIdTail`] lot, FIFO per family, §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebPagesNetKind {
+    /// `GetWebPageQuery` (cpp:117-166) — `messages.getWebPage(url,
+    /// hash)`; `web_page_id` is the handler's `web_page_id_` capture
+    /// (the `webPageNotModified` band's target, cpp:147-156).
+    GetWebPage { web_page_id: WebPageId },
+}
+
+/// The parked `Promise<WebPageId>` continuation — the C++ promise
+/// chain around `GetWebPageQuery` collapses onto these tails; the
+/// answer router runs the tail at settle
+/// ([`WebPagesManager::settle_web_page_id`]).
+pub(crate) enum WebPageIdTail {
+    /// The promise carried on the query (`reload_web_page_by_url`,
+    /// cpp:1557-1563; `fetch_web_page_by_url` → `load_web_page_by_url`,
+    /// cpp:1470-1498) — the handler's `promise_` member (cpp:119).
+    Promise { promise: Promise<WebPageId> },
+    /// The `get_web_page_instant_view` promise lambda (cpp:1271-1280):
+    /// the resolved id re-enters `get_web_page_instant_view_impl` with
+    /// the captured `only_local`; the error rides to the inner tail.
+    InstantViewImpl {
+        only_local: bool,
+        inner: Box<WebPageIdTail>,
+    },
+    /// The `GetWebPageInstantViewRequest` actor tail
+    /// (Requests.cpp:1127-1146): the settled id builds the
+    /// instant-view object for the td_api promise — the invalid id and
+    /// the null object answer the `send_result` null rewrite (404 "Not
+    /// Found", Td.cpp:1405-1409). The RequestActor 500-retry (the
+    /// `get_tries() < 2` re-run settling the captured id,
+    /// Requests.cpp:1134-1137) stays collapsed — the errors ride to
+    /// the caller.
+    InstantViewObject {
+        promise: Promise<td_api::WebPageInstantView>,
+    },
 }
 
 /// `WebPagesManager::GetWebPagePreviewOptions` (WebPagesManager.h:52-56).
@@ -173,8 +212,8 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
 pub struct GetWebPagePreviewOptions {
     pub(crate) first_url: String,
     pub(crate) skip_confirmation: bool,
-    /// The ride-along options; consumed by the net query tail
-    /// ([blocked: net]).
+    /// The ride-along options; consumed by the `GetWebPagePreviewQuery`
+    /// tail ([blocked: net/M.17]).
     #[allow(dead_code)]
     pub(crate) link_preview_options: Option<Box<td_api::LinkPreviewOptions>>,
 }
@@ -195,7 +234,7 @@ impl GetWebPagePreviewOptions {
 // ---------------------------------------------------------------------------
 
 /// `WebPagesManager::WebPageInstantView`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WebPageInstantView {
     pub(crate) page_blocks: Vec<WebPageBlock>,
     pub(crate) url: String,
@@ -207,6 +246,25 @@ pub struct WebPageInstantView {
     pub(crate) is_full: bool,
     pub(crate) is_loaded: bool,
     pub(crate) was_loaded_from_database: bool,
+}
+
+impl Default for WebPageInstantView {
+    /// The C++ member initializers (cpp:170-179) — `is_empty_` defaults
+    /// TRUE: a fresh `WebPage` carries no instant view.
+    fn default() -> Self {
+        Self {
+            page_blocks: Vec::new(),
+            url: String::new(),
+            view_count: 0,
+            hash: 0,
+            is_v2: false,
+            is_rtl: false,
+            is_empty: true,
+            is_full: false,
+            is_loaded: false,
+            was_loaded_from_database: false,
+        }
+    }
 }
 
 impl WebPageInstantView {
@@ -660,14 +718,29 @@ pub struct WebPagesManager {
     pub(crate) web_page_polls: HashMap<WebPageId, HashSet<i64>>,
     pub(crate) poll_web_pages: HashMap<i64, Vec<WebPageId>>,
     pub(crate) story_web_pages: HashMap<StoryFullId, HashSet<WebPageId>>,
-    /// The parked reload-query maps; consumed by the net query tails
-    /// ([blocked: net]).
+    /// The manager-held dispatch surface of the net-drain 46 family —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests; the `AttachMenuManager::net` shape).
+    pub(crate) net: Option<crate::td::WebPagesNetHandle>,
+    /// The parked `load_web_page_from_database` promises — the url→id
+    /// database ladder stays collapsed onto the url-map probe (the
+    /// module doc's pmc-persistence collapse); `have_web_page_force`
+    /// reads the records directly.
     #[allow(dead_code)]
     pub(crate) load_web_page_from_database_queries: HashMap<WebPageId, Vec<Promise<()>>>,
-    #[allow(dead_code)]
-    pub(crate) load_web_page_instant_view_queries: HashMap<WebPageId, Vec<Promise<WebPageId>>>,
-    pub(crate) load_server_web_page_instant_view_queries:
-        HashMap<WebPageId, Vec<Promise<WebPageId>>>,
+    /// `load_local_web_page_instant_view_queries_` (WebPagesManager.h)
+    /// — the only-local database-load promise tails; drained by
+    /// `on_load_web_page_instant_view`.
+    pub(crate) load_web_page_instant_view_queries: HashMap<WebPageId, Vec<WebPageIdTail>>,
+    /// `load_server_web_page_instant_view_queries_` — the server-reload
+    /// promise tails; the head entry owns the in-flight query, drained
+    /// by `on_reload_web_page_instant_view`.
+    pub(crate) load_server_web_page_instant_view_queries: HashMap<WebPageId, Vec<WebPageIdTail>>,
+    /// The by-URL `GetWebPageQuery` promise tails (the handler's
+    /// `promise_` member + the lambda continuations; FIFO per family,
+    /// §5) — the invalid-id answers pop it in
+    /// `Td::on_web_pages_net_answer`.
+    pub(crate) pending_web_page_queries: Vec<WebPageIdTail>,
 }
 
 impl WebPagesManager {
@@ -681,6 +754,13 @@ impl WebPagesManager {
 
     fn get_web_page_instant_view_database_key(web_page_id: WebPageId) -> Vec<u8> {
         format!("wpiv{}", web_page_id.get()).into_bytes()
+    }
+
+    /// Test-only: the instant-view database key (the band tests seed
+    /// the pmc with it).
+    #[cfg(test)]
+    fn get_web_page_instant_view_database_key_for_test(web_page_id: WebPageId) -> Vec<u8> {
+        Self::get_web_page_instant_view_database_key(web_page_id)
     }
 
     /// `WebPagesManager::get_web_page` (WebPagesManager.cpp:2190-2192).
@@ -848,7 +928,11 @@ impl WebPagesManager {
             env.change_files_source(source_id, &old_file_ids, &new_file_ids, "update_web_page");
         }
 
-        let _ = old_instant_view;
+        // `update_web_page_instant_view` (cpp:897) — the old/new
+        // instant-view merge: a loaded old view survives an empty
+        // server answer through `need_use_old_instant_view`.
+        let new_instant_view = self.web_pages[&web_page_id].instant_view.clone();
+        self.update_web_page_instant_view(env, web_page_id, new_instant_view, old_instant_view);
         if is_changed && !from_database {
             self.on_web_page_changed(env, web_page_id, true);
             let web_page = self.web_pages.get(&web_page_id).unwrap().clone();
@@ -1071,86 +1155,161 @@ impl WebPagesManager {
         file_source_id
     }
 
+    /// The `td_->create_handler<GetWebPageQuery>(…)->send(...)` collapse
+    /// (WebPagesManager.cpp:117-135) — the dispatcher tag rides the
+    /// kind; `None` on the handle keeps the net-inert posture (the
+    /// pre-init windows and the net-inert tests; the
+    /// `send_attach_menu_net_query` shape).
+    fn send_web_pages_net_query(
+        &mut self,
+        kind: WebPagesNetKind,
+        what: &str,
+        build: impl FnOnce() -> telegram_api::Function,
+    ) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(kind, build()),
+            None => tdutils::log_info!("Send {what} — [net-inert]"),
+        }
+    }
+
+    /// Run one parked `Promise<WebPageId>` tail with the query result
+    /// — the C++ promise chain settles exactly here (the lambda
+    /// re-entry cpp:1271-1280, the actor's object build
+    /// Requests.cpp:1138-1146).
+    pub(crate) fn settle_web_page_id(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        tail: WebPageIdTail,
+        result: tdutils::status::Result<WebPageId>,
+    ) {
+        match tail {
+            WebPageIdTail::Promise { mut promise } => promise.set_result(result),
+            WebPageIdTail::InstantViewImpl { only_local, inner } => match result {
+                TdResult::Ok(web_page_id) => {
+                    self.get_web_page_instant_view_impl(env, web_page_id, only_local, *inner);
+                }
+                TdResult::Err(status) => {
+                    self.settle_web_page_id(env, *inner, TdResult::Err(status))
+                }
+            },
+            WebPageIdTail::InstantViewObject { mut promise } => match result {
+                TdResult::Ok(web_page_id) if web_page_id.is_valid() => {
+                    match self.get_web_page_instant_view_object(env, web_page_id) {
+                        Some(object) => promise.set_value(object),
+                        // the `send_result(nullptr)` rewrite
+                        // (Td.cpp:1405-1409)
+                        None => promise.set_error(Status::error(404, "Not Found")),
+                    }
+                }
+                TdResult::Ok(_) => promise.set_error(Status::error(404, "Not Found")),
+                TdResult::Err(status) => promise.set_error(status),
+            },
+        }
+    }
+
     /// `WebPagesManager::fetch_web_page_by_url`
     /// (WebPagesManager.cpp:1470-1483).
-    pub fn fetch_web_page_by_url(
+    pub(crate) fn fetch_web_page_by_url(
         &mut self,
         env: &mut impl WebPagesManagerEnv,
         url: &str,
-        promise: Promise<WebPageId>,
+        tail: WebPageIdTail,
     ) {
-        self.load_web_page_by_url(env, url.to_owned(), false, promise);
+        if url.is_empty() {
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
+        }
+        if let Some((web_page_id, _)) = self.url_to_web_page_id.get(url) {
+            let web_page_id = *web_page_id;
+            return self.settle_web_page_id(env, tail, TdResult::Ok(web_page_id));
+        }
+        self.load_web_page_by_url(env, url.to_owned(), false, tail);
     }
 
-    /// `WebPagesManager::load_web_page_by_url`
-    /// (WebPagesManager.cpp:1484-1499) — the db-load + net-reload half.
+    /// `WebPagesManager::load_web_page_by_url` (cpp:1484-1498) — the
+    /// url→id database ladder collapses onto the url-map probe (the
+    /// module doc's pmc-persistence collapse); the cache miss
+    /// re-fetches through `reload_web_page_by_url`.
     fn load_web_page_by_url(
         &mut self,
         env: &mut impl WebPagesManagerEnv,
         url: String,
-        _only_local: bool,
-        mut promise: Promise<WebPageId>,
+        only_local: bool,
+        tail: WebPageIdTail,
     ) {
         let web_page_id = self.get_web_page_by_url(&url);
         if web_page_id.is_valid() {
-            promise.set_value(web_page_id);
-            return;
+            return self.settle_web_page_id(env, tail, TdResult::Ok(web_page_id));
         }
-        if self.have_web_page_force(env, web_page_id) {
-            promise.set_value(web_page_id);
-            return;
-        }
-        // [blocked: net]: the GetWebPageQuery reload — the promise parks
-        // with the query, and the pending timeout keeps the URL alive.
-        if !env.close_flag() {
-            env.add_pending_web_page_timeout(0, 1.0);
-        }
+        self.reload_web_page_by_url(env, &url, only_local, tail);
     }
 
-    /// `WebPagesManager::reload_web_page_by_url`
-    /// (WebPagesManager.cpp:1557-1564).
-    pub fn reload_web_page_by_url(
+    /// `WebPagesManager::reload_web_page_by_url` (cpp:1557-1563) — the
+    /// by-URL send; the promise tail rides the query (parked in the
+    /// family lot, popped by the answer).
+    pub(crate) fn reload_web_page_by_url(
         &mut self,
         env: &mut impl WebPagesManagerEnv,
         url: &str,
         only_local: bool,
-        promise: Promise<WebPageId>,
+        tail: WebPageIdTail,
     ) {
-        let web_page_id = self.get_web_page_by_url(url);
-        if web_page_id.is_valid() {
-            self.get_web_page_instant_view_impl(env, web_page_id, only_local, promise);
+        // `TRY_STATUS_PROMISE(promise, G()->close_status())` — the
+        // port drops the promise on close (the collapsed-actor
+        // convention)
+        if env.close_flag() {
             return;
         }
-        self.load_web_page_by_url(env, url.to_owned(), only_local, promise);
+        if only_local {
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
+        }
+        // `GetWebPageQuery::send` (cpp:126-129): the empty-url band
+        // settles before any query.
+        if url.is_empty() {
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
+        }
+        self.pending_web_page_queries.push(tail);
+        let url = url.to_owned();
+        self.send_web_pages_net_query(
+            WebPagesNetKind::GetWebPage {
+                web_page_id: WebPageId::default(),
+            },
+            "messages.getWebPage",
+            move || {
+                telegram_api::Function::messages_getWebPage(telegram_api::messages_getWebPage {
+                    url,
+                    hash: 0,
+                })
+            },
+        );
     }
 
     /// `WebPagesManager::get_web_page_instant_view`
     /// (WebPagesManager.cpp:1256-1282).
-    pub fn get_web_page_instant_view(
+    pub(crate) fn get_web_page_instant_view(
         &mut self,
         env: &mut impl WebPagesManagerEnv,
         url: &str,
         only_local: bool,
-        mut promise: Promise<WebPageId>,
+        tail: WebPageIdTail,
     ) {
         if url.is_empty() {
-            promise.set_value(WebPageId::default());
-            return;
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
         }
         if let Some((web_page_id, _)) = self.url_to_web_page_id.get(url) {
+            let web_page_id = *web_page_id;
             if !web_page_id.is_valid() {
-                self.reload_web_page_by_url(env, url, only_local, promise);
-                return;
+                // ignore negative caching (cpp:1267-1269)
+                return self.reload_web_page_by_url(env, url, only_local, tail);
             }
-            self.get_web_page_instant_view_impl(env, *web_page_id, only_local, promise);
-            return;
+            return self.get_web_page_instant_view_impl(env, web_page_id, only_local, tail);
         }
-        let web_page_id = self.get_web_page_by_url(url);
-        if web_page_id.is_valid() {
-            self.get_web_page_instant_view_impl(env, web_page_id, only_local, promise);
-            return;
-        }
-        self.load_web_page_by_url(env, url.to_owned(), only_local, promise);
+        // the `PromiseCreator::lambda` chain (cpp:1271-1280): the
+        // resolved id re-enters `get_web_page_instant_view_impl`
+        let tail = WebPageIdTail::InstantViewImpl {
+            only_local,
+            inner: Box::new(tail),
+        };
+        self.load_web_page_by_url(env, url.to_owned(), only_local, tail);
     }
 
     /// `WebPagesManager::get_web_page_instant_view_impl`
@@ -1160,76 +1319,354 @@ impl WebPagesManager {
         env: &mut impl WebPagesManagerEnv,
         web_page_id: WebPageId,
         only_local: bool,
-        mut promise: Promise<WebPageId>,
+        tail: WebPageIdTail,
     ) {
         if env.close_flag() {
             return;
         }
-        let web_page_instant_view = match self.web_pages.get(&web_page_id) {
-            Some(web_page) if !web_page.instant_view.is_empty => {
-                Some(web_page.instant_view.clone())
-            }
-            _ => None,
+        // `get_web_page_instant_view` answers null for a missing page
+        // or an empty instant view (cpp:2364-2370)
+        let Some(web_page) = self.web_pages.get(&web_page_id) else {
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
         };
-        let Some(web_page_instant_view) = web_page_instant_view else {
-            promise.set_value(WebPageId::default());
-            return;
-        };
-        if !web_page_instant_view.is_loaded || !only_local {
-            self.load_web_page_instant_view(env, web_page_id, only_local, promise);
-            return;
+        let (is_loaded, instant_view_is_empty) = (
+            web_page.instant_view.is_loaded,
+            web_page.instant_view.is_empty,
+        );
+        if instant_view_is_empty {
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
         }
-        promise.set_value(web_page_id);
+        if !is_loaded || !only_local {
+            return self.load_web_page_instant_view(env, web_page_id, only_local, tail);
+        }
+        self.settle_web_page_id(env, tail, TdResult::Ok(web_page_id));
     }
 
     /// `WebPagesManager::load_web_page_instant_view`
-    /// (WebPagesManager.cpp:1305-1342) — the db half, then the
-    /// [blocked: net] server half.
+    /// (WebPagesManager.cpp:1305-1341) — the only-local database half,
+    /// then the server-reload half (the promise tail parks per
+    /// WebPageId; the head entry owns the in-flight query).
     fn load_web_page_instant_view(
         &mut self,
         env: &mut impl WebPagesManagerEnv,
         web_page_id: WebPageId,
         only_local: bool,
-        mut promise: Promise<WebPageId>,
+        tail: WebPageIdTail,
     ) {
-        if !env.use_message_database() || only_local {
-            self.load_server_web_page_instant_view_queries
-                .entry(web_page_id)
-                .or_default()
-                .push(promise);
-            if self.load_server_web_page_instant_view_queries[&web_page_id].len() == 1 {
-                let url = self.get_web_page_url(web_page_id);
-                let hash = self
-                    .web_pages
-                    .get(&web_page_id)
-                    .map_or(0, |web_page| web_page.instant_view.hash);
-                let reload = Promise::default();
-                env.send_get_web_page_query(web_page_id, url, hash, reload);
-            }
+        if env.close_flag() {
             return;
         }
-        let value =
-            env.sqlite_pmc_get_raw(&Self::get_web_page_instant_view_database_key(web_page_id));
-        if value.is_empty() {
-            self.load_server_web_page_instant_view_queries
-                .entry(web_page_id)
-                .or_default()
-                .push(promise);
-            return;
-        }
-        let mut parser = Parser::new(&value);
-        let instant_view = match WebPageInstantView::parse(env, &mut parser) {
-            Ok(instant_view) => instant_view,
-            Err(_) => {
-                env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(web_page_id));
-                promise.set_value(web_page_id);
+        if only_local {
+            let was_loaded_from_database = self
+                .web_pages
+                .get(&web_page_id)
+                .is_some_and(|web_page| web_page.instant_view.was_loaded_from_database);
+            if env.use_message_database() && !was_loaded_from_database {
+                let queries = self
+                    .load_web_page_instant_view_queries
+                    .entry(web_page_id)
+                    .or_default();
+                queries.push(tail);
+                if queries.len() == 1 {
+                    // the async `pmc->get` lambda (cpp:1316-1321)
+                    // collapses onto the sync read (the
+                    // `have_web_page_force` convention)
+                    let value = env.sqlite_pmc_get_raw(
+                        &Self::get_web_page_instant_view_database_key(web_page_id),
+                    );
+                    self.on_load_web_page_instant_view_from_database(env, web_page_id, value);
+                }
                 return;
             }
-        };
-        if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
-            web_page.instant_view = instant_view;
+            return self.settle_web_page_id(env, tail, TdResult::Ok(WebPageId::default()));
         }
-        promise.set_value(web_page_id);
+        let queries = self
+            .load_server_web_page_instant_view_queries
+            .entry(web_page_id)
+            .or_default();
+        queries.push(tail);
+        if queries.len() == 1 {
+            let Some(web_page) = self.web_pages.get(&web_page_id) else {
+                // the C++ CHECK band (cpp:1332) — the impl gate
+                // guarantees a page with an instant view
+                tdutils::log_error!(
+                    "Have no web page {} to reload the instant view of",
+                    web_page_id.get()
+                );
+                return;
+            };
+            let url = web_page.url.clone();
+            // `is_full_ ? hash_ : 0` (cpp:1338-1339)
+            let hash = if web_page.instant_view.is_full {
+                web_page.instant_view.hash
+            } else {
+                0
+            };
+            self.send_web_pages_net_query(
+                WebPagesNetKind::GetWebPage { web_page_id },
+                "messages.getWebPage",
+                move || {
+                    telegram_api::Function::messages_getWebPage(telegram_api::messages_getWebPage {
+                        url,
+                        hash,
+                    })
+                },
+            );
+        }
+    }
+
+    /// `WebPagesManager::on_load_web_page_instant_view_from_database`
+    /// (WebPagesManager.cpp:1343-1397) — the sync-read collapse of the
+    /// async `pmc->get` answer; the record parse pairs the bare
+    /// framing the database half reads with (the versioned
+    /// log-event framing is the pmc-persistence plane's collapse).
+    fn on_load_web_page_instant_view_from_database(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        value: Vec<u8>,
+    ) {
+        if env.close_flag() {
+            return;
+        }
+        // the page may lose its instant view before the database
+        // answer (cpp:1351-1362)
+        let instant_view_is_empty = self
+            .web_pages
+            .get(&web_page_id)
+            .is_none_or(|web_page| web_page.instant_view.is_empty);
+        if instant_view_is_empty {
+            tdutils::log_warning!("There is no instant view in {}", web_page_id.get());
+            if !value.is_empty() {
+                env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(web_page_id));
+            }
+            return self.on_load_web_page_instant_view(env, web_page_id, WebPageId::default());
+        }
+        if self.web_pages[&web_page_id]
+            .instant_view
+            .was_loaded_from_database
+        {
+            return;
+        }
+        let mut instant_view = if !value.is_empty() {
+            let mut parser = Parser::new(&value);
+            match WebPageInstantView::parse(env, &mut parser) {
+                Ok(instant_view) => instant_view,
+                Err(_) => {
+                    // the parse failure erases the record (cpp:1374-1379)
+                    env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(
+                        web_page_id,
+                    ));
+                    WebPageInstantView::default()
+                }
+            }
+        } else {
+            WebPageInstantView::default()
+        };
+        instant_view.was_loaded_from_database = true;
+
+        let (current_instant_view, old_file_ids) = {
+            let web_page = &self.web_pages[&web_page_id];
+            (
+                web_page.instant_view.clone(),
+                self.get_web_page_file_ids(web_page),
+            )
+        };
+        // `update_web_page_instant_view` (cpp:1393) — the merge writes
+        // the page record in place (the C++ reference pair collapses
+        // onto the map write-back)
+        self.update_web_page_instant_view(env, web_page_id, current_instant_view, instant_view);
+
+        let new_file_ids = self.get_web_page_file_ids(&self.web_pages[&web_page_id]);
+        if old_file_ids != new_file_ids {
+            let url = self.web_pages[&web_page_id].url.clone();
+            let source_id = self.get_url_file_source_id(env, &url);
+            env.change_files_source(
+                source_id,
+                &old_file_ids,
+                &new_file_ids,
+                "on_load_web_page_instant_view_from_database",
+            );
+        }
+        self.on_load_web_page_instant_view(env, web_page_id, web_page_id);
+    }
+
+    /// `WebPagesManager::update_web_page_instant_view_load_requests`
+    /// (WebPagesManager.cpp:1399-1413) — the lot drain's shared tail.
+    fn update_web_page_instant_view_load_requests(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        mut new_web_page_id: WebPageId,
+        tails: Vec<WebPageIdTail>,
+    ) {
+        // the null / not-loaded instant view collapses the id
+        // (cpp:1403-1411)
+        match self
+            .web_pages
+            .get(&new_web_page_id)
+            .filter(|web_page| !web_page.instant_view.is_empty)
+            .map(|web_page| web_page.instant_view.is_loaded)
+        {
+            None => new_web_page_id = WebPageId::default(),
+            Some(false) => {
+                tdutils::log_error!(
+                    "Expected to receive instant view of {}/{new_web_page_id} from the server, but didn't receive it",
+                    web_page_id.get()
+                );
+                new_web_page_id = WebPageId::default();
+            }
+            Some(true) => {}
+        }
+        for tail in tails {
+            self.settle_web_page_id(env, tail, TdResult::Ok(new_web_page_id));
+        }
+    }
+
+    /// `WebPagesManager::on_load_web_page_instant_view`
+    /// (WebPagesManager.cpp:1415-1425) — the local (database) lot drain.
+    fn on_load_web_page_instant_view(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        new_web_page_id: WebPageId,
+    ) {
+        if let Some(tails) = self.load_web_page_instant_view_queries.remove(&web_page_id) {
+            self.update_web_page_instant_view_load_requests(
+                env,
+                web_page_id,
+                new_web_page_id,
+                tails,
+            );
+        }
+    }
+
+    /// `WebPagesManager::on_reload_web_page_instant_view`
+    /// (WebPagesManager.cpp:1427-1445) — the server lot drain; the
+    /// answer router's target for the valid-id `GetWebPage` sends.
+    pub(crate) fn on_reload_web_page_instant_view(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        result: tdutils::status::Result<WebPageId>,
+    ) {
+        // `G()->ignore_result_if_closing(r_web_page_id)` (cpp:1428)
+        if env.close_flag() {
+            return;
+        }
+        if let TdResult::Ok(new_web_page_id) = result {
+            self.on_load_web_page_instant_view(env, web_page_id, new_web_page_id);
+        }
+        let Some(tails) = self
+            .load_server_web_page_instant_view_queries
+            .remove(&web_page_id)
+        else {
+            return;
+        };
+        match result {
+            TdResult::Ok(new_web_page_id) => self.update_web_page_instant_view_load_requests(
+                env,
+                web_page_id,
+                new_web_page_id,
+                tails,
+            ),
+            TdResult::Err(status) => {
+                tdutils::log_info!(
+                    "Receive error {} for load {}",
+                    status.message(),
+                    web_page_id.get()
+                );
+                for tail in tails {
+                    self.settle_web_page_id(env, tail, TdResult::Err(status.clone()));
+                }
+            }
+        }
+    }
+
+    /// `WebPagesManager::update_web_page_instant_view`
+    /// (WebPagesManager.cpp:905-953) — the old/new instant-view merge;
+    /// the merged record writes back into the page (the C++ reference
+    /// pair collapses onto the map write-back).
+    fn update_web_page_instant_view(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        new_instant_view: WebPageInstantView,
+        old_instant_view: WebPageInstantView,
+    ) {
+        let new_from_database = new_instant_view.was_loaded_from_database;
+        let old_from_database = old_instant_view.was_loaded_from_database;
+        let mut new_instant_view = new_instant_view;
+        if new_instant_view.is_empty && !new_from_database {
+            // the new view is from the server and is empty — erase the
+            // instant view (cpp:908-918)
+            if env.use_message_database() && (!old_instant_view.is_empty || !old_from_database) {
+                new_instant_view.was_loaded_from_database = true;
+                if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
+                    web_page.instant_view = new_instant_view;
+                }
+                env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(web_page_id));
+            }
+            return;
+        }
+        if Self::need_use_old_instant_view(&new_instant_view, &old_instant_view) {
+            new_instant_view = old_instant_view;
+        }
+        if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
+            web_page.instant_view = new_instant_view.clone();
+        }
+        if env.use_message_database() && !new_instant_view.is_empty && new_instant_view.is_loaded {
+            // we have an instant view and probably want it to be saved
+            if !new_from_database && !old_from_database {
+                // load it from the database first (cpp:931-933) — the
+                // recursive local load (the inner merge writes the
+                // record; the empty-promise tail parks with the lot)
+                return self.load_web_page_instant_view(
+                    env,
+                    web_page_id,
+                    true,
+                    WebPageIdTail::Promise {
+                        promise: Promise::default(),
+                    },
+                );
+            }
+            if !new_instant_view.was_loaded_from_database {
+                tdutils::log_info!("Save instant view of {} to database", web_page_id.get());
+                new_instant_view.was_loaded_from_database = true;
+                if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
+                    web_page.instant_view = new_instant_view.clone();
+                }
+                let mut out = Vec::new();
+                new_instant_view.store(env, &mut out);
+                env.sqlite_pmc_set_raw(
+                    &Self::get_web_page_instant_view_database_key(web_page_id),
+                    &out,
+                );
+            }
+        }
+    }
+
+    /// `WebPagesManager::need_use_old_instant_view`
+    /// (WebPagesManager.cpp:955-974).
+    fn need_use_old_instant_view(
+        new_instant_view: &WebPageInstantView,
+        old_instant_view: &WebPageInstantView,
+    ) -> bool {
+        if old_instant_view.is_empty || !old_instant_view.is_loaded {
+            return false;
+        }
+        if new_instant_view.is_empty || !new_instant_view.is_loaded {
+            return true;
+        }
+        if new_instant_view.is_full != old_instant_view.is_full {
+            return old_instant_view.is_full;
+        }
+        if new_instant_view.hash == old_instant_view.hash {
+            // the same instant view
+            return !new_instant_view.is_full || old_instant_view.is_full;
+        }
+        // data in database is always outdated
+        new_instant_view.was_loaded_from_database
     }
 
     /// `WebPagesManager::on_get_web_page_instant_view_view_count`
@@ -1251,10 +1688,11 @@ impl WebPagesManager {
 
     /// `WebPagesManager::get_web_page_preview`
     /// (WebPagesManager.cpp:1219-1255) — the URL extraction + the
-    /// [blocked: net] query seam.
+    /// [blocked: net/M.17] query seam (the M.17 link-preview object
+    /// builder settles the answer).
     pub fn get_web_page_preview(
         &mut self,
-        env: &mut impl WebPagesManagerEnv,
+        _env: &mut impl WebPagesManagerEnv,
         text: Option<td_api::FormattedText>,
         link_preview_options: Option<td_api::LinkPreviewOptions>,
         mut promise: Promise<Option<td_api::LinkPreview>>,
@@ -1282,8 +1720,9 @@ impl WebPagesManager {
         };
         // WebPagesManager.cpp:1226-1240 — the is-disabled and url bands.
         // The known-web-page band (the local get_link_preview_object
-        // answer) is [blocked: M.17 residue — the link-preview object
-        // builder family] and rides the query seam with the rest.
+        // answer, cpp:1241-1244) is [blocked: M.17 residue — the
+        // link-preview object builder family] and rides the query
+        // seam with the rest.
         if link_preview_options.as_ref().is_some_and(|o| o.is_disabled) {
             promise.set_value(None);
             return;
@@ -1300,44 +1739,35 @@ impl WebPagesManager {
         let mut options = GetWebPagePreviewOptions::from_td_api(link_preview_options);
         options.skip_confirmation = skip_confirmation;
         options.first_url = url;
-        env.send_get_web_page_preview_query(formatted_text, Box::new(options), promise);
+        // `GetWebPagePreviewQuery::send` (cpp:95-101) — [blocked:
+        // net/M.17]: the query's answer settles through
+        // `on_get_web_page_preview` → `get_link_preview_object`
+        // (cpp:2040-2196), the M.17 link-preview object builder
+        // family; the wire kind + the answer walk land with it (the
+        // promise parks offline, exactly like the C++ without a
+        // network).
+        tdutils::log_info!("Send messages.getWebPagePreview — [blocked: net/M.17]");
+        let _ = (formatted_text, options, promise);
     }
 
-    /// The collapsed `GetWebPageInstantViewRequest` do_send_result
-    /// (Requests.cpp:1138-1146): resolve the id through the ladder, then
-    /// build the instant-view object for the answered band; the net
-    /// parking band leaves the promise unanswered offline.
+    /// The collapsed `GetWebPageInstantViewRequest` (Requests.cpp:1127-1146):
+    /// the ladder runs with the `InstantViewObject` promise tail — the
+    /// settled id builds the instant-view object at settle (the null
+    /// object answers the 404 rewrite), whether synchronously off the
+    /// cache or when the parked query's answer drains.
     pub fn get_web_page_instant_view_with_object(
         &mut self,
         env: &mut impl WebPagesManagerEnv,
         url: &str,
         only_local: bool,
-        mut promise: Promise<td_api::WebPageInstantView>,
+        promise: Promise<td_api::WebPageInstantView>,
     ) {
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let capture = std::sync::Arc::clone(&slot);
-        let inner = tdutils::promise::PromiseCreator::lambda_result(
-            move |result: tdutils::status::Result<WebPageId>| {
-                *capture.lock().unwrap() = Some(result);
-            },
+        self.get_web_page_instant_view(
+            env,
+            url,
+            only_local,
+            WebPageIdTail::InstantViewObject { promise },
         );
-        self.get_web_page_instant_view(env, url, only_local, inner);
-        match slot.lock().unwrap().take() {
-            Some(tdutils::status::Result::Ok(web_page_id)) => {
-                if web_page_id.is_valid() {
-                    match self.get_web_page_instant_view_object(env, web_page_id) {
-                        Some(object) => promise.set_value(object),
-                        None => promise.set_error(Status::error(400, "Web page not found")),
-                    }
-                } else {
-                    promise.set_error(Status::error(400, "Web page not found"));
-                }
-            }
-            Some(tdutils::status::Result::Err(status)) => promise.set_error(status),
-            None => {
-                // [blocked: net]: the ladder parked; the promise parks.
-            }
-        }
     }
 
     /// `WebPagesManager::on_pending_web_page_timeout`
@@ -1355,8 +1785,17 @@ impl WebPagesManager {
             return;
         }
         if let Some(url) = self.pending_web_page_urls.get(&web_page_id).cloned() {
-            let fetch = Promise::default();
-            self.fetch_web_page_by_url(env, &url, fetch);
+            // the collapsed re-fetch half — the polls branch's
+            // `reload_web_page_by_url(url, false, Promise<WebPageId>())`
+            // (cpp:2428-2439) over the pending-url registry; the empty
+            // promise tail rides the query
+            self.fetch_web_page_by_url(
+                env,
+                &url,
+                WebPageIdTail::Promise {
+                    promise: Promise::default(),
+                },
+            );
             return;
         }
         let message_full_ids: Vec<MessageFullId> = self
@@ -1671,6 +2110,11 @@ mod tests {
         file_counter: std::cell::Cell<i64>,
         timeouts: std::cell::RefCell<Vec<(i64, f64)>>,
         binlog: std::cell::RefCell<Vec<(i32, Vec<u8>)>>,
+        /// The in-memory sqlite pmc (the net-drain 46 database half).
+        pmc: std::cell::RefCell<HashMap<Vec<u8>, Vec<u8>>>,
+        /// The erased pmc keys (the merge-band asserts).
+        erases: std::cell::RefCell<Vec<Vec<u8>>>,
+        use_message_database: std::cell::Cell<bool>,
     }
 
     impl crate::photo::PhotoStoreEnv for TestEnv {
@@ -1804,16 +2248,21 @@ mod tests {
             false
         }
         fn use_message_database(&self) -> bool {
-            false
+            self.use_message_database.get()
         }
         fn server_time(&self) -> f64 {
             0.0
         }
-        fn sqlite_pmc_get_raw(&mut self, _key: &[u8]) -> Vec<u8> {
-            Vec::new()
+        fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+            self.pmc.borrow().get(key).cloned().unwrap_or_default()
         }
-        fn sqlite_pmc_set_raw(&mut self, _key: &[u8], _value: &[u8]) {}
-        fn sqlite_pmc_erase(&mut self, _key: &[u8]) {}
+        fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+            self.pmc.borrow_mut().insert(key.to_vec(), value.to_vec());
+        }
+        fn sqlite_pmc_erase(&mut self, key: &[u8]) {
+            self.pmc.borrow_mut().remove(key);
+            self.erases.borrow_mut().push(key.to_vec());
+        }
         fn binlog_add_web_page(&mut self, data: &[u8]) -> u64 {
             self.binlog.borrow_mut().push((0x10, data.to_vec()));
             1
@@ -1854,12 +2303,6 @@ mod tests {
         ) {
         }
         fn get_messages_from_server(&mut self, _message_full_ids: &[MessageFullId]) {}
-        fn reload_quick_reply_message(
-            &mut self,
-            _shortcut_id: QuickReplyShortcutId,
-            _message_id: crate::messages_manager::MessageId,
-        ) {
-        }
         fn force_create_dialog(&mut self, _dialog_id: DialogId) {}
         fn on_get_story(
             &mut self,
@@ -1903,21 +2346,6 @@ mod tests {
         fn is_premium(&self) -> bool {
             false
         }
-        fn send_get_web_page_preview_query(
-            &mut self,
-            _text: crate::message_entity::FormattedText,
-            _options: Box<GetWebPagePreviewOptions>,
-            _promise: Promise<Option<td_api::LinkPreview>>,
-        ) {
-        }
-        fn send_get_web_page_query(
-            &mut self,
-            _web_page_id: WebPageId,
-            _url: String,
-            _hash: i32,
-            _promise: Promise<WebPageId>,
-        ) {
-        }
     }
 
     fn env() -> TestEnv {
@@ -1926,7 +2354,273 @@ mod tests {
             file_counter: std::cell::Cell::new(0),
             timeouts: std::cell::RefCell::new(Vec::new()),
             binlog: std::cell::RefCell::new(Vec::new()),
+            pmc: std::cell::RefCell::new(HashMap::new()),
+            erases: std::cell::RefCell::new(Vec::new()),
+            use_message_database: std::cell::Cell::new(false),
         }
+    }
+
+    /// A slot-captured `Promise<WebPageId>` (the band-test probe).
+    type IdSlot = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<WebPageId>>>>;
+
+    fn id_slot() -> (Promise<WebPageId>, IdSlot) {
+        let slot: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<WebPageId>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+            *capture.lock().unwrap() = Some(result);
+        });
+        (promise, slot)
+    }
+
+    /// A stored instant-view database record (the bare framing the
+    /// database half parses).
+    fn stored_instant_view(env: &mut TestEnv, web_page_id: WebPageId, hash: i32) {
+        let mut out = Vec::new();
+        WebPageInstantView {
+            hash,
+            is_full: true,
+            is_loaded: true,
+            is_empty: false,
+            ..WebPageInstantView::default()
+        }
+        .store(env, &mut out);
+        env.sqlite_pmc_set_raw(
+            &WebPagesManager::get_web_page_instant_view_database_key_for_test(web_page_id),
+            &out,
+        );
+    }
+
+    #[test]
+    fn fresh_web_pages_carry_no_instant_view() {
+        // the C++ member initializer (cpp:178): `is_empty_` defaults
+        // true — a page without an instant view settles the null ladder
+        // band instead of arming a server reload
+        let web_page = WebPage::default();
+        assert!(web_page.instant_view.is_empty);
+        assert!(!web_page.instant_view.is_loaded);
+    }
+
+    #[test]
+    fn instant_view_database_half_loads_and_merges() {
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        env.use_message_database.set(true);
+        let web_page_id = WebPageId::new(5);
+        manager.web_pages.insert(
+            web_page_id,
+            WebPage {
+                url: "https://example.com/iv".to_owned(),
+                instant_view: WebPageInstantView {
+                    hash: 7,
+                    is_loaded: true,
+                    is_empty: false,
+                    ..WebPageInstantView::default()
+                },
+                ..WebPage::default()
+            },
+        );
+        stored_instant_view(&mut env, web_page_id, 42);
+
+        let (promise, slot) = id_slot();
+        manager.load_web_page_instant_view(
+            &mut env,
+            web_page_id,
+            true,
+            WebPageIdTail::Promise { promise },
+        );
+        // the sync database read drains inside the call: the stored
+        // view wins the merge (cpp:955-974) and the tail settles with
+        // the id
+        let settled = slot.lock().unwrap().take();
+        assert!(
+            matches!(settled, Some(tdutils::status::Result::Ok(id)) if id == web_page_id),
+            "the database half settles the id: {settled:?}"
+        );
+        let instant_view = &manager.web_pages[&web_page_id].instant_view;
+        assert_eq!(instant_view.hash, 42, "the stored view won the merge");
+        assert!(instant_view.is_full, "the is_full merge band (cpp:966-967)");
+        assert!(instant_view.is_loaded);
+        assert!(instant_view.was_loaded_from_database);
+        assert!(manager.load_web_page_instant_view_queries.is_empty());
+    }
+
+    #[test]
+    fn instant_view_database_half_empty_record_saves_the_current_view() {
+        // no stored record: the parsed default is db-from (cpp:1381) —
+        // the merge keeps the current view and the save band writes it
+        // to the database (cpp:935-944)
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        env.use_message_database.set(true);
+        let web_page_id = WebPageId::new(6);
+        manager.web_pages.insert(
+            web_page_id,
+            WebPage {
+                url: "https://example.com/none".to_owned(),
+                instant_view: WebPageInstantView {
+                    hash: 3,
+                    is_full: true,
+                    is_loaded: true,
+                    is_empty: false,
+                    ..WebPageInstantView::default()
+                },
+                ..WebPage::default()
+            },
+        );
+
+        let (promise, slot) = id_slot();
+        manager.load_web_page_instant_view(
+            &mut env,
+            web_page_id,
+            true,
+            WebPageIdTail::Promise { promise },
+        );
+        let settled = slot.lock().unwrap().take();
+        assert!(
+            matches!(settled, Some(tdutils::status::Result::Ok(id)) if id == web_page_id),
+            "the empty database record settles the current id: {settled:?}"
+        );
+        let iv_key = WebPagesManager::get_web_page_instant_view_database_key_for_test(web_page_id);
+        assert!(
+            env.pmc.borrow().contains_key(&iv_key),
+            "the save band stored the current view"
+        );
+        let instant_view = &manager.web_pages[&web_page_id].instant_view;
+        assert_eq!(instant_view.hash, 3, "the current view won the merge");
+        assert!(instant_view.was_loaded_from_database);
+    }
+
+    #[test]
+    fn server_empty_instant_view_erases_the_database_record() {
+        // `update_web_page` (cpp:897) with a fresh server page (no
+        // cached_page) erases a stored instant view (cpp:908-918)
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        env.use_message_database.set(true);
+        let web_page_id = WebPageId::new(7);
+        manager.web_pages.insert(
+            web_page_id,
+            WebPage {
+                url: "https://example.com/iv".to_owned(),
+                instant_view: WebPageInstantView {
+                    hash: 42,
+                    is_full: true,
+                    is_loaded: true,
+                    is_empty: false,
+                    was_loaded_from_database: true,
+                    ..WebPageInstantView::default()
+                },
+                ..WebPage::default()
+            },
+        );
+        let iv_key = WebPagesManager::get_web_page_instant_view_database_key_for_test(web_page_id);
+        env.pmc.borrow_mut().insert(iv_key.clone(), vec![1, 2, 3]);
+
+        let fresh = WebPage {
+            url: "https://example.com/iv".to_owned(),
+            type_: "article".to_owned(),
+            ..WebPage::default()
+        };
+        manager.update_web_page(&mut env, fresh, web_page_id, false, false);
+
+        let instant_view = &manager.web_pages[&web_page_id].instant_view;
+        assert!(
+            instant_view.is_empty,
+            "the server-empty band cleared the view"
+        );
+        assert!(instant_view.was_loaded_from_database);
+        assert!(
+            env.erases.borrow().contains(&iv_key),
+            "the stored instant-view record was erased"
+        );
+    }
+
+    #[test]
+    fn instant_view_object_tail_answers_the_null_rewrite() {
+        // the `GetWebPageInstantViewRequest` actor tail
+        // (Requests.cpp:1138-1146): the invalid id and the null object
+        // answer the send_result null rewrite — 404 "Not Found"
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        let slot: std::sync::Arc<
+            std::sync::Mutex<Option<tdutils::status::Result<td_api::WebPageInstantView>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+            *capture.lock().unwrap() = Some(result);
+        });
+        manager.settle_web_page_id(
+            &mut env,
+            WebPageIdTail::InstantViewObject { promise },
+            TdResult::Ok(WebPageId::default()),
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 404);
+                assert_eq!(status.message(), "Not Found");
+            }
+            other => panic!("the null rewrite: {other:?}"),
+        }
+
+        // the loaded view builds the object
+        let (promise, slot) = id_slot();
+        manager.web_pages.insert(
+            WebPageId::new(9),
+            WebPage {
+                url: "https://example.com/iv".to_owned(),
+                instant_view: WebPageInstantView {
+                    is_empty: false,
+                    is_loaded: true,
+                    view_count: 7,
+                    ..WebPageInstantView::default()
+                },
+                ..WebPage::default()
+            },
+        );
+        manager.settle_web_page_id(
+            &mut env,
+            WebPageIdTail::InstantViewImpl {
+                only_local: true,
+                inner: Box::new(WebPageIdTail::Promise { promise }),
+            },
+            TdResult::Ok(WebPageId::new(9)),
+        );
+        // impl(9, only_local): the loaded view settles without any
+        // query — the plain tail carries the id
+        assert!(
+            matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(id)) if id == WebPageId::new(9)
+            ),
+            "the loaded only-local settle"
+        );
+    }
+
+    #[test]
+    fn reload_head_error_fails_the_server_lot() {
+        // `on_reload_web_page_instant_view` (cpp:1439-1441) — the
+        // error band fails every parked tail with the same status
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        let web_page_id = WebPageId::new(11);
+        let (promise, slot) = id_slot();
+        manager
+            .load_server_web_page_instant_view_queries
+            .insert(web_page_id, vec![WebPageIdTail::Promise { promise }]);
+        manager.on_reload_web_page_instant_view(
+            &mut env,
+            web_page_id,
+            TdResult::Err(Status::error(500, "WEBPAGE_CACHED_FAILED")),
+        );
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 500);
+                assert_eq!(status.message(), "WEBPAGE_CACHED_FAILED");
+            }
+            other => panic!("the server-lot error band: {other:?}"),
+        }
+        assert!(manager.load_server_web_page_instant_view_queries.is_empty());
     }
 
     #[test]

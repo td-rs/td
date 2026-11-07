@@ -48,7 +48,6 @@ use crate::star_gift_manager::{
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
 use crate::td::AttachMenuEnv;
-use crate::td::AutosaveEnv;
 use crate::td::BackgroundEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
@@ -6894,6 +6893,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -6901,7 +6901,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
             td.terms_of_service_manager.accept_terms_of_service(
                 &mut env,
@@ -9551,39 +9551,27 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |s: td_api::AutosaveSettings| {
                 Object::autosaveSettings(s)
             });
-            let mut env = AutosaveEnv {
-                global: &mut td.global,
-                updates: &mut td.autosave_updates,
-            };
-            td.autosave_manager.get_autosave_settings(&mut env, promise);
+            let (mut manager, mut env) = crate::td::autosave_env_split(&mut *td);
+            manager.get_autosave_settings(&mut env, promise);
+            td.autosave_manager = manager;
         }
         Function::setAutosaveSettings(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = AutosaveEnv {
-                global: &mut td.global,
-                updates: &mut td.autosave_updates,
-            };
-            td.autosave_manager.set_autosave_settings(
-                &mut env,
-                request.scope,
-                request.settings,
-                promise,
-            );
+            let (mut manager, mut env) = crate::td::autosave_env_split(&mut *td);
+            manager.set_autosave_settings(&mut env, request.scope, request.settings, promise);
+            td.autosave_manager = manager;
         }
         Function::clearAutosaveSettingsExceptions(_) => {
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = AutosaveEnv {
-                global: &mut td.global,
-                updates: &mut td.autosave_updates,
-            };
-            td.autosave_manager
-                .clear_autosave_settings_exceptions(&mut env, promise);
+            let (mut manager, mut env) = crate::td::autosave_env_split(&mut *td);
+            manager.clear_autosave_settings_exceptions(&mut env, promise);
+            td.autosave_manager = manager;
         }
 
         // Everything else waits for its manager step.

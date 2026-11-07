@@ -90,7 +90,7 @@ use crate::message_content::*;
 use crate::message_entity::FormattedText;
 use crate::messages_manager::{
     DialogId, EphemeralMessageFullId, FileUploadId, FolderId, MessageFullId,
-    QuickReplyMessageFullId, QuickReplyShortcutId, StoryFullId, StoryId,
+    QuickReplyMessageFullId, StoryFullId, StoryId,
 };
 use crate::mtproto_header::gen_default_header;
 use crate::notification_manager::NotificationManager;
@@ -3139,7 +3139,8 @@ type CommunityNetHandle = NetKindHandle<CommunityNetKind>;
 
 /// The AccountManager in-flight query kinds — the C++ ResultHandler
 /// classes of AccountManager.cpp:180-612 (the sessions/authorizations,
-/// web-authorization, contact-token and TTL families).
+/// web-authorization, contact-token and TTL families) plus the sibling
+/// terms-of-service pair (TermsOfServiceManager.cpp:23-92, net-drain 51).
 #[derive(Clone, Copy)]
 pub(crate) enum AccountNetKind {
     /// `SetAccountTtlQuery` (cpp:180) — the `!result` 500 band.
@@ -3177,6 +3178,15 @@ pub(crate) enum AccountNetKind {
     /// `ImportContactTokenQuery` (cpp:574) — the `on_get_user` intake
     /// answers with the stored user object.
     ImportContactToken,
+    /// `GetTermsOfServiceUpdateQuery` (TermsOfServiceManager.cpp:23-62)
+    /// — the auth-success poll; the answer routes
+    /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_get_terms_of_service`].
+    GetTermsOfServiceUpdate,
+    /// `AcceptTermsOfServiceQuery` (TermsOfServiceManager.cpp:64-92) —
+    /// the dataJSON accept; the Bool answer routes
+    /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_accept_terms_of_service`]
+    /// with the parked request promise.
+    AcceptTermsOfService,
 }
 
 /// The cloned account dispatch surface the [`AccountEnv`] senders use —
@@ -3532,6 +3542,10 @@ pub(crate) enum AutoDownloadNetKind {
 /// use — the answers drain through [`Td::on_auto_download_net_answer`].
 type AutoDownloadNetHandle = NetKindHandle<AutoDownloadNetKind>;
 
+/// The cloned autosave dispatch surface the [`AutosaveEnv`] senders use —
+/// the answers drain through [`Td::on_autosave_net_answer`].
+pub(crate) type AutosaveNetHandle = NetKindHandle<crate::autosave_manager::AutosaveNetKind>;
+
 /// The cloned quick-reply dispatch surface the [`QuickReplyEnv`]
 /// senders use — the answers drain through
 /// [`Td::on_quick_reply_net_answer`].
@@ -3655,6 +3669,13 @@ pub(crate) type ForumTopicNetHandle = NetKindHandle<crate::forum_topic_manager::
 pub(crate) type TranscriptionNetHandle =
     NetKindHandle<crate::transcription_manager::TranscriptionNetKind>;
 
+/// The cloned web-pages dispatch surface the
+/// [`crate::web_pages_manager::WebPagesManager`] holds — the
+/// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
+/// reloads and the instant-view heads); the answers drain through
+/// [`Td::on_web_pages_net_answer`]. Manager-held (the forum-topic
+/// shape): the send legs run inside the manager over the env's reads.
+pub(crate) type WebPagesNetHandle = NetKindHandle<crate::web_pages_manager::WebPagesNetKind>;
 /// The cloned attach-menu dispatch surface the
 /// [`crate::attach_menu_manager::AttachMenuManager`] holds — the
 /// net-drain 42 families' send legs (the reload/single-bot/toggle
@@ -6017,6 +6038,9 @@ pub struct Td {
     /// The callback-parked auto-download query answers
     /// (the `Td::on_auto_download_net_answer` drain).
     auto_download_net_completed: Arc<Mutex<Vec<(AutoDownloadNetKind, NetQuery)>>>,
+    /// The callback-parked autosave query answers
+    /// (the `Td::on_autosave_net_answer` drain).
+    autosave_net_completed: Arc<Mutex<Vec<(crate::autosave_manager::AutosaveNetKind, NetQuery)>>>,
     /// The parked auto-download promises.
     auto_download_promises: Vec<PendingAutoDownloadQuery>,
     /// The callback-parked quick-reply query answers (the
@@ -6140,6 +6164,11 @@ pub struct Td {
     /// [`Td::on_forum_topic_net_answer`].
     forum_topic_net_completed:
         Arc<Mutex<Vec<(crate::forum_topic_manager::ForumTopicNetKind, NetQuery)>>>,
+    /// The web-pages net completed queue (the `WebPagesNetKind` tags;
+    /// the net-drain 46 family) — the dispatcher callbacks park here,
+    /// the actor pump routes them through
+    /// [`Td::on_web_pages_net_answer`].
+    web_pages_net_completed: Arc<Mutex<Vec<(crate::web_pages_manager::WebPagesNetKind, NetQuery)>>>,
     /// The transcription net completed queue (the
     /// `TranscriptionNetKind` tags; the net-drain 47 families) — the
     /// dispatcher callbacks park here, the actor pump routes them
@@ -6641,6 +6670,7 @@ impl Td {
             privacy_net_completed: Arc::new(Mutex::new(Vec::new())),
             privacy_promises: Vec::new(),
             auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
+            autosave_net_completed: Arc::new(Mutex::new(Vec::new())),
             auto_download_promises: Vec::new(),
             quick_reply_net_completed: Arc::new(Mutex::new(Vec::new())),
             theme_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -6665,6 +6695,7 @@ impl Td {
             notification_settings_net_completed: Arc::new(Mutex::new(Vec::new())),
             dialog_participant_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
+            web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
@@ -7158,6 +7189,7 @@ impl Td {
         self.group_call_manager.net = self.group_call_net();
         self.call_manager.net = self.call_net();
         self.forum_topic_manager.net = self.forum_topic_net();
+        self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
@@ -8956,6 +8988,7 @@ impl Td {
         self.dispatch_completed_translation_net();
         self.dispatch_completed_privacy_net();
         self.dispatch_completed_auto_download_net();
+        self.dispatch_completed_autosave_net();
         self.dispatch_completed_quick_reply_net();
         self.dispatch_completed_theme_net();
         self.dispatch_completed_premium_net();
@@ -8973,6 +9006,7 @@ impl Td {
         self.dispatch_completed_notification_settings_net();
         self.dispatch_completed_dialog_participant_net();
         self.dispatch_completed_forum_topic_net();
+        self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
         self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_story_net();
@@ -9183,6 +9217,15 @@ impl Td {
         })
     }
 
+    /// The cloned autosave dispatch surface (the `AutosaveEnv` senders).
+    pub(crate) fn autosave_net(&self) -> Option<AutosaveNetHandle> {
+        Some(AutosaveNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.autosave_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned quick-reply dispatch surface.
     fn quick_reply_net(&self) -> Option<QuickReplyNetHandle> {
         Some(QuickReplyNetHandle {
@@ -9352,6 +9395,18 @@ impl Td {
         Some(ForumTopicNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.forum_topic_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned web-pages dispatch surface the
+    /// [`crate::web_pages_manager::WebPagesManager`] holds — `None`
+    /// keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests).
+    pub(crate) fn web_pages_net(&self) -> Option<WebPagesNetHandle> {
+        Some(WebPagesNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.web_pages_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10767,6 +10822,56 @@ impl Td {
             self.on_quick_reply_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked autosave answers — the C++ ResultHandler
+    /// halves (AutosaveManager.cpp:32-95).
+    fn dispatch_completed_autosave_net(&mut self) {
+        let completed = std::mem::take(&mut *self.autosave_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_autosave_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one autosave net answer by kind — the get promise chains
+    /// into the real [`crate::autosave_manager::AutosaveManager::
+    /// on_get_auto_save_settings`] intake (the C++ promise lambda,
+    /// AutosaveManager.cpp:346-350); the save value drops and the error
+    /// band reloads (cpp:82-94, the manager's own FIFO).
+    fn on_autosave_net_answer(
+        &mut self,
+        kind: crate::autosave_manager::AutosaveNetKind,
+        query: NetQuery,
+    ) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        // the split carries the live handle — the get intake's SCOPE_EXIT
+        // reload tail and the save error band re-send through it
+        let (mut manager, mut env) = autosave_env_split(self);
+        match kind {
+            crate::autosave_manager::AutosaveNetKind::GetAutoSaveSettings => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::account_AutoSaveSettings::parse(query.ok())
+                        .map_err(|_| parse_error("account_getAutoSaveSettings"))
+                };
+                manager.on_get_auto_save_settings(&mut env, result);
+            }
+            crate::autosave_manager::AutosaveNetKind::SaveAutoSaveSettings => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool_value(query.ok())
+                        .map(|_| ())
+                        .ok_or_else(|| parse_error("account_saveAutoSaveSettings"))
+                };
+                manager.on_save_auto_save_settings(&mut env, result);
+            }
+        }
+        self.autosave_manager = manager;
     }
 
     /// Drain the callback-parked theme answers — the C++ ResultHandler
@@ -17598,6 +17703,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked WebPages answers — the C++
+    /// ResultHandler halves of the net-drain 46 family
+    /// (`GetWebPageQuery`, WebPagesManager.cpp:117-166).
+    fn dispatch_completed_web_pages_net(&mut self) {
+        let completed = std::mem::take(&mut *self.web_pages_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_web_pages_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Drain the callback-parked Transcription answers — the C++
     /// ResultHandler halves of the net-drain 47 families
     /// (TranscriptionInfo.cpp:21-91).
@@ -19582,6 +19698,106 @@ impl Td {
                     "messages.reorderPinnedForumTopics",
                     "ReorderPinnedForumTopicsQuery",
                 );
+            }
+        }
+    }
+
+    /// Route one web-pages net answer by kind — the ResultHandler halves
+    /// of the net-drain 46 family (`GetWebPageQuery`,
+    /// WebPagesManager.cpp:117-166). The page intake
+    /// (`on_get_web_page`) and the url registration
+    /// (`on_get_web_page_by_url`) live in the manager; the
+    /// `webPageNotModified` band (the view-count intake, cpp:147-156)
+    /// runs here; the invalid-id sends settle the parked
+    /// `WebPageIdTail` lot, the valid-id sends drain the instant-view
+    /// lots through `on_reload_web_page_instant_view` (cpp:1334-1339).
+    fn on_web_pages_net_answer(
+        &mut self,
+        kind: crate::web_pages_manager::WebPagesNetKind,
+        query: NetQuery,
+    ) {
+        use crate::web_pages_manager::WebPagesNetKind as K;
+
+        match kind {
+            K::GetWebPage { web_page_id } => {
+                // the handler's `url_` capture (cpp:131) re-parsed off
+                // the query payload — the answer pairs with its own
+                // request exactly (no FIFO url lot)
+                let url = match telegram_api::Function::parse(query.query()) {
+                    Ok(telegram_api::Function::messages_getWebPage(body)) => body.url,
+                    _ => String::new(),
+                };
+                let result: tdutils::status::Result<crate::webpage::WebPageId> = if query.is_error()
+                {
+                    // `GetWebPageQuery::on_error` (cpp:163-164)
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_WebPage::parse(query.ok()) {
+                        Ok(answer) => {
+                            tdutils::log_info!("Receive result for GetWebPageQuery");
+                            self.intake_users(answer.users, "GetWebPageQuery");
+                            self.intake_chats(answer.chats, "GetWebPageQuery");
+                            match answer.webpage.map(|page| *page) {
+                                // the `webPageNotModified` band
+                                // (cpp:147-156)
+                                Some(telegram_api::WebPage::webPageNotModified(page)) => {
+                                    if web_page_id.is_valid() {
+                                        let view_count = page.cached_page_views;
+                                        let (mut env, manager) = web_pages_env_split(self);
+                                        manager.on_get_web_page_instant_view_view_count(
+                                            &mut env,
+                                            web_page_id,
+                                            view_count,
+                                        );
+                                        tdutils::status::Result::Ok(web_page_id)
+                                    } else {
+                                        tdutils::log_error!(
+                                            "Receive webPageNotModified for {}",
+                                            url
+                                        );
+                                        tdutils::status::Result::Err(Status::error(
+                                            500,
+                                            "Receive webPageNotModified",
+                                        ))
+                                    }
+                                }
+                                // the page walk (cpp:158-160)
+                                Some(page) => {
+                                    let (mut env, manager) = web_pages_env_split(self);
+                                    let new_web_page_id = manager.on_get_web_page(
+                                        &mut env,
+                                        page,
+                                        crate::dialog_id::DialogId::default(),
+                                    );
+                                    manager.on_get_web_page_by_url(&url, new_web_page_id, false);
+                                    tdutils::status::Result::Ok(new_web_page_id)
+                                }
+                                None => tdutils::status::Result::Err(Status::error(
+                                    500,
+                                    "Failed to parse the messages.getWebPage answer",
+                                )),
+                            }
+                        }
+                        Err(_) => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getWebPage answer",
+                        )),
+                    }
+                };
+                let (mut env, manager) = web_pages_env_split(self);
+                if web_page_id.is_valid() {
+                    // the instant-view reload head: the answer drains the
+                    // server lot (the C++ query-promise lambda,
+                    // cpp:1334-1339)
+                    manager.on_reload_web_page_instant_view(&mut env, web_page_id, result);
+                } else {
+                    // the by-URL send: the promise tail settles (FIFO per
+                    // family, §5)
+                    if !manager.pending_web_page_queries.is_empty() {
+                        let tail = manager.pending_web_page_queries.remove(0);
+                        manager.settle_web_page_id(&mut env, tail, result);
+                    }
+                }
             }
         }
     }
@@ -22309,6 +22525,87 @@ impl Td {
                         }
                     }
                 }
+            }
+            // `GetTermsOfServiceUpdateQuery` (TermsOfServiceManager.cpp:
+            // 23-62) — the answer converts the Empty/Update halves
+            // into the (expires, TermsOfService) pair (cpp:36-57) and
+            // routes the poll intake `on_get_terms_of_service`
+            // (cpp:145-167); the error leg is the logged drop (the C++
+            // `Random::fast(10, 60)` reschedule rides the collapsed
+            // timer plane, cpp:59-61 → 151-153).
+            AccountNetKind::GetTermsOfServiceUpdate => {
+                let result: std::result::Result<
+                    (i32, crate::terms_of_service::TermsOfService),
+                    Status,
+                > = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::help_TermsOfServiceUpdate::parse(query.ok()) {
+                        Ok(
+                            telegram_api::help_TermsOfServiceUpdate::help_termsOfServiceUpdateEmpty(
+                                update,
+                            ),
+                        ) => Ok((
+                            update.expires,
+                            crate::terms_of_service::TermsOfService::default(),
+                        )),
+                        Ok(telegram_api::help_TermsOfServiceUpdate::help_termsOfServiceUpdate(
+                            update,
+                        )) => Ok((
+                            update.expires,
+                            crate::terms_of_service::TermsOfService::from_telegram(
+                                update.terms_of_service.as_ref(),
+                            ),
+                        )),
+                        Err(_) => Err(parse_error("help.getTermsOfServiceUpdate")),
+                    }
+                };
+                let mut env = AccountEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    user_manager: &mut self.user_manager,
+                    device_token_manager: &mut self.device_token_manager,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.account_updates,
+                    net: None,
+                };
+                self.terms_of_service_manager
+                    .on_get_terms_of_service(&mut env, result);
+            }
+            // `AcceptTermsOfServiceQuery` (TermsOfServiceManager.cpp:
+            // 64-92) — the Bool answer runs the accept intake with the
+            // parked request promise (the false band logs and still
+            // settles, cpp:80-87); the error leg forwards
+            // (cpp:89-91 → 176-178).
+            AccountNetKind::AcceptTermsOfService => {
+                let Some(mut promise) = self.terms_of_service_manager.take_accept_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Some(result) = parse_wire_bool_value(query.ok()) else {
+                    promise.set_error(parse_error("help.acceptTermsOfService"));
+                    return;
+                };
+                if !result {
+                    tdutils::log_error!("Failed to accept terms of service");
+                }
+                // The intake re-polls (the collapsed schedule(0)), so the
+                // env carries the live dispatch surface.
+                let net = self.account_net();
+                let mut env = AccountEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    user_manager: &mut self.user_manager,
+                    device_token_manager: &mut self.device_token_manager,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.account_updates,
+                    net,
+                };
+                self.terms_of_service_manager
+                    .on_accept_terms_of_service(&mut env, promise);
             }
             // `SetAccountTtlQuery` (cpp:180-209) — the `!result` 500 band.
             AccountNetKind::SetAccountTtl => {
@@ -26703,6 +27000,7 @@ impl Td {
     /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
     /// auth-success moment shared with `init_notification_manager`.
     fn init_terms_of_service_manager(&mut self) {
+        let net = self.account_net();
         let mut env = AccountEnv {
             global: &mut self.global,
             options: self.option_manager.as_mut(),
@@ -26710,7 +27008,7 @@ impl Td {
             device_token_manager: &mut self.device_token_manager,
             auth_is_bot: self.auth_manager.is_bot(),
             updates: &mut self.account_updates,
-            net: None,
+            net,
         };
         self.terms_of_service_manager.init(&mut env);
     }
@@ -35192,8 +35490,8 @@ impl tdnet::net_query::DcInitSink for InertDcInit {
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
 /// the field-split borrows (the `NotificationEnv` convention); the net
 /// field carries the live dispatch surface for the query senders (`None`
-/// keeps the net-inert posture — the TOS/suggested-action arms never
-/// send).
+/// keeps the net-inert posture — the account and terms-of-service
+/// families dispatch, the suggested-action arms stay net-inert).
 pub(crate) struct AccountEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: Option<&'a mut OptionManager>,
@@ -35532,8 +35830,50 @@ impl AccountManagerEnv for AccountEnv<'_> {
 }
 
 impl crate::terms_of_service_manager::TermsOfServiceManagerEnv for AccountEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    /// `GetTermsOfServiceUpdateQuery::send`
+    /// (TermsOfServiceManager.cpp:31-34).
+    fn send_get_terms_of_service_update_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::GetTermsOfServiceUpdate,
+                telegram_api::Function::help_getTermsOfServiceUpdate(
+                    telegram_api::help_getTermsOfServiceUpdate,
+                ),
+            ),
+            None => tdutils::log_info!("Send help.getTermsOfServiceUpdate — [net-inert]"),
+        }
+    }
+
+    /// `AcceptTermsOfServiceQuery::send` (TermsOfServiceManager.cpp:71-74)
+    /// — the dataJSON id form.
+    fn send_accept_terms_of_service_query(&mut self, terms_of_service_id: &str) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::AcceptTermsOfService,
+                telegram_api::Function::help_acceptTermsOfService(
+                    telegram_api::help_acceptTermsOfService {
+                        id: Some(telegram_api::DataJSON {
+                            data: terms_of_service_id.to_owned(),
+                        }),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send help.acceptTermsOfService for {terms_of_service_id} — [net-inert]"
+            ),
+        }
     }
 }
 
@@ -38115,40 +38455,60 @@ impl BoostManagerEnv for BoostEnv<'_> {
     }
 }
 
-/// The [`crate::autosave_manager::AutosaveManagerEnv`] over the `Td`
-/// fields — built per call with the field-split borrows (the
-/// `NotificationEnv` convention), never held across calls. The sqlite pmc
+/// The [`crate::autosave_manager::AutosaveManagerEnv`] over the whole
+/// `Td` — built per call through [`autosave_env_split`] (the
+/// `QuickReplyEnv` convention), never held across calls. The sqlite pmc
 /// surface routes to `TdDb::common_kv` (the C++ `get_sqlite_pmc` home);
 /// the calls are gated on `use_message_database` by the manager, matching
 /// the C++ branch that guards them.
 pub(crate) struct AutosaveEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out for the autosave manager — the
+/// manager out, the env over the `Td` remainder (the
+/// `quick_reply_env_split` convention); the caller restores the manager
+/// after the call.
+pub(crate) fn autosave_env_split(
+    td: &mut Td,
+) -> (crate::autosave_manager::AutosaveManager, AutosaveEnv<'_>) {
+    let manager = std::mem::take(&mut td.autosave_manager);
+    (manager, AutosaveEnv { td })
 }
 
 impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn use_message_database(&self) -> bool {
-        self.global.use_message_database()
+        self.td.global.use_message_database()
     }
 
     fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.td_db().common_kv().get(key)
+        self.td.global.td_db().common_kv().get(key)
     }
 
     fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.td_db().common_kv().set(key, value);
+        self.td.global.td_db().common_kv().set(key, value);
     }
 
     fn binlog_pmc_erase(&mut self, key: &str) {
-        self.global.binlog_pmc().erase(key);
+        self.td.global.binlog_pmc().erase(key);
     }
 
     fn send_update(&mut self, update: td_api::Update) {
-        self.updates.push(update);
+        self.td.autosave_updates.push(update);
+    }
+
+    /// `td_->dialog_manager_->get_input_peer` — the full InputPeer family
+    /// over the free fn (the whole-Td env reaches it directly).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
     }
 
     /// the simplified dialog seam until the M.5/M.7 dialog integration
@@ -38167,6 +38527,62 @@ impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
     fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
         // `dialog_manager::force_create_dialog` — the M.6/M.7 cache seam;
         // every dialog id is resolvable in the collapsed cache
+    }
+
+    /// `GetAutoSaveSettingsQuery::send` (AutosaveManager.cpp:40-42) —
+    /// the answers drain through `Td::on_autosave_net_answer`.
+    fn send_get_auto_save_settings_query(&mut self) {
+        match self.td.autosave_net() {
+            Some(net) => net.dispatch(
+                crate::autosave_manager::AutosaveNetKind::GetAutoSaveSettings,
+                telegram_api::Function::account_getAutoSaveSettings(
+                    telegram_api::account_getAutoSaveSettings,
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send GetAutoSaveSettings — [net-inert]");
+            }
+        }
+    }
+
+    /// `SaveAutoSaveSettingsQuery::send` (AutosaveManager.cpp:67-80) —
+    /// the peer form rides the `PEER_MASK` flag (the generated storer
+    /// carries the bare bool flags itself).
+    fn send_save_auto_save_settings_query(
+        &mut self,
+        users: bool,
+        chats: bool,
+        broadcasts: bool,
+        dialog_id: crate::dialog_id::DialogId,
+        peer: Option<tdmtproto::telegram_api::InputPeer>,
+        settings: &tdmtproto::telegram_api::AutoSaveSettings,
+    ) {
+        match self.td.autosave_net() {
+            Some(net) => net.dispatch(
+                crate::autosave_manager::AutosaveNetKind::SaveAutoSaveSettings,
+                telegram_api::Function::account_saveAutoSaveSettings(
+                    telegram_api::account_saveAutoSaveSettings {
+                        flags: if peer.is_some() {
+                            crate::autosave_manager::SAVE_AUTO_SAVE_SETTINGS_PEER_MASK
+                        } else {
+                            0
+                        },
+                        users,
+                        chats,
+                        broadcasts,
+                        peer: peer.map(Box::new),
+                        settings: Some(settings.clone()),
+                    },
+                ),
+            ),
+            None => {
+                let _ = dialog_id;
+                tdutils::log_info!(
+                    "Send SaveAutoSaveSettings(users = {users}, chats = {chats}, \
+                     broadcasts = {broadcasts}) — [net-inert]"
+                );
+            }
+        }
     }
 }
 
@@ -45165,14 +45581,6 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
         // [blocked: M.10/net]
     }
 
-    fn reload_quick_reply_message(
-        &mut self,
-        _shortcut_id: QuickReplyShortcutId,
-        _message_id: crate::message_id::MessageId,
-    ) {
-        // [blocked: Wave 3]
-    }
-
     fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
         // [blocked: M.6]
     }
@@ -45252,25 +45660,6 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
         self.options
             .as_ref()
             .is_some_and(|options| options.get_option_boolean("is_premium", false))
-    }
-
-    fn send_get_web_page_preview_query(
-        &mut self,
-        _text: crate::message_entity::FormattedText,
-        _options: Box<crate::web_pages_manager::GetWebPagePreviewOptions>,
-        _promise: Promise<Option<td_api::LinkPreview>>,
-    ) {
-        // [blocked: net]
-    }
-
-    fn send_get_web_page_query(
-        &mut self,
-        _web_page_id: crate::webpage::WebPageId,
-        _url: String,
-        _hash: i32,
-        _promise: Promise<crate::webpage::WebPageId>,
-    ) {
-        // [blocked: net]
     }
 }
 
@@ -52448,6 +52837,7 @@ mod tests {
         td.call_manager.net = td.call_net();
         td.statistics_manager.net = td.statistics_net();
         td.forum_topic_manager.net = td.forum_topic_net();
+        td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
         (td, rec, callback)
     }
@@ -55051,6 +55441,276 @@ mod tests {
         assert!(td.account_net_completed.lock().is_empty(), "drained");
     }
 
+    // ---- the net-drain 51 terms-of-service slice: the poll + accept
+    // families ride the account dispatch plane (the
+    // TermsOfServiceManager.cpp handler halves). ----
+
+    /// The net-drain 51 terms-of-service round-trips — the §3.9
+    /// families ride the dispatcher through the [`AccountEnv`] send
+    /// arms (GetTermsOfServiceUpdateQuery/AcceptTermsOfServiceQuery,
+    /// TermsOfServiceManager.cpp:23-92): the auth-success poll with the
+    /// full terms object in the update, the accept through the live
+    /// td_api arm with the schedule(0) re-poll, and the
+    /// false-Bool/error/parse bands.
+    #[test]
+    fn terms_of_service_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(terms_of_service_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn terms_of_service_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-terms");
+
+        // The env exactly as the production call sites build it —
+        // expanded at the call site so the field borrows stay disjoint.
+        macro_rules! terms_env {
+            () => {{
+                let net = td.account_net();
+                AccountEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    user_manager: &mut td.user_manager,
+                    device_token_manager: &mut td.device_token_manager,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.account_updates,
+                    net,
+                }
+            }};
+        }
+
+        fn terms_answer(expires: i32, id: &str, text: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_termsOfServiceUpdate {
+                expires,
+                terms_of_service: Some(telegram_api::help_TermsOfService {
+                    // bit 1 — min_age_confirm rides the wire
+                    flags: 1 << 1,
+                    popup: true,
+                    id: Some(telegram_api::DataJSON {
+                        data: id.to_owned(),
+                    }),
+                    text: text.to_owned(),
+                    entities: Vec::new(),
+                    min_age_confirm: 16,
+                }),
+            }
+            .store_boxed(&mut out);
+            out
+        }
+
+        fn empty_terms_answer(expires: i32) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_termsOfServiceUpdateEmpty { expires }.store_boxed(&mut out);
+            out
+        }
+
+        fn count_terms_updates(td: &Td) -> usize {
+            td.account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateTermsOfService(_)))
+                .count()
+        }
+
+        fn account_terms_update(td: &Td) -> Option<&td_api::updateTermsOfService> {
+            td.account_updates.iter().find_map(|update| match update {
+                td_api::Update::updateTermsOfService(update) => Some(update),
+                _ => None,
+            })
+        }
+
+        // 1. The auth-success poll — help.getTermsOfServiceUpdate
+        //    dispatches once (the is_inited_ gate, cpp:105-115); the
+        //    answer converts the Empty/Update halves (cpp:36-57) and
+        //    routes on_get_terms_of_service (cpp:145-167) — the update
+        //    carries the full terms object (cpp:136-143).
+        {
+            let mut env = terms_env!();
+            td.terms_of_service_manager.init(&mut env);
+            let mut env = terms_env!();
+            td.terms_of_service_manager.init(&mut env);
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].tl_constructor(),
+                telegram_api::help_getTermsOfServiceUpdate::ID
+            );
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                terms_answer(1_700_003_600, "tos-1", "Please accept"),
+            );
+            td.dispatch_completed_account_net();
+            let update = account_terms_update(&td).expect("the terms update emits");
+            assert_eq!(update.terms_of_service_id, "tos-1");
+            let terms = update.terms_of_service.as_ref().unwrap();
+            assert_eq!(terms.min_user_age, 16);
+            assert!(terms.show_popup);
+            assert_eq!(terms.text.as_ref().unwrap().text, "Please accept");
+        }
+
+        // 2. acceptTermsOfService through the live td_api arm — the
+        //    dataJSON wire form (cpp:71-74); boolTrue settles ok
+        //    (cpp:76-87), the pending clears with no update on the
+        //    accept itself (cpp:184-188), and the schedule(0) re-poll
+        //    dispatches again (the collapsed timer) — the empty-update
+        //    re-poll answer keeps the pending clear.
+        {
+            let updates_before = count_terms_updates(&td);
+            td.request(
+                201,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].tl_constructor(),
+                telegram_api::help_acceptTermsOfService::ID
+            );
+            let wire = telegram_api::help_acceptTermsOfService::parse(sent[0].query()).unwrap();
+            assert_eq!(wire.id.unwrap().data, "tos-1");
+            net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 201)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the accept settles ok"
+            );
+            assert_eq!(
+                count_terms_updates(&td),
+                updates_before,
+                "the accept itself emits no update"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].tl_constructor(),
+                telegram_api::help_getTermsOfServiceUpdate::ID
+            );
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                empty_terms_answer(1_700_003_600),
+            );
+            td.dispatch_completed_account_net();
+            assert_eq!(
+                count_terms_updates(&td),
+                updates_before,
+                "the empty re-poll answer emits nothing"
+            );
+        }
+
+        // 3. The false-Bool band — the LOG(ERROR) leg still settles ok
+        //    (cpp:80-87); the re-poll's terms answer re-emits the update
+        //    even though the id is unchanged (cpp:157-161 — the
+        //    reference sends on every non-empty poll, no id compare).
+        {
+            td.request(
+                202,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_complete(sent.into_iter().next().unwrap(), bool_answer(false));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 202)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the false Bool still settles ok"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                terms_answer(1_700_003_600, "tos-1", "Please accept"),
+            );
+            td.dispatch_completed_account_net();
+            assert_eq!(
+                count_terms_updates(&td),
+                2,
+                "the re-poll answer re-emits the update"
+            );
+        }
+
+        // 4. The error forward (cpp:89-91 → 176-178) and the
+        //    parse-failure 500 band.
+        {
+            td.request(
+                203,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_fail(
+                sent.into_iter().next().unwrap(),
+                400,
+                "TERMS_OF_SERVICE_INVALID",
+            );
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 203);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "TERMS_OF_SERVICE_INVALID");
+
+            td.request(
+                204,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_complete(
+                sent.into_iter().next().unwrap(),
+                vec![0x00, 0x00, 0x00, 0x00],
+            );
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 204);
+            assert_eq!(error.code, 500);
+            assert_eq!(
+                error.message,
+                "Failed to parse the help.acceptTermsOfService answer"
+            );
+        }
+
+        // 5. The poll error band — the failed answer routes the error
+        //    half of on_get_terms_of_service (logged + dropped; the C++
+        //    reschedules at Random::fast(10, 60), the collapsed timer
+        //    plane; cpp:59-61 → 151-153).
+        {
+            let updates_before = count_terms_updates(&td);
+            td.request(
+                205,
+                Function::acceptTermsOfService(td_api::acceptTermsOfService {
+                    terms_of_service_id: "tos-1".to_owned(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+            td.dispatch_completed_account_net();
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert_eq!(sent.len(), 1);
+            net_fail(sent.into_iter().next().unwrap(), 500, "FLOOD_WAIT");
+            td.dispatch_completed_account_net();
+            assert_eq!(
+                count_terms_updates(&td),
+                updates_before,
+                "the failed poll emits nothing"
+            );
+        }
+
+        assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
     // ---- the star net slice: the option/subscription/revenue families
     // ride the dispatcher and their answers drain through the real Td
     // routing (the StarManager.cpp handler halves). ----
@@ -55131,6 +55791,332 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// The net-drain 46 web-page round-trips — the GetWebPageQuery
+    /// family's send legs dispatch through the installed handle (the
+    /// by-URL reloads and the instant-view heads) and the wire answers
+    /// settle the parked promise tails (the band ladders live in
+    /// `web_pages_manager.rs`; these cover the dispatcher plumbing, the
+    /// ladder continuations and the null-object 404 rewrite).
+    #[test]
+    fn web_page_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(web_page_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn web_page_families_ride_the_dispatcher_impl() {
+        use crate::web_pages_manager::{WebPageIdTail, WebPageInstantView, WebPagesManager};
+        use crate::webpage::WebPageId;
+
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-web-pages");
+
+        /// A wire `webPage` answer body (no cached_page — the instant
+        /// view content plane rides the M.17 seam).
+        fn wire_page(id: i64, url: &str) -> telegram_api::WebPage {
+            telegram_api::WebPage::webPage(telegram_api::webPage {
+                id,
+                flags: 0,
+                url: url.to_owned(),
+                display_url: url.to_owned(),
+                hash: 0,
+                r#type: "article".to_owned(),
+                site_name: String::new(),
+                title: "Title".to_owned(),
+                description: String::new(),
+                photo: None,
+                embed_url: String::new(),
+                embed_type: String::new(),
+                embed_width: 0,
+                embed_height: 0,
+                duration: 0,
+                author: String::new(),
+                document: None,
+                cached_page: None,
+                attributes: Vec::new(),
+                has_large_media: false,
+                video_cover_photo: false,
+            })
+        }
+
+        /// The `messages.webPage` answer envelope.
+        fn web_page_answer(page: telegram_api::WebPage, users: Vec<telegram_api::User>) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&telegram_api::messages_WebPage::ID.to_le_bytes());
+            telegram_api::messages_WebPage {
+                webpage: Some(Box::new(page)),
+                chats: Vec::new(),
+                users,
+            }
+            .store(&mut out);
+            out
+        }
+
+        /// The `webPageNotModified` answer envelope.
+        fn not_modified_answer(cached_page_views: i32) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&telegram_api::messages_WebPage::ID.to_le_bytes());
+            telegram_api::messages_WebPage {
+                webpage: Some(Box::new(telegram_api::WebPage::webPageNotModified(
+                    telegram_api::webPageNotModified {
+                        flags: 1, // CACHED_PAGE_VIEWS
+                        cached_page_views,
+                    },
+                ))),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .store(&mut out);
+            out
+        }
+
+        /// Seed a cached page with a loaded instant view (the
+        /// instant-view reload head's precondition, cpp:1331-1332).
+        fn seed_page_with_instant_view(td: &mut Td, id: i64, url: &str, hash: i32, is_full: bool) {
+            let (mut env, manager) = crate::td::web_pages_env_split(td);
+            let web_page_id = WebPageId::new(id);
+            manager
+                .url_to_web_page_id
+                .insert(url.to_owned(), (web_page_id, false));
+            manager.web_pages.insert(
+                web_page_id,
+                crate::web_pages_manager::WebPage {
+                    url: url.to_owned(),
+                    display_url: url.to_owned(),
+                    type_: "article".to_owned(),
+                    title: "Title".to_owned(),
+                    ..crate::web_pages_manager::WebPage::default()
+                },
+            );
+            if let Some(page) = manager.web_pages.get_mut(&web_page_id) {
+                page.instant_view = WebPageInstantView {
+                    hash,
+                    is_full,
+                    is_loaded: true,
+                    is_empty: false,
+                    ..WebPageInstantView::default()
+                };
+            }
+            let _ = &mut env;
+        }
+
+        // 1. getWebPageInstantView over the live td_api arm — the cold
+        //    URL reload sends messages.getWebPage(url, 0); the full-page
+        //    answer lands the record + the url map, and the empty
+        //    instant view settles the actor tail through the null-object
+        //    rewrite (404 "Not Found", Td.cpp:1405-1409).
+        {
+            td.request(
+                1,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/page".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            let body = telegram_api::messages_getWebPage::parse(sent.query()).expect("the body");
+            assert_eq!(body.url, "https://example.com/page");
+            assert_eq!(body.hash, 0, "the cold by-URL hash");
+            net_complete(
+                sent,
+                web_page_answer(wire_page(5, "https://example.com/page"), Vec::new()),
+            );
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 1);
+            assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            // the landed record: the second, only-local request answers
+            // from the negative-cache ladder without any new query
+            td.request(
+                2,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/page".to_owned(),
+                    only_local: true,
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 2);
+            assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            assert!(
+                rec.sent.lock().is_empty(),
+                "the cached-url request dispatches nothing"
+            );
+        }
+
+        // 2. the wire error band — the by-URL send's error rides to the
+        //    request answer (the GetWebPageQuery::on_error half,
+        //    cpp:162-165).
+        {
+            td.request(
+                3,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/gone".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            net_fail(sent, 400, "WEBPAGE_NOT_EXIST");
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 3);
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (400, "WEBPAGE_NOT_EXIST")
+            );
+        }
+
+        // 3. the instant-view reload head — the cached page re-requests
+        //    with is_full ? hash : 0 (cpp:1329-1330); the
+        //    webPageNotModified answer runs the view-count intake
+        //    (cpp:141-146) and settles the parked actor tail with the
+        //    captured id, which builds the instant-view object.
+        {
+            seed_page_with_instant_view(&mut td, 7, "https://example.com/iv", 42, true);
+            td.request(
+                4,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/iv".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            let body = telegram_api::messages_getWebPage::parse(sent.query()).expect("the body");
+            assert_eq!(body.hash, 42, "the is_full hash re-request");
+            net_complete(sent, not_modified_answer(99));
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let responses = responses_of(&callback, 4);
+            assert_eq!(responses.len(), 1, "the not-modified settle");
+            let Object::webPageInstantView(object) = &responses[0] else {
+                panic!("the instant-view object answer: {:?}", responses[0]);
+            };
+            assert_eq!(object.view_count, 99, "the view-count intake");
+            // the view count persisted on the record
+            let (_, manager) = crate::td::web_pages_env_split(&mut td);
+            assert_eq!(
+                manager
+                    .web_pages
+                    .get(&WebPageId::new(7))
+                    .expect("the cached page")
+                    .instant_view
+                    .view_count,
+                99
+            );
+        }
+
+        // 4. the server-lot error band — the reload head's error fails
+        //    every parked tail of the lot (cpp:1439-1441).
+        {
+            seed_page_with_instant_view(&mut td, 8, "https://example.com/iv-err", 0, false);
+            td.request(
+                5,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/iv-err".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            let body = telegram_api::messages_getWebPage::parse(sent.query()).expect("the body");
+            assert_eq!(body.hash, 0, "the !is_full hash re-request");
+            net_fail(sent, 500, "Internal Server Error");
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 5);
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (500, "Internal Server Error")
+            );
+        }
+
+        // 5. the webPagePending band — the pending page arms the
+        //    timeout (the re-fetch keeps the URL) and the ladder
+        //    settles the empty-instant-view 404 (cpp:630-641).
+        {
+            td.request(
+                6,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/pending".to_owned(),
+                    only_local: false,
+                }),
+            );
+            let sent = take_sent_query(&rec, telegram_api::messages_getWebPage::ID);
+            net_complete(
+                sent,
+                web_page_answer(
+                    telegram_api::WebPage::webPagePending(telegram_api::webPagePending {
+                        flags: 1, // URL
+                        id: 9,
+                        date: 100,
+                        url: "https://example.com/pending".to_owned(),
+                    }),
+                    Vec::new(),
+                ),
+            );
+            td.dispatch_completed_web_pages_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 6);
+            assert_eq!((error.code, error.message.as_str()), (404, "Not Found"));
+            assert!(
+                td.web_pages_timeouts.contains_key(&9),
+                "the pending-page timeout armed"
+            );
+            assert_eq!(
+                td.web_pages_manager
+                    .pending_web_page_urls
+                    .get(&WebPageId::new(9))
+                    .map(String::as_str),
+                Some("https://example.com/pending")
+            );
+        }
+
+        // 6. the loaded-instant-view only_local band — the cached answer
+        //    settles without any query (cpp:1297-1299).
+        {
+            td.request(
+                7,
+                Function::getWebPageInstantView(td_api::getWebPageInstantView {
+                    url: "https://example.com/iv".to_owned(),
+                    only_local: true,
+                }),
+            );
+            td.flush_deferred_results();
+            let responses = responses_of(&callback, 7);
+            assert_eq!(responses.len(), 1, "the only-local settle");
+            assert!(
+                rec.sent.lock().is_empty(),
+                "the loaded-instant-view only-local request dispatches nothing"
+            );
+        }
+
+        // 7. the net-inert posture — the plain WebPageId tail parks in
+        //    the family lot when the handle is absent (the None arm
+        //    logs net-inert, §0.2).
+        {
+            td.web_pages_manager.net = None;
+            let slot: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<WebPageId>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            let (mut env, manager) = crate::td::web_pages_env_split(&mut td);
+            WebPagesManager::fetch_web_page_by_url(
+                manager,
+                &mut env,
+                "https://example.com/inert",
+                WebPageIdTail::Promise { promise },
+            );
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "the net-inert send parks the tail"
+            );
+            let (_, manager) = crate::td::web_pages_env_split(&mut td);
+            assert_eq!(manager.pending_web_page_queries.len(), 1);
+        }
     }
 
     fn forum_topic_families_ride_the_dispatcher_impl() {
@@ -68174,6 +69160,254 @@ mod tests {
         assert!(
             td.quick_reply_manager.net_promises.is_empty(),
             "all promises resolved"
+        );
+    }
+
+    // ---- the autosave net slice (§3.9): the get/save settings pair rides
+    // the dispatcher (AutosaveManager.cpp:32-95); the delete query stays
+    // parked at its seam. ----
+
+    /// A wire `autoSaveSettings` with the video-size flag (the
+    /// manager-test helper shape).
+    fn autosave_wire_settings(
+        photos: bool,
+        videos: bool,
+        size: i64,
+    ) -> telegram_api::AutoSaveSettings {
+        telegram_api::AutoSaveSettings {
+            flags: 1 << 2,
+            photos,
+            videos,
+            video_max_size: size,
+        }
+    }
+
+    /// A boxed `account.autoSaveSettings` answer.
+    fn autosave_answer(
+        users: telegram_api::AutoSaveSettings,
+        chats: telegram_api::AutoSaveSettings,
+        broadcasts: telegram_api::AutoSaveSettings,
+    ) -> Vec<u8> {
+        let mut answer = Vec::new();
+        telegram_api::account_AutoSaveSettings {
+            users_settings: Some(users),
+            chats_settings: Some(chats),
+            broadcasts_settings: Some(broadcasts),
+            exceptions: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .store_boxed(&mut answer);
+        answer
+    }
+
+    fn autosave_private_scope() -> td_api::AutosaveSettingsScope {
+        td_api::AutosaveSettingsScope::autosaveSettingsScopePrivateChats(
+            td_api::autosaveSettingsScopePrivateChats,
+        )
+    }
+
+    fn autosave_scope_chat(chat_id: i64) -> td_api::AutosaveSettingsScope {
+        td_api::AutosaveSettingsScope::autosaveSettingsScopeChat(
+            td_api::autosaveSettingsScopeChat { chat_id },
+        )
+    }
+
+    #[test]
+    fn autosave_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(autosave_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn autosave_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-autosave");
+
+        // seed a received user so the per-dialog save form resolves the
+        // peer with its access hash (the C++ in-query build, cpp:72-75)
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_users(env, vec![wire_user(7, "Bob")], "t");
+        });
+
+        // 1. the get leg: the reload query dispatches, the answer lands
+        //    in the real intake and the parked request promise resolves.
+        let (promise, slot) = record_bot_info_result::<td_api::AutosaveSettings>();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.get_autosave_settings(&mut env, promise);
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAutoSaveSettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            autosave_answer(
+                autosave_wire_settings(true, false, 10_000_000),
+                autosave_wire_settings(false, false, 1),
+                autosave_wire_settings(false, false, 1),
+            ),
+        );
+        td.dispatch_completed_autosave_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(settings)) => {
+                let private = settings.private_chat_settings.expect("inited");
+                assert!(private.autosave_photos && !private.autosave_videos);
+                assert!(settings.exceptions.is_empty());
+            }
+            other => panic!("unexpected get result: {other:?}"),
+        }
+        assert_eq!(td.autosave_updates.len(), 3, "one update per scope");
+
+        // 2. the save leg (the scope form): peer-less, the users flag
+        //    rides, no PEER_MASK.
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_private_scope()),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: true,
+                    autosave_videos: true,
+                    max_video_file_size: 20_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let parsed = telegram_api::account_saveAutoSaveSettings::parse(sent[0].query()).unwrap();
+        assert!(parsed.users && !parsed.chats && !parsed.broadcasts);
+        assert_eq!(parsed.flags & (1 << 3), 0, "the scope form is peer-less");
+        assert!(parsed.peer.is_none());
+        assert_eq!(parsed.settings.as_ref().unwrap().video_max_size, 20_000_000);
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_autosave_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 3. the per-dialog save form: the peer resolves with the access
+        //    hash and PEER_MASK rides the flags.
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_scope_chat(7)),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: true,
+                    autosave_videos: false,
+                    max_video_file_size: 3_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let parsed = telegram_api::account_saveAutoSaveSettings::parse(sent[0].query()).unwrap();
+        assert_eq!(
+            parsed.flags & (1 << 3),
+            1 << 3,
+            "the peer form rides PEER_MASK"
+        );
+        match parsed.peer.as_deref() {
+            Some(telegram_api::InputPeer::inputPeerUser(u)) => {
+                assert_eq!(u.user_id, 7);
+                assert_eq!(u.access_hash, 42);
+            }
+            other => panic!("the user peer rides the access hash: {other:?}"),
+        }
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_autosave_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 4. the unresolvable-peer band — the C++ in-query CHECK
+        //    downgrades to the sibling access band; no query goes out.
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_scope_chat(999)),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: true,
+                    autosave_videos: false,
+                    max_video_file_size: 3_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        assert!(rec.sent.lock().is_empty(), "no query for the banded save");
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "Chat not found");
+            }
+            other => panic!("the peer band answers 400: {other:?}"),
+        }
+
+        // 5. the save error band: the promise fails and the reload tail
+        //    re-fires the get query (the C++ on_error, cpp:91-94).
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = autosave_env_split(&mut td);
+            manager.set_autosave_settings(
+                &mut env,
+                Some(autosave_private_scope()),
+                Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: false,
+                    autosave_videos: false,
+                    max_video_file_size: 20_000_000,
+                }),
+                promise,
+            );
+            td.autosave_manager = manager;
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 429, "Too Many Requests");
+        td.dispatch_completed_autosave_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 429);
+            }
+            other => panic!("the error band fails the promise: {other:?}"),
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the reload re-fires");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getAutoSaveSettings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            autosave_answer(
+                autosave_wire_settings(false, false, 10_000_000),
+                autosave_wire_settings(false, false, 1),
+                autosave_wire_settings(false, false, 1),
+            ),
+        );
+        td.dispatch_completed_autosave_net();
+
+        assert!(td.autosave_net_completed.lock().is_empty(), "drained");
+        assert!(
+            td.autosave_manager.pending_save_promises.is_empty(),
+            "all save promises resolved"
         );
     }
 
