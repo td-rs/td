@@ -3729,6 +3729,14 @@ pub(crate) type GameNetHandle = NetKindHandle<crate::game_manager::GameNetKind>;
 pub(crate) type BotRecommendationNetHandle =
     NetKindHandle<crate::bot_recommendation_manager::BotRecommendationNetKind>;
 
+/// The cloned stickers dispatch surface the
+/// [`crate::stickers_manager::StickersManager`] holds — the net-drain 59
+/// families' send legs (the `StickersManager.cpp` ResultHandler query
+/// classes); the answers drain through [`Td::on_stickers_net_answer`].
+/// Manager-held (the bot-recommendation shape): the send legs run inside
+/// the manager over the env's file-plane reads.
+pub(crate) type StickersNetHandle = NetKindHandle<crate::stickers_manager::StickersNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -6298,6 +6306,10 @@ pub struct Td {
             )>,
         >,
     >,
+    /// The stickers net completed queue (the `StickersNetKind` tags; the
+    /// net-drain 59 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_stickers_net_answer`].
+    stickers_net_completed: Arc<Mutex<Vec<(crate::stickers_manager::StickersNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6821,6 +6833,7 @@ impl Td {
             callback_net_completed: Arc::new(Mutex::new(Vec::new())),
             game_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
+            stickers_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7319,6 +7332,7 @@ impl Td {
         self.callback_queries_manager.net = self.callback_net();
         self.game_manager.net = self.game_net();
         self.bot_recommendation_manager.net = self.bot_recommendation_net();
+        self.stickers_manager.net = self.stickers_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9144,6 +9158,7 @@ impl Td {
         self.dispatch_completed_callback_net();
         self.dispatch_completed_game_net();
         self.dispatch_completed_bot_recommendation_net();
+        self.dispatch_completed_stickers_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9632,6 +9647,18 @@ impl Td {
         Some(BotRecommendationNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.bot_recommendation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned stickers dispatch surface the
+    /// [`crate::stickers_manager::StickersManager`] holds — `None` keeps
+    /// the net-inert posture (the pre-init windows and the net-inert
+    /// tests).
+    pub(crate) fn stickers_net(&self) -> Option<StickersNetHandle> {
+        Some(StickersNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.stickers_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -16749,8 +16776,8 @@ impl Td {
                             )),
                         }
                     };
-                    let mut manager = std::mem::take(&mut self.premium_manager);
-                    manager.on_get_premium_gift_options(result, promise);
+                    let (mut manager, mut env) = premium_env_split(self);
+                    manager.on_get_premium_gift_options(&mut env, result, promise);
                     self.premium_manager = manager;
                 }
             }
@@ -18450,6 +18477,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.bot_recommendation_net_completed.lock());
         for (kind, query) in completed {
             self.on_bot_recommendation_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked Stickers answers — the C++
+    /// ResultHandler halves of the net-drain 59 families (the
+    /// `StickersManager.cpp` query classes).
+    fn dispatch_completed_stickers_net(&mut self) {
+        let completed = std::mem::take(&mut *self.stickers_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_stickers_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -21561,6 +21599,137 @@ impl Td {
                     manager.on_get_bot_recommendations(&mut env, bot_user_id, result);
                 }
                 self.bot_recommendation_manager = manager;
+            }
+        }
+    }
+
+    /// Route one Stickers net answer by kind — the C++
+    /// ResultHandler `on_result`/`on_error` halves of the StickersManager
+    /// query classes: the wire answer (or the wire error, or the
+    /// `fetch_result` parse failure riding the same Err path — the
+    /// landed-flip convention, §5) re-enters the manager's intake over
+    /// the request arms' take/put env shape; the request promises settle
+    /// from the parked family lots.
+    fn on_stickers_net_answer(
+        &mut self,
+        kind: crate::stickers_manager::StickersNetKind,
+        query: NetQuery,
+    ) {
+        match kind {
+            // `GetCustomEmojiDocumentsQuery` (StickersManager.cpp:1432-1459)
+            // — the `Vector<Document>` answer converts at the manager's
+            // `on_get_custom_emoji_documents` (cpp:6587-6606).
+            crate::stickers_manager::StickersNetKind::GetCustomEmojiDocuments => {
+                let (custom_emoji_ids, promise) = self
+                    .stickers_manager
+                    .take_pending_get_custom_emoji_documents()
+                    .unwrap_or_else(|| (Vec::new(), Promise::default()));
+                let result: tdutils::status::Result<Vec<telegram_api::Document>> = if query
+                    .is_error()
+                {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match parse_vector_document(query.ok()) {
+                        Some(documents) => {
+                            tdutils::log_info!("Receive result for GetCustomEmojiDocumentsQuery");
+                            tdutils::status::Result::Ok(documents)
+                        }
+                        None => tdutils::status::Result::Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getCustomEmojiDocuments answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.stickers_manager);
+                {
+                    let (mut env, _) = crate::td::stickers_env_split(self);
+                    manager.on_get_custom_emoji_documents(
+                        &mut env,
+                        result,
+                        custom_emoji_ids,
+                        promise,
+                    );
+                }
+                self.stickers_manager = manager;
+            }
+            // `ReloadSpecialStickerSetQuery` (StickersManager.cpp:794-832)
+            // — the `messages_StickerSet` answer runs the full record intake
+            // (cpp:3816-3948), then the special-set tail (cpp:4025-4054);
+            // the wire error and the parse failure both land in
+            // `on_load_special_sticker_set` (cpp:829-832). The changed arm
+            // passes an invalid expected id (cpp:809-814 — "sticker_set_id_
+            // must be replaced always") so the intake accepts a set-id
+            // change; the not-modified arm passes the carried id.
+            crate::stickers_manager::StickersNetKind::ReloadSpecialStickerSet {
+                set_type,
+                sticker_set_id,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_StickerSet::parse(query.ok()) {
+                        Ok(set) => {
+                            tdutils::log_info!("Receive result for ReloadSpecialStickerSetQuery");
+                            Ok(set)
+                        }
+                        Err(_) => Err(Status::error(
+                            500,
+                            "Failed to parse the messages.getStickerSet answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.stickers_manager);
+                {
+                    let (mut env, _) = crate::td::stickers_env_split(self);
+                    match result {
+                        Err(status) => {
+                            tdutils::log_warning!(
+                                "Receive error for ReloadSpecialStickerSetQuery: {status}"
+                            );
+                            manager.on_load_special_sticker_set(
+                                &mut env,
+                                set_type,
+                                tdutils::status::Result::Err(status),
+                            );
+                        }
+                        Ok(set) => {
+                            let (expected_id, is_changed) =
+                                match &set {
+                                    telegram_api::messages_StickerSet::messages_stickerSet(_) => {
+                                        // cpp:809-814 — the id can change on
+                                        // the changed arm; the invalid expected
+                                        // id keeps the mismatch band off
+                                        (
+                                            crate::stickers_manager::StickerSetId::default(),
+                                            true,
+                                        )
+                                    }
+                                    telegram_api::messages_StickerSet::messages_stickerSetNotModified(_) => {
+                                        (sticker_set_id, false)
+                                    }
+                                };
+                            let received_id = manager.on_get_messages_sticker_set(
+                                &mut env,
+                                expected_id,
+                                set,
+                                is_changed,
+                            );
+                            if !received_id.is_valid() {
+                                manager.on_load_special_sticker_set(
+                                    &mut env,
+                                    set_type,
+                                    tdutils::status::Result::Err(Status::error(
+                                        500,
+                                        "Failed to add special sticker set",
+                                    )),
+                                );
+                            } else {
+                                manager.on_get_special_sticker_set(&mut env, set_type, received_id);
+                            }
+                        }
+                    }
+                }
+                self.stickers_manager = manager;
             }
         }
     }
@@ -28515,6 +28684,34 @@ impl Td {
         )
     }
 
+    /// The `promise<td_api::object_ptr<T>>` form whose `nullptr` value arm
+    /// has no Rust response (ClientJson.cpp:94-95 answers JSON null) — the
+    /// null band parks (the `send_null_user` convention, recorded for the
+    /// S84 audit).
+    pub(crate) fn nullable_deferred_promise<T, F>(
+        &self,
+        id: u64,
+        map: F,
+    ) -> tdutils::promise::Promise<Option<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(T) -> Object + Send + 'static,
+    {
+        let outbox = Arc::clone(&self.deferred_results);
+        tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<Option<T>>| {
+                let result = match result {
+                    tdutils::status::Result::Ok(Some(value)) => Ok(map(value)),
+                    // the C++ answers JSON null; the Rust response plane has
+                    // no null object yet, so the promise parks
+                    tdutils::status::Result::Ok(None) => return,
+                    tdutils::status::Result::Err(status) => Err(status),
+                };
+                outbox.lock().push((id, result));
+            },
+        )
+    }
+
     /// Point the actor timeout at the earliest armed deadline (the member
     /// MultiTimeouts re-arm on every set/cancel). The slot is shared with
     /// the ConfigManager expire time and the recoverer wakeup, so this
@@ -32114,6 +32311,23 @@ fn parse_vector_premium_gift_code_option(
         options.push(telegram_api::PremiumGiftCodeOption::read(&mut reader).ok()?);
     }
     Some(options)
+}
+
+/// The bare `Vector<Document>` answer reader — the
+/// `fetch_result<messages_getCustomEmojiDocuments>` half
+/// (`GetCustomEmojiDocumentsQuery::on_result`,
+/// StickersManager.cpp:1446-1453).
+fn parse_vector_document(data: &[u8]) -> Option<Vec<telegram_api::Document>> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32().ok()? != telegram_api::tl::VECTOR_ID {
+        return None;
+    }
+    let count = reader.i32().ok()? as u32 as usize;
+    let mut documents = Vec::with_capacity(count);
+    for _ in 0..count {
+        documents.push(telegram_api::Document::read(&mut reader).ok()?);
+    }
+    Some(documents)
 }
 
 fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
@@ -39253,6 +39467,16 @@ pub(crate) fn premium_env_split(td: &mut Td) -> (crate::premium::PremiumManager,
 }
 
 impl PremiumEnv for PremiumTdEnv<'_> {
+    fn get_premium_gift_sticker_object(
+        &mut self,
+        month_count: i32,
+        star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        // Premium.cpp:446 — `stickers_manager_->get_premium_gift_sticker_object`
+        let (mut env, stickers_manager) = crate::td::stickers_env_split(self.td);
+        stickers_manager.get_premium_gift_sticker_object(&mut env, month_count, star_count)
+    }
+
     fn get_option_integer(&self, name: &str) -> i64 {
         self.td
             .option_manager
@@ -48752,6 +48976,7 @@ pub(crate) struct TdStickersEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
 }
 
 impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
@@ -48869,6 +49094,92 @@ impl crate::stickers_manager::StickersManagerEnv for TdStickersEnv<'_> {
         let file_manager = self.file_manager.lock();
         Some(file_manager.get_file_object(file_id))
     }
+
+    fn file_suggested_path(&mut self, file_id: crate::files::FileId) -> String {
+        let file_manager = self.file_manager.lock();
+        file_manager
+            .get_file_view(file_id)
+            .map(|view| view.suggested_path())
+            .unwrap_or_default()
+    }
+
+    fn file_register_sticker(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        dc_id: crate::chat_manager::DcId,
+        file_reference: String,
+        size: i64,
+        format: crate::documents_manager::StickerFormat,
+    ) -> crate::files::FileId {
+        let mut file_manager = self.file_manager.lock();
+        file_manager.register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                crate::files::FileType::Sticker,
+                document_id,
+                access_hash,
+                dc_id,
+                file_reference,
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::new(0),
+            size,
+            0,
+            format!(
+                "{}{}",
+                document_id,
+                crate::stickers_manager::get_sticker_format_extension(format)
+            ),
+        )
+    }
+
+    fn photo_size_registered(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        file_reference: String,
+        dc_id: crate::chat_manager::DcId,
+        size_ptr: telegram_api::PhotoSize,
+        format: crate::photo::PhotoFormat,
+    ) -> crate::photo::PhotoSizeOrMinithumbnail {
+        crate::photo::get_photo_size_registered(
+            &mut self.file_manager.lock(),
+            &mut self.file_load_manager.lock(),
+            crate::files::PhotoSizeSource::thumbnail(crate::files::FileType::Thumbnail, 0),
+            document_id,
+            access_hash,
+            file_reference,
+            dc_id,
+            crate::message_id::DialogId::new(0),
+            size_ptr,
+            format,
+        )
+    }
+
+    fn register_photo_size(
+        &mut self,
+        document_id: i64,
+        access_hash: i64,
+        file_reference: String,
+        file_size: i32,
+        dc_id: crate::chat_manager::DcId,
+        format: crate::photo::PhotoFormat,
+    ) -> crate::files::FileId {
+        crate::photo::register_photo_size(
+            &mut self.file_manager.lock(),
+            crate::files::PhotoSizeSource::thumbnail(
+                crate::files::FileType::Thumbnail,
+                b'f' as i32,
+            ),
+            document_id,
+            access_hash,
+            file_reference,
+            crate::message_id::DialogId::new(0),
+            file_size,
+            dc_id,
+            format,
+        )
+    }
 }
 
 /// The field-split over [`Td`] for the StickersManager request arms (the
@@ -48885,6 +49196,7 @@ pub(crate) fn stickers_env_split(
         auth_manager,
         user_manager,
         file_manager,
+        file_load_manager,
         stickers_manager,
         ..
     } = td;
@@ -48895,6 +49207,7 @@ pub(crate) fn stickers_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             file_manager: std::sync::Arc::clone(file_manager),
+            file_load_manager: std::sync::Arc::clone(file_load_manager),
         },
         stickers_manager,
     )
@@ -54448,6 +54761,7 @@ mod tests {
         td.callback_queries_manager.net = td.callback_net();
         td.game_manager.net = td.game_net();
         td.bot_recommendation_manager.net = td.bot_recommendation_net();
+        td.stickers_manager.net = td.stickers_net();
         (td, rec, callback)
     }
 
@@ -59502,6 +59816,560 @@ mod tests {
             td.bot_recommendation_net_completed.lock().is_empty(),
             "drained"
         );
+    }
+
+    #[test]
+    fn custom_emoji_documents_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(custom_emoji_documents_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 59 custom-emoji family —
+    /// `messages.getCustomEmojiDocuments` through the live td_api arm
+    /// (getCustomEmojiStickers, Requests.cpp:7745-7749): the outgoing
+    /// query carries the deduped unknown ids
+    /// (StickersManager.cpp:6583-6579), the answer runs the sticker-record
+    /// intake (`on_get_sticker_document` → `create_sticker` →
+    /// `on_get_sticker`, cpp:2972-3067/:3376-3435/:2845-2950) and the
+    /// parked request promise settles from the family lot.
+    fn custom_emoji_documents_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-stickers-custom-emoji");
+
+        /// A wire custom-emoji sticker document: the id is the custom
+        /// emoji id, the `documentAttributeCustomEmoji` carries the alt
+        /// and the set.
+        fn custom_emoji_document(
+            custom_emoji_id: i64,
+            alt: &str,
+            set_id: i64,
+        ) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                id: custom_emoji_id,
+                access_hash: 0x5100_0000_0000 + custom_emoji_id,
+                file_reference: b"ref".to_vec(),
+                mime_type: "application/x-tgsticker".to_string(),
+                size: 4096,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![
+                    telegram_api::DocumentAttribute::documentAttributeImageSize(
+                        telegram_api::documentAttributeImageSize { w: 100, h: 100 },
+                    ),
+                    telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                        telegram_api::documentAttributeCustomEmoji {
+                            flags: 0,
+                            free: true,
+                            text_color: false,
+                            alt: alt.to_owned(),
+                            stickerset: Some(telegram_api::InputStickerSet::inputStickerSetID(
+                                telegram_api::inputStickerSetID {
+                                    id: set_id,
+                                    access_hash: 0x6600_0000_0000 + set_id,
+                                },
+                            )),
+                        },
+                    ),
+                ],
+                ..telegram_api::document::default()
+            })
+        }
+
+        /// A boxed bare `Vector<Document>` answer.
+        fn documents_answer(documents: Vec<telegram_api::Document>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::tl::__i32(&mut out, telegram_api::tl::VECTOR_ID);
+            telegram_api::tl::__i32(&mut out, documents.len() as i32);
+            for document in documents {
+                document.store(&mut out);
+            }
+            out
+        }
+
+        // 1. the live arm parks the request promise and the query rides
+        //    the dispatcher with the deduped unknown ids (cpp:6570-6579).
+        let first_id = 5_000_001;
+        let second_id = 5_000_002;
+        td.request(
+            401,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![first_id, second_id, first_id],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        let body = telegram_api::messages_getCustomEmojiDocuments::parse(sent.query())
+            .expect("the getCustomEmojiDocuments body");
+        assert_eq!(body.document_id, vec![first_id, second_id]);
+
+        // 2. the answer builds the sticker records (the set record + the
+        //    custom-emoji id map) and answers the per-id object vector —
+        //    the still-unknown second id contributes nothing
+        //    (cpp:6473-6493).
+        net_complete(
+            sent,
+            documents_answer(vec![custom_emoji_document(first_id, "\u{1f389}", 4242)]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 401);
+        let stickers = match responses.first() {
+            Some(Object::stickers(stickers)) => stickers.clone(),
+            other => panic!("the getCustomEmojiStickers answer: {other:?}"),
+        };
+        assert_eq!(stickers.stickers.len(), 1, "the unknown id drops");
+        let sticker = stickers.stickers[0].clone();
+        assert_eq!(sticker.id, first_id);
+        assert_eq!(sticker.set_id, 4242);
+        assert_eq!(sticker.width, 100);
+        assert_eq!(sticker.height, 100);
+        assert_eq!(sticker.emoji, "\u{1f389}");
+        assert!(matches!(
+            sticker.format,
+            Some(td_api::StickerFormat::stickerFormatTgs(_))
+        ));
+        match sticker.full_type {
+            Some(td_api::StickerFullType::stickerFullTypeCustomEmoji(custom)) => {
+                assert_eq!(custom.custom_emoji_id, first_id);
+                assert!(!custom.needs_repainting);
+            }
+            other => panic!("the custom-emoji full type: {other:?}"),
+        }
+        assert!(sticker.sticker.is_some(), "the registered file object");
+
+        // 3. the id-map cache hit answers without a wire query
+        //    (cpp:6486-6493: both ids resolve after the second load).
+        td.request(
+            402,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![first_id],
+            }),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "the cache hit sends nothing");
+        assert!(
+            responses_of(&callback, 402)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.len() == 1))
+        );
+
+        // 4. the error band — the codes forward verbatim through the
+        //    promise (cpp:6593-6594).
+        td.request(
+            403,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_003],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_fail(sent, 420, "EMOJI_INVALID");
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 403);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "EMOJI_INVALID");
+
+        // 5. the parse-failure band — the fetch_result failure rides the
+        //    same Err path as the C++ on_error chain (§5 convention).
+        td.request(
+            404,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_004],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 404);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the messages.getCustomEmojiDocuments answer"
+        );
+
+        // 6. the no-attribute band — a document without the sticker or
+        //    custom-emoji attribute LOG(ERROR)s and drops
+        //    (cpp:3022-3030); the answer is the empty sticker vector.
+        td.request(
+            405,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_005],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(
+            sent,
+            documents_answer(vec![telegram_api::Document::document(
+                telegram_api::document {
+                    id: 5_000_005,
+                    mime_type: "image/webp".to_string(),
+                    dc_id: 2,
+                    ..telegram_api::document::default()
+                },
+            )]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 405)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.is_empty()))
+        );
+
+        // 7. the unknown-mime band — the format guard drops the document
+        //    (cpp:3031-3037: `image/png` is not a sticker mime).
+        td.request(
+            406,
+            Function::getCustomEmojiStickers(td_api::getCustomEmojiStickers {
+                custom_emoji_ids: vec![5_000_006],
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getCustomEmojiDocuments::ID);
+        net_complete(
+            sent,
+            documents_answer(vec![telegram_api::Document::document(
+                telegram_api::document {
+                    id: 5_000_006,
+                    mime_type: "image/png".to_string(),
+                    dc_id: 2,
+                    attributes: vec![
+                        telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                            telegram_api::documentAttributeCustomEmoji {
+                                alt: String::new(),
+                                ..telegram_api::documentAttributeCustomEmoji::default()
+                            },
+                        ),
+                    ],
+                    ..telegram_api::document::default()
+                },
+            )]),
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 406)
+                .iter()
+                .any(|object| matches!(object, Object::stickers(value)
+                    if value.stickers.is_empty()))
+        );
+
+        assert!(td.stickers_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn stickers_special_sets_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(stickers_special_sets_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The net-drain 59 special-sticker-set family —
+    /// `messages.getStickerSet` over the special wire inputs
+    /// (`ReloadSpecialStickerSetQuery`, StickersManager.cpp:794-832) and
+    /// the §6 premium gift-options sticker leg: the premium arm's
+    /// `get_premium_gift_sticker_object` (Premium.cpp:446) triggers the
+    /// premium-gift set load on the first miss, the set record lands from
+    /// the `messages_stickerSet` answer (cpp:3797-3948), and the next
+    /// premium answer carries the live sticker.
+    fn stickers_special_sets_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-stickers-special-sets");
+
+        /// A wire premium-gift sticker document: the id doubles as the
+        /// custom emoji id over the custom-emoji attribute.
+        fn gift_document(document_id: i64, alt: &str) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                id: document_id,
+                access_hash: 0x3100_0000_0000 + document_id,
+                file_reference: b"ref".to_vec(),
+                mime_type: "application/x-tgsticker".to_string(),
+                size: 4096,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![
+                    telegram_api::DocumentAttribute::documentAttributeImageSize(
+                        telegram_api::documentAttributeImageSize { w: 512, h: 512 },
+                    ),
+                    telegram_api::DocumentAttribute::documentAttributeCustomEmoji(
+                        telegram_api::documentAttributeCustomEmoji {
+                            flags: 0,
+                            free: true,
+                            text_color: false,
+                            alt: alt.to_owned(),
+                            stickerset: Some(telegram_api::InputStickerSet::inputStickerSetID(
+                                telegram_api::inputStickerSetID {
+                                    id: 6106107694985,
+                                    access_hash: 12345,
+                                },
+                            )),
+                        },
+                    ),
+                ],
+                ..telegram_api::document::default()
+            })
+        }
+
+        /// A boxed `messages_stickerSet` answer for the premium-gift set —
+        /// five keycap-emoji stickers (the `1..5` month ladder of
+        /// cpp:2579-2591).
+        fn gift_set_answer() -> Vec<u8> {
+            const SET_ID: i64 = 6106107694985;
+            let mut documents = Vec::new();
+            let mut packs = Vec::new();
+            for number in 1i64..=5 {
+                // the ids double as custom emoji ids, which the C++
+                // validity band floors at 1 << 20 (CustomEmojiId.h:29-31)
+                let document_id = 0x10_0000 + number;
+                documents.push(gift_document(
+                    document_id,
+                    &format!("{}\u{20e3}", char::from(b'0' + number as u8)),
+                ));
+                packs.push(telegram_api::StickerPack {
+                    emoticon: format!("{}\u{20e3}", char::from(b'0' + number as u8)),
+                    documents: vec![document_id],
+                });
+            }
+            let mut out = Vec::new();
+            let set = telegram_api::messages_StickerSet::messages_stickerSet(
+                telegram_api::messages_stickerSet {
+                    set: Some(telegram_api::StickerSet {
+                        flags: 0,
+                        archived: false,
+                        official: true,
+                        masks: false,
+                        emojis: true,
+                        text_color: false,
+                        channel_emoji_status: false,
+                        creator: false,
+                        installed_date: 0,
+                        id: SET_ID,
+                        access_hash: 12345,
+                        title: "Premium Gifts".to_owned(),
+                        short_name: "premium_gifts".to_owned(),
+                        thumbs: Vec::new(),
+                        thumb_dc_id: 0,
+                        thumb_version: 0,
+                        thumb_document_id: 0,
+                        count: 5,
+                        hash: 7,
+                    }),
+                    packs,
+                    keywords: Vec::new(),
+                    documents,
+                },
+            );
+            set.store(&mut out);
+            out
+        }
+
+        /// The boxed bare `Vector<PremiumGiftCodeOption>` answer.
+        fn gift_options_answer() -> Vec<u8> {
+            let mut answer = Vec::new();
+            answer.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+            answer.extend_from_slice(&2i32.to_le_bytes());
+            for (months, amount) in [(3, 500), (12, 2000)] {
+                telegram_api::PremiumGiftCodeOption {
+                    flags: 0,
+                    users: 1,
+                    months,
+                    store_product: String::new(),
+                    store_quantity: 0,
+                    currency: "USD".to_owned(),
+                    amount,
+                }
+                .store_boxed(&mut answer);
+            }
+            answer
+        }
+
+        // 1. getPremiumGiftPaymentOptions through the live td_api arm —
+        //    the premium answer's sticker leg misses
+        //    (`get_premium_gift_sticker_set` → null, cpp:2528-2546), so
+        //    the first answer carries no sticker and the premium-gift
+        //    special set load rides the dispatcher.
+        td.request(
+            501,
+            Function::getPremiumGiftPaymentOptions(td_api::getPremiumGiftPaymentOptions {}),
+        );
+        let premium_sent =
+            take_sent_query(&rec, telegram_api::payments_getPremiumGiftCodeOptions::ID);
+        net_complete(premium_sent, gift_options_answer());
+        td.dispatch_completed_premium_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 501).first() {
+            Some(Object::premiumGiftPaymentOptions(options)) => {
+                assert!(
+                    options
+                        .options
+                        .iter()
+                        .all(|option| option.sticker.is_none()),
+                    "the pre-flip band answers no sticker"
+                );
+            }
+            other => panic!("the first gift-options answer: {other:?}"),
+        }
+
+        // 2. the miss triggered the special-set load — the
+        //    `inputStickerSetPremiumGifts` wire input with hash 0
+        //    (cpp:802-804).
+        let sticker_sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        let body = telegram_api::messages_getStickerSet::parse(sticker_sent.query()).expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetPremiumGifts(
+                _
+            ))
+        ));
+        assert_eq!(body.hash, 0);
+
+        // 3. the set answer lands the record (the document walk, the packs
+        //    walk into `sticker_emojis_map_`, the set record) and settles
+        //    the premium-gift pending lot.
+        net_complete(sticker_sent, gift_set_answer());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+
+        // 4. the second premium answer carries the live sticker leg — the
+        //    §6 flip, verified through the live td_api arm.
+        td.request(
+            502,
+            Function::getPremiumGiftPaymentOptions(td_api::getPremiumGiftPaymentOptions {}),
+        );
+        let premium_sent =
+            take_sent_query(&rec, telegram_api::payments_getPremiumGiftCodeOptions::ID);
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the loaded special set re-sends no sticker query"
+        );
+        net_complete(premium_sent, gift_options_answer());
+        td.dispatch_completed_premium_net();
+        td.flush_deferred_results();
+        let options = match responses_of(&callback, 502).first() {
+            Some(Object::premiumGiftPaymentOptions(options)) => options.clone(),
+            other => panic!("the second gift-options answer: {other:?}"),
+        };
+        assert_eq!(options.options.len(), 2);
+        for option in &options.options {
+            let sticker = option
+                .sticker
+                .as_ref()
+                .expect("the §6 gift-options sticker leg is live");
+            // cpp:2579-2591 — 3 months → the "2" keycap, 12 months → the
+            // "4" keycap
+            let expected_alt = match option.month_count {
+                3 => "2\u{20e3}",
+                12 => "4\u{20e3}",
+                other => panic!("unexpected month count {other}"),
+            };
+            assert_eq!(sticker.emoji, expected_alt);
+            assert_eq!(sticker.set_id, 6106107694985);
+            match &sticker.full_type {
+                Some(td_api::StickerFullType::stickerFullTypeCustomEmoji(custom)) => {
+                    assert_eq!(
+                        custom.custom_emoji_id,
+                        i64::from(sticker.emoji.as_bytes()[0] - b'0') + 0x10_0000
+                    );
+                }
+                other => panic!("the gift sticker full type: {other:?}"),
+            }
+        }
+
+        // 5. getPremiumInfoSticker through the live td_api arm — the
+        //    loaded set answers immediately (cpp:2648-2651).
+        td.request(
+            503,
+            Function::getPremiumInfoSticker(td_api::getPremiumInfoSticker { month_count: 6 }),
+        );
+        td.flush_deferred_results();
+        match responses_of(&callback, 503).first() {
+            Some(Object::sticker(sticker)) => assert_eq!(sticker.emoji, "3\u{20e3}"),
+            other => panic!("the premium info sticker: {other:?}"),
+        }
+
+        // 6. getThemedEmojiStatuses through the live td_api arm
+        //    (Requests.cpp:6815-6819 — the themed reader; the bare
+        //    getDefaultEmojiStatuses arm is the EmojiStatus.cpp plane) —
+        //    the default-statuses set load parks the promise, the answer
+        //    settles it with the first 8 custom emoji ids (cpp:6294-6305).
+        td.request(
+            504,
+            Function::getThemedEmojiStatuses(td_api::getThemedEmojiStatuses {}),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        let body = telegram_api::messages_getStickerSet::parse(sent.query()).expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetEmojiDefaultStatuses(_))
+        ));
+        net_complete(
+            sent,
+            gift_set_answer(), // any loaded set settles the lot
+        );
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 504).first() {
+            Some(Object::emojiStatusCustomEmojis(statuses)) => {
+                assert_eq!(statuses.custom_emoji_ids.len(), 5);
+            }
+            other => panic!("the default emoji statuses answer: {other:?}"),
+        }
+
+        // 7. the error band — a failed special-set load keeps the parked
+        //    reader promises parked (cpp:1988-2005: only the premium-gift
+        //    lot settles, over the OK arm; the rest wait for the 300-600s
+        //    retry, which parks at the timer plane). The channel twin
+        //    drives the wire error; a second request joins the parked lot
+        //    without a new wire query (the is_being_loaded guard).
+        td.request(
+            505,
+            Function::getThemedChatEmojiStatuses(td_api::getThemedChatEmojiStatuses {}),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        let body = telegram_api::messages_getStickerSet::parse(sent.query()).expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetEmojiChannelDefaultStatuses(_))
+        ));
+        net_fail(sent, 420, "STICKERSET_INVALID");
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 505).is_empty(),
+            "the parked promise stays parked on the failed load"
+        );
+        td.request(
+            507,
+            Function::getThemedChatEmojiStatuses(td_api::getThemedChatEmojiStatuses {}),
+        );
+        td.flush_deferred_results();
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the in-flight load keeps the second reader parked"
+        );
+        assert!(responses_of(&callback, 507).is_empty());
+
+        // 8. the parse-failure band — the fetch_result failure rides the
+        //    same Err path (§5 convention) and parks the same way.
+        td.request(
+            506,
+            Function::getForumTopicDefaultIcons(td_api::getForumTopicDefaultIcons {}),
+        );
+        let sent = take_sent_query(&rec, telegram_api::messages_getStickerSet::ID);
+        net_complete(sent, b"garbage".to_vec());
+        td.dispatch_completed_stickers_net();
+        td.flush_deferred_results();
+        assert!(responses_of(&callback, 506).is_empty());
+
+        assert!(td.stickers_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]
@@ -65218,7 +66086,7 @@ mod tests {
         // the custom emoji must be known (the have_custom_emoji read)
         td.stickers_manager.custom_emoji_to_sticker_id.insert(
             crate::stickers_manager::CustomEmojiId::new(777),
-            crate::messages_manager::MessageId::new(1),
+            crate::files::FileId::new(1, 1),
         );
 
         let sticker_photo =
@@ -70341,13 +71209,35 @@ mod tests {
                     options.options[1].star_count,
                     crate::star_manager::get_star_count(1000, false)
                 );
+                // the §6 flip's miss band (net-drain 59): the sticker leg
+                // reads the premium-gift special set, misses and triggers
+                // the load — the answer itself carries no sticker
                 assert!(
-                    options.options[1].sticker.is_none(),
-                    "the stickers plane parks"
+                    options
+                        .options
+                        .iter()
+                        .all(|option| option.sticker.is_none()),
+                    "the unloaded premium-gift set answers no sticker"
                 );
             }
             other => panic!("unexpected gift options result: {other:?}"),
         }
+
+        // the miss dispatched the special-set load — the §6 flip's
+        // stickers-plane leg over the inputStickerSetPremiumGifts wire
+        // input (StickersManager.cpp:802-804, hash 0)
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let body = telegram_api::messages_getStickerSet::parse(
+            take_sent(sent, telegram_api::messages_getStickerSet::ID).query(),
+        )
+        .expect("body");
+        assert!(matches!(
+            body.stickerset,
+            Some(telegram_api::InputStickerSet::inputStickerSetPremiumGifts(
+                _
+            ))
+        ));
+        assert_eq!(body.hash, 0);
 
         // 4. getPremiumGiveawayPaymentOptions — the boost-peer resolution
         //    at the send leg: the channel dialog answers the M.6 stub

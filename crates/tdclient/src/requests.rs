@@ -1956,8 +1956,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::getCustomEmojiReactionAnimations(_) => {
-            // Requests.cpp:3913-3917 — the generic-animations set load
-            // parks ([blocked: net]).
+            // Requests.cpp:3913-3917 — the generic-animations special set
+            // rides the ReloadSpecialStickerSetQuery plane (net-drain 59);
+            // offline the promise parks on the per-type lot.
             if !check_is_user(td, id) {
                 return;
             }
@@ -1966,14 +1967,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             stickers_manager.get_custom_emoji_reaction_generic_animations(&mut env, false, promise);
         }
         Function::getForumTopicDefaultIcons(_) => {
-            // Requests.cpp:4827-4831 — the topic-icons set load parks.
+            // Requests.cpp:4827-4831 — the topic-icons special set rides
+            // the ReloadSpecialStickerSetQuery plane (net-drain 59);
+            // offline the promise parks on the per-type lot.
             let promise = td.deferred_promise::<td_api::Stickers, _>(id, Object::stickers);
             let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
             stickers_manager.get_default_topic_icons(&mut env, false, promise);
         }
         Function::getThemedEmojiStatuses(_) => {
-            // Requests.cpp:6815-6819 — the default-statuses set load
-            // parks ([blocked: net]).
+            // Requests.cpp:6815-6819 — the default-statuses special set
+            // rides the ReloadSpecialStickerSetQuery plane (net-drain 59);
+            // offline the promise parks on the per-type lot.
             if !check_is_user(td, id) {
                 return;
             }
@@ -2007,11 +2011,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             stickers_manager.get_premium_stickers(&mut env, request.limit, promise);
         }
         Function::getPremiumInfoSticker(request) => {
-            // Requests.cpp:9011-9015 — the premium-gift set load parks.
+            // Requests.cpp:9011-9015 — the premium-gift special set rides
+            // the ReloadSpecialStickerSetQuery plane (net-drain 59); the
+            // C++ set_value(nullptr) band parks at the response plane.
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<td_api::Sticker, _>(id, Object::sticker);
+            // the C++ `promise.set_value(nullptr sticker)` answers JSON
+            // null (ClientJson.cpp:94-95); the Rust response plane has no
+            // null object, so that band parks (the `send_null_user`
+            // convention)
+            let promise = td.nullable_deferred_promise::<td_api::Sticker, _>(id, Object::sticker);
             let (mut env, stickers_manager) = crate::td::stickers_env_split(td);
             stickers_manager.load_premium_gift_sticker(&mut env, request.month_count, 0, promise);
         }
