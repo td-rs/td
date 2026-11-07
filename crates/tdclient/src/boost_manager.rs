@@ -33,6 +33,12 @@ pub(crate) enum BoostNetKind {
     /// member for the `on_error` dialog head (cpp:260); the answer is
     /// the shared `premium.myBoosts` conversion of the slots family.
     ApplyBoost { dialog_id: DialogId },
+    /// `GetBoostsListQuery` (BoostManager.cpp:264-308) —
+    /// `premium.getBoostsList`; the kind carries the handler's
+    /// `dialog_id_` member for the `on_error` dialog head (cpp:304); the
+    /// answer converts through
+    /// [`BoostManager::get_found_chat_boosts_object`].
+    GetBoostsList { dialog_id: DialogId },
     /// `GetBoostsStatusQuery` (BoostManager.cpp:138-225) —
     /// `premium.getBoostsStatus`; the kind carries the handler's
     /// `dialog_id_` member for the `on_error` dialog head (cpp:193) and
@@ -101,6 +107,10 @@ pub trait BoostManagerEnv {
         dialog_id.get()
     }
 
+    /// `td_->user_manager_->get_user_id_object(user_id, source)`
+    /// (UserManager.cpp) — the boost-source conversions.
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64;
+
     /// `td_->dialog_manager_->get_input_peer(dialog_id, access_rights)`
     /// (DialogManager.cpp:1377) — the query send legs resolve the peer.
     fn get_input_peer(
@@ -120,16 +130,6 @@ pub trait BoostManagerEnv {
     /// plane stand-in.
     fn on_update_channel_participant_count(&mut self, _channel_id: ChannelId, _count: i32) {}
 
-    fn send_get_boosts_list_query(
-        &mut self,
-        dialog_id: DialogId,
-        only_gift_codes: bool,
-        offset: &str,
-        limit: i32,
-    ) {
-        tdutils::log_info!("Send premium.getBoostsList for {dialog_id:?} — [blocked: net]");
-        let _ = (only_gift_codes, offset, limit);
-    }
     fn send_get_user_boosts_query(&mut self, dialog_id: DialogId, user_id: i64) {
         tdutils::log_info!("Send premium.getUserBoosts for {dialog_id:?} — [blocked: net]");
         let _ = user_id;
@@ -155,7 +155,12 @@ pub struct BoostManager {
     /// member, cpp:123) — popped FIFO by the `premium.boostsStatus`
     /// answers.
     pub(crate) pending_get_boosts_status: Vec<Promise<td_api::ChatBoostStatus>>,
-    /// The `FoundChatBoosts`-typed promises parked at the list seams.
+    /// The `GetBoostsListQuery` promises (the handler's `promise_`
+    /// member, cpp:266) — popped FIFO by the `premium.boostsList`
+    /// answers of the list family.
+    pub(crate) pending_get_boosts_list: Vec<Promise<td_api::FoundChatBoosts>>,
+    /// The `FoundChatBoosts`-typed promises parked at the user-boosts
+    /// seam (the fifth family lands next).
     pub parked_found_boosts: Vec<Promise<td_api::FoundChatBoosts>>,
 }
 
@@ -586,8 +591,36 @@ impl BoostManager {
         }
     }
 
-    /// `get_dialog_boosts` (cpp:481-490).
+    /// `get_dialog_boosts` (cpp:481-490) — the dialog-access gate, then
+    /// the non-positive limit band, then the handler collapse.
     pub fn get_dialog_boosts(
+        &mut self,
+        env: &mut impl BoostManagerEnv,
+        dialog_id: DialogId,
+        only_gift_codes: bool,
+        offset: &str,
+        limit: i32,
+        mut promise: Promise<td_api::FoundChatBoosts>,
+    ) {
+        if let Err(status) = env.check_dialog_access(dialog_id, "get_dialog_boosts") {
+            return promise.set_error(status);
+        }
+        if limit <= 0 {
+            return promise.set_error(Status::error(400, "Parameter limit must be positive"));
+        }
+        self.send_get_boosts_list_query(env, dialog_id, only_gift_codes, offset, limit, promise);
+    }
+
+    /// The `td_->create_handler<GetBoostsListQuery>(promise)
+    /// ->send(dialog_id, only_gift_codes, offset, limit)` collapse
+    /// (BoostManager.cpp:272-281): the request promise parks in the
+    /// family lot (the C++ carries it on the query's `promise_` member,
+    /// cpp:266 — §5's FIFO shape), then the read peer resolves and the
+    /// wire query dispatches with the gifts flag bit. The C++
+    /// `CHECK(input_peer != nullptr)` (cpp:275) is the port's
+    /// `complete_error` file-through (the message-query CHECK
+    /// convention). `None` on the handle keeps the net-inert posture.
+    pub(crate) fn send_get_boosts_list_query(
         &mut self,
         env: &mut impl BoostManagerEnv,
         dialog_id: DialogId,
@@ -596,8 +629,134 @@ impl BoostManager {
         limit: i32,
         promise: Promise<td_api::FoundChatBoosts>,
     ) {
-        env.send_get_boosts_list_query(dialog_id, only_gift_codes, offset, limit);
-        self.parked_found_boosts.push(promise);
+        self.pending_get_boosts_list.push(promise);
+        let kind = BoostNetKind::GetBoostsList { dialog_id };
+        match (
+            self.net.clone(),
+            env.get_input_peer(dialog_id, crate::user_manager::AccessRights::Read),
+        ) {
+            // `GetBoostsListQuery::send` (cpp:272-281)
+            (Some(net), Some(peer)) => net.dispatch(
+                kind,
+                telegram_api::Function::premium_getBoostsList(
+                    telegram_api::premium_getBoostsList {
+                        flags: 0,
+                        gifts: only_gift_codes,
+                        peer: Some(Box::new(peer)),
+                        offset: offset.to_string(),
+                        limit,
+                    },
+                ),
+            ),
+            (Some(net), None) => net.complete_error(kind, 400, "Can't access the chat"),
+            (None, _) => {
+                tdutils::log_info!("Send premium.getBoostsList for {dialog_id:?} — [net-inert]")
+            }
+        }
+    }
+
+    /// The FIFO-head promise pop for the `Td::on_boost_net_answer` drain
+    /// (the C++ promise rides the query).
+    pub(crate) fn pop_get_boosts_list_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::FoundChatBoosts>> {
+        (!self.pending_get_boosts_list.is_empty()).then(|| self.pending_get_boosts_list.remove(0))
+    }
+
+    /// `get_chat_boost_object` (BoostManager.cpp:35-73) — the three
+    /// boost sources (giveaway/gift-code/premium) with the unclaimed
+    /// giveaway's zeroed user, the invalid message id's `MessageId::min`
+    /// floor and the invalid-user `nullptr` drop; `None` is the drop.
+    pub(crate) fn get_chat_boost_object(
+        &mut self,
+        env: &mut impl BoostManagerEnv,
+        boost: &telegram_api::Boost,
+    ) -> Option<td_api::ChatBoost> {
+        let source = if boost.giveaway {
+            let mut user_id = crate::user_manager::UserId::new(boost.user_id);
+            if !user_id.is_valid() || boost.unclaimed {
+                user_id = crate::user_manager::UserId::default();
+            }
+            let mut giveaway_message_id =
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::messages_manager::ServerMessageId::new(boost.giveaway_msg_id),
+                );
+            if !giveaway_message_id.is_valid() {
+                giveaway_message_id = crate::messages_manager::MessageId::min();
+            }
+            Some(td_api::ChatBoostSource::chatBoostSourceGiveaway(
+                td_api::chatBoostSourceGiveaway {
+                    user_id: env.get_user_id_object(user_id, "chatBoostSourceGiveaway"),
+                    gift_code: boost.used_gift_slug.clone(),
+                    star_count: crate::star_manager::get_star_count(boost.stars, false),
+                    giveaway_message_id: giveaway_message_id.get(),
+                    is_unclaimed: boost.unclaimed,
+                },
+            ))
+        } else if boost.gift {
+            let user_id = crate::user_manager::UserId::new(boost.user_id);
+            if !user_id.is_valid() {
+                None
+            } else {
+                Some(td_api::ChatBoostSource::chatBoostSourceGiftCode(
+                    td_api::chatBoostSourceGiftCode {
+                        user_id: env.get_user_id_object(user_id, "chatBoostSourceGiftCode"),
+                        gift_code: boost.used_gift_slug.clone(),
+                    },
+                ))
+            }
+        } else {
+            let user_id = crate::user_manager::UserId::new(boost.user_id);
+            if !user_id.is_valid() {
+                None
+            } else {
+                Some(td_api::ChatBoostSource::chatBoostSourcePremium(
+                    td_api::chatBoostSourcePremium {
+                        user_id: env.get_user_id_object(user_id, "chatBoostSourcePremium"),
+                    },
+                ))
+            }
+        };
+        let Some(source) = source else {
+            tdutils::log_error!("Receive a boost with an invalid source");
+            return None;
+        };
+        Some(td_api::ChatBoost {
+            id: boost.id.clone(),
+            count: boost.multiplier.max(1),
+            source: Some(source),
+            start_date: boost.date,
+            expiration_date: boost.expires.max(0),
+        })
+    }
+
+    /// The `premium.boostsList` answer conversion of the two list
+    /// families (BoostManager.cpp:283-307 and 331-355) — the users
+    /// intake, the boost-object loop with the null/expiry drops, and the
+    /// count/next-offset pass-through.
+    pub(crate) fn get_found_chat_boosts_object(
+        &mut self,
+        env: &mut impl BoostManagerEnv,
+        result: telegram_api::premium_BoostsList,
+        source: &str,
+    ) -> td_api::FoundChatBoosts {
+        env.on_get_users(result.users, source);
+        let total_count = result.count;
+        let mut boosts = Vec::new();
+        for boost in &result.boosts {
+            let Some(chat_boost_object) = self.get_chat_boost_object(env, boost) else {
+                continue;
+            };
+            if chat_boost_object.expiration_date <= env.unix_time() {
+                continue;
+            }
+            boosts.push(chat_boost_object);
+        }
+        td_api::FoundChatBoosts {
+            total_count,
+            boosts,
+            next_offset: result.next_offset,
+        }
     }
 
     /// `get_user_dialog_boosts` (cpp:492-502).
@@ -664,19 +823,6 @@ mod tests {
             self.username.clone()
         }
 
-        fn send_get_boosts_list_query(
-            &mut self,
-            dialog_id: DialogId,
-            only_gift_codes: bool,
-            offset: &str,
-            limit: i32,
-        ) {
-            self.queries.push(format!(
-                "getBoostsList {} {only_gift_codes} {offset} {limit}",
-                dialog_id.get()
-            ));
-        }
-
         fn send_get_user_boosts_query(&mut self, dialog_id: DialogId, user_id: i64) {
             self.queries
                 .push(format!("getUserBoosts {} {user_id}", dialog_id.get()));
@@ -711,6 +857,14 @@ mod tests {
             } else {
                 None
             }
+        }
+
+        fn get_user_id_object(
+            &mut self,
+            user_id: crate::user_manager::UserId,
+            _source: &str,
+        ) -> i64 {
+            user_id.get()
         }
 
         fn on_get_dialog_error(&mut self, dialog_id: DialogId, status: &Status, source: &str) {
@@ -836,6 +990,136 @@ mod tests {
         assert!(
             manager.pop_get_my_boosts_promise().is_none(),
             "the FIFO lot"
+        );
+    }
+
+    #[test]
+    fn the_list_gate_bands_answer_inline() {
+        // `get_dialog_boosts` (cpp:481-490): the access gate, then the
+        // non-positive limit band, then the park (the net-inert posture)
+        let mut env = env();
+        let mut manager = BoostManager::new();
+        let error_of = |manager: &mut BoostManager, env: &mut TestEnv, chat: i64, limit: i32| {
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<td_api::FoundChatBoosts>| {
+                    *capture.lock().unwrap() = Some(match result {
+                        tdutils::status::Result::Err(status) => {
+                            Some((status.code(), status.message().to_string()))
+                        }
+                        tdutils::status::Result::Ok(_) => None,
+                    });
+                },
+            );
+            manager.get_dialog_boosts(env, DialogId::new(chat), false, "off", limit, promise);
+            slot.lock().unwrap().take().flatten()
+        };
+        assert_eq!(
+            error_of(&mut manager, &mut env, 0, 10),
+            Some((400, "Chat not found".to_string()))
+        );
+        assert_eq!(
+            error_of(&mut manager, &mut env, 1, 0),
+            Some((400, "Parameter limit must be positive".to_string()))
+        );
+        assert_eq!(
+            error_of(&mut manager, &mut env, 1, -1),
+            Some((400, "Parameter limit must be positive".to_string()))
+        );
+        assert!(manager.pending_get_boosts_list.is_empty());
+        manager.get_dialog_boosts(
+            &mut env,
+            DialogId::new(1),
+            true,
+            "off",
+            10,
+            Promise::default(),
+        );
+        assert_eq!(manager.pending_get_boosts_list.len(), 1);
+        assert!(manager.pop_get_boosts_list_promise().is_some());
+        assert!(
+            manager.pop_get_boosts_list_promise().is_none(),
+            "the FIFO lot"
+        );
+    }
+
+    #[test]
+    fn the_boost_object_conversion_runs_the_source_bands() {
+        // `get_chat_boost_object` (cpp:35-73): the three sources, the
+        // unclaimed giveaway's zeroed user + the invalid message id's
+        // `MessageId::min` floor, the invalid-user drop and the
+        // multiplier/expiry clamps
+        let mut env = env();
+        let mut manager = BoostManager::new();
+        let boost = |gift: bool, giveaway: bool, unclaimed: bool, user_id: i64, msg_id: i32| {
+            telegram_api::Boost {
+                flags: 1 | 1 << 4 | 1 << 5 | 1 << 6 | ((1 << 2) * i32::from(giveaway)),
+                gift,
+                giveaway,
+                unclaimed,
+                id: format!("id-{user_id}-{giveaway}"),
+                user_id,
+                giveaway_msg_id: msg_id,
+                date: 10,
+                expires: 2_000_000_000,
+                used_gift_slug: "slug".to_string(),
+                multiplier: 0,
+                stars: 1 << 60,
+            }
+        };
+        // the premium source: the multiplier clamps to 1
+        let object = manager
+            .get_chat_boost_object(&mut env, &boost(false, false, false, 9, 0))
+            .expect("the premium source converts");
+        assert_eq!(
+            (object.count, object.start_date, object.expiration_date),
+            (1, 10, 2_000_000_000)
+        );
+        assert!(matches!(
+            object.source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourcePremium(source)) if source.user_id == 9
+        ));
+        // the gift-code source
+        let object = manager
+            .get_chat_boost_object(&mut env, &boost(true, false, false, 9, 0))
+            .expect("the gift-code source converts");
+        assert!(matches!(
+            object.source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiftCode(source)) if
+                (source.user_id, source.gift_code.as_str()) == (9, "slug")
+        ));
+        // the claimed giveaway: the user rides, the message id rides and
+        // the star count clamps to the ±2^51 bound
+        let object = manager
+            .get_chat_boost_object(&mut env, &boost(false, true, false, 9, 55))
+            .expect("the giveaway source converts");
+        assert!(matches!(
+            object.source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiveaway(source)) if
+                (source.user_id, source.giveaway_message_id, source.star_count, source.is_unclaimed) ==
+                (9, 55 << 20, 1 << 51, false)
+        ));
+        // the unclaimed giveaway: the user zeroes and the invalid
+        // message id floors to MessageId::min
+        let object = manager
+            .get_chat_boost_object(&mut env, &boost(false, true, true, 9, 0))
+            .expect("the unclaimed giveaway converts");
+        assert!(matches!(
+            object.source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiveaway(source)) if
+                (source.user_id, source.giveaway_message_id, source.is_unclaimed) == (0, 1, true)
+        ));
+        // the invalid-user drops (both the gift and the premium arms)
+        assert!(
+            manager
+                .get_chat_boost_object(&mut env, &boost(true, false, false, 0, 0))
+                .is_none()
+        );
+        assert!(
+            manager
+                .get_chat_boost_object(&mut env, &boost(false, false, false, 0, 0))
+                .is_none()
         );
     }
 

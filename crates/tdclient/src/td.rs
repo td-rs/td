@@ -20464,6 +20464,55 @@ impl Td {
                 }
                 self.boost_manager = manager;
             }
+            // `GetBoostsListQuery::on_result`/`on_error`
+            // (BoostManager.cpp:283-307) — the `premium.boostsList`
+            // answer converts through the manager intake (the users
+            // intake + the boost-source loop with the null/expiry drops)
+            // and settles the parked FIFO-head promise; the error leg
+            // runs the dialog-error head first (cpp:304-307).
+            K::GetBoostsList { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_BoostsList::parse(query.ok()) {
+                        Ok(list) => Ok(list),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.boostsList: {error}");
+                            Err(parse_error("premium_getBoostsList"))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetBoostsListQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_get_boosts_list_promise();
+                match (result, promise) {
+                    (Ok(list), Some(mut promise)) => {
+                        let found = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_found_chat_boosts_object(
+                                &mut env,
+                                list,
+                                "GetBoostsListQuery",
+                            )
+                        };
+                        promise.set_value(found);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.boostsList answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
             // `ApplyBoostQuery::on_result`/`on_error`
             // (BoostManager.cpp:249-261) — the answer is the shared
             // `premium.myBoosts` conversion of the slots family; the
@@ -38958,6 +39007,11 @@ impl BoostManagerEnv for BoostEnv<'_> {
         // (ChatManager.cpp:7994) — the M.5 participant-count plane
         // stand-in
         let _ = (channel_id, count);
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
     }
 }
 
@@ -89257,6 +89311,330 @@ kQIDAQAB\n\
         );
         assert_eq!(
             td.boost_manager.pending_apply_boost.len(),
+            1,
+            "the net-inert park"
+        );
+    }
+
+    fn sample_boosts_list() -> telegram_api::premium_BoostsList {
+        telegram_api::premium_BoostsList {
+            flags: 1, // the next-offset bit
+            count: 5,
+            boosts: vec![
+                // the premium source (cpp:64-70)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5, // user_id + slug + multiplier
+                    gift: false,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "a".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: -3,
+                    expires: 2_000_000_000,
+                    used_gift_slug: String::new(),
+                    multiplier: 3,
+                    stars: 0,
+                },
+                // the gift-code source (cpp:55-62)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5,
+                    gift: true,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "b".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 2_000_000_000,
+                    used_gift_slug: "slug-b".to_string(),
+                    multiplier: 0, // clamps to 1 (cpp:72)
+                    stars: 0,
+                },
+                // the unclaimed giveaway: the user id zeroes and the
+                // invalid message id floors to MessageId::min (cpp:41-53)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 6,
+                    gift: false,
+                    giveaway: true,
+                    unclaimed: true,
+                    id: "c".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 2_000_000_000,
+                    used_gift_slug: String::new(),
+                    multiplier: 2,
+                    stars: 250,
+                },
+                // the invalid gift-code user drops the boost (cpp:57-60)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5,
+                    gift: true,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "d".to_string(),
+                    user_id: 0,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 2_000_000_000,
+                    used_gift_slug: String::new(),
+                    multiplier: 1,
+                    stars: 0,
+                },
+                // the expired boost drops (cpp:295-298)
+                telegram_api::Boost {
+                    flags: 1 | 1 << 4 | 1 << 5,
+                    gift: false,
+                    giveaway: false,
+                    unclaimed: false,
+                    id: "e".to_string(),
+                    user_id: 9,
+                    giveaway_msg_id: 0,
+                    date: 10,
+                    expires: 1,
+                    used_gift_slug: String::new(),
+                    multiplier: 1,
+                    stars: 0,
+                },
+            ],
+            next_offset: "next".to_string(),
+            users: vec![telegram_api::User::userEmpty(telegram_api::userEmpty {
+                id: 9,
+            })],
+        }
+    }
+
+    #[test]
+    fn boost_list_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_list_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_list_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-list");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "boost_list_family_rides_the_dispatcher",
+        );
+
+        // 1. the live td_api arm's gate: an unknown chat answers the
+        //    "Chat not found" band (cpp:483)
+        let id = 41;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000002,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsList::ID,
+            "the gated getChatBoosts",
+        );
+
+        // 2. the limit band answers inline after the gate (cpp:484-486)
+        let id = 42;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 0,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Parameter limit must be positive")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsList::ID,
+            "the limit band sends nothing",
+        );
+
+        // 3. the family rides the wire: the gifts flag bit, the offset,
+        //    the limit and the resolved read peer (cpp:272-281)
+        let id = 43;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: true,
+                offset: "off".to_string(),
+                limit: 42,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsList::ID,
+        );
+        let body = telegram_api::premium_getBoostsList::parse(sent.query()).expect("the sent body");
+        assert!(body.gifts);
+        assert_eq!((body.offset.as_str(), body.limit), ("off", 42));
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+
+        // 4. the premium.boostsList answer converts (cpp:283-307) and
+        //    settles the request promise
+        net_complete(sent, wire!(sample_boosts_list()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let found = {
+            let Some(Object::foundChatBoosts(found)) =
+                responses_of(&callback, id).into_iter().next()
+            else {
+                panic!("expected a foundChatBoosts response for {id}");
+            };
+            found
+        };
+        assert_eq!((found.total_count, found.next_offset.as_str()), (5, "next"));
+        assert_eq!(found.boosts.len(), 3, "the invalid + expired drop");
+        // the premium source: the multiplier rides, the negative date
+        // passes through (only the expiry clamps, cpp:71-73)
+        assert_eq!(
+            (
+                found.boosts[0].id.as_str(),
+                found.boosts[0].count,
+                found.boosts[0].start_date,
+                found.boosts[0].expiration_date
+            ),
+            ("a", 3, -3, 2_000_000_000)
+        );
+        assert!(matches!(
+            found.boosts[0].source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourcePremium(source)) if source.user_id == 9
+        ));
+        // the gift-code source: the zero multiplier clamps to 1
+        assert_eq!(
+            (found.boosts[1].id.as_str(), found.boosts[1].count),
+            ("b", 1)
+        );
+        assert!(matches!(
+            found.boosts[1].source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiftCode(source)) if
+                (source.user_id, source.gift_code.as_str()) == (9, "slug-b")
+        ));
+        // the unclaimed giveaway: the user id zeroes, the star count
+        // rides and the invalid message id floors to MessageId::min
+        assert!(matches!(
+            found.boosts[2].source.as_ref(),
+            Some(td_api::ChatBoostSource::chatBoostSourceGiveaway(source)) if
+                (source.user_id, source.giveaway_message_id, source.star_count, source.is_unclaimed) == (0, 1, 250, true)
+        ));
+        assert!(
+            td.boost_net_completed.lock().is_empty(),
+            "the answer drained"
+        );
+
+        // 5. the wire-error band runs the on_error tail (cpp:304-307)
+        let id = 44;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsList::ID,
+        );
+        net_fail(sent, 420, "BOOSTS_LIST_FLOOD");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (420, "BOOSTS_LIST_FLOOD")
+        );
+
+        // 6. the parse-failure band answers the C++ 500
+        let id = 45;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getBoostsList::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the premium_getBoostsList answer")
+        );
+
+        // 7. the net-inert posture parks the request promise without a
+        //    wire query
+        td.boost_manager.net = None;
+        let id = 46;
+        td.request(
+            id,
+            Function::getChatBoosts(td_api::getChatBoosts {
+                chat_id: 700000001,
+                only_gift_codes: false,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getBoostsList::ID,
+            "the net-inert getChatBoosts",
+        );
+        assert_eq!(
+            td.boost_manager.pending_get_boosts_list.len(),
             1,
             "the net-inert park"
         );
