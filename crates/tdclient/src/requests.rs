@@ -1576,8 +1576,10 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::getMessageImportConfirmationText(request) => {
-            // `Requests.cpp:2949-2954` — the text answer parks behind the
-            // import-confirmation query ([blocked: net]).
+            // `Requests.cpp:6584-6588` — the live arm routes into the
+            // manager; the text answer rides the `MessageImportNetKind`
+            // plane (CheckHistoryImportPeerQuery,
+            // MessageImportManager.cpp:67-98).
             if !check_is_user(td, id) {
                 return;
             }
@@ -1587,9 +1589,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let (mut message_import_manager, mut env) = crate::td::message_import_env_split(td);
             message_import_manager
                 .get_message_import_confirmation_text(&mut env, dialog_id, promise);
+            td.message_import_manager = message_import_manager;
         }
         Function::getMessageFileType(request) => {
-            // `Requests.cpp:2956-2962`.
+            // `Requests.cpp:6577-6582` — the live arm routes into the
+            // manager; the answer rides the `MessageImportNetKind` plane
+            // (CheckHistoryImportQuery, MessageImportManager.cpp:30-64).
             if !check_is_user(td, id) {
                 return;
             }
