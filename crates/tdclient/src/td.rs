@@ -17877,6 +17877,39 @@ impl Td {
                 }
                 self.inline_queries_manager = manager;
             }
+            // `SetInlineBotResultsQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:153-165) — the Bool answer settles
+            // the parked promise ok either way (the `!result` band only
+            // logs, cpp:156-159); the error band forwards the status.
+            K::SetInlineBotResults => {
+                let status = if query.is_error() {
+                    Some(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(false) => {
+                            tdutils::log_error!("Sending answer to an inline query has failed");
+                            None
+                        }
+                        Some(true) => None,
+                        None => Some(Status::error(
+                            500,
+                            "Failed to parse the messages_setInlineBotResults answer",
+                        )),
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_set_inline_bot_results_promise();
+                match (status, promise) {
+                    (None, Some(mut promise)) => promise.set_value(()),
+                    (Some(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.setInlineBotResults answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
         }
     }
 
@@ -46308,14 +46341,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         source: &str,
     ) -> Vec<telegram_api::MessageEntity> {
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
-    }
-
-    fn send_set_inline_bot_results_query(
-        &mut self,
-        _query: telegram_api::messages_setInlineBotResults,
-        _promise: Promise<()>,
-    ) {
-        // [blocked: net]
     }
 
     fn send_set_bot_guest_chat_result_query(
@@ -88767,6 +88792,213 @@ kQIDAQAB\n\
         assert_eq!(
             (error.code, error.message.as_str()),
             (406, "Request canceled")
+        );
+
+        // 6. the bot-mode answerInlineQuery arm rides the wire
+        //    (Requests.cpp:8205-8212 → answer_inline_query →
+        //    SetInlineBotResultsQuery::send, cpp:133-152): the flags carry
+        //    the next-offset + switch-pm bits, the article result folds
+        //    through get_input_bot_inline_result and the button takes the
+        //    switch-pm arm
+        td.auth_manager.force_bot_for_test();
+        td.request(
+            6,
+            Function::answerInlineQuery(td_api::answerInlineQuery {
+                inline_query_id: 77,
+                is_personal: true,
+                button: Some(td_api::InlineQueryResultsButton {
+                    text: "Switch".to_owned(),
+                    r#type: Some(
+                        td_api::InlineQueryResultsButtonType::inlineQueryResultsButtonTypeStartBot(
+                            td_api::inlineQueryResultsButtonTypeStartBot {
+                                parameter: "abc123_XY".to_owned(),
+                            },
+                        ),
+                    ),
+                }),
+                results: vec![
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "r1".to_owned(),
+                            url: "https://t.me".to_owned(),
+                            title: "Title".to_owned(),
+                            description: "Desc".to_owned(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ],
+                cache_time: 30,
+                next_offset: "2".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setInlineBotResults::ID,
+        );
+        let body =
+            telegram_api::messages_setInlineBotResults::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, (1 << 1) | (1 << 2) | (1 << 3)); // PRIVATE | NEXT_OFFSET | SWITCH_PM
+        assert_eq!(
+            (body.gallery, body.private, body.query_id),
+            (false, true, 77)
+        );
+        assert_eq!(body.cache_time, 30);
+        assert_eq!(body.next_offset, "2");
+        match body.switch_pm.as_ref() {
+            Some(switch_pm) => {
+                assert_eq!(
+                    (switch_pm.text.as_str(), switch_pm.start_param.as_str()),
+                    ("Switch", "abc123_XY")
+                );
+            }
+            None => panic!("the switch-pm button"),
+        }
+        assert!(body.switch_webview.is_none());
+        assert_eq!(body.results.len(), 1);
+        match &body.results[0] {
+            telegram_api::InputBotInlineResult::inputBotInlineResult(result) => {
+                assert_eq!(
+                    (result.flags, result.id.as_str(), result.r#type.as_str()),
+                    ((1 << 1) | (1 << 2) | (1 << 3), "r1", "article") // TITLE | DESCRIPTION | URL
+                );
+                assert_eq!(result.title, "Title");
+                assert_eq!(result.description, "Desc");
+                assert_eq!(result.url, "https://t.me");
+                assert!(result.thumb.is_none() && result.content.is_none());
+                assert!(matches!(
+                    result.send_message.as_ref(),
+                    Some(telegram_api::InputBotInlineMessage::inputBotInlineMessageText(message))
+                        if message.message == "hi"
+                ));
+            }
+            other => panic!("the article result, got {other:?}"),
+        }
+
+        // 7. the Bool answer settles the parked promise ok (cpp:153-161);
+        //    the false band only logs
+        net_complete(sent, bool_true_bytes());
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 6).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 8. the wire error forwards to the request promise (cpp:162-165)
+        td.request(
+            7,
+            Function::answerInlineQuery(td_api::answerInlineQuery {
+                inline_query_id: 78,
+                is_personal: false,
+                button: None,
+                results: vec![
+                    td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                        td_api::inputInlineQueryResultArticle {
+                            id: "r2".to_owned(),
+                            url: String::new(),
+                            title: "T".to_owned(),
+                            description: String::new(),
+                            thumbnail_url: String::new(),
+                            thumbnail_width: 0,
+                            thumbnail_height: 0,
+                            reply_markup: None,
+                            input_message_content: Some(Box::new(
+                                td_api::InputMessageContent::inputMessageText(
+                                    td_api::inputMessageText {
+                                        text: Some(td_api::FormattedText {
+                                            text: "hi".to_owned(),
+                                            entities: Vec::new(),
+                                        }),
+                                        link_preview_options: None,
+                                        clear_draft: false,
+                                    },
+                                ),
+                            )),
+                        },
+                    ),
+                ],
+                cache_time: 30,
+                next_offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_setInlineBotResults::ID,
+        );
+        net_fail(sent, 400, "QUERY_ID_INVALID");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "QUERY_ID_INVALID")
+        );
+
+        // 9. the count band (cpp:728-731) — the 51st result errors before
+        //    any send
+        td.request(
+            8,
+            Function::answerInlineQuery(td_api::answerInlineQuery {
+                inline_query_id: 79,
+                is_personal: false,
+                button: None,
+                results: (0..51)
+                    .map(|index| {
+                        td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                            td_api::inputInlineQueryResultArticle {
+                                id: format!("r{index}"),
+                                url: String::new(),
+                                title: "T".to_owned(),
+                                description: String::new(),
+                                thumbnail_url: String::new(),
+                                thumbnail_width: 0,
+                                thumbnail_height: 0,
+                                reply_markup: None,
+                                input_message_content: Some(Box::new(
+                                    td_api::InputMessageContent::inputMessageText(
+                                        td_api::inputMessageText {
+                                            text: Some(td_api::FormattedText {
+                                                text: "hi".to_owned(),
+                                                entities: Vec::new(),
+                                            }),
+                                            link_preview_options: None,
+                                            clear_draft: false,
+                                        },
+                                    ),
+                                )),
+                            },
+                        )
+                    })
+                    .collect(),
+                cache_time: 30,
+                next_offset: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 8);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Too many inline query results specified")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_setInlineBotResults::ID,
+            "the count band sends nothing",
         );
     }
 }

@@ -697,12 +697,6 @@ pub trait InlineQueriesManagerEnv {
 
     // -- the remaining `[blocked: net]` query tails; each one drops the
     // -- promise, which keeps the C++ request unanswered offline
-    /// `SetInlineBotResultsQuery` (InlineQueriesManager.cpp:123-166).
-    fn send_set_inline_bot_results_query(
-        &mut self,
-        query: telegram_api::messages_setInlineBotResults,
-        promise: Promise<()>,
-    );
     /// `SetBotGuestChatResultQuery` (InlineQueriesManager.cpp:168-196).
     fn send_set_bot_guest_chat_result_query(
         &mut self,
@@ -877,6 +871,10 @@ pub(crate) enum InlineQueriesNetKind {
         bot_user_id: UserId,
         query_hash: u64,
     },
+    /// `SetInlineBotResultsQuery` (cpp:123-166) —
+    /// `messages.setInlineBotResults`; the Bool answer settles the parked
+    /// promise ok either way (the `!result` band only logs, cpp:156-159).
+    SetInlineBotResults,
 }
 
 /// The parked family promises (the ResultHandler `promise_` members) —
@@ -885,6 +883,8 @@ pub(crate) enum InlineQueriesNetKind {
 pub(crate) struct PendingInlineQueries {
     /// `GetInlineBotResultsQuery::promise_`.
     get_inline_bot_results: Vec<Promise<Option<td_api::InlineQueryResults>>>,
+    /// `SetInlineBotResultsQuery::promise_`.
+    set_inline_bot_results: Vec<Promise<()>>,
 }
 
 /// `InlineQueriesManager::PendingInlineQuery` (InlineQueriesManager.h:172-181).
@@ -1246,7 +1246,7 @@ impl InlineQueriesManager {
             switch_pm,
             switch_webview: web_view,
         };
-        env.send_set_inline_bot_results_query(query, promise);
+        self.send_set_inline_bot_results_query(query, promise);
     }
 
     /// `answer_guest_query` (InlineQueriesManager.cpp:762-768).
@@ -1831,6 +1831,40 @@ impl InlineQueriesManager {
             None
         } else {
             Some(self.pending.get_inline_bot_results.remove(0))
+        }
+    }
+
+    /// The `td_->create_handler<SetInlineBotResultsQuery>(promise_)
+    /// ->send(...)` collapse (InlineQueriesManager.cpp:133-152) — the
+    /// request promise parks in the family lot first (the handler's
+    /// `promise_` member), then the built wire query dispatches. `None`
+    /// on the handle keeps the net-inert posture.
+    pub(crate) fn send_set_inline_bot_results_query(
+        &mut self,
+        query: telegram_api::messages_setInlineBotResults,
+        promise: Promise<()>,
+    ) {
+        self.pending.set_inline_bot_results.push(promise);
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                InlineQueriesNetKind::SetInlineBotResults,
+                telegram_api::Function::messages_setInlineBotResults(query),
+            ),
+            None => tdutils::log_info!(
+                "Send messages.setInlineBotResults for query {} — [net-inert]",
+                query.query_id
+            ),
+        }
+    }
+
+    /// The set-inline-bot-results family pop for the
+    /// [`crate::td::Td::on_inline_queries_net_answer`] drain — the FIFO
+    /// head the answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_set_inline_bot_results_promise(&mut self) -> Option<Promise<()>> {
+        if self.pending.set_inline_bot_results.is_empty() {
+            None
+        } else {
+            Some(self.pending.set_inline_bot_results.remove(0))
         }
     }
 
@@ -3479,6 +3513,7 @@ mod tests {
     /// their promises in the family lots without dispatching (the
     /// [net-inert] posture; the netted_td round-trips drive the wire).
     struct TestEnv {
+        is_bot: bool,
         bots: Vec<i64>,
         inline: Vec<i64>,
         known: Vec<i64>,
@@ -3492,6 +3527,7 @@ mod tests {
     impl Default for TestEnv {
         fn default() -> Self {
             TestEnv {
+                is_bot: false,
                 bots: vec![9],
                 inline: vec![9],
                 known: vec![9],
@@ -3520,7 +3556,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     impl InlineQueriesManagerEnv for TestEnv {
         fn auth_is_bot(&self) -> bool {
-            false
+            self.is_bot
         }
 
         fn close_flag(&self) -> bool {
@@ -3647,14 +3683,6 @@ mod tests {
             _source: &str,
         ) -> Vec<telegram_api::MessageEntity> {
             Vec::new()
-        }
-
-        fn send_set_inline_bot_results_query(
-            &mut self,
-            _query: telegram_api::messages_setInlineBotResults,
-            _promise: Promise<()>,
-        ) {
-            // [blocked: net]
         }
 
         fn send_set_bot_guest_chat_result_query(
@@ -3871,6 +3899,98 @@ mod tests {
         assert!(manager.pop_get_inline_bot_results_promise().is_some());
         assert!(manager.pop_get_inline_bot_results_promise().is_some());
         assert!(manager.pop_get_inline_bot_results_promise().is_none());
+    }
+
+    /// The answer_inline_query bands over the bot env: the button
+    /// validation ladder (cpp:705-737) answers inline, the good article
+    /// parks the promise in the family lot and the game result's
+    /// short-name form rides the inputBotInlineResultGame arm.
+    #[test]
+    fn answer_inline_query_bands_and_net_inert_park() {
+        let mut manager = InlineQueriesManager::new();
+        let mut env = TestEnv {
+            is_bot: true,
+            ..TestEnv::default()
+        };
+        let article = || {
+            td_api::InputInlineQueryResult::inputInlineQueryResultArticle(
+                td_api::inputInlineQueryResultArticle {
+                    id: "r1".to_owned(),
+                    url: String::new(),
+                    title: "T".to_owned(),
+                    description: String::new(),
+                    thumbnail_url: String::new(),
+                    thumbnail_width: 0,
+                    thumbnail_height: 0,
+                    reply_markup: None,
+                    input_message_content: Some(Box::new(
+                        td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                            text: Some(td_api::FormattedText {
+                                text: "hi".to_owned(),
+                                entities: Vec::new(),
+                            }),
+                            link_preview_options: None,
+                            clear_draft: false,
+                        }),
+                    )),
+                },
+            )
+        };
+
+        // the empty start_parameter band (cpp:712-714)
+        let (promise, outcomes) = recording_promise::<()>();
+        manager.answer_inline_query(
+            &mut env,
+            7,
+            false,
+            Some(td_api::InlineQueryResultsButton {
+                text: "S".to_owned(),
+                r#type: Some(
+                    td_api::InlineQueryResultsButtonType::inlineQueryResultsButtonTypeStartBot(
+                        td_api::inlineQueryResultsButtonTypeStartBot {
+                            parameter: String::new(),
+                        },
+                    ),
+                ),
+            }),
+            vec![article()],
+            30,
+            String::new(),
+            promise,
+        );
+        assert!(matches!(
+            outcomes.lock().unwrap().first(),
+            Some(Err(message)) if message == "400 Can't use empty start_parameter"
+        ));
+
+        // the game result takes the inputBotInlineResultGame arm
+        // (cpp:1013-1038) — no inline-message fold, no content fields
+        let (promise, _outcomes) = recording_promise::<()>();
+        manager.answer_inline_query(
+            &mut env,
+            7,
+            false,
+            None,
+            vec![td_api::InputInlineQueryResult::inputInlineQueryResultGame(
+                td_api::inputInlineQueryResultGame {
+                    id: "g1".to_owned(),
+                    game_short_name: "snake".to_owned(),
+                    reply_markup: None,
+                },
+            )],
+            30,
+            String::new(),
+            promise,
+        );
+        assert_eq!(
+            manager.pending.set_inline_bot_results.len(),
+            1,
+            "the net-inert park"
+        );
+        assert!(
+            manager.pop_set_inline_bot_results_promise().is_some(),
+            "the FIFO pop"
+        );
     }
 
     /// The net-inert band of the whole send_inline_query ladder: the bot
