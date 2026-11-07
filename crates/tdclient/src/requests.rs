@@ -40,11 +40,8 @@ use crate::dialog_participant_manager::DialogParticipantManagerEnv;
 use crate::message_id::{MessageFullId, MessageId};
 use crate::messages_manager::DialogId as MmDialogId;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
-use crate::notification_settings::{
-    ReactionNotificationSettings, get_notification_settings_scope,
-    get_scope_notification_settings_object,
-};
-use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::notification_settings::ReactionNotificationSettings;
+use crate::notification_settings::get_notification_settings_scope;
 use crate::star_gift_manager::{
     StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
 };
@@ -753,30 +750,20 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             };
             let scope = get_notification_settings_scope(&scope_object);
             // `GetScopeNotificationSettingsRequest` (Requests.cpp:1340-1364):
-            // the synchronized settings answer the object, an unsynchronized
-            // scope defers into the (net-blocked) fetch and answers nothing
-            let unix_time = td.get_unix_time();
-            let answer = {
-                let env = NotificationEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    auth_is_authorized: td.auth_manager.is_authorized(),
-                    auth_is_bot: td.auth_manager.is_bot(),
-                    updates: &mut td.notification_updates,
-                };
-                match td
-                    .notification_settings_manager
-                    .get_scope_notification_settings_for_request(&env, scope)
-                {
-                    ScopeSettingsAnswer::Ready(settings) => {
-                        Some(get_scope_notification_settings_object(settings, unix_time))
-                    }
-                    ScopeSettingsAnswer::Deferred => None,
-                }
+            // the promise is the answer path on both bands — it settles
+            // inline with the synchronized object, or parks on the fetch
+            // query (the RequestActor defer) and the answer drain resolves
+            // it with the now-synchronized state (the do_run re-run)
+            let promise = td.deferred_promise(id, Object::scopeNotificationSettings);
+            let env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
             };
-            if let Some(object) = answer {
-                td.send_result(id, Object::scopeNotificationSettings(object));
-            }
+            td.notification_settings_manager
+                .get_scope_notification_settings_for_request(&env, scope, promise);
         }
         Function::setScopeNotificationSettings(request) => {
             // `Requests.cpp:7968-7975`: CHECK_IS_USER + the null-scope gate;
@@ -1540,9 +1527,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getAttachmentMenuBot(request) => {
             // `Requests.cpp:1101-1105` — the bot-data read answers the
-            // manager object; the reload query tail parks at the
-            // [blocked: net] seam. (The M.40 flip predated the arms — the
-            // dispatcher audit caught the gap.)
+            // manager object; the reload query tail rides the dispatcher
+            // (net-drain 42).
             if !check_is_user(td, id) {
                 return;
             }
@@ -1565,8 +1551,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::toggleBotIsAddedToAttachmentMenu(request) => {
-            // `Requests.cpp:1107-1113` — the ok answer parks behind the
-            // toggle query ([blocked: net]).
+            // `Requests.cpp:1107-1113` — the ok answer chains into the
+            // reload query (net-drain 42).
             if !check_is_user(td, id) {
                 return;
             }
@@ -6624,15 +6610,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 debug_information,
                 promise,
             );
-        }
-        Function::sendCallLog(_) => {
-            // `Requests.cpp:5148-5153` — the FileManager call-log upload
-            // surface (FileType::CallLog + upload callback) queues on the
-            // M.12 upload continuation; the interim 500 stays.
-            if !check_is_user(td, id) {
-                return;
-            }
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
         // --- account / sessions (Requests.cpp:2452-2478, 2515, …) ---
@@ -16995,7 +16972,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::getUserPrivacySettingRules(request) => {
             // Requests.cpp:2418-2422 — `PrivacyManager::get_privacy`; the
             // synchronized cache band answers the rules builder and the
-            // `account.getPrivacy` tail is the `[blocked: net]` seam.
+            // `account.getPrivacy` tail rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17016,7 +16993,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::setUserPrivacySettingRules(request) => {
             // Requests.cpp:2424-2428 — `PrivacyManager::set_privacy`; the
             // rules intake bands are real and the `account.setPrivacy`
-            // tail is the `[blocked: net]` seam.
+            // tail rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17075,8 +17052,8 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::getReadDatePrivacySettings(_) => {
             // Requests.cpp:5711-5723 — the query-promise lambda rewraps
             // the fetched `GlobalPrivacySettings` into the td_api object;
-            // the `account.getGlobalPrivacySettings` fetch is the
-            // `[blocked: net]` seam.
+            // the `account.getGlobalPrivacySettings` fetch rides the
+            // dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17112,7 +17089,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
             // = `settings == nullptr || !settings->show_read_date_`); the
             // archive hide is statically dead for this set type and the
             // get → `apply_changes` → `account.setGlobalPrivacySettings`
-            // chain parks at the `[blocked: net]` seam.
+            // chain rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17131,8 +17108,8 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
         Function::getNewChatPrivacySettings(_) => {
             // Requests.cpp:5732-5744 — the query-promise lambda rewrap of
             // `get_new_chat_privacy_settings_object`; the
-            // `account.getGlobalPrivacySettings` fetch is the
-            // `[blocked: net]` seam.
+            // `account.getGlobalPrivacySettings` fetch rides the
+            // dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
@@ -17168,7 +17145,7 @@ fn run_privacy_auto_download_requests(td: &mut Td, id: u64, function: Function) 
             // `[0, 1000000]` star-count clamp; the archive hide is
             // statically dead for this set type and the get →
             // `apply_changes` → `account.setGlobalPrivacySettings` chain
-            // parks at the `[blocked: net]` seam.
+            // rides the dispatcher.
             if !check_is_user(td, id) {
                 return;
             }
