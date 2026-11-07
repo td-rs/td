@@ -3204,6 +3204,16 @@ pub(crate) enum AccountNetKind {
 /// the answers drain through [`Td::on_account_net_answer`].
 type AccountNetHandle = NetKindHandle<AccountNetKind>;
 
+/// The cloned inline-queries dispatch surface the
+/// [`crate::inline_queries_manager::InlineQueriesManager`] holds — the
+/// per-kind handle over the InlineQueriesManager.cpp ResultHandler kinds
+/// (the net-drain 48 plane); the answers drain through
+/// [`Td::dispatch_completed_inline_queries_net`]. Manager-held (the
+/// [`crate::inline_queries_manager::InlineQueriesManager::net`] field, the
+/// forum-topic shape): the send legs run inside the manager.
+pub(crate) type InlineQueriesNetHandle =
+    NetKindHandle<crate::inline_queries_manager::InlineQueriesNetKind>;
+
 /// The StarManager in-flight query kinds — the C++ ResultHandler classes
 /// of StarManager.cpp:49-1400.
 #[derive(Clone, Copy)]
@@ -6186,6 +6196,18 @@ pub struct Td {
     /// through [`Td::on_transcription_net_answer`].
     transcription_net_completed:
         Arc<Mutex<Vec<(crate::transcription_manager::TranscriptionNetKind, NetQuery)>>>,
+    /// The inline-queries net completed queue (the
+    /// `InlineQueriesNetKind` tags; the net-drain 48 families) — the
+    /// dispatcher callbacks park here, the actor pump routes them
+    /// through [`Td::on_inline_queries_net_answer`].
+    inline_queries_net_completed: Arc<
+        Mutex<
+            Vec<(
+                crate::inline_queries_manager::InlineQueriesNetKind,
+                NetQuery,
+            )>,
+        >,
+    >,
     /// The attach-menu net completed queue (the `AttachMenuNetKind`
     /// tags; the net-drain 42 families) — the dispatcher callbacks park
     /// here, the actor pump routes them through
@@ -6708,6 +6730,7 @@ impl Td {
             forum_topic_net_completed: Arc::new(Mutex::new(Vec::new())),
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
+            inline_queries_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
@@ -7202,6 +7225,7 @@ impl Td {
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
+        self.inline_queries_manager.net = self.inline_queries_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9020,6 +9044,7 @@ impl Td {
         self.dispatch_completed_forum_topic_net();
         self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
+        self.dispatch_completed_inline_queries_net();
         self.dispatch_completed_attach_menu_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
@@ -9429,6 +9454,18 @@ impl Td {
         Some(TranscriptionNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.transcription_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned inline-queries dispatch surface the
+    /// [`crate::inline_queries_manager::InlineQueriesManager`] holds (the
+    /// net-drain 48 families' send legs) — `None` keeps the net-inert
+    /// posture.
+    pub(crate) fn inline_queries_net(&self) -> Option<InlineQueriesNetHandle> {
+        Some(InlineQueriesNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.inline_queries_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17735,6 +17772,112 @@ impl Td {
             self.on_transcription_net_answer(kind, query);
         }
         self.drain_sink();
+    }
+
+    /// Drain the callback-parked inline-query answers — the C++
+    /// ResultHandler halves of the net-drain 48 families
+    /// (InlineQueriesManager.cpp:67-455).
+    fn dispatch_completed_inline_queries_net(&mut self) {
+        let completed = std::mem::take(&mut *self.inline_queries_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_inline_queries_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Route one inline-query net answer by kind — the ResultHandler
+    /// halves of the net-drain 48 families (InlineQueriesManager.cpp:
+    /// 67-455): the wire answers parse here, run the landed intakes and
+    /// settle the parked family promises exactly where the C++ handler
+    /// settles them (the parse failures run the same `on_error` tails the
+    /// C++ `fetch_result` failure would).
+    fn on_inline_queries_net_answer(
+        &mut self,
+        kind: crate::inline_queries_manager::InlineQueriesNetKind,
+        query: NetQuery,
+    ) {
+        use crate::inline_queries_manager::InlineQueriesNetKind as K;
+        match kind {
+            // `GetInlineBotResultsQuery::on_result`/`on_error`
+            // (InlineQueriesManager.cpp:94-121) — the answer routes
+            // `on_get_inline_query_results` with the handler's re-entry
+            // key triple and the parked promise; the error tail rewrites
+            // the cancel (cpp:112-114) and the bot timeout (cpp:115-117),
+            // runs the nullptr intake for the query hash, then errors the
+            // promise.
+            K::GetInlineBotResults {
+                dialog_id,
+                bot_user_id,
+                query_hash,
+            } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_BotResults::parse(query.ok()) {
+                        Ok(results) => Ok(results),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.botResults: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getInlineBotResults answer",
+                            ))
+                        }
+                    }
+                };
+                let result = match result {
+                    Err(status) => {
+                        let status = if status.code() == tdnet::net_query::CANCELED_ERROR_CODE {
+                            Status::error(406, "Request canceled")
+                        } else if status.message() == "BOT_RESPONSE_TIMEOUT" {
+                            Status::error(502, "The bot is not responding")
+                        } else {
+                            status
+                        };
+                        if status.is_error() {
+                            tdutils::log_info!(
+                                "Receive error for GetInlineBotResultsQuery: {status}"
+                            );
+                        }
+                        Err(status)
+                    }
+                    ok => ok,
+                };
+                let mut manager = std::mem::take(&mut self.inline_queries_manager);
+                let promise = manager.pop_get_inline_bot_results_promise();
+                match (result, promise) {
+                    (Ok(results), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_inline_query_results(
+                            &mut env,
+                            dialog_id,
+                            bot_user_id,
+                            query_hash,
+                            Some(results),
+                            promise,
+                        );
+                    }
+                    (Err(status), Some(promise)) => {
+                        let (mut env, _, _) = inline_env_split(self);
+                        manager.on_get_inline_query_results(
+                            &mut env,
+                            dialog_id,
+                            bot_user_id,
+                            query_hash,
+                            None,
+                            Promise::default(),
+                        );
+                        let mut promise = promise;
+                        promise.set_error(status);
+                    }
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => tdutils::log_info!(
+                        "Receive an unexpected messages.getInlineBotResults answer"
+                    ),
+                }
+                self.inline_queries_manager = manager;
+            }
+        }
     }
 
     /// The net-drain 42 attach-menu answers (the dispatcher callback
@@ -46167,17 +46310,6 @@ impl crate::inline_queries_manager::InlineQueriesManagerEnv for TdInlineEnv<'_> 
         crate::message_entity::get_input_message_entities::<()>(None, entities, source)
     }
 
-    fn send_get_inline_bot_results_query(
-        &mut self,
-        _query: telegram_api::messages_getInlineBotResults,
-        _dialog_id: crate::dialog_id::DialogId,
-        _bot_user_id: crate::user_manager::UserId,
-        _query_hash: u64,
-        _promise: Promise<Option<td_api::InlineQueryResults>>,
-    ) {
-        // [blocked: net]
-    }
-
     fn send_set_inline_bot_results_query(
         &mut self,
         _query: telegram_api::messages_setInlineBotResults,
@@ -53104,6 +53236,7 @@ mod tests {
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
+        td.inline_queries_manager.net = td.inline_queries_net();
         (td, rec, callback)
     }
 
@@ -88420,5 +88553,220 @@ kQIDAQAB\n\
                 .expect("the empty-call band");
             assert_eq!(error.message, "Input call must be non-empty");
         }
+    }
+
+    // ---- the net-drain 48 inline-query families: the §3.9
+    // InlineQueriesManager wire queries (InlineQueriesManager.cpp:67-455)
+    // ride the InlineQueriesNetKind plane. ----
+
+    /// The wire form of a received inline bot: the access hash (the
+    /// user-mode input user), the bot + inline flags and the placeholder
+    /// (the `USER_BOT_INLINE_PLACEHOLDER_MASK` band, cpp:3820).
+    fn inline_bot_user(user_id: i64, access_hash: i64) -> telegram_api::User {
+        telegram_api::User::user(telegram_api::user {
+            flags: 1 | (1 << 19), // ACCESS_HASH_MASK | BOT_INLINE_PLACEHOLDER_MASK
+            bot: true,
+            bot_inline_placeholder: "Query...".to_owned(),
+            id: user_id,
+            access_hash,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn inline_queries_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(inline_queries_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn inline_queries_net_families_ride_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain48-inline");
+        td.intake_users(
+            vec![inline_bot_user(9, 3)],
+            "inline_queries_net_families_ride_the_dispatcher",
+        );
+
+        // 1. the live getInlineQueryResults arm rides the wire
+        //    (Requests.cpp:8195-8203 → send_inline_query → loop() →
+        //    GetInlineBotResultsQuery::send, cpp:76-92): the flags carry no
+        //    geo point, the bot is the resolved input user and the empty
+        //    dialog resolves to inputPeerEmpty
+        td.request(
+            1,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "weather".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineBotResults::ID,
+        );
+        let body =
+            telegram_api::messages_getInlineBotResults::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 0);
+        assert_eq!(body.query, "weather");
+        assert_eq!(body.offset, "");
+        assert!(matches!(
+            body.bot.as_ref(),
+            Some(telegram_api::InputUser::inputUser(user)) if (user.user_id, user.access_hash) == (9, 3)
+        ));
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerEmpty(_))
+        ));
+        assert!(body.geo_point.is_none());
+
+        // 2. the answer drain runs the landed intake
+        //    (on_get_inline_query_results, cpp:2280-2322): the query id
+        //    rides the results object, the article result parks at the
+        //    [blocked: M.9] content seam so the list answers empty
+        let bot_results = telegram_api::messages_BotResults {
+            flags: 1 << 1, // NEXT_OFFSET_MASK — the offset rides flags.1
+            gallery: false,
+            query_id: 55,
+            next_offset: "2".to_owned(),
+            switch_pm: None,
+            switch_webview: None,
+            results: vec![telegram_api::BotInlineResult::botInlineResult(
+                telegram_api::botInlineResult {
+                    flags: 0,
+                    id: "a".to_owned(),
+                    r#type: "article".to_owned(),
+                    title: String::new(),
+                    description: String::new(),
+                    url: String::new(),
+                    thumb: None,
+                    content: None,
+                    send_message: Some(telegram_api::BotInlineMessage::botInlineMessageText(
+                        telegram_api::botInlineMessageText {
+                            flags: 0,
+                            no_webpage: false,
+                            invert_media: false,
+                            message: "hi".to_owned(),
+                            entities: Vec::new(),
+                            reply_markup: None,
+                        },
+                    )),
+                },
+            )],
+            cache_time: 60,
+            users: Vec::new(),
+        };
+        net_complete(sent, wire!(bot_results));
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::inlineQueryResults(results)) => {
+                assert_eq!(results.inline_query_id, 55);
+                assert_eq!(results.next_offset, "2");
+                assert!(results.results.is_empty(), "the M.9 content seam parks");
+                assert!(results.button.is_none());
+            }
+            other => panic!("the inline query results, got {other:?}"),
+        }
+
+        // 3. the error tail (cpp:111-121): the plain wire error forwards
+        //    to the request promise after the nullptr intake. The
+        //    INLINE_QUERY_DELAY_MS gate (cpp:1419-1420) parks the next
+        //    send until the clock jumps past the 400ms window
+        //    (`Time::jump_in_future`, the C++ timeout hop).
+        tdutils::time::jump_in_future(tdutils::time::now() + 0.5);
+        td.request(
+            2,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "other".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineBotResults::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_7"));
+
+        // 4. the BOT_RESPONSE_TIMEOUT rewrite (cpp:115-117) — the 502
+        //    "The bot is not responding" band
+        tdutils::time::jump_in_future(tdutils::time::now() + 0.5);
+        td.request(
+            3,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "third".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_getInlineBotResults::ID,
+        );
+        net_fail(sent, 500, "BOT_RESPONSE_TIMEOUT");
+        td.dispatch_completed_inline_queries_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (502, "The bot is not responding")
+        );
+
+        // 5. the dropped-pending band (cpp:1389-1399): a new query inside
+        //    the 400ms window parks first, then the next one drops it —
+        //    its promise errors 406 "Request canceled" (the C++
+        //    cancel_query hop's answer) and the nullptr intake runs for
+        //    its hash
+        td.request(
+            4,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "pending".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::messages_getInlineBotResults::ID,
+            "the 400ms inline-query delay parks the pending query",
+        );
+        td.request(
+            5,
+            Function::getInlineQueryResults(td_api::getInlineQueryResults {
+                bot_user_id: 9,
+                chat_id: 0,
+                user_location: None,
+                query: "third-b".to_owned(),
+                offset: String::new(),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (406, "Request canceled")
+        );
     }
 }
