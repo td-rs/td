@@ -3694,6 +3694,14 @@ pub(crate) type WebPagesNetHandle = NetKindHandle<crate::web_pages_manager::WebP
 /// Manager-held (the forum-topic shape): the send legs run inside the
 /// manager over the env's input-user reads.
 pub(crate) type AttachMenuNetHandle = NetKindHandle<crate::attach_menu_manager::AttachMenuNetKind>;
+/// The cloned boost dispatch surface the
+/// [`crate::boost_manager::BoostManager`] holds — the per-kind handle
+/// over the BoostManager.cpp ResultHandler kinds (the net-drain 59
+/// families); the answers drain through
+/// [`Td::dispatch_completed_boost_net`]. Manager-held (the
+/// [`crate::game_manager::GameManager::net`] shape): the send legs run
+/// inside the manager over the env's peer/input-user reads.
+pub(crate) type BoostNetHandle = NetKindHandle<crate::boost_manager::BoostNetKind>;
 
 /// The `ConvertStarGiftQuery` continuation queue — the C++
 /// `PromiseCreator::lambda` (StarGiftManager.cpp:2874-2881): the reload
@@ -6192,6 +6200,10 @@ pub struct Td {
     /// [`Td::on_attach_menu_net_answer`].
     attach_menu_net_completed:
         Arc<Mutex<Vec<(crate::attach_menu_manager::AttachMenuNetKind, NetQuery)>>>,
+    /// The boost net completed queue (the `BoostNetKind` tags; the
+    /// net-drain 59 families) — the dispatcher callbacks park here, the
+    /// actor pump routes them through [`Td::on_boost_net_answer`].
+    boost_net_completed: Arc<Mutex<Vec<(crate::boost_manager::BoostNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6709,6 +6721,7 @@ impl Td {
             web_pages_net_completed: Arc::new(Mutex::new(Vec::new())),
             transcription_net_completed: Arc::new(Mutex::new(Vec::new())),
             attach_menu_net_completed: Arc::new(Mutex::new(Vec::new())),
+            boost_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7202,6 +7215,7 @@ impl Td {
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
+        self.boost_manager.net = self.boost_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9021,6 +9035,7 @@ impl Td {
         self.dispatch_completed_web_pages_net();
         self.dispatch_completed_transcription_net();
         self.dispatch_completed_attach_menu_net();
+        self.dispatch_completed_boost_net();
         self.dispatch_completed_story_net();
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
@@ -9441,6 +9456,17 @@ impl Td {
         Some(AttachMenuNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.attach_menu_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned boost dispatch surface the
+    /// [`crate::boost_manager::BoostManager`] holds (the net-drain 59
+    /// families' send legs) — `None` keeps the net-inert posture.
+    pub(crate) fn boost_net(&self) -> Option<BoostNetHandle> {
+        Some(BoostNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.boost_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -17748,6 +17774,16 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked boost answers — the C++ ResultHandler
+    /// halves of the net-drain 59 families (BoostManager.cpp:94-325).
+    fn dispatch_completed_boost_net(&mut self) {
+        let completed = std::mem::take(&mut *self.boost_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_boost_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20377,6 +20413,56 @@ impl Td {
                     tdutils::log_error!("Failed to add a bot to attachment menu");
                 }
                 manager.reload_attach_menu_bots(&mut env, promise);
+            }
+        }
+    }
+
+    /// Route one boost net answer by kind — the ResultHandler halves of
+    /// the net-drain 59 families (BoostManager.cpp:94-325): the wire
+    /// answer parses here, the parked family promise settles exactly
+    /// where the C++ handler settles it (the parse failures run the same
+    /// `on_error` tails the C++ `fetch_result` failure would, cpp:107-118).
+    fn on_boost_net_answer(&mut self, kind: crate::boost_manager::BoostNetKind, query: NetQuery) {
+        use crate::boost_manager::BoostNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        match kind {
+            // `GetMyBoostsQuery::on_result`/`on_error` (cpp:107-118) —
+            // the `premium.myBoosts` answer converts through the
+            // manager intake (the users/chats intakes + the slot loop,
+            // cpp:47-93) and settles the parked FIFO-head promise; the
+            // error leg has no dialog head (cpp:115-118).
+            K::GetMyBoosts => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_MyBoosts::parse(query.ok()) {
+                        Ok(my_boosts) => Ok(my_boosts),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.myBoosts: {error}");
+                            Err(parse_error("premium_getMyBoosts"))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_get_my_boosts_promise();
+                match (result, promise) {
+                    (Ok(my_boosts), Some(mut promise)) => {
+                        let slots = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_chat_boost_slots_object(&mut env, my_boosts)
+                        };
+                        promise.set_value(slots);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.myBoosts answer")
+                    }
+                }
+                self.boost_manager = manager;
             }
         }
     }
@@ -38678,43 +38764,84 @@ impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
 
 /// The boost-plane env over the `Td` fields.
 pub(crate) struct BoostEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out for the boost manager — the
+/// manager out, the env over the `Td` remainder (the
+/// `premium_env_split` convention); the caller restores the manager
+/// after the call. The net-drain 59 families widened the env from the
+/// field-split form to the whole-Td view: the answer drains resolve
+/// peers/users/chats through the real managers.
+pub(crate) fn boost_env_split(td: &mut Td) -> (crate::boost_manager::BoostManager, BoostEnv<'_>) {
+    let manager = std::mem::take(&mut td.boost_manager);
+    (manager, BoostEnv { td })
 }
 
 impl BoostManagerEnv for BoostEnv<'_> {
     fn close_flag(&self) -> bool {
-        self.global.close_flag()
+        self.td.global.close_flag()
     }
 
     fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_integer(name, default_value)
-        })
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or(default_value, |options| {
+                options.get_option_integer(name, default_value)
+            })
     }
 
-    fn send_update(&mut self, _update: td_api::Update) {}
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(td_api::Object::from(update));
+    }
 
     fn check_dialog_access(
         &mut self,
         dialog_id: crate::dialog_id::DialogId,
+        source: &str,
     ) -> std::result::Result<(), tdutils::status::Status> {
-        if dialog_id.is_valid() {
-            Ok(())
-        } else {
-            Err(tdutils::status::Status::error(400, "Chat not found"))
-        }
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            source,
+        ))
     }
 
     fn get_channel_first_username(&mut self, channel_id: crate::chat_manager::ChannelId) -> String {
         // `ChatManager::get_channel_first_username` — the M.5 surface; the
         // seam answers the empty username.
-        let _ = (
-            self.chat_manager as &mut crate::chat_manager::ChatManager,
-            channel_id,
-        );
+        let _ = (&mut self.td.chat_manager, channel_id);
         String::new()
+    }
+
+    // The answer-conversion reads of the net-drain 59 families (the
+    // `PremiumTdEnv` arms over the same managers).
+    fn unix_time(&mut self) -> i32 {
+        self.td.global.unix_time()
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        self.td.intake_users(users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str) {
+        self.td.intake_chats(chats, source);
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+        _force_read: bool,
+    ) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
     }
 }
 
@@ -53104,6 +53231,7 @@ mod tests {
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
         td.attach_menu_manager.net = td.attach_menu_net();
+        td.boost_manager.net = td.boost_net();
         (td, rec, callback)
     }
 
@@ -88420,5 +88548,194 @@ kQIDAQAB\n\
                 .expect("the empty-call band");
             assert_eq!(error.message, "Input call must be non-empty");
         }
+    }
+
+    // ---- the net-drain 59 boost families: the five §3.9 BoostManager
+    // ---- wire queries (BoostManager.cpp:94-325) ride the BoostNetKind
+    // ---- plane.
+
+    /// The one `chatBoostSlots` response of a request (the
+    /// `error_of`/`responses_of` companions).
+    fn chat_boost_slots_of(callback: &CollectCallback, id: u64) -> td_api::ChatBoostSlots {
+        let Some(Object::chatBoostSlots(slots)) = responses_of(callback, id).into_iter().next()
+        else {
+            panic!("expected a chatBoostSlots response for {id}");
+        };
+        slots
+    }
+
+    fn sample_my_boosts() -> telegram_api::premium_MyBoosts {
+        let peer = |user_id: i64| {
+            Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id,
+            }))
+        };
+        telegram_api::premium_MyBoosts {
+            my_boosts: vec![
+                // the live user slot — the dates pass through
+                telegram_api::MyBoost {
+                    flags: 3,
+                    slot: 3,
+                    peer: peer(700000001),
+                    date: 100,
+                    expires: 2_000_000_000,
+                    cooldown_until_date: 50,
+                },
+                // the empty slot — no peer, so the chat id stays 0 and
+                // the dates zero (BoostManager.cpp:78-81); flags = the
+                // cooldown bit only (the peer bit stays clear)
+                telegram_api::MyBoost {
+                    flags: 2,
+                    slot: 4,
+                    peer: None,
+                    date: 100,
+                    expires: 2_000_000_000,
+                    cooldown_until_date: 50,
+                },
+                // the expired slot drops (cpp:57-59)
+                telegram_api::MyBoost {
+                    flags: 3,
+                    slot: 5,
+                    peer: peer(700000002),
+                    date: 100,
+                    expires: 1,
+                    cooldown_until_date: 50,
+                },
+                // the invalid-peer slot drops (cpp:68-74)
+                telegram_api::MyBoost {
+                    flags: 1,
+                    slot: 6,
+                    peer: peer(0),
+                    date: 100,
+                    expires: 2_000_000_000,
+                    cooldown_until_date: 0,
+                },
+            ],
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn boost_my_boosts_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_my_boosts_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_my_boosts_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost");
+
+        // 1. the live td_api arm rides the wire:
+        //    getAvailableChatBoostSlots sends premium.getMyBoosts
+        //    (BoostManager.cpp:100/416-419)
+        let id = 11;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        telegram_api::premium_getMyBoosts::parse(sent.query()).expect("the sent body");
+
+        // 2. the premium.myBoosts answer converts through
+        //    get_chat_boost_slots_object (cpp:47-93) and settles the
+        //    request promise
+        net_complete(sent, wire!(sample_my_boosts()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let slots = chat_boost_slots_of(&callback, id);
+        assert_eq!(slots.slots.len(), 2, "the expired + invalid slots drop");
+        assert_eq!(
+            (
+                slots.slots[0].slot_id,
+                slots.slots[0].currently_boosted_chat_id,
+                slots.slots[0].start_date,
+                slots.slots[0].expiration_date,
+                slots.slots[0].cooldown_until_date
+            ),
+            (3, 700000001, 100, 2_000_000_000, 50)
+        );
+        assert_eq!(
+            (
+                slots.slots[1].slot_id,
+                slots.slots[1].currently_boosted_chat_id,
+                slots.slots[1].start_date,
+                slots.slots[1].cooldown_until_date
+            ),
+            (4, 0, 0, 0)
+        );
+        assert!(
+            td.boost_net_completed.lock().is_empty(),
+            "the myBoosts answer drained"
+        );
+
+        // 3. the wire-error band forwards the status to the request
+        //    promise (cpp:115-118 — no dialog head on this family)
+        let id = 12;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        net_fail(sent, 420, "BOOSTS_FLOOD");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!((error.code, error.message.as_str()), (420, "BOOSTS_FLOOD"));
+
+        // 4. the parse-failure band answers the C++ 500
+        let id = 13;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        net_complete(sent, 0x9972_75b5u32.to_le_bytes().to_vec());
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Failed to parse the premium_getMyBoosts answer")
+        );
+
+        // 5. the net-inert posture parks the request promise without a
+        //    wire query (the pre-init windows)
+        td.boost_manager.net = None;
+        let id = 14;
+        td.request(
+            id,
+            Function::getAvailableChatBoostSlots(td_api::getAvailableChatBoostSlots),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_getMyBoosts::ID,
+            "the net-inert getAvailableChatBoostSlots",
+        );
+        td.flush_deferred_results();
+        assert_eq!(
+            td.boost_manager.pending_get_my_boosts.len(),
+            1,
+            "the net-inert park"
+        );
     }
 }

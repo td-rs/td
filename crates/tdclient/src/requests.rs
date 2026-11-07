@@ -49,7 +49,6 @@ use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
 use crate::td::AttachMenuEnv;
 use crate::td::BackgroundEnv;
-use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
@@ -1677,12 +1676,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise::<td_api::ChatBoostSlots, _>(id, Object::chatBoostSlots);
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_boost_slots(&mut env, promise);
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_boost_slots(&mut env, promise);
+            td.boost_manager = manager;
         }
         Function::getChatBoostFeatures(request) => {
             // `Requests.cpp:3517-3521` — the local feature-table builder
@@ -1690,14 +1686,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            let features = td
-                .boost_manager
-                .get_chat_boost_features_object(&mut env, !request.is_channel);
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            let features = manager.get_chat_boost_features_object(&mut env, !request.is_channel);
+            td.boost_manager = manager;
             td.send_result(id, Object::chatBoostFeatures(features));
         }
         Function::getChatBoostLevelFeatures(request) => {
@@ -1705,16 +1696,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            let features = td.boost_manager.get_chat_boost_level_features_object(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            let features = manager.get_chat_boost_level_features_object(
                 &mut env,
                 !request.is_channel,
                 request.level,
             );
+            td.boost_manager = manager;
             td.send_result(id, Object::chatBoostLevelFeatures(features));
         }
         Function::getChatAvailablePaidMessageReactionSenders(request) => {
@@ -9611,16 +9599,13 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::ChatBoostStatus| Object::chatBoostStatus(s));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_dialog_boost_status(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_dialog_boost_status(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 promise,
             );
+            td.boost_manager = manager;
         }
         Function::boostChat(request) => {
             if !check_is_user(td, id) {
@@ -9628,32 +9613,27 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |s: td_api::ChatBoostSlots| Object::chatBoostSlots(s));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.boost_dialog(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.boost_dialog(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 &request.slot_ids,
                 promise,
             );
+            td.boost_manager = manager;
         }
         Function::getChatBoostLink(request) => {
             if !check_is_user(td, id) {
                 return;
             }
             let result = {
-                let mut env = BoostEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    chat_manager: &mut td.chat_manager,
-                };
-                td.boost_manager.get_dialog_boost_link(
+                let (mut manager, mut env) = crate::td::boost_env_split(td);
+                let result = manager.get_dialog_boost_link(
                     &mut env,
                     crate::dialog_id::DialogId::new(request.chat_id),
-                )
+                );
+                td.boost_manager = manager;
+                result
             };
             match result {
                 Ok((url, is_public)) => td.send_result(
@@ -9675,12 +9655,8 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_dialog_boosts(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_dialog_boosts(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.only_gift_codes,
@@ -9688,6 +9664,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 request.limit,
                 promise,
             );
+            td.boost_manager = manager;
         }
         Function::getUserChatBoosts(request) => {
             if !check_is_user(td, id) {
@@ -9695,17 +9672,14 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
-            let mut env = BoostEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                chat_manager: &mut td.chat_manager,
-            };
-            td.boost_manager.get_user_dialog_boosts(
+            let (mut manager, mut env) = crate::td::boost_env_split(td);
+            manager.get_user_dialog_boosts(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 request.user_id,
                 promise,
             );
+            td.boost_manager = manager;
         }
 
         // Everything else waits for its manager step.
