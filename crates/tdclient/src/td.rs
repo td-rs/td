@@ -20464,6 +20464,49 @@ impl Td {
                 }
                 self.boost_manager = manager;
             }
+            // `ApplyBoostQuery::on_result`/`on_error`
+            // (BoostManager.cpp:249-261) — the answer is the shared
+            // `premium.myBoosts` conversion of the slots family; the
+            // error leg runs the dialog-error head first (cpp:260-261).
+            K::ApplyBoost { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::premium_MyBoosts::parse(query.ok()) {
+                        Ok(my_boosts) => Ok(my_boosts),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse premium.myBoosts: {error}");
+                            Err(parse_error("premium_applyBoost"))
+                        }
+                    }
+                };
+                if let Err(status) = &result {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "ApplyBoostQuery",
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.boost_manager);
+                let promise = manager.pop_apply_boost_promise();
+                match (result, promise) {
+                    (Ok(my_boosts), Some(mut promise)) => {
+                        let slots = {
+                            let mut env = crate::td::BoostEnv { td: self };
+                            manager.get_chat_boost_slots_object(&mut env, my_boosts)
+                        };
+                        promise.set_value(slots);
+                    }
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {
+                        tdutils::log_info!("Receive an unexpected premium.applyBoost answer")
+                    }
+                }
+                self.boost_manager = manager;
+            }
             // `GetBoostsStatusQuery::on_result`/`on_error` (cpp:135-196)
             // — the `premium.boostsStatus` answer converts through the
             // manager intake (the validation ladder, the audience counts
@@ -89053,6 +89096,167 @@ kQIDAQAB\n\
         );
         assert_eq!(
             td.boost_manager.pending_get_boosts_status.len(),
+            1,
+            "the net-inert park"
+        );
+    }
+
+    #[test]
+    fn boost_apply_family_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(boost_apply_family_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn boost_apply_family_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain59-boost-apply");
+        td.user_manager.set_my_id(
+            &mut crate::user_manager::UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            },
+            crate::user_manager::UserId::new(700000001),
+        );
+        td.intake_users(
+            vec![telegram_api::User::user(telegram_api::user {
+                flags: 1 << 15,
+                id: 700000001,
+                ..Default::default()
+            })],
+            "boost_apply_family_rides_the_dispatcher",
+        );
+
+        // 1. the live td_api arm's gate: an unknown chat answers the
+        //    "Chat not found" band (cpp:429 — the TRY_STATUS_PROMISE)
+        let id = 31;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000002,
+                slot_ids: vec![1],
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Chat not found")
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_applyBoost::ID,
+            "the gated boostChat",
+        );
+
+        // 2. the empty slot list redirects to the slots family
+        //    (cpp:431-432) — the wire query is premium.getMyBoosts
+        let id = 32;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: Vec::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_getMyBoosts::ID,
+        );
+        net_complete(sent, wire!(sample_my_boosts()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        assert_eq!(chat_boost_slots_of(&callback, id).slots.len(), 2);
+
+        // 3. the slot list rides the wire: the SLOTS flag bit, the slot
+        //    ids and the resolved read peer (cpp:237-247)
+        let id = 33;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: vec![2, 4],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_applyBoost::ID,
+        );
+        let body = telegram_api::premium_applyBoost::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags & 1, 1, "the SLOTS_MASK flag");
+        assert_eq!(body.slots, vec![2, 4]);
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+
+        // 4. the premium.myBoosts answer converts through the shared
+        //    slots intake (cpp:249-258) and settles the request promise
+        net_complete(sent, wire!(sample_my_boosts()));
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let slots = chat_boost_slots_of(&callback, id);
+        assert_eq!(slots.slots.len(), 2);
+        assert_eq!(
+            td.boost_manager.pending_apply_boost.len(),
+            0,
+            "the apply promise drained"
+        );
+
+        // 5. the wire-error band runs the on_error tail: the
+        //    dialog-error head then the promise error (cpp:260-261)
+        let id = 34;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: vec![1],
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::premium_applyBoost::ID,
+        );
+        net_fail(sent, 400, "SLOT_ALREADY_BOOSTED");
+        td.dispatch_completed_boost_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, id);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "SLOT_ALREADY_BOOSTED")
+        );
+
+        // 6. the net-inert posture parks the request promise without a
+        //    wire query
+        td.boost_manager.net = None;
+        let id = 35;
+        td.request(
+            id,
+            Function::boostChat(td_api::boostChat {
+                chat_id: 700000001,
+                slot_ids: vec![1],
+            }),
+        );
+        assert_not_sent(
+            &rec,
+            telegram_api::premium_applyBoost::ID,
+            "the net-inert boostChat",
+        );
+        assert_eq!(
+            td.boost_manager.pending_apply_boost.len(),
             1,
             "the net-inert park"
         );
