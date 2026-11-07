@@ -3187,6 +3187,17 @@ pub(crate) enum AccountNetKind {
     /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_accept_terms_of_service`]
     /// with the parked request promise.
     AcceptTermsOfService,
+    /// `DismissSuggestionQuery` (SuggestedActionManager.cpp:26-63) — the
+    /// `help.dismissSuggestion` send; the kind carries the parked lot key
+    /// `(dialog_id, type)` so the answer pops the exact lot; the Bool
+    /// answer (either value) routes the ok half of
+    /// [`crate::suggested_action_manager::SuggestedActionManager::on_dismiss_suggested_action`].
+    DismissSuggestion { dialog_id: i64, action_type: i32 },
+    /// `CheckPromoDataQuery` (SuggestedActionManager.cpp:65-105) — the
+    /// login-email promo check over `help.getPromoData`; the answer
+    /// settles the parked request promise directly (the
+    /// SETUP_LOGIN_EMAIL scan, the 404 "Not Found" band).
+    CheckPromoData,
 }
 
 /// The cloned account dispatch surface the [`AccountEnv`] senders use —
@@ -7763,6 +7774,7 @@ impl Td {
                 global: &mut self.global,
                 options: self.option_manager.as_mut(),
                 user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
                 device_token_manager: &mut self.device_token_manager,
                 auth_is_bot: self.auth_manager.is_bot(),
                 updates: &mut self.account_updates,
@@ -22418,6 +22430,7 @@ impl Td {
                         global: &mut self.global,
                         options: self.option_manager.as_mut(),
                         user_manager: &mut self.user_manager,
+                        chat_manager: &mut self.chat_manager,
                         device_token_manager: &mut self.device_token_manager,
                         auth_is_bot: self.auth_manager.is_bot(),
                         updates: &mut self.account_updates,
@@ -22718,6 +22731,7 @@ impl Td {
                     global: &mut self.global,
                     options: self.option_manager.as_mut(),
                     user_manager: &mut self.user_manager,
+                    chat_manager: &mut self.chat_manager,
                     device_token_manager: &mut self.device_token_manager,
                     auth_is_bot: self.auth_manager.is_bot(),
                     updates: &mut self.account_updates,
@@ -22753,6 +22767,7 @@ impl Td {
                     global: &mut self.global,
                     options: self.option_manager.as_mut(),
                     user_manager: &mut self.user_manager,
+                    chat_manager: &mut self.chat_manager,
                     device_token_manager: &mut self.device_token_manager,
                     auth_is_bot: self.auth_manager.is_bot(),
                     updates: &mut self.account_updates,
@@ -22815,6 +22830,102 @@ impl Td {
                             promise.set_error(parse_error("account_getAccountTTL"));
                         }
                     }
+                }
+            }
+            // `DismissSuggestionQuery` (SuggestedActionManager.cpp:26-63)
+            // — the Bool answer (either value) settles the routing lambda
+            // ok (cpp:48-55); the error leg runs the dialog-error head
+            // first (cpp:57-62), then the ok/error halves of
+            // `on_dismiss_suggested_action` (cpp:195-220) run over the
+            // kind-keyed lot — the no-dialog ok branch reports the
+            // `ConfigManager::reload_app_config` tail (cpp:216).
+            AccountNetKind::DismissSuggestion {
+                dialog_id,
+                action_type,
+            } => {
+                let dialog = crate::dialog_id::DialogId::new(dialog_id);
+                let result = if query.is_error() {
+                    let status = query.error().clone();
+                    if dialog.is_valid() {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &self.global,
+                            dialog,
+                            &status,
+                            "DismissSuggestionQuery",
+                        );
+                    }
+                    Err(status)
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(_) => Ok(()),
+                        None => Err(parse_error("help.dismissSuggestion")),
+                    }
+                };
+                let net = self.account_net();
+                let mut env = AccountEnv {
+                    global: &mut self.global,
+                    options: self.option_manager.as_mut(),
+                    user_manager: &mut self.user_manager,
+                    chat_manager: &mut self.chat_manager,
+                    device_token_manager: &mut self.device_token_manager,
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    updates: &mut self.account_updates,
+                    net,
+                };
+                let reload_app_config = self.suggested_action_manager.on_dismiss_suggested_action(
+                    &mut env,
+                    (dialog_id, action_type),
+                    result,
+                );
+                if reload_app_config {
+                    // `ConfigManager::reload_app_config` (cpp:216 →
+                    // ConfigManager.cpp:970-980) — the td-level config
+                    // tail (the actions dispatch the follow-up
+                    // help.getAppConfig).
+                    let is_bot = self.auth_manager.is_bot();
+                    let close_flag = self.global.close_flag();
+                    let actions = self
+                        .config_manager
+                        .as_mut()
+                        .map(|config_manager| {
+                            config_manager.reload_app_config(None, is_bot, close_flag)
+                        })
+                        .unwrap_or_default();
+                    self.apply_config_actions(actions);
+                }
+            }
+            // `CheckPromoDataQuery` (SuggestedActionManager.cpp:65-105) —
+            // the promoData answer scans the pending suggestions for the
+            // login-email pair (cpp:87-94): a match settles ok, every
+            // other ok band (the empty promo, no match) answers the 404
+            // "Not Found" (cpp:99); errors forward verbatim
+            // (cpp:102-104), parse failures ride the 500 convention.
+            AccountNetKind::CheckPromoData => {
+                let Some(mut promise) = self.suggested_action_manager.take_login_email_promise()
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let required = match telegram_api::help_PromoData::parse(query.ok()) {
+                    Ok(telegram_api::help_PromoData::help_promoData(promo)) => {
+                        promo.pending_suggestions.iter().any(|suggestion| {
+                            suggestion == "SETUP_LOGIN_EMAIL"
+                                || suggestion == "SETUP_LOGIN_EMAIL_NOSKIP"
+                        })
+                    }
+                    Ok(telegram_api::help_PromoData::help_promoDataEmpty(_)) => false,
+                    Err(_) => {
+                        promise.set_error(parse_error("help.getPromoData"));
+                        return;
+                    }
+                };
+                if required {
+                    promise.set_value(());
+                } else {
+                    promise.set_error(Status::error(404, "Not Found"));
                 }
             }
         }
@@ -27159,6 +27270,7 @@ impl Td {
             global: &mut self.global,
             options: self.option_manager.as_mut(),
             user_manager: &mut self.user_manager,
+            chat_manager: &mut self.chat_manager,
             device_token_manager: &mut self.device_token_manager,
             auth_is_bot: self.auth_manager.is_bot(),
             updates: &mut self.account_updates,
@@ -27670,6 +27782,7 @@ impl Td {
                 global: &mut self.global,
                 options: self.option_manager.as_mut(),
                 user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
                 device_token_manager: &mut self.device_token_manager,
                 auth_is_bot: self.auth_manager.is_bot(),
                 updates: &mut self.account_updates,
@@ -35673,12 +35786,14 @@ impl tdnet::net_query::DcInitSink for InertDcInit {
 /// TermsOfServiceManager, SuggestedActionManager) — built per call with
 /// the field-split borrows (the `NotificationEnv` convention); the net
 /// field carries the live dispatch surface for the query senders (`None`
-/// keeps the net-inert posture — the account and terms-of-service
-/// families dispatch, the suggested-action arms stay net-inert).
+/// keeps the net-inert posture — the inert arms log instead); the
+/// chat-manager half serves the suggested-action dismiss send legs (the
+/// `MessageQueryEnv` split shape).
 pub(crate) struct AccountEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: Option<&'a mut OptionManager>,
     pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
     pub(crate) device_token_manager: &'a mut crate::device_token_manager::DeviceTokenManager,
     pub(crate) auth_is_bot: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
@@ -36084,8 +36199,153 @@ impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'
         )
     }
 
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    /// `DialogManager::check_dialog_access(dialog_id, false, Read,
+    /// "dismiss_suggested_action")` (SuggestedActionManager.cpp:163-165)
+    /// — the M.6 registry stand-in over the split borrows (the
+    /// `TdDialogParticipantEnv` shape; the full dialog-manager ladder
+    /// lands with the dialog plane).
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        use crate::dialog_id::DialogType;
+        let have = match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            DialogType::Chat => self
+                .chat_manager
+                .get_chat(dialog_id.get_chat_id())
+                .is_some(),
+            DialogType::SecretChat | DialogType::None => false,
+        };
+        if have {
+            Ok(())
+        } else if !dialog_id.is_valid() {
+            Err(tdutils::status::Status::error(
+                400,
+                "Invalid chat identifier specified",
+            ))
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    /// `DialogManager::get_input_peer(dialog_id, Read)` — the dismiss
+    /// send-leg peer ladder over the split borrows (the
+    /// `MessageQueryEnv::env_input_peer` twin).
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let user_id = dialog_id.get_user_id();
+                let options = self.options.as_deref_mut()?;
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &env,
+                    user_id,
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            DialogType::Chat => self.chat_manager.get_input_peer_chat(
+                dialog_id.get_chat_id(),
+                crate::user_manager::AccessRights::Read,
+            ),
+            DialogType::Channel => {
+                let channel_id = dialog_id.get_channel_id();
+                let options = self.options.as_deref_mut()?;
+                let env = crate::user_manager::UserEnv {
+                    global: self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.chat_manager.get_input_peer_channel(
+                    &env,
+                    channel_id,
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    /// `DismissSuggestionQuery::send` (SuggestedActionManager.cpp:34-46)
+    /// — the peer branch at the send leg: the valid dialog resolves its
+    /// read peer (the C++ CHECK band logs inert here), the empty dialog
+    /// sends `inputPeerEmpty`.
+    fn send_dismiss_suggestion_query(&mut self, action: &crate::suggested_action::SuggestedAction) {
+        let Some(net) = self.net.clone() else {
+            return tdutils::log_info!(
+                "Send help.dismissSuggestion for {:?} — [net-inert]",
+                action.type_
+            );
+        };
+        let input_peer = if action.dialog_id.is_valid() {
+            match self.get_input_peer(action.dialog_id) {
+                Some(peer) => peer,
+                None => {
+                    // the C++ CHECK(input_peer != nullptr) band
+                    // (cpp:38-39) — the logged inert skip
+                    return tdutils::log_info!(
+                        "DismissSuggestionQuery has no input peer for {:?}",
+                        action.dialog_id
+                    );
+                }
+            }
+        } else {
+            telegram_api::InputPeer::inputPeerEmpty(telegram_api::inputPeerEmpty {})
+        };
+        net.dispatch(
+            AccountNetKind::DismissSuggestion {
+                dialog_id: action.dialog_id.get(),
+                action_type: action.type_ as i32,
+            },
+            telegram_api::Function::help_dismissSuggestion(telegram_api::help_dismissSuggestion {
+                peer: Some(Box::new(input_peer)),
+                suggestion: action.get_suggested_action_str(),
+            }),
+        );
+    }
+
+    /// `CheckPromoDataQuery::send` (SuggestedActionManager.cpp:72-74).
+    fn send_get_promo_data_query(&mut self) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::CheckPromoData,
+                telegram_api::Function::help_getPromoData(telegram_api::help_getPromoData),
+            ),
+            None => tdutils::log_info!("Send help.getPromoData — [net-inert]"),
+        }
     }
 }
 
@@ -38386,18 +38646,20 @@ impl PremiumEnv for PremiumTdEnv<'_> {
 
     // `dismiss_suggested_action(SuggestedAction{type}, Promise<Unit>())`
     // (Premium.cpp:1461-1465) over the suggested-action manager — the
-    // `AccountEnv` build (the `hide_archive_and_mute_suggested_action`
-    // precedent); the `DismissSuggestionQuery` seam parks with the
-    // suggested-action net slice.
+    // net-armed `AccountEnv` build (the suggested-action families ride
+    // the account dispatch plane, net-drain 52; the wire
+    // `help.dismissSuggestion` goes out for a present action).
     fn dismiss_suggested_action(
         &mut self,
         action_type: crate::suggested_action::SuggestedActionType,
     ) {
+        let net = self.td.account_net();
         let this = &mut *self.td;
         let crate::td::Td {
             global,
             option_manager,
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_manager,
             suggested_action_manager,
@@ -38410,10 +38672,11 @@ impl PremiumEnv for PremiumTdEnv<'_> {
             global,
             options: option_manager.as_mut(),
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_is_bot: auth_manager.is_bot(),
             updates: account_updates,
-            net: None,
+            net,
         };
         // the C++ internal callers drop their promises
         suggested_action_manager.dismiss_suggested_action(
@@ -39262,6 +39525,7 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
             global,
             option_manager,
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_manager,
             suggested_action_manager,
@@ -39274,6 +39538,7 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
             global,
             options: option_manager.as_mut(),
             user_manager,
+            chat_manager,
             device_token_manager,
             auth_is_bot: auth_manager.is_bot(),
             updates: account_updates,
@@ -54033,6 +54298,7 @@ mod tests {
             global: &mut td.global,
             options: td.option_manager.as_mut(),
             user_manager: &mut td.user_manager,
+            chat_manager: &mut td.chat_manager,
             device_token_manager: &mut td.device_token_manager,
             auth_is_bot: td.auth_manager.is_bot(),
             updates: &mut td.account_updates,
@@ -55638,6 +55904,544 @@ mod tests {
             .unwrap();
     }
 
+    // ---- the net-drain 52 suggested-action slice (the promo family):
+    // the login-email check rides the account dispatch plane (the
+    // SuggestedActionManager.cpp CheckPromoDataQuery handler half). ----
+
+    /// The net-drain 52 promo round-trip — the §3.9 family rides the
+    /// dispatcher through the [`AccountEnv`] send arm
+    /// (CheckPromoDataQuery, SuggestedActionManager.cpp:65-105): the
+    /// live `isLoginEmailAddressRequired` arm dispatches
+    /// `help.getPromoData`, the matching SETUP_LOGIN_EMAIL answer
+    /// settles ok (cpp:87-93), the unmatched and empty promo bands
+    /// answer 404 "Not Found" (cpp:94-99), errors forward verbatim
+    /// (cpp:102-104) and parse failures ride the 500 convention.
+
+    #[test]
+    fn suggested_action_promo_bands_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suggested_action_promo_bands_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn suggested_action_promo_bands_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suggested-actions");
+
+        fn promo_answer(suggestions: &[&str]) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_PromoData::help_promoData(telegram_api::help_promoData {
+                flags: 0,
+                proxy: false,
+                expires: 1_700_003_600,
+                peer: None,
+                psa_type: String::new(),
+                psa_message: String::new(),
+                pending_suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+                dismissed_suggestions: Vec::new(),
+                custom_pending_suggestion: None,
+                chats: Vec::new(),
+                users: Vec::new(),
+            })
+            .store(&mut out);
+            out
+        }
+
+        fn promo_empty_answer() -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::help_PromoData::help_promoDataEmpty(telegram_api::help_promoDataEmpty {
+                expires: 1_700_003_600,
+            })
+            .store(&mut out);
+            out
+        }
+
+        td.request(
+            310,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_answer(&["SETUP_LOGIN_EMAIL"]));
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 310)
+                .iter()
+                .any(|object| matches!(object, Object::ok(_))),
+            "the matching promo settles ok"
+        );
+
+        td.request(
+            311,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_answer(&["VALIDATE_PASSWORD"]));
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 311);
+        assert_eq!(error.code, 404);
+        assert_eq!(error.message, "Not Found");
+
+        td.request(
+            312,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, promo_empty_answer());
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 312);
+        assert_eq!(error.code, 404);
+        assert_eq!(error.message, "Not Found");
+
+        td.request(
+            313,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_fail(sent, 420, "SLOWMODE_WAIT");
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 313);
+        assert_eq!(error.code, 420);
+        assert_eq!(error.message, "SLOWMODE_WAIT");
+
+        td.request(
+            314,
+            Function::isLoginEmailAddressRequired(td_api::isLoginEmailAddressRequired),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::help_getPromoData::ID,
+        );
+        net_complete(sent, vec![0x00, 0x00, 0x00, 0x00]);
+        td.dispatch_completed_account_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 314);
+        assert_eq!(error.code, 500);
+        assert_eq!(
+            error.message,
+            "Failed to parse the help.getPromoData answer"
+        );
+    }
+
+    // ---- the net-drain 52 suggested-action slice (the dismiss
+    // family): the hideSuggestedAction arm rides the account dispatch
+    // plane (the SuggestedAction.cpp free ladder + the manager flow, the
+    // DismissSuggestionQuery handler half). ----
+
+    /// The net-drain 52 dismiss round-trips — the §3.9 family rides the
+    /// dispatcher through the [`AccountEnv`] send arm
+    /// (DismissSuggestionQuery, SuggestedActionManager.cpp:26-63): the
+    /// live `hideSuggestedAction` arm through the free ladder
+    /// (SuggestedAction.cpp:312-355) into the manager flow (cpp:156-193)
+    /// and the wire query — the wire form (inputPeerEmpty + the action
+    /// string), the head-only send + fan-out, the ladder bands, the
+    /// error forward, the dialog-access band — and the Bool answer
+    /// settling the deferred ok with the reload tail (cpp:195-220); the
+    /// premium dismiss-park flip (the assignStoreTransaction trio,
+    /// Premium.cpp:1454-1465).
+    #[test]
+    fn suggested_action_dismiss_bands_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suggested_action_dismiss_bands_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn suggested_action_dismiss_bands_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suggested-actions-dismiss");
+
+        // Load the persistent actions through the real manager intake
+        // (the dismiss entry sends only for present actions) — the env
+        // exactly as the production call sites build it (the take-out
+        // convention).
+        fn load_actions(td: &mut Td, strs: &[&str]) {
+            let mut manager = std::mem::take(&mut td.suggested_action_manager);
+            let net = td.account_net();
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+                net,
+            };
+            manager.update_suggested_actions(
+                &mut env,
+                strs.iter()
+                    .map(|str| crate::suggested_action::SuggestedAction::from_action_str(str))
+                    .collect(),
+            );
+            td.suggested_action_manager = manager;
+        }
+
+        fn dismiss_wire(query: &NetQuery) -> telegram_api::help_dismissSuggestion {
+            telegram_api::help_dismissSuggestion::parse(query.query()).unwrap()
+        }
+
+        // 1. The live hideSuggestedAction arm — the loaded action rides
+        //    the free ladder into the manager flow (Requests.cpp:8144-
+        //    8148 → SuggestedAction.cpp:312-355 → 156-193): the wire form
+        //    carries inputPeerEmpty + the action string; boolTrue settles
+        //    the deferred ok (cpp:48-55), the removal update emits and the
+        //    no-dialog ok branch runs the reload tail (cpp:216) — the
+        //    follow-up help.getAppConfig dispatches.
+        {
+            load_actions(&mut td, &["PREMIUM_UPGRADE"]);
+            td.request(
+                301,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionUpgradePremium(
+                        td_api::suggestedActionUpgradePremium,
+                    )),
+                }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::help_dismissSuggestion::ID,
+            );
+            let wire = dismiss_wire(&sent);
+            assert!(matches!(
+                wire.peer.as_ref().map(|peer| peer.as_ref()),
+                Some(telegram_api::InputPeer::inputPeerEmpty(_))
+            ));
+            assert_eq!(wire.suggestion, "PREMIUM_UPGRADE");
+            net_complete(sent, bool_answer(true));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 301)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the dismiss settles ok"
+            );
+            let removed = td
+                .account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateSuggestedActions(_)))
+                .count();
+            assert_eq!(removed, 2, "the intake load + the removal update");
+            // cpp:216 — the reload tail: the follow-up app-config query
+            // dispatches (the in-flight coalescing keeps it at one).
+            let config_queries = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::help_getAppConfig::ID)
+                .count();
+            assert_eq!(config_queries, 1, "the reload tail dispatches");
+        }
+
+        // 2. The fan-out band — a second dismiss of the same in-flight
+        //    action parks without a second query (cpp:185-192); one
+        //    answer settles both promises.
+        {
+            load_actions(&mut td, &["PREMIUM_RESTORE"]);
+            td.request(
+                302,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionRestorePremium(
+                        td_api::suggestedActionRestorePremium,
+                    )),
+                }),
+            );
+            td.request(
+                303,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionRestorePremium(
+                        td_api::suggestedActionRestorePremium,
+                    )),
+                }),
+            );
+            let dismissals = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::help_dismissSuggestion::ID)
+                .collect::<Vec<_>>();
+            assert_eq!(dismissals.len(), 1, "the head-only send");
+            net_complete(dismissals.into_iter().next().unwrap(), bool_answer(true));
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            for id in [302, 303] {
+                assert!(
+                    responses_of(&callback, id)
+                        .iter()
+                        .any(|object| matches!(object, Object::ok(_))),
+                    "the fan-out settles {id}"
+                );
+            }
+            let _ = std::mem::take(&mut *rec.sent.lock());
+        }
+
+        // 3. The absent-action band — a dismiss of an action the manager
+        //    does not hold settles ok inline with no wire query
+        //    (cpp:179-181).
+        {
+            td.request(
+                304,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionCheckPhoneNumber(
+                        td_api::suggestedActionCheckPhoneNumber,
+                    )),
+                }),
+            );
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 304)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the absent action settles ok"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(sent.is_empty(), "no wire query for an absent action");
+        }
+
+        // 4. The ladder bands through the live arm — the noskip 400
+        //    (SuggestedAction.cpp:317-318), the invalid delay 400
+        //    (cpp:333-334) and the matching-days ok band (cpp:339-346:
+        //    the removal update + the cleared option, no wire query).
+        {
+            td.request(
+                305,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(
+                        td_api::SuggestedAction::suggestedActionSetLoginEmailAddress(
+                            td_api::suggestedActionSetLoginEmailAddress {
+                                can_be_hidden: false,
+                            },
+                        ),
+                    ),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 305);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "The action can't be hidden");
+
+            td.request(
+                306,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionSetPassword(
+                        td_api::suggestedActionSetPassword {
+                            authorization_delay: -1,
+                        },
+                    )),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 306);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Invalid authorization_delay specified");
+
+            if let Some(options) = td.option_manager.as_mut() {
+                options.set_option_integer("otherwise_relogin_days", 7);
+            }
+            let updates_before = td
+                .account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateSuggestedActions(_)))
+                .count();
+            td.request(
+                307,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionSetPassword(
+                        td_api::suggestedActionSetPassword {
+                            authorization_delay: 7,
+                        },
+                    )),
+                }),
+            );
+            td.flush_deferred_results();
+            assert!(
+                responses_of(&callback, 307)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_))),
+                "the days band settles ok"
+            );
+            let updates_after = td
+                .account_updates
+                .iter()
+                .filter(|update| matches!(update, td_api::Update::updateSuggestedActions(_)))
+                .count();
+            assert_eq!(updates_after, updates_before + 1, "the removal update");
+            assert_eq!(
+                td.option_manager
+                    .as_ref()
+                    .map(|options| options.get_option_integer("otherwise_relogin_days", 0)),
+                Some(0),
+                "the option cleared"
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(sent.is_empty(), "the days band sends nothing");
+        }
+
+        // 5. The error band — the wire error forwards to the deferred
+        //    promise (cpp:57-62 → 206-208).
+        {
+            load_actions(&mut td, &["BIRTHDAY_SETUP"]);
+            td.request(
+                308,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(td_api::SuggestedAction::suggestedActionSetBirthdate(
+                        td_api::suggestedActionSetBirthdate,
+                    )),
+                }),
+            );
+            let sent = take_sent(
+                std::mem::take(&mut *rec.sent.lock()),
+                telegram_api::help_dismissSuggestion::ID,
+            );
+            net_fail(sent, 400, "SUGGESTION_INVALID");
+            td.dispatch_completed_account_net();
+            td.flush_deferred_results();
+            let error = error_of(&callback, 308);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "SUGGESTION_INVALID");
+        }
+
+        // 6. The dialog-form band — the unregistered channel fails the
+        //    access gate before any dispatch (cpp:163-165).
+        {
+            td.request(
+                309,
+                Function::hideSuggestedAction(td_api::hideSuggestedAction {
+                    action: Some(
+                        td_api::SuggestedAction::suggestedActionConvertToBroadcastGroup(
+                            td_api::suggestedActionConvertToBroadcastGroup {
+                                supergroup_id: 1099,
+                            },
+                        ),
+                    ),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = error_of(&callback, 309);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Chat not found");
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(sent.is_empty());
+        }
+
+        // 8. The premium dismiss-park flip (§6) — the
+        //    assignStoreTransaction PremiumSubscription purpose dismisses
+        //    the three suggested actions (Premium.cpp:1454-1456): with the
+        //    actions loaded the trio rides the wire (the §6 parks flip),
+        //    the answers drain through the account plane and the reload
+        //    tail parks behind the in-flight app-config query (the
+        //    coalescing).
+        {
+            load_actions(
+                &mut td,
+                &["PREMIUM_UPGRADE", "PREMIUM_ANNUAL", "PREMIUM_RESTORE"],
+            );
+            let (promise, slot) = record_translation_unit();
+            with_premium_manager(&mut td, |manager, env| {
+                manager.assign_store_transaction(
+                    env,
+                    Some(td_api::StoreTransaction::storeTransactionGooglePlay(
+                        td_api::storeTransactionGooglePlay {
+                            package_name: "org.telegram.plus".to_string(),
+                            store_product_id: "product/12".to_string(),
+                            purchase_token: "tok".to_string(),
+                        },
+                    )),
+                    Some(
+                        td_api::StorePaymentPurpose::storePaymentPurposePremiumSubscription(
+                            td_api::storePaymentPurposePremiumSubscription {
+                                is_restore: true,
+                                is_upgrade: false,
+                            },
+                        ),
+                    ),
+                    promise,
+                );
+            });
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            let mut dismiss_queries = Vec::new();
+            let mut rest = Vec::new();
+            for query in sent {
+                if query.tl_constructor() == telegram_api::help_dismissSuggestion::ID {
+                    dismiss_queries.push(query);
+                } else {
+                    rest.push(query);
+                }
+            }
+            let dismissals = dismiss_queries
+                .iter()
+                .map(dismiss_wire)
+                .map(|wire| wire.suggestion.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                dismissals,
+                ["PREMIUM_UPGRADE", "PREMIUM_ANNUAL", "PREMIUM_RESTORE"],
+                "the §6 trio rides the wire"
+            );
+            let assign_query = rest
+                .into_iter()
+                .find(|query| {
+                    query.tl_constructor() == telegram_api::payments_assignPlayMarketTransaction::ID
+                })
+                .expect("the assign query dispatches");
+            let mut answer = Vec::new();
+            telegram_api::Updates::updates(telegram_api::updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            })
+            .store(&mut answer);
+            net_complete(assign_query, answer);
+            td.dispatch_completed_premium_net();
+            assert!(matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ));
+            // the trio's Bool answers drain through the account plane:
+            // the lots pop, the promise-less internal dismisses settle,
+            // and each no-dialog ok branch queues an app-config reload —
+            // all coalesced behind the in-flight query from case 1 (no
+            // new dispatch).
+            for query in dismiss_queries {
+                net_complete(query, bool_answer(true));
+                td.dispatch_completed_account_net();
+            }
+            assert!(
+                td.suggested_action_manager
+                    .dismiss_suggested_action_queries
+                    .is_empty(),
+                "the dismisses drain"
+            );
+            let config_queries = std::mem::take(&mut *rec.sent.lock())
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::help_getAppConfig::ID)
+                .count();
+            assert_eq!(
+                config_queries, 0,
+                "the reloads coalesce behind the in-flight config"
+            );
+        }
+
+        assert!(td.account_net_completed.lock().is_empty(), "drained");
+    }
+
     fn terms_of_service_families_ride_the_dispatcher_impl() {
         let (mut td, rec, callback) = netted_td_with_callback("netfix-terms");
 
@@ -55650,6 +56454,7 @@ mod tests {
                     global: &mut td.global,
                     options: td.option_manager.as_mut(),
                     user_manager: &mut td.user_manager,
+                    chat_manager: &mut td.chat_manager,
                     device_token_manager: &mut td.device_token_manager,
                     auth_is_bot: td.auth_manager.is_bot(),
                     updates: &mut td.account_updates,
@@ -68667,16 +69472,16 @@ mod tests {
             Some(tdutils::status::Result::Ok(()))
         ));
         // the PremiumSubscription purpose dismisses the three
-        // suggested actions (cpp:1461-1465) — the promises park at the
-        // suggested-action plane's net seam
-        assert_eq!(
+        // suggested actions (cpp:1461-1465) — the manager holds no
+        // actions here, so each dismiss settles its Unit promise inline
+        // with no wire query and no park (SuggestedActionManager.cpp:
+        // 179-181); the flip's wire trio rides the net-drain 52
+        // suggested-action round-trips.
+        assert!(
             td.suggested_action_manager
                 .dismiss_suggested_action_queries
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![(0, 7), (0, 8), (0, 9)],
-            "UpgradePremium/SubscribeToAnnualPremium/RestorePremium"
+                .is_empty(),
+            "no parked dismiss lots for absent actions"
         );
 
         // 15. assignStoreTransaction — the empty transaction answers the

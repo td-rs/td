@@ -352,6 +352,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     global: &mut td.global,
                     options: td.option_manager.as_mut(),
                     user_manager: &mut td.user_manager,
+                    chat_manager: &mut td.chat_manager,
                     device_token_manager: &mut td.device_token_manager,
                     auth_is_bot: td.auth_manager.is_bot(),
                     updates: &mut td.account_updates,
@@ -1648,20 +1649,22 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             td.statistics_manager = manager;
         }
         Function::isLoginEmailAddressRequired(_) => {
-            // `Requests.cpp:1893-1898` — the ok answer parks behind the
-            // promo-data query ([blocked: net]).
+            // `Requests.cpp:1893-1898` — the CheckPromoDataQuery answers
+            // the ok/404 bands (SuggestedActionManager.cpp:65-105).
             if !check_is_user(td, id) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
             td.suggested_action_manager
                 .is_login_email_address_required(&mut env, promise);
@@ -6626,6 +6629,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6635,24 +6639,37 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 .confirm_qr_code_authentication(&mut env, &link, promise);
         }
         Function::hideSuggestedAction(request) => {
+            // `Requests.cpp:8144-8148` → the free `dismiss_suggested_action`
+            // ladder (SuggestedAction.cpp:312-355): the type bands answer
+            // inline, everything else rides the DismissSuggestionQuery
+            // wire family and the promise settles from the Bool answer
+            // (SuggestedActionManager.cpp:26-63).
             if !check_is_user(td, id) {
                 return;
             }
             let Some(action) = request.action.as_ref() else {
                 return td.send_error_impl(id, 400, "Action must be non-empty");
             };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let net = td.account_net();
             let mut env = AccountEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
-                net: None,
+                net,
             };
-            td.suggested_action_manager
-                .hide_suggested_action(&mut env, SuggestedAction::from_td_api(action));
-            td.send_result(id, ok_object());
+            let mut manager = std::mem::take(&mut td.suggested_action_manager);
+            crate::suggested_action_manager::dismiss_suggested_action(
+                &mut env,
+                &mut manager,
+                SuggestedAction::from_td_api(action),
+                promise,
+            );
+            td.suggested_action_manager = manager;
         }
         Function::getUserLink(_) => {
             if !check_is_user(td, id) {
@@ -6666,6 +6683,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6684,6 +6702,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6701,6 +6720,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6719,6 +6739,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6737,6 +6758,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6755,6 +6777,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6777,6 +6800,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6801,6 +6825,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6818,6 +6843,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6836,6 +6862,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6857,6 +6884,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6876,6 +6904,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -6898,6 +6927,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -17925,6 +17955,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -17984,6 +18015,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
@@ -18726,6 +18758,7 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
                 user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
                 device_token_manager: &mut td.device_token_manager,
                 auth_is_bot: td.auth_manager.is_bot(),
                 updates: &mut td.account_updates,
