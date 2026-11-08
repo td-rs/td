@@ -1358,6 +1358,55 @@ mod tests {
         let _ = crate::sqlite_db::destroy(&path);
     }
 
+    /// The pytdbot/echobot live blocker (2026-11-08): `TdDb::open` on a
+    /// FRESH directory with a non-empty `database_encryption_key` must
+    /// create the database (binlog + sqlite, AesCtr-encrypted from the
+    /// first event) and reopen cleanly — it reported WRONG_PASSWORD
+    /// instead. The key is the raw KDF fast path (`TdDb::as_db_key`), and
+    /// an empty JSON key defaults to the "cucumber" raw key, so both arms
+    /// are covered.
+    #[test]
+    fn tddb_fresh_open_with_key_roundtrip() {
+        for (name, key) in [
+            ("m6_tddb_fresh_key", b"1234echobot$".to_vec()),
+            ("m6_tddb_fresh_key_empty", Vec::new()),
+        ] {
+            let dir = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let parameters = Parameters {
+                encryption_key: if key.is_empty() {
+                    DbKey::raw_key(b"cucumber".to_vec())
+                } else {
+                    DbKey::raw_key(key)
+                },
+                database_directory: dir.join("database").to_string_lossy().into_owned(),
+                files_directory: dir.join("files").to_string_lossy().into_owned(),
+                ..Parameters::default()
+            };
+
+            // 1. fresh open with the key creates the database
+            let mut opened = match TdDb::open(parameters.clone()) {
+                Result::Ok(ok) => ok,
+                Result::Err(status) => panic!("fresh open failed: {status}"),
+            };
+            opened.database.close_all(false);
+
+            // 2. reopen with the same key reads the created binlog
+            let mut opened = match TdDb::open(parameters.clone()) {
+                Result::Ok(ok) => ok,
+                Result::Err(status) => panic!("reopen failed: {status}"),
+            };
+            opened.database.close_all(false);
+
+            // 3. reopen with a wrong key must fail with WRONG_PASSWORD
+            let mut wrong = parameters.clone();
+            wrong.encryption_key = DbKey::raw_key(b"other-key".to_vec());
+            assert!(TdDb::open(wrong).is_error());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// M.6.13: the fresh path sets `was_created` and creates both tables;
     /// the pinned-dialogs migration (a database at version 11) collects the
     /// pinned rows per folder into the pmc, newest order first.
