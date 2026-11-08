@@ -1,15 +1,21 @@
 //! `CallActor` (td/telegram/CallActor.{h,cpp}) — the M.32 Wave-3 call
 //! state machine. The C++ actor collapses to a plain struct (the M.13
 //! convention); the net queries (request/accept/confirm/discard/received/
-//! getCallConfig/getDhConfig) are `[blocked: net]` env seams with the
-//! promises parked manager-side, the actor timeouts (set_timeout_in) are
-//! recorded no-ops until the actor envelope + Td timeout slot land, and
-//! the in-flight-query cancel on discard is dropped with the queries
-//! themselves.
+//! getCallConfig/getDhConfig) ride the manager-held `CallNetKind` plane:
+//! the actor builds the TL at the send site and hands it to the env seam,
+//! the `CallEnv` override dispatches, and the answers drain through
+//! `Td::on_call_net_answer` (the promises park in the manager's FIFO
+//! family lots like the C++ carrying them on the query). The call/media
+//! stack DEP is stale at the pin: the eight wire families landed with
+//! this plane while the media payload plane (tgcalls) stays parked —
+//! the ready state carries the key/config the media stack would consume.
+//! The actor timeouts (set_timeout_in) are recorded no-ops until the
+//! actor envelope and Td timeout slot land, and the in-flight-query
+//! cancel on discard is dropped with the queries themselves.
 
 use crate::call_discard_reason::{
     CallDiscardReason, CallDiscardReasonType, get_call_discard_reason,
-    get_group_call_invite_link_slug,
+    get_group_call_invite_link_slug, get_input_phone_call_discard_reason,
 };
 use crate::call_id::CallId;
 use crate::call_protocol::{CallConnection, CallProtocol, CallState, CallStateType};
@@ -64,48 +70,72 @@ pub trait CallActorEnv: DhCacheEnv {
     /// `send_closure(G()->td(), &Td::send_update, ...)`.
     fn send_update(&mut self, update: td_api::Update);
 
-    /// `getCallConfig` (start_up) — `[blocked: net]`.
-    fn send_get_call_config_query(&mut self) {
-        tdutils::log_info!("Send phone.getCallConfig — [blocked: net]");
+    /// `getCallConfig` (start_up, cpp:884-891) — the dispatch seam; the
+    /// actor builds the TL and the `CallEnv` override rides the
+    /// `CallNetKind` plane (the offline default logs the net-inert
+    /// posture). The answer handler is [`CallActor::on_get_call_config_result`].
+    fn send_get_call_config_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.getCallConfig — [net-inert]");
     }
 
-    /// `messages_getDhConfig` (do_load_dh_config) — `[blocked: net]`; the
-    /// answer handler is [`CallActor::on_dh_config`].
-    fn send_get_dh_config_query(&mut self, version: i32) {
-        tdutils::log_info!("Send messages.getDhConfig(version = {version}) — [blocked: net]");
+    /// `messages_getDhConfig` (do_load_dh_config, cpp:668-703) — the
+    /// answer parses in the Td router (the DhConfig build + the DRBG
+    /// seed + the stored-config fallback, cpp:683-701) and lands in
+    /// [`CallActor::on_dh_config`].
+    fn send_get_dh_config_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send messages.getDhConfig — [net-inert]");
     }
 
-    /// `phone_requestCall` (try_send_request_query) — `[blocked: net]`.
-    fn send_request_call_query(&mut self, input_user: &telegram_api::InputUser) {
-        tdutils::log_info!("Send phone.requestCall for {input_user:?} — [blocked: net]");
+    /// `phone_requestCall` (try_send_request_query, cpp:734-736) — the
+    /// answer rides [`CallActor::update_call_inner`] (cpp:753-758); the
+    /// C++ `total_timeout_limit_` + `request_query_ref_` ride the fixed
+    /// dispatch budget (no cancel surface — the standing divergence).
+    fn send_request_call_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.requestCall — [net-inert]");
     }
 
-    /// `phone_acceptCall` — `[blocked: net]`.
-    fn send_accept_call_query(&mut self) {
-        tdutils::log_info!("Send phone.acceptCall — [blocked: net]");
+    /// `phone_acceptCall` (cpp:772-774) — the answer rides
+    /// [`CallActor::update_call_inner`] (cpp:784-789).
+    fn send_accept_call_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.acceptCall — [net-inert]");
     }
 
-    /// `phone_confirmCall` — `[blocked: net]`.
-    fn send_confirm_call_query(&mut self) {
-        tdutils::log_info!("Send phone.confirmCall — [blocked: net]");
+    /// `phone_confirmCall` (cpp:797-799) — the answer rides
+    /// [`CallActor::update_call_inner`] (cpp:808-812).
+    fn send_confirm_call_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.confirmCall — [net-inert]");
     }
 
-    /// `phone_discardCall` — `[blocked: net]`.
-    fn send_discard_call_query(&mut self) {
-        tdutils::log_info!("Send phone.discardCall — [blocked: net]");
+    /// `phone_discardCall` (cpp:826-828) — the ok answer rides the
+    /// Updates engine (cpp:837-841), the fetch error routes into
+    /// [`CallActor::on_error`].
+    fn send_discard_call_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.discardCall — [net-inert]");
     }
 
-    /// `phone_receivedCall` — `[blocked: net]`.
-    fn send_received_call_query(&mut self) {
-        tdutils::log_info!("Send phone.receivedCall — [blocked: net]");
+    /// `phone_receivedCall` (cpp:706) — the ok answer is unused
+    /// (cpp:714-719), the fetch error routes into [`CallActor::on_error`].
+    fn send_received_call_query(&mut self, call_id: CallId, function: telegram_api::Function) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.receivedCall — [net-inert]");
     }
 
-    /// `phone_sendSignalingData` — `[blocked: net]`.
-    fn send_call_signaling_data_query(&mut self, data: &[u8]) {
-        tdutils::log_info!(
-            "Send phone.sendSignalingData for {} bytes — [blocked: net]",
-            data.len()
-        );
+    /// `phone_sendSignalingData` (cpp:278-279) — the request promise
+    /// parks in the manager's FIFO family lot and settles in the answer
+    /// router (cpp:280-289); the actor never sees it.
+    fn send_call_signaling_data_query(
+        &mut self,
+        call_id: CallId,
+        function: telegram_api::Function,
+    ) {
+        let _ = (call_id, function);
+        tdutils::log_info!("Send phone.sendSignalingData — [net-inert]");
     }
 }
 
@@ -198,9 +228,6 @@ pub struct CallActor {
     dh_handshake: DhHandshake,
     dh_config: Option<DhConfig>,
     dh_config_query_sent: bool,
-    /// The `()`-typed promises parked at their `[blocked: net]` query
-    /// sends (the UserManager `net_blocked_promises` convention).
-    pub net_blocked_promises: Vec<Promise<()>>,
 }
 
 impl CallActor {
@@ -228,7 +255,6 @@ impl CallActor {
             dh_handshake: DhHandshake::new(),
             dh_config: None,
             dh_config_query_sent: false,
-            net_blocked_promises: Vec::new(),
         }
     }
 
@@ -296,21 +322,25 @@ impl CallActor {
         ));
     }
 
-    /// `send_call_signaling_data` (CallActor.cpp:272-289).
+    /// `send_call_signaling_data` (CallActor.cpp:272-289) — the state
+    /// gate + the TL build; the manager parks the request promise in the
+    /// FIFO family lot and dispatches (the C++ promise rides the query
+    /// lambda, cpp:280-289).
     pub fn send_call_signaling_data(
         &mut self,
-        env: &mut impl CallActorEnv,
         data: Vec<u8>,
-        mut promise: Promise<()>,
-    ) {
+    ) -> std::result::Result<telegram_api::Function, Status> {
         if self.call_state.type_ != CallStateType::Ready
             && self.call_state.discard_reason.type_ != CallDiscardReasonType::UpgradeToGroupCall
         {
-            promise.set_error(Status::error(400, "Call is not active"));
-            return;
+            return Err(Status::error(400, "Call is not active"));
         }
-        env.send_call_signaling_data_query(&data);
-        self.net_blocked_promises.push(promise);
+        Ok(telegram_api::Function::phone_sendSignalingData(
+            telegram_api::phone_sendSignalingData {
+                peer: Some(self.get_input_phone_call("send_call_signaling_data")),
+                data,
+            },
+        ))
     }
 
     /// `discard_call` (CallActor.cpp:291-346) — the C++ signature shape.
@@ -752,8 +782,10 @@ impl CallActor {
         self.call_state_need_flush = true;
     }
 
-    /// `on_dh_config` (CallActor.cpp:653-666) — the result handler the
-    /// net seam will call; takes the plain config for testability.
+    /// `on_dh_config` (CallActor.cpp:653-666) — the C++ fetch lambda
+    /// (the Td router) builds + stores the config (cpp:691); this tail
+    /// takes it into the actor member (`dh_config_ = move_as_ok()`,
+    /// cpp:655) and runs the good-prime check.
     pub fn on_dh_config(
         &mut self,
         env: &mut impl CallActorEnv,
@@ -763,29 +795,45 @@ impl CallActor {
             Ok(config) => config,
             Err(status) => return self.on_error(env, status),
         };
+        self.dh_config = Some(config.clone());
         let status = DhHandshake::check_config(config.g, &config.prime, &DhCache::instance());
         if status.is_error() {
             return self.on_error(env, status);
         }
-        env.set_dh_config(config);
         self.dh_config_query_sent = false;
         self.loop_(env);
     }
 
-    /// `do_load_dh_config` (CallActor.cpp:668-703) — the query is
-    /// `[blocked: net]`; the version rides the seam.
+    /// `do_load_dh_config` (CallActor.cpp:668-703) — the answer parses
+    /// in the Td router (the DhConfig build + the DRBG seed + the
+    /// stored-config fallback, cpp:683-701) and lands in
+    /// [`CallActor::on_dh_config`].
     fn do_load_dh_config(&mut self, env: &mut impl CallActorEnv) {
         let version = env.get_dh_config().map_or(0, |config| config.version);
-        env.send_get_dh_config_query(version);
+        env.send_get_dh_config_query(
+            self.local_call_id,
+            telegram_api::Function::messages_getDhConfig(telegram_api::messages_getDhConfig {
+                version,
+                random_length: 0,
+            }),
+        );
     }
 
     /// `send_received_query` (CallActor.cpp:705-712).
     fn send_received_query(&mut self, env: &mut impl CallActorEnv) {
-        env.send_received_call_query();
+        env.send_received_call_query(
+            self.local_call_id,
+            telegram_api::Function::phone_receivedCall(telegram_api::phone_receivedCall {
+                peer: Some(self.get_input_phone_call("send_received_query")),
+            }),
+        );
     }
 
-    /// `try_send_request_query` (CallActor.cpp:721-751) — the local DH and
-    /// input-user halves are real; the query is `[blocked: net]`.
+    /// `try_send_request_query` (CallActor.cpp:721-751) — the DH halves
+    /// are real and the TL rides the dispatch seam; the C++
+    /// `total_timeout_limit_` rides the fixed 24h dispatch budget here
+    /// and the `request_query_ref_` cancel is dropped (the standing
+    /// slice divergences, cpp:743-746).
     fn try_send_request_query(&mut self, env: &mut impl CallActorEnv) {
         if env.close_flag() {
             return;
@@ -802,7 +850,17 @@ impl CallActor {
         self.state = CallActorState::WaitRequestResult;
         // the ring timeout is the recorded actor-timeout collapse
         let _ = env.get_option_integer("call_receive_timeout_ms", 20000);
-        env.send_request_call_query(&input_user);
+        env.send_request_call_query(
+            self.local_call_id,
+            telegram_api::Function::phone_requestCall(telegram_api::phone_requestCall {
+                flags: 0,
+                video: self.is_video,
+                user_id: Some(input_user),
+                random_id: tdutils::random::secure_int32(),
+                g_a_hash: self.dh_handshake.get_g_b_hash().to_vec(),
+                protocol: Some(self.call_state.protocol.get_input_phone_call_protocol()),
+            }),
+        );
     }
 
     /// `try_send_accept_query` (CallActor.cpp:762-781).
@@ -815,17 +873,29 @@ impl CallActor {
         }
         let dh_config = self.dh_config.clone().expect("dh config just loaded");
         self.dh_handshake.set_config(dh_config.g, &dh_config.prime);
+        let function = telegram_api::Function::phone_acceptCall(telegram_api::phone_acceptCall {
+            peer: Some(self.get_input_phone_call("try_send_accept_query")),
+            g_b: self.dh_handshake.get_g_b(),
+            protocol: Some(self.call_state.protocol.get_input_phone_call_protocol()),
+        });
         self.state = CallActorState::WaitAcceptResult;
-        env.send_accept_call_query();
+        env.send_accept_call_query(self.local_call_id, function);
     }
 
-    /// `try_send_confirm_query` (CallActor.cpp:792-806).
+    /// `try_send_confirm_query` (CallActor.cpp:792-806) — the TL field
+    /// is named `g_a` but carries `g_b` (cpp:797-799).
     fn try_send_confirm_query(&mut self, env: &mut impl CallActorEnv) {
         if !self.load_dh_config(env) {
             return;
         }
+        let function = telegram_api::Function::phone_confirmCall(telegram_api::phone_confirmCall {
+            peer: Some(self.get_input_phone_call("try_send_confirm_query")),
+            g_a: self.dh_handshake.get_g_b(),
+            key_fingerprint: self.call_state.key_fingerprint,
+            protocol: Some(self.call_state.protocol.get_input_phone_call_protocol()),
+        });
         self.state = CallActorState::WaitConfirmResult;
-        env.send_confirm_call_query();
+        env.send_confirm_call_query(self.local_call_id, function);
     }
 
     /// `try_send_discard_query` (CallActor.cpp:816-835).
@@ -839,8 +909,16 @@ impl CallActor {
             self.loop_(env);
             return;
         }
+        let function = telegram_api::Function::phone_discardCall(telegram_api::phone_discardCall {
+            flags: 0,
+            video: self.is_video,
+            peer: Some(self.get_input_phone_call("try_send_discard_query")),
+            duration: self.duration,
+            reason: get_input_phone_call_discard_reason(&self.call_state.discard_reason),
+            connection_id: self.connection_id,
+        });
         self.state = CallActorState::WaitDiscardResult;
-        env.send_discard_call_query();
+        env.send_discard_call_query(self.local_call_id, function);
     }
 
     /// `on_begin_exchanging_key` (CallActor.cpp:516-523).
@@ -900,7 +978,10 @@ impl CallActor {
 
     /// `start_up` (CallActor.cpp:884-891).
     pub fn start_up(&mut self, env: &mut impl CallActorEnv) {
-        env.send_get_call_config_query();
+        env.send_get_call_config_query(
+            self.local_call_id,
+            telegram_api::Function::phone_getCallConfig(telegram_api::phone_getCallConfig),
+        );
     }
 
     /// `on_get_call_config_result` (CallActor.cpp:893-900).
@@ -1042,35 +1123,51 @@ mod tests {
             self.updates.push(update);
         }
 
-        fn send_get_call_config_query(&mut self) {
+        fn send_get_call_config_query(
+            &mut self,
+            _call_id: CallId,
+            _function: telegram_api::Function,
+        ) {
             self.queries.push("getCallConfig".to_string());
         }
 
-        fn send_get_dh_config_query(&mut self, version: i32) {
-            self.queries.push(format!("getDhConfig {version}"));
+        fn send_get_dh_config_query(
+            &mut self,
+            _call_id: CallId,
+            _function: telegram_api::Function,
+        ) {
+            self.queries.push("getDhConfig".to_string());
         }
 
-        fn send_request_call_query(&mut self, _input_user: &telegram_api::InputUser) {
+        fn send_request_call_query(&mut self, _call_id: CallId, _function: telegram_api::Function) {
             self.queries.push("requestCall".to_string());
         }
 
-        fn send_accept_call_query(&mut self) {
+        fn send_accept_call_query(&mut self, _call_id: CallId, _function: telegram_api::Function) {
             self.queries.push("acceptCall".to_string());
         }
 
-        fn send_confirm_call_query(&mut self) {
+        fn send_confirm_call_query(&mut self, _call_id: CallId, _function: telegram_api::Function) {
             self.queries.push("confirmCall".to_string());
         }
 
-        fn send_discard_call_query(&mut self) {
+        fn send_discard_call_query(&mut self, _call_id: CallId, _function: telegram_api::Function) {
             self.queries.push("discardCall".to_string());
         }
 
-        fn send_received_call_query(&mut self) {
+        fn send_received_call_query(
+            &mut self,
+            _call_id: CallId,
+            _function: telegram_api::Function,
+        ) {
             self.queries.push("receivedCall".to_string());
         }
 
-        fn send_call_signaling_data_query(&mut self, _data: &[u8]) {
+        fn send_call_signaling_data_query(
+            &mut self,
+            _call_id: CallId,
+            _function: telegram_api::Function,
+        ) {
             self.queries.push("signaling".to_string());
         }
     }
@@ -1287,5 +1384,33 @@ mod tests {
         assert_eq!(fingerprint.len(), 4);
         // sha256(key + g_a) drives the table exactly like the C++
         assert_eq!(fingerprint, get_emoji_fingerprints(&sha256(b"keyg_a")));
+    }
+
+    #[test]
+    fn signaling_data_builds_the_query_only_when_ready() {
+        let mut actor = CallActor::new(CallId::new(1));
+        // the Empty-state gate (cpp:273-275)
+        assert!(matches!(
+            actor.send_call_signaling_data(b"sig".to_vec()),
+            Err(ref status) if status.message() == "Call is not active"
+        ));
+
+        // the Ready-state build (cpp:276-279): the peer + the payload
+        // ride the phone.sendSignalingData body
+        actor.call_id = 100;
+        actor.call_access_hash = 7;
+        actor.is_call_id_inited = true;
+        actor.call_state.type_ = CallStateType::Ready;
+        let function = actor
+            .send_call_signaling_data(b"sig".to_vec())
+            .expect("the ready state builds the query");
+        match function {
+            telegram_api::Function::phone_sendSignalingData(query) => {
+                let peer = query.peer.expect("the input phone call");
+                assert_eq!((peer.id, peer.access_hash), (100, 7));
+                assert_eq!(query.data, b"sig".to_vec());
+            }
+            other => panic!("the signaling body: {other:?}"),
+        }
     }
 }

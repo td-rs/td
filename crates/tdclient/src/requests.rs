@@ -6484,13 +6484,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |call_id: td_api::CallId| Object::callId(call_id));
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.create_call(
                 &mut env,
                 UserId::new(request.user_id),
@@ -6508,13 +6512,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Call protocol must be non-empty");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.accept_call(
                 &mut env,
                 CallId::new(request.call_id),
@@ -6528,13 +6536,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.send_call_signaling_data(
                 &mut env,
                 CallId::new(request.call_id),
@@ -6552,13 +6564,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.discard_call(
                 &mut env,
                 CallId::new(request.call_id),
@@ -6579,13 +6595,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.rate_call(
                 &mut env,
                 &request.call_id,
@@ -6612,13 +6632,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 }
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.send_call_debug_information(
                 &mut env,
                 call_id,
@@ -17973,13 +17997,17 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager
                 .send_call_log(&mut env, &request.call_id, request.log_file, promise);
         }
