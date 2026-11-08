@@ -2826,9 +2826,15 @@ impl crate::messages_manager::DialogReactionsContext for Td {
 /// The walking-skeleton + auth in-flight net kinds: a dispatched query's
 /// token maps back to one of these on the answer drain (the C++ delivers
 /// through the query's promise; the skeleton parks the pair instead).
-enum PendingNetKind {
+pub(crate) enum PendingNetKind {
     Auth(AuthPendingKind),
     GetMe,
+    /// The editMessageText request (the EditMessageQuery answer tail):
+    /// the dialog + message identify the object the tail rebuilds.
+    EditMessage {
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::message_id::MessageId,
+    },
     /// The PhoneNumberManager plane (the glue slice): the change-phone /
     /// verify-phone / confirm-ownership queries.
     Phone(PhonePendingKind),
@@ -7231,7 +7237,10 @@ impl Td {
             tdutils::status::Result::Err(error) => {
                 tracing::warn!("Failed to open database: {error}");
                 let request_id = self.set_parameters_request_id;
-                self.send_error_impl(request_id, error.code(), error.message());
+                // Td.cpp's init failure path answers 400 with the Status
+                // message (the raw internal Status code, e.g.
+                // WRONG_PASSWORD's -1037284, is not a td_api code)
+                self.send_error_impl(request_id, 400, error.message());
                 return self.finish_set_parameters();
             }
         };
@@ -27863,6 +27872,73 @@ impl Td {
     }
 
     /// Route one walking-skeleton answer by kind.
+    /// `EditMessageQuery::on_result/on_error`
+    /// (MessagesManager.cpp:1925-1946): the answer is an Updates umbrella
+    /// fed through the updates pipe (the local edit +
+    /// `updateMessageEdited` apply before the request result); the
+    /// MESSAGE_NOT_MODIFIED arm succeeds for users like the C++. The
+    /// result is the edited message object (the RequestOnceActor
+    /// do_send_result half).
+    fn on_edit_message_answer(
+        &mut self,
+        request_id: u64,
+        dialog_id: crate::dialog_id::DialogId,
+        message_id: crate::message_id::MessageId,
+        answer: Option<&[u8]>,
+        wire_error: Option<&tdutils::status::Status>,
+    ) {
+        if let Some(error) = wire_error {
+            // the C++ user band: MESSAGE_NOT_MODIFIED means the text is
+            // already the requested one — success
+            if !self.auth_manager.is_bot() && error.message() == "MESSAGE_NOT_MODIFIED" {
+                // fall through to the object build below
+            } else {
+                let code = if error.code() > 0 { error.code() } else { 400 };
+                self.send_error_impl(request_id, code, error.message());
+                return;
+            }
+        } else if let Some(answer) = answer {
+            // the answer IS an Updates umbrella — the same serialization
+            // the session driver pushes, so the standard intake applies
+            // the edit + updateMessageEdited before the request result
+            self.on_net_update(answer.to_vec());
+        }
+        // the do_send_result half: the updated message object
+        let td_ptr = std::ptr::from_mut(self);
+        let manager_ptr = std::ptr::from_mut(
+            &mut self.messages_manager as &mut crate::messages_manager::MessagesManager,
+        );
+        // SAFETY: the raw-pointer split-borrow convention of the send arm
+        // (manager / state / ctx alias one Td, used strictly sequentially)
+        let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let reactions_ctx = crate::messages_manager::MessageObjectReactionsContext::new(
+            &*ctx as &dyn crate::messages_manager::MessageObjectContext,
+        );
+        let object = unsafe {
+            let Some(d) = (*manager_ptr).get_dialog_mut(dialog_id) else {
+                return self.send_error_impl(request_id, 400, "Message not found");
+            };
+            let Some(m) = d.messages.get_mut(&message_id) else {
+                return self.send_error_impl(request_id, 400, "Message not found");
+            };
+            crate::messages_manager::get_message_object(
+                &*manager_ptr,
+                &reactions_ctx,
+                &*ctx,
+                dialog_id,
+                m.as_mut(),
+                "EditMessageTextRequest",
+            )
+        };
+        let _ = state;
+        match object {
+            Some(message) => self.send_result(request_id, Object::message(message)),
+            None => self.send_error_impl(request_id, 400, "Message not found"),
+        }
+    }
+
     fn on_walking_answer(&mut self, request_id: u64, kind: PendingNetKind, query: NetQuery) {
         let answer: Option<&[u8]> = if query.is_error() {
             None
@@ -27881,6 +27957,17 @@ impl Td {
         };
         match kind {
             PendingNetKind::Auth(kind) => self.on_auth_answer(request_id, kind, answer, error),
+            PendingNetKind::EditMessage {
+                dialog_id,
+                message_id,
+            } => {
+                let wire_error = if query.is_error() {
+                    Some(query.error())
+                } else {
+                    None
+                };
+                self.on_edit_message_answer(request_id, dialog_id, message_id, answer, wire_error)
+            }
             PendingNetKind::Phone(kind) => {
                 let wire_error = if query.is_error() {
                     Some(query.error())
@@ -30774,7 +30861,7 @@ impl Td {
     }
 
     /// Allocate a dispatch token and park the request.
-    fn park_net(&mut self, request_id: u64, kind: PendingNetKind) -> u64 {
+    pub(crate) fn park_net(&mut self, request_id: u64, kind: PendingNetKind) -> u64 {
         let token = self.net_dispatch_token;
         self.net_dispatch_token += 1;
         self.pending_net.insert(token, (request_id, kind));
@@ -30783,7 +30870,7 @@ impl Td {
 
     /// Serialize + dispatch one walking-skeleton query (the session
     /// prepends the shared `MtprotoHeader`).
-    fn dispatch_walking_query(
+    pub(crate) fn dispatch_walking_query(
         &mut self,
         token: u64,
         function: telegram_api::Function,
