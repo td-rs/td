@@ -205,8 +205,10 @@ impl Drop for ReceiverCallback {
 }
 
 /// `Client.cpp:MultiTd` — one Td actor per client of a `MultiImpl`.
-#[derive(Default)]
 struct MultiTd {
+    /// The send-scheduler pointer handed to every Td actor — the
+    /// session drivers' `guard(false)` context for cross-thread wakes.
+    send_ptr: Option<tdactor::SchedulerPtr>,
     tds: HashMap<i32, ActorOwn<Td>>,
 }
 
@@ -219,6 +221,13 @@ actor_messages! {
 }
 
 impl MultiTd {
+    fn new(send_ptr: Option<tdactor::SchedulerPtr>) -> Self {
+        MultiTd {
+            send_ptr,
+            tds: HashMap::new(),
+        }
+    }
+
     fn create(&mut self, td_id: i32, callback: Box<dyn TdCallback>) {
         debug_assert!(!self.tds.contains_key(&td_id), "double client create");
         // `MultiTd::create` (Client.cpp:246-254): the instance tag
@@ -228,7 +237,7 @@ impl MultiTd {
         // it in turn; scheduler-internal actors keep the tag empty.
         let saved_tag = tdutils::logging::current_log_tag();
         tdutils::logging::set_log_tag(tdutils::logging::intern_log_tag(&td_id.to_string()));
-        let td = create_actor("Td", Td::new(callback));
+        let td = create_actor("Td", Td::new(callback).with_send_scheduler(self.send_ptr));
         tdutils::logging::set_log_tag(saved_tag);
         self.tds.insert(td_id, td);
     }
@@ -280,10 +289,10 @@ impl MultiImpl {
 
     pub fn new() -> Self {
         let mut scheduler = ConcurrentScheduler::new(Self::ADDITIONAL_THREAD_COUNT);
-        let (multi_td, send_ptr) = {
+        let send_ptr = scheduler.send_scheduler();
+        let multi_td = {
             let _guard = scheduler.get_main_guard();
-            let actor = create_actor("MultiTd", MultiTd::default());
-            (actor, scheduler.send_scheduler())
+            create_actor("MultiTd", MultiTd::new(Some(send_ptr)))
         };
         scheduler.start();
         let shutdown = scheduler.shutdown_signal();

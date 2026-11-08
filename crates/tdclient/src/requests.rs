@@ -4780,20 +4780,11 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
                 return;
             };
-            // SearchPublicChatRequest: set_tries(4); get_tries() < 3 →
-            // false on the first try. The result object is the
-            // MessagesManager chat (the builder lands with M.10; on this
-            // base every reachable path errors first — the parked-resolve
-            // collapse keeps the inline stand-in: the resolve query goes
-            // out and the M.10 gap answers here, the parked family promise
-            // settles a dropped slot).
-            let (promise, slot) = unit_request_promise();
-            let _dialog_id =
-                crate::dialog_manager::search_public_dialog(td, &username, false, promise);
-            if fail_from_slot(td, id, &slot) {
-                return;
-            }
-            td.send_error_impl(id, 500, "Chat info not found");
+            // SearchPublicChatRequest (Requests.cpp:405-424): the resolve
+            // parks on the per-username queue; the settle tail re-runs and
+            // builds the `do_send_result` chat object.
+            let promise = td.deferred_promise::<crate::td_api::Chat, _>(id, Object::chat);
+            crate::dialog_manager::search_public_chat_for_request(td, &username, promise);
         }
         Function::searchPublicChats(request) => {
             if !check_is_user(td, id) {

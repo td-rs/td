@@ -1329,8 +1329,23 @@ pub struct DialogManager {
     /// parked family promise signals through the slot; the answer
     /// tails re-run the entry against the fresh cache).
     pub(crate) pending_search_dialogs_requests: Vec<PendingSearchDialogsRequest>,
+    /// The parked `searchPublicChat` requests — the same RequestActor
+    /// re-run collapse over the per-username resolve queue.
+    pub(crate) pending_search_public_chat_requests: Vec<PendingSearchPublicChatRequest>,
     /// The `EditDialogPhotoQuery` promises (DialogManager.cpp:282).
     pub(crate) pending_edit_dialog_photo: Vec<Promise<()>>,
+}
+
+/// One parked `searchPublicChat` request — the `SearchPublicChatRequest`
+/// actor state (Requests.cpp:405-424): the username, the RequestActor
+/// tries (4: "1 for server request + 1 for reload Video chat + 1 for
+/// reload dialog + 1 for result"), and the completion slot of the
+/// promise parked on the per-username resolve queue.
+pub(crate) struct PendingSearchPublicChatRequest {
+    pub(crate) username: String,
+    pub(crate) tries_left: i32,
+    pub(crate) slot: UnitSlot,
+    pub(crate) promise: Promise<crate::td_api::Chat>,
 }
 
 /// One parked search request — the `SearchPublicChatsRequest`/
@@ -1397,6 +1412,7 @@ impl DialogManager {
             resolve_dialog_username_queries: HashMap::new(),
             search_public_dialogs_queries: Default::default(),
             pending_search_dialogs_requests: Vec::new(),
+            pending_search_public_chat_requests: Vec::new(),
             pending_edit_dialog_photo: Vec::new(),
         }
     }
@@ -5269,6 +5285,7 @@ pub(crate) fn on_resolved_username(td: &mut Td, username: &str, result: Result<D
             // the failed parked search requests answer with the error
             // (the RequestActor do_send_error half)
             drain_search_dialogs_requests(td);
+            drain_search_public_chat_requests(td);
             return;
         }
         Result::Ok(dialog_id) => dialog_id,
@@ -5280,6 +5297,7 @@ pub(crate) fn on_resolved_username(td: &mut Td, username: &str, result: Result<D
             promise.set_error(Status::error(500, "Chat not found"));
         }
         drain_search_dialogs_requests(td);
+        drain_search_public_chat_requests(td);
         return;
     }
 
@@ -5289,6 +5307,7 @@ pub(crate) fn on_resolved_username(td: &mut Td, username: &str, result: Result<D
             promise.set_error(Status::error(500, "Invalid username"));
         }
         drain_search_dialogs_requests(td);
+        drain_search_public_chat_requests(td);
         return;
     }
 
@@ -5319,6 +5338,7 @@ pub(crate) fn on_resolved_username(td: &mut Td, username: &str, result: Result<D
     // the settled promises re-run the parked search requests (the
     // RequestActor raw_event → loop re-entry)
     drain_search_dialogs_requests(td);
+    drain_search_public_chat_requests(td);
 }
 
 /// `DialogManager::drop_username` (DialogManager.cpp:3307-3324) — free fn
@@ -5557,6 +5577,141 @@ pub(crate) fn search_public_dialogs_for_request(
             park_search_dialogs_request(td, query, type_filter, 0, false, slot, promise);
         }
     }
+}
+
+/// The request-facing `searchPublicChat` (SearchPublicChatRequest,
+/// Requests.cpp:405-424): one `search_public_dialog` pass with the chat
+/// promise — synchronous completions build the `do_send_result` chat
+/// object, errors forward, and a park hands the slot + promise back for
+/// the request entry (the promise rides the per-username resolve queue;
+/// the settle tail re-runs in [`drain_search_public_chat_requests`]).
+pub(crate) fn search_public_chat_for_request(
+    td: &mut Td,
+    username: &str,
+    promise: Promise<crate::td_api::Chat>,
+) {
+    match run_search_public_chat_request(td, username, false, promise) {
+        SearchPublicChatRequestRun::Answered => {}
+        SearchPublicChatRequestRun::Parked { slot, promise } => {
+            // SearchPublicChatRequest::set_tries(4) — the initial park
+            // spends the first try.
+            park_search_public_chat_request(td, username.to_owned(), 4 - 1, slot, promise);
+        }
+    }
+}
+
+/// The outcome of one `searchPublicChat` run over a fresh slot promise —
+/// answered inline, or parked on the per-username resolve queue.
+enum SearchPublicChatRequestRun {
+    Answered,
+    Parked {
+        slot: UnitSlot,
+        promise: Promise<crate::td_api::Chat>,
+    },
+}
+
+/// The shared `do_run` leg of the request wrapper and the re-run: one
+/// `search_public_dialog` pass (Requests.cpp:410-412).
+fn run_search_public_chat_request(
+    td: &mut Td,
+    username: &str,
+    force: bool,
+    mut promise: Promise<crate::td_api::Chat>,
+) -> SearchPublicChatRequestRun {
+    let (unit_promise, slot) = unit_slot_promise();
+    let dialog_id = search_public_dialog(td, username, force, unit_promise);
+    let outcome = slot.lock().unwrap().take();
+    match outcome {
+        Some(Result::Ok(())) => {
+            promise.set_value(get_chat_object_for_search_result(td, dialog_id));
+            SearchPublicChatRequestRun::Answered
+        }
+        Some(Result::Err(status)) => {
+            promise.set_error(status);
+            SearchPublicChatRequestRun::Answered
+        }
+        None => SearchPublicChatRequestRun::Parked { slot, promise },
+    }
+}
+
+fn park_search_public_chat_request(
+    td: &mut Td,
+    username: String,
+    tries_left: i32,
+    slot: UnitSlot,
+    promise: Promise<crate::td_api::Chat>,
+) {
+    td.dialog_manager
+        .pending_search_public_chat_requests
+        .push(PendingSearchPublicChatRequest {
+            username,
+            tries_left,
+            slot,
+            promise,
+        });
+}
+
+/// Re-run the signaled parked `searchPublicChat` requests — the
+/// SearchPublicChatRequest re-entry (RequestActor loop): a settled
+/// resolve re-runs against the fresh cache and the resolved dialog
+/// builds the `do_send_result` chat object.
+fn drain_search_public_chat_requests(td: &mut Td) {
+    let mut requests = std::mem::take(&mut td.dialog_manager.pending_search_public_chat_requests);
+    let mut index = 0;
+    while index < requests.len() {
+        let signal = requests[index].slot.lock().unwrap().take();
+        match signal {
+            None => {
+                index += 1;
+            }
+            Some(Result::Err(status)) => {
+                let PendingSearchPublicChatRequest { mut promise, .. } = requests.remove(index);
+                promise.set_error(status);
+            }
+            Some(Result::Ok(())) => {
+                let PendingSearchPublicChatRequest {
+                    username,
+                    tries_left,
+                    slot: _,
+                    promise,
+                } = requests.remove(index);
+                // do_run's `get_tries() < 3` force flag — the later
+                // reload re-runs force (`--tries_left_` at every re-run).
+                let tries_left = tries_left - 1;
+                let force = tries_left < 3;
+                match run_search_public_chat_request(td, &username, force, promise) {
+                    SearchPublicChatRequestRun::Answered => {}
+                    SearchPublicChatRequestRun::Parked { slot, mut promise } => {
+                        if tries_left == 0 {
+                            promise.set_error(Status::error(500, "Requested data is inaccessible"));
+                        } else {
+                            park_search_public_chat_request(
+                                td, username, tries_left, slot, promise,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    td.dialog_manager.pending_search_public_chat_requests = requests;
+}
+
+/// The `do_send_result` half of SearchPublicChatRequest
+/// (Requests.cpp:415) — `messages_manager_->get_chat_object(dialog_id_)`:
+/// the chat object for the resolved dialog (the private-chat creation
+/// half emits updateNewChat for a newly known peer; the object rides the
+/// chats map). Non-user dialogs answer from the map — the channel/basic
+/// object builder is the same parked seam the update tails use.
+fn get_chat_object_for_search_result(td: &mut Td, dialog_id: DialogId) -> crate::td_api::Chat {
+    let key = dialog_id.get();
+    if !td.chats.contains_key(&key) {
+        td.ensure_chat(key);
+    }
+    td.chats.get(&key).cloned().unwrap_or_else(|| {
+        tdutils::log_error!("searchPublicChat: no chat object for {dialog_id:?}");
+        crate::td_api::Chat::default()
+    })
 }
 
 /// The request-facing `search_dialogs_on_server`
@@ -5815,6 +5970,7 @@ pub(crate) fn on_get_public_dialogs_search_result(
         .insert(query.to_owned(), get_peers_dialog_ids(td, &my_peers, false));
     td.dialog_manager = manager;
     drain_search_dialogs_requests(td);
+    drain_search_public_chat_requests(td);
 }
 
 /// `DialogManager::on_failed_public_dialogs_search`
@@ -5853,6 +6009,7 @@ pub(crate) fn on_failed_public_dialogs_search(
         .or_default();
     td.dialog_manager = manager;
     drain_search_dialogs_requests(td);
+    drain_search_public_chat_requests(td);
 }
 
 /// `DialogManager::on_get_public_dialogs_search_result` /

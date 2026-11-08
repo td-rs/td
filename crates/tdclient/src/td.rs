@@ -5772,6 +5772,11 @@ pub struct Td {
     pub(crate) net_router: Option<Arc<NetRouter>>,
     /// The shared driver context (the C++ `G()` session surface).
     pub(crate) net_shared: Option<Arc<NetShared>>,
+    /// The send-scheduler pointer (`ConcurrentScheduler::send_scheduler`):
+    /// the session drivers' cross-thread wake context — the NetShared
+    /// scheduler field captures THIS, never the main scheduler the actor
+    /// itself runs on (the 2026-11-08 RefCell/idle-wake finding).
+    pub(crate) send_scheduler: Option<tdactor::SchedulerPtr>,
     /// The per-raw-DC shared auth data (`auth<raw>`/`salt<raw>` pmc
     /// images), built at `init` and shared with the pools and the
     /// `DcAuthManager`.
@@ -6855,6 +6860,7 @@ impl Td {
             net_query_dispatcher: None,
             net_router: None,
             net_shared: None,
+            send_scheduler: None,
             auth_data_registry: HashMap::new(),
             #[cfg(test)]
             sent_net_queries: Arc::new(Mutex::new(Vec::new())),
@@ -7447,8 +7453,19 @@ impl Td {
             }
             self.auth_data_registry = registry;
         }
+        // The SEND scheduler, never the main one the actor runs on: the
+        // session driver threads take this ptr's `guard(false)`, so their
+        // `send_closure_later` routes cross-scheduler through the owning
+        // scheduler's inbound queue. Capturing the main scheduler made
+        // every session-thread wake take the same-thread mailbox branch —
+        // racing the pump's RefCells (the 2026-11-08 "RefCell already
+        // borrowed" + idle-wake stall finding).
         let scheduler = if Scheduler::in_scheduler_context() {
-            Some(Scheduler::instance_ptr())
+            // Production: the send scheduler — session-driver wakes must
+            // route cross-scheduler. Tests: the actor's own scheduler (the
+            // test pump runs on the same thread, where the direct mailbox
+            // path is the correct wake).
+            Some(self.send_scheduler.unwrap_or_else(Scheduler::instance_ptr))
         } else {
             None
         };
@@ -9224,6 +9241,12 @@ impl Td {
             self.net_shared.clone(),
         );
         dispatcher.dispatch_with_callback(net_query, Box::new(callback));
+    }
+
+    /// Builder: the send-scheduler pointer for the NetShared wake path.
+    pub(crate) fn with_send_scheduler(mut self, ptr: Option<tdactor::SchedulerPtr>) -> Self {
+        self.send_scheduler = ptr;
+        self
     }
 
     pub(crate) fn drain_net_events(&mut self) {

@@ -25893,17 +25893,28 @@ pub fn send_message(
     };
 
     if manager.get_dialog(dialog_id).is_none() {
-        // `get_dialog_force` + the bot paid-broadcast force-create — the
-        // DialogManager info seam (as send_message_group)
-        if ctx.is_bot()
-            && options
-                .as_ref()
-                .is_some_and(|options| options.allow_paid_broadcast)
-            && dialog_id.get_type() == DialogType::User
-        {
-            // `force_create_dialog` — the M.10.20 wiring
+        // `get_dialog_force` (MessagesManager.cpp send_message): a dialog
+        // with a KNOWN peer (the searchPublicChat resolve intake registered
+        // its access hash) is created on demand — the resolved-chat send
+        // flow found live 2026-11-08. `have_input_peer` is the peer-known
+        // proxy; the C++ async user-full-load park rides the RequestActor
+        // retry and stays the deferred half.
+        if state.have_input_peer(dialog_id, false) {
+            manager.add_dialog_for_new_message(dialog_id);
         }
-        return Err((400, "Chat not found".to_owned()));
+        if manager.get_dialog(dialog_id).is_none() {
+            // the bot paid-broadcast force-create seam (as
+            // send_message_group)
+            if ctx.is_bot()
+                && options
+                    .as_ref()
+                    .is_some_and(|options| options.allow_paid_broadcast)
+                && dialog_id.get_type() == DialogType::User
+            {
+                // `force_create_dialog` — the M.10.20 wiring
+            }
+            return Err((400, "Chat not found".to_owned()));
+        }
     }
 
     let message_topic = get_send_message_topic(ctx, dialog_id, topic_id.as_ref())?;

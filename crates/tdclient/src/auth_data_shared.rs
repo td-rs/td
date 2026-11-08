@@ -560,10 +560,15 @@ mod tests {
         save_auth_key_to_pmc(&mut pmc, dc_id, &auth_key);
 
         // The AuthManager restore markers (td.rs reads `auth`/`auth_is_bot`,
-        // `UserManager::load_my_id` reads `my_id`).
+        // `UserManager::load_my_id` reads `my_id`), plus the key's own DC as
+        // the main DC (`NetQueryDispatcher`'s binlog half, td.rs:9276): an
+        // imported key lives on its birth DC, and without this marker the
+        // client dials the default entry DC whose server answers
+        // AUTH_KEY_UNREGISTERED (the prod DC4 session finding, 2026-11-08).
         pmc.set("auth", "ok");
         pmc.set("auth_is_bot", if is_bot { "true" } else { "false" });
         pmc.set("my_id", &user_id);
+        pmc.set("main_dc_id", &raw_dc.to_string());
 
         // Round-trip proof before the pmc goes out of scope.
         let reloaded = load_auth_key_from_pmc(&mut pmc, dc_id);
