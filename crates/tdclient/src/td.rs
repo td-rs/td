@@ -38633,10 +38633,6 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         self.dh_config.clone()
     }
 
-    fn set_dh_config(&mut self, config: DhConfig) {
-        *self.dh_config = Some(config);
-    }
-
     fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
         self.user_manager
             .on_get_users(&mut self.user_env, users, source);
@@ -98125,6 +98121,49 @@ kQIDAQAB\n\
                     .get_call_actor(crate::call_id::CallId::new(7))
                     .is_none()
             );
+
+            // 8b. the stored BAD config fails the next call too — every
+            //     C++ actor validates the config through on_dh_config's
+            //     check (cpp:653-666); the port's cached store read (the
+            //     `load_dh_config` branch) mirrors the same gate: no
+            //     fresh getDhConfig query, no request leg, the error
+            //     state flushes and the unknown call id discards locally
+            {
+                td.request(
+                    61,
+                    Function::createCall(td_api::createCall {
+                        user_id: 5,
+                        protocol: Some(td_api::CallProtocol {
+                            udp_p2p: true,
+                            udp_reflector: true,
+                            min_layer: 65,
+                            max_layer: 92,
+                            library_versions: vec!["4".to_string()],
+                        }),
+                        is_video: false,
+                    }),
+                );
+                let sent_after = std::mem::take(&mut *rec.sent.lock());
+                assert!(
+                    sent_after
+                        .iter()
+                        .all(|q| q.tl_constructor() != telegram_api::messages_getDhConfig::ID),
+                    "the store serves the load — no fresh dh query"
+                );
+                assert!(
+                    sent_after
+                        .iter()
+                        .all(|q| q.tl_constructor() != telegram_api::phone_requestCall::ID),
+                    "the bad stored prime fails the load before the request leg"
+                );
+                assert!(
+                    sent_after
+                        .iter()
+                        .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                    "the unknown call id discards without a query"
+                );
+                call_error_state(&td, 0, "Bad prime mod 4g");
+            }
         }
 
         // 9. getDhConfig's full variant, good prime — the fresh config

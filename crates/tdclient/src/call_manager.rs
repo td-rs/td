@@ -824,10 +824,6 @@ mod tests {
             self.dh_config.clone()
         }
 
-        fn set_dh_config(&mut self, config: DhConfig) {
-            self.dh_config = Some(config);
-        }
-
         fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
 
         fn get_input_user(
@@ -902,10 +898,12 @@ mod tests {
     #[test]
     fn create_call_allocates_and_dispatches() {
         let mut env = TestEnv::new();
+        // a good stored config — a bad one fails the load (the C++
+        // on_dh_config gate, CallActor.cpp:653-666)
         env.dh_config = Some(DhConfig {
             version: 1,
-            prime: vec![1, 2, 3],
-            g: 2,
+            prime: crate::dh_cache::BUILT_IN_GOOD_PRIME.to_vec(),
+            g: 3,
         });
         let mut manager = CallManager::new();
         let (promise, recorded) = record::<td_api::CallId>();

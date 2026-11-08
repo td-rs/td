@@ -43,10 +43,11 @@ pub trait CallActorEnv: DhCacheEnv {
     /// `G()->get_option_integer`.
     fn get_option_integer(&self, name: &str, default_value: i64) -> i64;
 
-    /// `G()->get_dh_config()` / `G()->set_dh_config()` — the config the
-    /// ConfigManager carries; `None` until one is fetched or set.
+    /// `G()->get_dh_config()` — the config the ConfigManager carries;
+    /// `None` until one is fetched (the store write lives in the Td
+    /// router's fetch lambda, `G()->set_dh_config()` analog,
+    /// CallActor.cpp:691).
     fn get_dh_config(&self) -> Option<DhConfig>;
-    fn set_dh_config(&mut self, config: DhConfig);
 
     /// `UserManager::on_get_users` — the phone_phoneCall user intake.
     fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str);
@@ -741,10 +742,35 @@ impl CallActor {
         }
     }
 
-    /// `load_dh_config` (CallActor.cpp:616-629).
+    /// The `on_dh_config` good-prime gate (CallActor.cpp:655-662): the
+    /// config folds into the actor member (cpp:655) and a bad prime
+    /// fails the call through `on_error` (cpp:660-662). Every config
+    /// passes through it — the fetch answer directly, the cached store
+    /// read over the NotModified fallback (cpp:683-701).
+    fn take_dh_config_checked(&mut self, env: &mut impl CallActorEnv, config: DhConfig) -> bool {
+        let status = DhHandshake::check_config(config.g, &config.prime, &DhCache::instance());
+        self.dh_config = Some(config);
+        if status.is_error() {
+            self.on_error(env, status);
+            return false;
+        }
+        true
+    }
+
+    /// `load_dh_config` (CallActor.cpp:616-629). The cached branch is
+    /// the port's store read (the `G()->get_dh_config()` analog) — the
+    /// C++ has no cached return here; its cached config rides the
+    /// `dhConfigNotModified` answer back through `on_dh_config`'s check
+    /// (cpp:699-701), so the read passes the same gate.
     fn load_dh_config(&mut self, env: &mut impl CallActorEnv) -> bool {
-        if let Some(config) = env.get_dh_config() {
-            self.dh_config = Some(config);
+        if let Some(config) = env.get_dh_config()
+            && !self.take_dh_config_checked(env, config)
+        {
+            // The `update_call` on_error convention — the loop pass
+            // flushes the error state and rides the local discard
+            // tail (the C++ re-yields the actor loop, cpp:660-662).
+            self.loop_(env);
+            return false;
         }
         if self.dh_config.is_some() {
             return true;
@@ -795,10 +821,8 @@ impl CallActor {
             Ok(config) => config,
             Err(status) => return self.on_error(env, status),
         };
-        self.dh_config = Some(config.clone());
-        let status = DhHandshake::check_config(config.g, &config.prime, &DhCache::instance());
-        if status.is_error() {
-            return self.on_error(env, status);
+        if !self.take_dh_config_checked(env, config) {
+            return;
         }
         self.dh_config_query_sent = false;
         self.loop_(env);
@@ -1093,10 +1117,6 @@ mod tests {
             self.dh_config.clone()
         }
 
-        fn set_dh_config(&mut self, config: DhConfig) {
-            self.dh_config = Some(config);
-        }
-
         fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
 
         fn get_input_user(
@@ -1199,10 +1219,12 @@ mod tests {
     #[test]
     fn create_call_sets_the_outgoing_pending_state_and_sends() {
         let mut env = TestEnv::new();
+        // a good stored config (the built-in 2048-bit prime, g = 3 passes
+        // the mod-4g gate) — a bad one now fails the load
         env.dh_config = Some(DhConfig {
             version: 1,
-            prime: vec![1, 2, 3],
-            g: 2,
+            prime: crate::dh_cache::BUILT_IN_GOOD_PRIME.to_vec(),
+            g: 3,
         });
         let mut actor = CallActor::new(CallId::new(1));
         let call_id = actor.create_call(&mut env, UserId::new(5), CallProtocol::default(), false);
@@ -1221,6 +1243,45 @@ mod tests {
             }
             _ => panic!("expected updateCall"),
         }
+    }
+
+    #[test]
+    fn create_call_fails_on_a_bad_cached_dh_config() {
+        // Every C++ actor validates the config through on_dh_config's
+        // good-prime check (CallActor.cpp:653-666) — the cached store
+        // read rides the NotModified fallback back into the same check
+        // (cpp:683-701), so a bad stored prime fails the call instead of
+        // riding the request leg
+        let mut env = TestEnv::new();
+        env.dh_config = Some(DhConfig {
+            version: 1,
+            prime: vec![0xff; 256],
+            g: 3,
+        });
+        let mut actor = CallActor::new(CallId::new(1));
+        actor.create_call(&mut env, UserId::new(5), CallProtocol::default(), false);
+        assert!(
+            !env.queries.iter().any(|q| q == "requestCall"),
+            "the bad prime fails the load before the request leg"
+        );
+        assert!(
+            !env.queries.iter().any(|q| q == "getDhConfig"),
+            "the store serves the load — no fresh query"
+        );
+        match env.updates.last() {
+            Some(td_api::Update::updateCall(update)) => {
+                let call = update.call.as_ref().unwrap();
+                match call.state.as_ref().unwrap() {
+                    td_api::CallState::callStateError(state) => {
+                        let error = state.error.as_ref().unwrap();
+                        assert_eq!(error.message, "Bad prime mod 4g");
+                    }
+                    other => panic!("expected the error state: {other:?}"),
+                }
+            }
+            other => panic!("expected updateCall: {other:?}"),
+        }
+        assert_eq!(actor.state, CallActorState::Discarded);
     }
 
     #[test]
