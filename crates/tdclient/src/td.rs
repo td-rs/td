@@ -3790,12 +3790,12 @@ pub(crate) type BotRecommendationNetHandle =
 pub(crate) type StickersNetHandle = NetKindHandle<crate::stickers_manager::StickersNetKind>;
 
 /// The cloned animations dispatch surface the
-/// [`crate::animations_manager::AnimationsManager`] holds — the
-/// net-drain 56 GetSavedGifs family's send leg (the
-/// `GetSavedGifsQuery` ResultHandler class, AnimationsManager.cpp:39-64);
-/// the answers drain through [`Td::on_animations_net_answer`].
-/// Manager-held (the game shape): the send legs run inside the manager
-/// over the env's file-plane reads.
+/// [`crate::animations_manager::AnimationsManager`] holds — the net-drain
+/// 56 families' send legs (the `GetSavedGifsQuery`/`SaveGifQuery`
+/// ResultHandler classes, AnimationsManager.cpp:39-124); the answers drain
+/// through [`Td::on_animations_net_answer`]. Manager-held (the game
+/// shape): the send legs run inside the manager over the env's file-plane
+/// reads.
 pub(crate) type AnimationsNetHandle = NetKindHandle<crate::animations_manager::AnimationsNetKind>;
 
 /// The cloned web-pages dispatch surface the
@@ -20713,8 +20713,7 @@ impl Td {
     }
 
     /// Route one animations net answer by kind — the ResultHandler
-    /// halves of the net-drain 56 GetSavedGifs family
-    /// (AnimationsManager.cpp:39-64):
+    /// halves of the net-drain 56 families (AnimationsManager.cpp:39-124):
     /// the wire answer parses here, the documents walk runs over the
     /// split env, and the manager intakes run behind the take/drop
     /// discipline (the game router shape). The parse failures run the
@@ -20796,6 +20795,52 @@ impl Td {
                             self.send_update(update.into());
                         }
                     }
+                }
+            }
+            // `SaveGifQuery::on_result`/`on_error` (cpp:86-123) — the
+            // Bool parses here, the bands (the ok=false reload, the
+            // degraded file-reference treatment, the verbatim error)
+            // run in the manager intake with the parked lot head.
+            K::SaveGif { file_id, unsave } => {
+                let result: tdutils::status::Result<bool> = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match crate::td::parse_wire_bool_value(query.ok()) {
+                        Some(result) => tdutils::status::Result::Ok(result),
+                        None => {
+                            tdutils::log_error!("Can't parse messages.saveGif Bool answer");
+                            tdutils::status::Result::Err(Status::error(
+                                500,
+                                "Failed to parse the messages_saveGif answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.animations_manager);
+                let parked = manager.pop_save_gif_query();
+                {
+                    let Td {
+                        global,
+                        option_manager,
+                        auth_manager,
+                        file_manager,
+                        file_reference_manager,
+                        animations_updates,
+                        ..
+                    } = self;
+                    let mut env = TdAnimationsEnv {
+                        global,
+                        options: option_manager.as_mut(),
+                        auth_is_bot: auth_manager.is_bot(),
+                        file_manager: std::sync::Arc::clone(file_manager),
+                        file_reference_manager,
+                        updates: animations_updates,
+                    };
+                    manager.on_save_gif_result(&mut env, file_id, unsave, result, parked);
+                }
+                self.animations_manager = manager;
+                for update in std::mem::take(&mut self.animations_updates) {
+                    self.send_update(update.into());
                 }
             }
         }
@@ -32143,19 +32188,6 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
 
     fn is_expected_error(&self, status: &tdutils::status::Status) -> bool {
         self.global.is_expected_error(status)
-    }
-
-    fn send_save_gif_query_net(
-        &mut self,
-        file_id: FileId,
-        unsave: bool,
-        _input_document: telegram_api::InputDocument,
-        _promise: Promise<()>,
-    ) {
-        tdutils::log_info!(
-            "Send SaveGifQuery(file_id = {}, unsave = {unsave}) — [blocked: net]",
-            file_id.get()
-        );
     }
 }
 
@@ -84900,9 +84932,9 @@ kQIDAQAB\n\
         assert!(td.game_net_completed.lock().is_empty(), "drained");
     }
 
-    // ---- the net-drain 56 animation families: the §3.9
-    // ---- AnimationsManager wire queries ride the AnimationsNetKind
-    // ---- plane. ----
+    // ---- the net-drain 56 animation families: the two §3.9
+    // ---- AnimationsManager wire queries (AnimationsManager.cpp:39-124)
+    // ---- ride the AnimationsNetKind plane. ----
 
     #[test]
     fn animations_net_families_ride_the_dispatcher() {
@@ -84948,11 +84980,19 @@ kQIDAQAB\n\
             out
         }
         fn animated_wire_document(id: i64) -> telegram_api::Document {
+            animated_wire_document_with_reference(id, Vec::new())
+        }
+        /// The refreshed-reference form — the repair answer re-serves the
+        /// animation document with a new `file_reference`.
+        fn animated_wire_document_with_reference(
+            id: i64,
+            file_reference: Vec<u8>,
+        ) -> telegram_api::Document {
             telegram_api::Document::document(telegram_api::document {
                 flags: 0,
                 id,
                 access_hash: 42,
-                file_reference: Vec::new(),
+                file_reference,
                 date: 0,
                 mime_type: "video/mp4".to_owned(),
                 size: 1000,
@@ -84976,6 +85016,9 @@ kQIDAQAB\n\
         // live getSavedAnimations arm loads from the server; the hash
         // fold covers the two ring documents the load answer carries
         let fold_hash = crate::misc::get_vector_hash(&[700, 701]);
+        // the fold over the ring after a save re-orders the added
+        // animation to the head (add_to_top_if, cpp:730)
+        let head_fold_hash = crate::misc::get_vector_hash(&[701, 700]);
 
         // 1. the live getSavedAnimations arm rides the wire:
         //    messages_getSavedGifs { hash: 0 } (the empty-ring fold)
@@ -85019,6 +85062,8 @@ kQIDAQAB\n\
         assert_eq!(animation.mime_type, "video/mp4");
         assert_eq!(animation.file_name, "");
         let animation_file_id = animation.animation.as_ref().unwrap().id;
+        let saved_animation_file_id = animations.animations[1].animation.as_ref().unwrap().id;
+        assert_ne!(saved_animation_file_id, animation_file_id);
         // the walk's registered remote carries the wire document id
         {
             let files = td.file_manager.lock();
@@ -85031,6 +85076,202 @@ kQIDAQAB\n\
             assert!(full_remote.is_document());
             assert_eq!(full_remote.get_id(), 700);
         }
+
+        // 3. the addSavedAnimation arm rides the wire: the resolved input
+        //    document + unsave=false (SaveGifQuery::send, cpp:77-85). The
+        //    second animation is not the ring head, so the C++ fast path
+        //    (cpp:700-707) does not swallow the save
+        td.request(
+            2,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: saved_animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        let body = telegram_api::messages_saveGif::parse(sent.query()).expect("the sent body");
+        assert!(!body.unsave);
+        let telegram_api::InputDocument::inputDocument(input_document) = body.id.as_ref().unwrap()
+        else {
+            panic!("the input document");
+        };
+        assert_eq!((input_document.id, input_document.access_hash), (701, 42));
+
+        // 4. the ok=false band: the server dropped the gif from the ring —
+        //    the reload fires a second getSavedGifs AND the promise settles
+        //    ok (cpp:92-98)
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 2);
+        assert!(matches!(responses.first(), Some(td_api::Object::ok(_))));
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(
+            body.hash, head_fold_hash,
+            "the reload carries the re-ordered ring fold"
+        );
+        // answer the reload with notModified (the plain no-op, cpp:566-573)
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+
+        // 5. the ok=true band: settles without a reload
+        td.request(
+            3,
+            Function::removeSavedAnimation(td_api::removeSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        let body = telegram_api::messages_saveGif::parse(sent.query()).expect("the sent body");
+        assert!(body.unsave);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        assert!(matches!(responses.first(), Some(td_api::Object::ok(_))));
+        assert!(rec.sent.lock().is_empty(), "no reload after the ok=true");
+
+        // 6. the wire-error band: the verbatim error + the reload re-send
+        //    (the plain on_error band, cpp:118-122)
+        td.request(
+            4,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        net_fail(sent, 400, "ANIMATION_INVALID");
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "ANIMATION_INVALID")
+        );
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+
+        // 7. the file-reference band (cpp:102-117): the reference
+        //    deletes, the saved-animations file source's repair closure
+        //    runs the is_repair form (FileReferenceManager.cpp:522-524),
+        //    and the repair answer re-sends the save query with the same
+        //    promise (the lambda's success arm, cpp:112-116)
+        td.request(
+            5,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: saved_animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        net_fail(sent, 400, "FILE_REFERENCE_INVALID");
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        // the promise stays parked — the repair ladder owns it now
+        assert!(
+            responses_of(&callback, 5).is_empty(),
+            "the repair chain holds the promise"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0, "the repair form carries no fold");
+        // the repair answer re-serves the animation with a refreshed
+        // reference; the walked record updates the file view the re-send
+        // reads (cpp:112-116)
+        net_complete(
+            sent,
+            saved_gifs_answer(
+                0,
+                vec![animated_wire_document_with_reference(701, b"v2".to_vec())],
+            ),
+        );
+        td.dispatch_completed_animations_net();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        let body = telegram_api::messages_saveGif::parse(sent.query()).expect("the sent body");
+        assert!(!body.unsave);
+        let telegram_api::InputDocument::inputDocument(input_document) = body.id.as_ref().unwrap()
+        else {
+            panic!("the re-sent input document");
+        };
+        assert_eq!((input_document.id, input_document.access_hash), (701, 42));
+        assert_eq!(
+            input_document.file_reference,
+            b"v2".to_vec(),
+            "the re-send carries the refreshed reference"
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 5);
+        assert!(matches!(responses.first(), Some(td_api::Object::ok(_))));
+
+        // 7b. the repair-failure band: the notModified repair answer
+        //     fails the repair lot (cpp:566-569) and the lambda's error
+        //     arm settles the parked promise with the C++ 400
+        //     (cpp:109-111)
+        td.request(
+            7,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        net_fail(sent, 400, "FILE_REFERENCE_INVALID");
+        td.dispatch_completed_animations_net();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Failed to find the animation")
+        );
 
         // 8. the repair form rides the wire with is_repair=true + hash 0;
         //    the notModified answer fails the repair promise with the C++
@@ -85107,10 +85348,11 @@ kQIDAQAB\n\
             other => panic!("expected the repair band, got {other:?}"),
         }
 
-        // 9. the net-inert posture — no dispatcher, the query family
-        //    parks like the C++ handler holds it. The loaded ring answers
+        // 9. the net-inert posture — no dispatcher, both families park
+        //    like the C++ handlers hold them. The loaded ring answers
         //    the get arm locally (the C++ cached read, cpp:495-504) with
-        //    the reload suppressed by the load clock
+        //    the reload suppressed by the load clock — only the query
+        //    families park
         td.net_query_dispatcher = None;
         td.animations_manager.net = None;
         td.request(
@@ -85126,6 +85368,36 @@ kQIDAQAB\n\
             };
             assert_eq!(animations.animations.len(), 2, "the cached ring");
         }
+        let (promise, slot) = record_slot::<()>();
+        {
+            let mut animations = std::mem::take(&mut td.animations_manager);
+            let Td {
+                global,
+                option_manager,
+                auth_manager,
+                file_manager,
+                file_reference_manager,
+                animations_updates,
+                ..
+            } = &mut td;
+            let mut env = TdAnimationsEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(file_manager),
+                file_reference_manager,
+                updates: animations_updates,
+            };
+            animations.send_save_gif_query(&mut env, repair_file_id, false, promise);
+            td.animations_manager = animations;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.animations_manager.pop_save_gif_query().is_some(),
+            "the save promise parks like the C++ handler holds it"
+        );
+
         // the drains ran clean — nothing parked, no strays
         assert!(td.animations_net_completed.lock().is_empty(), "drained");
     }

@@ -4,11 +4,11 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`AnimationsManagerEnv`] trait carries the `G()`/option/pmc/
-//! cross-manager surfaces, and the `GetSavedGifsQuery` wire tail rides
-//! the manager-held `AnimationsNetHandle` (net-drain 56) — the answers
-//! drain through `Td::on_animations_net_answer` into the landed
-//! intakes; the `SaveGifQuery` tail stays the env seam and parks its
-//! promise offline.
+//! cross-manager surfaces, and the two wire queries
+//! (`GetSavedGifsQuery`/`SaveGifQuery`) ride the manager-held
+//! `AnimationsNetHandle` (net-drain 56) — the answers drain through
+//! `Td::on_animations_net_answer` into the landed intakes; the
+//! net-inert posture parks the query lots.
 //!
 //! The saved-animations pmc record (the sqlite-pmc `"ans"` key) is the
 //! byte-exact `AnimationListLogEvent` framing: the log-event version
@@ -35,12 +35,13 @@ use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 
 /// The in-flight query kinds of the net-drain 56 animation families —
-/// the C++ `GetSavedGifsQuery` `Td::ResultHandler` class
-/// (AnimationsManager.cpp:39-64) collapsed onto a dispatcher tag; the
-/// answers drain through [`crate::td::Td::on_animations_net_answer`].
-/// The kind carries only the handler member the answer half keys on
-/// (the request carries no promise — the answer feeds the manager's own
-/// load/repair state machine).
+/// the C++ `GetSavedGifsQuery`/`SaveGifQuery` `Td::ResultHandler`
+/// classes (AnimationsManager.cpp:39-124) collapsed onto dispatcher
+/// tags; the answers drain through [`crate::td::Td::on_animations_net_answer`].
+/// The kinds carry only the handler members the answer half keys on;
+/// the request promise and the SaveGif file-reference stash park in the
+/// manager's family lot (the C++ carries them on the query — §5's
+/// FIFO-per-family shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnimationsNetKind {
     /// `GetSavedGifsQuery` (AnimationsManager.cpp:39-64) —
@@ -48,6 +49,20 @@ pub(crate) enum AnimationsNetKind {
     /// the answer feeds the manager's own load/repair state machine (no
     /// request promise).
     GetSavedGifs { is_repair: bool },
+    /// `SaveGifQuery` (AnimationsManager.cpp:66-124) —
+    /// `messages.saveGif`; the `file_id_`/`unsave_` members ride the
+    /// kind, the promise + the stashed `file_reference_` (cpp:81) park
+    /// in the family lot.
+    SaveGif { file_id: FileId, unsave: bool },
+}
+
+/// A parked `messages.saveGif` query — the `SaveGifQuery` members the
+/// `Copy` kind can't carry: the stashed `file_reference_`
+/// (AnimationsManager.cpp:81, the error-band delete target) and the
+/// request promise (the C++ carries both on the query).
+pub(crate) struct PendingSaveGifQuery {
+    pub(crate) file_reference: Vec<u8>,
+    pub(crate) promise: Promise<()>,
 }
 
 /// The `G()`/manager slice the collapsed manager reads through.
@@ -98,20 +113,6 @@ pub trait AnimationsManagerEnv: DialogPhotoStoreEnv {
         old_file_ids: &[FileId],
         new_file_ids: &[FileId],
         source: &str,
-    );
-
-    // -- the `[blocked: net]` query tail; it drops the promise, which
-    // -- keeps the C++ request unanswered offline
-    /// `SaveGifQuery::send(file_id, input_document, unsave)`
-    /// (AnimationsManager.cpp:66-124); the input document is resolved
-    /// locally, the query send and the file-reference repair half are
-    /// inside the net seam.
-    fn send_save_gif_query_net(
-        &mut self,
-        file_id: FileId,
-        unsave: bool,
-        input_document: telegram_api::InputDocument,
-        promise: Promise<()>,
     );
 }
 
@@ -169,6 +170,17 @@ pub struct AnimationsManager {
     load_saved_animations_queries: Vec<Promise<()>>,
     repair_saved_animations_queries: Vec<Promise<()>>,
     pending_saved_animation_calls: Vec<SavedAnimationCall>,
+    /// The parked `messages.saveGif` queries — the C++ handlers' `promise_`
+    /// and `file_reference_` members (AnimationsManager.cpp:71/:81), popped
+    /// FIFO by the answer drain.
+    pending_save_gif_queries: Vec<PendingSaveGifQuery>,
+    /// The parked save-GIF repairs — the `SaveGifQuery` file-reference
+    /// band's lambda captures (AnimationsManager.cpp:109-116) beside the
+    /// `FileSourceSavedAnimations` repair closure, which runs
+    /// `repair_saved_animations` (FileReferenceManager.cpp:522-524): the
+    /// repair answer re-sends the save query with the same request
+    /// promise, the repair failure settles the 400.
+    pending_save_gif_repairs: Vec<(FileId, bool, Promise<()>)>,
     saved_animations_file_source_id: FileSourceId,
 
     animation_search_emojis: String,
@@ -916,6 +928,15 @@ impl AnimationsManager {
 
         if is_repair {
             set_promises(&mut self.repair_saved_animations_queries);
+            // the repair lambda's success arms
+            // (AnimationsManager.cpp:112-116) — the re-sent SaveGifQuery
+            // parks a fresh family-lot entry with the same request
+            // promise and reads the refreshed file view
+            for (animation_id, unsave, promise) in
+                std::mem::take(&mut self.pending_save_gif_repairs)
+            {
+                self.send_save_gif_query(env, animation_id, unsave, promise);
+            }
         } else {
             self.on_load_saved_animations_finished(env, walk.animation_ids, false);
 
@@ -945,6 +966,15 @@ impl AnimationsManager {
         }
         if is_repair {
             fail_promises(&mut self.repair_saved_animations_queries, &error);
+            // the repair lambda's error arm
+            // (AnimationsManager.cpp:109-111) — the C++ 400 the parked
+            // save promise settles with
+            for (_, _, mut promise) in std::mem::take(&mut self.pending_save_gif_repairs) {
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Failed to find the animation",
+                ));
+            }
         } else {
             fail_promises(&mut self.load_saved_animations_queries, &error);
             fail_saved_animation_calls(&mut self.pending_saved_animation_calls, &error);
@@ -1000,8 +1030,11 @@ impl AnimationsManager {
         self.add_saved_animation_impl(env, file_id, true, promise);
     }
 
-    /// `send_save_gif_query` (AnimationsManager.cpp:650-661); the query
-    /// send is the `[blocked: net]` seam.
+    /// `send_save_gif_query` (AnimationsManager.cpp:650-661); the input
+    /// document resolves locally, then the `SaveGifQuery` rides the
+    /// manager-held handle — the promise + the stashed `file_reference_`
+    /// (cpp:77-85) park in the family lot, the net-inert posture keeps
+    /// them parked.
     pub fn send_save_gif_query(
         &mut self,
         env: &mut impl AnimationsManagerEnv,
@@ -1023,7 +1056,117 @@ impl AnimationsManager {
             assert!(!full_remote_location.is_web());
             as_input_document(full_remote_location)
         };
-        env.send_save_gif_query_net(animation_id, unsave, input_document, promise);
+        // the `SaveGifQuery` ctor stash (cpp:81) + the promise parking
+        // (cpp:76-78 — the C++ carries them on the query, §5's FIFO shape)
+        let file_reference = match &input_document {
+            telegram_api::InputDocument::inputDocument(document) => document.file_reference.clone(),
+            // as_input_document CHECKs is_document
+            telegram_api::InputDocument::inputDocumentEmpty(_) => Vec::new(),
+        };
+        self.pending_save_gif_queries.push(PendingSaveGifQuery {
+            file_reference,
+            promise,
+        });
+        let kind = AnimationsNetKind::SaveGif {
+            file_id: animation_id,
+            unsave,
+        };
+        match self.net.clone() {
+            // `SaveGifQuery::send` (cpp:77-85)
+            Some(net) => net.dispatch(
+                kind,
+                telegram_api::Function::messages_saveGif(telegram_api::messages_saveGif {
+                    id: Some(input_document),
+                    unsave,
+                }),
+            ),
+            None => tdutils::log_info!(
+                "Send SaveGifQuery(file_id = {}, unsave = {unsave}) — [net-inert]",
+                animation_id.get()
+            ),
+        }
+    }
+
+    /// The save-family lot pop for the
+    /// [`crate::td::Td::on_animations_net_answer`] drain — the FIFO head
+    /// the answer pairs with (the C++ promise rides its own query;
+    /// answers complete in wire order, the payments `pop_head` shape).
+    pub(crate) fn pop_save_gif_query(&mut self) -> Option<PendingSaveGifQuery> {
+        if self.pending_save_gif_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_save_gif_queries.remove(0))
+        }
+    }
+
+    /// `SaveGifQuery::on_result`/`on_error`
+    /// (AnimationsManager.cpp:86-123) — the parsed Bool or the wire
+    /// error, with the parked lot head. The file-reference band
+    /// (cpp:102-117) rides the `FileSourceSavedAnimations` repair
+    /// closure: the reference deletes, then the captures park beside the
+    /// repair lot — the repair answer re-sends the save query with the
+    /// same promise (cpp:112-116), the repair failure settles the 400
+    /// (cpp:109-111). The general `repair_file_reference` walk over the
+    /// other file sources is the [blocked: file-reference repair plane]
+    /// seam — the saved-animations source is the one this manager
+    /// registers.
+    pub(crate) fn on_save_gif_result(
+        &mut self,
+        env: &mut impl AnimationsManagerEnv,
+        file_id: FileId,
+        unsave: bool,
+        result: tdutils::status::Result<bool>,
+        mut parked: Option<PendingSaveGifQuery>,
+    ) {
+        let Some(PendingSaveGifQuery {
+            file_reference,
+            promise,
+        }) = parked.take()
+        else {
+            // the send leg parked none (the net-inert posture or a
+            // dropped request)
+            tdutils::log_info!("Receive an unexpected messages.saveGif answer");
+            return;
+        };
+        let mut promise = promise;
+        match result {
+            // cpp:92-98 — the ok Bool settles the promise, a false first
+            // forces the ring reload
+            tdutils::status::Result::Ok(result) => {
+                tdutils::log_info!("Receive result for save GIF: {result}");
+                if !result {
+                    self.reload_saved_animations(env, true);
+                }
+                promise.set_value(());
+            }
+            tdutils::status::Result::Err(status) => {
+                if !env.auth_is_bot() && crate::files::is_file_reference_error(&status) {
+                    // cpp:102-117 — the VLOG head, the reference delete,
+                    // then the repair: the saved-animations file source is
+                    // the one this plane registers, and its closure runs
+                    // `repair_saved_animations`
+                    // (FileReferenceManager.cpp:522-524); the lambda's
+                    // captures park here and drain beside the repair lot
+                    tdutils::log_info!("Receive {status} for file reference repair");
+                    env.file_manager()
+                        .lock()
+                        .delete_file_reference(file_id, &file_reference);
+                    self.pending_save_gif_repairs
+                        .push((file_id, unsave, promise));
+                    // the empty promise plays the C++ lambda carrier —
+                    // the tuple beside it is what the drain completes
+                    self.repair_saved_animations(env, Promise::default());
+                    return;
+                }
+                // cpp:118-122 — the expected-error log head, the reload,
+                // the verbatim promise error
+                if !env.is_expected_error(&status) {
+                    tdutils::log_error!("Receive error for save GIF: {status}");
+                }
+                self.reload_saved_animations(env, true);
+                promise.set_error(status);
+            }
+        }
     }
 
     /// `add_saved_animation_by_id` (AnimationsManager.cpp:663-672).
@@ -1709,7 +1852,6 @@ mod tests {
         sqlite: std::collections::HashMap<Vec<u8>, Vec<u8>>,
         options: std::collections::HashMap<String, String>,
         updates: Vec<td_api::Update>,
-        queries: Vec<String>,
         is_bot: bool,
         use_sqlite: bool,
     }
@@ -1725,7 +1867,6 @@ mod tests {
                 sqlite: std::collections::HashMap::new(),
                 options: std::collections::HashMap::new(),
                 updates: Vec::new(),
-                queries: Vec::new(),
                 is_bot: false,
                 use_sqlite: true,
             }
@@ -1749,17 +1890,6 @@ mod tests {
                 0,
                 "animation.mp4".to_owned(),
             )
-        }
-
-        fn save_gif_queries(&self) -> Vec<&String> {
-            self.queries
-                .iter()
-                .filter(|query| query.starts_with("save_gif"))
-                .collect()
-        }
-
-        fn has_query(&self, prefix: &str) -> bool {
-            self.queries.iter().any(|query| query.starts_with(prefix))
         }
 
         /// Builds the `"ans"` pmc record over the manager's current ring —
@@ -1877,18 +2007,6 @@ mod tests {
             // the C++ expected-error code set (Global.h:723-737) reduced
             // to the flood-wait family these bands exercise
             status.code() == 420
-        }
-
-        fn send_save_gif_query_net(
-            &mut self,
-            file_id: FileId,
-            unsave: bool,
-            _input_document: telegram_api::InputDocument,
-            promise: Promise<()>,
-        ) {
-            self.queries
-                .push(format!("save_gif {} unsave={unsave}", file_id.get()));
-            drop(promise);
         }
     }
 
@@ -2094,12 +2212,13 @@ mod tests {
 
         let (promise, fulfilled, failed, _) = flag_promise();
         manager.add_saved_animation(&mut env, input(id1).as_ref(), promise);
-        // the promise rode the `[blocked: net]` SaveGifQuery seam — the C++
-        // request stays unanswered offline, so the flag never flips
+        // the net-inert posture keeps the request parked in the family lot
+        // (no dispatcher to ride; the C++ handler holds the promise,
+        // cpp:76-78) — nothing settles offline
         assert!(!fulfilled.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!failed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(manager.saved_animation_ids, vec![id1]);
-        assert!(env.has_query(&format!("save_gif {} unsave=false", id1.get())));
+        assert_eq!(manager.pending_save_gif_queries.len(), 1);
         // the pmc record landed
         assert!(env.sqlite.contains_key(b"ans".as_slice()));
 
@@ -2131,20 +2250,23 @@ mod tests {
         // remove
         let (promise, fulfilled, failed, _) = flag_promise();
         manager.remove_saved_animation(&mut env, input(id2).as_ref(), promise);
-        // the unsave query rides the `[blocked: net]` seam — the promise stays
-        // pending offline
+        // the unsave query parks in the family lot (the net-inert posture)
         assert!(!fulfilled.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!failed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(manager.saved_animation_ids, vec![id3]);
-        assert!(env.has_query(&format!("save_gif {} unsave=true", id2.get())));
+        assert_eq!(
+            manager.pending_save_gif_queries.len(),
+            4,
+            "the three adds + the unsave park in the net-inert lot"
+        );
 
-        // remove of a non-member answers ok without a query
-        let queries_before = env.queries.len();
+        // remove of a non-member answers ok without a new park
+        let parked_before = manager.pending_save_gif_queries.len();
         let (promise, fulfilled, failed, _) = flag_promise();
         manager.remove_saved_animation(&mut env, input(id1).as_ref(), promise);
         assert!(fulfilled.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!failed.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(env.queries.len(), queries_before);
+        assert_eq!(manager.pending_save_gif_queries.len(), parked_before);
 
         // only MPEG4 animations can be saved
         let webm_id = env.register_animation_file(400);
@@ -2168,9 +2290,10 @@ mod tests {
         assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(manager.saved_animation_ids, vec![id3]);
 
-        // id1 + id2 + id3 adds and the id2 unsave rode the net seam; the id3
-        // re-add took the fast path and the webm add failed before the query
-        assert_eq!(env.save_gif_queries().len(), 4);
+        // id1 + id2 + id3 adds and the id2 unsave parked in the lot; the
+        // id3 re-add took the fast path and the webm add failed before
+        // the save
+        assert_eq!(manager.pending_save_gif_queries.len(), 4);
     }
 
     /// The search-parameters plane: the constructor loads, the
@@ -2886,5 +3009,224 @@ mod tests {
         assert!(!get_fulfilled.load(std::sync::atomic::Ordering::SeqCst));
         assert!(get_failed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!manager.are_saved_animations_being_loaded);
+    }
+
+    /// The captured-settle slot of [`record_promise`].
+    type RecordSlot = std::sync::Arc<parking_lot::Mutex<Option<tdutils::status::Result<()>>>>;
+
+    /// A [`PromiseInterface`] capturing the settle for the save-GIF
+    /// bands — the flag promises drop the error text.
+    struct RecordPromise {
+        result: RecordSlot,
+    }
+
+    impl PromiseInterface<()> for RecordPromise {
+        fn set_value(&mut self, _value: ()) {
+            *self.result.lock() = Some(tdutils::status::Result::Ok(()));
+        }
+
+        fn set_error(&mut self, error: tdutils::status::Status) {
+            *self.result.lock() = Some(tdutils::status::Result::Err(error));
+        }
+    }
+
+    fn record_promise() -> (Promise<()>, RecordSlot) {
+        let result = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        (
+            Promise::from_interface(RecordPromise {
+                result: std::sync::Arc::clone(&result),
+            }),
+            result,
+        )
+    }
+
+    /// The `SaveGifQuery` answer bands (AnimationsManager.cpp:86-123)
+    /// over the family lot: the ok/ok=false/error arms settle the popped
+    /// head, and the file-reference band parks the repair chain
+    /// (cpp:102-117) that the repair answer/failure drains
+    /// (FileReferenceManager.cpp:522-524).
+    #[test]
+    fn save_gif_query_bands_settle_the_family_lot() {
+        let mut env = TestEnv::default();
+        let mut manager = AnimationsManager::new();
+        let id1 = env.register_animation_file(1300);
+        manager.create_animation(
+            env.is_bot,
+            id1,
+            String::new(),
+            PhotoSize::default(),
+            AnimationSize::default(),
+            false,
+            Vec::new(),
+            "band.mp4".to_owned(),
+            "video/mp4".to_owned(),
+            1,
+            crate::photo::get_dimensions(70, 70, "test bands"),
+            true,
+        );
+        // load the ring over an empty database record so the send legs
+        // run on a loaded manager
+        env.sqlite.insert(b"ans".to_vec(), {
+            let mut blob = Vec::new();
+            store_log_event_version(&mut blob);
+            store_i32(&mut blob, 0);
+            blob
+        });
+        manager.get_saved_animations(&mut env, flag_promise::<td_api::Animations>().0);
+        assert!(manager.are_saved_animations_loaded);
+
+        // 1. the ok=true band settles without a reload (cpp:92-98)
+        let (promise, result) = record_promise();
+        manager.send_save_gif_query(&mut env, id1, false, promise);
+        assert_eq!(manager.pending_save_gif_queries.len(), 1);
+        manager.are_saved_animations_being_loaded = false;
+        let parked = manager.pop_save_gif_query();
+        manager.on_save_gif_result(
+            &mut env,
+            id1,
+            false,
+            tdutils::status::Result::Ok(true),
+            parked,
+        );
+        assert!(matches!(
+            result.lock().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(!manager.are_saved_animations_being_loaded, "no reload");
+
+        // 2. the ok=false band settles + arms the forced reload
+        // (cpp:95-96) — the net-inert posture parks the wire send
+        let (promise, result) = record_promise();
+        manager.send_save_gif_query(&mut env, id1, false, promise);
+        let parked = manager.pop_save_gif_query();
+        manager.on_save_gif_result(
+            &mut env,
+            id1,
+            false,
+            tdutils::status::Result::Ok(false),
+            parked,
+        );
+        assert!(matches!(
+            result.lock().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            manager.are_saved_animations_being_loaded,
+            "the reload armed"
+        );
+
+        // 3. the plain error band (cpp:118-122): the verbatim error —
+        // the reload gate stays armed from band 2 (the C++ join), so the
+        // send legs below keep their lots clean
+        let (promise, result) = record_promise();
+        manager.send_save_gif_query(&mut env, id1, false, promise);
+        let parked = manager.pop_save_gif_query();
+        manager.on_save_gif_result(
+            &mut env,
+            id1,
+            false,
+            tdutils::status::Result::Err(tdutils::status::Status::error(
+                500,
+                "Internal Server Error",
+            )),
+            parked,
+        );
+        match result.lock().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (500, "Internal Server Error")
+                );
+            }
+            other => panic!("the verbatim error band: {other:?}"),
+        }
+
+        // 4. the file-reference band (cpp:102-117): nothing settles — the
+        // captures park beside the repair lot with the is_repair=true
+        // query armed (the net-inert send)
+        let (promise, result) = record_promise();
+        manager.send_save_gif_query(&mut env, id1, false, promise);
+        let parked = manager.pop_save_gif_query();
+        manager.on_save_gif_result(
+            &mut env,
+            id1,
+            false,
+            tdutils::status::Result::Err(tdutils::status::Status::error(
+                400,
+                "FILE_REFERENCE_INVALID",
+            )),
+            parked,
+        );
+        assert!(
+            result.lock().is_none(),
+            "the repair chain holds the promise"
+        );
+        assert_eq!(manager.pending_save_gif_repairs.len(), 1);
+        assert_eq!(manager.repair_saved_animations_queries.len(), 1);
+
+        // 5. the repair failure drains the tuple with the lambda's error
+        // arm (cpp:109-111)
+        manager.on_get_saved_animations_failed(
+            true,
+            tdutils::status::Status::error(500, "Failed to reload saved animations"),
+        );
+        assert!(manager.pending_save_gif_repairs.is_empty());
+        match result.lock().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (400, "Failed to find the animation")
+                );
+            }
+            other => panic!("the repair-failure band: {other:?}"),
+        }
+
+        // 6. the repair answer re-sends the save with the same promise
+        // (cpp:112-116) — the fresh family-lot entry carries it
+        let (promise, result) = record_promise();
+        manager.send_save_gif_query(&mut env, id1, false, promise);
+        let parked = manager.pop_save_gif_query();
+        manager.on_save_gif_result(
+            &mut env,
+            id1,
+            false,
+            tdutils::status::Result::Err(tdutils::status::Status::error(
+                400,
+                "FILE_REFERENCE_INVALID",
+            )),
+            parked,
+        );
+        manager.on_get_saved_animations(
+            &mut env,
+            true,
+            SavedGifsWalk {
+                not_modified: false,
+                animation_ids: Vec::new(),
+                wire_hash: 0,
+            },
+        );
+        assert!(manager.pending_save_gif_repairs.is_empty());
+        assert!(
+            result.lock().is_none(),
+            "the re-sent query holds the promise"
+        );
+        assert_eq!(
+            manager.pending_save_gif_queries.len(),
+            1,
+            "the re-send parks a fresh family-lot entry"
+        );
+        // the re-sent query settles on its own answer
+        let parked = manager.pop_save_gif_query();
+        manager.on_save_gif_result(
+            &mut env,
+            id1,
+            false,
+            tdutils::status::Result::Ok(true),
+            parked,
+        );
+        assert!(matches!(
+            result.lock().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
     }
 }
