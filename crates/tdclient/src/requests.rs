@@ -11413,7 +11413,9 @@ fn run_bot_requests_46(td: &mut Td, id: u64, function: Function) {
 /// The M.50 SecretChatsManager arm group of the request dispatcher — see
 /// the frame note at the forward site in [`run_request`]. The arms route
 /// into `td_->secret_chats_manager_->...` (Requests.cpp:5082-5091,
-/// 7409-7415); the network tails are the [blocked: net] query seams.
+/// 7409-7415); the five wire families ride the manager-held
+/// `SecretNetKind` plane and the chat-object build parks with the
+/// dialog plane.
 #[allow(clippy::too_many_lines)]
 fn run_secret_chat_requests(td: &mut Td, id: u64, function: Function) {
     fn secret_chat_arm(
@@ -11443,20 +11445,51 @@ fn run_secret_chat_requests(td: &mut Td, id: u64, function: Function) {
 
     match function {
         // createNewSecretChat (Requests.cpp:5082-5091) — the C++ routes
-        // through user_manager_->create_new_secret_chat, which converts
-        // the created chat id to the chat object; both the net leg and
-        // the conversion park [blocked: net / the chat creation intake].
+        // through user_manager_->create_new_secret_chat, which resolves
+        // the plain `inputUser` peer (UserManager.cpp:9845-9854, the
+        // "Can't create secret chat with the user" band) and chains the
+        // chat-object build onto the create receipt (cpp:9864-9870);
+        // the object build itself parks with the dialog plane.
         Function::createNewSecretChat(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<td_api::Chat, _>(id, Object::chat);
+            let mut promise = td.deferred_promise::<td_api::Chat, _>(id, Object::chat);
+            let (user_id, user_access_hash) = {
+                let crate::td::Td {
+                    global,
+                    option_manager,
+                    auth_manager,
+                    user_manager,
+                    ..
+                } = td;
+                let user_env = crate::user_manager::UserEnv {
+                    global,
+                    options: option_manager.as_mut().expect("user environment"),
+                    auth_is_bot: auth_manager.is_bot(),
+                };
+                match user_manager
+                    .get_input_user(&user_env, crate::user_manager::UserId::new(request.user_id))
+                {
+                    Ok(tdmtproto::telegram_api::InputUser::inputUser(user)) => (
+                        crate::user_manager::UserId::new(user.user_id),
+                        user.access_hash,
+                    ),
+                    Ok(_) => {
+                        promise.set_error(Status::error(
+                            400,
+                            "Can't create secret chat with the user",
+                        ));
+                        return;
+                    }
+                    Err(status) => {
+                        promise.set_error(status);
+                        return;
+                    }
+                }
+            };
             secret_chat_arm(td, |env, manager| {
-                manager.create_chat_chat_object(
-                    env,
-                    crate::user_manager::UserId::new(request.user_id),
-                    promise,
-                );
+                manager.create_chat_chat_object(env, user_id, user_access_hash, promise);
             });
         }
 
