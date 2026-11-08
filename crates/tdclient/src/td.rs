@@ -3789,6 +3789,15 @@ pub(crate) type BotRecommendationNetHandle =
 /// the manager over the env's file-plane reads.
 pub(crate) type StickersNetHandle = NetKindHandle<crate::stickers_manager::StickersNetKind>;
 
+/// The cloned animations dispatch surface the
+/// [`crate::animations_manager::AnimationsManager`] holds — the
+/// net-drain 56 GetSavedGifs family's send leg (the
+/// `GetSavedGifsQuery` ResultHandler class, AnimationsManager.cpp:39-64);
+/// the answers drain through [`Td::on_animations_net_answer`].
+/// Manager-held (the game shape): the send legs run inside the manager
+/// over the env's file-plane reads.
+pub(crate) type AnimationsNetHandle = NetKindHandle<crate::animations_manager::AnimationsNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -6415,6 +6424,11 @@ pub struct Td {
     /// net-drain 59 families) — the dispatcher callbacks park here, the
     /// actor pump routes them through [`Td::on_stickers_net_answer`].
     stickers_net_completed: Arc<Mutex<Vec<(crate::stickers_manager::StickersNetKind, NetQuery)>>>,
+    /// The animations net completed queue (the `AnimationsNetKind` tags;
+    /// the net-drain 56 families) — the dispatcher callbacks park here,
+    /// the actor pump routes them through [`Td::on_animations_net_answer`].
+    animations_net_completed:
+        Arc<Mutex<Vec<(crate::animations_manager::AnimationsNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6948,6 +6962,7 @@ impl Td {
             notification_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             stickers_net_completed: Arc::new(Mutex::new(Vec::new())),
+            animations_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7449,6 +7464,7 @@ impl Td {
         self.device_token_manager.net = self.device_token_net();
         self.notification_manager.net = self.notification_net();
         self.stickers_manager.net = self.stickers_net();
+        self.animations_manager.net = self.animations_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9277,6 +9293,7 @@ impl Td {
         self.dispatch_completed_boost_net();
         self.dispatch_completed_callback_net();
         self.dispatch_completed_game_net();
+        self.dispatch_completed_animations_net();
         self.dispatch_completed_reaction_net();
         self.dispatch_completed_inline_message_net();
         self.dispatch_completed_top_dialog_net();
@@ -9857,6 +9874,18 @@ impl Td {
         Some(StickersNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.stickers_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned animations dispatch surface the
+    /// [`crate::animations_manager::AnimationsManager`] holds (the
+    /// net-drain 56 families' send legs) — `None` keeps the net-inert
+    /// posture.
+    pub(crate) fn animations_net(&self) -> Option<AnimationsNetHandle> {
+        Some(AnimationsNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.animations_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -18759,6 +18788,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked animations answers — the C++
+    /// ResultHandler halves of the net-drain 56 families
+    /// (AnimationsManager.cpp:39-124).
+    fn dispatch_completed_animations_net(&mut self) {
+        let completed = std::mem::take(&mut *self.animations_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_animations_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20668,6 +20708,95 @@ impl Td {
                     }
                 }
                 self.game_manager = manager;
+            }
+        }
+    }
+
+    /// Route one animations net answer by kind — the ResultHandler
+    /// halves of the net-drain 56 GetSavedGifs family
+    /// (AnimationsManager.cpp:39-64):
+    /// the wire answer parses here, the documents walk runs over the
+    /// split env, and the manager intakes run behind the take/drop
+    /// discipline (the game router shape). The parse failures run the
+    /// same on_error tails the C++ `fetch_result` failure would
+    /// (cpp:50-56/:88-94).
+    fn on_animations_net_answer(
+        &mut self,
+        kind: crate::animations_manager::AnimationsNetKind,
+        query: NetQuery,
+    ) {
+        use crate::animations_manager::AnimationsNetKind as K;
+        match kind {
+            // `GetSavedGifsQuery::on_result`/`on_error` (cpp:46-63) — the
+            // error head is the expected-error-gated LOG(ERROR), then the
+            // failed intake; the ok arm walks the documents over the
+            // split intake env (the `td_->documents_manager_->
+            // on_get_document` loop, cpp:584-586) before the manager
+            // finishes the state machine.
+            K::GetSavedGifs { is_repair } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_SavedGifs::parse(query.ok()) {
+                        Ok(saved_gifs) => Ok(saved_gifs),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.savedGifs: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getSavedGifs answer",
+                            ))
+                        }
+                    }
+                };
+                match result {
+                    Err(status) => {
+                        if !self.global.is_expected_error(&status) {
+                            tdutils::log_error!("Receive error for get saved animations: {status}");
+                        }
+                        let mut manager = std::mem::take(&mut self.animations_manager);
+                        manager.on_get_saved_animations_failed(is_repair, status);
+                        self.animations_manager = manager;
+                    }
+                    Ok(saved_gifs) => {
+                        // the documents walk (cpp:575-604) — no manager
+                        // method is live here, so the intake env routes
+                        // the record dispatch
+                        let walk = {
+                            let (mut env, documents) = self.documents_env();
+                            crate::animations_manager::walk_saved_animations(
+                                documents, &mut env, saved_gifs,
+                            )
+                        };
+                        let mut manager = std::mem::take(&mut self.animations_manager);
+                        {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                file_manager,
+                                file_reference_manager,
+                                animations_updates,
+                                ..
+                            } = self;
+                            let mut env = TdAnimationsEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                file_manager: std::sync::Arc::clone(file_manager),
+                                file_reference_manager,
+                                updates: animations_updates,
+                            };
+                            manager.on_get_saved_animations(&mut env, is_repair, walk);
+                        }
+                        self.animations_manager = manager;
+                        // the intake queued `updateSavedAnimations` —
+                        // flush the outbox with the answer (the C++
+                        // send_closures it from the manager)
+                        for update in std::mem::take(&mut self.animations_updates) {
+                            self.send_update(update.into());
+                        }
+                    }
+                }
             }
         }
     }
@@ -31896,7 +32025,7 @@ impl FileManagerWorker for TdFileWorker {
 // The C++ AnimationsManager reads `G()` (options, close flag, the binlog
 // + sqlite pmcs, the FileManager) and sends its queries from the
 // collapsed actor's `create_handler`s; the env carries the same surfaces
-// and the `[blocked: net]` query seams.
+// (the two wire queries ride the manager-held net handle, net-drain 56).
 
 /// The per-call [`crate::animations_manager::AnimationsManagerEnv`] over
 /// the Td fields — built per call with the field-split borrows, never
@@ -32014,12 +32143,6 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
 
     fn is_expected_error(&self, status: &tdutils::status::Status) -> bool {
         self.global.is_expected_error(status)
-    }
-
-    fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64) {
-        tdutils::log_info!(
-            "Send GetSavedGifsQuery(is_repair = {is_repair}, hash = {hash}) — [blocked: net]"
-        );
     }
 
     fn send_save_gif_query_net(
@@ -56211,6 +56334,7 @@ mod tests {
         td.device_token_manager.net = td.device_token_net();
         td.notification_manager.net = td.notification_net();
         td.stickers_manager.net = td.stickers_net();
+        td.animations_manager.net = td.animations_net();
         (td, rec, callback)
     }
 
@@ -84774,6 +84898,236 @@ kQIDAQAB\n\
 
         // the drains ran clean — nothing parked, no strays
         assert!(td.game_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the net-drain 56 animation families: the §3.9
+    // ---- AnimationsManager wire queries ride the AnimationsNetKind
+    // ---- plane. ----
+
+    #[test]
+    fn animations_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(animations_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn animations_net_families_ride_the_dispatcher_impl() {
+        /// The `messages.savedGifsNotModified` wire answer (the enum
+        /// `store` writes the boxed constructor framing).
+        fn not_modified_answer() -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_SavedGifs::messages_savedGifsNotModified(
+                telegram_api::messages_savedGifsNotModified,
+            )
+            .store(&mut out);
+            out
+        }
+        /// A `Promise<T>` slot (the game round-trip's record_slot shape).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+        /// The saved-animations wire answer over the animated test document.
+        fn saved_gifs_answer(hash: i64, documents: Vec<telegram_api::Document>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_SavedGifs::messages_savedGifs(
+                telegram_api::messages_savedGifs {
+                    hash,
+                    gifs: documents,
+                },
+            )
+            .store(&mut out);
+            out
+        }
+        fn animated_wire_document(id: i64) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                flags: 0,
+                id,
+                access_hash: 42,
+                file_reference: Vec::new(),
+                date: 0,
+                mime_type: "video/mp4".to_owned(),
+                size: 1000,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![telegram_api::DocumentAttribute::documentAttributeAnimated(
+                    telegram_api::documentAttributeAnimated,
+                )],
+            })
+        }
+
+        let (mut td, rec, callback) = netted_td_with_files("netdrain65-animations");
+        // user mode (the saved-animations arms CHECK !is_bot) — the
+        // netted harness defaults to it; the files database is on — the
+        // repair leg's refreshed-reference re-register flushes its file
+        // record (the FileDb events need the files key-value)
+        assert!(!td.auth_manager.is_bot());
+
+        // the pmc ring record reads back empty (the "ans" key), so the
+        // live getSavedAnimations arm loads from the server; the hash
+        // fold covers the two ring documents the load answer carries
+        let fold_hash = crate::misc::get_vector_hash(&[700, 701]);
+
+        // 1. the live getSavedAnimations arm rides the wire:
+        //    messages_getSavedGifs { hash: 0 } (the empty-ring fold)
+        td.request(
+            1,
+            Function::getSavedAnimations(td_api::getSavedAnimations {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0);
+
+        // 2. the savedGifs answer walks the REAL documents intake: the
+        //    animation record lands (the create_animation dispatch), the
+        //    ring loads, updateSavedAnimations flushes, and the parked
+        //    request promise settles with the animations object
+        net_complete(
+            sent,
+            saved_gifs_answer(
+                fold_hash,
+                vec![
+                    telegram_api::Document::documentEmpty(telegram_api::documentEmpty { id: 1 }),
+                    animated_wire_document(700),
+                    animated_wire_document(701),
+                ],
+            ),
+        );
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        // the outbox flushed with the answer (updateSavedAnimations rode
+        // send_update; the empty lot proves the flush ran)
+        assert!(td.animations_updates.is_empty());
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::animations(animations) = responses.first().unwrap() else {
+            panic!("the getSavedAnimations answer: {:?}", responses.first());
+        };
+        assert_eq!(animations.animations.len(), 2, "the empty document drops");
+        let animation = &animations.animations[0];
+        assert_eq!(animation.mime_type, "video/mp4");
+        assert_eq!(animation.file_name, "");
+        let animation_file_id = animation.animation.as_ref().unwrap().id;
+        // the walk's registered remote carries the wire document id
+        {
+            let files = td.file_manager.lock();
+            let full_remote = files
+                .get_file_view(crate::files::FileId::new(animation_file_id, 0))
+                .unwrap()
+                .get_full_remote_location()
+                .unwrap()
+                .clone();
+            assert!(full_remote.is_document());
+            assert_eq!(full_remote.get_id(), 700);
+        }
+
+        // 8. the repair form rides the wire with is_repair=true + hash 0;
+        //    the notModified answer fails the repair promise with the C++
+        //    500 (cpp:566-569)
+        let repair_file_id = {
+            let mut file_manager = td.file_manager.lock();
+            file_manager.register_remote(
+                crate::files::FullRemoteFileLocation::from_document(
+                    crate::files::FileType::Animation,
+                    701,
+                    42,
+                    crate::chat_manager::DcId::internal(2),
+                    String::new(),
+                ),
+                crate::files::FileLocationSource::FromServer,
+                crate::message_id::DialogId::default(),
+                1000,
+                0,
+                "repair.mp4".to_owned(),
+            )
+        };
+        let mut animations = std::mem::take(&mut td.animations_manager);
+        animations.create_animation(
+            td.auth_manager.is_bot(),
+            repair_file_id,
+            String::new(),
+            crate::photo::PhotoSize::default(),
+            crate::photo::AnimationSize::default(),
+            false,
+            Vec::new(),
+            "repair.mp4".to_owned(),
+            "video/mp4".to_owned(),
+            1,
+            crate::photo::get_dimensions(10, 10, "netdrain65 repair"),
+            true,
+        );
+        let (promise, slot) = record_slot::<()>();
+        {
+            let Td {
+                global,
+                option_manager,
+                auth_manager,
+                file_manager,
+                file_reference_manager,
+                animations_updates,
+                ..
+            } = &mut td;
+            let mut env = TdAnimationsEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(file_manager),
+                file_reference_manager,
+                updates: animations_updates,
+            };
+            animations.repair_saved_animations(&mut env, promise);
+        }
+        td.animations_manager = animations;
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0);
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (500, "Failed to reload saved animations")
+                );
+            }
+            other => panic!("expected the repair band, got {other:?}"),
+        }
+
+        // 9. the net-inert posture — no dispatcher, the query family
+        //    parks like the C++ handler holds it. The loaded ring answers
+        //    the get arm locally (the C++ cached read, cpp:495-504) with
+        //    the reload suppressed by the load clock
+        td.net_query_dispatcher = None;
+        td.animations_manager.net = None;
+        td.request(
+            6,
+            Function::getSavedAnimations(td_api::getSavedAnimations {}),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        {
+            let responses = responses_of(&callback, 6);
+            let td_api::Object::animations(animations) = responses.first().unwrap() else {
+                panic!("the cached ring answer: {:?}", responses.first());
+            };
+            assert_eq!(animations.animations.len(), 2, "the cached ring");
+        }
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.animations_net_completed.lock().is_empty(), "drained");
     }
 
     #[test]

@@ -4,10 +4,11 @@
 //!
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`AnimationsManagerEnv`] trait carries the `G()`/option/pmc/
-//! cross-manager surfaces, and every `create_handler<...>` network tail
-//! is an env seam marked `[blocked: net]` — the C++ promise lands in the
-//! query and stays unanswered offline, exactly like the collapsed-line
-//! convention.
+//! cross-manager surfaces, and the `GetSavedGifsQuery` wire tail rides
+//! the manager-held `AnimationsNetHandle` (net-drain 56) — the answers
+//! drain through `Td::on_animations_net_answer` into the landed
+//! intakes; the `SaveGifQuery` tail stays the env seam and parks its
+//! promise offline.
 //!
 //! The saved-animations pmc record (the sqlite-pmc `"ans"` key) is the
 //! byte-exact `AnimationListLogEvent` framing: the log-event version
@@ -33,7 +34,23 @@ use std::sync::Arc;
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 
-/// The `Td *td` slice of the collapsed AnimationsManager.
+/// The in-flight query kinds of the net-drain 56 animation families —
+/// the C++ `GetSavedGifsQuery` `Td::ResultHandler` class
+/// (AnimationsManager.cpp:39-64) collapsed onto a dispatcher tag; the
+/// answers drain through [`crate::td::Td::on_animations_net_answer`].
+/// The kind carries only the handler member the answer half keys on
+/// (the request carries no promise — the answer feeds the manager's own
+/// load/repair state machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnimationsNetKind {
+    /// `GetSavedGifsQuery` (AnimationsManager.cpp:39-64) —
+    /// `messages.getSavedGifs`; the `is_repair_` member rides the kind,
+    /// the answer feeds the manager's own load/repair state machine (no
+    /// request promise).
+    GetSavedGifs { is_repair: bool },
+}
+
+/// The `G()`/manager slice the collapsed manager reads through.
 pub trait AnimationsManagerEnv: DialogPhotoStoreEnv {
     // -- the G()/auth slice
     fn auth_is_bot(&self) -> bool;
@@ -83,11 +100,8 @@ pub trait AnimationsManagerEnv: DialogPhotoStoreEnv {
         source: &str,
     );
 
-    // -- the `[blocked: net]` query tails; each one drops the promise,
-    // -- which keeps the C++ request unanswered offline
-    /// `GetSavedGifsQuery::send(is_repair, hash)`
-    /// (AnimationsManager.cpp:39-64).
-    fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64);
+    // -- the `[blocked: net]` query tail; it drops the promise, which
+    // -- keeps the C++ request unanswered offline
     /// `SaveGifQuery::send(file_id, input_document, unsave)`
     /// (AnimationsManager.cpp:66-124); the input document is resolved
     /// locally, the query send and the file-reference repair half are
@@ -139,6 +153,11 @@ pub(crate) enum SavedAnimationCall {
 /// `AnimationsManager` (AnimationsManager.h:29-166) — the collapsed actor.
 #[derive(Default)]
 pub struct AnimationsManager {
+    /// The manager-held dispatch surface of the net-drain 56 families —
+    /// `None` keeps the net-inert posture (the pre-init windows and the
+    /// net-inert tests; the [`crate::game_manager::GameManager::net`]
+    /// shape).
+    pub(crate) net: Option<crate::td::AnimationsNetHandle>,
     animations: HashMap<FileId, Animation>,
 
     saved_animations_limit: i32,
@@ -681,7 +700,8 @@ impl AnimationsManager {
     }
 
     /// `reload_saved_animations` (AnimationsManager.cpp:471-482); the
-    /// `GetSavedGifsQuery` send is the `[blocked: net]` seam.
+    /// `GetSavedGifsQuery` send rides the manager-held handle (the
+    /// net-inert posture logs and parks, cpp:480).
     pub fn reload_saved_animations(&mut self, env: &mut impl AnimationsManagerEnv, force: bool) {
         if env.close_flag() {
             return;
@@ -696,7 +716,19 @@ impl AnimationsManager {
             }
             self.are_saved_animations_being_loaded = true;
             let hash = self.get_saved_animations_hash(env, "reload_saved_animations");
-            env.send_get_saved_gifs_query(false, hash);
+            // `GetSavedGifsQuery::send(false, hash)` (cpp:41-44)
+            let kind = AnimationsNetKind::GetSavedGifs { is_repair: false };
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getSavedGifs(
+                        telegram_api::messages_getSavedGifs { hash },
+                    ),
+                ),
+                None => tdutils::log_info!(
+                    "Send GetSavedGifsQuery(is_repair = false, hash = {hash}) — [net-inert]"
+                ),
+            }
         }
     }
 
@@ -717,7 +749,19 @@ impl AnimationsManager {
         let is_first = self.repair_saved_animations_queries.is_empty();
         self.repair_saved_animations_queries.push(promise);
         if is_first {
-            env.send_get_saved_gifs_query(true, 0);
+            // `GetSavedGifsQuery::send(true, 0)` (cpp:492)
+            let kind = AnimationsNetKind::GetSavedGifs { is_repair: true };
+            match self.net.clone() {
+                Some(net) => net.dispatch(
+                    kind,
+                    telegram_api::Function::messages_getSavedGifs(
+                        telegram_api::messages_getSavedGifs { hash: 0 },
+                    ),
+                ),
+                None => tdutils::log_info!(
+                    "Send GetSavedGifsQuery(is_repair = true, hash = 0) — [net-inert]"
+                ),
+            }
         }
     }
 
@@ -1382,11 +1426,6 @@ impl AnimationsManager {
     }
 }
 
-// The `SaveGifQuery` send seam's local half resolved the input document;
-// the dropped promise keeps the request unanswered offline (the
-// collapsed-line convention, recorded at
-// `AnimationsManagerEnv::send_save_gif_query_net`).
-
 /// The walked shape of a `messages.savedGifs` answer — the input of the
 /// [`AnimationsManager::on_get_saved_animations`] state machine.
 pub struct SavedGifsWalk {
@@ -1834,9 +1873,10 @@ mod tests {
             }
         }
 
-        fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64) {
-            self.queries
-                .push(format!("get_saved_gifs {is_repair} {hash}"));
+        fn is_expected_error(&self, status: &tdutils::status::Status) -> bool {
+            // the C++ expected-error code set (Global.h:723-737) reduced
+            // to the flood-wait family these bands exercise
+            status.code() == 420
         }
 
         fn send_save_gif_query_net(
@@ -2660,13 +2700,13 @@ mod tests {
         }
         assert_eq!(manager.saved_animation_ids, vec![id2, id1]);
 
-        // the recorded reload query carries the same fold; the empty-db load's
-        // auto-reload left the being-loaded flag set (only the server answer
-        // clears it in the C++) — simulate the answer clearing it
+        // the forced reload re-arms the being-loaded decision in the
+        // net-inert posture (the fold above is the wire hash shape; the
+        // empty-db load's auto-reload left the flag set — only the server
+        // answer clears it in the C++)
         manager.are_saved_animations_being_loaded = false;
-        let expected = crate::misc::get_vector_hash(&[900, 800]);
         manager.reload_saved_animations(&mut env, true);
-        assert!(env.has_query(&format!("get_saved_gifs false {expected}")));
+        assert!(manager.are_saved_animations_being_loaded);
     }
 
     /// `get_animation_object` (AnimationsManager.cpp:150-162): the built
@@ -2835,9 +2875,11 @@ mod tests {
 
         let (get_promise, get_fulfilled, get_failed, _) = flag_promise::<td_api::Animations>();
         manager.get_saved_animations(&mut env, get_promise);
-        // the load path's forced reload still sends is_repair=false
-        // (AnimationsManager.cpp:480); the empty hash folds to 0
-        assert!(env.has_query("get_saved_gifs false 0"));
+        // the load path's forced reload runs the net-inert decision: the
+        // being-loaded gate arms with the is_repair=false form
+        // (AnimationsManager.cpp:480); the empty hash folds to 0 — the
+        // wire body rides the netted round-trip
+        assert!(manager.are_saved_animations_being_loaded);
 
         let error = tdutils::status::Status::error(429, "Too Many Requests: retry later");
         manager.on_get_saved_animations_failed(false, error);
