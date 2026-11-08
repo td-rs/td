@@ -40574,6 +40574,36 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         stickers_manager.get_premium_gift_sticker_object(&mut env, month_count, star_count)
     }
 
+    // Premium.cpp:371/377 — `animations_manager_->get_animation_object`
+    // over the animations record (the §6 flip, net-drain 56): the
+    // per-call animations env (the field-split shape — the answer drain
+    // builds the same view)
+    fn get_animation_object(&mut self, file_id: FileId) -> Option<td_api::Animation> {
+        let manager = std::mem::take(&mut self.td.animations_manager);
+        let object = {
+            let Td {
+                global,
+                option_manager,
+                auth_manager,
+                file_manager,
+                file_reference_manager,
+                animations_updates,
+                ..
+            } = self.td;
+            let env = TdAnimationsEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(file_manager),
+                file_reference_manager,
+                updates: animations_updates,
+            };
+            manager.get_animation_object(&env, file_id)
+        };
+        self.td.animations_manager = manager;
+        object
+    }
+
     fn get_option_integer(&self, name: &str) -> i64 {
         self.td
             .option_manager
@@ -73658,9 +73688,16 @@ mod tests {
                     state.animations[0].feature,
                     Some(td_api::PremiumFeature::premiumFeatureIncreasedLimits(_))
                 ));
+                // the §6 flip (net-drain 56): the promo answer builds the
+                // real animation object over the walked document record
+                // (the animations integration) — the whole-Td env leg;
+                // the trait default stays the miss band
+                let animation = state.animations[0].animation.as_ref().unwrap();
+                assert_eq!(animation.mime_type, "video/mp4");
+                assert!(animation.animation.as_ref().unwrap().id > 0);
                 assert!(
-                    state.animations[0].animation.is_none(),
-                    "the animation object parks at M.20"
+                    state.business_animations[0].animation.is_some(),
+                    "the business twin builds too"
                 );
                 assert_eq!(state.business_animations.len(), 1);
                 assert!(matches!(
